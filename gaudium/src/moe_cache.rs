@@ -208,12 +208,12 @@ impl MoeBook {
         let mut cold: Option<usize> = None;
         for e in 0..y.n_experts {
             if y.slot_of[e] >= 0 {
-                if cold.map_or(true, |c| y.score[e] < y.score[c]) {
+                if cold.is_none_or(|c| y.score[e] < y.score[c]) {
                     cold = Some(e);
                 }
             } else if y.where_filling[e] < 0
                 && !y.waiting[e]
-                && hot.map_or(true, |hi| y.score[e] > y.score[hi])
+                && hot.is_none_or(|hi| y.score[e] > y.score[hi])
             {
                 hot = Some(e);
             }
@@ -353,7 +353,11 @@ impl MoeBook {
                         MoePolicy::Lru => y.used_tick[e] < y.used_tick[be],
                         MoePolicy::Promoter => y.score[e] < y.score[be],
                     };
-                    if better { Some(s) } else { Some(bs) }
+                    if better {
+                        Some(s)
+                    } else {
+                        Some(bs)
+                    }
                 }
             };
         }
@@ -365,7 +369,9 @@ impl MoeBook {
         let mut out = Vec::new();
         let max_ret = self.reserve.max(self.retire_max);
         for h in 0..self.layers.len() {
-            let want = self.layers[h].n_slots.min(self.reserve + self.layers[h].wait_queue.len());
+            let want = self.layers[h]
+                .n_slots
+                .min(self.reserve + self.layers[h].wait_queue.len());
             while self.layers[h].n_free + self.layers[h].n_retiring < want
                 && self.layers[h].n_retiring < max_ret
             {
@@ -375,7 +381,10 @@ impl MoeBook {
                 let y = &mut self.layers[h];
                 let exp = y.slots[s].expert as usize;
                 y.slot_of[exp] = -1;
-                y.slots[s].guard.begin_retire().expect("Ready -> RetiringUnbound");
+                y.slots[s]
+                    .guard
+                    .begin_retire()
+                    .expect("Ready -> RetiringUnbound");
                 y.n_retiring += 1;
                 self.counters.evictions += 1;
                 out.push(EvictJob {
@@ -497,7 +506,10 @@ mod tests {
         let jobs = b.take_jobs(4);
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].expert, 9);
-        assert_eq!(b.layers[0].slots[jobs[0].slot].guard.state(), SlotState::SlotFilling);
+        assert_eq!(
+            b.layers[0].slots[jobs[0].slot].guard.state(),
+            SlotState::SlotFilling
+        );
         assert!(!b.request(0, 9) && !b.is_resident(0, 9));
 
         b.loaded(jobs[0]);
@@ -548,7 +560,11 @@ mod tests {
         assert_eq!(u.miss_now(0, 22, true), MissAction::TwinAndRequest);
         assert_eq!(u.miss_now(0, 20, true), MissAction::TwinOnly);
         assert_eq!(u.miss_now(0, 1, true), MissAction::TwinOnly);
-        u.published(FillJob { layer: 0, expert: 20, slot: s1 });
+        u.published(FillJob {
+            layer: 0,
+            expert: 20,
+            slot: s1,
+        });
         assert!(u.is_resident(0, 20) && u.counters.uploads_now == 2);
 
         // plan_build exact match to moe_cache_test.cpp
@@ -556,7 +572,10 @@ mod tests {
         let slots = [11, -1, 3, 6, 11, -1, 3, -1, -1, 3, 0, 6];
         let (plan, dev) = plan_build(&ids, &slots, 4, 3);
         assert_eq!(plan[0], 4);
-        assert_eq!(&plan[1..17], &[11, 2, 0, 1, 3, 3, 2, 7, 0, 1, 5, 8, 6, 2, 6, 9]);
+        assert_eq!(
+            &plan[1..17],
+            &[11, 2, 0, 1, 3, 3, 2, 7, 0, 1, 5, 8, 6, 2, 6, 9]
+        );
         assert_eq!(&plan[1 + 48..1 + 48 + 8], &[0, 16, 2, 18, 33, 34, 3, 35]);
         for i in 0..12 {
             assert_eq!(dev[i], i32::from(slots[i] >= 0));
@@ -607,7 +626,8 @@ mod tests {
             }
         }
 
-        let mut active: VecDeque<(u64, Vec<(usize, usize, i32)>)> = VecDeque::new();
+        type ActiveLaunch = (u64, Vec<(usize, usize, i32)>);
+        let mut active: VecDeque<ActiveLaunch> = VecDeque::new();
         let mut launched = 0u64;
         let mut filling: Vec<FillJob> = Vec::new();
         let mut rng = SimpleRng(0x9E37_79B9_7F4A_7C15);
@@ -631,7 +651,10 @@ mod tests {
                     let s = table[h][e];
                     events += 1;
                     if s >= 0 {
-                        assert_eq!(content[h][s as usize], e as i32, "stale slot content at read!");
+                        assert_eq!(
+                            content[h][s as usize], e as i32,
+                            "stale slot content at read!"
+                        );
                         reads.push((h, s as usize, e as i32));
                         dev.push(1);
                         hits += 1;
@@ -660,8 +683,8 @@ mod tests {
                         );
                     }
                 }
-                for e in 0..n_experts {
-                    assert_ne!(table[job.layer][e], job.slot as i32);
+                for &slot_val in &table[job.layer][..n_experts] {
+                    assert_ne!(slot_val, job.slot as i32);
                 }
                 content[job.layer][job.slot] = -2; // writing
                 filling.push(job);
@@ -695,6 +718,9 @@ mod tests {
             book.quiesce(seq);
         }
         let hit_pct = (hits as f64) * 100.0 / (events as f64);
-        assert!(hit_pct >= 90.0, "expected >= 90% LRU hit rate on hot set, got {hit_pct:.2}%");
+        assert!(
+            hit_pct >= 90.0,
+            "expected >= 90% LRU hit rate on hot set, got {hit_pct:.2}%"
+        );
     }
 }

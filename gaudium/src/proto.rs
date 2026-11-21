@@ -304,8 +304,8 @@ impl<'a> Reader<'a> {
         let byte_len = n.checked_mul(4).ok_or(ProtoError::Truncated)?;
         let bytes = self.take(byte_len)?;
         let mut out = Vec::with_capacity(n);
-        for chunk in bytes.chunks_exact(4) {
-            out.push(i32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in bytes.as_chunks::<4>().0 {
+            out.push(i32::from_le_bytes(*chunk));
         }
         Ok(out)
     }
@@ -315,8 +315,8 @@ impl<'a> Reader<'a> {
         let byte_len = n.checked_mul(4).ok_or(ProtoError::Truncated)?;
         let bytes = self.take(byte_len)?;
         let mut out = Vec::with_capacity(n);
-        for chunk in bytes.chunks_exact(4) {
-            out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in bytes.as_chunks::<4>().0 {
+            out.push(f32::from_le_bytes(*chunk));
         }
         Ok(out)
     }
@@ -496,7 +496,7 @@ pub fn recv_frame<R: Read>(mut stream: R) -> Result<(MsgType, Vec<u8>), ProtoErr
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr)?;
     let len = u32::from_le_bytes(hdr);
-    if len < 1 || len > MAX_FRAME {
+    if !(1..=MAX_FRAME).contains(&len) {
         return Err(ProtoError::OversizedFrame(len));
     }
     let mut tbuf = [0u8; 1];
@@ -599,6 +599,9 @@ mod tests {
             recv_frame(Cursor::new(bad_hdr)),
             Err(ProtoError::OversizedFrame(_))
         ));
-        assert!(matches!(decode_submit(&[0, 1, 2]), Err(ProtoError::Truncated)));
+        assert!(matches!(
+            decode_submit(&[0, 1, 2]),
+            Err(ProtoError::Truncated)
+        ));
     }
 }

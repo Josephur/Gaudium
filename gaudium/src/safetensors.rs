@@ -26,7 +26,12 @@ pub enum SafetensorsError {
     Io(String),
     Json(JsonError),
     Malformed(String),
-    OutOfRange { tensor: String, beg: u64, end: u64, avail: u64 },
+    OutOfRange {
+        tensor: String,
+        beg: u64,
+        end: u64,
+        avail: u64,
+    },
     NotFound(String),
 }
 
@@ -36,8 +41,16 @@ impl fmt::Display for SafetensorsError {
             Self::Io(m) => write!(f, "safetensors io error: {m}"),
             Self::Json(e) => write!(f, "safetensors {e}"),
             Self::Malformed(m) => write!(f, "safetensors malformed: {m}"),
-            Self::OutOfRange { tensor, beg, end, avail } => {
-                write!(f, "safetensors offsets [{beg}, {end}) out of range (avail {avail}) for {tensor}")
+            Self::OutOfRange {
+                tensor,
+                beg,
+                end,
+                avail,
+            } => {
+                write!(
+                    f,
+                    "safetensors offsets [{beg}, {end}) out of range (avail {avail}) for {tensor}"
+                )
             }
             Self::NotFound(name) => write!(f, "safetensors tensor not found: {name}"),
         }
@@ -92,8 +105,9 @@ impl MappedShard {
         let meta = file
             .metadata()
             .map_err(|e| SafetensorsError::Io(format!("stat {}: {e}", path.display())))?;
-        let len = usize::try_from(meta.len())
-            .map_err(|_| SafetensorsError::Malformed(format!("file too large: {}", path.display())))?;
+        let len = usize::try_from(meta.len()).map_err(|_| {
+            SafetensorsError::Malformed(format!("file too large: {}", path.display()))
+        })?;
         if len < 8 {
             return Err(SafetensorsError::Malformed(format!(
                 "file too small (< 8 bytes): {}",
@@ -187,12 +201,14 @@ impl SafetensorsStore {
             let wm = parsed
                 .get("weight_map")
                 .and_then(JsonValue::as_object)
-                .ok_or_else(|| SafetensorsError::Malformed("index has no weight_map object".into()))?;
+                .ok_or_else(|| {
+                    SafetensorsError::Malformed("index has no weight_map object".into())
+                })?;
             let mut shard_names = Vec::new();
             for (_, v) in wm {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| SafetensorsError::Malformed("weight_map entry is not a string".into()))?;
+                let s = v.as_str().ok_or_else(|| {
+                    SafetensorsError::Malformed("weight_map entry is not a string".into())
+                })?;
                 if !shard_names.iter().any(|x| x == s) {
                     shard_names.push(s.to_owned());
                 }
@@ -215,7 +231,13 @@ impl SafetensorsStore {
         }
     }
 
-    pub fn add_lazy(&mut self, name: String, dtype: String, shape: Vec<u64>, lazy: Arc<dyn LazyRows>) {
+    pub fn add_lazy(
+        &mut self,
+        name: String,
+        dtype: String,
+        shape: Vec<u64>,
+        lazy: Arc<dyn LazyRows>,
+    ) {
         self.tensors.insert(
             name,
             TensorMeta {
@@ -266,13 +288,15 @@ impl SafetensorsStore {
                 .get("data_offsets")
                 .and_then(JsonValue::as_array)
                 .filter(|a| a.len() == 2)
-                .ok_or_else(|| SafetensorsError::Malformed(format!("bad data_offsets for {name}")))?;
-            let beg = off_arr[0]
-                .as_u64()
-                .ok_or_else(|| SafetensorsError::Malformed(format!("non-u64 begin offset for {name}")))?;
-            let end = off_arr[1]
-                .as_u64()
-                .ok_or_else(|| SafetensorsError::Malformed(format!("non-u64 end offset for {name}")))?;
+                .ok_or_else(|| {
+                    SafetensorsError::Malformed(format!("bad data_offsets for {name}"))
+                })?;
+            let beg = off_arr[0].as_u64().ok_or_else(|| {
+                SafetensorsError::Malformed(format!("non-u64 begin offset for {name}"))
+            })?;
+            let end = off_arr[1].as_u64().ok_or_else(|| {
+                SafetensorsError::Malformed(format!("non-u64 end offset for {name}"))
+            })?;
             if beg > end || end > avail {
                 return Err(SafetensorsError::OutOfRange {
                     tensor: name.clone(),
@@ -283,10 +307,10 @@ impl SafetensorsStore {
             }
             let mut shape = Vec::with_capacity(shape_arr.len());
             for d in shape_arr {
-                shape.push(
-                    d.as_u64()
-                        .ok_or_else(|| SafetensorsError::Malformed(format!("bad dim in {name}")))?,
-                );
+                shape
+                    .push(d.as_u64().ok_or_else(|| {
+                        SafetensorsError::Malformed(format!("bad dim in {name}"))
+                    })?);
             }
             self.tensors.insert(
                 name.clone(),
@@ -366,7 +390,8 @@ mod tests {
     #[test]
     fn reads_multi_shard_safetensors_and_validates_bounds() {
         let dir = temp_dir("multi");
-        let idx_json = r#"{"weight_map":{"a.weight":"s1.safetensors","b.weight":"s2.safetensors"}}"#;
+        let idx_json =
+            r#"{"weight_map":{"a.weight":"s1.safetensors","b.weight":"s2.safetensors"}}"#;
         fs::write(dir.join("model.safetensors.index.json"), idx_json).unwrap();
 
         let s1 = make_safetensors_bytes(
@@ -386,7 +411,10 @@ mod tests {
         let a = store.get("a.weight").unwrap();
         assert_eq!(a.dtype, "BF16");
         assert_eq!(a.shape, vec![2, 2]);
-        assert_eq!(store.tensor_bytes("a.weight").unwrap().unwrap(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            store.tensor_bytes("a.weight").unwrap().unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
         let b_bytes = store.tensor_bytes("b.weight").unwrap().unwrap();
         assert_eq!(f32::from_le_bytes(b_bytes.try_into().unwrap()), 42.0);
         fs::remove_dir_all(&dir).unwrap();

@@ -153,7 +153,16 @@ def pool_same_slab_adjacent(prev_block: Nat, +cur_block: Nat, bps: Nat) -> Bool:
 # ============================================================================
 # Strict < on lcp and prompt_len expresses `snap_pos <= lcp - 1` and `snap_pos <= P - 1`
 # with ZERO unsigned underflow when lcp == 0 or prompt_len == 0.
-def pfx_reuse_valid(+snap_pos: Nat, lcp: Nat, prompt_len: Nat, +tile: Nat, need_mtp: Bool, mtp_upto: Nat, need_df: Bool, df_upto: Nat) -> Bool:
+def pfx_reuse_valid(
+  +snap_pos: Nat,
+  lcp: Nat,
+  prompt_len: Nat,
+  +tile: Nat,
+  need_mtp: Bool,
+  mtp_upto: Nat,
+  need_df: Bool,
+  df_upto: Nat
+) -> Bool:
   Bool.and(
     Bool.and(Nat.is_gt(snap_pos, 0n), Bool.and(Nat.is_gt(tile, 0n), Nat.is_eq(Nat.mod(snap_pos, tile), 0n))),
     Bool.and(

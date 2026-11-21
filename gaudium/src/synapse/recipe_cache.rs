@@ -39,8 +39,8 @@ impl Sha256 {
     pub fn new() -> Self {
         Self {
             h: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
             ],
             buf: [0; 64],
             buf_len: 0,
@@ -49,7 +49,9 @@ impl Sha256 {
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
-        self.total_bits = self.total_bits.wrapping_add((data.len() as u64).wrapping_mul(8));
+        self.total_bits = self
+            .total_bits
+            .wrapping_add((data.len() as u64).wrapping_mul(8));
         if self.buf_len > 0 {
             let take = (64 - self.buf_len).min(data.len());
             self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
@@ -240,7 +242,9 @@ pub struct RetrievedTensorDesc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingViolation {
     UnboundTensor(String),
-    MissingWorkspace { needed: u64 },
+    MissingWorkspace {
+        needed: u64,
+    },
     DuplicatePersistentSectionAddress {
         addr: u64,
         first_section: u32,
@@ -434,8 +438,13 @@ mod tests {
         ok_map.insert("in_a".into(), 0x1000_0000);
         ok_map.insert("in_b".into(), 0x2000_0000);
         ok_map.insert("arena_slice".into(), 0x1000_1000);
-        verify_launch_bindings(&[t1.clone(), t2.clone(), t3.clone()], &ok_map, 4096, 0x9000_0000)
-            .unwrap();
+        verify_launch_bindings(
+            &[t1.clone(), t2.clone(), t3.clone()],
+            &ok_map,
+            4096,
+            0x9000_0000,
+        )
+        .unwrap();
 
         // Missing workspace fails
         assert_eq!(

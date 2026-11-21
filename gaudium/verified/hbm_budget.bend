@@ -230,7 +230,12 @@ def hbm_usable_le_total(t, b, s):
   hb_sub_le_self(t, Nat.add(b, s))
 
 # Helper proof for fit/shortfall exact partition:
-def hb_fit_step_eq(+pp: Nat, +up: Nat, fits: Bool, ih: {hbm_fit_reconstruct_lhs(hbm_check_fit_if(pp, up, fits), pp, up) == hbm_fit_reconstruct_rhs(hbm_check_fit_if(pp, up, fits), pp, up) : Nat}) -> {hbm_fit_reconstruct_lhs(hbm_check_fit_if(1n+pp, 1n+up, fits), 1n+pp, 1n+up) == hbm_fit_reconstruct_rhs(hbm_check_fit_if(1n+pp, 1n+up, fits), 1n+pp, 1n+up) : Nat}:
+def hb_fit_step_eq(
+  +pp: Nat,
+  +up: Nat,
+  fits: Bool,
+  ih: {hbm_fit_reconstruct_lhs(hbm_check_fit_if(pp, up, fits), pp, up) == hbm_fit_reconstruct_rhs(hbm_check_fit_if(pp, up, fits), pp, up) : Nat}
+) -> {hbm_fit_reconstruct_lhs(hbm_check_fit_if(1n+pp, 1n+up, fits), 1n+pp, 1n+up) == hbm_fit_reconstruct_rhs(hbm_check_fit_if(1n+pp, 1n+up, fits), 1n+pp, 1n+up) : Nat}:
   match fits:
     case True{}:
       %ih : {1n+Nat.add(pp, Nat.sub(up, pp)) == 1n+_ : Nat}

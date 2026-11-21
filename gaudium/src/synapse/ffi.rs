@@ -248,7 +248,9 @@ const _: () = {
     assert!(std::mem::offset_of!(SynRetrievedLaunchTensorInfoExt, tensor_data_type) == 1036);
     assert!(std::mem::offset_of!(SynRetrievedLaunchTensorInfoExt, tensor_dims) == 1040);
     assert!(std::mem::offset_of!(SynRetrievedLaunchTensorInfoExt, tensor_section_id) == 1476);
-    assert!(std::mem::offset_of!(SynRetrievedLaunchTensorInfoExt, tensor_offset_in_section) == 1480);
+    assert!(
+        std::mem::offset_of!(SynRetrievedLaunchTensorInfoExt, tensor_offset_in_section) == 1480
+    );
     assert!(std::mem::offset_of!(SynRetrievedLaunchTensorInfoExt, is_input) == 1488);
 };
 
@@ -303,36 +305,51 @@ pub struct SynapseApi {
     pub syn_driver_get_version: unsafe extern "C" fn(*mut c_char, c_int) -> SynStatus,
     pub syn_device_acquire_by_type: unsafe extern "C" fn(*mut SynDeviceId, u32) -> SynStatus,
     pub syn_device_release: unsafe extern "C" fn(SynDeviceId) -> SynStatus,
-    pub syn_device_get_memory_info: unsafe extern "C" fn(SynDeviceId, *mut u64, *mut u64) -> SynStatus,
+    pub syn_device_get_memory_info:
+        unsafe extern "C" fn(SynDeviceId, *mut u64, *mut u64) -> SynStatus,
     pub syn_device_malloc: unsafe extern "C" fn(SynDeviceId, u64, u64, u32, *mut u64) -> SynStatus,
     pub syn_device_free: unsafe extern "C" fn(SynDeviceId, u64, u32) -> SynStatus,
     pub syn_host_map: unsafe extern "C" fn(SynDeviceId, u64, *const c_void) -> SynStatus,
     pub syn_host_unmap: unsafe extern "C" fn(SynDeviceId, *const c_void) -> SynStatus,
     pub syn_host_malloc: unsafe extern "C" fn(SynDeviceId, u64, u32, *mut *mut c_void) -> SynStatus,
     pub syn_host_free: unsafe extern "C" fn(SynDeviceId, *const c_void, u32) -> SynStatus,
-    pub syn_stream_create_generic: unsafe extern "C" fn(*mut SynStreamHandle, SynDeviceId, u32) -> SynStatus,
+    pub syn_stream_create_generic:
+        unsafe extern "C" fn(*mut SynStreamHandle, SynDeviceId, u32) -> SynStatus,
     pub syn_stream_destroy: unsafe extern "C" fn(SynStreamHandle) -> SynStatus,
     pub syn_stream_synchronize: unsafe extern "C" fn(SynStreamHandle) -> SynStatus,
-    pub syn_stream_wait_event: unsafe extern "C" fn(SynStreamHandle, SynEventHandle, u32) -> SynStatus,
+    pub syn_stream_wait_event:
+        unsafe extern "C" fn(SynStreamHandle, SynEventHandle, u32) -> SynStatus,
     pub syn_event_create: unsafe extern "C" fn(*mut SynEventHandle, SynDeviceId, u32) -> SynStatus,
     pub syn_event_destroy: unsafe extern "C" fn(SynEventHandle) -> SynStatus,
     pub syn_event_record: unsafe extern "C" fn(SynEventHandle, SynStreamHandle) -> SynStatus,
     pub syn_event_synchronize: unsafe extern "C" fn(SynEventHandle) -> SynStatus,
-    pub syn_event_elapsed_time: unsafe extern "C" fn(*mut u64, SynEventHandle, SynEventHandle) -> SynStatus,
+    pub syn_event_elapsed_time:
+        unsafe extern "C" fn(*mut u64, SynEventHandle, SynEventHandle) -> SynStatus,
     pub syn_mem_copy_async: unsafe extern "C" fn(SynStreamHandle, u64, u64, u64, u32) -> SynStatus,
     pub syn_graph_create: unsafe extern "C" fn(*mut SynGraphHandle, u32) -> SynStatus,
     pub syn_graph_destroy: unsafe extern "C" fn(SynGraphHandle) -> SynStatus,
-    pub syn_graph_compile: unsafe extern "C" fn(*mut SynRecipeHandle, SynGraphHandle, *const c_char, *const c_char) -> SynStatus,
-    pub syn_graph_set_attribute: unsafe extern "C" fn(SynGraphHandle, *const u32, *const u64, u32) -> SynStatus,
-    pub syn_section_create: unsafe extern "C" fn(*mut SynSectionHandle, u64, SynGraphHandle) -> SynStatus,
+    pub syn_graph_compile: unsafe extern "C" fn(
+        *mut SynRecipeHandle,
+        SynGraphHandle,
+        *const c_char,
+        *const c_char,
+    ) -> SynStatus,
+    pub syn_graph_set_attribute:
+        unsafe extern "C" fn(SynGraphHandle, *const u32, *const u64, u32) -> SynStatus,
+    pub syn_section_create:
+        unsafe extern "C" fn(*mut SynSectionHandle, u64, SynGraphHandle) -> SynStatus,
     pub syn_section_set_persistent: unsafe extern "C" fn(SynSectionHandle, bool) -> SynStatus,
     pub syn_section_set_rmw: unsafe extern "C" fn(SynSectionHandle, bool) -> SynStatus,
     pub syn_section_destroy: unsafe extern "C" fn(SynSectionHandle) -> SynStatus,
-    pub syn_tensor_handle_create: unsafe extern "C" fn(*mut SynTensor, SynGraphHandle, u32, *const c_char) -> SynStatus,
-    pub syn_tensor_assign_to_section: unsafe extern "C" fn(SynTensor, SynSectionHandle, u64) -> SynStatus,
-    pub syn_tensor_set_geometry: unsafe extern "C" fn(SynTensor, *const SynTensorGeometry, u32) -> SynStatus,
+    pub syn_tensor_handle_create:
+        unsafe extern "C" fn(*mut SynTensor, SynGraphHandle, u32, *const c_char) -> SynStatus,
+    pub syn_tensor_assign_to_section:
+        unsafe extern "C" fn(SynTensor, SynSectionHandle, u64) -> SynStatus,
+    pub syn_tensor_set_geometry:
+        unsafe extern "C" fn(SynTensor, *const SynTensorGeometry, u32) -> SynStatus,
     pub syn_tensor_set_device_data_type: unsafe extern "C" fn(SynTensor, u32) -> SynStatus,
-    pub syn_tensor_set_device_full_layout: unsafe extern "C" fn(SynTensor, *const SynTensorDeviceFullLayout) -> SynStatus,
+    pub syn_tensor_set_device_full_layout:
+        unsafe extern "C" fn(SynTensor, *const SynTensorDeviceFullLayout) -> SynStatus,
     pub syn_tensor_set_allow_permutation: unsafe extern "C" fn(SynTensor, i8) -> SynStatus,
     pub syn_tensor_destroy: unsafe extern "C" fn(SynTensor) -> SynStatus,
     pub syn_node_create_with_id: unsafe extern "C" fn(
@@ -349,15 +366,29 @@ pub struct SynapseApi {
         *const *const c_char,
         *const *const c_char,
     ) -> SynStatus,
-    pub syn_node_dependency_set: unsafe extern "C" fn(SynGraphHandle, *const SynNodeId, *const SynNodeId, u32, u32) -> SynStatus,
+    pub syn_node_dependency_set: unsafe extern "C" fn(
+        SynGraphHandle,
+        *const SynNodeId,
+        *const SynNodeId,
+        u32,
+        u32,
+    ) -> SynStatus,
     pub syn_recipe_serialize: unsafe extern "C" fn(SynRecipeHandle, *const c_char) -> SynStatus,
-    pub syn_recipe_deserialize: unsafe extern "C" fn(*mut SynRecipeHandle, *const c_char) -> SynStatus,
+    pub syn_recipe_deserialize:
+        unsafe extern "C" fn(*mut SynRecipeHandle, *const c_char) -> SynStatus,
     pub syn_recipe_destroy: unsafe extern "C" fn(SynRecipeHandle) -> SynStatus,
-    pub syn_recipe_get_attribute: unsafe extern "C" fn(*mut u64, *const u32, c_uint, SynRecipeHandle) -> SynStatus,
+    pub syn_recipe_get_attribute:
+        unsafe extern "C" fn(*mut u64, *const u32, c_uint, SynRecipeHandle) -> SynStatus,
     pub syn_workspace_get_size: unsafe extern "C" fn(*mut u64, SynRecipeHandle) -> SynStatus,
-    pub syn_tensor_retrieve_launch_amount: unsafe extern "C" fn(SynRecipeHandle, *mut u32) -> SynStatus,
-    pub syn_tensor_retrieve_launch_ids: unsafe extern "C" fn(SynRecipeHandle, *mut u64, u32) -> SynStatus,
-    pub syn_tensor_retrieve_launch_info_by_id_ext: unsafe extern "C" fn(SynRecipeHandle, u32, *mut SynRetrievedLaunchTensorInfoExt) -> SynStatus,
+    pub syn_tensor_retrieve_launch_amount:
+        unsafe extern "C" fn(SynRecipeHandle, *mut u32) -> SynStatus,
+    pub syn_tensor_retrieve_launch_ids:
+        unsafe extern "C" fn(SynRecipeHandle, *mut u64, u32) -> SynStatus,
+    pub syn_tensor_retrieve_launch_info_by_id_ext: unsafe extern "C" fn(
+        SynRecipeHandle,
+        u32,
+        *mut SynRetrievedLaunchTensorInfoExt,
+    ) -> SynStatus,
     pub syn_launch_with_external_events_ext: unsafe extern "C" fn(
         SynStreamHandle,
         *const SynLaunchTensorInfoExt,
@@ -468,7 +499,10 @@ impl SynapseApi {
                 syn_tensor_assign_to_section: load_sym(handle, "synTensorAssignToSection")?,
                 syn_tensor_set_geometry: load_sym(handle, "synTensorSetGeometry")?,
                 syn_tensor_set_device_data_type: load_sym(handle, "synTensorSetDeviceDataType")?,
-                syn_tensor_set_device_full_layout: load_sym(handle, "synTensorSetDeviceFullLayout")?,
+                syn_tensor_set_device_full_layout: load_sym(
+                    handle,
+                    "synTensorSetDeviceFullLayout",
+                )?,
                 syn_tensor_set_allow_permutation: load_sym(handle, "synTensorSetAllowPermutation")?,
                 syn_tensor_destroy: load_sym(handle, "synTensorDestroy")?,
                 syn_node_create_with_id: load_sym(handle, "synNodeCreateWithId")?,
@@ -478,10 +512,19 @@ impl SynapseApi {
                 syn_recipe_destroy: load_sym(handle, "synRecipeDestroy")?,
                 syn_recipe_get_attribute: load_sym(handle, "synRecipeGetAttribute")?,
                 syn_workspace_get_size: load_sym(handle, "synWorkspaceGetSize")?,
-                syn_tensor_retrieve_launch_amount: load_sym(handle, "synTensorRetrieveLaunchAmount")?,
+                syn_tensor_retrieve_launch_amount: load_sym(
+                    handle,
+                    "synTensorRetrieveLaunchAmount",
+                )?,
                 syn_tensor_retrieve_launch_ids: load_sym(handle, "synTensorRetrieveLaunchIds")?,
-                syn_tensor_retrieve_launch_info_by_id_ext: load_sym(handle, "synTensorRetrieveLaunchInfoByIdExt")?,
-                syn_launch_with_external_events_ext: load_sym(handle, "synLaunchWithExternalEventsExt")?,
+                syn_tensor_retrieve_launch_info_by_id_ext: load_sym(
+                    handle,
+                    "synTensorRetrieveLaunchInfoByIdExt",
+                )?,
+                syn_launch_with_external_events_ext: load_sym(
+                    handle,
+                    "synLaunchWithExternalEventsExt",
+                )?,
                 syn_configuration_set: load_sym(handle, "synConfigurationSet")?,
                 syn_configuration_get: load_sym(handle, "synConfigurationGet")?,
             })
@@ -499,7 +542,9 @@ impl SynapseApi {
     pub fn driver_version(&self) -> Result<String, SynapseError> {
         let mut buf = [0u8; 256];
         // SAFETY: Valid writable buffer + exact length passed to `synDriverGetVersion`.
-        let st = unsafe { (self.syn_driver_get_version)(buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
+        let st = unsafe {
+            (self.syn_driver_get_version)(buf.as_mut_ptr() as *mut c_char, buf.len() as c_int)
+        };
         syn_check("synDriverGetVersion", st)?;
         let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         Ok(String::from_utf8_lossy(&buf[..len]).into_owned())

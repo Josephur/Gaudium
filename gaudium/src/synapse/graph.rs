@@ -100,8 +100,13 @@ impl GraphBuilder {
     }
 
     /// Records a normalized TPC-C kernel ELF hash into this graph's recipe fingerprint.
-    pub fn record_kernel_elf_hash(&mut self, kernel_name: impl Into<String>, norm_sha256: impl Into<String>) {
-        self.kernel_elf_hashes.push((kernel_name.into(), norm_sha256.into()));
+    pub fn record_kernel_elf_hash(
+        &mut self,
+        kernel_name: impl Into<String>,
+        norm_sha256: impl Into<String>,
+    ) {
+        self.kernel_elf_hashes
+            .push((kernel_name.into(), norm_sha256.into()));
     }
 
     pub fn add_persistent_section(&mut self, rmw: bool) -> SectionId {
@@ -375,7 +380,12 @@ impl GraphBuilder {
             let attrs: Vec<u32> = self.graph_attrs.iter().map(|&(a, _)| a as u32).collect();
             let vals: Vec<u64> = self.graph_attrs.iter().map(|&(_, v)| v).collect();
             syn_check("synGraphSetAttribute", unsafe {
-                (api.syn_graph_set_attribute)(graph, attrs.as_ptr(), vals.as_ptr(), attrs.len() as u32)
+                (api.syn_graph_set_attribute)(
+                    graph,
+                    attrs.as_ptr(),
+                    vals.as_ptr(),
+                    attrs.len() as u32,
+                )
             })?;
         }
 
@@ -550,7 +560,11 @@ impl CompiledRecipe {
         }
         if count > 0 {
             syn_check("synTensorRetrieveLaunchInfoByIdExt", unsafe {
-                (api.syn_tensor_retrieve_launch_info_by_id_ext)(handle, count, raw_infos.as_mut_ptr())
+                (api.syn_tensor_retrieve_launch_info_by_id_ext)(
+                    handle,
+                    count,
+                    raw_infos.as_mut_ptr(),
+                )
             })?;
         }
 
@@ -590,7 +604,9 @@ impl CompiledRecipe {
         let (pool_addr, pool_size) = dev.shared_workspace();
         self.guard
             .bind_workspace(self.ws_size, pool_size, dev.is_sealed())
-            .map_err(|e| SynapseError::Guard(format!("recipe {} workspace bind failed: {e:?}", self.name)))?;
+            .map_err(|e| {
+                SynapseError::Guard(format!("recipe {} workspace bind failed: {e:?}", self.name))
+            })?;
         self.ws_addr = if self.ws_size > 0 { pool_addr } else { 0 };
         Ok(())
     }
@@ -604,13 +620,15 @@ impl CompiledRecipe {
         dev.guard()
             .check_launch()
             .map_err(|e| SynapseError::Guard(format!("device launch refused: {e:?}")))?;
-        self.guard
-            .check_launch()
-            .map_err(|e| SynapseError::Guard(format!("recipe {} launch refused: {e:?}", self.name)))?;
-        verify_launch_bindings(&self.tensors, bindings, self.ws_size, self.ws_addr)
-            .map_err(|e| SynapseError::Guard(format!("recipe {} binding check failed: {e:?}", self.name)))?;
+        self.guard.check_launch().map_err(|e| {
+            SynapseError::Guard(format!("recipe {} launch refused: {e:?}", self.name))
+        })?;
+        verify_launch_bindings(&self.tensors, bindings, self.ws_size, self.ws_addr).map_err(
+            |e| SynapseError::Guard(format!("recipe {} binding check failed: {e:?}", self.name)),
+        )?;
 
-        let mut launch_infos: Vec<SynLaunchTensorInfoExt> = Vec::with_capacity(self.raw_infos.len());
+        let mut launch_infos: Vec<SynLaunchTensorInfoExt> =
+            Vec::with_capacity(self.raw_infos.len());
         for (raw, desc) in self.raw_infos.iter().zip(&self.tensors) {
             let addr = *bindings.get(&desc.name).expect("verified bound");
             launch_infos.push(SynLaunchTensorInfoExt {

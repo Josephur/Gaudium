@@ -5,8 +5,8 @@
 
 use crate::verified::{
     clamp_top_k, ctx_reserve, effective_max_new, kv_high_water, method_allows_sampling,
-    prompt_admitted, prompt_room, remaining_budget, sampler_family_join,
-    sampling_request_admitted, served_ctx, step_headroom_fits, SamplerFamily, SpecMethod,
+    prompt_admitted, prompt_room, remaining_budget, sampler_family_join, sampling_request_admitted,
+    served_ctx, step_headroom_fits, SamplerFamily, SpecMethod,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +36,11 @@ pub struct SequenceBudget {
 
 impl SequenceBudget {
     /// Admits a prompt and computes its clamped `max_new` budget (`req_max_new == None` => full room).
-    pub fn admit(prompt_len: u64, req_max_new: Option<u64>, lmax: u64) -> Result<Self, BudgetError> {
+    pub fn admit(
+        prompt_len: u64,
+        req_max_new: Option<u64>,
+        lmax: u64,
+    ) -> Result<Self, BudgetError> {
         if !prompt_admitted(prompt_len, lmax) {
             return Err(BudgetError::PromptRejected {
                 prompt_len,

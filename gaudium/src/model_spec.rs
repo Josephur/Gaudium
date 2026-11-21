@@ -145,13 +145,23 @@ impl ModelSpec {
         let model_type = str_field(&root, "model_type").to_owned();
         let text_model_type = str_field(tc, "model_type");
 
-        let family = if architecture.contains("Gemma4Assistant") || model_type == "gemma4_assistant" {
+        let family = if architecture.contains("Gemma4Assistant") || model_type == "gemma4_assistant"
+        {
             ModelFamily::Gemma4Assistant
-        } else if architecture.contains("Gemma4") || model_type.starts_with("gemma4") || text_model_type.starts_with("gemma4") {
+        } else if architecture.contains("Gemma4")
+            || model_type.starts_with("gemma4")
+            || text_model_type.starts_with("gemma4")
+        {
             ModelFamily::Gemma4
-        } else if architecture.contains("Qwen3_5Moe") || text_model_type == "qwen3_5_moe_text" || u64_field(tc, "num_experts") > 0 {
+        } else if architecture.contains("Qwen3_5Moe")
+            || text_model_type == "qwen3_5_moe_text"
+            || u64_field(tc, "num_experts") > 0
+        {
             ModelFamily::Qwen35Moe
-        } else if architecture.contains("Qwen3_5") || text_model_type == "qwen3_5_text" || u64_field(tc, "linear_num_key_heads") > 0 {
+        } else if architecture.contains("Qwen3_5")
+            || text_model_type == "qwen3_5_text"
+            || u64_field(tc, "linear_num_key_heads") > 0
+        {
             ModelFamily::Qwen35Dense
         } else if architecture.contains("Qwen3") || model_type == "qwen3" {
             ModelFamily::Qwen3
@@ -171,35 +181,38 @@ impl ModelSpec {
             let d = u64_field(tc, "head_dim");
             if d > 0 {
                 d
-            } else if n_heads > 0 {
-                hidden / n_heads
             } else {
-                0
+                hidden.checked_div(n_heads).unwrap_or(0)
             }
         };
         let rms_eps = f64_field(tc, "rms_norm_eps", 1e-6);
-        let tie_word_embeddings = bool_field(&root, "tie_word_embeddings", bool_field(tc, "tie_word_embeddings", false));
+        let tie_word_embeddings = bool_field(
+            &root,
+            "tie_word_embeddings",
+            bool_field(tc, "tie_word_embeddings", false),
+        );
 
-        let layer_types: Vec<String> = if let Some(arr) = tc.get("layer_types").and_then(JsonValue::as_array) {
-            arr.iter()
-                .map(|x| x.as_str().unwrap_or("").to_owned())
-                .collect()
-        } else {
-            let interval = u64_field(tc, "full_attention_interval");
-            if interval > 0 {
-                (0..n_layers)
-                    .map(|l| {
-                        if (l + 1) % interval == 0 {
-                            "full_attention".to_owned()
-                        } else {
-                            "linear_attention".to_owned()
-                        }
-                    })
+        let layer_types: Vec<String> =
+            if let Some(arr) = tc.get("layer_types").and_then(JsonValue::as_array) {
+                arr.iter()
+                    .map(|x| x.as_str().unwrap_or("").to_owned())
                     .collect()
             } else {
-                vec!["full_attention".to_owned(); n_layers as usize]
-            }
-        };
+                let interval = u64_field(tc, "full_attention_interval");
+                if interval > 0 {
+                    (0..n_layers)
+                        .map(|l| {
+                            if (l + 1) % interval == 0 {
+                                "full_attention".to_owned()
+                            } else {
+                                "linear_attention".to_owned()
+                            }
+                        })
+                        .collect()
+                } else {
+                    vec!["full_attention".to_owned(); n_layers as usize]
+                }
+            };
 
         let gdn_k_heads = u64_field(tc, "linear_num_key_heads");
         let gdn_v_heads = u64_field(tc, "linear_num_value_heads");
@@ -209,8 +222,14 @@ impl ModelSpec {
         let experts_per_tok = u64_field(tc, "num_experts_per_tok");
         let moe_intermediate = u64_field(tc, "moe_intermediate_size");
 
-        let has_vision = root.get("vision_config").and_then(JsonValue::as_object).is_some();
-        let fp8_quantized = root.get("quantization_config").and_then(JsonValue::as_object).is_some();
+        let has_vision = root
+            .get("vision_config")
+            .and_then(JsonValue::as_object)
+            .is_some();
+        let fp8_quantized = root
+            .get("quantization_config")
+            .and_then(JsonValue::as_object)
+            .is_some();
 
         let gemma4 = if matches!(family, ModelFamily::Gemma4 | ModelFamily::Gemma4Assistant) {
             let rp = tc.get("rope_parameters");
@@ -218,11 +237,19 @@ impl ModelSpec {
             let grp = rp.and_then(|x| x.get("full_attention"));
             let g_dh = {
                 let v = u64_field(tc, "global_head_dim");
-                if v > 0 { v } else { head_dim }
+                if v > 0 {
+                    v
+                } else {
+                    head_dim
+                }
             };
             let g_nkv = {
                 let v = u64_field(tc, "num_global_key_value_heads");
-                if v > 0 { v } else { n_kv_heads }
+                if v > 0 {
+                    v
+                } else {
+                    n_kv_heads
+                }
             };
             let vc = root.get("vision_config");
             let ac = root.get("audio_config").filter(|v| v.as_object().is_some());
@@ -237,15 +264,33 @@ impl ModelSpec {
                 ple_vocab: u64_field(tc, "vocab_size_per_layer_input"),
                 kv_shared: u64_field(tc, "num_kv_shared_layers"),
                 double_wide_mlp: bool_field(tc, "use_double_wide_mlp", false),
-                s_theta: srp.map(|x| f64_field(x, "rope_theta", 10_000.0)).unwrap_or(10_000.0),
-                g_theta: grp.map(|x| f64_field(x, "rope_theta", 1_000_000.0)).unwrap_or(1_000_000.0),
-                s_rope_type: srp.map(|x| str_field(x, "rope_type")).unwrap_or("default").to_owned(),
-                g_rope_type: grp.map(|x| str_field(x, "rope_type")).unwrap_or("default").to_owned(),
-                s_partial: srp.map(|x| f64_field(x, "partial_rotary_factor", 1.0)).unwrap_or(1.0),
-                g_partial: grp.map(|x| f64_field(x, "partial_rotary_factor", 1.0)).unwrap_or(1.0),
+                s_theta: srp
+                    .map(|x| f64_field(x, "rope_theta", 10_000.0))
+                    .unwrap_or(10_000.0),
+                g_theta: grp
+                    .map(|x| f64_field(x, "rope_theta", 1_000_000.0))
+                    .unwrap_or(1_000_000.0),
+                s_rope_type: srp
+                    .map(|x| str_field(x, "rope_type"))
+                    .unwrap_or("default")
+                    .to_owned(),
+                g_rope_type: grp
+                    .map(|x| str_field(x, "rope_type"))
+                    .unwrap_or("default")
+                    .to_owned(),
+                s_partial: srp
+                    .map(|x| f64_field(x, "partial_rotary_factor", 1.0))
+                    .unwrap_or(1.0),
+                g_partial: grp
+                    .map(|x| f64_field(x, "partial_rotary_factor", 1.0))
+                    .unwrap_or(1.0),
                 has_audio: ac.is_some(),
-                a_left: ac.map(|x| u64_field(x, "attention_context_left")).unwrap_or(0),
-                a_right: ac.map(|x| u64_field(x, "attention_context_right")).unwrap_or(0),
+                a_left: ac
+                    .map(|x| u64_field(x, "attention_context_left"))
+                    .unwrap_or(0),
+                a_right: ac
+                    .map(|x| u64_field(x, "attention_context_right"))
+                    .unwrap_or(0),
                 v_heads: vc.map(|x| u64_field(x, "num_attention_heads")).unwrap_or(0),
                 v_head_dim: vc.map(|x| u64_field(x, "head_dim")).unwrap_or(0),
                 v_hidden: vc.map(|x| u64_field(x, "hidden_size")).unwrap_or(0),
@@ -319,12 +364,26 @@ impl ModelSpec {
                     .ok_or_else(|| SpecError::InvalidDims("missing gemma4 spec".into()))?;
                 validate_hidden(self.hidden, self.vocab)
                     .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
-                let s_pairs = Gemma4Rope::rotated_pairs(&g4.s_rope_type, g4.s_partial, self.head_dim);
-                let g_pairs = Gemma4Rope::rotated_pairs(&g4.g_rope_type, g4.g_partial, g4.global_head_dim);
-                validate_gemma4_heads("sliding", self.n_heads, self.n_kv_heads, self.head_dim, s_pairs)
-                    .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
-                validate_gemma4_heads("global", self.n_heads, g4.global_kv_heads, g4.global_head_dim, g_pairs)
-                    .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
+                let s_pairs =
+                    Gemma4Rope::rotated_pairs(&g4.s_rope_type, g4.s_partial, self.head_dim);
+                let g_pairs =
+                    Gemma4Rope::rotated_pairs(&g4.g_rope_type, g4.g_partial, g4.global_head_dim);
+                validate_gemma4_heads(
+                    "sliding",
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    s_pairs,
+                )
+                .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
+                validate_gemma4_heads(
+                    "global",
+                    self.n_heads,
+                    g4.global_kv_heads,
+                    g4.global_head_dim,
+                    g_pairs,
+                )
+                .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
                 validate_gemma4_ple(g4.ple_dim, g4.ple_vocab, self.vocab)
                     .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
                 validate_gemma4_kv_share(self.n_layers, g4.kv_shared)

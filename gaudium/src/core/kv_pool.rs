@@ -263,7 +263,12 @@ mod tests {
     #[test]
     fn slab_runs_split_on_holes_and_1gb_boundaries() {
         // Mirrors cache_ram_test.cpp tests 5 & 7
-        let runs = coalesce_slab_runs(&[3, 4, 5, 9, 10], 4 * BLOCK_BYTES + 100, BLOCK_BYTES, BLOCKS_PER_SLAB);
+        let runs = coalesce_slab_runs(
+            &[3, 4, 5, 9, 10],
+            4 * BLOCK_BYTES + 100,
+            BLOCK_BYTES,
+            BLOCKS_PER_SLAB,
+        );
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].slab_idx, 0);
         assert_eq!(runs[0].first_block_in_slab, 3);
@@ -279,7 +284,12 @@ mod tests {
         assert_eq!(slab_coords(511, BLOCKS_PER_SLAB), (0, 511));
         assert_eq!(slab_coords(512, BLOCKS_PER_SLAB), (1, 0));
 
-        let cross = coalesce_slab_runs(&[510, 511, 512, 513], 4 * BLOCK_BYTES, BLOCK_BYTES, BLOCKS_PER_SLAB);
+        let cross = coalesce_slab_runs(
+            &[510, 511, 512, 513],
+            4 * BLOCK_BYTES,
+            BLOCK_BYTES,
+            BLOCKS_PER_SLAB,
+        );
         assert_eq!(cross.len(), 2);
         assert_eq!(cross[0].slab_idx, 0);
         assert_eq!(cross[0].first_block_in_slab, 510);
@@ -316,10 +326,7 @@ mod tests {
             ..base
         }));
         // lcp == 0 => safe (no unsigned underflow) and refused
-        assert!(!is_prefix_reuse_valid(PrefixReuseQuery {
-            lcp: 0,
-            ..base
-        }));
+        assert!(!is_prefix_reuse_valid(PrefixReuseQuery { lcp: 0, ..base }));
         // Unaligned snapshot => refused
         assert!(!is_prefix_reuse_valid(PrefixReuseQuery {
             snap_pos: 2500,

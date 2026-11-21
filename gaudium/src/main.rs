@@ -86,7 +86,10 @@ fn hpu_smoke() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     // Verify AllocGuard actively blocks post-seal allocations
-    if dev.dmalloc(128, HbmCat::CatOther, "illegal_post_seal").is_ok() {
+    if dev
+        .dmalloc(128, HbmCat::CatOther, "illegal_post_seal")
+        .is_ok()
+    {
         return Err("AllocGuard failed to refuse post-seal dmalloc!".into());
     }
 
@@ -95,7 +98,9 @@ fn hpu_smoke() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let host_a: Vec<u16> = (0..n).map(|i| f32_to_bf16_rne(i as f32)).collect();
-    let host_b: Vec<u16> = (0..n).map(|i| f32_to_bf16_rne(10.0 + (i as f32) * 0.5)).collect();
+    let host_b: Vec<u16> = (0..n)
+        .map(|i| f32_to_bf16_rne(10.0 + (i as f32) * 0.5))
+        .collect();
     let bytes_a: Vec<u8> = host_a.iter().flat_map(|x| x.to_le_bytes()).collect();
     let bytes_b: Vec<u8> = host_b.iter().flat_map(|x| x.to_le_bytes()).collect();
 
@@ -111,11 +116,11 @@ fn hpu_smoke() -> Result<(), String> {
 
     let ev0 = dev.create_event(true).map_err(|e| e.to_string())?;
     let ev1 = dev.create_event(true).map_err(|e| e.to_string())?;
-    ev0.record(dev.compute_stream()).map_err(|e| e.to_string())?;
+    ev0.record_compute(&dev).map_err(|e| e.to_string())?;
     recipe
         .launch_checked(&dev, &bindings)
         .map_err(|e| e.to_string())?;
-    ev1.record(dev.compute_stream()).map_err(|e| e.to_string())?;
+    ev1.record_compute(&dev).map_err(|e| e.to_string())?;
     ev1.synchronize().map_err(|e| e.to_string())?;
     let ns = gaudium::synapse::device::DeviceEvent::elapsed_ns(&ev0, &ev1).unwrap_or(0);
 
@@ -126,9 +131,13 @@ fn hpu_smoke() -> Result<(), String> {
     for i in 0..n {
         let got_bits = u16::from_le_bytes([out_bytes[2 * i], out_bytes[2 * i + 1]]);
         let got = bf16_to_f32(got_bits);
-        let expected = bf16_to_f32(f32_to_bf16_rne(bf16_to_f32(host_a[i]) + bf16_to_f32(host_b[i])));
+        let expected = bf16_to_f32(f32_to_bf16_rne(
+            bf16_to_f32(host_a[i]) + bf16_to_f32(host_b[i]),
+        ));
         if got != expected {
-            return Err(format!("mismatch at lane {i}: got {got}, expected {expected}"));
+            return Err(format!(
+                "mismatch at lane {i}: got {got}, expected {expected}"
+            ));
         }
     }
 

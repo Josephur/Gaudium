@@ -11,11 +11,31 @@ use crate::verified::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gemma4Error {
-    InvalidHeads { kind: &'static str, nh: u64, nkv: u64, dh: u64, pairs: u64 },
-    InvalidPle { ple_dim: u64, ple_vocab: u64, vocab: u64 },
-    InvalidKvShare { n_layers: u64, kv_shared: u64 },
-    InvalidAudioCtx { left: u64, right: u64 },
-    InvalidVisionHeads { v_heads: u64, v_head_dim: u64, v_hidden: u64 },
+    InvalidHeads {
+        kind: &'static str,
+        nh: u64,
+        nkv: u64,
+        dh: u64,
+        pairs: u64,
+    },
+    InvalidPle {
+        ple_dim: u64,
+        ple_vocab: u64,
+        vocab: u64,
+    },
+    InvalidKvShare {
+        n_layers: u64,
+        kv_shared: u64,
+    },
+    InvalidAudioCtx {
+        left: u64,
+        right: u64,
+    },
+    InvalidVisionHeads {
+        v_heads: u64,
+        v_head_dim: u64,
+        v_hidden: u64,
+    },
     InvalidHostPinState(PinState),
 }
 
@@ -41,7 +61,11 @@ pub fn rope_table_vecs(pairs: u64) -> u64 {
 
 /// Converts a natural-order per-channel f32 table `{DH}` (`DH % 128 == 0`) into the Gemma 4 TPC view.
 pub fn deinterleave_channel_table(natural: &[f32]) -> Vec<f32> {
-    assert_eq!(natural.len() % 128, 0, "Gemma 4 channel table length must be a multiple of 128");
+    assert_eq!(
+        natural.len() % 128,
+        0,
+        "Gemma 4 channel table length must be a multiple of 128"
+    );
     let mut out = vec![0.0f32; natural.len()];
     let blocks = natural.len() / 128;
     for b in 0..blocks {

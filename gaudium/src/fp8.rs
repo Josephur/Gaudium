@@ -144,7 +144,11 @@ pub fn quantize_rows_bf16(
                     for &b in row {
                         amax = amax.max(bf16_to_f32(b).abs());
                     }
-                    let sc = if amax > 0.0 { pow2_ceil(amax / FP8_MAX) } else { 1.0 };
+                    let sc = if amax > 0.0 {
+                        pow2_ceil(amax / FP8_MAX)
+                    } else {
+                        1.0
+                    };
                     sc_chunk[r] = sc;
                     am_chunk[r] = amax;
                     let inv = 1.0 / sc;
@@ -199,7 +203,7 @@ impl ActScale {
     }
 
     pub fn compute_k(amax: f32, margin: f32) -> i32 {
-        if !(amax > 0.0) {
+        if amax.is_nan() || amax <= 0.0 {
             return 0;
         }
         (FP8_MAX / (amax * margin)).log2().floor() as i32
@@ -211,10 +215,14 @@ pub fn load_act_scales(path: &Path) -> io::Result<BTreeMap<String, ActScale>> {
     let mut map = BTreeMap::new();
     for line in text.lines() {
         let mut it = line.split_whitespace();
-        let (Some(site), Some(k), Some(amax), Some(rms)) = (it.next(), it.next(), it.next(), it.next()) else {
+        let (Some(site), Some(k), Some(amax), Some(rms)) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
             continue;
         };
-        if let (Ok(k), Ok(amax), Ok(rms)) = (k.parse::<i32>(), amax.parse::<f32>(), rms.parse::<f32>()) {
+        if let (Ok(k), Ok(amax), Ok(rms)) =
+            (k.parse::<i32>(), amax.parse::<f32>(), rms.parse::<f32>())
+        {
             map.insert(site.to_owned(), ActScale { k, amax, rms });
         }
     }
@@ -245,7 +253,12 @@ pub fn cache_store_fp8(dir: &Path, name: &str, w8: &[u8], scale: &[f32]) -> io::
     write_atomic(&dir.join(format!("{name}.scale")), &sbytes)
 }
 
-pub fn cache_load_fp8(dir: &Path, name: &str, n: usize, k: usize) -> io::Result<Option<(Vec<u8>, Vec<f32>)>> {
+pub fn cache_load_fp8(
+    dir: &Path,
+    name: &str,
+    n: usize,
+    k: usize,
+) -> io::Result<Option<(Vec<u8>, Vec<f32>)>> {
     let p_w8 = dir.join(format!("{name}.w8"));
     let p_sc = dir.join(format!("{name}.scale"));
     if !p_w8.exists() || !p_sc.exists() {
@@ -257,8 +270,8 @@ pub fn cache_load_fp8(dir: &Path, name: &str, n: usize, k: usize) -> io::Result<
         return Ok(None);
     }
     let mut scale = Vec::with_capacity(n);
-    for c in sc_bytes.chunks_exact(4) {
-        scale.push(f32::from_le_bytes(c.try_into().unwrap()));
+    for c in sc_bytes.as_chunks::<4>().0 {
+        scale.push(f32::from_le_bytes(*c));
     }
     Ok(Some((w8, scale)))
 }
@@ -303,7 +316,11 @@ mod tests {
         assert_eq!(stats.amax_max, 3.5);
         for c in 0..4 {
             let recon = e4m3_to_f32(w8[c]) * scales[0];
-            assert!((recon - vals[c]).abs() <= 0.1, "col {c}: got {recon}, want {}", vals[c]);
+            assert!(
+                (recon - vals[c]).abs() <= 0.1,
+                "col {c}: got {recon}, want {}",
+                vals[c]
+            );
         }
         assert!(w8[4..8].iter().all(|&b| b == 0));
     }

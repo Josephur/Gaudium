@@ -48,7 +48,7 @@ impl Default for SampleParams {
 
 impl SampleParams {
     pub fn is_greedy(&self) -> bool {
-        !(self.temperature > 0.0)
+        self.temperature.is_nan() || self.temperature <= 0.0
     }
 
     pub fn to_dev(&self, vocab: u64) -> DevSampleParams {
@@ -153,8 +153,8 @@ const EC: [f32; 6] = [
     0.008_369_151,
     0.001_394_111_1,
 ];
-const LN2F: f32 = 0.693_147_2;
-const LOG2EF: f32 = 1.442_695;
+const LN2F: f32 = std::f32::consts::LN_2;
+const LOG2EF: f32 = std::f32::consts::LOG2_E;
 const LN2_HI: f32 = 0.693_145_75;
 const LN2_LO: f32 = 1.428_606_8e-6;
 const RND: f32 = 12_582_912.0;
@@ -171,8 +171,8 @@ pub fn mlog(y: f32) -> f32 {
     let t = f32::from_bits(mb as u32) - 1.0f32;
     let mut q = LC[8];
     for &c in LC[..8].iter().rev() {
-        q = q * t;
-        q = q + c;
+        q *= t;
+        q += c;
     }
     let p = q * t;
     let r = (e as f32) * LN2F;
@@ -184,11 +184,11 @@ pub fn mexp(x: f32) -> f32 {
     let y = x * LOG2EF;
     let n = (y + RND) - RND;
     let mut r = x - (n * LN2_HI);
-    r = r - (n * LN2_LO);
+    r -= n * LN2_LO;
     let mut q = EC[5];
     for &c in EC[..5].iter().rev() {
-        q = q * r;
-        q = q + c;
+        q *= r;
+        q += c;
     }
     let p = (q * r) + 1.0f32;
     let ni = n as i32;
@@ -290,7 +290,11 @@ pub fn round_thresholds(lo: i32, hi: i32) -> ([i32; NTH], [f32; NTH]) {
     for j in 0..NTH {
         if n <= NTH as i32 {
             tk[j] = lo + (j as i32);
-            tv[j] = if (j as i32) < n { val_of_key(tk[j]) } else { PINF };
+            tv[j] = if (j as i32) < n {
+                val_of_key(tk[j])
+            } else {
+                PINF
+            };
         } else {
             let k = lo + ((j as i64) * (n as i64) / (NTH as i64)) as i32;
             tk[j] = k;
@@ -346,8 +350,8 @@ fn block_partial(
                 } else {
                     1.0
                 };
-                for j in 0..NTH {
-                    acc[j][k] = acc[j][k] + if l >= tv[j] { w } else { 0.0 };
+                for (acc_row, &t_val) in acc.iter_mut().zip(tv.iter()) {
+                    acc_row[k] += if l >= t_val { w } else { 0.0 };
                 }
             }
         }
@@ -355,9 +359,9 @@ fn block_partial(
     // Handle any non-128-aligned tail in host unit tests gracefully
     let tail_start = b * BLK + nv * 128;
     let tail_end = logits_bf16.len().min((b + 1) * BLK);
-    for v in tail_start..tail_end {
-        let l = bf16_to_f32(logits_bf16[v]);
-        let lane = (v - tail_start) % 64;
+    for (offset, &bits) in logits_bf16[tail_start..tail_end].iter().enumerate() {
+        let l = bf16_to_f32(bits);
+        let lane = offset % 64;
         let w = if phase_b {
             let mut x = (l - m) * inv_t;
             if x < -30.0 {
@@ -367,8 +371,8 @@ fn block_partial(
         } else {
             1.0
         };
-        for j in 0..NTH {
-            acc[j][lane] = acc[j][lane] + if l >= tv[j] { w } else { 0.0 };
+        for (acc_row, &t_val) in acc.iter_mut().zip(tv.iter()) {
+            acc_row[lane] += if l >= t_val { w } else { 0.0 };
         }
     }
     let mut out = [0.0f32; NTH];
@@ -389,9 +393,17 @@ fn search_round(
     let m = prev.max_logit;
     let inv_t = dev.f[0];
     let (lo, hi, done) = if round == 0 {
-        (key_ceil(m - dev.f[1]), key_of(m), !(dev.i[0] > 0) || !trunc_active)
+        (
+            key_ceil(m - dev.f[1]),
+            key_of(m),
+            !(dev.i[0] > 0) || !trunc_active,
+        )
     } else if round == NIT {
-        (prev.lo, key_of(m), (dev.i[3] & F_TOPP) == 0 || !trunc_active)
+        (
+            prev.lo,
+            key_of(m),
+            (dev.i[3] & F_TOPP) == 0 || !trunc_active,
+        )
     } else {
         (prev.lo, prev.hi, prev.done)
     };
@@ -410,10 +422,10 @@ fn search_round(
     let (tk, tv) = round_thresholds(lo, hi);
     let mut tot = [0.0f32; NTH];
     for (b, &bmax) in bm.iter().enumerate() {
-        if !(bmax < tv[0]) {
+        if bmax >= tv[0] || bmax.is_nan() {
             let p16 = block_partial(logits_bf16, b, &tv, phase_b, m, inv_t);
-            for j in 0..NTH {
-                tot[j] = tot[j] + p16[j];
+            for (t_slot, &p_val) in tot.iter_mut().zip(p16.iter()) {
+                *t_slot += p_val;
             }
         }
     }
@@ -423,12 +435,12 @@ fn search_round(
         s.target
     };
     let mut cnt = 0i32;
-    for j in 0..NTH {
+    for &t_val in &tot {
         if phase_b {
-            if tot[j] >= target {
+            if t_val >= target {
                 cnt += 1;
             }
-        } else if tot[j] >= (dev.i[0] as f32) {
+        } else if t_val >= (dev.i[0] as f32) {
             cnt += 1;
         }
     }
@@ -471,9 +483,10 @@ pub fn sample_row(
     let nb = logits_bf16.len().div_ceil(BLK);
     let mut bm = vec![NEG; nb];
     let mut m = NEG;
-    for b in 0..nb {
-        bm[b] = block_max(logits_bf16, b);
-        m = m.max(bm[b]);
+    for (b, slot) in bm.iter_mut().enumerate() {
+        let mx = block_max(logits_bf16, b);
+        *slot = mx;
+        m = m.max(mx);
     }
     let mut st = SearchState {
         max_logit: m,
@@ -514,9 +527,10 @@ pub fn sample_row(
         }
         let start = b * BLK;
         let end = logits_bf16.len().min(start + BLK);
-        for v in start..end {
-            let l = bf16_to_f32(logits_bf16[v]);
-            if !(l >= thr) {
+        for (offset, &bits) in logits_bf16[start..end].iter().enumerate() {
+            let v = start + offset;
+            let l = bf16_to_f32(bits);
+            if l.is_nan() || l < thr {
                 continue;
             }
             let x = (l - m) * inv_t;
@@ -554,7 +568,10 @@ mod tests {
     #[test]
     fn bf16_order_keys_strictly_monotone() {
         let vals = [-100.0f32, -1.0, -0.001, 0.0, 0.001, 1.0, 100.0];
-        let keys: Vec<i32> = vals.iter().map(|&v| key_of(bf16_to_f32(f32_to_bf16_rne(v)))).collect();
+        let keys: Vec<i32> = vals
+            .iter()
+            .map(|&v| key_of(bf16_to_f32(f32_to_bf16_rne(v))))
+            .collect();
         for w in keys.windows(2) {
             assert!(w[0] < w[1], "order violated: {} >= {}", w[0], w[1]);
         }
@@ -597,7 +614,11 @@ mod tests {
         let r1 = sample_row(&logits, &dev, 0, 7, true);
         let r2 = sample_row(&logits, &dev, 0, 7, true);
         assert_eq!(r1.token, r2.token);
-        assert!(r1.token == 10 || r1.token == 20, "top_k=2 violated: got {}", r1.token);
+        assert!(
+            r1.token == 10 || r1.token == 20,
+            "top_k=2 violated: got {}",
+            r1.token
+        );
 
         // Verify polynomial accuracy for mlog / mexp
         assert!((mlog(0.5) - 0.5f32.ln()).abs() < 1e-5);

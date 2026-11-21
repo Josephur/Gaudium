@@ -62,7 +62,7 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
      DevClosed{}
    ```
 3. **No `if/else` in Bend 2** — match on `Bool`'s `True{}` / `False{}` constructors, or use `Bool.pick(T, cond, then_val, else_val)`.
-4. **Match scrutinees & def headers:** Bend 2 only matches on parameters or bound variables (never computed expressions like `match f(x):`); bind or pass intermediate values to a helper `def`. Keep `def` headers on a single line (until multi-line headers are supported upstream in `emit.rs`). Both nested `match`, multi-scrutinee `match a b:`, and `case 1n+p:` successor patterns are supported.
+4. **Match scrutinees & def headers:** Bend 2 only matches on parameters or bound variables (never computed expressions like `match f(x):`); bind or pass intermediate values to a helper `def`. Both single-line and multi-line `def` headers, nested `match`, multi-scrutinee `match a b:`, and `case 1n+p:` successor patterns are supported.
 5. **Exact integer arithmetic semantics (`Nat` vs fixed-width ints):**
    - Use **`Nat`** (emits saturating `u64` + total division) for all conservation, budget, alignment, and bounds math so Peano `Nat` proofs (`Nat.sub(0n, x) == 0n`, `Nat.div(a, 0n) == 0n`, `Nat.mod(a, 0n) == a`) match emitted Rust **exactly**.
    - Note: `Nat.is_zero` is not in Bend 2.0.40 `Base`; use `Nat.is_eq(x, 0n)`.
@@ -79,10 +79,10 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 
 ## 5. Build, Proof Gate & Anti-Cheat Law Lock Rules
 
-- **Toolchain PATH:** Ensure Bend 2 (`~/.bend/bin`) and Lean (`~/.elan/bin`) are on `PATH` (or set `BEND_BIN`):
+- **Toolchain PATH:** `rusty-bends-build` automatically discovers `~/.bend/bin/bend` and `~/.elan/bin` (override with `BEND_BIN` if installed elsewhere); `gaudium/bend.pin` pins the Bend 2 release:
   ```bash
-  PATH="$HOME/.bend/bin:$HOME/.elan/bin:$PATH" cargo check
-  PATH="$HOME/.bend/bin:$HOME/.elan/bin:$PATH" cargo test
+  cargo check
+  cargo test
   ```
 - **`BEND_VERDICT` modes:**
   - `auto` (default): always enforces `bend <file> --check-only`, plus Lean `bend <file> --verdict` whenever compatible Lean is installed.

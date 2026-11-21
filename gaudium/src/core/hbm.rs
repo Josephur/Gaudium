@@ -5,8 +5,8 @@
 
 use crate::verified::{
     hbm_check_fit, hbm_fit_ok, hbm_fit_reconstruct_lhs, hbm_fit_reconstruct_rhs,
-    hbm_grant_prefix_slots, hbm_ledger_add, hbm_ledger_empty, hbm_ledger_matches,
-    hbm_ledger_total, hbm_usable, HbmCat, HbmFit, HbmLedger,
+    hbm_grant_prefix_slots, hbm_ledger_add, hbm_ledger_empty, hbm_ledger_matches, hbm_ledger_total,
+    hbm_usable, HbmCat, HbmFit, HbmLedger,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +79,14 @@ impl HbmLedgerGuard {
         (w, kv, ck, sc, ot)
     }
 
-    pub fn matches(&self, weights: u64, kv: u64, checkpoints: u64, scratch: u64, other: u64) -> bool {
+    pub fn matches(
+        &self,
+        weights: u64,
+        kv: u64,
+        checkpoints: u64,
+        scratch: u64,
+        other: u64,
+    ) -> bool {
         hbm_ledger_matches(self.ledger, weights, kv, checkpoints, scratch, other)
     }
 }
@@ -108,12 +115,12 @@ mod tests {
     fn hl225_96gb_usable_and_fit_partition() {
         let total = 96 * GIB;
         let driver = 4 * GIB;
-        let spare = 1 * GIB;
+        let spare = GIB;
         let usable = usable_hbm_bytes(total, driver, spare);
         assert_eq!(usable, 91 * GIB);
 
         // Underflow protection when driver + spare > total
-        assert_eq!(usable_hbm_bytes(10 * GIB, 12 * GIB, 1 * GIB), 0);
+        assert_eq!(usable_hbm_bytes(10 * GIB, 12 * GIB, GIB), 0);
 
         // Exact fit with margin
         let planned_ok = 82 * GIB;

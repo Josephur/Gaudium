@@ -23,7 +23,11 @@ pub struct JsonError {
 
 impl fmt::Display for JsonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "json parse error at byte {}: {}", self.offset, self.message)
+        write!(
+            f,
+            "json parse error at byte {}: {}",
+            self.offset, self.message
+        )
     }
 }
 
@@ -351,7 +355,14 @@ mod tests {
         assert_eq!(v.get("b").and_then(JsonValue::as_f64), Some(-350.0));
         assert_eq!(v.get("s").and_then(JsonValue::as_str), Some("hi\n🚀"));
         let arr = v.get("c").and_then(JsonValue::as_array).unwrap();
-        assert_eq!(arr, &[JsonValue::Bool(true), JsonValue::Bool(false), JsonValue::Null]);
+        assert_eq!(
+            arr,
+            &[
+                JsonValue::Bool(true),
+                JsonValue::Bool(false),
+                JsonValue::Null
+            ]
+        );
     }
 
     #[test]

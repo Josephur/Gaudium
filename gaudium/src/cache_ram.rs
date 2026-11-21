@@ -27,13 +27,13 @@ fn splitmix64(mut x: u64) -> u64 {
 /// Byte hash matching `pfx::hash_bytes`.
 pub fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
     let mut h = seed;
-    let mut chunks = bytes.chunks_exact(8);
-    for c in &mut chunks {
-        let w = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for c in chunks {
+        let w = u64::from_le_bytes(*c);
         h = splitmix64(h ^ w).wrapping_add(0x632B_E59B_D9B4_E019);
     }
     let mut tail = 0u64;
-    for (k, &b) in chunks.remainder().iter().enumerate() {
+    for (k, &b) in rem.iter().enumerate() {
         tail |= (b as u64) << (8 * k);
     }
     splitmix64(h ^ tail ^ (bytes.len() as u64))
@@ -166,7 +166,7 @@ impl PrefixCache {
                 return;
             }
             let s = (h / self.tile) * self.tile;
-            if s >= self.tile && s > p.reuse && s <= prompt_len - 1 {
+            if s >= self.tile && s > p.reuse && s < prompt_len {
                 cands.push(s);
             }
         };
@@ -188,7 +188,7 @@ impl PrefixCache {
         for c in cands {
             all.push((c, None));
         }
-        all.sort_by(|a, b| b.0.cmp(&a.0));
+        all.sort_by_key(|a| std::cmp::Reverse(a.0));
         all.truncate(self.nslots);
 
         let mut used = vec![false; self.nslots];
@@ -221,7 +221,13 @@ impl PrefixCache {
         p
     }
 
-    pub fn commit(&mut self, plan: &PrefixPlan, new_keys: Vec<u64>, fills_mtp: bool, fills_df: bool) {
+    pub fn commit(
+        &mut self,
+        plan: &PrefixPlan,
+        new_keys: Vec<u64>,
+        fills_mtp: bool,
+        fills_df: bool,
+    ) {
         let prompt_len = new_keys.len();
         self.mtp_upto = if fills_mtp {
             prompt_len
@@ -478,9 +484,7 @@ impl RamPool {
                 continue;
             }
             let all_snaps = pc.snaps.iter().all(|s| y.has_snap_seg(s.pos));
-            if all_snaps
-                && y.pc.mtp_upto >= pc.mtp_upto.min(e)
-                && y.pc.df_upto >= pc.df_upto.min(e)
+            if all_snaps && y.pc.mtp_upto >= pc.mtp_upto.min(e) && y.pc.df_upto >= pc.df_upto.min(e)
             {
                 return Some(y.id);
             }
@@ -550,7 +554,13 @@ mod tests {
         (0..n).map(|i| conv * 1_000_003 + (i as u64)).collect()
     }
 
-    fn put_entry(pool: &mut RamPool, keys: Vec<u64>, positions: &[usize], row_bytes: u64, snap_bytes: u64) -> Option<u64> {
+    fn put_entry(
+        pool: &mut RamPool,
+        keys: Vec<u64>,
+        positions: &[usize],
+        row_bytes: u64,
+        snap_bytes: u64,
+    ) -> Option<u64> {
         let id = pool.create();
         let e = *positions.last().unwrap();
         let band_bytes = row_bytes * (e as u64);
@@ -590,7 +600,10 @@ mod tests {
     #[test]
     fn mirrors_all_seven_scenarios_of_cache_ram_test_cpp() {
         let mut p = RamPool::new(64 * MB).unwrap();
-        assert_eq!((p.nblocks(), p.free_blocks(), p.budget_bytes()), (32, 32, 64 * MB));
+        assert_eq!(
+            (p.nblocks(), p.free_blocks(), p.budget_bytes()),
+            (32, 32, 64 * MB)
+        );
 
         // 1. Accounting in whole 2 MB blocks, snapshots included
         let ka = synth_keys(1, 3000);
@@ -603,8 +616,14 @@ mod tests {
 
         // 2. Planner rule: [0, s] equal, s <= P - 1, drafter bounds, context cap
         assert_eq!(p.best(&ka, true, false, &[], 1 << 20), Some((a, 2560)));
-        assert_eq!(p.best(&ka[..2561], true, false, &[], 1 << 20), Some((a, 2560)));
-        assert_eq!(p.best(&ka[..2560], true, false, &[], 1 << 20), Some((a, 1024)));
+        assert_eq!(
+            p.best(&ka[..2561], true, false, &[], 1 << 20),
+            Some((a, 2560))
+        );
+        assert_eq!(
+            p.best(&ka[..2560], true, false, &[], 1 << 20),
+            Some((a, 1024))
+        );
         let mut ka3 = ka.clone();
         ka3[2000] ^= 1;
         assert_eq!(p.best(&ka3, true, false, &[], 1 << 20), Some((a, 1024)));
@@ -641,7 +660,10 @@ mod tests {
         assert!(!p.make_room(30, Some(c), |id| gone.push(id))); // keep entry never evicted
         assert!(gone.is_empty());
         assert!(p.make_room(32, None, |id| gone.push(id)));
-        assert_eq!((gone, p.free_blocks(), p.entry_count(), p.totals.evictions), (vec![c], 32, 0, 3));
+        assert_eq!(
+            (gone, p.free_blocks(), p.entry_count(), p.totals.evictions),
+            (vec![c], 32, 0, 3)
+        );
 
         // 4. Prefix-of-longer-entry & covering
         let kd1 = synth_keys(4, 2100);
@@ -678,6 +700,13 @@ mod tests {
         let cross = big.extents(&[510, 511, 512, 513], 4 * BLOCK_BYTES);
         assert_eq!(cross.len(), 2);
         assert_eq!((cross[0].slab_idx, cross[0].byte_len), (0, 2 * BLOCK_BYTES));
-        assert_eq!((cross[1].slab_idx, cross[1].byte_offset_in_slab, cross[1].byte_len), (1, 0, 2 * BLOCK_BYTES));
+        assert_eq!(
+            (
+                cross[1].slab_idx,
+                cross[1].byte_offset_in_slab,
+                cross[1].byte_len
+            ),
+            (1, 0, 2 * BLOCK_BYTES)
+        );
     }
 }

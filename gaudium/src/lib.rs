@@ -5,7 +5,7 @@
 //! emitted as zero-overhead pure Rust into `OUT_DIR/verified.rs`.
 
 pub mod verified {
-    #![allow(dead_code, unused_parens, clippy::all)]
+    #![allow(dead_code, clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/verified.rs"));
 }
 

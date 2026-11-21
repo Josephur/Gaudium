@@ -304,7 +304,12 @@ impl RequestGuard {
 }
 
 /// Checked admission gate for multi-lane decode + exclusive vision requests (`LaneGate`).
-pub fn can_admit_lane(busy: u64, max_lanes: u64, exclusive_active: bool, want_exclusive: bool) -> bool {
+pub fn can_admit_lane(
+    busy: u64,
+    max_lanes: u64,
+    exclusive_active: bool,
+    want_exclusive: bool,
+) -> bool {
     lane_can_admit(busy, max_lanes, exclusive_active, want_exclusive)
 }
 
@@ -353,7 +358,10 @@ mod tests {
         dev.transition(DevEvent::EvDevClose).unwrap();
         assert_eq!(dev.state(), DevState::DevClosed);
         // Closed absorbs further events
-        assert_eq!(dev.transition(DevEvent::EvSynInit).unwrap(), DevState::DevClosed);
+        assert_eq!(
+            dev.transition(DevEvent::EvSynInit).unwrap(),
+            DevState::DevClosed
+        );
     }
 
     #[test]
@@ -367,7 +375,9 @@ mod tests {
 
         let mut rec_ok = RecipeGuard::new();
         rec_ok.compile();
-        rec_ok.bind_workspace(500_000_000, 640_000_000, true).unwrap();
+        rec_ok
+            .bind_workspace(500_000_000, 640_000_000, true)
+            .unwrap();
         assert!(rec_ok.check_launch().is_ok());
         rec_ok.destroy();
         assert!(rec_ok.check_launch().is_err());

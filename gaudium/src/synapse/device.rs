@@ -110,7 +110,9 @@ impl HpuDevice {
         let mut last_st = 0;
         for attempt in 0..retries {
             // SAFETY: Valid output pointer and `SynDeviceType::Gaudi2`.
-            last_st = unsafe { (api.syn_device_acquire_by_type)(&mut dev_id, SynDeviceType::Gaudi2 as u32) };
+            last_st = unsafe {
+                (api.syn_device_acquire_by_type)(&mut dev_id, SynDeviceType::Gaudi2 as u32)
+            };
             if last_st == SYN_SUCCESS {
                 break;
             }
@@ -135,7 +137,9 @@ impl HpuDevice {
         let create_stream = |label: &'static str| -> Result<SynStreamHandle, SynapseError> {
             let mut h: SynStreamHandle = std::ptr::null_mut();
             // SAFETY: Device is acquired; valid output pointer.
-            syn_check(label, unsafe { (api.syn_stream_create_generic)(&mut h, dev_id, 0) })?;
+            syn_check(label, unsafe {
+                (api.syn_stream_create_generic)(&mut h, dev_id, 0)
+            })?;
             Ok(h)
         };
 
@@ -210,7 +214,11 @@ impl HpuDevice {
     }
 
     /// Verifies a planned byte total against actual card HBM using verified `core::hbm`.
-    pub fn check_plan_fits(&self, planned_bytes: u64, spare_bytes: u64) -> Result<u64, SynapseError> {
+    pub fn check_plan_fits(
+        &self,
+        planned_bytes: u64,
+        spare_bytes: u64,
+    ) -> Result<u64, SynapseError> {
         let (free, total) = self.memory_info()?;
         let driver_used = total.saturating_sub(free);
         let usable = usable_hbm_bytes(total, driver_used, spare_bytes);
@@ -273,8 +281,11 @@ impl HpuDevice {
     }
 
     /// Synchronizes a single stream.
-    pub fn sync_stream(&self, stream: SynStreamHandle) -> Result<(), SynapseError> {
-        // SAFETY: Valid stream owned by this device.
+    ///
+    /// # Safety
+    /// `stream` must be a live stream handle belonging to this `HpuDevice`.
+    pub unsafe fn sync_stream(&self, stream: SynStreamHandle) -> Result<(), SynapseError> {
+        // SAFETY: Caller supplies a valid stream owned by this device.
         syn_check("synStreamSynchronize", unsafe {
             (self.api.syn_stream_synchronize)(stream)
         })
@@ -284,7 +295,8 @@ impl HpuDevice {
     pub fn sync_all(&self) -> Result<(), SynapseError> {
         for s in [self.compute, self.compute2, self.h2d, self.d2h] {
             if !s.is_null() {
-                self.sync_stream(s)?;
+                // SAFETY: Streams are owned by `self` and alive until `Drop`.
+                unsafe { self.sync_stream(s)? };
             }
         }
         Ok(())
@@ -292,7 +304,15 @@ impl HpuDevice {
 
     /// Maps host memory extents atomically for DMA using verified `HostPinGuard` (rolls back ALL
     /// already-mapped extents if any single `synHostMap` fails!).
-    pub fn host_map_extents(&self, base: *const u8, extents: &[u64]) -> Result<Vec<(*const u8, u64)>, SynapseError> {
+    ///
+    /// # Safety
+    /// `[base, base + sum(extents))` must point to valid, allocated host memory that remains
+    /// live until unmapped via [`Self::host_unmap_extents`].
+    pub unsafe fn host_map_extents(
+        &self,
+        base: *const u8,
+        extents: &[u64],
+    ) -> Result<Vec<(*const u8, u64)>, SynapseError> {
         let mut pin = HostPinGuard::new();
         let mut mapped: Vec<(*const u8, u64)> = Vec::with_capacity(extents.len());
         let mut offset = 0usize;
@@ -358,7 +378,7 @@ impl HpuDevice {
                 SynDmaDir::HostToDram as u32,
             )
         })
-        .and_then(|()| self.sync_stream(self.h2d));
+        .and_then(|()| unsafe { self.sync_stream(self.h2d) });
         // SAFETY: Always free staging buffer after sync (or failed enqueue).
         unsafe {
             (self.api.syn_host_free)(self.dev_id, stage, 0);
@@ -387,7 +407,7 @@ impl HpuDevice {
                 SynDmaDir::DramToHost as u32,
             )
         })
-        .and_then(|()| self.sync_stream(self.d2h));
+        .and_then(|()| unsafe { self.sync_stream(self.d2h) });
         if copy_res.is_ok() {
             // SAFETY: Sync completed; `stage` holds `dst.len()` valid bytes.
             unsafe {
@@ -456,7 +476,19 @@ pub struct DeviceEvent {
 }
 
 impl DeviceEvent {
-    pub fn record(&self, stream: SynStreamHandle) -> Result<(), SynapseError> {
+    /// Records this event onto `dev`'s primary compute stream.
+    pub fn record_compute(&self, dev: &HpuDevice) -> Result<(), SynapseError> {
+        // SAFETY: `dev.compute_stream()` is a valid live stream owned by `dev`.
+        syn_check("synEventRecord", unsafe {
+            (self.api.syn_event_record)(self.handle, dev.compute_stream())
+        })
+    }
+
+    /// Records this event onto an explicit raw stream handle.
+    ///
+    /// # Safety
+    /// `stream` must be a valid live `SynStreamHandle` on the same device.
+    pub unsafe fn record(&self, stream: SynStreamHandle) -> Result<(), SynapseError> {
         syn_check("synEventRecord", unsafe {
             (self.api.syn_event_record)(self.handle, stream)
         })

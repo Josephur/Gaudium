@@ -12,13 +12,41 @@ use crate::verified::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShapeError {
     InvalidBucket(u64),
-    InvalidGqa { n_heads: u64, n_kv_heads: u64, head_dim: u64 },
-    InvalidGdn { k_heads: u64, v_heads: u64, conv_k: u64 },
-    InvalidHidden { hidden: u64, vocab: u64 },
-    InvalidMoe { n_experts: u64, top_k: u64, expert_ff: u64 },
-    InvalidVitGrid { t: u64, h: u64, w: u64, max_patches: u64 },
-    InvalidTreeShape { n_nodes: u64, spine: u64 },
-    InvalidTreeNode { idx: u64, parent: u64, depth: u64, rank: u64 },
+    InvalidGqa {
+        n_heads: u64,
+        n_kv_heads: u64,
+        head_dim: u64,
+    },
+    InvalidGdn {
+        k_heads: u64,
+        v_heads: u64,
+        conv_k: u64,
+    },
+    InvalidHidden {
+        hidden: u64,
+        vocab: u64,
+    },
+    InvalidMoe {
+        n_experts: u64,
+        top_k: u64,
+        expert_ff: u64,
+    },
+    InvalidVitGrid {
+        t: u64,
+        h: u64,
+        w: u64,
+        max_patches: u64,
+    },
+    InvalidTreeShape {
+        n_nodes: u64,
+        spine: u64,
+    },
+    InvalidTreeNode {
+        idx: u64,
+        parent: u64,
+        depth: u64,
+        rank: u64,
+    },
 }
 
 /// Safe upward alignment (div-by-zero safe: `align == 0` returns `x`).
@@ -224,7 +252,10 @@ mod tests {
         let mut seen_l128 = [false; 128];
         for c in 0..128u64 {
             let p = permute_lane128(c) as usize;
-            assert!(p < 128 && !seen_l128[p], "lane128 collision at c={c} -> {p}");
+            assert!(
+                p < 128 && !seen_l128[p],
+                "lane128 collision at c={c} -> {p}"
+            );
             seen_l128[p] = true;
         }
         assert_eq!(permute_lane128(0), 0);
@@ -235,14 +266,20 @@ mod tests {
         let mut seen_l256 = [false; 256];
         for c in 0..256u64 {
             let p = permute_lane256(c) as usize;
-            assert!(p < 256 && !seen_l256[p], "lane256 collision at c={c} -> {p}");
+            assert!(
+                p < 256 && !seen_l256[p],
+                "lane256 collision at c={c} -> {p}"
+            );
             seen_l256[p] = true;
         }
 
         let mut seen_v128 = [false; 128];
         for q in 0..128u64 {
             let p = permute_kv8_vpos128(q) as usize;
-            assert!(p < 128 && !seen_v128[p], "kv8_vpos128 collision at q={q} -> {p}");
+            assert!(
+                p < 128 && !seen_v128[p],
+                "kv8_vpos128 collision at q={q} -> {p}"
+            );
             seen_v128[p] = true;
         }
         assert_eq!(permute_kv8_vpos(128), 128);
@@ -287,33 +324,89 @@ mod tests {
     fn draft_tree_validation_mirrors_tree_manager_test() {
         // Shape "4:1-4@2": 5 spine nodes (0..=4) + 4 leaves (5..=8)
         let mut t = vec![
-            TreeNodeSpec { parent: 0, depth: 0, rank: 0 },
-            TreeNodeSpec { parent: 0, depth: 1, rank: 0 },
-            TreeNodeSpec { parent: 1, depth: 2, rank: 0 },
-            TreeNodeSpec { parent: 2, depth: 3, rank: 0 },
-            TreeNodeSpec { parent: 3, depth: 4, rank: 0 },
-            TreeNodeSpec { parent: 0, depth: 1, rank: 1 },
-            TreeNodeSpec { parent: 1, depth: 2, rank: 1 },
-            TreeNodeSpec { parent: 2, depth: 3, rank: 1 },
-            TreeNodeSpec { parent: 3, depth: 4, rank: 1 },
+            TreeNodeSpec {
+                parent: 0,
+                depth: 0,
+                rank: 0,
+            },
+            TreeNodeSpec {
+                parent: 0,
+                depth: 1,
+                rank: 0,
+            },
+            TreeNodeSpec {
+                parent: 1,
+                depth: 2,
+                rank: 0,
+            },
+            TreeNodeSpec {
+                parent: 2,
+                depth: 3,
+                rank: 0,
+            },
+            TreeNodeSpec {
+                parent: 3,
+                depth: 4,
+                rank: 0,
+            },
+            TreeNodeSpec {
+                parent: 0,
+                depth: 1,
+                rank: 1,
+            },
+            TreeNodeSpec {
+                parent: 1,
+                depth: 2,
+                rank: 1,
+            },
+            TreeNodeSpec {
+                parent: 2,
+                depth: 3,
+                rank: 1,
+            },
+            TreeNodeSpec {
+                parent: 3,
+                depth: 4,
+                rank: 1,
+            },
         ];
         validate_draft_tree(&t, 4, 32, 8, 4).unwrap();
 
         // Child of a leaf (parent == 5 >= spine 4) is rejected
-        t.push(TreeNodeSpec { parent: 5, depth: 2, rank: 0 });
+        t.push(TreeNodeSpec {
+            parent: 5,
+            depth: 2,
+            rank: 0,
+        });
         assert!(validate_draft_tree(&t, 4, 32, 8, 4).is_err());
 
         // Self-parent is rejected
         let cyclic = vec![
-            TreeNodeSpec { parent: 0, depth: 0, rank: 0 },
-            TreeNodeSpec { parent: 1, depth: 1, rank: 0 },
+            TreeNodeSpec {
+                parent: 0,
+                depth: 0,
+                rank: 0,
+            },
+            TreeNodeSpec {
+                parent: 1,
+                depth: 1,
+                rank: 0,
+            },
         ];
         assert!(validate_draft_tree(&cyclic, 1, 32, 8, 4).is_err());
 
         // Exceeding adapter max_nodes (32 for u32 ancestor bitmask) is rejected
-        let mut oversized = vec![TreeNodeSpec { parent: 0, depth: 0, rank: 0 }];
+        let mut oversized = vec![TreeNodeSpec {
+            parent: 0,
+            depth: 0,
+            rank: 0,
+        }];
         for i in 1..33u64 {
-            oversized.push(TreeNodeSpec { parent: i - 1, depth: i, rank: 0 });
+            oversized.push(TreeNodeSpec {
+                parent: i - 1,
+                depth: i,
+                rank: 0,
+            });
         }
         assert!(validate_draft_tree(&oversized, 32, 32, 32, 4).is_err());
     }

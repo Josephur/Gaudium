@@ -98,10 +98,10 @@ impl TreeShape {
     /// 32-bit ancestor bitmask table: bit `j` of `anc[t]` is 1 iff `j` is `t` or an ancestor of `t`.
     pub fn anc_tab(&self) -> Vec<u32> {
         let mut v = vec![0u32; self.nodes.len()];
-        for t in 0..self.nodes.len() {
+        for (t, mask) in v.iter_mut().enumerate() {
             let mut u = t as i32;
             while u >= 0 {
-                v[t] |= 1u32 << (u as u32);
+                *mask |= 1u32 << (u as u32);
                 u = self.nodes[u as usize].parent;
             }
         }
@@ -297,8 +297,12 @@ pub fn walk_tree(shape: &TreeShape, draft_ids: &[i32], target_tokens: &[i32]) ->
     let mut u = 0usize;
     loop {
         let mut found = None;
-        for t in (u + 1)..shape.n_nodes() {
-            if shape.nodes[t].parent == u as i32 && draft_ids[t] == target_tokens[u] {
+        for (t, (&node, &did)) in std::iter::zip(&shape.nodes, draft_ids)
+            .enumerate()
+            .take(shape.n_nodes())
+            .skip(u + 1)
+        {
+            if node.parent == u as i32 && did == target_tokens[u] {
                 found = Some(t);
                 break;
             }
@@ -334,14 +338,7 @@ impl TreeStats {
         Self::with_priors(dmax, kt, 0.75, 0.65, 0.35, 0.1)
     }
 
-    pub fn with_priors(
-        dmax: usize,
-        kt: usize,
-        c1: f64,
-        tail: f64,
-        q2: f64,
-        alpha: f64,
-    ) -> Self {
+    pub fn with_priors(dmax: usize, kt: usize, c1: f64, tail: f64, q2: f64, alpha: f64) -> Self {
         let mut c = vec![tail; dmax + 2];
         c[1] = c1;
         let mut q = vec![vec![0.0; kt]; dmax + 2];
@@ -368,7 +365,11 @@ impl TreeStats {
         self.steps += 1;
         let d = shape.spine();
         let is_leaf = last_node > d;
-        let ds = if is_leaf { depth.saturating_sub(1) } else { depth };
+        let ds = if is_leaf {
+            depth.saturating_sub(1)
+        } else {
+            depth
+        };
         for j in 1..=d.min(ds + 1) {
             let o = if j <= ds { 1.0 } else { 0.0 };
             self.c[j] += self.alpha * (o - self.c[j]);
@@ -554,13 +555,29 @@ mod tests {
         assert_eq!(walk_tree(&t, &ids, &tok), vec![0, 5]);
 
         // Adapter-style rejections (child of leaf, rank >= topk, depth > spine)
-        assert!(parse_tree_spec("3:4@2").unwrap().validate_caterpillar(16, 16, 4).is_err());
+        assert!(parse_tree_spec("3:4@2")
+            .unwrap()
+            .validate_caterpillar(16, 16, 4)
+            .is_err());
         let mut g = make_shape(3, &[(1, 1)], "branch");
-        g.nodes.push(Node { parent: 4, depth: 2, rank: 0 });
+        g.nodes.push(Node {
+            parent: 4,
+            depth: 2,
+            rank: 0,
+        });
         assert!(g.validate_caterpillar(16, 16, 4).is_err());
-        assert!(parse_tree_spec("3:1@5").unwrap().validate_caterpillar(16, 16, 4).is_err());
-        assert!(parse_tree_spec("d9@4").unwrap().validate_caterpillar(16, 16, 4).is_ok());
-        assert!(parse_tree_spec("d20@4").unwrap().validate_caterpillar(16, 16, 4).is_err());
+        assert!(parse_tree_spec("3:1@5")
+            .unwrap()
+            .validate_caterpillar(16, 16, 4)
+            .is_err());
+        assert!(parse_tree_spec("d9@4")
+            .unwrap()
+            .validate_caterpillar(16, 16, 4)
+            .is_ok());
+        assert!(parse_tree_spec("d20@4")
+            .unwrap()
+            .validate_caterpillar(16, 16, 4)
+            .is_err());
 
         // Online policy
         let mut st = TreeStats::new(5, 4);
@@ -573,8 +590,14 @@ mod tests {
         let c3 = parse_tree_spec("3").unwrap();
         let e1 = st.expected_tokens(&s3);
         let ec = st.expected_tokens(&c3);
-        assert!(e1 > ec + 0.5, "leaf value {e1:.2} vs chain {ec:.2} (start {e0:.2})");
+        assert!(
+            e1 > ec + 0.5,
+            "leaf value {e1:.2} vs chain {ec:.2} (start {e0:.2})"
+        );
         let cost = TreeCost::default();
-        assert_eq!(choose_shape(&st, &[c3, s3], &cost, Some(3), &["3/3", "3:1@2/3"]), Some(1));
+        assert_eq!(
+            choose_shape(&st, &[c3, s3], &cost, Some(3), &["3/3", "3:1@2/3"]),
+            Some(1)
+        );
     }
 }
