@@ -1,0 +1,90 @@
+# ============================================================================
+# Gaudium — Public-Ready .gitignore
+# Keep secrets, site-local topology, build outputs, recipes, and weights out
+# of version control from commit #1.
+# ============================================================================
+
+# --- Secrets, environment & site-local configs ---
+.env
+.env.*
+config.env
+*.pem
+*.key
+*.p12
+*.pfx
+AGENTS.local.md
+
+# --- Local agent / IDE / MCP configurations (never commit tokens or plugins) ---
+.agents/
+.mcp.json
+.zcode/
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# --- Legacy read-only references & bootstrap templates (local only) ---
+oldsrc/
+example-app/
+setup-rusty-bends.sh
+
+# --- Rust / Cargo / Bend / Lean build artifacts ---
+target/
+**/*.rs.bk
+*.rlib
+*.rmeta
+.bend-cache/
+.lake/
+
+# --- Gaudi 2 / SynapseAI / TPC-C native build outputs & recipe caches ---
+build/
+*.o
+*.a
+*.so
+*.so.*
+*.d
+*.elf
+*.recipe
+*.habana_recipe
+
+# --- Live runtime state, locks, logs & benchmark scratch ---
+.cardlock/
+.logs/
+.serve/
+.serve-fn/
+.benchportal/
+.deep/
+.wt/
+habana_logs/
+synapse_log*
+*.log
+*.pid
+*.start
+nohup.out
+
+# --- Model weights, fixtures, dumps & archives ---
+models/
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+*.npy
+*.npz
+*.f32
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.zst
+
+# --- Python / OS / editor noise ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

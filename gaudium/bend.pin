@@ -1,0 +1,4 @@
+# Optional Bend 2 compiler version pin.
+# Left commented until rusty-bends-build supports Bend 2.0.40's 'bend version' subcommand
+# (currently invokes 'bend --version'). Tested with Bend 2.0.40 + Lean 4.36.0.
+# 2.0.40

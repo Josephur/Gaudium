@@ -1,0 +1,340 @@
+//! Rust Shell wrappers for tensor alignment, channel permutation, kernel-baked dimension
+//! validation, ViT patch grids, draft-tree bounds, and lane state-block relocation.
+//!
+//! All predicates and bounds math delegate directly to `verified/tensor_bounds.bend`.
+
+use crate::verified::{
+    addr_in_block, align128, align_up, bucket_chunks, bucket_valid, gdn_dims_valid, gqa_dims_valid,
+    hidden_dims_valid, kv8_vpos, kv8_vpos128, lane128, lane256, moe_dims_valid, qsa_blocks,
+    relocate_addr, tree_node_valid, tree_shape_bounds_valid, vit_grid_valid, vit_merged_tokens,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShapeError {
+    InvalidBucket(u64),
+    InvalidGqa { n_heads: u64, n_kv_heads: u64, head_dim: u64 },
+    InvalidGdn { k_heads: u64, v_heads: u64, conv_k: u64 },
+    InvalidHidden { hidden: u64, vocab: u64 },
+    InvalidMoe { n_experts: u64, top_k: u64, expert_ff: u64 },
+    InvalidVitGrid { t: u64, h: u64, w: u64, max_patches: u64 },
+    InvalidTreeShape { n_nodes: u64, spine: u64 },
+    InvalidTreeNode { idx: u64, parent: u64, depth: u64, rank: u64 },
+}
+
+/// Safe upward alignment (div-by-zero safe: `align == 0` returns `x`).
+pub fn align_up_safe(x: u64, align: u64) -> u64 {
+    align_up(x, align)
+}
+
+/// 128-element / 128-byte upward alignment.
+pub fn align_128(x: u64) -> u64 {
+    align128(x)
+}
+
+/// Validates a 4096-token attention chunk bucket (`lb > 0 && lb % 4096 == 0`).
+pub fn validate_bucket(lb: u64) -> Result<(u64, u64), ShapeError> {
+    if bucket_valid(lb) {
+        Ok((bucket_chunks(lb), qsa_blocks(lb)))
+    } else {
+        Err(ShapeError::InvalidBucket(lb))
+    }
+}
+
+/// Deinterleaved 128-lane channel permutation (`model_qwen35.hpp`).
+pub fn permute_lane128(c: u64) -> u64 {
+    lane128(c)
+}
+
+/// Deinterleaved 256-channel head permutation (`model_qwen35.hpp`).
+pub fn permute_lane256(c: u64) -> u64 {
+    lane256(c)
+}
+
+/// FP8 KV V-row permutation within a 128-row block (`model_qwen35.hpp`).
+pub fn permute_kv8_vpos128(q: u64) -> u64 {
+    kv8_vpos128(q)
+}
+
+/// FP8 KV V-row permutation across blocks (`model_qwen35.hpp`).
+pub fn permute_kv8_vpos(q: u64) -> u64 {
+    kv8_vpos(q)
+}
+
+/// Validates kernel-baked GQA attention dimensions (`adapter_qwen35.hpp`).
+pub fn validate_gqa(n_heads: u64, n_kv_heads: u64, head_dim: u64) -> Result<(), ShapeError> {
+    if gqa_dims_valid(n_heads, n_kv_heads, head_dim) {
+        Ok(())
+    } else {
+        Err(ShapeError::InvalidGqa {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        })
+    }
+}
+
+/// Validates kernel-baked Gated DeltaNet dimensions (`adapter_qwen35.hpp`).
+pub fn validate_gdn(k_heads: u64, v_heads: u64, conv_k: u64) -> Result<(), ShapeError> {
+    if gdn_dims_valid(k_heads, v_heads, conv_k) {
+        Ok(())
+    } else {
+        Err(ShapeError::InvalidGdn {
+            k_heads,
+            v_heads,
+            conv_k,
+        })
+    }
+}
+
+/// Validates hidden & vocabulary alignment bounds (`adapter_qwen35.hpp`).
+pub fn validate_hidden(hidden: u64, vocab: u64) -> Result<(), ShapeError> {
+    if hidden_dims_valid(hidden, vocab) {
+        Ok(())
+    } else {
+        Err(ShapeError::InvalidHidden { hidden, vocab })
+    }
+}
+
+/// Validates MoE expert counts and expert FF alignment (`adapter_qwen35.hpp`).
+pub fn validate_moe(n_experts: u64, top_k: u64, expert_ff: u64) -> Result<(), ShapeError> {
+    if moe_dims_valid(n_experts, top_k, expert_ff) {
+        Ok(())
+    } else {
+        Err(ShapeError::InvalidMoe {
+            n_experts,
+            top_k,
+            expert_ff,
+        })
+    }
+}
+
+/// Validates a ViT patch grid `(t, h, w)` and returns the 2x2-merged vision token count.
+pub fn validate_vit_grid(t: u64, h: u64, w: u64, max_patches: u64) -> Result<u64, ShapeError> {
+    if vit_grid_valid(t, h, w, max_patches) {
+        Ok(vit_merged_tokens(t, h, w))
+    } else {
+        Err(ShapeError::InvalidVitGrid {
+            t,
+            h,
+            w,
+            max_patches,
+        })
+    }
+}
+
+/// Draft-tree node metadata matching `dtree::Node`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeNodeSpec {
+    pub parent: u64,
+    pub depth: u64,
+    pub rank: u64,
+}
+
+/// Validates a speculative caterpillar draft tree against verified node/depth/bitmask bounds.
+pub fn validate_draft_tree(
+    nodes: &[TreeNodeSpec],
+    spine: u64,
+    max_nodes: u64,
+    max_depth: u64,
+    topk: u64,
+) -> Result<(), ShapeError> {
+    let n_nodes = nodes.len() as u64;
+    if !tree_shape_bounds_valid(n_nodes, spine, max_nodes, max_depth, topk) {
+        return Err(ShapeError::InvalidTreeShape { n_nodes, spine });
+    }
+    // Root node 0 must be at depth 0, rank 0
+    if nodes[0].depth != 0 || nodes[0].rank != 0 {
+        return Err(ShapeError::InvalidTreeNode {
+            idx: 0,
+            parent: nodes[0].parent,
+            depth: nodes[0].depth,
+            rank: nodes[0].rank,
+        });
+    }
+    for (idx, node) in nodes.iter().enumerate().skip(1) {
+        let parent_idx = node.parent as usize;
+        if parent_idx >= idx {
+            return Err(ShapeError::InvalidTreeNode {
+                idx: idx as u64,
+                parent: node.parent,
+                depth: node.depth,
+                rank: node.rank,
+            });
+        }
+        let parent_depth = nodes[parent_idx].depth;
+        if !tree_node_valid(
+            idx as u64,
+            node.parent,
+            node.depth,
+            parent_depth,
+            node.rank,
+            spine,
+            topk,
+        ) {
+            return Err(ShapeError::InvalidTreeNode {
+                idx: idx as u64,
+                parent: node.parent,
+                depth: node.depth,
+                rank: node.rank,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checked lane state-block address relocator (mirrors `common.hpp` `Reloc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneReloc {
+    pub lane0_lo: u64,
+    pub lane0_hi: u64,
+    pub dst_lo: u64,
+}
+
+impl LaneReloc {
+    pub fn contains(&self, addr: u64) -> bool {
+        addr_in_block(addr, self.lane0_lo, self.lane0_hi)
+    }
+
+    pub fn relocate(&self, addr: u64) -> u64 {
+        relocate_addr(addr, self.lane0_lo, self.lane0_hi, self.dst_lo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alignment_and_bucket_bounds() {
+        assert_eq!(align_up_safe(0, 128), 0);
+        assert_eq!(align_up_safe(1, 128), 128);
+        assert_eq!(align_up_safe(128, 128), 128);
+        assert_eq!(align_up_safe(129, 128), 256);
+        assert_eq!(align_up_safe(777, 0), 777); // div-by-zero safe
+        assert_eq!(align_128(5120), 5120);
+
+        assert_eq!(validate_bucket(4096), Ok((1, 1024)));
+        assert_eq!(validate_bucket(262_144), Ok((64, 65_536)));
+        assert!(validate_bucket(0).is_err());
+        assert!(validate_bucket(4095).is_err());
+    }
+
+    #[test]
+    fn channel_and_kv8_permutations_are_bijections() {
+        let mut seen_l128 = [false; 128];
+        for c in 0..128u64 {
+            let p = permute_lane128(c) as usize;
+            assert!(p < 128 && !seen_l128[p], "lane128 collision at c={c} -> {p}");
+            seen_l128[p] = true;
+        }
+        assert_eq!(permute_lane128(0), 0);
+        assert_eq!(permute_lane128(1), 64);
+        assert_eq!(permute_lane128(2), 1);
+        assert_eq!(permute_lane128(127), 127);
+
+        let mut seen_l256 = [false; 256];
+        for c in 0..256u64 {
+            let p = permute_lane256(c) as usize;
+            assert!(p < 256 && !seen_l256[p], "lane256 collision at c={c} -> {p}");
+            seen_l256[p] = true;
+        }
+
+        let mut seen_v128 = [false; 128];
+        for q in 0..128u64 {
+            let p = permute_kv8_vpos128(q) as usize;
+            assert!(p < 128 && !seen_v128[p], "kv8_vpos128 collision at q={q} -> {p}");
+            seen_v128[p] = true;
+        }
+        assert_eq!(permute_kv8_vpos(128), 128);
+        assert_eq!(permute_kv8_vpos(130), 192);
+    }
+
+    #[test]
+    fn real_gaudi_model_dimensions_validate() {
+        // Qwen3.8-27B (dense hybrid GQA + GDN)
+        validate_gqa(24, 4, 256).unwrap();
+        validate_gdn(16, 48, 4).unwrap();
+        validate_hidden(5120, 248_320).unwrap();
+
+        // Qwen3.6-35B-A3B (MoE hybrid)
+        validate_gqa(16, 2, 256).unwrap();
+        validate_gdn(16, 32, 4).unwrap();
+        validate_moe(256, 8, 512).unwrap();
+
+        // Qwen3-8B (pure GQA, dh=128)
+        validate_gqa(32, 8, 128).unwrap();
+        validate_hidden(4096, 151_936).unwrap();
+
+        // Zero-dim and misalignment guards
+        assert!(validate_gqa(24, 0, 256).is_err());
+        assert!(validate_gqa(24, 5, 256).is_err());
+        assert!(validate_gqa(24, 4, 64).is_err());
+        assert!(validate_gdn(0, 48, 4).is_err());
+        assert!(validate_gdn(16, 48, 3).is_err());
+        assert!(validate_hidden(0, 248_320).is_err());
+        assert!(validate_hidden(5120, 248_321).is_err());
+        assert!(validate_moe(0, 8, 512).is_err());
+        assert!(validate_moe(256, 16, 512).is_err()); // ek > 12
+
+        // ViT 2x2 merger
+        assert_eq!(validate_vit_grid(1, 28, 28, 4096), Ok(196));
+        assert!(validate_vit_grid(1, 0, 28, 4096).is_err());
+        assert!(validate_vit_grid(1, 27, 28, 4096).is_err()); // odd height
+        assert!(validate_vit_grid(1, 100, 100, 4096).is_err()); // exceeds max_patches
+    }
+
+    #[test]
+    fn draft_tree_validation_mirrors_tree_manager_test() {
+        // Shape "4:1-4@2": 5 spine nodes (0..=4) + 4 leaves (5..=8)
+        let mut t = vec![
+            TreeNodeSpec { parent: 0, depth: 0, rank: 0 },
+            TreeNodeSpec { parent: 0, depth: 1, rank: 0 },
+            TreeNodeSpec { parent: 1, depth: 2, rank: 0 },
+            TreeNodeSpec { parent: 2, depth: 3, rank: 0 },
+            TreeNodeSpec { parent: 3, depth: 4, rank: 0 },
+            TreeNodeSpec { parent: 0, depth: 1, rank: 1 },
+            TreeNodeSpec { parent: 1, depth: 2, rank: 1 },
+            TreeNodeSpec { parent: 2, depth: 3, rank: 1 },
+            TreeNodeSpec { parent: 3, depth: 4, rank: 1 },
+        ];
+        validate_draft_tree(&t, 4, 32, 8, 4).unwrap();
+
+        // Child of a leaf (parent == 5 >= spine 4) is rejected
+        t.push(TreeNodeSpec { parent: 5, depth: 2, rank: 0 });
+        assert!(validate_draft_tree(&t, 4, 32, 8, 4).is_err());
+
+        // Self-parent is rejected
+        let cyclic = vec![
+            TreeNodeSpec { parent: 0, depth: 0, rank: 0 },
+            TreeNodeSpec { parent: 1, depth: 1, rank: 0 },
+        ];
+        assert!(validate_draft_tree(&cyclic, 1, 32, 8, 4).is_err());
+
+        // > 32 nodes is rejected (prevents u32 ancestor bitmask shift UB)
+        let mut oversized = vec![TreeNodeSpec { parent: 0, depth: 0, rank: 0 }];
+        for i in 1..33u64 {
+            oversized.push(TreeNodeSpec { parent: i - 1, depth: i, rank: 0 });
+        }
+        assert!(validate_draft_tree(&oversized, 32, 64, 32, 4).is_err());
+    }
+
+    #[test]
+    fn lane_relocation_moves_only_in_block_addresses() {
+        let reloc = LaneReloc {
+            lane0_lo: 0x1000_0000,
+            lane0_hi: 0x2000_0000,
+            dst_lo: 0x3000_0000,
+        };
+        assert!(reloc.contains(0x1000_0000));
+        assert!(reloc.contains(0x1FFF_FFFF));
+        assert!(!reloc.contains(0x2000_0000));
+        assert!(!reloc.contains(0x0800_0000));
+
+        assert_eq!(reloc.relocate(0x1000_0000), 0x3000_0000);
+        assert_eq!(reloc.relocate(0x1234_5678), 0x3234_5678);
+        // Shared weights outside [lane0_lo, lane0_hi) remain untouched
+        assert_eq!(reloc.relocate(0x0800_1000), 0x0800_1000);
+        assert_eq!(reloc.relocate(0x2000_0000), 0x2000_0000);
+        assert_eq!(reloc.relocate(0x9000_0000), 0x9000_0000);
+    }
+}

@@ -1,0 +1,24 @@
+cc2d96177d64bd71  dev_alloc_launch_disjoint  law dev_alloc_launch_disjoint : for + s : DevState { Bool.and ( dev_can_alloc ( s ) , dev_can_launch ( s ) ) == False { } : Bool }
+66013e0cb837f25a  dev_closed_absorbing  law dev_closed_absorbing : for ev : DevEvent { dev_step ( DevClosed { } , ev ) == DevClosed { } : DevState }
+ebbddef48543f39e  dev_drain_blocks_all  law dev_drain_blocks_all : for + s : DevState { Bool.or ( dev_can_alloc ( dev_drain ( s ) ) , Bool.or ( dev_can_dma ( dev_drain ( s ) ) , dev_can_launch ( dev_drain ( s ) ) ) ) == False { } : Bool }
+55d549147ef088a6  dev_drain_idempotent  law dev_drain_idempotent : for s : DevState { dev_drain ( dev_drain ( s ) ) == dev_drain ( s ) : DevState }
+3ddfe8a0a0c54651  lane_busy_blocks_exclusive  law lane_busy_blocks_exclusive : for b : Nat for max_lanes : Nat { lane_can_admit ( 1n + b , max_lanes , False { } , True { } ) == False { } : Bool }
+3f71bff599d5e309  lane_exclusive_blocks_all  law lane_exclusive_blocks_all : for busy : Nat for max_lanes : Nat for want_excl : Bool { lane_can_admit ( busy , max_lanes , True { } , want_excl ) == False { } : Bool }
+4775d7007e9e1d84  lane_full_blocks_shared  law lane_full_blocks_shared : for + cap : Nat for excl : Bool { lane_can_admit ( cap , cap , excl , False { } ) == False { } : Bool }
+f1cbe1206fb49073  recipe_destroy_idempotent  law recipe_destroy_idempotent : for s : RecipeState { recipe_step ( recipe_step ( s , EvRecDestroy { } ) , EvRecDestroy { } ) == recipe_step ( s , EvRecDestroy { } ) : RecipeState }
+836167e72b5b07af  recipe_destroyed_absorbing  law recipe_destroyed_absorbing : for ev : RecipeEvent { recipe_step ( RecDestroyed { } , ev ) == RecDestroyed { } : RecipeState }
+49ef901098934384  recipe_sealed_ws_overflow_fails  law recipe_sealed_ws_overflow_fails : { recipe_bind_ws ( RecCompiled { } , False { } , True { } ) == RecWsFailed { } : RecipeState }
+5f951be29cb5f043  recipe_shared_fit_binds  law recipe_shared_fit_binds : for sealed : Bool { recipe_bind_ws ( RecCompiled { } , True { } , sealed ) == RecWsBound { } : RecipeState }
+a1e1d13137bf7fec  recipe_ws_fail_never_launches  law recipe_ws_fail_never_launches : { recipe_can_launch ( RecWsFailed { } ) == False { } : Bool }
+50e5c88a1ed73b76  req_cancel_idempotent  law req_cancel_idempotent : for s : ReqState { req_cancel ( req_cancel ( s ) ) == req_cancel ( s ) : ReqState }
+4156536946afa0e3  req_terminal_absorbing  law req_terminal_absorbing : for + s : ReqState for ev : ReqEvent { Bool.or ( Bool.not ( req_is_terminal ( s ) ) , req_eq ( req_step ( s , ev ) , s ) ) == True { } : Bool }
+83030691075e6413  router_no_switch_while_active  law router_no_switch_while_active : for act : Nat for st : BackendState { router_can_switch ( 1n + act , st ) == False { } : Bool }
+c2cbe6cec354675c  router_no_switch_while_loading  law router_no_switch_while_loading : for act : Nat { router_can_switch ( act , BeLoading { } ) == False { } : Bool }
+b4a7e0b48da9b054  router_no_switch_while_ready  law router_no_switch_while_ready : for act : Nat { router_can_switch ( act , BeReady { } ) == False { } : Bool }
+2e1a09ee017289ea  router_no_switch_while_stopping  law router_no_switch_while_stopping : for act : Nat { router_can_switch ( act , BeStopping { } ) == False { } : Bool }
+31193373364a99fe  slot_fill_never_overwrites_readable  law slot_fill_never_overwrites_readable : for + s : SlotState { Bool.and ( slot_is_readable ( s ) , slot_is_writable ( slot_begin_fill ( s ) ) ) == False { } : Bool }
+10198e983a5b22c0  slot_quiesce_at_exact_epoch  law slot_quiesce_at_exact_epoch : for + ep : Nat { slot_quiesce ( SlotRetiringEpoch { ep } , ep ) == SlotFree { } : SlotState }
+14be0b19eae0c42a  slot_quiesce_before_epoch_stays_retiring  law slot_quiesce_before_epoch_stays_retiring : for + c : Nat { slot_quiesce ( SlotRetiringEpoch { 1n + c } , c ) == SlotRetiringEpoch { 1n + c } : SlotState }
+86f508a366b3132a  slot_rollback_roundtrip  law slot_rollback_roundtrip : { slot_rollback_retire ( slot_begin_retire ( SlotReady { } ) ) == SlotReady { } : SlotState }
+dfce56566b9352f7  slot_rw_disjoint  law slot_rw_disjoint : for + s : SlotState { Bool.and ( slot_is_readable ( s ) , slot_is_writable ( s ) ) == False { } : Bool }
+a7ddf0cb7323bd51  slot_unbound_never_quiesces  law slot_unbound_never_quiesces : for completed : Nat { slot_quiesce ( SlotRetiringUnbound { } , completed ) == SlotRetiringUnbound { } : SlotState }
