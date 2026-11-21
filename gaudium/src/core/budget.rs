@@ -5,8 +5,8 @@
 
 use crate::verified::{
     clamp_top_k, ctx_reserve, effective_max_new, kv_high_water, method_allows_sampling,
-    prompt_admitted, prompt_room, remaining_budget, sampler_family_join, served_ctx,
-    step_headroom_fits, SamplerFamily, SpecMethod,
+    prompt_admitted, prompt_room, remaining_budget, sampler_family_join,
+    sampling_request_admitted, served_ctx, step_headroom_fits, SamplerFamily, SpecMethod,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,12 +100,13 @@ impl SequenceBudget {
     }
 }
 
-/// Checks whether a speculative decoding method supports non-greedy sampling.
+/// Checks whether a speculative decoding method supports the requested sampling mode
+/// (delegates policy enforcement to verified `sampling_request_admitted`).
 pub fn check_method_sampling(method: SpecMethod, wants_sampling: bool) -> Result<(), BudgetError> {
-    if wants_sampling && !method_allows_sampling(method) {
-        Err(BudgetError::SamplingDisallowed(method))
-    } else {
+    if sampling_request_admitted(method_allows_sampling(method), wants_sampling) {
         Ok(())
+    } else {
+        Err(BudgetError::SamplingDisallowed(method))
     }
 }
 

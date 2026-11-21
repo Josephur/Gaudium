@@ -310,12 +310,12 @@ mod tests {
         ];
         assert!(validate_draft_tree(&cyclic, 1, 32, 8, 4).is_err());
 
-        // > 32 nodes is rejected (prevents u32 ancestor bitmask shift UB)
+        // Exceeding adapter max_nodes (32 for u32 ancestor bitmask) is rejected
         let mut oversized = vec![TreeNodeSpec { parent: 0, depth: 0, rank: 0 }];
         for i in 1..33u64 {
             oversized.push(TreeNodeSpec { parent: i - 1, depth: i, rank: 0 });
         }
-        assert!(validate_draft_tree(&oversized, 32, 64, 32, 4).is_err());
+        assert!(validate_draft_tree(&oversized, 32, 32, 32, 4).is_err());
     }
 
     #[test]

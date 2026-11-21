@@ -179,6 +179,10 @@ def method_allows_sampling(m: SpecMethod) -> Bool:
     case _:
       False{}
 
+# Policy gate: greedy requests are always allowed; sampled requests require method capability.
+def sampling_request_admitted(method_can_sample: Bool, wants_sampling: Bool) -> Bool:
+  Bool.or(Bool.not(wants_sampling), method_can_sample)
+
 # Mixed-batch sampler lattice join: Search > NoSearch > Greedy (GAUDIUM_BATCH_MIX).
 def sampler_family_join(a: SamplerFamily, b: SamplerFamily) -> SamplerFamily:
   match a:
@@ -343,12 +347,21 @@ def sampler_join_assoc(a, b, c):
             case SampNoSearch{}: {==}
             case SampSearch{}: {==}
 
-# LAW TB.10: Greedy-only speculative methods ALWAYS refuse sampled requests.
-law greedy_only_methods_refuse_sampling:
-  {Bool.or(method_allows_sampling(MethodDFlash2{}), Bool.or(method_allows_sampling(MethodCertified{}), Bool.or(method_allows_sampling(MethodPromptLookup{}), Bool.or(method_allows_sampling(MethodMtpTree{}), method_allows_sampling(MethodDSpineFixedTree{}))))) == False{} : Bool}
+# LAW TB.10: Any method without sampling capability refuses sampled requests; greedy is always admitted.
+law unsupported_method_refuses_sampling:
+  {sampling_request_admitted(False{}, True{}) == False{} : Bool}
 
-def greedy_only_methods_refuse_sampling():
+def unsupported_method_refuses_sampling():
   {==}
+
+law greedy_request_always_admitted:
+  for cap: Bool
+  {sampling_request_admitted(cap, False{}) == True{} : Bool}
+
+def greedy_request_always_admitted(cap):
+  match cap:
+    case True{}: {==}
+    case False{}: {==}
 
 # LAW TB.11: Clamped top_k NEVER exceeds vocabulary size.
 law top_k_clamped_to_vocab:

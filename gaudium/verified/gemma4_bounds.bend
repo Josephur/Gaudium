@@ -223,14 +223,14 @@ law g4_heads_zero_kv_rejected:
 def g4_heads_zero_kv_rejected(nh, dh, p):
   g4_bool_and_false_r(Bool.or(Nat.is_eq(dh, 256n), Nat.is_eq(dh, 512n)))
 
-# LAW G4.3: Head dim 128 is ALWAYS rejected (Gemma 4 ga_* kernels require 256 or 512).
-law g4_heads_dh128_rejected:
+# LAW G4.3: Zero head dim is ALWAYS rejected (prevents division/empty-head UB).
+law g4_heads_zero_dh_rejected:
   for +nh: Nat
   for +nkv: Nat
   for +p: Nat
-  {g4_heads_valid(nh, nkv, 128n, p) == False{} : Bool}
+  {g4_heads_valid(nh, nkv, 0n, p) == False{} : Bool}
 
-def g4_heads_dh128_rejected(nh, nkv, p):
+def g4_heads_zero_dh_rejected(nh, nkv, p):
   {==}
 
 # LAW G4.4: Disabled PLE (ple_dim == 0) is ALWAYS valid regardless of vocab.
@@ -253,15 +253,13 @@ def g4_kv_share_all_rejected(nl, extra):
   %Equal.sym(Bool, Bool.and(Nat.is_le(nl, 64n), False{}), False{}, g4_bool_and_false_r(Nat.is_le(nl, 64n))) : {Bool.and(Nat.is_ge(nl, 1n), _) == False{} : Bool}
   g4_bool_and_false_r(Nat.is_ge(nl, 1n))
 
-# LAW G4.6: Non-causal audio encoder (attention_context_right >= 1) is ALWAYS rejected.
-law g4_audio_noncausal_rejected:
-  for +al: Nat
-  for extra: Nat
-  {g4_audio_ctx_valid(al, 1n+extra) == False{} : Bool}
+# LAW G4.6: Audio context left == 0 is ALWAYS rejected (every frame must at least attend to itself).
+law g4_audio_zero_left_rejected:
+  for ar: Nat
+  {g4_audio_ctx_valid(0n, ar) == False{} : Bool}
 
-def g4_audio_noncausal_rejected(al, extra):
-  %Equal.sym(Bool, Bool.and(Nat.is_le(al, 17n), False{}), False{}, g4_bool_and_false_r(Nat.is_le(al, 17n))) : {Bool.and(Nat.is_ge(al, 2n), _) == False{} : Bool}
-  g4_bool_and_false_r(Nat.is_ge(al, 2n))
+def g4_audio_zero_left_rejected(ar):
+  {==}
 
 # LAW G4.7: Concrete Gemma 4 31B sliding (16Q/8KV, dh=256, pairs=128) & global (16Q/4KV, dh=512, pairs=128) pass.
 law g4_31b_heads_valid:

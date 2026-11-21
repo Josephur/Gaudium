@@ -18,4 +18,5 @@ pub mod moe_cache;
 pub mod proto;
 pub mod safetensors;
 pub mod sampler;
+pub mod synapse;
 pub mod tree;

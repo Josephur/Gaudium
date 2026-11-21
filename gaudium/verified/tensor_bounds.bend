@@ -71,8 +71,11 @@ def tn_bool_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
     case True{}: {==}
     case False{}: {==}
 
-def tn_le_add33_32_false(extra: Nat) -> {False{} == Nat.is_le(Nat.add(33n, extra), 32n) : Bool}:
-  {==}
+def tn_le_add_succ_false(mn: Nat, extra: Nat) -> {False{} == Nat.is_le(Nat.add(mn, 1n+extra), mn) : Bool}:
+  match mn:
+    case 0n: {==}
+    case 1n+p:
+      tn_le_add_succ_false(p, extra)
 
 # ============================================================================
 # 2. Alignment, Attention Bucket & Channel Permutation Math
@@ -220,20 +223,17 @@ def vit_grid_valid(+t: Nat, +h: Nat, +w: Nat, max_patches: Nat) -> Bool:
 def vit_merged_tokens(t: Nat, h: Nat, w: Nat) -> Nat:
   Nat.mul(t, Nat.mul(Nat.div(h, 2n), Nat.div(w, 2n)))
 
-# Draft-tree bounds: <= 32 nodes (ancestor u32 bitmask), caterpillar depth/rank checks.
+# Draft-tree bounds: parameterized by adapter max_nodes (e.g. 32 for u32 ancestor bitmasks), caterpillar depth/rank checks.
 def tree_shape_bounds_valid(+n_nodes: Nat, +spine: Nat, max_nodes: Nat, max_depth: Nat, topk: Nat) -> Bool:
   Bool.and(
     Nat.is_ge(n_nodes, 2n),
     Bool.and(
-      Nat.is_le(n_nodes, 32n),
+      Nat.is_le(n_nodes, max_nodes),
       Bool.and(
-        Nat.is_le(n_nodes, max_nodes),
+        Nat.is_ge(spine, 1n),
         Bool.and(
-          Nat.is_ge(spine, 1n),
-          Bool.and(
-            Nat.is_le(spine, max_depth),
-            Nat.is_le(Nat.sub(n_nodes, 1n), Nat.mul(topk, spine))
-          )
+          Nat.is_le(spine, max_depth),
+          Nat.is_le(Nat.sub(n_nodes, 1n), Nat.mul(topk, spine))
         )
       )
     )
@@ -355,17 +355,18 @@ law vit_zero_h_rejected:
 def vit_zero_h_rejected(t, w, m):
   tn_bool_and_false_r(Nat.is_ge(t, 1n))
 
-# LAW TN.9: Any draft tree with > 32 nodes is ALWAYS rejected (prevents 32-bit bitmask shift UB).
-law tree_over_32_rejected:
+# LAW TN.9: Any draft tree exceeding its bitmask/adapter cap `max_nodes` is ALWAYS rejected.
+law tree_over_max_nodes_rejected:
+  for +mn: Nat
   for +extra: Nat
   for +sp: Nat
-  for mn: Nat
   for md: Nat
   for tk: Nat
-  {tree_shape_bounds_valid(Nat.add(33n, extra), sp, mn, md, tk) == False{} : Bool}
+  {tree_shape_bounds_valid(Nat.add(mn, 1n+extra), sp, mn, md, tk) == False{} : Bool}
 
-def tree_over_32_rejected(extra, sp, mn, md, tk):
-  {==}
+def tree_over_max_nodes_rejected(mn, extra, sp, md, tk):
+  %tn_le_add_succ_false(mn, extra) : {Bool.and(Nat.is_ge(Nat.add(mn, 1n+extra), 2n), Bool.and(_, Bool.and(Nat.is_ge(sp, 1n), Bool.and(Nat.is_le(sp, md), Nat.is_le(Nat.sub(Nat.add(mn, 1n+extra), 1n), Nat.mul(tk, sp)))))) == False{} : Bool}
+  tn_bool_and_false_r(Nat.is_ge(Nat.add(mn, 1n+extra), 2n))
 
 # LAW TN.10: A draft-tree node can NEVER be its own parent (guarantees DAG / tree acyclicity).
 law tree_self_parent_rejected:
