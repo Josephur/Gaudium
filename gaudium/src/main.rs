@@ -1,14 +1,52 @@
-//! Gaudium CLI entry point (Slice 1 + Slice 2 verified-core smoke check).
+//! Gaudium CLI entry point (Verified Core + Host Engine Subsystems).
+
+use std::env;
+use std::path::Path;
+use std::process;
 
 use gaudium::core::budget::{advertised_served_ctx, SequenceBudget};
 use gaudium::core::hbm::{check_hbm_fit, usable_hbm_bytes, HbmLedgerGuard};
 use gaudium::core::kv_pool::{BlockPoolTracker, BLOCKS_PER_SLAB, BLOCK_BYTES};
 use gaudium::core::lifecycle::{DeviceGuard, ExpertSlotGuard, RecipeGuard, RequestGuard};
 use gaudium::core::shapes::{validate_gdn, validate_gqa, validate_hidden};
+use gaudium::model_spec::ModelSpec;
+use gaudium::safetensors::SafetensorsStore;
 use gaudium::verified::{DevEvent, HbmCat, ReqEvent};
 
+fn inspect_model(dir: &Path) -> Result<(), String> {
+    let cfg_path = dir.join("config.json");
+    let spec = ModelSpec::from_config_file(&cfg_path).map_err(|e| e.to_string())?;
+    spec.validate().map_err(|e| e.to_string())?;
+    let store = SafetensorsStore::open(dir).map_err(|e| e.to_string())?;
+    println!(
+        "OK: {:?} ({}) — hidden={}, vocab={}, layers={} (full_attn={}), heads={}/{}, dh={}, fp8={}, vision={}, tensors={}",
+        spec.family,
+        spec.architecture,
+        spec.hidden,
+        spec.vocab,
+        spec.n_layers,
+        spec.n_full_attention_layers(),
+        spec.n_heads,
+        spec.n_kv_heads,
+        spec.head_dim,
+        spec.fp8_quantized,
+        spec.has_vision,
+        store.len()
+    );
+    Ok(())
+}
+
 fn main() {
-    // Slice 1: lifecycle state machines
+    let args: Vec<String> = env::args().collect();
+    if args.len() == 3 && args[1] == "--inspect-model" {
+        if let Err(e) = inspect_model(Path::new(&args[2])) {
+            eprintln!("FAIL: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+
+    // Smoke-check Slice 1 + Slice 2 verified core
     let mut dev = DeviceGuard::new();
     dev.transition(DevEvent::EvSynInit).expect("syn init");
     dev.transition(DevEvent::EvDevAcquire).expect("acquire");
@@ -30,7 +68,6 @@ fn main() {
     req.apply(ReqEvent::EvReqPrefillDone).expect("decode");
     req.apply(ReqEvent::EvReqFinishStop).expect("stop");
 
-    // Slice 2: block pool, HBM budget, token budget, and shape guards
     let mut pool = BlockPoolTracker::new(BLOCKS_PER_SLAB);
     pool.alloc(7).expect("alloc 7 blocks");
 

@@ -9,4 +9,13 @@ pub mod verified {
     include!(concat!(env!("OUT_DIR"), "/verified.rs"));
 }
 
+pub mod cache_ram;
 pub mod core;
+pub mod fp8;
+pub mod json;
+pub mod model_spec;
+pub mod moe_cache;
+pub mod proto;
+pub mod safetensors;
+pub mod sampler;
+pub mod tree;
