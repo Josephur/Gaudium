@@ -420,6 +420,156 @@ impl HpuDevice {
         copy_res
     }
 
+    /// Allocates a reusable Synapse-pinned host staging buffer (eliminates per-step `synHostMalloc`).
+    pub fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuf, SynapseError> {
+        let alloc_bytes = bytes.max(64);
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        syn_check("synHostMalloc", unsafe {
+            (self.api.syn_host_malloc)(self.dev_id, alloc_bytes as u64, 0, &mut ptr)
+        })?;
+        Ok(PinnedBuf {
+            api: Arc::clone(&self.api),
+            dev_id: self.dev_id,
+            ptr: ptr as *mut u8,
+            len: alloc_bytes,
+        })
+    }
+
+    /// Copies `bytes` from the start of a pinned host buffer to `dst_hbm` (blocking on H2D stream).
+    pub fn copy_h2d_pinned_sync(
+        &self,
+        src: &PinnedBuf,
+        bytes: usize,
+        dst_hbm: u64,
+    ) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("h2d refused: {e:?}")))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes > src.len {
+            return Err(SynapseError::InvalidArg(format!(
+                "copy_h2d_pinned_sync: {bytes} > pinned capacity {}",
+                src.len
+            )));
+        }
+        syn_check("synMemCopyAsync(H2D)", unsafe {
+            (self.api.syn_mem_copy_async)(
+                self.h2d,
+                src.ptr as u64,
+                bytes as u64,
+                dst_hbm,
+                SynDmaDir::HostToDram as u32,
+            )
+        })?;
+        unsafe { self.sync_stream(self.h2d) }
+    }
+
+    /// Enqueues multiple `(src_offset, bytes, dst_hbm)` H2D transfers from one `PinnedBuf`
+    /// back-to-back and synchronizes the H2D stream once.
+    pub fn copy_h2d_pinned_batch_sync(
+        &self,
+        src: &PinnedBuf,
+        transfers: &[(usize, usize, u64)],
+    ) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("h2d refused: {e:?}")))?;
+        if transfers.is_empty() {
+            return Ok(());
+        }
+        for &(off, bytes, dst_hbm) in transfers {
+            if bytes == 0 {
+                continue;
+            }
+            if off.saturating_add(bytes) > src.len {
+                return Err(SynapseError::InvalidArg(format!(
+                    "copy_h2d_pinned_batch_sync: {}..{} > pinned capacity {}",
+                    off,
+                    off.saturating_add(bytes),
+                    src.len
+                )));
+            }
+            syn_check("synMemCopyAsync(H2D)", unsafe {
+                (self.api.syn_mem_copy_async)(
+                    self.h2d,
+                    (src.ptr as u64) + (off as u64),
+                    bytes as u64,
+                    dst_hbm,
+                    SynDmaDir::HostToDram as u32,
+                )
+            })?;
+        }
+        unsafe { self.sync_stream(self.h2d) }
+    }
+
+    /// Copies `bytes` from `src_hbm` into the start of a pinned host buffer (blocking on D2H stream).
+    pub fn copy_d2h_pinned_sync(
+        &self,
+        src_hbm: u64,
+        dst: &mut PinnedBuf,
+        bytes: usize,
+    ) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("d2h refused: {e:?}")))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes > dst.len {
+            return Err(SynapseError::InvalidArg(format!(
+                "copy_d2h_pinned_sync: {bytes} > pinned capacity {}",
+                dst.len
+            )));
+        }
+        syn_check("synMemCopyAsync(D2H)", unsafe {
+            (self.api.syn_mem_copy_async)(
+                self.d2h,
+                src_hbm,
+                bytes as u64,
+                dst.ptr as u64,
+                SynDmaDir::DramToHost as u32,
+            )
+        })?;
+        unsafe { self.sync_stream(self.d2h) }
+    }
+
+    /// Uploads an arbitrarily large host slice to HBM in chunks using one reusable `PinnedBuf`.
+    pub fn upload_h2d_chunked(
+        &self,
+        src: &[u8],
+        dst_hbm: u64,
+        stage: &mut PinnedBuf,
+    ) -> Result<(), SynapseError> {
+        let cap = stage.len();
+        let mut off = 0usize;
+        while off < src.len() {
+            let n = (src.len() - off).min(cap);
+            stage.as_mut_slice()[..n].copy_from_slice(&src[off..off + n]);
+            self.copy_h2d_pinned_sync(stage, n, dst_hbm + off as u64)?;
+            off += n;
+        }
+        Ok(())
+    }
+
+    /// Zero-fills `bytes` of device HBM using a pre-zeroed `PinnedBuf` (in chunks of `zero_stage.len()`).
+    pub fn zero_hbm_chunked(
+        &self,
+        dst_hbm: u64,
+        bytes: u64,
+        zero_stage: &PinnedBuf,
+    ) -> Result<(), SynapseError> {
+        let cap = zero_stage.len() as u64;
+        let mut off = 0u64;
+        while off < bytes {
+            let n = (bytes - off).min(cap) as usize;
+            self.copy_h2d_pinned_sync(zero_stage, n, dst_hbm + off)?;
+            off += n as u64;
+        }
+        Ok(())
+    }
+
     /// Drains all streams immediately and moves `DeviceGuard` to `DevDraining` (`AGENTS.md` §8).
     pub fn drain_all(&mut self) {
         self.guard.emergency_drain();
@@ -466,6 +616,47 @@ impl Drop for HpuDevice {
             (self.api.syn_destroy)();
         }
         let _ = self.guard.transition(DevEvent::EvDevClose);
+    }
+}
+
+/// Reusable Synapse-pinned host staging buffer freed automatically on drop.
+///
+/// Must be dropped before the owning `HpuDevice` (declare `PinnedBuf` fields before `HpuDevice`
+/// in structs that hold both).
+pub struct PinnedBuf {
+    api: Arc<SynapseApi>,
+    dev_id: SynDeviceId,
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl PinnedBuf {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is valid for `len` bytes for the lifetime of `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` is uniquely owned & valid for `len` bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                (self.api.syn_host_free)(self.dev_id, self.ptr as *mut c_void, 0);
+            }
+        }
     }
 }
 

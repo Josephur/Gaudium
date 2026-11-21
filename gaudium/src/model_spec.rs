@@ -65,7 +65,13 @@ pub struct ModelSpec {
     pub n_kv_heads: u64,
     pub head_dim: u64,
     pub rms_eps: f64,
+    pub rope_theta: f64,
+    pub rotary_dim: u64,
     pub tie_word_embeddings: bool,
+    pub text_prefix: String,
+    pub attn_gate: bool,
+    pub norm_plus1: bool,
+    pub eos_token_ids: Vec<i32>,
     pub layer_types: Vec<String>,
     // Qwen3.5 / 3.6 / 3.8 Gated DeltaNet fields (0 when absent)
     pub gdn_k_heads: u64,
@@ -186,11 +192,51 @@ impl ModelSpec {
             }
         };
         let rms_eps = f64_field(tc, "rms_norm_eps", 1e-6);
+        let rope_theta = tc
+            .get("rope_parameters")
+            .and_then(|rp| rp.get("rope_theta"))
+            .and_then(JsonValue::as_f64)
+            .unwrap_or_else(|| f64_field(tc, "rope_theta", 1_000_000.0));
+        let partial_rotary_factor = tc
+            .get("rope_parameters")
+            .and_then(|rp| rp.get("partial_rotary_factor"))
+            .and_then(JsonValue::as_f64)
+            .unwrap_or_else(|| f64_field(tc, "partial_rotary_factor", 1.0));
+        let rotary_dim = ((head_dim as f64) * partial_rotary_factor).round() as u64;
         let tie_word_embeddings = bool_field(
             &root,
             "tie_word_embeddings",
             bool_field(tc, "tie_word_embeddings", false),
         );
+        let text_prefix = if root.get("text_config").is_some() {
+            "model.language_model.".to_owned()
+        } else {
+            "model.".to_owned()
+        };
+        let attn_gate = matches!(family, ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe);
+        let norm_plus1 = matches!(family, ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe);
+        let mut eos_token_ids = Vec::new();
+        for src in [tc.get("eos_token_id"), root.get("eos_token_id")]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = src.as_i64() {
+                if !eos_token_ids.contains(&(id as i32)) {
+                    eos_token_ids.push(id as i32);
+                }
+            } else if let Some(arr) = src.as_array() {
+                for item in arr {
+                    if let Some(id) = item.as_i64() {
+                        if !eos_token_ids.contains(&(id as i32)) {
+                            eos_token_ids.push(id as i32);
+                        }
+                    }
+                }
+            }
+        }
+        if eos_token_ids.is_empty() && matches!(family, ModelFamily::Qwen3) {
+            eos_token_ids.extend_from_slice(&[151_645, 151_643]);
+        }
 
         let layer_types: Vec<String> =
             if let Some(arr) = tc.get("layer_types").and_then(JsonValue::as_array) {
@@ -311,7 +357,13 @@ impl ModelSpec {
             n_kv_heads,
             head_dim,
             rms_eps,
+            rope_theta,
+            rotary_dim,
             tie_word_embeddings,
+            text_prefix,
+            attn_gate,
+            norm_plus1,
+            eos_token_ids,
             layer_types,
             gdn_k_heads,
             gdn_v_heads,
@@ -410,6 +462,31 @@ impl ModelSpec {
             .iter()
             .filter(|t| t.as_str() == "full_attention")
             .count()
+    }
+
+    pub fn n_linear_layers(&self) -> usize {
+        self.layer_types
+            .iter()
+            .filter(|t| t.as_str() == "linear_attention")
+            .count()
+    }
+
+    pub fn is_moe(&self) -> bool {
+        self.n_experts > 0
+    }
+
+    /// Output dimension of `q_proj`: `NH * DH` (plain Qwen3) or `2 * NH * DH` (gated Qwen3.5).
+    pub fn qg_dim(&self) -> u64 {
+        if self.attn_gate {
+            2 * self.n_heads * self.head_dim
+        } else {
+            self.n_heads * self.head_dim
+        }
+    }
+
+    /// Output dimension of `k_proj` / `v_proj`: `NKV * DH`.
+    pub fn kv_dim(&self) -> u64 {
+        self.n_kv_heads * self.head_dim
     }
 }
 

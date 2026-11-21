@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use gaudium::core::hbm::{check_hbm_fit, usable_hbm_bytes, HbmLedgerGuard};
 use gaudium::core::kv_pool::{BlockPoolTracker, BLOCKS_PER_SLAB, BLOCK_BYTES};
 use gaudium::core::lifecycle::{DeviceGuard, ExpertSlotGuard, RecipeGuard, RequestGuard};
 use gaudium::core::shapes::{validate_gdn, validate_gqa, validate_hidden};
+use gaudium::engine::qwen3::{Qwen3Config, Qwen3Engine, Qwen3GenParams, KV_CHUNK};
 use gaudium::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use gaudium::model_spec::ModelSpec;
 use gaudium::safetensors::SafetensorsStore;
@@ -18,7 +20,42 @@ use gaudium::synapse::device::HpuDevice;
 use gaudium::synapse::ffi::{SynDataType, SynapseApi};
 use gaudium::synapse::graph::GraphBuilder;
 use gaudium::synapse::recipe_cache::RecipeCache;
+use gaudium::tokenizer::{format_qwen3_chat, StreamDecoder, Tokenizer};
 use gaudium::verified::{DevEvent, HbmCat, ReqEvent};
+
+fn print_usage() {
+    println!(
+        "Gaudium — Intel Gaudi 2 Inference Engine (RustyBends v1)\n\
+         \n\
+         Usage:\n\
+         \x20 gaudium                                   Run verified-core self-check\n\
+         \x20 gaudium --inspect-model <dir>             Validate config.json & Safetensors\n\
+         \x20 gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json\n\
+         \x20 gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test\n\
+         \x20 gaudium --generate [options]              Run live Gaudi 2 LLM generation\n\
+         \n\
+         Generate options:\n\
+         \x20 --model <dir>         Model directory (or GAUDIUM_MODEL)\n\
+         \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
+         \x20 --prompt <text>       Input prompt text\n\
+         \x20 --prompt-ids <csv>    Raw comma-separated prompt token IDs (skips tokenizer)\n\
+         \x20 --chat                Wrap --prompt in Qwen3 ChatML template\n\
+         \x20 --no-think            Disable thinking block (with --chat)\n\
+         \x20 --system <text>       System prompt (with --chat)\n\
+         \x20 --max-new <N>         Maximum tokens to generate (default: 64)\n\
+         \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)\n\
+         \x20 --temperature <F>     Sampling temperature; 0 = greedy (default: 0.0)\n\
+         \x20 --top-p <F>           Nucleus sampling p (default: 1.0)\n\
+         \x20 --top-k <N>           Top-k sampling cap (default: 0 = off)\n\
+         \x20 --min-p <F>           Min-p sampling threshold (default: 0.0)\n\
+         \x20 --seed <N>            Sampling RNG seed (default: 0)\n\
+         \x20 --no-eos              Do not stop early on EOS token\n\
+         \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
+         \x20 --no-cache            Disable on-disk compiled recipe cache\n\
+         \x20 --dump-tokens         Print generated token IDs to stderr\n\
+         \x20 --verbose             Print HBM, recipe compile, and timing diagnostics"
+    );
+}
 
 fn inspect_model(dir: &Path) -> Result<(), String> {
     let cfg_path = dir.join("config.json");
@@ -43,12 +80,172 @@ fn inspect_model(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Live hardware end-to-end smoke test on Intel Gaudi 2 (HL-225):
-///   1. Dynamically loads `libSynapse.so` and opens Gaudi 2 through verified `DeviceGuard`.
-///   2. Checks HBM capacity, compiles a BF16 `add_fwd_bf16` graph via `GraphBuilder` (destroys graph immediately).
-///   3. Allocates HBM buffers + shared workspace, seals `AllocGuard` (proves post-seal alloc fails).
-///   4. Runs H2D DMA -> `launch_checked` on Gaudi 2 TPC -> D2H DMA -> verifies exact BF16 output.
-///   5. Drains all streams cleanly on drop.
+fn run_tokenize(dir: &Path, text: &str) -> Result<(), String> {
+    let tok = Tokenizer::from_model_dir(dir).map_err(|e| e.to_string())?;
+    let ids = tok.encode(text, true);
+    let decoded = tok.decode(&ids, false);
+    println!("vocab={} tokens={}", tok.vocab_size(), ids.len());
+    println!("ids={ids:?}");
+    println!("decoded={decoded:?}");
+    Ok(())
+}
+
+fn run_generate(args: &[String]) -> Result<(), String> {
+    let mut model_dir: Option<PathBuf> = env::var_os("GAUDIUM_MODEL").map(PathBuf::from);
+    let mut kernels_dir: Option<PathBuf> = env::var_os("GAUDIUM_KERNELS").map(PathBuf::from);
+    let mut prompt: Option<String> = None;
+    let mut prompt_ids_raw: Option<String> = None;
+    let mut chat = false;
+    let mut no_think = false;
+    let mut system_prompt: Option<String> = None;
+    let mut max_ctx = KV_CHUNK;
+    let mut cache_dir: Option<PathBuf> = None;
+    let mut no_cache = false;
+    let mut dump_tokens = false;
+    let mut verbose = false;
+    let mut params = Qwen3GenParams::default();
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let next_val = |idx: &mut usize, name: &str| -> Result<String, String> {
+            *idx += 1;
+            args.get(*idx)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match flag {
+            "--generate" => {}
+            "--model" => model_dir = Some(PathBuf::from(next_val(&mut i, "--model")?)),
+            "--kernels" => kernels_dir = Some(PathBuf::from(next_val(&mut i, "--kernels")?)),
+            "--prompt" => prompt = Some(next_val(&mut i, "--prompt")?),
+            "--prompt-ids" => prompt_ids_raw = Some(next_val(&mut i, "--prompt-ids")?),
+            "--chat" => chat = true,
+            "--no-think" => no_think = true,
+            "--system" => system_prompt = Some(next_val(&mut i, "--system")?),
+            "--max-new" => {
+                params.max_new = next_val(&mut i, "--max-new")?
+                    .parse()
+                    .map_err(|_| "invalid --max-new".to_string())?;
+            }
+            "--max-ctx" => {
+                max_ctx = next_val(&mut i, "--max-ctx")?
+                    .parse()
+                    .map_err(|_| "invalid --max-ctx".to_string())?;
+            }
+            "--temperature" => {
+                params.temperature = next_val(&mut i, "--temperature")?
+                    .parse()
+                    .map_err(|_| "invalid --temperature".to_string())?;
+            }
+            "--top-p" => {
+                params.top_p = next_val(&mut i, "--top-p")?
+                    .parse()
+                    .map_err(|_| "invalid --top-p".to_string())?;
+            }
+            "--top-k" => {
+                params.top_k = next_val(&mut i, "--top-k")?
+                    .parse()
+                    .map_err(|_| "invalid --top-k".to_string())?;
+            }
+            "--min-p" => {
+                params.min_p = next_val(&mut i, "--min-p")?
+                    .parse()
+                    .map_err(|_| "invalid --min-p".to_string())?;
+            }
+            "--seed" => {
+                params.seed = next_val(&mut i, "--seed")?
+                    .parse()
+                    .map_err(|_| "invalid --seed".to_string())?;
+            }
+            "--no-eos" => params.stop_on_eos = false,
+            "--cache-dir" => cache_dir = Some(PathBuf::from(next_val(&mut i, "--cache-dir")?)),
+            "--no-cache" => no_cache = true,
+            "--dump-tokens" => dump_tokens = true,
+            "--verbose" | "-v" => verbose = true,
+            other => return Err(format!("unknown argument '{other}'")),
+        }
+        i += 1;
+    }
+
+    let model_dir =
+        model_dir.ok_or_else(|| "missing --model <dir> (or GAUDIUM_MODEL env var)".to_string())?;
+    let kernels_dir = kernels_dir
+        .ok_or_else(|| "missing --kernels <dir> (or GAUDIUM_KERNELS env var)".to_string())?;
+
+    let tok = Tokenizer::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+    let prompt_ids: Vec<i32> = if let Some(csv) = prompt_ids_raw {
+        csv.split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                s.trim()
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid token id '{s}'"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let raw_prompt = prompt.unwrap_or_else(|| "The capital of France is".to_string());
+        let formatted = if chat {
+            format_qwen3_chat(&raw_prompt, system_prompt.as_deref(), !no_think)
+        } else {
+            raw_prompt
+        };
+        tok.encode(&formatted, true)
+    };
+
+    if verbose {
+        eprintln!(
+            "[gaudium] prompt_tokens={} ids={:?}",
+            prompt_ids.len(),
+            &prompt_ids[..prompt_ids.len().min(32)]
+        );
+    }
+
+    let mut cfg = Qwen3Config::new(model_dir, kernels_dir);
+    cfg.max_ctx = max_ctx;
+    cfg.cache_dir = cache_dir;
+    cfg.no_cache = no_cache;
+    cfg.verbose = verbose;
+
+    let mut engine = Qwen3Engine::load(&cfg)?;
+
+    let mut decoder = StreamDecoder::new(&tok);
+    let stdout = io::stdout();
+    let report = engine.generate(&prompt_ids, &params, |id| {
+        if !tok.is_special(id) {
+            let chunk = decoder.push(id);
+            if !chunk.is_empty() {
+                let mut lock = stdout.lock();
+                let _ = lock.write_all(chunk.as_bytes());
+                let _ = lock.flush();
+            }
+        }
+    })?;
+
+    let tail = decoder.flush();
+    if !tail.is_empty() {
+        print!("{tail}");
+    }
+    println!();
+
+    if dump_tokens {
+        eprintln!("TOKENS: {:?}", report.generated_tokens);
+    }
+    eprintln!(
+        "[gaudium] prefill: {} tok in {:.1} ms ({:.1} tok/s) | decode: {} tok in {:.1} ms ({:.2} tok/s, {:.2} ms/step) | eos={}",
+        report.prompt_tokens,
+        report.ttft_ms,
+        report.prefill_tok_s,
+        report.generated_tokens.len().saturating_sub(1),
+        report.decode_ms,
+        report.decode_tok_s,
+        report.ms_per_step,
+        report.stopped_by_eos
+    );
+    Ok(())
+}
+
+/// Live hardware end-to-end smoke test on Intel Gaudi 2 (HL-225).
 fn hpu_smoke() -> Result<(), String> {
     let api = Arc::new(SynapseApi::load_default().map_err(|e| e.to_string())?);
     let drv_ver = api.driver_version().map_err(|e| e.to_string())?;
@@ -155,6 +352,10 @@ fn hpu_smoke() -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return;
+    }
     if args.len() == 3 && args[1] == "--inspect-model" {
         if let Err(e) = inspect_model(Path::new(&args[2])) {
             eprintln!("FAIL: {e}");
@@ -162,9 +363,23 @@ fn main() {
         }
         return;
     }
+    if args.len() == 4 && args[1] == "--tokenize" {
+        if let Err(e) = run_tokenize(Path::new(&args[2]), &args[3]) {
+            eprintln!("TOKENIZE FAIL: {e}");
+            process::exit(1);
+        }
+        return;
+    }
     if args.len() == 2 && args[1] == "--hpu-smoke" {
         if let Err(e) = hpu_smoke() {
             eprintln!("HPU SMOKE FAIL: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--generate") {
+        if let Err(e) = run_generate(&args[1..]) {
+            eprintln!("GENERATE FAIL: {e}");
             process::exit(1);
         }
         return;

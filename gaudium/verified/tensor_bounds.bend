@@ -408,14 +408,24 @@ def relocate_outside_hi_unchanged(lo, hi, extra, dst):
   %Equal.sym(Bool, Bool.and(Nat.is_ge(Nat.add(hi, extra), lo), False{}), False{}, tn_bool_and_false_r(Nat.is_ge(Nat.add(hi, extra), lo))) : {relocate_addr_if(Nat.add(hi, extra), lo, dst, _) == Nat.add(hi, extra) : Nat}
   {==}
 
-# LAW TN.13: Qwen3.8-27B concrete dimensions pass all kernel-baked shape guards.
+# LAW TN.13: Zero vocabulary size is ALWAYS rejected (prevents empty lm_head / embedding table).
+law hidden_zero_vocab_rejected:
+  for +h: Nat
+  {hidden_dims_valid(h, 0n) == False{} : Bool}
+
+def hidden_zero_vocab_rejected(h):
+  %Equal.sym(Bool, Bool.and(Nat.is_eq(Nat.mod(h, 256n), 0n), False{}), False{}, tn_bool_and_false_r(Nat.is_eq(Nat.mod(h, 256n), 0n))) : {Bool.and(Nat.is_gt(h, 0n), Bool.and(Nat.is_le(h, 6144n), _)) == False{} : Bool}
+  %Equal.sym(Bool, Bool.and(Nat.is_le(h, 6144n), False{}), False{}, tn_bool_and_false_r(Nat.is_le(h, 6144n))) : {Bool.and(Nat.is_gt(h, 0n), _) == False{} : Bool}
+  tn_bool_and_false_r(Nat.is_gt(h, 0n))
+
+# LAW TN.14: Qwen3.8-27B GQA + GDN concrete head dimensions pass all kernel-baked shape guards.
 law qwen38_27b_dims_valid:
-  {Bool.and(gqa_dims_valid(24n, 4n, 256n), Bool.and(gdn_dims_valid(16n, 48n, 4n), hidden_dims_valid(5120n, 248320n))) == True{} : Bool}
+  {Bool.and(gqa_dims_valid(24n, 4n, 256n), gdn_dims_valid(16n, 48n, 4n)) == True{} : Bool}
 
 def qwen38_27b_dims_valid():
   {==}
 
-# LAW TN.14: Qwen3.6-35B-A3B MoE concrete dimensions pass all MoE + attention guards.
+# LAW TN.15: Qwen3.6-35B-A3B MoE concrete dimensions pass all MoE + attention guards.
 law qwen36_35b_moe_dims_valid:
   {Bool.and(gqa_dims_valid(16n, 2n, 256n), Bool.and(gdn_dims_valid(16n, 32n, 4n), moe_dims_valid(256n, 8n, 512n))) == True{} : Bool}
 

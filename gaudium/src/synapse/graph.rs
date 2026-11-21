@@ -129,6 +129,47 @@ impl GraphBuilder {
         self.add_tensor_in_section(name, dtype, dims, sec, 0)
     }
 
+    /// Returns the existing `TensorId` if a persistent tensor with `name` already exists (verifying
+    /// matching dtype & dims), otherwise creates a new dedicated persistent tensor. Prevents
+    /// duplicate persistent sections bound to the same HBM address (`synLaunch` status 30).
+    pub fn get_or_add_persistent_tensor(
+        &mut self,
+        name: impl Into<String>,
+        dtype: SynDataType,
+        dims: &[u64],
+    ) -> TensorId {
+        let name_str = name.into();
+        for (i, t) in self.tensors.iter().enumerate() {
+            if t.section.is_some() && t.name == name_str {
+                debug_assert_eq!(t.dtype, dtype, "tensor {name_str} dtype mismatch on reuse");
+                debug_assert_eq!(
+                    t.dims.as_slice(),
+                    dims,
+                    "tensor {name_str} dims mismatch on reuse"
+                );
+                return TensorId(i);
+            }
+        }
+        self.add_persistent_tensor(name_str, dtype, dims)
+    }
+
+    /// Lists all persistent tensors declared in this graph as `(name, dtype, dims, byte_size)`.
+    pub fn persistent_tensor_specs(&self) -> Vec<(String, SynDataType, Vec<u64>, u64)> {
+        self.tensors
+            .iter()
+            .filter(|t| t.section.is_some())
+            .map(|t| {
+                let elems: u64 = t.dims.iter().copied().product();
+                (
+                    t.name.clone(),
+                    t.dtype,
+                    t.dims.clone(),
+                    elems.saturating_mul(t.dtype.byte_size()),
+                )
+            })
+            .collect()
+    }
+
     /// Creates a persistent tensor at `byte_offset` inside a shared persistent arena section (V2-ready).
     pub fn add_tensor_in_section(
         &mut self,
@@ -317,6 +358,12 @@ impl GraphBuilder {
         }
 
         // Apply compiler settings, construct graph, compile, and DESTROY graph immediately
+        let use_exp = self.no_pipeline_mgmt || self.no_persistent_reuse;
+        if use_exp {
+            let k = CString::new("ENABLE_EXPERIMENTAL_FLAGS").unwrap();
+            let v = CString::new("true").unwrap();
+            let _ = unsafe { (api.syn_configuration_set)(k.as_ptr(), v.as_ptr()) };
+        }
         if self.no_pipeline_mgmt {
             let k = CString::new("ENABLE_PIPELINE_MANAGEMENT").unwrap();
             let v = CString::new("false").unwrap();
@@ -349,6 +396,11 @@ impl GraphBuilder {
         if self.no_persistent_reuse {
             let k = CString::new("ENABLE_PERSISTENT_OUTPUT_REUSE").unwrap();
             let v = CString::new("true").unwrap();
+            let _ = unsafe { (api.syn_configuration_set)(k.as_ptr(), v.as_ptr()) };
+        }
+        if use_exp {
+            let k = CString::new("ENABLE_EXPERIMENTAL_FLAGS").unwrap();
+            let v = CString::new("false").unwrap();
             let _ = unsafe { (api.syn_configuration_set)(k.as_ptr(), v.as_ptr()) };
         }
 
@@ -611,22 +663,16 @@ impl CompiledRecipe {
         Ok(())
     }
 
-    /// Checked launch enforcing `DeviceGuard`, `RecipeGuard`, complete bindings, and section exclusivity.
-    pub fn launch_checked(
+    /// Pre-validates a fixed binding map once (`verify_launch_bindings`) and materializes the
+    /// `SynLaunchTensorInfoExt` array so hot decode loops launch with zero per-step map lookups
+    /// or heap allocations.
+    pub fn prepare_launch(
         &self,
-        dev: &HpuDevice,
         bindings: &BTreeMap<String, u64>,
-    ) -> Result<(), SynapseError> {
-        dev.guard()
-            .check_launch()
-            .map_err(|e| SynapseError::Guard(format!("device launch refused: {e:?}")))?;
-        self.guard.check_launch().map_err(|e| {
-            SynapseError::Guard(format!("recipe {} launch refused: {e:?}", self.name))
-        })?;
+    ) -> Result<PreparedLaunch, SynapseError> {
         verify_launch_bindings(&self.tensors, bindings, self.ws_size, self.ws_addr).map_err(
             |e| SynapseError::Guard(format!("recipe {} binding check failed: {e:?}", self.name)),
         )?;
-
         let mut launch_infos: Vec<SynLaunchTensorInfoExt> =
             Vec::with_capacity(self.raw_infos.len());
         for (raw, desc) in self.raw_infos.iter().zip(&self.tensors) {
@@ -639,12 +685,31 @@ impl CompiledRecipe {
                 tensor_id: raw.tensor_id,
             });
         }
+        Ok(PreparedLaunch {
+            recipe_name: self.name.clone(),
+            launch_infos,
+        })
+    }
 
+    /// Launches a pre-validated `PreparedLaunch` (zero map lookups, zero allocations), still
+    /// enforcing live `DeviceGuard` and `RecipeGuard` checks.
+    pub fn launch_prepared(
+        &self,
+        dev: &HpuDevice,
+        prepared: &PreparedLaunch,
+    ) -> Result<(), SynapseError> {
+        dev.guard()
+            .check_launch()
+            .map_err(|e| SynapseError::Guard(format!("device launch refused: {e:?}")))?;
+        self.guard.check_launch().map_err(|e| {
+            SynapseError::Guard(format!("recipe {} launch refused: {e:?}", self.name))
+        })?;
+        debug_assert_eq!(prepared.recipe_name, self.name);
         syn_check("synLaunchWithExternalEventsExt", unsafe {
             (self.api.syn_launch_with_external_events_ext)(
                 dev.compute_stream(),
-                launch_infos.as_ptr(),
-                launch_infos.len() as u32,
+                prepared.launch_infos.as_ptr(),
+                prepared.launch_infos.len() as u32,
                 self.ws_addr,
                 self.handle,
                 std::ptr::null_mut(),
@@ -653,6 +718,22 @@ impl CompiledRecipe {
             )
         })
     }
+
+    /// Checked launch enforcing `DeviceGuard`, `RecipeGuard`, complete bindings, and section exclusivity.
+    pub fn launch_checked(
+        &self,
+        dev: &HpuDevice,
+        bindings: &BTreeMap<String, u64>,
+    ) -> Result<(), SynapseError> {
+        let prepared = self.prepare_launch(bindings)?;
+        self.launch_prepared(dev, &prepared)
+    }
+}
+
+/// Pre-validated launch descriptor for zero-allocation hot-path recipe launches.
+pub struct PreparedLaunch {
+    recipe_name: String,
+    launch_infos: Vec<SynLaunchTensorInfoExt>,
 }
 
 impl Drop for CompiledRecipe {

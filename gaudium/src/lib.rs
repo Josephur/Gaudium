@@ -11,12 +11,15 @@ pub mod verified {
 
 pub mod cache_ram;
 pub mod core;
+pub mod engine;
 pub mod fp8;
 pub mod json;
+pub mod kernels;
 pub mod model_spec;
 pub mod moe_cache;
 pub mod proto;
 pub mod safetensors;
 pub mod sampler;
 pub mod synapse;
+pub mod tokenizer;
 pub mod tree;
