@@ -16,6 +16,7 @@ use gaudium::engine::qwen3::{Qwen3Config, Qwen3Engine, Qwen3GenParams, KV_CHUNK}
 use gaudium::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use gaudium::model_spec::ModelSpec;
 use gaudium::safetensors::SafetensorsStore;
+use gaudium::server::{parse_model_arg, run_server, ServerConfig};
 use gaudium::synapse::device::HpuDevice;
 use gaudium::synapse::ffi::{SynDataType, SynapseApi};
 use gaudium::synapse::graph::GraphBuilder;
@@ -33,6 +34,24 @@ fn print_usage() {
          \x20 gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json\n\
          \x20 gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test\n\
          \x20 gaudium --generate [options]              Run live Gaudi 2 LLM generation\n\
+         \x20 gaudium --serve [options]                 Start OpenAI HTTP/SSE + Gaudium Web UI server\n\
+         \n\
+         Serve options:\n\
+         \x20 --host <addr>         Bind address (default: 0.0.0.0)\n\
+         \x20 --port <N>            Bind port (default: 8090)\n\
+         \x20 --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap)\n\
+         \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
+         \x20 --ui-dir <dir>        Gaudium Web UI bundle directory (or GAUDIUM_UI_DIR)\n\
+         \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)\n\
+         \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
+         \x20 --no-cache            Disable on-disk compiled recipe cache\n\
+         \x20 --lazy                Start without holding Gaudi 2; load on first chat/start\n\
+         \x20 --idle-park <secs>    Auto-release Gaudi 2 after N seconds idle (0=off, default: 300)\n\
+         \x20 --api-key <key>       Optional Bearer / X-Api-Key auth token\n\
+         \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
+         \n\
+         Live status environment variables:\n\
+         \x20 GAUDI_LIVE_DIR        Directory for live dashboard JSON records (GAUDI_LIVE=0 disables)\n\
          \n\
          Generate options:\n\
          \x20 --model <dir>         Model directory (or GAUDIUM_MODEL)\n\
@@ -353,6 +372,96 @@ fn hpu_smoke() -> Result<(), String> {
     Ok(())
 }
 
+fn run_serve(args: &[String]) -> Result<(), String> {
+    let mut host = env::var("GAUDIUM_SERVE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let mut port: u16 = env::var("GAUDIUM_SERVE_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8090);
+    let mut models = Vec::new();
+    let mut kernels_dir: Option<PathBuf> = env::var_os("GAUDIUM_KERNELS").map(PathBuf::from);
+    let mut ui_dir: Option<PathBuf> = env::var_os("GAUDIUM_UI_DIR").map(PathBuf::from);
+    let mut max_ctx = KV_CHUNK;
+    let mut cache_dir: Option<PathBuf> = None;
+    let mut no_cache = false;
+    let mut lazy = false;
+    let mut idle_park_secs = 300u64;
+    let mut api_key: Option<String> = env::var("GAUDIUM_API_KEY").ok().filter(|s| !s.is_empty());
+    let mut verbose = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let next_val = |idx: &mut usize, name: &str| -> Result<String, String> {
+            *idx += 1;
+            args.get(*idx)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match flag {
+            "--serve" => {}
+            "--host" => host = next_val(&mut i, "--host")?,
+            "--port" => {
+                let s = next_val(&mut i, "--port")?;
+                port = s.parse().map_err(|_| format!("invalid --port '{s}'"))?;
+            }
+            "--model" => {
+                let s = next_val(&mut i, "--model")?;
+                models.push(parse_model_arg(&s));
+            }
+            "--kernels" => kernels_dir = Some(PathBuf::from(next_val(&mut i, "--kernels")?)),
+            "--ui-dir" => ui_dir = Some(PathBuf::from(next_val(&mut i, "--ui-dir")?)),
+            "--max-ctx" => {
+                let s = next_val(&mut i, "--max-ctx")?;
+                max_ctx = s.parse().map_err(|_| format!("invalid --max-ctx '{s}'"))?;
+            }
+            "--cache-dir" => cache_dir = Some(PathBuf::from(next_val(&mut i, "--cache-dir")?)),
+            "--no-cache" => no_cache = true,
+            "--lazy" => lazy = true,
+            "--idle-park" => {
+                let s = next_val(&mut i, "--idle-park")?;
+                idle_park_secs = s
+                    .parse()
+                    .map_err(|_| format!("invalid --idle-park '{s}'"))?;
+            }
+            "--api-key" => api_key = Some(next_val(&mut i, "--api-key")?),
+            "--verbose" => verbose = true,
+            other => return Err(format!("unknown --serve flag '{other}'")),
+        }
+        i += 1;
+    }
+
+    if models.is_empty() {
+        if let Ok(m) = env::var("GAUDIUM_MODEL") {
+            if !m.is_empty() {
+                models.push(parse_model_arg(&m));
+            }
+        }
+    }
+    let kernels_dir = kernels_dir.ok_or("missing --kernels <dir> (or GAUDIUM_KERNELS)")?;
+    if ui_dir.is_none() {
+        let default_ui = PathBuf::from("ui");
+        if default_ui.is_dir() {
+            ui_dir = Some(default_ui);
+        }
+    }
+
+    run_server(ServerConfig {
+        host,
+        port,
+        models,
+        kernels_dir,
+        ui_dir,
+        max_ctx,
+        cache_dir,
+        no_cache,
+        lazy,
+        idle_park_secs,
+        api_key,
+        verbose,
+    })
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -383,6 +492,13 @@ fn main() {
     if args.iter().any(|a| a == "--generate") {
         if let Err(e) = run_generate(&args[1..]) {
             eprintln!("GENERATE FAIL: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--serve") {
+        if let Err(e) = run_serve(&args[1..]) {
+            eprintln!("SERVE FAIL: {e}");
             process::exit(1);
         }
         return;

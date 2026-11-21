@@ -20,12 +20,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::core::budget::SequenceBudget;
 use crate::engine::packer::WeightPacker;
 use crate::kernels::KernelEnv;
+use crate::live_report::LiveReporter;
 use crate::model_spec::{ModelFamily, ModelSpec};
 use crate::safetensors::SafetensorsStore;
 use crate::sampler::{sample_row, SampleParams};
@@ -107,6 +109,7 @@ pub struct Qwen3GenReport {
     pub decode_tok_s: f64,
     pub ms_per_step: f64,
     pub stopped_by_eos: bool,
+    pub stopped_by_cancel: bool,
 }
 
 /// Required kernel ELFs for plain Qwen3 (`DH=128, NKV=8, GQ=4`).
@@ -759,16 +762,33 @@ pub struct Qwen3Engine {
     step_cursor: u64,
     step_tokens: u64,
     step_logits: u64,
+    hbm_bytes: [u64; 5],
+    live: LiveReporter,
 
     // Device handle (dropped LAST!)
     dev: HpuDevice,
 }
+
+// SAFETY: `Qwen3Engine` exclusively owns its SynapseAI device context, streams, compiled recipes,
+// pinned host buffers, and pre-validated launch descriptors. Moving ownership across threads (e.g.
+// behind a `Mutex` in the HTTP server) is safe because no handle is accessed concurrently.
+unsafe impl Send for Qwen3Engine {}
 
 impl Qwen3Engine {
     /// Initializes the Gaudi 2 device, validates the model against the verified core, compiles/loads
     /// core recipes, plans & seals HBM arenas (`AllocGuard`), and uploads Safetensors weights.
     pub fn load(cfg: &Qwen3Config) -> Result<Self, String> {
         let t_start = Instant::now();
+        let live =
+            LiveReporter::from_env("gaudium-rust", env!("CARGO_PKG_VERSION"), "engine", true);
+        let model_name = cfg
+            .model_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("gaudium-model")
+            .to_string();
+        live.set_model(&model_name);
+        live.set_phase("loading", "opening device and compiling recipes");
 
         let spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
             .map_err(|e| format!("load config.json: {e}"))?;
@@ -1133,6 +1153,23 @@ impl Qwen3Engine {
         dev.seal_with_shared_workspace(ws_bytes)
             .map_err(|e| format!("seal HBM allocations: {e}"))?;
 
+        let kv_only_bytes = kv_bytes.saturating_sub(gdn_state_bytes);
+        let hbm_bytes = [
+            weights_bytes,
+            kv_only_bytes,
+            gdn_state_bytes,
+            act_bytes,
+            ws_bytes,
+        ];
+        live.set_hbm_bytes(
+            hbm_bytes[0],
+            hbm_bytes[1],
+            hbm_bytes[2],
+            hbm_bytes[3],
+            hbm_bytes[4],
+        );
+        live.set_phase("loading", "uploading weights to HBM");
+
         head_t1
             .bind_shared_workspace(&dev)
             .map_err(|e| format!("bind head_T1 ws: {e}"))?;
@@ -1244,6 +1281,8 @@ impl Qwen3Engine {
         let step_tokens = *step_act_addr.get("tokens").ok_or("missing step 'tokens'")?;
         let step_logits = *step_act_addr.get("logits").ok_or("missing step 'logits'")?;
 
+        live.set_phase("idle", "ready");
+
         Ok(Self {
             spec,
             max_ctx,
@@ -1274,6 +1313,8 @@ impl Qwen3Engine {
             step_cursor,
             step_tokens,
             step_logits,
+            hbm_bytes,
+            live,
             dev,
         })
     }
@@ -1284,6 +1325,11 @@ impl Qwen3Engine {
 
     pub fn max_ctx(&self) -> u64 {
         self.max_ctx
+    }
+
+    /// Exact 5-category HBM ledger bytes `[weights, kv, state, scratch, workspace]`.
+    pub fn hbm_bytes(&self) -> [u64; 5] {
+        self.hbm_bytes
     }
 
     /// Zeroes all KV caches and GDN initial recurrent/conv states (slot 0) before a new request.
@@ -1421,6 +1467,18 @@ impl Qwen3Engine {
         &mut self,
         prompt_ids: &[i32],
         params: &Qwen3GenParams,
+        on_token: impl FnMut(i32),
+    ) -> Result<Qwen3GenReport, String> {
+        self.generate_cancellable(prompt_ids, params, None, on_token)
+    }
+
+    /// Like `generate`, but checks `cancel` cleanly between prefill tiles and after each synced
+    /// decode step so no Synapse launch is ever left queued on cancellation.
+    pub fn generate_cancellable(
+        &mut self,
+        prompt_ids: &[i32],
+        params: &Qwen3GenParams,
+        cancel: Option<&AtomicBool>,
         mut on_token: impl FnMut(i32),
     ) -> Result<Qwen3GenReport, String> {
         if prompt_ids.is_empty() {
@@ -1438,13 +1496,44 @@ impl Qwen3Engine {
             }
         }
         let is_eos = |tok: i32| eos_ids.contains(&tok);
+        let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
 
+        let method_label = if params.temperature > 0.0 {
+            format!("K=0 BF16 T={:.2}", params.temperature)
+        } else {
+            "K=0 BF16 greedy".to_string()
+        };
+        self.live
+            .begin_request(prompt_ids.len() as u64, &method_label, "");
+
+        let res = self.run_generate_inner(
+            prompt_ids,
+            params,
+            &mut budget,
+            &is_eos,
+            &is_cancelled,
+            &mut on_token,
+        );
+        self.live.end_request();
+        res
+    }
+
+    fn run_generate_inner(
+        &mut self,
+        prompt_ids: &[i32],
+        params: &Qwen3GenParams,
+        budget: &mut SequenceBudget,
+        is_eos: &impl Fn(i32) -> bool,
+        is_cancelled: &impl Fn() -> bool,
+        on_token: &mut impl FnMut(i32),
+    ) -> Result<Qwen3GenReport, String> {
         self.clear_request_state()?;
         let mut gdn_parity: usize = 0;
 
         let t_prefill = Instant::now();
         let mut generated = Vec::with_capacity(budget.max_new() as usize);
         let mut stopped_by_eos = false;
+        let mut stopped_by_cancel = false;
 
         // ---- PREFILL PHASE ----
         let first_tok: i32 = if prompt_ids.len() == 1 {
@@ -1467,6 +1556,10 @@ impl Qwen3Engine {
             let mut last_tile_len = 0u64;
 
             while pos < prompt_ids.len() {
+                if is_cancelled() {
+                    stopped_by_cancel = true;
+                    break;
+                }
                 let tile_len = (prompt_ids.len() - pos).min(self.prefill_tile as usize) as u64;
                 let end_pos = (pos as u64) + tile_len;
                 let nch = end_pos.div_ceil(KV_CHUNK).clamp(1, self.max_chunks);
@@ -1583,6 +1676,21 @@ impl Qwen3Engine {
                 pos += tile_len as usize;
             }
 
+            if stopped_by_cancel {
+                let ttft_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+                return Ok(Qwen3GenReport {
+                    prompt_tokens: prompt_ids.len(),
+                    generated_tokens: generated,
+                    ttft_ms,
+                    prefill_tok_s: 0.0,
+                    decode_ms: 0.0,
+                    decode_tok_s: 0.0,
+                    ms_per_step: 0.0,
+                    stopped_by_eos: false,
+                    stopped_by_cancel: true,
+                });
+            }
+
             // Launch shared head_T1 directly on the last prompt token's hidden row!
             let final_x_base = if n_layers.is_multiple_of(2) {
                 self.pf_x0
@@ -1628,13 +1736,16 @@ impl Qwen3Engine {
         let ttft_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         let prefill_tok_s = (prompt_ids.len() as f64) / (ttft_ms / 1000.0).max(1e-9);
 
-        if budget.remaining() > 0 {
+        if budget.remaining() > 0 && !is_cancelled() {
             budget.record_emitted(1);
             generated.push(first_tok);
+            self.live.first_token(Some(ttft_ms), 1);
             on_token(first_tok);
             if params.stop_on_eos && is_eos(first_tok) {
                 stopped_by_eos = true;
             }
+        } else if is_cancelled() {
+            stopped_by_cancel = true;
         }
 
         // ---- DECODE PHASE (1 monolithic synLaunch per token, ping-pong GDN parity!) ----
@@ -1642,7 +1753,11 @@ impl Qwen3Engine {
         let mut cur_tok = first_tok;
         let mut decode_steps = 0usize;
 
-        while !stopped_by_eos && budget.remaining() > 0 {
+        while !stopped_by_eos && !stopped_by_cancel && budget.remaining() > 0 {
+            if is_cancelled() {
+                stopped_by_cancel = true;
+                break;
+            }
             let cursor_val = (prompt_ids.len() + decode_steps) as u64;
             let nch = (cursor_val + 1)
                 .div_ceil(KV_CHUNK)
@@ -1668,6 +1783,7 @@ impl Qwen3Engine {
             decode_steps += 1;
             budget.record_emitted(1);
             generated.push(next_tok);
+            self.live.step(1, 0, 0);
             on_token(next_tok);
             cur_tok = next_tok;
 
@@ -1697,6 +1813,7 @@ impl Qwen3Engine {
             decode_tok_s,
             ms_per_step,
             stopped_by_eos,
+            stopped_by_cancel,
         })
     }
 }
