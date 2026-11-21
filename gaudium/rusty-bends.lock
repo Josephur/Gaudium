@@ -1,24 +1,82 @@
+2bf79af1179eb9b8  align_up_never_shrinks  law align_up_never_shrinks : for + x : Nat for + a : Nat { Nat.is_le ( x , align_up ( x , a ) ) == True { } : Bool }
+bafa9500c7a2bc5f  align_up_zero_align_safe  law align_up_zero_align_safe : for + x : Nat { align_up ( x , 0n ) == x : Nat }
+b78c36cf6b175755  bucket_zero_invalid  law bucket_zero_invalid : { bucket_valid ( 0n ) == False { } : Bool }
 cc2d96177d64bd71  dev_alloc_launch_disjoint  law dev_alloc_launch_disjoint : for + s : DevState { Bool.and ( dev_can_alloc ( s ) , dev_can_launch ( s ) ) == False { } : Bool }
 66013e0cb837f25a  dev_closed_absorbing  law dev_closed_absorbing : for ev : DevEvent { dev_step ( DevClosed { } , ev ) == DevClosed { } : DevState }
 ebbddef48543f39e  dev_drain_blocks_all  law dev_drain_blocks_all : for + s : DevState { Bool.or ( dev_can_alloc ( dev_drain ( s ) ) , Bool.or ( dev_can_dma ( dev_drain ( s ) ) , dev_can_launch ( dev_drain ( s ) ) ) ) == False { } : Bool }
 55d549147ef088a6  dev_drain_idempotent  law dev_drain_idempotent : for s : DevState { dev_drain ( dev_drain ( s ) ) == dev_drain ( s ) : DevState }
+a09474b00bc19d2b  effective_max_new_le_room  law effective_max_new_le_room : for unb : Bool for + req : Nat for + p : Nat for + lmax : Nat { Nat.is_le ( effective_max_new ( unb , req , p , lmax ) , prompt_room ( p , lmax ) ) == True { } : Bool }
+b8a418606825f53b  empty_prompt_rejected  law empty_prompt_rejected : for lmax : Nat { prompt_admitted ( 0n , lmax ) == False { } : Bool }
+9334163f983bbf1f  g4_31b_heads_valid  law g4_31b_heads_valid : { Bool.and ( g4_heads_valid ( 16n , 8n , 256n , 128n ) , g4_heads_valid ( 16n , 4n , 512n , 128n ) ) == True { } : Bool }
+c74c47153e6fb0be  g4_audio_zero_left_rejected  law g4_audio_zero_left_rejected : for ar : Nat { g4_audio_ctx_valid ( 0n , ar ) == False { } : Bool }
+6bc6fbd345acaeea  g4_heads_zero_dh_rejected  law g4_heads_zero_dh_rejected : for + nh : Nat for + nkv : Nat for + p : Nat { g4_heads_valid ( nh , nkv , 0n , p ) == False { } : Bool }
+d556bde2ff41c207  g4_heads_zero_kv_rejected  law g4_heads_zero_kv_rejected : for + nh : Nat for + dh : Nat for + p : Nat { g4_heads_valid ( nh , 0n , dh , p ) == False { } : Bool }
+b92e3f940df9aed8  g4_kv_share_all_rejected  law g4_kv_share_all_rejected : for + nl : Nat for + extra : Nat { g4_kv_share_valid ( nl , Nat.add ( nl , extra ) ) == False { } : Bool }
+c53430ffbf275392  g4_ple_off_always_valid  law g4_ple_off_always_valid : for pv : Nat for v : Nat { g4_ple_valid ( 0n , pv , v ) == True { } : Bool }
+629829a88fd02c54  g4_rope_vecs_boundary  law g4_rope_vecs_boundary : { Bool.and ( Nat.is_eq ( g4_rope_vecs ( 0n ) , 0n ) , Nat.is_eq ( g4_rope_vecs ( 128n ) , 1n ) ) == True { } : Bool }
+13a2fa8783059771  gdn_zero_k_rejected  law gdn_zero_k_rejected : for + vh : Nat for ck : Nat { gdn_dims_valid ( 0n , vh , ck ) == False { } : Bool }
+53fe9947235719b6  gqa_zero_kv_rejected  law gqa_zero_kv_rejected : for + nh : Nat for + dh : Nat { gqa_dims_valid ( nh , 0n , dh ) == False { } : Bool }
+22d66bf5996db2a1  greedy_request_always_admitted  law greedy_request_always_admitted : for cap : Bool { sampling_request_admitted ( cap , False { } ) == True { } : Bool }
+517d5b7e787fa37f  hbm_fit_partition_exact  law hbm_fit_partition_exact : for + p : Nat for + u : Nat { hbm_fit_reconstruct_lhs ( hbm_check_fit ( p , u ) , p , u ) == hbm_fit_reconstruct_rhs ( hbm_check_fit ( p , u ) , p , u ) : Nat }
+f81a59d79982e9f9  hbm_ledger_add_conserved  law hbm_ledger_add_conserved : for + w : Nat for + kv : Nat for + ck : Nat for + sc : Nat for + ot : Nat for cat : HbmCat for + b : Nat { hbm_ledger_total ( hbm_ledger_add ( HbmLedger { w , kv , ck , sc , ot } , cat , b ) ) == Nat.add ( hbm_ledger_total ( HbmLedger { w , kv , ck , sc , ot } ) , b ) : Nat }
+7dbbb48200f8d4a4  hbm_prefix_slots_bounded_by_req  law hbm_prefix_slots_bounded_by_req : for + req : Nat for + sb : Nat for + bp : Nat for + u : Nat { Nat.is_le ( hbm_grant_prefix_slots ( req , sb , bp , u ) , req ) == True { } : Bool }
+09c88ccc963f74d8  hbm_prefix_slots_zero_bytes_safe  law hbm_prefix_slots_zero_bytes_safe : for + req : Nat for + bp : Nat for + u : Nat { hbm_grant_prefix_slots ( req , 0n , bp , u ) == 0n : Nat }
+9b6a2afddc86aed9  hbm_prefix_slots_zero_when_context_over  law hbm_prefix_slots_zero_when_context_over : for + req : Nat for + sb : Nat for + u : Nat for + extra : Nat { hbm_grant_prefix_slots ( req , sb , Nat.add ( u , 1n + extra ) , u ) == 0n : Nat }
+7d4cf812aaad6ae8  hbm_usable_le_total  law hbm_usable_le_total : for + t : Nat for + b : Nat for + s : Nat { Nat.is_le ( hbm_usable ( t , b , s ) , t ) == True { } : Bool }
+b7e5987616afd237  hbm_usable_zero_when_exceeded  law hbm_usable_zero_when_exceeded : for + t : Nat for + extra : Nat for + spare : Nat { hbm_usable ( t , Nat.add ( t , extra ) , spare ) == 0n : Nat }
+08cdd002a2423f2d  hidden_zero_rejected  law hidden_zero_rejected : for + v : Nat { hidden_dims_valid ( 0n , v ) == False { } : Bool }
+7ab60bcdca0eaca5  hidden_zero_vocab_rejected  law hidden_zero_vocab_rejected : for + h : Nat { hidden_dims_valid ( h , 0n ) == False { } : Bool }
+ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat for + k : Nat for + b : Nat for + lmax : Nat { Nat.is_le ( kv_high_water ( p , c , k , b , lmax ) , lmax ) == True { } : Bool }
 3ddfe8a0a0c54651  lane_busy_blocks_exclusive  law lane_busy_blocks_exclusive : for b : Nat for max_lanes : Nat { lane_can_admit ( 1n + b , max_lanes , False { } , True { } ) == False { } : Bool }
 3f71bff599d5e309  lane_exclusive_blocks_all  law lane_exclusive_blocks_all : for busy : Nat for max_lanes : Nat for want_excl : Bool { lane_can_admit ( busy , max_lanes , True { } , want_excl ) == False { } : Bool }
 4775d7007e9e1d84  lane_full_blocks_shared  law lane_full_blocks_shared : for + cap : Nat for excl : Bool { lane_can_admit ( cap , cap , excl , False { } ) == False { } : Bool }
+ba223807cabf30d6  moe_zero_experts_rejected  law moe_zero_experts_rejected : for + ek : Nat for + ef : Nat { moe_dims_valid ( 0n , ek , ef ) == False { } : Bool }
+1b6bb5e0fe9aa632  oversized_prompt_rejected  law oversized_prompt_rejected : for + lmax : Nat for + extra : Nat { prompt_admitted ( Nat.add ( served_ctx ( lmax ) , extra ) , lmax ) == False { } : Bool }
+84e37afe4c2e2159  pfx_reuse_at_prompt_end_false  law pfx_reuse_at_prompt_end_false : for + p : Nat for lcp : Nat for + tile : Nat for nm : Bool for mu : Nat for nd : Bool for du : Nat { pfx_reuse_valid ( p , lcp , p , tile , nm , mu , nd , du ) == False { } : Bool }
+88c72e192da91a43  pfx_reuse_zero_lcp_false  law pfx_reuse_zero_lcp_false : for + pos : Nat for p : Nat for + tile : Nat for nm : Bool for mu : Nat for nd : Bool for du : Nat { pfx_reuse_valid ( pos , 0n , p , tile , nm , mu , nd , du ) == False { } : Bool }
+562f7a385f56ce0b  pin_partial_never_usable  law pin_partial_never_usable : for m : Nat { pin_is_usable ( PinPartial { m } ) == False { } : Bool }
+d988530d3e062cc3  pin_rollback_idempotent_and_absorbing  law pin_rollback_idempotent_and_absorbing : for s : PinState for last : Bool { Bool.and ( Nat.is_eq ( pin_mapped_count ( pin_rollback ( pin_rollback ( s ) ) ) , 0n ) , Bool.not ( pin_is_usable ( pin_add_extent ( pin_rollback ( s ) , last ) ) ) ) == True { } : Bool }
+b9ae717603d6847a  pin_rollback_leaves_zero_mapped  law pin_rollback_leaves_zero_mapped : for s : PinState { pin_mapped_count ( pin_rollback ( s ) ) == 0n : Nat }
+fb68ef776588f49d  pool_alloc_conserved  law pool_alloc_conserved : for + a : Nat for + f : Nat for + req : Nat { pool_total ( pool_alloc ( PoolAcct { a , f } , req ) ) == Nat.add ( a , f ) : Nat }
+3b361c056a362005  pool_blocks_for_zero_blocksize_safe  law pool_blocks_for_zero_blocksize_safe : for bytes : Nat { pool_blocks_for ( bytes , 0n ) == 0n : Nat }
+629df579b2948887  pool_blocks_for_zero_bytes  law pool_blocks_for_zero_bytes : for + b : Nat { pool_blocks_for ( 0n , b ) == 0n : Nat }
+504161b525faee92  pool_busy_never_evicted  law pool_busy_never_evicted : for pins : Nat { pool_can_evict ( pins , True { } ) == False { } : Bool }
+aa76434870811052  pool_double_free_noop  law pool_double_free_noop : for + a : Nat for + f : Nat for + extra : Nat { pool_free ( PoolAcct { a , f } , Nat.add ( a , 1n + extra ) ) == PoolAcct { a , f } : PoolAcct }
+b30c6bd81672818b  pool_free_conserved  law pool_free_conserved : for + a : Nat for + f : Nat for + rel : Nat { pool_total ( pool_free ( PoolAcct { a , f } , rel ) ) == Nat.add ( a , f ) : Nat }
+f37e1ea922e84f0b  pool_init_conserved  law pool_init_conserved : for cap : Nat { pool_total ( pool_init ( cap ) ) == cap : Nat }
+4eccdf8143fa6c1e  pool_oob_block_rejected  law pool_oob_block_rejected : for + cap : Nat for + extra : Nat { pool_block_in_bounds ( Nat.add ( cap , extra ) , cap ) == False { } : Bool }
+59241ade773e071d  pool_oom_alloc_noop  law pool_oom_alloc_noop : for + a : Nat for + f : Nat for + extra : Nat { pool_alloc ( PoolAcct { a , f } , Nat.add ( f , 1n + extra ) ) == PoolAcct { a , f } : PoolAcct }
+e7c4808878bc6e78  pool_pinned_never_evicted  law pool_pinned_never_evicted : for p : Nat for busy : Bool { pool_can_evict ( 1n + p , busy ) == False { } : Bool }
+2afc489632120517  qwen36_35b_moe_dims_valid  law qwen36_35b_moe_dims_valid : { Bool.and ( gqa_dims_valid ( 16n , 2n , 256n ) , Bool.and ( gdn_dims_valid ( 16n , 32n , 4n ) , moe_dims_valid ( 256n , 8n , 512n ) ) ) == True { } : Bool }
+b4326499ace96154  qwen38_27b_dims_valid  law qwen38_27b_dims_valid : { Bool.and ( gqa_dims_valid ( 24n , 4n , 256n ) , gdn_dims_valid ( 16n , 48n , 4n ) ) == True { } : Bool }
 f1cbe1206fb49073  recipe_destroy_idempotent  law recipe_destroy_idempotent : for s : RecipeState { recipe_step ( recipe_step ( s , EvRecDestroy { } ) , EvRecDestroy { } ) == recipe_step ( s , EvRecDestroy { } ) : RecipeState }
 836167e72b5b07af  recipe_destroyed_absorbing  law recipe_destroyed_absorbing : for ev : RecipeEvent { recipe_step ( RecDestroyed { } , ev ) == RecDestroyed { } : RecipeState }
 49ef901098934384  recipe_sealed_ws_overflow_fails  law recipe_sealed_ws_overflow_fails : { recipe_bind_ws ( RecCompiled { } , False { } , True { } ) == RecWsFailed { } : RecipeState }
 5f951be29cb5f043  recipe_shared_fit_binds  law recipe_shared_fit_binds : for sealed : Bool { recipe_bind_ws ( RecCompiled { } , True { } , sealed ) == RecWsBound { } : RecipeState }
 a1e1d13137bf7fec  recipe_ws_fail_never_launches  law recipe_ws_fail_never_launches : { recipe_can_launch ( RecWsFailed { } ) == False { } : Bool }
+ef5581aa41edbb3c  relocate_outside_hi_unchanged  law relocate_outside_hi_unchanged : for + lo : Nat for + hi : Nat for + extra : Nat for dst : Nat { relocate_addr ( Nat.add ( hi , extra ) , lo , hi , dst ) == Nat.add ( hi , extra ) : Nat }
+86a3f7e429ec2b6a  relocate_preserves_lo  law relocate_preserves_lo : for + lo : Nat for + span : Nat for + dst : Nat { relocate_addr ( lo , lo , Nat.add ( lo , 1n + span ) , dst ) == dst : Nat }
+4e29b494852f35ad  remaining_monotone_step  law remaining_monotone_step : for + sent : Nat for + m : Nat { Nat.is_le ( remaining_budget ( 1n + sent , m ) , remaining_budget ( sent , m ) ) == True { } : Bool }
+1f4af7eeefaac3d0  remaining_zero_at_limit  law remaining_zero_at_limit : for + m : Nat for + over : Nat { remaining_budget ( Nat.add ( m , over ) , m ) == 0n : Nat }
 50e5c88a1ed73b76  req_cancel_idempotent  law req_cancel_idempotent : for s : ReqState { req_cancel ( req_cancel ( s ) ) == req_cancel ( s ) : ReqState }
 4156536946afa0e3  req_terminal_absorbing  law req_terminal_absorbing : for + s : ReqState for ev : ReqEvent { Bool.or ( Bool.not ( req_is_terminal ( s ) ) , req_eq ( req_step ( s , ev ) , s ) ) == True { } : Bool }
 83030691075e6413  router_no_switch_while_active  law router_no_switch_while_active : for act : Nat for st : BackendState { router_can_switch ( 1n + act , st ) == False { } : Bool }
 c2cbe6cec354675c  router_no_switch_while_loading  law router_no_switch_while_loading : for act : Nat { router_can_switch ( act , BeLoading { } ) == False { } : Bool }
 b4a7e0b48da9b054  router_no_switch_while_ready  law router_no_switch_while_ready : for act : Nat { router_can_switch ( act , BeReady { } ) == False { } : Bool }
 2e1a09ee017289ea  router_no_switch_while_stopping  law router_no_switch_while_stopping : for act : Nat { router_can_switch ( act , BeStopping { } ) == False { } : Bool }
+26b5224cfa7d2e55  sampler_join_assoc  law sampler_join_assoc : for a : SamplerFamily for b : SamplerFamily for c : SamplerFamily { sampler_family_join ( sampler_family_join ( a , b ) , c ) == sampler_family_join ( a , sampler_family_join ( b , c ) ) : SamplerFamily }
+19191af27260d856  sampler_join_comm  law sampler_join_comm : for a : SamplerFamily for b : SamplerFamily { sampler_family_join ( a , b ) == sampler_family_join ( b , a ) : SamplerFamily }
+ef3164b94e9c8972  sampler_join_idem  law sampler_join_idem : for a : SamplerFamily { sampler_family_join ( a , a ) == a : SamplerFamily }
+e8d3c1badf2d23ad  served_ctx_above_reserve  law served_ctx_above_reserve : for + extra : Nat { served_ctx ( Nat.add ( 128n , extra ) ) == extra : Nat }
+d969f0265d42f716  served_ctx_le_lmax  law served_ctx_le_lmax : for + lmax : Nat { Nat.is_le ( served_ctx ( lmax ) , lmax ) == True { } : Bool }
 31193373364a99fe  slot_fill_never_overwrites_readable  law slot_fill_never_overwrites_readable : for + s : SlotState { Bool.and ( slot_is_readable ( s ) , slot_is_writable ( slot_begin_fill ( s ) ) ) == False { } : Bool }
 10198e983a5b22c0  slot_quiesce_at_exact_epoch  law slot_quiesce_at_exact_epoch : for + ep : Nat { slot_quiesce ( SlotRetiringEpoch { ep } , ep ) == SlotFree { } : SlotState }
 14be0b19eae0c42a  slot_quiesce_before_epoch_stays_retiring  law slot_quiesce_before_epoch_stays_retiring : for + c : Nat { slot_quiesce ( SlotRetiringEpoch { 1n + c } , c ) == SlotRetiringEpoch { 1n + c } : SlotState }
 86f508a366b3132a  slot_rollback_roundtrip  law slot_rollback_roundtrip : { slot_rollback_retire ( slot_begin_retire ( SlotReady { } ) ) == SlotReady { } : SlotState }
 dfce56566b9352f7  slot_rw_disjoint  law slot_rw_disjoint : for + s : SlotState { Bool.and ( slot_is_readable ( s ) , slot_is_writable ( s ) ) == False { } : Bool }
 a7ddf0cb7323bd51  slot_unbound_never_quiesces  law slot_unbound_never_quiesces : for completed : Nat { slot_quiesce ( SlotRetiringUnbound { } , completed ) == SlotRetiringUnbound { } : SlotState }
+8bbd01462fd1da03  top_k_clamped_to_vocab  law top_k_clamped_to_vocab : for + k : Nat for + v : Nat { Nat.is_le ( clamp_top_k ( k , v ) , v ) == True { } : Bool }
+fb48a38269eaafac  tree_over_max_nodes_rejected  law tree_over_max_nodes_rejected : for + mn : Nat for + extra : Nat for + sp : Nat for md : Nat for tk : Nat { tree_shape_bounds_valid ( Nat.add ( mn , 1n + extra ) , sp , mn , md , tk ) == False { } : Bool }
+f438ba027c288a28  tree_self_parent_rejected  law tree_self_parent_rejected : for + i : Nat for + d : Nat for pd : Nat for r : Nat for + sp : Nat for tk : Nat { tree_node_valid ( i , i , d , pd , r , sp , tk ) == False { } : Bool }
+09ae686fe3d30743  unsupported_method_refuses_sampling  law unsupported_method_refuses_sampling : { sampling_request_admitted ( False { } , True { } ) == False { } : Bool }
+bf27fed2cf696824  vit_zero_h_rejected  law vit_zero_h_rejected : for + t : Nat for + w : Nat for m : Nat { vit_grid_valid ( t , 0n , w , m ) == False { } : Bool }
