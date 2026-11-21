@@ -76,6 +76,8 @@ pub struct ModelSpec {
     // Qwen3.5 / 3.6 / 3.8 Gated DeltaNet fields (0 when absent)
     pub gdn_k_heads: u64,
     pub gdn_v_heads: u64,
+    pub gdn_k_dim: u64,
+    pub gdn_v_dim: u64,
     pub gdn_conv_k: u64,
     // MoE fields (0 when dense)
     pub n_experts: u64,
@@ -262,6 +264,26 @@ impl ModelSpec {
 
         let gdn_k_heads = u64_field(tc, "linear_num_key_heads");
         let gdn_v_heads = u64_field(tc, "linear_num_value_heads");
+        let gdn_k_dim = {
+            let v = u64_field(tc, "linear_key_head_dim");
+            if v > 0 {
+                v
+            } else if gdn_k_heads > 0 {
+                128
+            } else {
+                0
+            }
+        };
+        let gdn_v_dim = {
+            let v = u64_field(tc, "linear_value_head_dim");
+            if v > 0 {
+                v
+            } else if gdn_v_heads > 0 {
+                128
+            } else {
+                0
+            }
+        };
         let gdn_conv_k = u64_field(tc, "linear_conv_kernel_dim");
 
         let n_experts = u64_field(tc, "num_experts");
@@ -367,6 +389,8 @@ impl ModelSpec {
             layer_types,
             gdn_k_heads,
             gdn_v_heads,
+            gdn_k_dim,
+            gdn_v_dim,
             gdn_conv_k,
             n_experts,
             experts_per_tok,
@@ -487,6 +511,33 @@ impl ModelSpec {
     /// Output dimension of `k_proj` / `v_proj`: `NKV * DH`.
     pub fn kv_dim(&self) -> u64 {
         self.n_kv_heads * self.head_dim
+    }
+
+    pub fn is_full_attention_layer(&self, layer: usize) -> bool {
+        self.layer_types
+            .get(layer)
+            .map(|t| t.as_str() == "full_attention")
+            .unwrap_or(true)
+    }
+
+    /// Gated DeltaNet `QKV = 2 * HK * DK + HV * DV` (e.g. `10240` for Qwen3.8-27B).
+    pub fn gdn_qkv_dim(&self) -> u64 {
+        2 * self.gdn_k_heads * self.gdn_k_dim + self.gdn_v_heads * self.gdn_v_dim
+    }
+
+    /// Gated DeltaNet `QKVZ = QKV + HV * DV` (e.g. `16384` for Qwen3.8-27B).
+    pub fn gdn_qkvz_dim(&self) -> u64 {
+        self.gdn_qkv_dim() + self.gdn_v_heads * self.gdn_v_dim
+    }
+
+    /// Padded gate-kernel lane count `HVP = ceil(HV / 64) * 64` (e.g. `64` for `HV = 48`).
+    pub fn gdn_hvp(&self) -> u64 {
+        self.gdn_v_heads.div_ceil(64) * 64
+    }
+
+    /// Gated DeltaNet `W_ba` output width `BA = 2 * HVP` (interleaved `[b, a]`, zero-padded).
+    pub fn gdn_ba_dim(&self) -> u64 {
+        2 * self.gdn_hvp()
     }
 }
 

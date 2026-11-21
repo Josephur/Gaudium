@@ -174,6 +174,9 @@ fn run_generate(args: &[String]) -> Result<(), String> {
         .ok_or_else(|| "missing --kernels <dir> (or GAUDIUM_KERNELS env var)".to_string())?;
 
     let tok = Tokenizer::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+    if let Some(im_end) = tok.token_id("<|im_end|>") {
+        params.extra_eos_ids.push(im_end);
+    }
     let prompt_ids: Vec<i32> = if let Some(csv) = prompt_ids_raw {
         csv.split(',')
             .filter(|s| !s.trim().is_empty())
