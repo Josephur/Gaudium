@@ -1,7 +1,7 @@
 # Gaudium Gaudi 2 TPC-C kernels & Synapse GC glue build.
 # Run on a host/container with the Intel Gaudi SDK (tpc-clang + /usr/include/habanalabs).
 #
-#   make -j16              Build all TPC-C kernels + libgaudium_tpc.so + libgaudium_ga.so
+#   make -j16              Build all TPC-C kernels + libgaudium_tpc.so + libgaudium_ga.so + libgaudium_st.so
 #   make -j16 qwen3        Build the minimal Qwen3-8B kernel subset + libgaudium_tpc.so
 #   make glue              Build only the Synapse Graph Compiler glue plugins
 #   make clean             Remove built kernel artifacts in $(KDIR)
@@ -17,12 +17,14 @@ CXX        ?= g++
 HABANA_INC ?= /usr/include/habanalabs
 
 .PHONY: all qwen3 glue clean
+# kernels.mk (included next) starts with per-ELF rules: without this a bare `make` would build only its first object
+.DEFAULT_GOAL := all
 
 include $(TPC_SRC)/kernels.mk
 
-all: $(KERNEL_OBJS) $(KDIR)/libgaudium_tpc.so $(KDIR)/libgaudium_ga.so
+all: $(KERNEL_OBJS) $(KDIR)/libgaudium_tpc.so $(KDIR)/libgaudium_ga.so $(KDIR)/libgaudium_st.so
 
-glue: $(KDIR)/libgaudium_tpc.so $(KDIR)/libgaudium_ga.so
+glue: $(KDIR)/libgaudium_tpc.so $(KDIR)/libgaudium_ga.so $(KDIR)/libgaudium_st.so
 
 QWEN3_OBJS := \
   $(KDIR)/attn128_prep_g8q4_gaudi2.o \

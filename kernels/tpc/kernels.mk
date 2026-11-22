@@ -555,3 +555,16 @@ $(KDIR)/moe_mgather_gaudi2.o: $(TPC_SRC)/moe_mme_gc_gaudi2.c $(MME_DEPS) | $(KDI
 $(KDIR)/moe_mcomb_gaudi2.o: $(TPC_SRC)/moe_mme_gc_gaudi2.c $(MME_DEPS) | $(KDIR)
 	cd $(TPC_SRC) && $(TPC_CC) -march=gaudi2 -O2 -ffp-contract=off -x c++ -c $(notdir $<) -o $@
 KERNEL_OBJS += $(KDIR)/moe_mdq13_gaudi2.o $(KDIR)/moe_mdq13w8_gaudi2.o $(KDIR)/moe_mdq2_gaudi2.o $(KDIR)/moe_mdq2w8_gaudi2.o $(KDIR)/moe_mswiglu_gaudi2.o $(KDIR)/moe_mgather_gaudi2.o $(KDIR)/moe_mcomb_gaudi2.o
+
+# step kernels added after the first kernel set, with their own glue plugin (libgaudium_st.so beside libgaudium_tpc.so in
+# GC_KERNEL_PATH, so that library stays the same binary and recipes without these kernels keep their recipe-cache keys)
+# gdn_f32r: the verify-row recurrence without per-row state checkpoints (the accepted rows' updates are applied again by the next step)
+$(KDIR)/gdn_f32r_gaudi2.o: $(TPC_SRC)/gdn_f32r_gaudi2.c | $(KDIR)
+	cd $(TPC_SRC) && $(TPC_CC) -march=gaudi2 -O2 -x c++ -c $(notdir $<) -o $@
+KERNEL_OBJS += $(KDIR)/gdn_f32r_gaudi2.o
+# gdn_f32v: the slotted row recurrence with its per-row gate scalars as vector loads (bit-identical to gdn_f32s)
+$(KDIR)/gdn_f32v_gaudi2.o: $(TPC_SRC)/gdn_f32v_gaudi2.c | $(KDIR)
+	cd $(TPC_SRC) && $(TPC_CC) -march=gaudi2 -O2 -x c++ -c $(notdir $<) -o $@
+KERNEL_OBJS += $(KDIR)/gdn_f32v_gaudi2.o
+$(KDIR)/libgaudium_st.so: $(GLUE_SRC)/st_glue.cpp $(GLUE_SRC)/elf_record.inc | $(KDIR)
+	$(CXX) -O2 -std=c++17 -fPIC -shared -I$(HABANA_INC) $< -o $@
