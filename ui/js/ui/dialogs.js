@@ -153,6 +153,7 @@ export function CardDialog({ engine, hello, live, onClose, onAction, now, engine
       ${e.last_error ? html`<dt>last error</dt><dd style="color:var(--bad)">${e.last_error}</dd>` : null}
     </dl></div>
     <div class="card-sec"><h3>Model</h3><dl class="kv">
+      ${Array.isArray(e.models) && e.models.length > 1 ? html`<dt>switch</dt><dd style="display:flex;gap:6px;flex-wrap:wrap">${e.models.map((m) => html`<button class=${cx('chip', (m.id === e.resident || m.resident) && 'on')} onClick=${() => onAction('load', m.id)} title=${`Switch to ${m.id} (${m.state})`}>${m.id} · ${m.state}</button>`)}</dd>` : null}
       <dt>model</dt><dd>${(desc && desc.known && desc.name) || (hello && hello.model) || info.model || '–'}${desc && desc.arch ? html` <span class="notice">(${desc.arch}${desc.layers ? `, ${desc.layers} layers` : ''})</span>` : null}</dd>
       ${desc && desc.known ? html`<dt>kind</dt><dd>${desc.moe ? `MoE: ${desc.moe.experts} experts, top-${desc.moe.topK}, expert width ${desc.moe.width}${desc.moe.form ? ` (${desc.moe.form} form)` : ''}` : 'dense'}</dd>` : null}
       ${pl ? html`<dt>experts</dt><dd>${pl.headline} · ${pl.text}${pl.layersText ? html`<br /><span class="notice">layer${pl.mode === 'host' ? 's' : ':slots'} ${pl.layersText}${pl.promoteEvery ? ` · hot-expert promotion every ${pl.promoteEvery} steps` : ''}</span>` : null}</dd>` : null}

@@ -771,7 +771,7 @@ export function App() {
         mcp=${s.mcp} proxyEnabled=${!!(s.props && s.props.cors_proxy_enabled)}
         mcpAct=${{ connect: mcpConnect, deleteAll: () => set({ confirm: { title: 'Delete all chats?', body: 'Every chat in this browser is removed. Export them first to keep a copy.', confirm: 'Delete all', danger: true, onConfirm: async () => { await db.deleteAll(); cache.clear(); newChat(); refreshList(); } } }) }} />` : null}
     ${s.dialog === 'card' ? html`<${CardDialog} engine=${s.engine} hello=${s.hello} live=${s.live} now=${s.now} engineAt=${s.engineAt} desc=${desc} onClose=${() => set({ dialog: null })}
-        onAction=${async (a) => { try { const r = await api.engineAction(a); toast(r.message || a); } catch (e) { toast(e.message); } }} />` : null}
+        onAction=${async (a, m) => { try { const r = await api.engineAction(a, m); toast(r.message || a); } catch (e) { toast(e.message); } }} />` : null}
     ${s.dialog === 'shortcuts' ? html`<${ShortcutsDialog} onClose=${() => set({ dialog: null })} />` : null}
     ${s.confirm ? html`<${ConfirmDialog} ...${s.confirm} onClose=${() => set({ confirm: null })} />` : null}
     ${s.needKey ? html`<${KeyDialog} error=${s.keyError} onSave=${(k) => { setSetting('apiKey', k); set({ needKey: false, keyError: '' }); loadProps(); if (events) events.reopen(); }} />` : null}

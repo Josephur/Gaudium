@@ -25,7 +25,7 @@ export const getProps = () => getJson('/props');
 export const getEngine = () => getJson('/gaudium/engine');
 export const getUiInfo = () => getJson('/gaudium/ui');
 export const getLive = () => getJson('/gaudium/live');
-export const engineAction = (action) => getJson('/gaudium/engine', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }) });
+export const engineAction = (action, model) => getJson('/gaudium/engine', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(model ? { action, model } : { action }) });
 // the prompt size of a chat body without running it (gaudium-server's /gaudium/count_tokens; docs/ui.md 10) and of a text
 export const countTokens = (body) => getJson('/gaudium/count_tokens', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 export const tokenize = (content) => getJson('/tokenize', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
