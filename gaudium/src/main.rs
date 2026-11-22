@@ -62,6 +62,13 @@ fn print_usage() {
          \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
          \x20 --no-cache            Disable on-disk compiled recipe cache\n\
          \x20 --lazy                Start without holding Gaudi 2; load on first chat/start\n\
+         \x20 --build-cache         With --serve: compile every recipe the served models load into\n\
+         \x20                       the recipe cache and exit, without opening the card and without\n\
+         \x20                       listening (safe beside a running server). Each model takes the\n\
+         \x20                       engine configuration a load of it takes, so a start after it\n\
+         \x20                       compiles nothing. Run it with the server's own options after any\n\
+         \x20                       change to kernels, graphs or contexts\n\
+         \x20 --build-cache-only <id>  The same for one served model id (repeatable)\n\
          \x20 --idle-park <secs>    Auto-release Gaudi 2 after N seconds idle (0=off, default: 300)\n\
          \x20 --queue-config <file> Card-queue settings, re-read on every turn (or GAUDIUM_QUEUE_CONFIG;\n\
          \x20                       default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock\n\
@@ -1592,6 +1599,8 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut verbose = false;
     let mut per_model: Vec<(String, ModelRunOptions)> = Vec::new();
     let mut draft_k: Vec<u64> = Vec::new();
+    let mut build_cache = false;
+    let mut build_cache_only: Vec<String> = Vec::new();
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -1700,6 +1709,11 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             "--cache-dir" => cache_dir = Some(PathBuf::from(next_val(&mut i, "--cache-dir")?)),
             "--no-cache" => no_cache = true,
             "--lazy" => lazy = true,
+            "--build-cache" => build_cache = true,
+            "--build-cache-only" => {
+                build_cache = true;
+                build_cache_only.push(next_val(&mut i, "--build-cache-only")?);
+            }
             "--idle-park" => {
                 let s = next_val(&mut i, "--idle-park")?;
                 idle_park_secs = s
@@ -1732,7 +1746,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         }
     }
 
-    run_server(ServerConfig {
+    let cfg = ServerConfig {
         host,
         port,
         models,
@@ -1749,7 +1763,12 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         verbose,
         per_model,
         draft_k,
-    })
+    };
+    // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
+    if build_cache {
+        return gaudium::server::build_cache(&cfg, &build_cache_only);
+    }
+    run_server(cfg)
 }
 
 fn main() {
@@ -1815,9 +1834,11 @@ fn main() {
         }
         return;
     }
-    if args
-        .iter()
-        .any(|a| a == "--generate" || a == "--build-cache")
+    let serving = args.iter().any(|a| a == "--serve");
+    if !serving
+        && args
+            .iter()
+            .any(|a| a == "--generate" || a == "--build-cache")
     {
         if let Err(e) = run_generate(&args[1..]) {
             eprintln!("GENERATE FAIL: {e}");

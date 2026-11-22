@@ -902,3 +902,52 @@ fn a2ui_declaration_adds_the_instructions_to_the_system_turn() {
     assert_eq!(s(&props, &["a2ui", "request_field"]), "gaudium_a2ui");
     assert!(at(&props, &["a2ui"]).get("instructions").is_none());
 }
+
+/// A model load and the off-card recipe build take one engine configuration.
+#[test]
+fn served_engine_configuration_follows_the_server_options() {
+    let mut opts = ModelRunOptions::default();
+    opts.draft_model = Some(PathBuf::from("/models/Target-DSpine-b16"));
+    opts.precision = Some(crate::engine::fp8_graph::WeightPrecision::Fp8);
+    opts.max_ctx = Some(131_072);
+    let mut own = ModelRunOptions::default();
+    own.own_mtp = true;
+    let cfg = ServerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        models: Vec::new(),
+        kernels_dir: PathBuf::from("/kernels"),
+        ui_dir: None,
+        max_ctx: 262_144,
+        cache_dir: Some(PathBuf::from("/cache")),
+        no_cache: false,
+        lazy: true,
+        idle_park_secs: 0,
+        queue_config: None,
+        api_key: None,
+        a2ui: false,
+        verbose: false,
+        per_model: vec![("a".into(), opts), ("moe".into(), own)],
+        draft_k: Vec::new(),
+    };
+    // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
+    let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
+    assert_eq!(drafter.as_deref(), Some(Path::new("/models/Target-DSpine-b16")));
+    assert_eq!(q.max_ctx, 131_072);
+    assert_eq!(q.cache_dir.as_deref(), Some(Path::new("/cache")));
+    assert_eq!(q.precision, crate::engine::fp8_graph::WeightPrecision::Fp8);
+    let spec = q.spec.expect("a drafter is planned");
+    assert_eq!(spec.draft_k, vec![7, 15]);
+    // the model's own MTP head: no checkpoint, four drafts
+    let (q, drafter) = engine_config_of(&cfg, "moe", Path::new("/models/Moe"), 262_144);
+    assert!(drafter.is_none());
+    assert_eq!(q.spec.expect("own MTP head").draft_k, vec![4]);
+    // a model without options: no drafter, the server's kernels and cache
+    let (q, drafter) = engine_config_of(&cfg, "plain", Path::new("/models/Plain"), 4096);
+    assert!(drafter.is_none() && q.spec.is_none());
+    assert_eq!(q.kernels_dir, PathBuf::from("/kernels"));
+    // a configuration without models, or an id it does not serve, is refused before anything
+    // is compiled
+    assert!(build_cache(&cfg, &[]).is_err());
+    assert!(build_cache(&cfg, &["nope".to_string()]).is_err());
+}

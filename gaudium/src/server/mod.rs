@@ -324,35 +324,9 @@ impl AppState {
         self.hub.publish(eng);
     }
 
-    /// The drafter the configuration gives model `idx`: `(checkpoint, kind, draft widths)`.
-    /// The drafter kind is read off the checkpoint directory name: a block drafter (`dflash2`,
-    /// one width), a model's own per-token drafter (`mtp`, a `-assistant` checkpoint) or a
-    /// DSpine drafter (`dspine`, an adaptive pair of widths). `--draft-k` sets the DSpine widths.
-    ///
-    /// A model configured to draft with its own MTP head has no checkpoint (`None`): 4 drafts
-    /// per launch, 3 in the routed mixture-of-experts form (its measured best widths).
+    /// The drafter the configuration gives model `idx` ([`planned_drafter_of`]).
     fn planned_drafter(&self, idx: usize) -> Option<(Option<PathBuf>, &'static str, Vec<u64>)> {
-        let id = &self.models[idx].id;
-        let (_, opts) = self.cfg.per_model.iter().find(|(k, _)| k == id)?;
-        if opts.own_mtp {
-            return Some((None, "mtp", vec![if opts.moe_routed { 3 } else { 4 }]));
-        }
-        let dir = opts.draft_model.as_ref()?;
-        let name = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
-        let (kind, draft_k) = if name.contains("dflash") {
-            ("dflash2", vec![7])
-        } else if name.ends_with("-assistant") {
-            ("mtp", vec![4])
-        } else if !self.cfg.draft_k.is_empty() {
-            ("dspine", self.cfg.draft_k.clone())
-        } else {
-            ("dspine", vec![7, 15])
-        };
-        Some((Some(dir.clone()), kind, draft_k))
+        planned_drafter_of(&self.cfg, &self.models[idx].id)
     }
 
     /// How model `idx` runs: read from its engine while it is resident, else what the
@@ -809,39 +783,7 @@ impl AppState {
 
         let m = &self.models[target_idx];
         let t0 = Instant::now();
-        let mut qcfg = Qwen3Config::new(m.dir.clone(), self.cfg.kernels_dir.clone());
-        qcfg.max_ctx = m.max_ctx;
-        qcfg.cache_dir = self.cfg.cache_dir.clone();
-        qcfg.no_cache = self.cfg.no_cache;
-        qcfg.verbose = self.cfg.verbose;
-        if let Some((_, opts)) = self.cfg.per_model.iter().find(|(id, _)| *id == m.id) {
-            qcfg.fp8_act = opts.fp8_act.clone();
-            qcfg.fp8_cache = opts.fp8_cache.clone();
-            qcfg.moe_routed = opts.moe_routed;
-            if let Some(p) = opts.precision {
-                qcfg.precision = p;
-            }
-        }
-        let drafter_dir = self
-            .planned_drafter(target_idx)
-            .and_then(|(dir, kind, draft_k)| {
-                use crate::engine::qwen3::spec::{SpecConfig, SpecMethod};
-                let method = match (kind, dir.clone()) {
-                    ("dflash2", Some(draft_model)) => SpecMethod::DFlash2 { draft_model },
-                    ("mtp", Some(draft_model)) => SpecMethod::Assistant { draft_model },
-                    // the model's own MTP head; draft readouts over the low token ids and the
-                    // control-token block only (drafts are guesses: the output is unchanged)
-                    ("mtp", None) => SpecMethod::Mtp {
-                        tree: None,
-                        reference: Vec::new(),
-                        draft_vocab: OWN_MTP_DRAFT_VOCAB,
-                    },
-                    (_, Some(draft_model)) => SpecMethod::DSpine { draft_model },
-                    (_, None) => return None,
-                };
-                qcfg.spec = Some(SpecConfig { method, draft_k });
-                dir
-            });
+        let (qcfg, drafter_dir) = engine_config_of(&self.cfg, &m.id, &m.dir, m.max_ctx);
 
         match load_engine(&qcfg) {
             Ok(eng) => {
@@ -923,6 +865,138 @@ impl AppState {
 }
 
 /// Starts the Gaudium HTTP/SSE + Web UI server (blocks until terminated).
+/// The drafter the configuration gives the served model `id`: `(checkpoint, kind, draft widths)`.
+/// The drafter kind is read off the checkpoint directory name: a block drafter (`dflash2`,
+/// one width), a model's own per-token drafter (`mtp`, a `-assistant` checkpoint) or a
+/// DSpine drafter (`dspine`, an adaptive pair of widths). `--draft-k` sets the DSpine widths.
+///
+/// A model configured to draft with its own MTP head has no checkpoint (`None`): 4 drafts
+/// per launch, 3 in the routed mixture-of-experts form (its measured best widths).
+fn planned_drafter_of(
+    cfg: &ServerConfig,
+    id: &str,
+) -> Option<(Option<PathBuf>, &'static str, Vec<u64>)> {
+    let (_, opts) = cfg.per_model.iter().find(|(k, _)| k == id)?;
+    if opts.own_mtp {
+        return Some((None, "mtp", vec![if opts.moe_routed { 3 } else { 4 }]));
+    }
+    let dir = opts.draft_model.as_ref()?;
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let (kind, draft_k) = if name.contains("dflash") {
+        ("dflash2", vec![7])
+    } else if name.ends_with("-assistant") {
+        ("mtp", vec![4])
+    } else if !cfg.draft_k.is_empty() {
+        ("dspine", cfg.draft_k.clone())
+    } else {
+        ("dspine", vec![7, 15])
+    };
+    Some((Some(dir.clone()), kind, draft_k))
+}
+
+/// The context the served model `id` runs at: `--max-ctx` (or the model's own `--model-ctx`) in
+/// whole KV chunks, clamped to the model's own limit.
+fn served_max_ctx(cfg: &ServerConfig, id: &str, dir: &Path) -> u64 {
+    let max_ctx = crate::verified::align_up(cfg.max_ctx.max(KV_CHUNK), KV_CHUNK);
+    crate::engine::clamp_ctx_to_model(
+        cfg.per_model
+            .iter()
+            .find(|(k, _)| k == id)
+            .and_then(|(_, o)| o.max_ctx)
+            .map_or(max_ctx, |c| crate::verified::align_up(c.max(KV_CHUNK), KV_CHUNK)),
+        dir,
+    )
+}
+
+/// The engine configuration the served model `id` is loaded with, and its drafter checkpoint.
+/// The one place that turns the server's options into an engine configuration: a model load and
+/// [`build_cache`] both take it from here, so the recipes one compiles are the recipes the
+/// other looks up.
+fn engine_config_of(
+    cfg: &ServerConfig,
+    id: &str,
+    dir: &Path,
+    max_ctx: u64,
+) -> (Qwen3Config, Option<PathBuf>) {
+    let mut qcfg = Qwen3Config::new(dir.to_path_buf(), cfg.kernels_dir.clone());
+    qcfg.max_ctx = max_ctx;
+    qcfg.cache_dir = cfg.cache_dir.clone();
+    qcfg.no_cache = cfg.no_cache;
+    qcfg.verbose = cfg.verbose;
+    if let Some((_, opts)) = cfg.per_model.iter().find(|(k, _)| k == id) {
+        qcfg.fp8_act = opts.fp8_act.clone();
+        qcfg.fp8_cache = opts.fp8_cache.clone();
+        qcfg.moe_routed = opts.moe_routed;
+        if let Some(p) = opts.precision {
+            qcfg.precision = p;
+        }
+    }
+    let drafter_dir = planned_drafter_of(cfg, id).and_then(|(dir, kind, draft_k)| {
+        use crate::engine::qwen3::spec::{SpecConfig, SpecMethod};
+        let method = match (kind, dir.clone()) {
+            ("dflash2", Some(draft_model)) => SpecMethod::DFlash2 { draft_model },
+            ("mtp", Some(draft_model)) => SpecMethod::Assistant { draft_model },
+            // the model's own MTP head; draft readouts over the low token ids and the
+            // control-token block only (drafts are guesses: the output is unchanged)
+            ("mtp", None) => SpecMethod::Mtp {
+                tree: None,
+                reference: Vec::new(),
+                draft_vocab: OWN_MTP_DRAFT_VOCAB,
+            },
+            (_, Some(draft_model)) => SpecMethod::DSpine { draft_model },
+            (_, None) => return None,
+        };
+        qcfg.spec = Some(SpecConfig { method, draft_k });
+        dir
+    });
+    (qcfg, drafter_dir)
+}
+
+/// `--serve ... --build-cache`: compiles into the recipe cache every recipe the served models
+/// load, WITHOUT opening the card and without listening (safe beside a running server). `only`
+/// limits it to those model ids. Each model takes the engine configuration a load of it takes
+/// ([`engine_config_of`]). A model family without an off-card build is skipped with a note.
+pub fn build_cache(cfg: &ServerConfig, only: &[String]) -> Result<(), String> {
+    if cfg.models.is_empty() {
+        return Err("at least one --model <dir> is required for --serve --build-cache".into());
+    }
+    if let Some(id) = only.iter().find(|o| !cfg.models.iter().any(|m| &m.id == *o)) {
+        return Err(format!("--build-cache-only '{id}': no --model with that id"));
+    }
+    let mut failed: Vec<String> = Vec::new();
+    for entry in cfg.models.iter().filter(|m| only.is_empty() || only.contains(&m.id)) {
+        let max_ctx = served_max_ctx(cfg, &entry.id, &entry.dir);
+        let (qcfg, _) = engine_config_of(cfg, &entry.id, &entry.dir, max_ctx);
+        eprintln!("[server] build-cache: model '{}' at context {max_ctx}", entry.id);
+        let family = ModelSpec::from_config_file(entry.dir.join("config.json"))
+            .map(|s| s.family)
+            .map_err(|e| format!("load config.json for '{}': {e}", entry.id))?;
+        if !matches!(
+            family,
+            ModelFamily::Qwen3 | ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
+        ) {
+            eprintln!(
+                "[server] build-cache: model '{}' skipped: no off-card build for family {family:?} (its recipes compile on its first load)",
+                entry.id
+            );
+            continue;
+        }
+        if let Err(e) = crate::engine::build_cache(&qcfg) {
+            eprintln!("[server] build-cache: model '{}' FAILED: {e}", entry.id);
+            failed.push(entry.id.clone());
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("build-cache failed for: {}", failed.join(", ")))
+    }
+}
+
 pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
     if cfg.models.is_empty() {
         return Err("at least one --model <dir> is required for --serve".into());
@@ -934,7 +1008,6 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
     // a live-record directory is configured.
     crate::live_report::enable_in_memory();
 
-    let max_ctx = crate::verified::align_up(cfg.max_ctx.max(KV_CHUNK), KV_CHUNK);
     let mut models = Vec::with_capacity(cfg.models.len());
     for entry in &cfg.models {
         let spec = ModelSpec::from_config_file(entry.dir.join("config.json"))
@@ -988,16 +1061,7 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             tokenizer: Arc::new(tok),
             extra_eos_ids,
             // `--max-ctx` (or the model's own `--model-ctx`), clamped to the model's own limit.
-            max_ctx: crate::engine::clamp_ctx_to_model(
-                cfg.per_model
-                    .iter()
-                    .find(|(id, _)| *id == entry.id)
-                    .and_then(|(_, o)| o.max_ctx)
-                    .map_or(max_ctx, |c| {
-                        crate::verified::align_up(c.max(KV_CHUNK), KV_CHUNK)
-                    }),
-                &entry.dir,
-            ),
+            max_ctx: served_max_ctx(&cfg, &entry.id, &entry.dir),
             gen_defaults: std::fs::read_to_string(entry.dir.join("generation_config.json"))
                 .map(|t| SamplerDefaults::from_generation_config(&t))
                 .unwrap_or(SamplerDefaults::FALLBACK),
