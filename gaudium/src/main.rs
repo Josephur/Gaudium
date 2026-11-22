@@ -76,6 +76,9 @@ fn print_usage() {
          \x20 --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster\n\
          \x20                       decode, more device memory, its own token stream)\n\
          \x20 --model-ctx <id=N>    Context size for model <id> instead of --max-ctx\n\
+         \x20 --precision <id=p>    Weight precision of model <id>: auto (default), bf16 or fp8 (a\n\
+         \x20                       BF16 checkpoint is quantised at load per output channel; give\n\
+         \x20                       its activation-scale table with --fp8-act)\n\
          \x20 --draft-k <N[,N..]>   DSpine drafts verified per launch (default: 7,15 adaptive)\n\
          \x20 --fp8-act <id=file>   FP8 activation-scale table for FP8 model <id> (repeatable)\n\
          \x20 --fp8-cache <id=dir>  Cache directory for model <id>'s quantised FP8 matrices\n\
@@ -1595,6 +1598,14 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                         ))
                     }
                 };
+            }
+            "--precision" => {
+                let raw = next_val(&mut i, "--precision")?;
+                let (opts, p) = model_opt(&mut per_model, &raw, "--precision")?;
+                opts.precision =
+                    Some(p.to_str().and_then(WeightPrecision::parse).ok_or_else(|| {
+                        format!("--precision expects <model id>=auto|bf16|fp8, got '{raw}'")
+                    })?);
             }
             "--model-ctx" => {
                 let raw = next_val(&mut i, "--model-ctx")?;

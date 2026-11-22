@@ -78,6 +78,9 @@ const OWN_MTP_DRAFT_VOCAB: u64 = 98_304;
 pub struct ModelRunOptions {
     /// Drafter checkpoint: enables speculative decoding for this model.
     pub draft_model: Option<PathBuf>,
+    /// Weight precision instead of the automatic one (`fp8` quantises a BF16 checkpoint at
+    /// load, with its activation-scale table from `fp8_act`).
+    pub precision: Option<crate::engine::fp8_graph::WeightPrecision>,
     /// Speculative decoding with the model's own MTP head (no drafter checkpoint).
     pub own_mtp: bool,
     /// Mixture-of-experts model: the routed expert form instead of the dense-masked one.
@@ -353,8 +356,22 @@ impl AppState {
         let m = &self.models[idx];
         RunFacts {
             from_engine: false,
-            // the engine's automatic precision: FP8 graphs for a block-FP8 checkpoint
-            fp8_weights: m.spec.fp8_quantized,
+            // the configured precision, else the engine's automatic one: FP8 graphs for a
+            // block-FP8 checkpoint
+            fp8_weights: {
+                use crate::engine::fp8_graph::WeightPrecision as P;
+                let configured = self
+                    .cfg
+                    .per_model
+                    .iter()
+                    .find(|(id, _)| *id == m.id)
+                    .and_then(|(_, o)| o.precision);
+                match configured {
+                    Some(P::Fp8) => true,
+                    Some(P::Bf16) => false,
+                    _ => m.spec.fp8_quantized,
+                }
+            },
             moe_routed: self
                 .cfg
                 .per_model
@@ -783,6 +800,9 @@ impl AppState {
             qcfg.fp8_act = opts.fp8_act.clone();
             qcfg.fp8_cache = opts.fp8_cache.clone();
             qcfg.moe_routed = opts.moe_routed;
+            if let Some(p) = opts.precision {
+                qcfg.precision = p;
+            }
         }
         let drafter_dir = self
             .planned_drafter(target_idx)
