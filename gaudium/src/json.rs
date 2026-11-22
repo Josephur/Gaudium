@@ -90,6 +90,80 @@ impl JsonValue {
     }
 }
 
+impl JsonValue {
+    /// Compact JSON text (`,` and `:` without spaces, non-ASCII characters as they are).
+    pub fn dump(&self) -> String {
+        let mut o = String::new();
+        self.dump_into(&mut o);
+        o
+    }
+
+    pub fn dump_into(&self, o: &mut String) {
+        match self {
+            JsonValue::Null => o.push_str("null"),
+            JsonValue::Bool(b) => o.push_str(if *b { "true" } else { "false" }),
+            JsonValue::Int(i) => o.push_str(&i.to_string()),
+            // JSON has no NaN or infinity
+            JsonValue::Float(f) if !f.is_finite() => o.push_str("null"),
+            JsonValue::Float(f) => o.push_str(&format!("{f:?}")),
+            JsonValue::Str(s) => {
+                o.push('"');
+                escape_json_into(o, s);
+                o.push('"');
+            }
+            JsonValue::Array(items) => {
+                o.push('[');
+                for (i, x) in items.iter().enumerate() {
+                    if i > 0 {
+                        o.push(',');
+                    }
+                    x.dump_into(o);
+                }
+                o.push(']');
+            }
+            JsonValue::Object(entries) => {
+                o.push('{');
+                for (i, (k, x)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        o.push(',');
+                    }
+                    o.push('"');
+                    escape_json_into(o, k);
+                    o.push_str("\":");
+                    x.dump_into(o);
+                }
+                o.push('}');
+            }
+        }
+    }
+}
+
+/// Appends the body of a JSON string: `"` `\\` and control characters escaped, the rest as is.
+pub fn escape_json_into(o: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            '\u{8}' => o.push_str("\\b"),
+            '\u{c}' => o.push_str("\\f"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+}
+
+/// A JSON string literal for `s`.
+pub fn quote_json(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    escape_json_into(&mut o, s);
+    o.push('"');
+    o
+}
+
 pub fn parse_json(input: &str) -> Result<JsonValue, JsonError> {
     parse_json_bytes(input.as_bytes())
 }
@@ -363,6 +437,18 @@ mod tests {
                 JsonValue::Null
             ]
         );
+    }
+
+    #[test]
+    fn dump_writes_compact_json_that_reads_back() {
+        let raw = r#"{"a":[1,-2.5,1e-7,true,null],"s":"q\"\\\n\u0001\u00fc","o":{}}"#;
+        let v = parse_json(raw).unwrap();
+        assert_eq!(
+            v.dump(),
+            "{\"a\":[1,-2.5,1e-7,true,null],\"s\":\"q\\\"\\\\\\n\\u0001\u{fc}\",\"o\":{}}"
+        );
+        assert_eq!(parse_json(&v.dump()).unwrap(), v);
+        assert_eq!(quote_json("a\tb"), "\"a\\tb\"");
     }
 
     #[test]

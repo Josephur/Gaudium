@@ -39,6 +39,9 @@ fn print_usage() {
          \x20 gaudium --inspect-model <dir>             Validate config.json & Safetensors\n\
          \x20 gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json\n\
          \x20 gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test\n\
+         \x20 gaudium --apply-template <model_dir> <request.json|->\n\
+         \x20                                           Print the prompt a chat request renders to with\n\
+         \x20                                           the model's own chat template (host only)\n\
          \x20 gaudium --generate [options]              Run live Gaudi 2 LLM generation\n\
          \x20 gaudium --build-cache [generate options]  Compile every recipe of that configuration into\n\
          \x20                                           the recipe cache and print its exact HBM plan,\n\
@@ -1721,6 +1724,28 @@ fn main() {
         if let Err(e) = run_tokenize(Path::new(&args[2]), &args[3]) {
             eprintln!("TOKENIZE FAIL: {e}");
             process::exit(1);
+        }
+        return;
+    }
+    if args.len() == 4 && args[1] == "--apply-template" {
+        // the prompt a chat request renders to with the model's own template (host only)
+        let run = || -> Result<String, String> {
+            let body = if args[3] == "-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+                    .map_err(|e| format!("read stdin: {e}"))?;
+                s
+            } else {
+                std::fs::read_to_string(&args[3]).map_err(|e| format!("read {}: {e}", args[3]))?
+            };
+            gaudium::server::apply_chat_template(Path::new(&args[2]), &body)
+        };
+        match run() {
+            Ok(prompt) => print!("{prompt}"),
+            Err(e) => {
+                eprintln!("APPLY TEMPLATE FAIL: {e}");
+                process::exit(1);
+            }
         }
         return;
     }

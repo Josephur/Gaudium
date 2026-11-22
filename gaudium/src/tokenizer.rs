@@ -891,6 +891,40 @@ pub fn gemma4_template_closes_thought(chat_template: &str) -> bool {
     chat_template.contains("<|channel>thought\\n<channel|>")
 }
 
+/// A byte-level tokenizer for tests: one token per byte (ids 0..=255) and the given added
+/// tokens `(content, special)` from id 256 on.
+#[cfg(test)]
+pub(crate) fn test_tokenizer(added: &[(&str, bool)]) -> Tokenizer {
+    let (b2cp, _) = byte_level_tables();
+    let vocab: Vec<String> = b2cp
+        .iter()
+        .enumerate()
+        .map(|(b, &cp)| {
+            let ch = char::from_u32(cp).unwrap();
+            format!("{}: {b}", crate::json::quote_json(&ch.to_string()))
+        })
+        .collect();
+    let added: Vec<String> = added
+        .iter()
+        .enumerate()
+        .map(|(i, (content, special))| {
+            format!(
+                "{{\"id\": {}, \"content\": {}, \"special\": {special}}}",
+                256 + i,
+                crate::json::quote_json(content)
+            )
+        })
+        .collect();
+    let json = format!(
+        r#"{{"model": {{"type": "BPE", "vocab": {{{}}}, "merges": []}}, "added_tokens": [{}],
+            "pre_tokenizer": {{"type": "Sequence", "pretokenizers": [
+              {{"type": "Split", "pattern": {{"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{{L}}\\p{{N}}]?\\p{{L}}+|\\p{{N}}| ?[^\\s\\p{{L}}\\p{{N}}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}}}]}}}}"#,
+        vocab.join(", "),
+        added.join(", ")
+    );
+    Tokenizer::from_json_str(&json).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

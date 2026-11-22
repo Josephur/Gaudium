@@ -49,6 +49,15 @@ Never rely on memory or GPU analogies for Gaudi 2 MME geometry, TPC VLIW/SIMD in
 
 ---
 
+## 3a. Verified-First Rule (applies to every change)
+
+- **Start in `gaudium/verified/`.** Before writing Rust for a feature or fix, list its decisions: state machines, policies and permission checks, priority and selection rules, counters and accounting, index and bounds arithmetic. Each one is written as a Bend function with `law`s stating what must always hold, and the Rust shell calls that function. Re-implementing a verified rule in Rust (a condition that duplicates it) is a defect.
+- **A change that adds or alters such logic adds or extends laws in the same change.** "Adding brand-new laws is allowed" (section 5) does not mean optional: a slice without laws is unfinished.
+- **Only what Bend cannot state stays unproved:** I/O, FFI, byte and text handling, and formats defined by an outside implementation. That code gets Rust tests (differential tests against the reference where one exists).
+- **Report it.** Every hand-off lists the laws added, the Rust call sites that use them, and what was left in the shell and why.
+
+---
+
 ## 4. Bend 2.0.40 + RustyBends Emitter Conventions
 
 Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0.40 and `rusty-bends-build/src/emit.rs`:

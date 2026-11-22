@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::anthropic::Builder;
+use super::outparse::Delta;
 use super::readout::{jq, Timings};
 use crate::live_report::{LaunchEvent, LaunchKind};
 
@@ -36,8 +38,10 @@ pub(super) struct StreamOut {
     /// The engine reports its launches (else: one chunk per token).
     feed: bool,
     cancel: Arc<AtomicBool>,
-    reasoning: String,
-    content: String,
+    /// Parsed output not written yet.
+    pending: Delta,
+    /// Block-structured framing (the Messages API) instead of chat-completion chunks.
+    pub anth: Option<Builder>,
     /// Tokens handed over by the token callback.
     seen: u64,
     /// Tokens covered by the launches reported so far.
@@ -77,8 +81,8 @@ impl StreamOut {
             n_prompt,
             feed,
             cancel,
-            reasoning: String::new(),
-            content: String::new(),
+            pending: Delta::default(),
+            anth: None,
             seen: 0,
             covered: 0,
             last: None,
@@ -140,15 +144,19 @@ impl StreamOut {
         }
     }
 
-    /// One generated token: its reasoning / content text (either may be empty, e.g. a special
-    /// token or bytes held back by the UTF-8 decoder).
-    pub fn push_token(&mut self, reasoning: &str, content: &str) {
+    /// Parsed output that belongs to no generated token (a forced call's opening).
+    pub fn add(&mut self, d: Delta) {
+        self.pending.append(d);
+    }
+
+    /// One generated token: what the output parser made of it (it may be empty, e.g. a special
+    /// token, bytes held back by the UTF-8 decoder or text the parser holds).
+    pub fn push_token(&mut self, d: Delta) {
         let now = Instant::now();
         self.seen += 1;
         self.first_token_at.get_or_insert(now);
         self.last_token_at = Some(now);
-        self.reasoning.push_str(reasoning);
-        self.content.push_str(content);
+        self.pending.append(d);
         if !self.feed || self.seen <= self.covered {
             self.flush();
         }
@@ -191,32 +199,30 @@ impl StreamOut {
         self.write(&chunk);
     }
 
-    /// Takes the text not written yet (the caller puts it into the final chunk).
-    pub fn take_pending(&mut self) -> (String, String) {
-        (
-            std::mem::take(&mut self.reasoning),
-            std::mem::take(&mut self.content),
-        )
+    /// Takes the output not written yet (the caller puts it into the final chunk).
+    pub fn take_pending(&mut self) -> Delta {
+        std::mem::take(&mut self.pending)
     }
 
     fn flush(&mut self) {
-        let has_text = !self.reasoning.is_empty() || !self.content.is_empty();
-        if self.stream.is_none() || (!has_text && !self.timings_per_token) {
+        // whole calls are for the final message; the stream carries their fragments
+        self.pending.tool_calls.clear();
+        let has_text = !self.pending.is_empty();
+        if self.stream.is_none() {
             return;
         }
-        let mut delta = String::from("{");
-        if !self.reasoning.is_empty() {
-            delta.push_str(&format!("\"reasoning_content\":{}", jq(&self.reasoning)));
-        }
-        if !self.content.is_empty() {
-            if delta.len() > 1 {
-                delta.push(',');
+        if let Some(b) = self.anth.as_mut() {
+            let events = b.feed(&std::mem::take(&mut self.pending));
+            if !events.is_empty() {
+                self.chunks += 1;
+                self.write(&events);
             }
-            delta.push_str(&format!("\"content\":{}", jq(&self.content)));
+            return;
         }
-        delta.push('}');
-        self.reasoning.clear();
-        self.content.clear();
+        if !has_text && !self.timings_per_token {
+            return;
+        }
+        let delta = delta_json(&std::mem::take(&mut self.pending));
         let timings = if self.timings_per_token {
             format!(",\"timings\":{}", self.timings().json())
         } else {
@@ -242,6 +248,43 @@ impl StreamOut {
             }
         }
     }
+}
+
+/// The `delta` object of a chat-completion chunk: reasoning, content and tool-call fragments
+/// (a call's first fragment carries its index, id, type and name).
+pub(super) fn delta_json(d: &Delta) -> String {
+    let mut parts = Vec::new();
+    if !d.reasoning.is_empty() {
+        parts.push(format!("\"reasoning_content\":{}", jq(&d.reasoning)));
+    }
+    if !d.content.is_empty() {
+        parts.push(format!("\"content\":{}", jq(&d.content)));
+    }
+    if !d.tool_deltas.is_empty() {
+        let calls: Vec<String> = d
+            .tool_deltas
+            .iter()
+            .map(|t| {
+                if t.header {
+                    format!(
+                        "{{\"index\":{},\"id\":{},\"type\":\"function\",\"function\":{{\"name\":{},\"arguments\":{}}}}}",
+                        t.index,
+                        jq(&t.id),
+                        jq(&t.name),
+                        jq(&t.arguments)
+                    )
+                } else {
+                    format!(
+                        "{{\"index\":{},\"function\":{{\"arguments\":{}}}}}",
+                        t.index,
+                        jq(&t.arguments)
+                    )
+                }
+            })
+            .collect();
+        parts.push(format!("\"tool_calls\":[{}]", calls.join(",")));
+    }
+    format!("{{{}}}", parts.join(","))
 }
 
 #[cfg(test)]
@@ -306,6 +349,14 @@ mod tests {
         )
     }
 
+    fn text(reasoning: &str, content: &str) -> Delta {
+        Delta {
+            reasoning: reasoning.into(),
+            content: content.into(),
+            ..Delta::default()
+        }
+    }
+
     fn timing(v: &JsonValue, k: &str) -> Option<u64> {
         v.get("timings")
             .and_then(|t| t.get(k))
@@ -328,21 +379,21 @@ mod tests {
         let mut w = writer(tx, true, false);
         // the first token: reported, then handed over
         w.on_event(&ev(LaunchKind::First, 1, 0, 0, 0, 0.0));
-        w.push_token("", "A");
+        w.push_token(text("", "A"));
         // launch 1 commits three tokens, then reports itself
         for t in ["b", "c", "d"] {
-            w.push_token("", t);
+            w.push_token(text("", t));
         }
         w.on_event(&ev(LaunchKind::Step, 4, 1, 7, 2, 30.0));
         // launch 2: one token whose bytes the decoder held back
-        w.push_token("", "");
+        w.push_token(text("", ""));
         w.on_event(&ev(LaunchKind::Step, 5, 2, 14, 2, 60.0));
         // launch 3: two tokens
-        w.push_token("", "e");
-        w.push_token("", "f");
+        w.push_token(text("", "e"));
+        w.push_token(text("", "f"));
         w.on_event(&ev(LaunchKind::Step, 7, 3, 21, 3, 90.0));
         assert_eq!(w.chunks, 4);
-        assert_eq!(w.take_pending(), (String::new(), String::new()));
+        assert!(w.take_pending().is_empty());
         drop(w);
 
         let c = payloads(rx);
@@ -374,7 +425,7 @@ mod tests {
         let (tx, rx) = pair();
         let mut w = writer(tx, true, false);
         w.on_event(&ev(LaunchKind::First, 1, 0, 0, 0, 0.0));
-        w.push_token("think", "");
+        w.push_token(text("think", ""));
         for (i, t) in ["x", "y"].iter().enumerate() {
             w.on_event(&ev(
                 LaunchKind::Step,
@@ -384,7 +435,7 @@ mod tests {
                 0,
                 25.0 * (i + 1) as f64,
             ));
-            w.push_token("", t);
+            w.push_token(text("", t));
         }
         drop(w);
         let c = payloads(rx);
@@ -412,8 +463,8 @@ mod tests {
     fn without_a_launch_feed_every_token_is_a_chunk_and_no_launch_count_is_claimed() {
         let (tx, rx) = pair();
         let mut w = writer(tx, false, false);
-        w.push_token("", "a");
-        w.push_token("", "b");
+        w.push_token(text("", "a"));
+        w.push_token(text("", "b"));
         drop(w);
         let c = payloads(rx);
         assert_eq!(c.len(), 2);
@@ -445,5 +496,81 @@ mod tests {
         w.on_event(&p);
         drop(w);
         assert!(payloads(rx).is_empty());
+    }
+
+    #[test]
+    fn tool_call_fragments_go_out_with_their_launch() {
+        use super::super::outparse::ToolDelta;
+        let (tx, rx) = pair();
+        let mut w = writer(tx, true, false);
+        // a forced call's opening belongs to no token: it goes out with the first launch
+        w.add(Delta {
+            tool_deltas: vec![ToolDelta {
+                index: 0,
+                header: true,
+                id: "call_x".into(),
+                name: "f".into(),
+                arguments: String::new(),
+            }],
+            ..Delta::default()
+        });
+        w.on_event(&ev(LaunchKind::First, 1, 0, 0, 0, 0.0));
+        let mut d = text("", "");
+        d.push_tool_delta(ToolDelta {
+            index: 0,
+            arguments: "{\"a\":".into(),
+            ..ToolDelta::default()
+        });
+        d.push_tool_delta(ToolDelta {
+            index: 0,
+            arguments: "1}".into(),
+            ..ToolDelta::default()
+        });
+        w.push_token(d);
+        assert!(w.take_pending().is_empty());
+        drop(w);
+        let c = payloads(rx);
+        assert_eq!(c.len(), 1);
+        let calls = c[0].get("choices").and_then(JsonValue::as_array).unwrap()[0]
+            .get("delta")
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(JsonValue::as_array)
+            .unwrap()
+            .to_vec();
+        // fragments of one call join: the header carries the arguments that came with it
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].get("index").and_then(JsonValue::as_u64), Some(0));
+        assert_eq!(
+            calls[0].get("id").and_then(JsonValue::as_str),
+            Some("call_x")
+        );
+        assert_eq!(
+            calls[0].get("type").and_then(JsonValue::as_str),
+            Some("function")
+        );
+        let f0 = calls[0].get("function").unwrap();
+        assert_eq!(f0.get("name").and_then(JsonValue::as_str), Some("f"));
+        assert_eq!(
+            f0.get("arguments").and_then(JsonValue::as_str),
+            Some("{\"a\":1}")
+        );
+        // a later fragment of the same call carries only its index and text
+        let later = Delta {
+            tool_deltas: vec![ToolDelta {
+                index: 0,
+                arguments: ",".into(),
+                ..ToolDelta::default()
+            }],
+            ..Delta::default()
+        };
+        let j = json::parse_json(&delta_json(&later)).unwrap();
+        let t = &j.get("tool_calls").and_then(JsonValue::as_array).unwrap()[0];
+        assert!(t.get("id").is_none() && t.get("type").is_none());
+        assert_eq!(
+            t.get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(JsonValue::as_str),
+            Some(",")
+        );
     }
 }

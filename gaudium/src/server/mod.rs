@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::budget::SequenceBudget;
 use crate::core::lifecycle::{can_switch_resident_model, RequestGuard};
+use crate::core::tool_calls::{finish_reason_name, generation_end, stop_reason_name, GenEnd};
 use crate::engine::qwen3::{Qwen3Config, Qwen3GenParams, KV_CHUNK};
 use crate::engine::{load_engine, GenEngine};
 use crate::json::{self, JsonValue};
@@ -32,9 +33,15 @@ use crate::model_spec::{ModelFamily, ModelSpec};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use crate::verified::{BackendState, ReqEvent};
 
+mod anthropic;
+mod chat;
+mod jinja;
+mod outparse;
 mod readout;
 mod stream_out;
 
+use chat::{ChatPrompt, ChatTemplate};
+use outparse::{Delta, OutputFormat, OutputParser};
 use readout::{DrafterFacts, RunFacts, Timings};
 use stream_out::StreamOut;
 
@@ -103,9 +110,10 @@ struct RegisteredModel {
     /// Gemma 4 only: the model's template closes an empty thought channel after the generation
     /// prompt of a non-thinking request.
     gemma_closes_thought: bool,
-    /// Gemma 4 only: ids of the tokens that open and close a channel (`<|channel>`,
-    /// `<channel|>`); a thinking reply writes its reasoning between them.
-    channel_ids: Option<(i32, i32)>,
+    /// The model's own chat template; `None`: the built-in text templates (no tool calling).
+    chat: Option<ChatTemplate>,
+    /// How the family writes its reasoning and its tool calls.
+    format: OutputFormat,
     /// Sampler settings of a request that names none: the model's own `generation_config.json`.
     gen_defaults: SamplerDefaults,
 }
@@ -708,6 +716,8 @@ impl AppState {
         let speculative = self.run_facts(idx).drafter.is_some();
         let gd = m.gen_defaults;
         let (d_temp, d_top_k, d_top_p) = (gd.temperature, gd.top_k, gd.top_p);
+        // tools reach the model through its own chat template
+        let tools = m.chat.as_ref().is_some_and(|t| t.supports_tools);
         let mut out = format!(
             "{{\"default_generation_settings\":{{\"n_ctx\":{},\"params\":{{\"seed\":-1,\"temperature\":{d_temp},\
              \"top_k\":{d_top_k},\"top_p\":{d_top_p},\"min_p\":0.0,\"max_tokens\":-1,\"n_predict\":-1,\"stream\":false,\
@@ -718,15 +728,17 @@ impl AppState {
              \"endpoint_slots\":true,\"endpoint_props\":false,\"endpoint_metrics\":false,\"ui\":{},\
              \"ui_settings\":{{}},\"chat_template\":\"qwen3\",\
              \"chat_template_caps\":{{\"supports_string_content\":true,\"supports_typed_content\":true,\
-             \"supports_tools\":false,\"supports_tool_calls\":false,\"supports_parallel_tool_calls\":false,\
+             \"supports_tools\":{tools},\"supports_tool_calls\":{tools},\"supports_parallel_tool_calls\":{tools},\
              \"supports_system_role\":true,\"supports_preserve_reasoning\":true,\"supports_reasoning_effort\":false,\
              \"supports_object_arguments\":false,\"reasoning_effort_levels\":[]}},\
-             \"bos_token\":\"\",\"eos_token\":\"<|im_end|>\",\"build_info\":{},\"is_sleeping\":false,\
+             \"bos_token\":{},\"eos_token\":{},\"build_info\":{},\"is_sleeping\":false,\
              \"cors_proxy_enabled\":false",
             m.max_ctx,
             jq(&m.id),
             jq(&m.dir.display().to_string()),
             self.cfg.ui_dir.is_some(),
+            jq(m.chat.as_ref().map_or("", |t| t.token("bos_token"))),
+            jq(m.chat.as_ref().map_or("<|im_end|>", |t| t.token("eos_token"))),
             jq(&format!("gaudium-rust {}", env!("CARGO_PKG_VERSION"))),
         );
         // what this model is and how it runs (the same description the event stream carries)
@@ -925,19 +937,47 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         let tok = Tokenizer::from_model_dir(&entry.dir)
             .map_err(|e| format!("load tokenizer.json for '{}': {e}", entry.id))?;
         let mut extra_eos_ids = Vec::new();
-        for special in ["<|im_end|>", "<|endoftext|>", "<turn|>"] {
+        // `<|tool_response>`: where a Gemma 4 reply hands over to the tool results of its calls
+        for special in ["<|im_end|>", "<|endoftext|>", "<turn|>", "<|tool_response>"] {
             if let Some(id) = tok.token_id(special) {
                 extra_eos_ids.push(id);
             }
         }
-        let channel_ids = (spec.family == ModelFamily::Gemma4)
-            .then(|| tok.token_id("<|channel>").zip(tok.token_id("<channel|>")))
-            .flatten();
+        let chat = match ChatTemplate::load(&entry.dir) {
+            Ok(Some((t, note))) => {
+                if let Some(note) = note {
+                    eprintln!(
+                        "[server] model '{}': {note}; reasoning and tool calls are parsed in the default form",
+                        entry.id
+                    );
+                }
+                Some(t)
+            }
+            Ok(None) => {
+                eprintln!(
+                    "[server] model '{}' has no chat template: built-in text template, no tool calling",
+                    entry.id
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "[server] model '{}': chat template not usable ({e}): built-in text template, no tool calling",
+                    entry.id
+                );
+                None
+            }
+        };
+        let format = match &chat {
+            Some(t) => t.format.clone(),
+            None => builtin_format(spec.family),
+        };
         models.push(RegisteredModel {
             id: entry.id.clone(),
             dir: entry.dir.clone(),
             spec,
-            channel_ids,
+            chat,
+            format,
             tokenizer: Arc::new(tok),
             extra_eos_ids,
             // `--max-ctx` (or the model's own `--model-ctx`), clamped to the model's own limit.
@@ -1217,6 +1257,7 @@ fn write_json(stream: &mut TcpStream, status: u16, json: &str) {
         404 => "Not Found",
         409 => "Conflict",
         503 => "Service Unavailable",
+        529 => "Overloaded",
         _ => "Internal Server Error",
     };
     write_response(
@@ -1308,6 +1349,7 @@ fn handle_connection(state: Arc<AppState>, mut stream: TcpStream) {
                 | "/models/load"
                 | "/models/unload"
                 | "/chat/completions"
+                | "/apply-template"
                 | "/tokenize"
                 | "/detokenize"
                 | "/slots"
@@ -1376,6 +1418,9 @@ fn handle_connection(state: Arc<AppState>, mut stream: TcpStream) {
         ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") => {
             handle_chat_completions(&state, &req, &mut stream);
         }
+        ("POST", "/v1/messages") => handle_messages(&state, &req, &mut stream),
+        ("POST", "/v1/messages/count_tokens") => handle_messages_count(&state, &req, &mut stream),
+        ("POST", "/apply-template") => handle_apply_template(&state, &req, &mut stream),
         ("GET", _) => handle_static_ui(&state, &req.path, &mut stream, true),
         ("HEAD", _) => handle_static_ui(&state, &req.path, &mut stream, false),
         _ => write_error(
@@ -1569,15 +1614,14 @@ fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut TcpStre
     };
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
     let m = &state.models[idx];
-    let preopen_think = m.spec.family == ModelFamily::Qwen35Dense;
-    let prompt_text = match build_model_chat_prompt(m, &val, preopen_think) {
+    let prompt = match prepare_prompt(m, &val) {
         Ok(p) => p,
         Err(e) => {
             write_error(stream, 400, "invalid_request_error", &e);
             return;
         }
     };
-    let ids = m.tokenizer.encode(&prompt_text, true);
+    let ids = m.tokenizer.encode(&prompt.text, true);
     let n_prompt = ids.len() as u64;
     let req_max = val.get("max_tokens").and_then(|v| v.as_u64());
     let (fits, max_tokens) = match SequenceBudget::admit(n_prompt, req_max, m.max_ctx) {
@@ -1786,34 +1830,165 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut TcpStre
     }
 }
 
+/// Which API a chat request came in on: the shape of its reply and of its errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Api {
+    /// `/v1/chat/completions`.
+    Chat,
+    /// `/v1/messages`; thinking blocks carry their text unless `show_thinking` is off.
+    Messages { show_thinking: bool },
+}
+
+impl Api {
+    fn error(self, stream: &mut TcpStream, status: u16, err_type: &str, msg: &str) {
+        match self {
+            Api::Chat => write_error(stream, status, err_type, msg),
+            Api::Messages { .. } => {
+                // an engine that cannot take the request now is "overloaded" to these clients
+                let status = if status == 503 { 529 } else { status };
+                write_json(stream, status, &anthropic::error_json(status, msg));
+            }
+        }
+    }
+
+    /// An error after the event stream began (framed; the caller ends the stream).
+    fn stream_error(self, status: u16, msg: &str) -> String {
+        match self {
+            Api::Chat => format!(
+                "data: {{\"error\":{{\"message\":{},\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n",
+                jq(msg)
+            ),
+            Api::Messages { .. } => anthropic::sse("error", &anthropic::error_json(status, msg)),
+        }
+    }
+}
+
+/// The prompt of a chat request: rendered with the model's own chat template, else with the
+/// built-in text template of its family (which has no tools).
+fn prepare_prompt(m: &RegisteredModel, body: &JsonValue) -> Result<ChatPrompt, String> {
+    if let Some(t) = &m.chat {
+        return chat::render_chat(t, body);
+    }
+    let text = build_model_chat_prompt(m, body, m.spec.family == ModelFamily::Qwen35Dense)?;
+    let reasoning_open = match (
+        text.rfind(&m.format.think_open),
+        text.rfind(&m.format.think_close),
+    ) {
+        (Some(open), Some(close)) => close < open,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let mut ignored = Vec::new();
+    if body
+        .get("tools")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|a| !a.is_empty())
+    {
+        ignored.push("tools (this model has no chat template)".to_string());
+    }
+    Ok(ChatPrompt {
+        text,
+        reasoning_open,
+        tools: None,
+        forced_prefix: String::new(),
+        single_call: false,
+        continue_final: false,
+        ignored,
+    })
+}
+
 fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
-    let t_arrival = Instant::now();
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
         return;
     };
+    run_chat(state, &val, stream, Api::Chat, Vec::new());
+}
+
+/// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path.
+fn handle_messages(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+    let api = Api::Messages {
+        show_thinking: true,
+    };
+    let body_str = String::from_utf8_lossy(&req.body);
+    let Ok(val) = json::parse_json(&body_str) else {
+        api.error(stream, 400, "invalid_request_error", "invalid JSON body");
+        return;
+    };
+    match anthropic::translate(&val) {
+        Ok(t) => run_chat(
+            state,
+            &t.chat,
+            stream,
+            Api::Messages {
+                show_thinking: t.show_thinking,
+            },
+            t.ignored,
+        ),
+        Err(e) => api.error(stream, 400, "invalid_request_error", &e),
+    }
+}
+
+/// `POST /v1/messages/count_tokens`: the prompt size of a Messages request without running it.
+fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+    let api = Api::Messages {
+        show_thinking: true,
+    };
+    let body_str = String::from_utf8_lossy(&req.body);
+    let Ok(val) = json::parse_json(&body_str) else {
+        api.error(stream, 400, "invalid_request_error", "invalid JSON body");
+        return;
+    };
+    let rendered = anthropic::translate(&val).and_then(|t| {
+        let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
+        prepare_prompt(m, &t.chat).map(|p| m.tokenizer.encode(&p.text, true).len())
+    });
+    match rendered {
+        Ok(n) => write_json(stream, 200, &format!("{{\"input_tokens\":{n}}}")),
+        Err(e) => api.error(stream, 400, "invalid_request_error", &e),
+    }
+}
+
+/// `POST /apply-template`: the prompt text a chat request renders to.
+fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+    let body_str = String::from_utf8_lossy(&req.body);
+    let Ok(val) = json::parse_json(&body_str) else {
+        write_error(stream, 400, "invalid_request_error", "invalid JSON body");
+        return;
+    };
+    let m = &state.models[state.find_model(val.get("model").and_then(|v| v.as_str()))];
+    match prepare_prompt(m, &val) {
+        Ok(p) => write_json(stream, 200, &format!("{{\"prompt\":{}}}", jq(&p.text))),
+        Err(e) => write_error(stream, 400, "invalid_request_error", &e),
+    }
+}
+
+/// Runs one chat request: prompt, card turn, generation, and the reply in the shape of `api`.
+/// `ignored`: request fields the caller already found accepted but not applied.
+fn run_chat(
+    state: &AppState,
+    val: &JsonValue,
+    stream: &mut TcpStream,
+    api: Api,
+    mut ignored: Vec<String>,
+) {
+    let t_arrival = Instant::now();
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
     let m = &state.models[idx];
-    let preopen_think = m.spec.family == ModelFamily::Qwen35Dense;
-    let prompt_text = match build_model_chat_prompt(m, &val, preopen_think) {
+    let prompt = match prepare_prompt(m, val) {
         Ok(p) => p,
         Err(e) => {
-            write_error(stream, 400, "invalid_request_error", &e);
+            api.error(stream, 400, "invalid_request_error", &e);
             return;
         }
     };
-    let prompt_ids = m.tokenizer.encode(&prompt_text, true);
+    ignored.extend(prompt.ignored.iter().cloned());
+    let prompt_ids = m.tokenizer.encode(&prompt.text, true);
     let n_prompt = prompt_ids.len() as u64;
     let stream_mode = val.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    // Qwen templates think unless told not to; the Gemma 4 template thinks only when asked.
-    let is_gemma = m.spec.family == ModelFamily::Gemma4;
-    let enable_thinking = requested_thinking(&val, !is_gemma);
-    // Gemma 4 writes its reasoning between two special tokens, which never reach the text.
-    let mut channel = m
-        .channel_ids
-        .filter(|_| enable_thinking)
-        .map(|(open, close)| ChannelSplitter::new(open, close, GEMMA4_THOUGHT_LABEL));
+    // `reasoning_format: "none"` leaves the reasoning in the content
+    let split_reasoning = val.get("reasoning_format").and_then(|v| v.as_str()) != Some("none");
     let temperature = val
         .get("temperature")
         .and_then(|v| v.as_f64())
@@ -1847,15 +2022,18 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
     let budget = match SequenceBudget::admit(n_prompt, req_max, m.max_ctx) {
         Ok(b) => b,
         Err(e) => {
-            write_error(
-                stream,
-                400,
-                "invalid_request_error",
-                &format!(
+            let msg = match api {
+                Api::Chat => format!(
                     "prompt ({n_prompt} tokens) exceeds context budget {}: {e:?}",
                     m.max_ctx
                 ),
-            );
+                // the words these clients match to compact their context
+                Api::Messages { .. } => format!(
+                    "prompt is too long: {n_prompt} tokens > {} maximum",
+                    crate::core::budget::advertised_served_ctx(m.max_ctx).saturating_sub(1)
+                ),
+            };
+            api.error(stream, 400, "invalid_request_error", &msg);
             return;
         }
     };
@@ -1881,7 +2059,7 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
         .filter(|w| !w.is_empty() && *w != "default")
     {
         if want != method {
-            write_error(
+            api.error(
                 stream,
                 400,
                 "invalid_request_error",
@@ -1896,7 +2074,10 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
     }
 
     let req_num = state.next_req_id.fetch_add(1, Ordering::Relaxed);
-    let req_id = format!("chatcmpl-gaudium-{req_num}");
+    let req_id = match api {
+        Api::Chat => format!("chatcmpl-gaudium-{req_num}"),
+        Api::Messages { .. } => format!("msg_gaudium_{req_num}"),
+    };
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -1929,7 +2110,7 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
             req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
             jq(&e)
         ));
-        write_error(stream, 503, "unavailable_error", &e);
+        api.error(stream, 503, "unavailable_error", &e);
         return;
     }
 
@@ -1991,17 +2172,10 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
                     jq(msg)
                 ));
                 if stream_mode {
-                    let _ = write_sse_chunk(
-                        stream,
-                        format!(
-                            "data: {{\"error\":{{\"message\":{}}}}}\n\ndata: [DONE]\n\n",
-                            jq(msg)
-                        )
-                        .as_bytes(),
-                    );
+                    let _ = write_sse_chunk(stream, api.stream_error(503, msg).as_bytes());
                     write_sse_end(stream);
                 } else {
-                    write_error(stream, 503, "unavailable_error", msg);
+                    api.error(stream, 503, "unavailable_error", msg);
                 }
                 return;
             }
@@ -2013,10 +2187,18 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
     state.publish_request(format!("{{{}}}", req_base("prefill", queued_ms)));
 
     let mut decoder = StreamDecoder::new(&m.tokenizer);
-    let mut splitter = ThinkSplitter::new(enable_thinking && !is_gemma, preopen_think);
-    let mut full_reasoning = String::new();
-    let mut full_content = String::new();
-    let mut hit_stop = false;
+    // Generated text -> reasoning, content and tool calls (and the request's stop strings).
+    let mut parser = OutputParser::new(
+        prompt.reasoning_open,
+        split_reasoning,
+        prompt.tools.clone(),
+        stop_seqs,
+        m.format.clone(),
+    );
+    if prompt.single_call {
+        parser.set_max_calls(1);
+    }
+    let format = &m.format;
     let mut started_decode = false;
     let tok_ref = Arc::clone(&m.tokenizer);
     let model_id = m.id.clone();
@@ -2055,11 +2237,21 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
         // The role chunk goes out now, so a client times its request from the moment the engine
         // took it.
         let mut o = out.lock().unwrap();
-        let init_chunk = format!(
-            "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
-            o.chunk_head(),
-        );
+        let init_chunk = match api {
+            Api::Chat => format!(
+                "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
+                o.chunk_head(),
+            ),
+            Api::Messages { show_thinking } => {
+                o.anth = Some(anthropic::Builder::new(show_thinking));
+                anthropic::Builder::message_start(&req_id, &model_id, n_prompt)
+            }
+        };
         o.write(&init_chunk);
+        // A forced tool call's opening is already in the prompt: the parser reads it first.
+        if !prompt.forced_prefix.is_empty() {
+            o.add(parser.feed(&prompt.forced_prefix));
+        }
     }
     if let Some(h) = &live {
         let sink_out = Arc::clone(&out);
@@ -2071,29 +2263,29 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
     let mut last_live_pub = Instant::now();
     let report =
         engine.generate_cancellable(&prompt_ids, &params, Some(&cancel_flag), &mut |tok_id| {
-            let (r_delta, c_delta) = if channel.as_mut().is_some_and(|c| c.marker(tok_id))
-                || tok_ref.is_special(tok_id)
-            {
-                (String::new(), String::new())
+            let piece = if tok_ref.is_special(tok_id) {
+                // a special token is text only when it is part of the family's tags
+                let text = String::from_utf8_lossy(tok_ref.token_bytes(tok_id)).into_owned();
+                if format.is_marker_piece(&text) {
+                    decoder.flush() + &text
+                } else {
+                    String::new()
+                }
             } else {
-                let piece = decoder.push(tok_id);
-                match channel.as_mut() {
-                    _ if piece.is_empty() => (String::new(), String::new()),
-                    Some(c) => c.text(&piece),
-                    None => splitter.push(&piece),
-                }
+                decoder.push(tok_id)
             };
-            full_reasoning.push_str(&r_delta);
-            if !c_delta.is_empty() {
-                full_content.push_str(&c_delta);
-                if !stop_seqs.is_empty() && stop_seqs.iter().any(|st| full_content.ends_with(st)) {
-                    hit_stop = true;
-                    cancel_flag.store(true, Ordering::Relaxed);
-                }
+            let delta = if piece.is_empty() {
+                Delta::default()
+            } else {
+                parser.feed(&piece)
+            };
+            // a stop string, or the call limit: the generation ends here
+            if parser.stopped() {
+                cancel_flag.store(true, Ordering::Relaxed);
             }
             let (timings, seen) = {
                 let mut o = out.lock().unwrap();
-                o.push_token(&r_delta, &c_delta);
+                o.push_token(delta);
                 (o.timings(), o.seen_tokens())
             };
             if !started_decode {
@@ -2136,33 +2328,38 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
     drop(turn);
     state.cancels.lock().unwrap().remove(&req_id);
 
-    // Flush decoder + splitter tail, after any text the last launch left unwritten
+    // Flush the decoder's and the parser's tail, after any output the last launch left unwritten
     let tail = decoder.flush();
-    let (r_tail, c_tail) = match channel.as_mut() {
-        Some(c) => c.text(&tail),
-        None => splitter.finish(&tail),
-    };
-    full_reasoning.push_str(&r_tail);
-    full_content.push_str(&c_tail);
+    let mut tail_delta = parser.feed(&tail);
+    tail_delta.append(parser.finish());
     let mut out = out.lock().unwrap();
-    let (mut r_rest, mut c_rest) = out.take_pending();
-    r_rest.push_str(&r_tail);
-    c_rest.push_str(&c_tail);
+    out.add(tail_delta);
+    let pending = out.take_pending();
+    let builder = out.anth.take();
     let first_token_ms = out.first_token_ms();
 
     match report {
         Ok(rep) => {
-            if rep.stopped_by_cancel && !hit_stop {
+            // How the generation ended and what the client is told: the verified selection.
+            let has_calls = !parser.tool_calls().is_empty();
+            let stop_string = !parser.matched_stop().is_empty();
+            let end = generation_end(
+                stop_string,
+                parser.stopped() && !stop_string,
+                rep.stopped_by_eos,
+                rep.stopped_by_cancel,
+            );
+            if end == GenEnd::GeCancelled {
                 let _ = rguard.cancel();
             } else {
                 let _ = rguard.apply(ReqEvent::EvReqFinishStop);
             }
-            let finish_reason = if rep.stopped_by_eos || hit_stop {
+            let finish_reason = finish_reason_name(end, has_calls);
+            // the readout's phases are stop / length / cancelled
+            let phase = if has_calls && end != GenEnd::GeCancelled {
                 "stop"
-            } else if rep.stopped_by_cancel {
-                "cancelled"
             } else {
-                "length"
+                finish_reason
             };
             let n_gen = rep.generated_tokens.len() as u64;
             let summary = live.as_ref().and_then(|h| h.request_summary());
@@ -2243,31 +2440,54 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
             if let Some(sec) = readout::spec_section_json(&timings) {
                 details.push_str(&format!(",\"spec\":{sec}"));
             }
+            if has_calls {
+                details.push_str(&format!(",\"tool_calls\":{}", parser.tool_calls().len()));
+            }
+            if !ignored.is_empty() {
+                details.push_str(&format!(
+                    ",\"ignored\":[{}]",
+                    ignored.iter().map(|i| jq(i)).collect::<Vec<_>>().join(",")
+                ));
+            }
             details.push_str(&format!(
                 ",\"sampling\":{{\"greedy\":{is_greedy},\"temperature\":{temperature:.3},\"top_k\":{top_k},\
                  \"top_p\":{top_p:.3},\"min_p\":{min_p:.3},\"seed\":{seed_json}}}}}"
             ));
             state.publish_request(format!(
                 "{{{},\"timings\":{timings_json},\"details\":{details}}}",
-                req_base(finish_reason, queued_ms)
+                req_base(phase, queued_ms)
             ));
 
-            if stream_mode {
-                let mut tail_delta = String::from("{");
-                if !r_rest.is_empty() {
-                    tail_delta.push_str(&format!("\"reasoning_content\":{}", jq(&r_rest)));
-                }
-                if !c_rest.is_empty() {
-                    if tail_delta.len() > 1 {
-                        tail_delta.push(',');
+            if let Api::Messages { show_thinking } = api {
+                let mut b = builder.unwrap_or_else(|| anthropic::Builder::new(show_thinking));
+                let stop = stop_reason_name(end, has_calls);
+                let usage = anthropic::usage_json(rep.prompt_tokens as u64, n_gen);
+                let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
+                let events = b.feed(&pending);
+                if stream_mode {
+                    out.write(&events);
+                    out.write(&b.finish(stop, parser.matched_stop(), &usage, &extra));
+                    if !out.write_failed {
+                        write_sse_end(stream);
                     }
-                    tail_delta.push_str(&format!("\"content\":{}", jq(&c_rest)));
+                } else {
+                    b.close();
+                    let msg = b.message(
+                        &req_id,
+                        &model_id,
+                        stop,
+                        parser.matched_stop(),
+                        &usage,
+                        &extra,
+                    );
+                    write_json(stream, 200, &msg);
                 }
-                tail_delta.push('}');
+            } else if stream_mode {
                 let final_chunk = format!(
-                    "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{tail_delta},\"finish_reason\":{}}}],\
+                    "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{},\"finish_reason\":{}}}],\
                      \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}\n\ndata: [DONE]\n\n",
                     out.chunk_head(),
+                    stream_out::delta_json(&pending),
                     jq(finish_reason),
                 );
                 out.write(&final_chunk);
@@ -2275,9 +2495,24 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
                     write_sse_end(stream);
                 }
             } else {
-                let mut msg = format!("{{\"role\":\"assistant\",\"content\":{}", jq(&full_content));
-                if !full_reasoning.is_empty() {
-                    msg.push_str(&format!(",\"reasoning_content\":{}", jq(&full_reasoning)));
+                // a reply that is only tool calls has no content
+                let content = if parser.content().is_empty() && has_calls {
+                    "null".to_string()
+                } else {
+                    jq(parser.content())
+                };
+                let mut msg = format!("{{\"role\":\"assistant\",\"content\":{content}");
+                if !parser.reasoning().is_empty() {
+                    msg.push_str(&format!(
+                        ",\"reasoning_content\":{}",
+                        jq(parser.reasoning())
+                    ));
+                }
+                if has_calls {
+                    msg.push_str(&format!(
+                        ",\"tool_calls\":{}",
+                        chat::tool_calls_json(parser.tool_calls()).dump()
+                    ));
                 }
                 msg.push('}');
                 let resp = format!(
@@ -2299,13 +2534,10 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
                 jq(&e)
             ));
             if stream_mode {
-                out.write(&format!(
-                    "data: {{\"error\":{{\"message\":{},\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n",
-                    jq(&e)
-                ));
+                out.write(&api.stream_error(500, &e));
                 write_sse_end(stream);
             } else {
-                write_error(stream, 500, "server_error", &e);
+                api.error(stream, 500, "server_error", &e);
             }
         }
     }
@@ -2394,7 +2626,7 @@ fn mime_type_for(path: &Path) -> &'static str {
 }
 
 // ============================================================================
-// ChatML Prompt Builder & Streaming `<think>...</think>` Splitter
+// Built-in Text Templates (models without a chat template)
 // ============================================================================
 
 /// Builds the chat prompt in the registered model's own template family.
@@ -2476,70 +2708,15 @@ pub fn build_gemma4_chat_prompt(
     Ok(out)
 }
 
-/// Name line of Gemma 4's reasoning channel: the text right after the opening token.
-const GEMMA4_THOUGHT_LABEL: &str = "thought\n";
-
-/// Splits a reply whose reasoning lies between two special tokens (which are never decoded to
-/// text) into `(reasoning_content, content)`: Gemma 4's `<|channel>thought\n ... <channel|>`.
-#[derive(Debug)]
-pub struct ChannelSplitter {
-    open: i32,
-    close: i32,
-    label: &'static str,
-    in_channel: bool,
-    /// Bytes of `label` still expected at the start of the channel's text.
-    label_left: usize,
-}
-
-impl ChannelSplitter {
-    pub fn new(open: i32, close: i32, label: &'static str) -> Self {
-        Self {
-            open,
-            close,
-            label,
-            in_channel: false,
-            label_left: 0,
-        }
+/// The reasoning tags of a family's built-in text template (a model without a chat template).
+fn builtin_format(family: ModelFamily) -> OutputFormat {
+    let mut f = OutputFormat::default();
+    if family == ModelFamily::Gemma4 {
+        // Gemma 4 writes its reasoning as a channel between two special tokens
+        f.think_open = "<|channel>thought\n".into();
+        f.think_close = "<channel|>".into();
     }
-
-    /// Whether `token` opens or closes the channel (it then carries no text).
-    pub fn marker(&mut self, token: i32) -> bool {
-        if token == self.open {
-            self.in_channel = true;
-            self.label_left = self.label.len();
-            true
-        } else if token == self.close {
-            self.in_channel = false;
-            self.label_left = 0;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// One piece of decoded text -> `(reasoning, content)`.
-    pub fn text(&mut self, piece: &str) -> (String, String) {
-        if !self.in_channel {
-            return (String::new(), piece.to_string());
-        }
-        // the channel's name line is not part of the reasoning; it may arrive in several pieces
-        let mut rest = piece;
-        while self.label_left > 0 && !rest.is_empty() {
-            let want = &self.label[self.label.len() - self.label_left..];
-            let n = want
-                .bytes()
-                .zip(rest.bytes())
-                .take_while(|(a, b)| a == b)
-                .count();
-            if n == 0 {
-                self.label_left = 0; // another channel name: keep its text
-                break;
-            }
-            self.label_left -= n;
-            rest = &rest[n..];
-        }
-        (rest.to_string(), String::new())
-    }
+    f
 }
 
 /// Builds a Qwen3 / Qwen3.5 ChatML prompt from an OpenAI `/v1/chat/completions` JSON body.
@@ -2593,113 +2770,6 @@ fn extract_message_text(content: Option<&JsonValue>) -> String {
     }
 }
 
-/// Streaming parser separating `<think>...</think>` blocks into `(reasoning_content, content)`.
-#[derive(Debug)]
-pub struct ThinkSplitter {
-    state: ThinkState,
-    buf: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThinkState {
-    Start,
-    InThink,
-    Content,
-}
-
-impl ThinkSplitter {
-    pub fn new(enable_thinking: bool, preopened: bool) -> Self {
-        Self {
-            state: if !enable_thinking {
-                ThinkState::Content
-            } else if preopened {
-                ThinkState::InThink
-            } else {
-                ThinkState::Start
-            },
-            buf: String::new(),
-        }
-    }
-
-    pub fn push(&mut self, piece: &str) -> (String, String) {
-        let mut reasoning = String::new();
-        let mut content = String::new();
-        self.buf.push_str(piece);
-
-        loop {
-            match self.state {
-                ThinkState::Start => {
-                    let trimmed = self.buf.trim_start_matches(['\n', '\r', ' ']);
-                    if trimmed.is_empty() {
-                        break;
-                    }
-                    if let Some(rest) = trimmed.strip_prefix("<think>") {
-                        let rest = rest.trim_start_matches('\n').to_string();
-                        self.buf = rest;
-                        self.state = ThinkState::InThink;
-                        continue;
-                    }
-                    if "<think>".starts_with(trimmed) {
-                        break;
-                    }
-                    // No `<think>` opening tag -> normal content
-                    content.push_str(&self.buf);
-                    self.buf.clear();
-                    self.state = ThinkState::Content;
-                    break;
-                }
-                ThinkState::InThink => {
-                    if let Some(idx) = self.buf.find("</think>") {
-                        reasoning.push_str(&self.buf[..idx]);
-                        let after = self.buf[idx + "</think>".len()..]
-                            .trim_start_matches('\n')
-                            .to_string();
-                        self.buf = after;
-                        self.state = ThinkState::Content;
-                        continue;
-                    }
-                    // Emit everything except any trailing prefix of "</think>"
-                    let keep = trailing_tag_prefix_len(&self.buf, "</think>");
-                    let emit_len = self.buf.len() - keep;
-                    if emit_len > 0 {
-                        reasoning.push_str(&self.buf[..emit_len]);
-                        self.buf.drain(..emit_len);
-                    }
-                    break;
-                }
-                ThinkState::Content => {
-                    content.push_str(&self.buf);
-                    self.buf.clear();
-                    break;
-                }
-            }
-        }
-        (reasoning, content)
-    }
-
-    pub fn finish(&mut self, tail: &str) -> (String, String) {
-        let (mut r, mut c) = self.push(tail);
-        if !self.buf.is_empty() {
-            match self.state {
-                ThinkState::InThink => r.push_str(&self.buf),
-                ThinkState::Start | ThinkState::Content => c.push_str(&self.buf),
-            }
-            self.buf.clear();
-        }
-        (r, c)
-    }
-}
-
-fn trailing_tag_prefix_len(haystack: &str, tag: &str) -> usize {
-    let max_k = haystack.len().min(tag.len().saturating_sub(1));
-    for k in (1..=max_k).rev() {
-        if haystack.is_char_boundary(haystack.len() - k) && haystack.ends_with(&tag[..k]) {
-            return k;
-        }
-    }
-    0
-}
-
 fn jq(s: &str) -> String {
     readout::jq(s)
 }
@@ -2744,6 +2814,19 @@ fn parse_query(q: &str) -> HashMap<String, String> {
     map
 }
 
+/// The prompt text a chat-completions request body renders to with the chat template of the
+/// model in `model_dir` (`gaudium --apply-template`).
+pub fn apply_chat_template(model_dir: &Path, body_json: &str) -> Result<String, String> {
+    let Some((template, note)) = chat::ChatTemplate::load(model_dir)? else {
+        return Err(format!("{} has no chat template", model_dir.display()));
+    };
+    if let Some(note) = note {
+        eprintln!("[template] {note}");
+    }
+    let body = json::parse_json(body_json).map_err(|e| e.to_string())?;
+    chat::render_chat(&template, &body).map(|p| p.text)
+}
+
 /// Parses `--model` spec: either `/path/to/ModelDir` (alias = basename) or `alias=/path/to/ModelDir`.
 pub fn parse_model_arg(raw: &str) -> ModelSpecEntry {
     if let Some((alias, path)) = raw.split_once('=') {
@@ -2766,6 +2849,9 @@ pub fn parse_model_arg(raw: &str) -> ModelSpecEntry {
 /// Helper to keep unused import warning clean when tests build cleanly.
 #[allow(dead_code)]
 fn _keep_btree(_: BTreeMap<String, String>) {}
+
+#[cfg(test)]
+mod http_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2876,41 +2962,6 @@ mod tests {
     }
 
     #[test]
-    fn think_splitter_handles_split_tags_and_plain_content() {
-        let mut s = ThinkSplitter::new(true, false);
-        let mut r = String::new();
-        let mut c = String::new();
-        for piece in [
-            "<thi",
-            "nk>\nStep 1",
-            " done</th",
-            "ink>\n\nHello",
-            " world!",
-        ] {
-            let (rd, cd) = s.push(piece);
-            r.push_str(&rd);
-            c.push_str(&cd);
-        }
-        let (rt, ct) = s.finish("");
-        r.push_str(&rt);
-        c.push_str(&ct);
-        assert_eq!(r, "Step 1 done");
-        assert_eq!(c, "Hello world!");
-
-        // Pre-opened thinking (Qwen3.5/3.8)
-        let mut pre = ThinkSplitter::new(true, true);
-        let (pr1, pc1) = pre.push("reasoning</think>\n\nAnswer");
-        let (pr2, pc2) = pre.finish("");
-        assert_eq!(format!("{pr1}{pr2}"), "reasoning");
-        assert_eq!(format!("{pc1}{pc2}"), "Answer");
-
-        let mut plain = ThinkSplitter::new(true, false);
-        let (r2, c2) = plain.push("Just a direct answer");
-        assert!(r2.is_empty());
-        assert_eq!(c2, "Just a direct answer");
-    }
-
-    #[test]
     fn build_chat_prompt_formats_multiturn_and_no_think() {
         let body = json::parse_json(
             r#"{
@@ -2968,34 +3019,24 @@ mod tests {
     }
 
     #[test]
-    fn channel_splitter_separates_the_thought_channel_by_its_tokens() {
-        let (open, close) = (100, 101);
-        let mut c = ChannelSplitter::new(open, close, GEMMA4_THOUGHT_LABEL);
-        let mut r = String::new();
-        let mut a = String::new();
-        let mut feed = |c: &mut ChannelSplitter, piece: &str| {
-            let (rd, cd) = c.text(piece);
-            r.push_str(&rd);
-            a.push_str(&cd);
-        };
-        assert!(!c.marker(7));
-        assert!(c.marker(open));
-        // the channel name arrives split over two pieces
-        for p in ["thou", "ght\nThe user", " greets me.\n"] {
-            feed(&mut c, p);
+    fn builtin_formats_and_api_error_shapes() {
+        assert_eq!(
+            builtin_format(ModelFamily::Qwen35Dense),
+            OutputFormat::default()
+        );
+        let g = builtin_format(ModelFamily::Gemma4);
+        assert_eq!(
+            (g.think_open.as_str(), g.think_close.as_str()),
+            ("<|channel>thought\n", "<channel|>")
+        );
+        assert!(Api::Chat
+            .stream_error(500, "x")
+            .ends_with("data: [DONE]\n\n"));
+        let e = Api::Messages {
+            show_thinking: true,
         }
-        assert!(c.marker(close));
-        for p in ["Hello", "!"] {
-            feed(&mut c, p);
-        }
-        assert_eq!(r, "The user greets me.\n");
-        assert_eq!(a, "Hello!");
-
-        // a reply that never opens the channel is all content; another channel name is kept
-        let mut c = ChannelSplitter::new(open, close, GEMMA4_THOUGHT_LABEL);
-        assert_eq!(c.text("Hi"), (String::new(), "Hi".to_string()));
-        assert!(c.marker(open));
-        assert_eq!(c.text("final\nx"), ("final\nx".to_string(), String::new()));
+        .stream_error(503, "busy");
+        assert!(e.starts_with("event: error\ndata: {\"type\":\"error\""));
     }
 
     #[test]
