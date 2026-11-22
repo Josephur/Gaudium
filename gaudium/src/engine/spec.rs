@@ -2162,14 +2162,14 @@ pub(super) fn decode(
                 } else {
                     &rt.steps[&(tk, nch)]
                 };
-                // host marks of the launch call (two launches may be in flight: the `live.step`
-                // that follows these marks consumes the older one)
-                eng.live.launch_begin();
+                // No host launch marks here: with two launches in flight a mark would be paired
+                // with the `live.step` of the older launch. The reporter times these steps by
+                // their token arrivals and takes their bytes from the armed launch model
+                // (`spec::readout::arm`), which a pending mark would switch off.
                 tryd!(step
                     .recipe
                     .launch_prepared(&eng.dev, &step.launches[p])
                     .map_err(|e| format!("launch spec step (cursor<={cur_hi}, T={t}): {e}")));
-                eng.live.launch_submitted();
             }
             if let Some(ev) = &events {
                 tryd!(ev[p]

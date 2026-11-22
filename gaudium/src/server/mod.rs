@@ -39,7 +39,6 @@ use readout::{DrafterFacts, RunFacts, Timings};
 use stream_out::StreamOut;
 
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
-const DEFAULT_MAX_TOKENS: u64 = 2048;
 
 #[derive(Debug, Clone)]
 pub struct ModelSpecEntry {
@@ -1844,11 +1843,8 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
         .or_else(|| val.get("max_completion_tokens"))
         .and_then(|v| v.as_u64())
         .filter(|&v| v > 0);
-    let budget = match SequenceBudget::admit(
-        n_prompt,
-        Some(req_max.unwrap_or(DEFAULT_MAX_TOKENS)),
-        m.max_ctx,
-    ) {
+    // A request that names no limit may generate to the end of the model's context.
+    let budget = match SequenceBudget::admit(n_prompt, req_max, m.max_ctx) {
         Ok(b) => b,
         Err(e) => {
             write_error(
