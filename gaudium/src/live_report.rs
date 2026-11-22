@@ -4,6 +4,12 @@
 //! transition, at most once per second during decode, and on a 1-second background heartbeat so
 //! long recipe compiles or weight uploads stay live.
 //!
+//! A reporter created with the heartbeat has one writer thread, and that thread does every file
+//! write after the first: a status change only wakes it. A file write can block in the filesystem
+//! for tens of milliseconds (replacing a file whose previous version is still being written out),
+//! and the thread that reports a change is the one running the request. Who writes is the verified
+//! `live_write_route`.
+//!
 //! Controlled strictly through standard environment variables (zero site-specific defaults):
 //! - `GAUDI_LIVE=0`: disables reporting unconditionally.
 //! - `GAUDI_LIVE_DIR`: target directory for live JSON records.
@@ -74,6 +80,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::live_profile::{StepSample as LaunchSample, StepTimeline, Traffic};
+use crate::verified::{live_write_route, LiveWrite};
 
 /// Process-wide: reporters created without a live directory keep their state in memory.
 static IN_MEMORY: AtomicBool = AtomicBool::new(false);
@@ -251,7 +258,13 @@ struct Shared {
     sink: Mutex<Option<LaunchSink>>,
     model: Mutex<Option<Box<dyn LaunchModel>>>,
     write_lock: Mutex<()>,
-    stop: (Mutex<bool>, Condvar),
+    /// The writer thread's mailbox.
+    wake: (Mutex<Wake>, Condvar),
+    /// The writer thread runs: status changes are handed to it instead of written by the caller.
+    has_writer: AtomicBool,
+    /// The thread that wrote the record last.
+    #[cfg(test)]
+    last_writer: Mutex<Option<thread::ThreadId>>,
     path: PathBuf,
     tmp_path: PathBuf,
     lock_dir: Option<PathBuf>,
@@ -262,6 +275,16 @@ struct Shared {
     where_tag: String,
     load_at_lock: String,
     lock_logged: Mutex<bool>,
+}
+
+/// What the writer thread is asked to do.
+#[derive(Debug, Default)]
+struct Wake {
+    /// The reporter is being dropped.
+    stop: bool,
+    /// A forced write is waiting (several requests before the thread runs make one write of the
+    /// newest state).
+    forced: bool,
 }
 
 /// Thread-safe, RAII live-stats writer. Unlinks its status record cleanly when dropped.
@@ -320,7 +343,10 @@ impl LiveReporter {
                 sink: Mutex::new(None),
                 model: Mutex::new(None),
                 write_lock: Mutex::new(()),
-                stop: (Mutex::new(false), Condvar::new()),
+                wake: (Mutex::new(Wake::default()), Condvar::new()),
+                has_writer: AtomicBool::new(false),
+                #[cfg(test)]
+                last_writer: Mutex::new(None),
                 path: PathBuf::new(),
                 tmp_path: PathBuf::new(),
                 lock_dir: None,
@@ -425,7 +451,10 @@ impl LiveReporter {
             sink: Mutex::new(None),
             model: Mutex::new(None),
             write_lock: Mutex::new(()),
-            stop: (Mutex::new(false), Condvar::new()),
+            wake: (Mutex::new(Wake::default()), Condvar::new()),
+            has_writer: AtomicBool::new(false),
+            #[cfg(test)]
+            last_writer: Mutex::new(None),
             path,
             tmp_path,
             lock_dir,
@@ -437,30 +466,22 @@ impl LiveReporter {
             load_at_lock,
             lock_logged: Mutex::new(false),
         });
+        // The first record and the card-lock holder exist before this returns (the caller opens
+        // the device next); every later write is the writer thread's, when there is one.
         flush(&shared, true, false);
 
         let hb_handle = if heartbeat {
             let s = Arc::clone(&shared);
             thread::Builder::new()
                 .name("gaudium-live-hb".into())
-                .spawn(move || {
-                    let (lk, cv) = &s.stop;
-                    let mut stopped = lk.lock().unwrap();
-                    while !*stopped {
-                        let (guard, _) = cv.wait_timeout(stopped, Duration::from_secs(1)).unwrap();
-                        stopped = guard;
-                        if *stopped {
-                            break;
-                        }
-                        drop(stopped);
-                        flush(&s, false, true);
-                        stopped = lk.lock().unwrap();
-                    }
-                })
+                .spawn(move || writer_loop(&s))
                 .ok()
         } else {
             None
         };
+        shared
+            .has_writer
+            .store(hb_handle.is_some(), Ordering::Release);
 
         Self {
             shared: Some(shared),
@@ -490,7 +511,7 @@ impl LiveReporter {
     pub fn set_model(&self, model: impl Into<String>) {
         if let Some(s) = &self.shared {
             s.state.lock().unwrap().model = model.into();
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -505,7 +526,7 @@ impl LiveReporter {
                     st.notes_is_status = true;
                 }
             }
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -535,7 +556,7 @@ impl LiveReporter {
                 other as f64 / 1e9,
             ]);
             drop(st);
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -554,7 +575,7 @@ impl LiveReporter {
             st.hbm_used_bytes = Some((total_gb * 1e9) as u64);
             st.hbm_gb = Some([weights_gb, kv_gb, state_gb, scratch_gb, other_gb]);
             drop(st);
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -626,7 +647,7 @@ impl LiveReporter {
                 st.samples.clear();
                 st.on_begin_request(has_notes);
             }
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -637,7 +658,7 @@ impl LiveReporter {
                 st.prompt_cached = cached_tokens;
                 st.prefill_done = st.prefill_done.max(cached_tokens);
             }
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -663,7 +684,7 @@ impl LiveReporter {
                 st.launch_event(LaunchKind::First, t, (0, 0, 0))
             };
             notify(s, &ev);
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -790,7 +811,7 @@ impl LiveReporter {
         };
         notify(s, &ev);
         if due {
-            flush(s, false, false);
+            request_write(s, false);
         }
     }
 
@@ -806,7 +827,7 @@ impl LiveReporter {
         if let Some(s) = &self.shared {
             s.state.lock().unwrap().phase = "idle".to_string();
             s.state.lock().unwrap().on_end_request("done");
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -820,7 +841,7 @@ impl LiveReporter {
                 st.phase = "idle".to_string();
                 st.on_end_request(outcome);
             }
-            flush(s, true, false);
+            request_write(s, true);
         }
     }
 
@@ -846,7 +867,7 @@ impl LiveReporter {
             (first, st.launch_event(LaunchKind::Prefill, t, (0, 0, 0)))
         };
         notify(s, &ev);
-        flush(s, first, false);
+        request_write(s, first);
     }
 
     /// `prefill_progress` plus the byte model of the tile that just finished: its `launches`
@@ -870,7 +891,7 @@ impl LiveReporter {
             (first, st.launch_event(LaunchKind::Prefill, t, (0, 0, 0)))
         };
         notify(s, &ev);
-        flush(s, first, false);
+        request_write(s, first);
     }
 
     /// Marks the host time right before the launch call of a decode step (the verify launch of a
@@ -1346,12 +1367,16 @@ impl State {
 impl Drop for LiveReporter {
     fn drop(&mut self) {
         if let Some(s) = &self.shared {
-            let (lk, cv) = &s.stop;
-            *lk.lock().unwrap() = true;
+            let (lk, cv) = &s.wake;
+            lk.lock().unwrap().stop = true;
             cv.notify_all();
         }
         if let Some(handle) = self.heartbeat.take() {
+            // the thread writes a waiting forced record before it ends
             let _ = handle.join();
+        }
+        if let Some(s) = &self.shared {
+            s.has_writer.store(false, Ordering::Release);
         }
         if let Some(s) = self.shared.as_ref().filter(|s| s.write_files) {
             let _ = fs::remove_file(&s.path);
@@ -1484,11 +1509,61 @@ fn json_opt_f64(v: Option<f64>, prec: usize) -> String {
     }
 }
 
+/// A status change is to reach the record. With a writer thread the caller only wakes it (a
+/// forced change) or leaves the change to its next periodic write; without one the caller writes.
+fn request_write(shared: &Shared, force: bool) {
+    if !shared.write_files {
+        return;
+    }
+    match live_write_route(shared.has_writer.load(Ordering::Acquire), force) {
+        LiveWrite::LwInline => flush(shared, force, false),
+        LiveWrite::LwWake => {
+            let (lk, cv) = &shared.wake;
+            let mut w = lk.lock().unwrap();
+            if !w.forced {
+                w.forced = true;
+                cv.notify_one();
+            }
+        }
+        LiveWrite::LwDefer => {}
+    }
+}
+
+/// The writer thread: a forced write as soon as one is asked for, else the 1-second heartbeat
+/// write. A forced write that is still waiting when the reporter is dropped is written first.
+fn writer_loop(shared: &Shared) {
+    let (lk, cv) = &shared.wake;
+    let mut w = lk.lock().unwrap();
+    loop {
+        if w.forced {
+            w.forced = false;
+            drop(w);
+            flush(shared, true, false);
+            w = lk.lock().unwrap();
+            continue;
+        }
+        if w.stop {
+            break;
+        }
+        let (guard, timeout) = cv.wait_timeout(w, Duration::from_secs(1)).unwrap();
+        w = guard;
+        if timeout.timed_out() && !w.forced && !w.stop {
+            drop(w);
+            flush(shared, false, true);
+            w = lk.lock().unwrap();
+        }
+    }
+}
+
 fn flush(shared: &Shared, force: bool, heartbeat: bool) {
     if !shared.write_files {
         return;
     }
     let _wg = shared.write_lock.lock().unwrap();
+    #[cfg(test)]
+    {
+        *shared.last_writer.lock().unwrap() = Some(thread::current().id());
+    }
     let host_ram = read_proc_ram_gb();
     let wall_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2188,6 +2263,125 @@ mod tests {
         );
         assert!(rep.profile_snapshot().is_none());
         drop(rep);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Polls `cond` for up to 5 s: the writer thread writes shortly after it is woken.
+    fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(5) {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        cond()
+    }
+
+    #[test]
+    fn status_writes_go_to_the_writer_thread_when_there_is_one() {
+        // today's routing (the laws only bound it)
+        assert!(matches!(live_write_route(true, true), LiveWrite::LwWake));
+        assert!(matches!(live_write_route(true, false), LiveWrite::LwDefer));
+        assert!(matches!(
+            live_write_route(false, true),
+            LiveWrite::LwInline
+        ));
+        assert!(matches!(
+            live_write_route(false, false),
+            LiveWrite::LwInline
+        ));
+    }
+
+    #[test]
+    fn a_reporter_with_a_writer_thread_never_writes_on_the_reporting_thread() {
+        let root = env::temp_dir().join(format!("gaudium_live_writer_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("live");
+        fs::create_dir_all(&dir).unwrap();
+        let me = thread::current().id();
+
+        let rep = LiveReporter::in_dir(&dir, "gaudium-rust", "v0.1", "engine", true);
+        let path = rep.path().unwrap().to_path_buf();
+        let shared = Arc::clone(rep.shared.as_ref().unwrap());
+        // the first record and the card-lock holder are written before the constructor returns
+        assert!(path.exists());
+        assert!(root.join("holder").exists());
+        assert_eq!(*shared.last_writer.lock().unwrap(), Some(me));
+        assert!(shared.has_writer.load(Ordering::Acquire));
+
+        // one whole request, every call of it on this thread
+        rep.set_model("Qwen3.8-27B");
+        rep.begin_request(39, "K=0 BF16", "");
+        rep.prefill_progress(0);
+        rep.prefill_progress(39);
+        rep.first_token(Some(35.2), 1);
+        rep.step(1, 0, 0);
+        rep.end_request();
+
+        // the newest state reaches the file, and it was not this thread that wrote it
+        let newest = || {
+            let Ok(raw) = fs::read_to_string(&path) else {
+                return false;
+            };
+            let Ok(v) = json::parse_json(&raw) else {
+                return false;
+            };
+            v.get("model").and_then(|x| x.as_str()) == Some("Qwen3.8-27B")
+                && v.get("phase").and_then(|x| x.as_str()) == Some("idle")
+                && v.get("request_seq").and_then(|x| x.as_u64()) == Some(1)
+                && v.get("outcome").and_then(|x| x.as_str()) == Some("done")
+        };
+        assert!(wait_for(newest), "the writer thread writes the newest state");
+        let writer = shared.last_writer.lock().unwrap().expect("a write");
+        assert_ne!(writer, me, "a request's thread does no file write");
+
+        drop(rep);
+        assert!(!path.exists(), "the record is removed on drop");
+        assert!(!shared.has_writer.load(Ordering::Acquire));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_reporter_without_a_writer_thread_writes_on_the_reporting_thread() {
+        let root = env::temp_dir().join(format!("gaudium_live_inline_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("live");
+        fs::create_dir_all(&dir).unwrap();
+        let rep = LiveReporter::in_dir(&dir, "gaudium-rust", "v0.1", "engine", false);
+        let path = rep.path().unwrap().to_path_buf();
+        let shared = Arc::clone(rep.shared.as_ref().unwrap());
+        assert!(!shared.has_writer.load(Ordering::Acquire));
+        rep.set_phase("load", "weights");
+        // written before the call returned
+        let v = read_record(&path);
+        assert_eq!(v.get("phase").and_then(|x| x.as_str()), Some("load"));
+        assert_eq!(
+            *shared.last_writer.lock().unwrap(),
+            Some(thread::current().id())
+        );
+        drop(rep);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_forced_write_still_waiting_at_drop_is_written_first() {
+        let root = env::temp_dir().join(format!("gaudium_live_drop_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("live");
+        fs::create_dir_all(&dir).unwrap();
+        for _ in 0..20 {
+            let _ = fs::remove_file(root.join("log"));
+            {
+                let rep = LiveReporter::in_dir(&dir, "gaudium-rust", "v0.1", "engine", true);
+                // the card-lock log gets its LOCK line with the first record that names a model
+                rep.set_model("Qwen3.8-27B");
+            }
+            let log = fs::read_to_string(root.join("log")).expect("lock log");
+            let lock = log.find("] LOCK ").expect("LOCK line before the reporter ended");
+            let unlock = log.find("] UNLOCK ").expect("UNLOCK line");
+            assert!(lock < unlock, "{log}");
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

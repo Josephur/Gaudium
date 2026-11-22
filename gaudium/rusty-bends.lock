@@ -72,6 +72,9 @@ ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat
 3ddfe8a0a0c54651  lane_busy_blocks_exclusive  law lane_busy_blocks_exclusive : for b : Nat for max_lanes : Nat { lane_can_admit ( 1n + b , max_lanes , False { } , True { } ) == False { } : Bool }
 3f71bff599d5e309  lane_exclusive_blocks_all  law lane_exclusive_blocks_all : for busy : Nat for max_lanes : Nat for want_excl : Bool { lane_can_admit ( busy , max_lanes , True { } , want_excl ) == False { } : Bool }
 4775d7007e9e1d84  lane_full_blocks_shared  law lane_full_blocks_shared : for + cap : Nat for excl : Bool { lane_can_admit ( cap , cap , excl , False { } ) == False { } : Bool }
+72939e08483e2782  live_write_forced_not_deferred  law live_write_forced_not_deferred : for has_writer : Bool { lw_is_defer ( live_write_route ( has_writer , True { } ) ) == False { } : Bool }
+2e68cb9c0d45b0de  live_write_no_writer_no_defer  law live_write_no_writer_no_defer : for force : Bool { lw_is_defer ( live_write_route ( False { } , force ) ) == False { } : Bool }
+37c4cba4beb87a11  live_write_off_the_caller  law live_write_off_the_caller : for force : Bool { lw_is_inline ( live_write_route ( True { } , force ) ) == False { } : Bool }
 ba223807cabf30d6  moe_zero_experts_rejected  law moe_zero_experts_rejected : for + ek : Nat for + ef : Nat { moe_dims_valid ( 0n , ek , ef ) == False { } : Bool }
 1b6bb5e0fe9aa632  oversized_prompt_rejected  law oversized_prompt_rejected : for + lmax : Nat for + extra : Nat { prompt_admitted ( Nat.add ( served_ctx ( lmax ) , extra ) , lmax ) == False { } : Bool }
 84e37afe4c2e2159  pfx_reuse_at_prompt_end_false  law pfx_reuse_at_prompt_end_false : for + p : Nat for lcp : Nat for + tile : Nat for nm : Bool for mu : Nat for nd : Bool for du : Nat { pfx_reuse_valid ( p , lcp , p , tile , nm , mu , nd , du ) == False { } : Bool }

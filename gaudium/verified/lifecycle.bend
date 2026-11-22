@@ -682,3 +682,82 @@ def router_no_switch_while_stopping(act):
   match act:
     case 0n: {==}
     case 1n+_: {==}
+
+# ============================================================================
+# 5. Live Status Record Writes (live_report.rs)
+# ============================================================================
+#
+# The engine publishes its status as small files (the live record, the card-lock holder). A file
+# write can block in the filesystem for far longer than a launch takes, so once the reporter has
+# its own writer thread, the thread that reported the change (a request's thread) hands the write
+# over and never touches the filesystem itself.
+
+type LiveWrite is Data:
+  LwInline{}
+  LwWake{}
+  LwDefer{}
+
+# Who writes the record after a status change:
+#   LwInline  the caller writes it (a reporter without a writer thread)
+#   LwWake    the writer thread is woken and writes it
+#   LwDefer   the writer thread's next periodic write covers it
+def live_write_route(has_writer: Bool, force: Bool) -> LiveWrite:
+  match has_writer:
+    case True{}:
+      match force:
+        case True{}:
+          LwWake{}
+        case False{}:
+          LwDefer{}
+    case False{}:
+      LwInline{}
+
+def lw_is_inline(r: LiveWrite) -> Bool:
+  match r:
+    case LwInline{}:
+      True{}
+    case _:
+      False{}
+
+def lw_is_defer(r: LiveWrite) -> Bool:
+  match r:
+    case LwDefer{}:
+      True{}
+    case _:
+      False{}
+
+# LAW 5.1: With a writer thread, the reporting thread never writes the record itself.
+law live_write_off_the_caller:
+  for force: Bool
+  {lw_is_inline(live_write_route(True{}, force)) == False{} : Bool}
+
+def live_write_off_the_caller(force):
+  match force:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# LAW 5.2: A forced write is never left to the periodic write.
+law live_write_forced_not_deferred:
+  for has_writer: Bool
+  {lw_is_defer(live_write_route(has_writer, True{})) == False{} : Bool}
+
+def live_write_forced_not_deferred(has_writer):
+  match has_writer:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# LAW 5.3: Nothing is left to a periodic write that does not exist (no writer thread).
+law live_write_no_writer_no_defer:
+  for force: Bool
+  {lw_is_defer(live_write_route(False{}, force)) == False{} : Bool}
+
+def live_write_no_writer_no_defer(force):
+  match force:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
