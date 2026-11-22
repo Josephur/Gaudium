@@ -219,7 +219,7 @@ function friendlyError(e, { canCompact = true } = {}) {
     if (e.status === 401 || e.status === 403 && e.type === 'authentication_error') { set({ needKey: true, keyError: 'The key was not accepted.' }); return { message: 'The server needs an API key.', code: e.status }; }
     if (b && b.type === 'exceed_context_size_error') return { message: `This conversation (${fmtInt(b.n_prompt_tokens)} tokens) is longer than the context (${fmtInt(b.n_ctx)} tokens).`, code: 400, overflow: true, canCompact,
       hint: canCompact ? 'Compact the conversation and send it again, or start a new chat.' : 'Nothing before this message is left to compact: it is too long for the context by itself. Shorten it or remove an attachment.' };
-    if (e.status === 503) return { message: e.message, code: 503, hint: 'The engine is parked or loading. Open “Engine and card” to see its state and start it.' };
+    if (e.status === 503) return { message: e.message, code: 503, hint: 'The engine is parked or loading. Open “Engine & Model” to see its state and start it.' };
     return { message: e.message, code: e.status };
   }
   return { message: /Failed to fetch|NetworkError|network/i.test(String(e && e.message)) ? 'The connection to the server was lost.' : String((e && e.message) || e), hint: 'Check that gaudium-server is running (gaudium-serve status).' };
@@ -260,7 +260,7 @@ async function streamPass(st, convId, targetId, body, { kind = null, compacted =
   const aborted = signal.aborted;
   if (seg && !seg.finish && aborted) seg.finish = 'cancelled';
   if (err && !aborted) seg = { ...(seg || newSegment()), error: friendlyError(err, { canCompact }) };
-  if (seg && !aborted && !seg.error && !seg.done && !seg.finish) seg.error = { message: 'The stream ended before the reply was complete.', hint: 'The engine may have stopped; see “Engine and card”.' };
+  if (seg && !aborted && !seg.error && !seg.done && !seg.finish) seg.error = { message: 'The stream ended before the reply was complete.', hint: 'The engine may have stopped; see “Engine & Model”.' };
   mark(seg);
   const hasAny = !!(seg && (seg.content || seg.reasoning || seg.toolCalls.length || seg.error || seg.timings));
   const segIndex = (getConv(convId).messages[targetId].segments || []).length;
@@ -700,7 +700,7 @@ function CardPill({ engine, hello, events, onClick, now, engineAt, precision }) 
   const elapsed = Math.round((e.state_for_s || 0) + Math.max(0, (now - (engineAt || now)) / 1000));
   const text = { ready: e.mock && !e.available ? 'mock replay' : 'card ready', parked: 'card parked', queued: 'waiting for the card', loading: `warming up ${elapsed} s`, stopping: 'releasing the card', failed: 'engine failed', offline: 'no event stream', connecting: 'connecting' }[st] || st;
   const cls = st === 'ready' ? 'ok' : st === 'failed' || st === 'offline' ? 'bad' : 'warn';
-  return html`<button class="cardpill" onClick=${onClick} title="Engine and card (Ctrl+Shift+G)">
+  return html`<button class="cardpill" onClick=${onClick} title="Engine & Model (Ctrl+Shift+G)">
     <span class=${cx('dot', cls, (st === 'queued' || st === 'loading' || st === 'stopping') && 'pulse')}></span>
     <span class="label">${text}</span>${precision && st === 'ready' ? html`<span class="mono">${precision}</span>` : null}
   </button>`;

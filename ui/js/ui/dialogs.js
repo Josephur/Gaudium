@@ -1,4 +1,4 @@
-// Dialogs: settings (incl. MCP servers), the engine and card, keyboard shortcuts, confirmation, the API key.
+// Dialogs: settings (incl. MCP servers), the engine and model, keyboard shortcuts, confirmation, the API key.
 import { html, cx } from './h.js';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { Icon } from './icons.js';
@@ -140,7 +140,7 @@ export function CardDialog({ engine, hello, live, onClose, onAction, now, engine
   const elapsed = (e.state_for_s || 0) + Math.max(0, (now - (engineAt || now)) / 1000);
   const label = { ready: 'Ready', parked: 'Parked: the card is free for other jobs', queued: 'Waiting for the card', loading: 'Warming up the card', stopping: 'Stopping', failed: 'Failed' }[st] || st;
   const cls = st === 'ready' ? 'ok' : st === 'failed' ? 'bad' : 'warn';
-  return html`<${Dialog} title="Engine and card" onClose=${onClose} narrow foot=${e.available ? html`
+  return html`<${Dialog} title="Engine & Model" onClose=${onClose} narrow foot=${e.available ? html`
       <button class="btn" onClick=${() => onAction(e.hold ? 'unhold' : 'hold')} title="Hold: keep the card while idle, even when other jobs wait">${e.hold ? 'Stop holding' : 'Hold the card'}</button>
       ${st === 'ready' ? html`<button class="btn" onClick=${() => onAction('release')} title="Free the card now; the next message takes it again">Release the card</button>` : null}
       ${st === 'parked' || st === 'failed' ? html`<button class="btn primary" onClick=${() => onAction('start')}>Start the engine</button>` : null}` : null}>
@@ -184,7 +184,7 @@ export function ShortcutsDialog({ onClose }) {
   const K = (...k) => html`<span>${k.map((x) => html`<kbd>${x}</kbd>`)}</span>`;
   const rows = [['New chat', K('Ctrl', 'Shift', 'O')], ['Search chats', K('Ctrl', 'K')], ['Settings', K('Ctrl', ',')], ['Rename this chat', K('Ctrl', 'Shift', 'E')],
     ['Export this chat', K('Ctrl', 'Shift', 'S')], ['Delete this chat', K('Ctrl', 'Shift', 'D')], ['Toggle the sidebar', K('Ctrl', 'B')], ['Focus the message box', K('/')],
-    ['Send', K('Enter')], ['New line', K('Shift', 'Enter')], ['Stop the reply', K('Esc')], ['Engine and card', K('Ctrl', 'Shift', 'G')], ['Compact the conversation', K('Ctrl', 'Shift', 'L')], ['These shortcuts', K('Ctrl', '/')]];
+    ['Send', K('Enter')], ['New line', K('Shift', 'Enter')], ['Stop the reply', K('Esc')], ['Engine & Model', K('Ctrl', 'Shift', 'G')], ['Compact the conversation', K('Ctrl', 'Shift', 'L')], ['These shortcuts', K('Ctrl', '/')]];
   return html`<${Dialog} title="Keyboard shortcuts" onClose=${onClose} narrow>
     <div class="shortcuts">${rows.map(([a, b]) => html`<span>${a}</span>${b}`)}</div>
     <p class="notice" style="margin:0">On a Mac, Cmd works in place of Ctrl.</p>

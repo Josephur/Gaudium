@@ -51,7 +51,7 @@ export function Sidebar({ convs, curId, query, setQuery, act, searchKey }) {
       <input ref=${imp} type="file" accept="application/json,.json" hidden id="import-input" onChange=${(e) => { if (e.target.files[0]) act.importFile(e.target.files[0]); e.target.value = ''; }} />
       <button class="link" onClick=${() => imp.current.click()}><${Icon} name="upload" />Import chats</button>
       <button class="link" onClick=${act.exportAll}><${Icon} name="download" />Export all chats</button>
-      <button class="link" onClick=${act.openCard}><${Icon} name="chip" />Engine and card</button>
+      <button class="link" onClick=${act.openCard}><${Icon} name="chip" />Engine & Model</button>
       <button class="link" onClick=${act.openSettings}><${Icon} name="gear" />Settings</button>
     </div>
   </aside>`;
