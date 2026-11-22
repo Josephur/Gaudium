@@ -375,6 +375,10 @@ pub struct SynapseApi {
         u32,
         u32,
     ) -> SynStatus,
+    /// `synNodeSetUserProgrammability` (absent from older SDKs: `None` there).
+    pub syn_node_set_user_programmability: Option<
+        unsafe extern "C" fn(SynGraphHandle, SynNodeId, *const SynUserProgrammability) -> SynStatus,
+    >,
     pub syn_recipe_serialize: unsafe extern "C" fn(SynRecipeHandle, *const c_char) -> SynStatus,
     pub syn_recipe_deserialize:
         unsafe extern "C" fn(*mut SynRecipeHandle, *const c_char) -> SynStatus,
@@ -408,6 +412,29 @@ pub struct SynapseApi {
 // SAFETY: Synapse C API function pointers are thread-safe to share across threads (device ops serialized per stream).
 unsafe impl Send for SynapseApi {}
 unsafe impl Sync for SynapseApi {}
+
+/// `synUserExecOrder`: position `executionOrderedIndex` of a node inside execution group `groupId`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SynUserExecOrder {
+    pub group_id: c_uint,
+    pub execution_ordered_index: c_uint,
+}
+
+/// `synUserBundling`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SynUserBundling {
+    pub bundle_user_index: c_uint,
+}
+
+/// `synUserProgrammability`: either pointer may be null.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SynUserProgrammability {
+    pub user_exec_order: *const SynUserExecOrder,
+    pub user_bundling: *const SynUserBundling,
+}
 
 unsafe fn load_sym<T: Copy>(handle: *mut c_void, name: &str) -> Result<T, SynapseError> {
     let cname = CString::new(name).map_err(|_| SynapseError::MissingSymbol(name.to_owned()))?;
@@ -510,6 +537,11 @@ impl SynapseApi {
                 syn_tensor_destroy: load_sym(handle, "synTensorDestroy")?,
                 syn_node_create_with_id: load_sym(handle, "synNodeCreateWithId")?,
                 syn_node_dependency_set: load_sym(handle, "synNodeDependencySet")?,
+                syn_node_set_user_programmability: load_sym(
+                    handle,
+                    "synNodeSetUserProgrammability",
+                )
+                .ok(),
                 syn_recipe_serialize: load_sym(handle, "synRecipeSerialize")?,
                 syn_recipe_deserialize: load_sym(handle, "synRecipeDeSerialize")?,
                 syn_recipe_destroy: load_sym(handle, "synRecipeDestroy")?,

@@ -136,3 +136,8 @@ fb48a38269eaafac  tree_over_max_nodes_rejected  law tree_over_max_nodes_rejected
 f438ba027c288a28  tree_self_parent_rejected  law tree_self_parent_rejected : for + i : Nat for + d : Nat for pd : Nat for r : Nat for + sp : Nat for tk : Nat { tree_node_valid ( i , i , d , pd , r , sp , tk ) == False { } : Bool }
 09ae686fe3d30743  unsupported_method_refuses_sampling  law unsupported_method_refuses_sampling : { sampling_request_admitted ( False { } , True { } ) == False { } : Bool }
 bf27fed2cf696824  vit_zero_h_rejected  law vit_zero_h_rejected : for + t : Nat for + w : Nat for m : Nat { vit_grid_valid ( t , 0n , w , m ) == False { } : Bool }
+ba31aa6c874875b7  wave_lag_follows_lead  law wave_lag_follows_lead : for m : Nat for h : Nat for + p : Nat { Nat.is_lt ( wave_step ( m , False { } , h , p ) , wave_step ( m , True { } , h , p ) ) == True { } : Bool }
+976317570747274f  wave_next_pair_follows  law wave_next_pair_follows : for m : Nat for h : Nat for + q : Nat { Nat.is_lt ( wave_step ( m , True { } , h , 1n + 1n + q ) , wave_step ( 1n + m , False { } , h , 1n + 1n + q ) ) == True { } : Bool }
+cad96b9f02ba842e  wave_off_runs_no_tile  law wave_off_runs_no_tile : for n : Nat { wave_tiles ( n , False { } ) == 0n : Nat }
+42d2bcd977672452  wave_sets_differ  law wave_sets_differ : for u : Unit { Nat.is_eq ( wave_set ( False { } ) , wave_set ( True { } ) ) == False { } : Bool }
+50c73e65fceb99d3  wave_tiles_never_exceed_full  law wave_tiles_never_exceed_full : for n : Nat for e : Bool { Nat.is_le ( wave_tiles ( n , e ) , n ) == True { } : Bool }

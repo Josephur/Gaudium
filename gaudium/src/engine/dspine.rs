@@ -1668,6 +1668,35 @@ impl DSpine {
         pos: u64,
         tile_len: u64,
     ) -> Result<(), String> {
+        self.launch_ctx_over(
+            dev,
+            spec,
+            cache,
+            driver_version,
+            elf_hashes,
+            lmax,
+            pos,
+            tile_len,
+            None,
+        )
+    }
+
+    /// [`Self::launch_ctx`] with some of the pass's buffers taken from `over` (tensor name ->
+    /// address) instead of the drafter's own: the tap rows and cursor of a tile that the
+    /// two-tile prefill loop keeps on its second buffer set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_ctx_over(
+        &mut self,
+        dev: &HpuDevice,
+        spec: &ModelSpec,
+        cache: &RecipeCache,
+        driver_version: &str,
+        elf_hashes: &[(String, String)],
+        lmax: u64,
+        pos: u64,
+        tile_len: u64,
+        over: Option<&BTreeMap<String, u64>>,
+    ) -> Result<(), String> {
         let tile_len = if pos + self.full_tile <= lmax {
             self.full_tile
         } else {
@@ -1682,7 +1711,12 @@ impl DSpine {
             self.ctx_recipes.insert(tile_len, r);
         }
         let r = &self.ctx_recipes[&tile_len];
-        let exact = select_exact_bindings(r, &self.pool)?;
+        let mut exact = select_exact_bindings(r, &self.pool)?;
+        for (name, &addr) in over.into_iter().flatten() {
+            if let Some(a) = exact.get_mut(name) {
+                *a = addr;
+            }
+        }
         r.launch_checked(dev, &exact)
             .map_err(|e| format!("launch dspine ctx T={tile_len}: {e}"))
     }

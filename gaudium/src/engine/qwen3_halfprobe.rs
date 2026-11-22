@@ -11,7 +11,7 @@
 //! serve another request afterwards (the CLI runs it after its last request).
 
 use super::prefill::{
-    build_attn_tile_graph, build_half_graph, build_lin_tile_graph, half_scratch_layout, FirstHalf,
+    apply_seq_order, build_attn_tile_graph, build_chunk_gemm_probe, build_half_graph, build_lin_tile_graph, half_scratch_layout, FirstHalf,
     TileForm, Weave, SECOND_PFX,
 };
 use super::*;
@@ -25,7 +25,7 @@ const LAYER_WEIGHTS_GDN: [&str; 2] = ["A_log", "dt_bias"];
 
 /// One recipe of the probe: (label, first half, second half, node order, compiler settings, whole
 /// layer in one body, recipe name suffix).
-type Case = (String, Option<FirstHalf>, bool, Weave, Vec<(String, String)>, bool, String);
+type Case = (String, Option<FirstHalf>, bool, Weave, Vec<(String, String)>, bool, String, Option<String>);
 
 /// The probe's recipes for this model and tile form. Graph-compiler settings to try on the
 /// DeltaNet forms come from `GAUDIUM_HALFPROBE_GC`: sets separated by `;`, each a `,`-separated
@@ -46,13 +46,20 @@ fn cases(spec: &ModelSpec, form: &TileForm) -> (Vec<Case>, Vec<(&'static str, Fi
         .collect();
 
     let mut all: Vec<Case> = Vec::new();
-    all.push(("second half alone".into(), None, true, Weave::Cost, Vec::new(), false, String::new()));
+    all.push(("second half alone".into(), None, true, Weave::Cost, Vec::new(), false, String::new(), None));
     let mut firsts: Vec<(&'static str, FirstHalf)> = Vec::new();
     if has_lin && form.mme {
         firsts.push(("DeltaNet", FirstHalf::Lin));
     }
+    // KV chunks the attention forms read (`GAUDIUM_HALFPROBE_NCH`, default 1): more than one
+    // needs a prompt that has filled that many chunks
+    let nch = std::env::var("GAUDIUM_HALFPROBE_NCH")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
     if has_attn && form.fastexp {
-        firsts.push(("attention", FirstHalf::Attn(1)));
+        firsts.push(("attention", FirstHalf::Attn(nch)));
     }
     for (name, f) in &firsts {
         all.push((
@@ -63,6 +70,7 @@ fn cases(spec: &ModelSpec, form: &TileForm) -> (Vec<Case>, Vec<(&'static str, Fi
             Vec::new(),
             false,
             String::new(),
+            None,
         ));
         for (wn, w) in [
             ("cost-ordered", Weave::Cost),
@@ -77,7 +85,30 @@ fn cases(spec: &ModelSpec, form: &TileForm) -> (Vec<Case>, Vec<(&'static str, Fi
                 Vec::new(),
                 false,
                 String::new(),
+                None,
             ));
+        }
+    }
+    // explicit two-body orders: `GAUDIUM_HALFPROBE_SEQS_LIN` / `_ATTN` hold `name=seq;name=seq`
+    // (see `apply_seq_order`)
+    for (name, f) in &firsts {
+        let var = match f {
+            FirstHalf::Lin => "GAUDIUM_HALFPROBE_SEQS_LIN",
+            FirstHalf::Attn(_) => "GAUDIUM_HALFPROBE_SEQS_ATTN",
+        };
+        for item in std::env::var(var).unwrap_or_default().split(';') {
+            if let Some((tag, seq)) = item.trim().split_once('=') {
+                all.push((
+                    format!("{name} first half + second half, order {tag}"),
+                    Some(*f),
+                    true,
+                    Weave::SecondFirst,
+                    Vec::new(),
+                    false,
+                    format!("_s{tag}"),
+                    Some(seq.to_string()),
+                ));
+            }
         }
     }
     // whole layers of each kind, then every compiler-setting set on the whole layers and on the
@@ -87,10 +118,10 @@ fn cases(spec: &ModelSpec, form: &TileForm) -> (Vec<Case>, Vec<(&'static str, Fi
         wholes.push(("DeltaNet", FirstHalf::Lin));
     }
     if has_attn && form.fastexp {
-        wholes.push(("attention", FirstHalf::Attn(1)));
+        wholes.push(("attention", FirstHalf::Attn(nch)));
     }
     for (name, f) in &wholes {
-        all.push((format!("{name} whole layer"), Some(*f), true, Weave::Cost, Vec::new(), true, String::new()));
+        all.push((format!("{name} whole layer"), Some(*f), true, Weave::Cost, Vec::new(), true, String::new(), None));
     }
     for (i, set) in gc_sets.iter().enumerate() {
         let tag: Vec<String> = set.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -104,6 +135,19 @@ fn cases(spec: &ModelSpec, form: &TileForm) -> (Vec<Case>, Vec<(&'static str, Fi
                 set.clone(),
                 true,
                 format!("_gc{i}"),
+                None,
+            ));
+        }
+        for (name, f) in &firsts {
+            all.push((
+                format!("{name} first half + second half, cost-ordered [{tag}]"),
+                Some(*f),
+                true,
+                Weave::Cost,
+                set.clone(),
+                false,
+                format!("_gc{i}"),
+                None,
             ));
         }
         all.push((
@@ -114,6 +158,7 @@ fn cases(spec: &ModelSpec, form: &TileForm) -> (Vec<Case>, Vec<(&'static str, Fi
             set.clone(),
             false,
             format!("_gc{i}"),
+            None,
         ));
     }
     (all, firsts)
@@ -130,7 +175,7 @@ fn case_graph(
     elf_hashes: &[(String, String)],
     elf_tile: &[(String, String)],
 ) -> GraphBuilder {
-    let (_, first, second, weave, gc, whole, sfx) = case;
+    let (_, first, second, weave, gc, whole, sfx, seq) = case;
     let mut gb = if *whole {
         match first {
             Some(FirstHalf::Attn(nch)) => {
@@ -155,6 +200,11 @@ fn case_graph(
     };
     for (k, v) in gc {
         gb.set_gc_setting(k.clone(), v.clone());
+    }
+    if let Some(seq) = seq {
+        if let Err(e) = apply_seq_order(&mut gb, seq) {
+            eprintln!("[halfprobe] {}: {e}", gb.recipe_name());
+        }
     }
     gb
 }
@@ -225,7 +275,7 @@ pub(super) fn run(eng: &mut Qwen3Engine, n: u32) -> Result<(), String> {
     let mut results: Vec<(String, f64)> = Vec::new();
     for case in all {
         let gb = case_graph(&case, &spec, t, eng.max_ctx, &form, &eng.elf_hashes, &elf_tile);
-        let (label, first, second, _, _, whole, _) = case;
+        let (label, first, second, _, _, whole, _, _) = case;
         let (layout, bytes) = half_scratch_layout(&gb);
         if bytes > total - reserve {
             return Err(format!(
@@ -310,6 +360,48 @@ pub(super) fn run(eng: &mut Qwen3Engine, n: u32) -> Result<(), String> {
         let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(n.max(1));
         eprintln!("[halfprobe] {us:>9.1} us  {label}  ({})", r.name);
         results.push((label, us));
+    }
+    // the chunk recurrence's GEMMs alone, f32 against BF16 operands (timing only: every tensor
+    // is a slice of the tile scratch, whatever it holds)
+    if spec.n_linear_layers() > 0 && std::env::var("GAUDIUM_HALFPROBE_CHUNK").is_ok_and(|v| v != "0") {
+        for (dt, dname) in [(SynDataType::Float, "f32"), (SynDataType::Bf16, "bf16")] {
+            for chain_only in [false, true] {
+                let gb = build_chunk_gemm_probe(&spec, t, dt, chain_only);
+                let mut pool: BTreeMap<String, u64> = BTreeMap::new();
+                let mut off = 0u64;
+                for (name, _dt, _dims, bytes) in gb.persistent_tensor_specs() {
+                    pool.insert(name, base + off);
+                    off += align256(bytes.max(256));
+                }
+                if off > total {
+                    eprintln!("[halfprobe] chunk GEMM probe needs {off} B of scratch, {total} B are planned: skipped");
+                    continue;
+                }
+                let mut r = gb
+                    .compile(Arc::clone(eng.dev.api()), &eng.cache, &eng.driver_version)
+                    .map_err(|e| format!("halfprobe: compile {}: {e}", gb.recipe_name()))?;
+                r.bind_shared_workspace(&eng.dev)
+                    .map_err(|e| format!("halfprobe: workspace of {}: {e}", r.name))?;
+                let bind = select_exact_bindings(&r, &pool)?;
+                r.launch_checked(&eng.dev, &bind)
+                    .map_err(|e| format!("halfprobe: launch {}: {e}", r.name))?;
+                unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
+                    .map_err(|e| format!("halfprobe: sync: {e}"))?;
+                let t0 = Instant::now();
+                for _ in 0..n {
+                    r.launch_checked(&eng.dev, &bind)
+                        .map_err(|e| format!("halfprobe: launch {}: {e}", r.name))?;
+                }
+                unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
+                    .map_err(|e| format!("halfprobe: sync: {e}"))?;
+                let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(n.max(1));
+                eprintln!(
+                    "[halfprobe] {us:>9.1} us  chunk recurrence GEMMs, {dname}, {}  ({})",
+                    if chain_only { "state chain only" } else { "all" },
+                    r.name
+                );
+            }
+        }
     }
     // overlap summary: two bodies in one recipe against the sum of the two alone
     let alone = |key: &str| {

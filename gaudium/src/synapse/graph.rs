@@ -16,6 +16,7 @@ use crate::synapse::ffi::{
     SynLaunchTensorInfoExt, SynNodeId, SynRecipeHandle, SynRetrievedLaunchTensorInfoExt,
     SynSectionHandle, SynTensor, SynTensorGeometry, SynTensorType, SynapseApi, SynapseError,
     HABANA_DIM_MAX,
+    SynUserExecOrder, SynUserProgrammability,
 };
 use crate::synapse::recipe_cache::{
     verify_launch_bindings, RecipeCache, RetrievedTensorDesc, Sha256,
@@ -91,6 +92,14 @@ pub struct GraphBuilder {
     /// fingerprint: a setting changes what is compiled.
     gc_settings: Vec<(String, String)>,
     kernel_elf_hashes: Vec<(String, String)>,
+    /// User execution order: every node `i` (creation order) is given the compiler's
+    /// `synUserExecOrder {group, i}`. `None` leaves the order to the compiler. Part of the
+    /// fingerprint.
+    user_exec_group: Option<u32>,
+    /// Per-node user execution order `(node, group, index)`: the compiler runs the nodes of one
+    /// group in index order and leaves nodes of different groups free of each other. Part of the
+    /// fingerprint.
+    node_exec_orders: Vec<(NodeId, u32, u32)>,
     /// [fp8] The quantisable weight matrices of this graph are `fp8_143` (`engine/fp8_graph.rs`).
     /// A build-time switch only: the tensors and nodes it leads to are what the fingerprint covers.
     fp8_weights: bool,
@@ -141,8 +150,25 @@ impl GraphBuilder {
             no_persistent_reuse: false,
             gc_settings,
             kernel_elf_hashes: Vec::new(),
+            user_exec_group: None,
+            node_exec_orders: Vec::new(),
             fp8_weights: false,
         }
+    }
+
+    /// Asks the graph compiler to execute the nodes in their creation order (execution group
+    /// `group`, index = creation index) instead of the order it would pick. The compiler may
+    /// still refuse an order that contradicts the data flow; `None` returns the choice to it.
+    pub fn set_user_exec_order(&mut self, group: Option<u32>) {
+        self.user_exec_group = group;
+    }
+
+    /// Puts node `node` at position `index` of execution group `group`: the compiler executes the
+    /// nodes of a group in index order (it refuses an order that contradicts the data flow) and
+    /// adds no ordering between nodes of different groups. One group per engine class fixes the
+    /// order of each engine's queue without making one engine wait for the other.
+    pub fn set_node_exec_order(&mut self, node: NodeId, group: u32, index: u32) {
+        self.node_exec_orders.push((node, group, index));
     }
 
     /// [fp8] Selects FP8 (`true`) or BF16 (`false`) for the quantisable weight matrices built next.
@@ -207,6 +233,9 @@ impl GraphBuilder {
             .collect();
         for d in &mut self.deps {
             *d = (NodeId(new_index[d.0 .0]), NodeId(new_index[d.1 .0]));
+        }
+        for o in &mut self.node_exec_orders {
+            o.0 = NodeId(new_index[o.0 .0]);
         }
         true
     }
@@ -478,6 +507,19 @@ impl GraphBuilder {
         for (k, d) in &self.kernel_elf_hashes {
             h.update_str(k);
             h.update_str(d);
+        }
+        if let Some(g) = self.user_exec_group {
+            h.update_str("user-exec-order");
+            h.update_u64(u64::from(g));
+        }
+        if !self.node_exec_orders.is_empty() {
+            h.update_str("node-exec-orders");
+            h.update_u64(self.node_exec_orders.len() as u64);
+            for &(n, g, i) in &self.node_exec_orders {
+                h.update_u64(n.0 as u64);
+                h.update_u64(u64::from(g));
+                h.update_u64(u64::from(i));
+            }
         }
         // graphs without extra compiler settings keep the keys they had before the field existed
         if !self.gc_settings.is_empty() {
@@ -766,6 +808,31 @@ impl GraphBuilder {
                 )
             })?;
             node_ids.push(nid);
+        }
+
+        if self.user_exec_group.is_some() || !self.node_exec_orders.is_empty() {
+            let set = api.syn_node_set_user_programmability.ok_or_else(|| {
+                SynapseError::InvalidArg(
+                    "this SDK has no synNodeSetUserProgrammability (user execution order)".into(),
+                )
+            })?;
+            let whole = self
+                .user_exec_group
+                .into_iter()
+                .flat_map(|g| (0..node_ids.len()).map(move |i| (NodeId(i), g, i as u32)));
+            for (node, group, index) in whole.chain(self.node_exec_orders.iter().copied()) {
+                let order = SynUserExecOrder {
+                    group_id: group,
+                    execution_ordered_index: index,
+                };
+                let up = SynUserProgrammability {
+                    user_exec_order: &order,
+                    user_bundling: std::ptr::null(),
+                };
+                syn_check("synNodeSetUserProgrammability", unsafe {
+                    set(graph, node_ids[node.0], &up)
+                })?;
+            }
         }
 
         for &(blocking, blocked) in &self.deps {

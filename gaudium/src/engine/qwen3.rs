@@ -248,6 +248,9 @@ pub use build_cache_rt::build_cache;
 mod prof_rt;
 #[path = "qwen3_halfprobe.rs"]
 mod halfprobe;
+// [prefill] two tiles in flight
+#[path = "qwen3_wave.rs"]
+mod wave_rt;
 // [step] enqueue-ahead greedy K=0 decode (token fed back on the card)
 #[path = "qwen3_k0pipe.rs"]
 mod k0pipe;
@@ -967,6 +970,8 @@ pub struct Qwen3Engine {
     embed_recipes: HashMap<u64, CompiledRecipe>,
     attn_layer_recipes: HashMap<(u64, u64), CompiledRecipe>, // (T, nch)
     lin_layer_recipes: HashMap<u64, CompiledRecipe>,         // T
+    /// [prefill] two-tile wavefront recipes of the full tile (empty: the wavefront is off)
+    wave_recipes: HashMap<prefill::WaveKey, CompiledRecipe>,
     // [moe hook] routed-experts prefill recipes (owns recipes: must drop before `dev`)
     moe_rx: moe_rt::RoutedPrefill,
 
@@ -1272,6 +1277,7 @@ impl Qwen3Engine {
 
         let mut attn_layer_recipes: HashMap<(u64, u64), CompiledRecipe> = HashMap::new();
         let mut lin_layer_recipes: HashMap<u64, CompiledRecipe> = HashMap::new();
+        let mut wave_recipes: HashMap<prefill::WaveKey, CompiledRecipe> = HashMap::new();
         let mut embed_recipes: HashMap<u64, CompiledRecipe> = HashMap::new();
         // [moe hook] routed form: the routed-experts prefill recipe of a full tile
         let mut moe_rx = moe_rt::RoutedPrefill::prepare(
@@ -1376,10 +1382,18 @@ impl Qwen3Engine {
         let pf_ids_bytes = align256(prefill_tile * 4);
         let pf_cursor_bytes = 256u64;
         let pf_const_bytes = pf.const_bytes();
+        // [prefill] the wavefront's second buffer set, when this load can run two tiles in flight
+        pf.set_wave_taps(match (&specdec, cfg.fp8_calibrate || spec.is_moe()) {
+            (_, true) => None,
+            (Some(sd), false) => sd.wave_taps(),
+            (None, false) => Some(0),
+        });
+        let pf_wave_bytes = align256(pf.wave_buf_bytes(&spec, prefill_tile));
         let act_fixed_bytes: u64 = pf_x_bytes * 2
             + pf_ids_bytes
             + pf_cursor_bytes
             + pf_const_bytes
+            + pf_wave_bytes
             + head_act_specs.values().map(|&b| align256(b)).sum::<u64>()
             + step_act_specs.values().map(|&b| align256(b)).sum::<u64>()
             + vis_act_bytes;
@@ -1418,6 +1432,7 @@ impl Qwen3Engine {
                 &mut attn_layer_recipes,
                 &mut lin_layer_recipes,
                 &mut embed_recipes,
+                &mut wave_recipes,
                 cfg.verbose,
                 &fits,
             )?
@@ -1657,6 +1672,10 @@ impl Qwen3Engine {
             0
         };
         pf.set_addresses(pf_scratch_base, pf_const_one);
+        if pf_wave_bytes > 0 {
+            let base = suballoc(&mut act_arena, pf_wave_bytes)?;
+            pf.set_wave_addresses(&spec, prefill_tile, base, [pf_x0, pf_x1], pf_ids, pf_cursor);
+        }
         let mut head_scratch = BTreeMap::new();
         for (name, &bytes) in &head_act_specs {
             head_scratch.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
@@ -1740,6 +1759,10 @@ impl Qwen3Engine {
         for r in embed_recipes.values_mut() {
             r.bind_shared_workspace(&dev)
                 .map_err(|e| format!("bind embed ws: {e}"))?;
+        }
+        for r in wave_recipes.values_mut() {
+            r.bind_shared_workspace(&dev)
+                .map_err(|e| format!("bind wavefront ws: {e}"))?;
         }
 
         // 8. Upload weights + RoPE tables from zero-copy mmap Safetensors into `weights_arena`
@@ -2011,6 +2034,7 @@ impl Qwen3Engine {
             embed_recipes,
             attn_layer_recipes,
             lin_layer_recipes,
+            wave_recipes,
             moe_rx,
             stage_io,
             weights_addr,
@@ -2388,11 +2412,37 @@ impl Qwen3Engine {
             // [profile] index of the next prefill launch (`--profile-steps pA-B`)
             let mut pf_launch: u64 = 0;
 
-            while pos < prompt_ids.len() {
+            // [prefill] the full tiles the verified schedule runs two in flight; the single-tile
+            // loop below takes the rest (an odd full tile, the partial last tile)
+            let mut wave_final_x: Option<u64> = None;
+            if let Some(w) = wave_rt::run(
+                self,
+                prompt_ids,
+                gdn_parity,
+                vis_layout.as_ref(),
+                is_cancelled,
+                &mut pf_launch,
+            )? {
+                pos = w.tiles * self.prefill_tile as usize;
+                if w.cancelled {
+                    stopped_by_cancel = true;
+                } else {
+                    last_tile_len = self.prefill_tile;
+                    wave_final_x = Some(w.final_x);
+                    // an even number of tiles leaves every recurrent state in the buffer it
+                    // started from; an odd count would flip it like the single-tile loop does
+                    if has_gdn && w.tiles % 2 == 1 {
+                        gdn_parity ^= 1;
+                    }
+                }
+            }
+
+            while pos < prompt_ids.len() && !stopped_by_cancel {
                 if is_cancelled() {
                     stopped_by_cancel = true;
                     break;
                 }
+                wave_final_x = None;
                 let tile_len = (prompt_ids.len() - pos).min(self.prefill_tile as usize) as u64;
                 let end_pos = (pos as u64) + tile_len;
                 let nch = end_pos.div_ceil(KV_CHUNK).clamp(1, self.max_chunks);
@@ -2651,10 +2701,11 @@ impl Qwen3Engine {
             }
 
             // Launch shared head_T1 directly on the last prompt token's hidden row!
-            let final_x_base = if n_layers.is_multiple_of(2) {
-                self.pf_x0
-            } else {
-                self.pf_x1
+            let final_x_base = match wave_final_x {
+                // the prompt ended on a tile of the wavefront: its rows, on its buffer set
+                Some(x) => x,
+                None if n_layers.is_multiple_of(2) => self.pf_x0,
+                None => self.pf_x1,
             };
             let last_row_addr = final_x_base + (last_tile_len - 1) * self.spec.hidden * 2;
 

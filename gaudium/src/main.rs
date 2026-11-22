@@ -119,6 +119,16 @@ fn print_usage() {
          \x20                       prints each setting's previous value\n\
          \x20 GAUDIUM_HALFPROBE_GC  Sets of such settings (sets separated by `;`) that --prefill\n\
          \x20                       halfprobe=N times on the tile layers, each against the default\n\
+         \x20 GAUDIUM_HALFPROBE_SEQS_LIN / GAUDIUM_HALFPROBE_SEQS_ATTN\n\
+         \x20                       `name=order[;name=order..]`: node orders of the two-body\n\
+         \x20                       (DeltaNet / attention first half + second half) recipes for\n\
+         \x20                       halfprobe to time. An order is `B:node` runs (body F or G up to\n\
+         \x20                       and including the node, `*` = the rest) and `B=node` single\n\
+         \x20                       nodes, `,`-separated; a leading `~` orders only the named nodes\n\
+         \x20 GAUDIUM_HALFPROBE_NCH KV chunks the probe's attention recipes read (default 1; the\n\
+         \x20                       prompt must have filled them)\n\
+         \x20 GAUDIUM_HALFPROBE_CHUNK  1 = halfprobe also times the DeltaNet chunk GEMMs alone with\n\
+         \x20                       f32 and with BF16 operands\n\
          Qwen prefill environment variables:\n\
          \x20 GAUDIUM_PREFILL       Prefill levers `k=v,..` when --prefill is not given (see --prefill\n\
          \x20                       under Generate options). Changes the compiled tile recipes; with\n\
@@ -299,7 +309,10 @@ fn print_usage() {
          \x20                       prep / norm kernels, fastexp=0|1 fast-exp tile softmax, groups=N\n\
          \x20                       attention chunk groups, s16=0|1|2 half-width attention core (BF16\n\
          \x20                       scores; 2: + FP8 P; default 2 with dense FP8 weights, else 0: it\n\
-         \x20                       changes the prefill numerics), plain = every lever off, stats /\n\
+         \x20                       changes the prefill numerics), wave=0|1 full tiles two in flight\n\
+         \x20                       (the halves of two tiles' layers share a launch so the MME and\n\
+         \x20                       the TPCs overlap; same nodes, same output; needs the mme and\n\
+         \x20                       fastexp forms), plain = every lever off, stats /\n\
          \x20                       profile = print the tile loop's host split / per-recipe times,\n\
          \x20                       halfprobe=N = measurement: after the last request, time whole\n\
          \x20                       tile layers, their halves and two halves in one recipe over N\n\

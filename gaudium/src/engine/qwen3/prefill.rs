@@ -79,6 +79,10 @@ pub struct PrefillOpts {
     /// Measurement: after the first request, time every half-layer recipe form over this many
     /// launches (0 = off). The engine serves nothing afterwards.
     pub half_probe: u32,
+    /// Two tiles in flight: full tiles run pairwise through two-body recipes (the second half of
+    /// one tile's layer with the first half of the next tile's), so the card overlaps one tile's
+    /// MME work with the other's TPC work. The same nodes on the same rows: the same bits.
+    pub wave: bool,
 }
 
 impl Default for PrefillOpts {
@@ -93,6 +97,7 @@ impl Default for PrefillOpts {
             profile: false,
             stats: false,
             half_probe: 0,
+            wave: true,
         }
     }
 }
@@ -110,10 +115,11 @@ impl PrefillOpts {
             profile: false,
             stats: false,
             half_probe: 0,
+            wave: false,
         }
     }
 
-    /// Parses `k=v[,k=v..]`: `tile`, `mme`, `rows`, `fastexp`, `groups`, `s16`, and the bare
+    /// Parses `k=v[,k=v..]`: `tile`, `mme`, `rows`, `fastexp`, `groups`, `s16`, `wave`, and the bare
     /// words `plain` (every lever off, 256-row tiles), `profile` and `stats`. Later entries win.
     pub fn parse(s: &str) -> Result<Self, String> {
         let mut o = Self::default();
@@ -148,6 +154,7 @@ impl PrefillOpts {
                     o.tile = t;
                 }
                 "mme" => o.mme = num("mme")? != 0,
+                "wave" => o.wave = num("wave")? != 0,
                 "rows" => {
                     let r = num("rows")?;
                     if r > 2 {
@@ -166,7 +173,7 @@ impl PrefillOpts {
                 }
                 other => {
                     return Err(format!(
-                        "unknown prefill option '{other}' (tile, mme, rows, fastexp, groups, s16, plain, profile, stats, halfprobe)"
+                        "unknown prefill option '{other}' (tile, mme, rows, fastexp, groups, s16, wave, plain, profile, stats, halfprobe)"
                     ))
                 }
             }
@@ -818,6 +825,99 @@ fn append_chunk_core(
     (x_all, s)
 }
 
+/// Measurement only: the MME side of the chunk recurrence (Gram products, Neumann series,
+/// chunk-batched products, serial state chain) on its own, every operand a bound tensor of data
+/// type `dt`, so the card can time the same GEMM shapes in f32 and in BF16. The TPC kernels that
+/// build the coefficients are left out; the values do not matter for the timing.
+pub fn build_chunk_gemm_probe(spec: &ModelSpec, t: u64, dt: SynDataType, chain_only: bool) -> GraphBuilder {
+    const D: u64 = 128;
+    let c = GDN_CHUNK;
+    let nchk = t.div_ceil(c);
+    let hv = spec.gdn_v_heads;
+    let tag = if dt == SynDataType::Float { "f32" } else { "bf16" };
+    let mut gb = GraphBuilder::new(format!(
+        "g_qwen_probe_chunk{}_{tag}_T{t}",
+        if chain_only { "chain" } else { "gemm" }
+    ));
+    let a = |gb: &mut GraphBuilder, n: &str, dims: &[u64]| {
+        gb.add_persistent_tensor(format!("P_{n}"), dt, dims)
+    };
+    let gemm3 = |gb: &mut GraphBuilder, n: &str, x: TensorId, y: TensorId, z: TensorId, out: TensorId, ta: bool| {
+        let p = crate::synapse::ops::GemmParams::new(ta, false);
+        gb.add_node("batch_gemm", format!("P_{n}"), &[x, y, z], &[out], as_param_bytes(&p));
+    };
+    let cc = [c, c, hv, nchk];
+    let wide = [D, 2 * c, hv, nchk];
+    let (ax, cx, ak, gl);
+    if chain_only {
+        ax = a(&mut gb, "AX", &wide);
+        cx = a(&mut gb, "CX", &wide);
+    } else {
+        let q = a(&mut gb, "q", &[D, c, hv, nchk]);
+        let k = a(&mut gb, "k", &[D, c, hv, nchk]);
+        let v = a(&mut gb, "v", &[D, c, hv, nchk]);
+        let kk = a(&mut gb, "KK", &cc);
+        let qk = a(&mut gb, "QK", &cc);
+        gb.op_batch_gemm("P_KK", k, k, kk, false, true);
+        gb.op_batch_gemm("P_QK", q, k, qk, false, true);
+        let (d0n, dn, dg, lp, id) = (
+            a(&mut gb, "D0n", &cc),
+            a(&mut gb, "Dn", &cc),
+            a(&mut gb, "Dg", &cc),
+            a(&mut gb, "Lp", &cc),
+            a(&mut gb, "Id", &cc),
+        );
+        let y = a(&mut gb, "Y", &cc);
+        gb.op_batch_gemm("P_Y", d0n, lp, y, false, false);
+        let mut n = a(&mut gb, "N1", &cc);
+        gemm3(&mut gb, "N1", d0n, lp, id, n, false);
+        for it in 2..(c / 16) {
+            let n2 = a(&mut gb, &format!("N{it}"), &cc);
+            gemm3(&mut gb, &format!("N{it}"), y, n, id, n2, false);
+            n = n2;
+        }
+        let mw = a(&mut gb, "Mw", &cc);
+        let mun = a(&mut gb, "Mun", &cc);
+        gb.op_batch_gemm("P_Mun", n, dn, mun, false, false);
+        gb.op_batch_gemm("P_Mw", n, dg, mw, false, false);
+        let m3 = a(&mut gb, "M3", &[c, 2 * c, hv, nchk]);
+        let gq0 = a(&mut gb, "GQ0", &wide);
+        let m2 = a(&mut gb, "M2", &[c, 2 * c, hv, nchk]);
+        let un = a(&mut gb, "Un", &[D, c, hv, nchk]);
+        cx = a(&mut gb, "CX", &wide);
+        ax = a(&mut gb, "AX", &wide);
+        gb.op_batch_gemm("P_M2", m3, mw, m2, false, false);
+        gb.op_batch_gemm("P_Un", mun, v, un, false, false);
+        gb.op_batch_gemm("P_CX", m3, un, cx, false, false);
+        gemm3(&mut gb, "AX", m2, k, gq0, ax, false);
+    }
+    ak = a(&mut gb, "AK", &wide);
+    gl = a(&mut gb, "gL", &[1, 1, hv, nchk]);
+    let split = |gb: &mut GraphBuilder, src: TensorId, n: &str, dims: &[u64]| -> Vec<TensorId> {
+        let parts: Vec<TensorId> = (0..nchk)
+            .map(|j| gb.add_intermediate(format!("P_{n}_{j}"), dt, dims))
+            .collect();
+        gb.op_split(format!("P_{n}_split"), src, &parts, 3);
+        parts
+    };
+    let axj = split(&mut gb, ax, "AXj", &[D, 2 * c, hv, 1]);
+    let cxj = split(&mut gb, cx, "CXj", &[D, 2 * c, hv, 1]);
+    let akj = split(&mut gb, ak, "AKj", &[D, 2 * c, hv, 1]);
+    let glj = split(&mut gb, gl, "gLj", &[1, 1, hv, 1]);
+    let mut s = a(&mut gb, "S0", &[D, D, hv, 1]);
+    let mul = if dt == SynDataType::Float { "mult_fwd_f32" } else { "mult_fwd_bf16" };
+    for j in 0..nchk as usize {
+        let xj = a(&mut gb, &format!("X_{j}"), &[D, 2 * c, hv, 1]);
+        gemm3(&mut gb, &format!("X_{j}"), axj[j], s, cxj[j], xj, false);
+        let sd = a(&mut gb, &format!("Sd_{j}"), &[D, D, hv, 1]);
+        gb.add_node(mul, format!("P_Sd_{j}"), &[s, glj[j]], &[sd], &[]);
+        let sn = a(&mut gb, &format!("S{}", j + 1), &[D, D, hv, 1]);
+        gemm3(&mut gb, &format!("Supd_{j}"), akj[j], xj, sd, sn, true);
+        s = sn;
+    }
+    gb
+}
+
 /// Appends one Gated DeltaNet layer with the chunked MME recurrence. The interface to the engine
 /// is the plain layer's: `(x_in, S_in, cs_in) -> (out, S_out, cs_out)`, states in the decode
 /// kernels' blob layout.
@@ -1167,6 +1267,82 @@ fn weave_order(cost: &dyn Fn(usize) -> (Eng, f64), a: &[usize], b: &[usize]) -> 
     order
 }
 
+/// Puts the nodes of a two-body half-layer graph in the order `seq` describes and hands that
+/// order to the compiler as the user execution order (one group: with the compiler's soft
+/// control edges this fixes each engine's queue order without cross-engine waits).
+///
+/// `seq` is a `,`-separated list of runs. `B:name` = "the nodes of body `B` (`G` = second-half
+/// body, `F` = first-half body) not placed yet, in creation order, up to and including node
+/// `name`" (`name` without the layer prefix; `*` = the rest of the body); `B=name` = that node
+/// alone (to keep the nodes of one compiler bundle together when the builder created another
+/// node between them). Nodes no run names follow in creation order. A measurement / tuning entry point: the production orders are
+/// fixed sequences chosen from card timings.
+pub fn apply_seq_order(gb: &mut GraphBuilder, seq: &str) -> Result<(), String> {
+    // `~` first: a partial order. Only the nodes the runs name get a position; the compiler
+    // places the others itself (it keeps its own interleave of, say, the chunk groups of an
+    // attention core, which a full order would serialise).
+    let (partial, seq) = match seq.strip_prefix('~') {
+        Some(rest) => (true, rest),
+        None => (false, seq),
+    };
+    let names: Vec<String> = gb.node_io_views().iter().map(|n| n.name.to_string()).collect();
+    let body_of = |i: usize| if names[i].starts_with(SECOND_PFX) { 'G' } else { 'F' };
+    let mut emitted = vec![false; names.len()];
+    let mut order: Vec<usize> = Vec::with_capacity(names.len());
+    for run in seq.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+        // `B:name` = body B's remaining nodes up to and including `name`; `B=name` = that node alone
+        let (body, name, single) = match (run.split_once(':'), run.split_once('=')) {
+            (Some((b, n)), _) => (b, n, false),
+            (None, Some((b, n))) => (b, n, true),
+            _ => return Err(format!("weave sequence run '{run}': expected B:name or B=name")),
+        };
+        let (bc, pfx) = match body {
+            "G" => ('G', SECOND_PFX),
+            "F" => ('F', "L_"),
+            _ => return Err(format!("weave sequence run '{run}': body must be F or G")),
+        };
+        let want = format!("{pfx}{name}");
+        let target = if name == "*" {
+            None
+        } else {
+            Some(
+                (0..names.len())
+                    .find(|&i| !emitted[i] && body_of(i) == bc && names[i] == want)
+                    .ok_or_else(|| {
+                        format!("weave sequence run '{run}': no node {want} left in body {body}")
+                    })?,
+            )
+        };
+        for (i, done) in emitted.iter_mut().enumerate() {
+            if *done || body_of(i) != bc {
+                continue;
+            }
+            let take = match (single, target) {
+                (true, Some(t)) => i == t,
+                (_, Some(t)) => i <= t,
+                (_, None) => true,
+            };
+            if take {
+                *done = true;
+                order.push(i);
+            }
+        }
+    }
+    let placed = order.len();
+    order.extend((0..names.len()).filter(|&i| !emitted[i]));
+    if !gb.reorder_nodes(&order) {
+        return Err("weave sequence: not a permutation".into());
+    }
+    if partial {
+        for i in 0..placed {
+            gb.set_node_exec_order(crate::synapse::graph::NodeId(i), 0, i as u32);
+        }
+    } else {
+        gb.set_user_exec_order(Some(0));
+    }
+    Ok(())
+}
+
 /// How the nodes of a two-body half-layer graph are ordered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Weave {
@@ -1296,6 +1472,127 @@ pub(super) fn half_scratch_layout(gb: &GraphBuilder) -> (BTreeMap<String, u64>, 
 }
 
 // ============================================================================
+// Two tiles in flight: the wavefront recipes
+// ============================================================================
+//
+// A full-layer recipe is a serial chain: on a 512-row FP8 tile the MME is busy 62 % of a DeltaNet
+// layer and the TPCs 42 %, one after the other. The card runs each engine's queue in the order
+// the compiler gives it and makes no engine wait for the other beyond the data flow, so a recipe
+// that holds half-steps of TWO tiles overlaps them when each queue alternates between the
+// bodies. The compiler's own order keeps a body together; a user execution order
+// (`GraphBuilder::set_user_exec_order`) changes each queue's order and adds no waits (the
+// compiler's control edges are soft). Measured on the card (FP8, 512 rows): DeltaNet first half
+// + second half 1134 us against 1267 us apart, attention 986 against 1090.
+//
+// Which half-steps share a launch is the verified schedule (`verified/prefill_wave.bend`); the
+// node order inside a recipe is the sequence below, chosen with a per-engine queue model of the
+// card and confirmed by card timings.
+
+/// The bodies of one wavefront recipe: the first half of a layer of one tile and / or the second
+/// half of a layer of the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WaveKey {
+    pub first: Option<FirstHalf>,
+    pub second: bool,
+}
+
+/// Node order of a two-body recipe (see [`apply_seq_order`]), from the nodes the first half has
+/// in this tile form. The second-half body is placed as its two GEMM clusters (output projection
+/// + gate; up + activation + down); the compiler keeps each cluster together.
+fn wave_seq(gb: &GraphBuilder, first: FirstHalf) -> Result<String, String> {
+    let has = |name: &str| gb.node_io_views().iter().any(|n| n.name == format!("L_{name}"));
+    let need = |names: &[&'static str]| -> Result<&'static str, String> {
+        names
+            .iter()
+            .copied()
+            .find(|n| has(n))
+            .ok_or_else(|| format!("wavefront order: none of the nodes {names:?} in the first half"))
+    };
+    match first {
+        FirstHalf::Lin => {
+            let prep = need(&["gdn_prepa", "gdn_prep"])?;
+            need(&["h_norm"])?;
+            need(&["solve"])?;
+            Ok(format!(
+                "F:h_norm,F=ba_gemm,F:qkvz_gemm,G:attn_gemm,F={prep},G:gate_gemm,F:solve,G:*,F:*"
+            ))
+        }
+        FirstHalf::Attn(_) => {
+            let qk = need(&["g0_qk", "qk"])?;
+            let sm = need(&["g0_softmax", "softmax"])?;
+            let groups = (0..)
+                .take_while(|g| has(&format!("g{g}_softmax")))
+                .count();
+            let head = "F:v_gemm,G:attn_gemm,F=attn_prep,G:gate_gemm";
+            if groups <= 1 {
+                // one chunk group: the second body's up / activation / down cluster after the
+                // softmax, under the PV GEMM, the combine and the post kernel (card: 885 us
+                // against 976 us with the cluster before the softmax, 1090 us apart)
+                let pre = ["vnat", "qs16"].into_iter().find(|n| has(n));
+                let pre = pre.map(|n| format!("F:{n},")).unwrap_or_default();
+                Ok(format!("{head},{pre}F={qk},F={sm},G:*,F:*"))
+            } else {
+                // several chunk groups: the compiler's own order of the core (every QK GEMM,
+                // then the softmaxes, then the PV GEMMs) pipelines the groups, and a full order
+                // would serialise them (card, 4 groups: 1914 us against 1806 us apart). So only
+                // the second body and a few nodes of the first get a position: the cluster
+                // follows the softmaxes of up to 8 groups (card, 4 groups: 1686 us after all
+                // four, 1705 us after two, 1789 us after one) and of half of them beyond that
+                // (a 131072-token prefill, up to 16 groups: 32.7 s after half, 33.6 s after
+                // all, 34.2 s with one tile in flight).
+                let after = if groups <= 8 { groups } else { groups / 2 };
+                let mid: String = (0..after).map(|g| format!("F=g{g}_softmax,")).collect();
+                Ok(format!("~{head},{mid}G=up_gemm,G:*"))
+            }
+        }
+    }
+}
+
+/// The wavefront recipe `key` of `t` rows: a half-layer graph, in the wavefront's node order
+/// when it holds two bodies.
+pub fn build_wave_graph(
+    spec: &ModelSpec,
+    t: u64,
+    lmax: u64,
+    key: WaveKey,
+    form: &TileForm,
+    elf_base: &[(String, String)],
+    elf_tile: &[(String, String)],
+) -> Result<GraphBuilder, String> {
+    let mut gb = build_half_graph(
+        spec,
+        t,
+        lmax,
+        key.first,
+        key.second,
+        Weave::SecondFirst,
+        form,
+        elf_base,
+        elf_tile,
+    );
+    if let (Some(first), true) = (key.first, key.second) {
+        let seq = wave_seq(&gb, first)?;
+        apply_seq_order(&mut gb, &seq)?;
+        let name = gb.recipe_name().replace("g_qwen_half_G", "g_qwen_wave").replace("_wG", "");
+        gb.set_recipe_name(name);
+    }
+    Ok(gb)
+}
+
+/// Device buffers of the wavefront beyond the single-tile loop's: per buffer set the layer
+/// input / output rows, the hand-over rows between a layer's halves, the tile's ids and cursor,
+/// and the drafter's tap rows. Set 0 reuses the single-tile loop's rows, ids, cursor and taps.
+#[derive(Debug, Clone, Default)]
+pub(super) struct WaveBufs {
+    pub x: [[u64; 2]; 2],
+    pub core: [u64; 2],
+    pub ids: [u64; 2],
+    pub cursor: [u64; 2],
+    /// Tap rows of set 1 (set 0 uses the drafter's own).
+    pub taps1: Vec<u64>,
+}
+
+// ============================================================================
 // Scratch plan
 // ============================================================================
 
@@ -1377,6 +1674,13 @@ pub(super) struct TileRt {
     attn_layout: HashMap<(u64, u64), BTreeMap<String, u64>>,
     lin_layout: HashMap<u64, BTreeMap<String, u64>>,
     pub timers: TileTimers,
+    /// Wavefront: drafter tap count the two-tile loop has to carry (`None`: this load cannot use
+    /// the wavefront), its recipes with their scratch layouts, and its buffers.
+    wave_taps: Option<usize>,
+    /// Wavefront recipes are compiled (the engine holds them, keyed like `wave_layout`).
+    wave_on: bool,
+    wave_layout: HashMap<WaveKey, BTreeMap<String, u64>>,
+    pub(super) wave_bufs: Option<WaveBufs>,
 }
 
 impl TileRt {
@@ -1409,7 +1713,108 @@ impl TileRt {
             attn_layout: HashMap::new(),
             lin_layout: HashMap::new(),
             timers: TileTimers::default(),
+            wave_taps: None,
+            wave_on: false,
+            wave_layout: HashMap::new(),
+            wave_bufs: None,
         })
+    }
+
+    /// Does this load want the wavefront recipes? The two-tile recipes exist for the dense
+    /// hybrid's tile forms (chunked DeltaNet, fast-exp attention) whose two layer kinds hand the
+    /// same row width to the output projection, with a DeltaNet layer first (the single first
+    /// half the wavefront starts with).
+    pub(super) fn wave_wanted(&self, spec: &ModelSpec) -> bool {
+        self.opts.wave
+            && self.wave_taps.is_some()
+            && !self.opts.profile
+            && self.form.mme
+            && self.form.fastexp
+            && spec.n_layers >= 2
+            && !spec.is_full_attention_layer(0)
+            && spec.n_heads * spec.head_dim == spec.gdn_v_heads * spec.gdn_v_dim
+    }
+
+    /// Tells the tile loop how many drafter tap rows a tile carries (`None`: the loaded drafter
+    /// has no two-tile form, so the wavefront stays off).
+    pub(super) fn set_wave_taps(&mut self, taps: Option<usize>) {
+        self.wave_taps = taps;
+    }
+
+    /// Bytes of the wavefront's own buffers at `tile` rows (0 when it is not wanted).
+    pub(super) fn wave_buf_bytes(&self, spec: &ModelSpec, tile: u64) -> u64 {
+        if !self.wave_wanted(spec) {
+            return 0;
+        }
+        let a = |n: u64| align_up(n.max(256), 256);
+        let x = a(spec.hidden * tile * 2);
+        let core = a(spec.n_heads * spec.head_dim * tile * 2);
+        let taps = self.wave_taps.unwrap_or(0) as u64;
+        2 * x + 2 * core + a(tile * 4) + 256 + taps * x
+    }
+
+    /// Lays the wavefront's buffers out in the region planned for them (`base`, sized by
+    /// [`Self::wave_buf_bytes`] at `tile` rows); set 0 takes the single-tile loop's buffers.
+    pub(super) fn set_wave_addresses(
+        &mut self,
+        spec: &ModelSpec,
+        tile: u64,
+        base: u64,
+        x0: [u64; 2],
+        ids0: u64,
+        cursor0: u64,
+    ) {
+        if base == 0 || !self.wave_on {
+            return;
+        }
+        let a = |n: u64| align_up(n.max(256), 256);
+        let x = a(spec.hidden * tile * 2);
+        let core = a(spec.n_heads * spec.head_dim * tile * 2);
+        let mut at = base;
+        let mut take = |n: u64| {
+            let p = at;
+            at += n;
+            p
+        };
+        let x1 = [take(x), take(x)];
+        let core2 = [take(core), take(core)];
+        let ids1 = take(a(tile * 4));
+        let cursor1 = take(256);
+        let taps1 = (0..self.wave_taps.unwrap_or(0)).map(|_| take(x)).collect();
+        self.wave_bufs = Some(WaveBufs {
+            x: [x0, x1],
+            core: core2,
+            ids: [ids0, ids1],
+            cursor: [cursor0, cursor1],
+            taps1,
+        });
+    }
+
+    /// The wavefront recipe keys of a load: the single halves that start and end a wavefront and
+    /// the two-body recipes of both layer kinds (one per KV chunk count for the attention half).
+    fn wave_keys(spec: &ModelSpec, max_chunks: u64) -> Vec<WaveKey> {
+        let mut keys = vec![
+            WaveKey { first: Some(FirstHalf::Lin), second: false },
+            WaveKey { first: None, second: true },
+            WaveKey { first: Some(FirstHalf::Lin), second: true },
+        ];
+        if spec.n_full_attention_layers() > 0 {
+            keys.extend((1..=max_chunks).map(|nch| WaveKey {
+                first: Some(FirstHalf::Attn(nch)),
+                second: true,
+            }));
+        }
+        keys
+    }
+
+    /// Is the wavefront ready to run (its recipes compiled and its buffers placed)?
+    pub(super) fn wave_ready(&self) -> bool {
+        self.wave_on && self.wave_bufs.is_some()
+    }
+
+    /// Scratch bindings (and the cast constant) of the wavefront recipe `key`.
+    pub(super) fn wave_pool(&self, key: WaveKey) -> BTreeMap<String, u64> {
+        self.pool_of(self.wave_layout.get(&key))
     }
 
     /// Rows of a full tile (the widest candidate until [`Self::settle`] chose).
@@ -1480,6 +1885,14 @@ impl TileRt {
         if spec.n_linear_layers() > 0 {
             bytes = bytes.max(scratch_layout(&self.lin_graph(spec, tile, &[])).1);
         }
+        if self.wave_wanted(spec) {
+            for key in Self::wave_keys(spec, max_chunks) {
+                if let Ok(gb) = build_wave_graph(spec, tile, lmax, key, &self.form, &[], &self.elf_tile)
+                {
+                    bytes = bytes.max(half_scratch_layout(&gb).1);
+                }
+            }
+        }
         bytes
     }
 
@@ -1499,6 +1912,7 @@ impl TileRt {
         attn: &mut HashMap<(u64, u64), CompiledRecipe>,
         lin: &mut HashMap<u64, CompiledRecipe>,
         embed: &mut HashMap<u64, CompiledRecipe>,
+        wave: &mut HashMap<WaveKey, CompiledRecipe>,
         verbose: bool,
         fits: &dyn Fn(u64, u64) -> bool,
     ) -> Result<(u64, u64), String> {
@@ -1571,6 +1985,57 @@ impl TileRt {
                 ws = ws.max(r.ws_size);
                 embed.insert(tile, r);
             }
+            // the wavefront recipes of this width (a compile or order failure leaves the
+            // single-tile loop in charge: the wavefront is an overlap of the same nodes)
+            wave.clear();
+            self.wave_on = false;
+            self.wave_layout.clear();
+            if self.wave_wanted(spec) && tile > 1 {
+                let t_wave = Instant::now();
+                let mut built = Vec::new();
+                let mut err = None;
+                for key in Self::wave_keys(spec, max_chunks) {
+                    let made = build_wave_graph(spec, tile, lmax, key, &self.form, elf_base, &self.elf_tile)
+                        .and_then(|gb| {
+                            let layout = half_scratch_layout(&gb);
+                            gb.compile(std::sync::Arc::clone(api), cache, driver_version)
+                                .map(|r| (r, layout))
+                                .map_err(|e| format!("compile {}: {e}", gb.recipe_name()))
+                        });
+                    match made {
+                        Ok((r, (layout, bytes))) if bytes <= scratch => built.push((key, r, layout)),
+                        Ok((r, (_, bytes))) => {
+                            err = Some(format!("{} needs {bytes} B of scratch, {scratch} B are planned", r.name));
+                            break;
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match err {
+                    None => {
+                        if verbose {
+                            eprintln!(
+                                "[gaudium] prefill wavefront recipes T={tile}: {} from the cache, {} compiled, {:.2}s",
+                                built.iter().filter(|b| b.1.from_cache).count(),
+                                built.iter().filter(|b| !b.1.from_cache).count(),
+                                t_wave.elapsed().as_secs_f64()
+                            );
+                        }
+                        for (key, r, layout) in built {
+                            ws = ws.max(r.ws_size);
+                            self.wave_layout.insert(key, layout);
+                            wave.insert(key, r);
+                        }
+                        self.wave_on = true;
+                    }
+                    Some(e) => eprintln!(
+                        "[gaudium] prefill wavefront off (single-tile recipes are used): {e}"
+                    ),
+                }
+            }
             chosen = Some((tile, scratch, ws));
             break;
         }
@@ -1583,6 +2048,9 @@ impl TileRt {
                 self.form.label(),
                 scratch as f64 / (1024.0 * 1024.0 * 1024.0)
             );
+            if self.wave_on {
+                eprintln!("[gaudium] prefill: full tiles run two in flight (wavefront recipes)");
+            }
         }
         Ok((scratch, ws))
     }
@@ -1783,6 +2251,77 @@ mod tests {
     }
 
     #[test]
+    fn wave_graphs_hold_both_halves_in_a_user_order() {
+        for fp8 in [false, true] {
+            let mut spec = dense_spec();
+            spec.fp8_weights = fp8;
+            let form = TileForm::resolve(&PrefillOpts::default(), &spec);
+            for first in [FirstHalf::Lin, FirstHalf::Attn(1), FirstHalf::Attn(5)] {
+                let f = build_half_graph(&spec, 512, 8192, Some(first), false, Weave::Cost, &form, &[], &[]);
+                let g = build_half_graph(&spec, 512, 8192, None, true, Weave::Cost, &form, &[], &[]);
+                let key = WaveKey { first: Some(first), second: true };
+                let w = build_wave_graph(&spec, 512, 8192, key, &form, &[], &[]).unwrap();
+                // the two halves, node for node
+                assert_eq!(w.node_count(), f.node_count() + g.node_count());
+                let mut names: Vec<String> =
+                    w.node_io_views().iter().map(|n| n.name.to_string()).collect();
+                let mut want: Vec<String> = f
+                    .node_io_views()
+                    .iter()
+                    .chain(g.node_io_views().iter())
+                    .map(|n| n.name.to_string())
+                    .collect();
+                names.sort();
+                want.sort();
+                assert_eq!(names, want);
+                assert!(w.recipe_name().starts_with("g_qwen_wave"), "{}", w.recipe_name());
+                // the order is part of what compiles: not the plain two-body recipe's key
+                let plain = build_half_graph(
+                    &spec, 512, 8192, Some(first), true, Weave::SecondFirst, &form, &[], &[],
+                );
+                assert_ne!(w.fingerprint("d"), plain.fingerprint("d"));
+            }
+            // the single halves at the ends of a wavefront are the half-layer recipes
+            let key = WaveKey { first: Some(FirstHalf::Lin), second: false };
+            let a = build_wave_graph(&spec, 512, 8192, key, &form, &[], &[]).unwrap();
+            let b = build_half_graph(
+                &spec, 512, 8192, Some(FirstHalf::Lin), false, Weave::SecondFirst, &form, &[], &[],
+            );
+            assert_eq!(a.fingerprint("d"), b.fingerprint("d"));
+        }
+    }
+
+    #[test]
+    fn seq_order_places_runs_and_single_nodes() {
+        let mut spec = dense_spec();
+        spec.fp8_weights = true;
+        let form = TileForm::resolve(&PrefillOpts::default(), &spec);
+        let mut gb = build_half_graph(
+            &spec, 512, 8192, Some(FirstHalf::Lin), true, Weave::SecondFirst, &form, &[], &[],
+        );
+        let n = gb.node_count();
+        apply_seq_order(&mut gb, "F:h_norm,F=ba_gemm,G:attn_gemm,F:*").unwrap();
+        let names: Vec<String> = gb.node_io_views().iter().map(|x| x.name.to_string()).collect();
+        assert_eq!(names.len(), n);
+        assert_eq!(&names[..2], ["L_h_norm", "L_ba_gemm"]);
+        let wo = names.iter().position(|x| x == "G_attn_gemm").unwrap();
+        let qkvz = names.iter().position(|x| x == "L_qkvz_gemm").unwrap();
+        assert!(wo < qkvz, "the second body's run comes before the rest of the first");
+        // nodes no run names keep their creation order at the end
+        assert!(names.iter().position(|x| x == "G_mo_gemm").unwrap() > qkvz);
+        assert!(apply_seq_order(&mut gb, "F:no_such_node").is_err());
+        assert!(apply_seq_order(&mut gb, "X:h_norm").is_err());
+    }
+
+    #[test]
+    fn wave_option_parses_and_plain_turns_it_off() {
+        assert!(PrefillOpts::default().wave);
+        assert!(!PrefillOpts::parse("wave=0").unwrap().wave);
+        assert!(!PrefillOpts::parse("plain").unwrap().wave);
+        assert!(PrefillOpts::parse("plain,wave=1").unwrap().wave);
+    }
+
+    #[test]
     fn plain_form_builds_the_plain_recipes() {
         let spec = dense_spec();
         let elfs = vec![("K".to_string(), "h".to_string())];
@@ -1856,3 +2395,4 @@ mod tests {
         assert!(!scratch_layout(&att8).0.contains_key("fp8_one"));
     }
 }
+

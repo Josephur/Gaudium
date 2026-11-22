@@ -1735,6 +1735,37 @@ impl SpecRuntime {
         Ok(())
     }
 
+    /// Drafter tap rows a prefill tile carries when two tiles are in flight (the wavefront keeps
+    /// a second set of them); `None`: this drafter's prefill hook reads buffers the two-tile
+    /// loop does not duplicate, so its prompts stay with the single-tile loop.
+    pub(super) fn wave_taps(&self) -> Option<usize> {
+        if self.mtp.is_some() || self.dflash2.is_some() {
+            return None;
+        }
+        Some(self.drafter.as_ref().map_or(0, |d| d.cfg.taps.len()))
+    }
+
+    /// [`Self::prefill_io`] for a tile on the wavefront's second buffer set: `taps` are that
+    /// set's tap rows, in tap order.
+    pub(super) fn prefill_io_set1(&self, l: usize, xin: u64, xout: u64, taps: &[u64]) -> (u64, u64) {
+        let Some(d) = &self.drafter else {
+            return (xin, xout);
+        };
+        let tap = |layer: usize| {
+            d.cfg
+                .taps
+                .iter()
+                .position(|&t| t == layer)
+                .and_then(|i| taps.get(i).copied())
+        };
+        let xin = if l > 0 {
+            tap(l - 1).unwrap_or(xin)
+        } else {
+            xin
+        };
+        (xin, tap(l).unwrap_or(xout))
+    }
+
     /// Prefill routing for the drafter's target-layer taps: a tapped layer writes its output to
     /// the tap buffer and the next layer reads it from there.
     pub(super) fn prefill_io(&self, l: usize, xin: u64, xout: u64) -> (u64, u64) {
@@ -1809,6 +1840,44 @@ pub(super) fn prefill_tile_hook(
         rt.lmax,
         pos,
         tile_len,
+    )
+}
+
+/// [`prefill_tile_hook`] for a tile on the wavefront's second buffer set: the drafter's context
+/// pass reads that set's tap rows and cursor (`over` = tensor name -> address).
+pub(super) fn prefill_tile_hook_set1(
+    eng: &mut Qwen3Engine,
+    pos: u64,
+    tile_len: u64,
+    over: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    let Qwen3Engine {
+        specdec,
+        dev,
+        spec,
+        cache,
+        driver_version,
+        ..
+    } = eng;
+    let Some(rt) = specdec.as_mut() else {
+        return Ok(());
+    };
+    if rt.mtp.is_some() || rt.dflash2.is_some() {
+        return Err("the wavefront has no second buffer set for this drafter".into());
+    }
+    let Some(d) = rt.drafter.as_mut() else {
+        return Ok(());
+    };
+    d.launch_ctx_over(
+        dev,
+        spec,
+        cache,
+        driver_version,
+        &rt.elf_hashes,
+        rt.lmax,
+        pos,
+        tile_len,
+        Some(over),
     )
 }
 
