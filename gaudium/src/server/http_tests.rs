@@ -24,7 +24,7 @@ impl GenEngine for ScriptedEngine {
     }
 
     fn max_ctx(&self) -> u64 {
-        8192
+        16384
     }
 
     fn hbm_bytes(&self) -> [u64; 5] {
@@ -127,7 +127,7 @@ fn harness() -> Harness {
             chat: Some(chat),
             tokenizer: Arc::clone(&tok),
             extra_eos_ids: Vec::new(),
-            max_ctx: 8192,
+            max_ctx: 16384,
             gemma_closes_thought: false,
             gen_defaults: SamplerDefaults::FALLBACK,
         }
@@ -147,13 +147,14 @@ fn harness() -> Harness {
             models: Vec::new(),
             kernels_dir: PathBuf::new(),
             ui_dir: None,
-            max_ctx: 8192,
+            max_ctx: 16384,
             cache_dir: None,
             no_cache: true,
             lazy: true,
             idle_park_secs: 0,
             queue_config: None,
             api_key: None,
+            a2ui: true,
             verbose: false,
             per_model: Vec::new(),
             draft_k: Vec::new(),
@@ -840,4 +841,64 @@ fn template_and_token_count_endpoints_and_props() {
             "{key}"
         );
     }
+}
+
+#[test]
+fn a2ui_declaration_adds_the_instructions_to_the_system_turn() {
+    let h = harness();
+    // a request that declares nothing renders as before
+    h.script("Hello.");
+    let (status, _) = h.chat("");
+    assert_eq!(status, 200);
+    assert!(!h.last_prompt().contains("a2ui"));
+
+    // a declared renderer: the instructions open the conversation as a system turn
+    h.script("A form helps.\n</think>\n\nHere.\n<a2ui-json>\n[]\n</a2ui-json>");
+    let (status, reply) = h.chat(",\"gaudium_a2ui\":true");
+    assert_eq!(status, 200, "{reply:?}");
+    let prompt = h.last_prompt();
+    assert!(
+        prompt.starts_with("<|im_start|>system\n# Interactive interfaces (A2UI 1.0)"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("<|im_end|>\n<|im_start|>user\nWeather in Oslo?"));
+    // the model's block reaches the client inside the ordinary content
+    assert!(s(&reply, &["choices", "0", "message", "content"]).contains("<a2ui-json>"));
+
+    // the same prompt is what the template and token-count endpoints see
+    let body = r#"{"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}],"gaudium_a2ui":{"1.0":{"supportedCatalogIds":["https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"]}}}"#;
+    let (status, text) = h.post("/apply-template", body);
+    assert_eq!(status, 200, "{text}");
+    let rendered = json::parse_json(&text).unwrap();
+    let rendered = s(&rendered, &["prompt"]);
+    assert!(rendered.starts_with("<|im_start|>system\nBe brief.\n\n# Interactive interfaces"));
+    assert_eq!(rendered.matches("<|im_start|>system").count(), 1);
+    let (_, text) = h.post("/gaudium/count_tokens", body);
+    let with = at(&json::parse_json(&text).unwrap(), &["n_prompt_tokens"])
+        .as_u64()
+        .unwrap();
+    let (_, text) = h.post(
+        "/gaudium/count_tokens",
+        r#"{"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}]}"#,
+    );
+    let without = at(&json::parse_json(&text).unwrap(), &["n_prompt_tokens"])
+        .as_u64()
+        .unwrap();
+    assert!(with > without + 500, "{with} vs {without}");
+
+    // a malformed declaration is refused; the Messages endpoint takes the field too
+    let (status, _) = h.chat(",\"gaudium_a2ui\":\"yes\"");
+    assert_eq!(status, 400);
+    h.script("Hello.");
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}],"gaudium_a2ui":true}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    assert!(h.last_prompt().contains("# Interactive interfaces (A2UI 1.0)"));
+
+    let props = json::parse_json(&h.state.props_json(0, true)).unwrap();
+    assert_eq!(at(&props, &["a2ui", "enabled"]).as_bool(), Some(true));
+    assert_eq!(s(&props, &["a2ui", "request_field"]), "gaudium_a2ui");
+    assert!(at(&props, &["a2ui"]).get("instructions").is_none());
 }

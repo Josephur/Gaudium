@@ -1,0 +1,95 @@
+/* A2UI surfaces: the interfaces the model describes, drawn in the chat (js/ui/a2ui.js). Colours and sizes are app.css's. */
+.a2-block { display: grid; gap: 8px; min-width: 0; }
+.a2-surface { border: 1px solid var(--line); border-radius: var(--r-l); background: var(--panel); padding: 14px 16px; min-width: 0; font-size: var(--t-m); }
+.a2-surface > .a2-card { border: 0; padding: 0; background: none; }
+.a2-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.a2-row { display: flex; flex-direction: row; flex-wrap: wrap; gap: 12px; min-width: 0; }
+.a2-weight { min-width: 0; display: flex; flex-direction: column; }
+.a2-weight > * { flex: 1; }
+.a2-list { display: flex; flex-direction: column; gap: 8px; max-height: 440px; overflow-y: auto; min-width: 0; }
+.a2-list.h { flex-direction: row; max-height: none; overflow-x: auto; overflow-y: hidden; padding-bottom: 4px; }
+.a2-list.h > .a2-item { flex: none; }
+.a2-item { min-width: 0; }
+.a2-card { border: 1px solid var(--line); border-radius: var(--r-m); background: var(--panel); padding: 12px 14px; min-width: 0; }
+.a2-card .a2-card { background: var(--sunk); }
+.a2-divider { height: 1px; background: var(--line); align-self: stretch; flex: none; }
+.a2-divider.v { width: 1px; height: auto; min-height: 20px; }
+
+.a2-text { min-width: 0; overflow-wrap: anywhere; line-height: 1.5; }
+.a2-text.caption { color: var(--muted); font-size: var(--t-s); }
+.a2-text.answer { font-size: inherit; line-height: 1.5; }
+.a2-text.answer > :first-child { margin-top: 0; }
+.a2-text.answer > :last-child { margin-bottom: 0; }
+.a2-text.answer h1, .a2-text.answer h2, .a2-text.answer h3 { margin: 0 0 .2em; line-height: 1.25; }
+.a2-text.answer h1 { font-size: 22px; }
+.a2-text.answer h2 { font-size: var(--t-l); }
+.a2-text.answer h3 { font-size: var(--t-b); }
+.a2-icon { display: inline-grid; place-items: center; width: 22px; height: 22px; color: var(--fg2); flex: none; }
+.a2-icon svg { width: 100%; height: 100%; }
+.a2-icon.missing { color: var(--muted); }
+.a2-image { display: block; max-width: 100%; border-radius: var(--r-m); background: var(--sunk); }
+.a2-image.icon { width: 24px; height: 24px; border-radius: 4px; }
+.a2-image.avatar { width: 44px; height: 44px; border-radius: 50%; }
+.a2-image.smallFeature { width: 96px; height: 96px; }
+.a2-image.mediumFeature { width: 100%; max-width: 320px; aspect-ratio: 16 / 10; }
+.a2-image.largeFeature { width: 100%; max-height: 420px; aspect-ratio: 16 / 9; }
+.a2-image.header { width: 100%; height: 150px; }
+.a2-image.missing { display: flex; align-items: center; justify-content: center; gap: 6px; color: var(--muted); font-size: var(--t-xs); border: 1px dashed var(--line2); overflow: hidden; }
+.a2-image.missing.icon span, .a2-image.missing.avatar span { display: none; }
+.a2-video { width: 100%; max-height: 420px; border-radius: var(--r-m); background: #000; }
+.a2-audio { display: grid; gap: 4px; }
+.a2-audio audio { width: 100%; height: 36px; }
+
+.a2-field { display: grid; gap: 5px; min-width: 0; border: 0; padding: 0; margin: 0; }
+.a2-field > label, .a2-field > legend, .a2-slider-head label { font-weight: 600; font-size: var(--t-s); padding: 0; }
+.a2-field > legend { margin-bottom: 5px; }
+.a2-field input[type=text], .a2-field input[type=number], .a2-field input[type=password], .a2-field input[type=search], .a2-field input[type=date],
+.a2-field input[type=time], .a2-field input[type=datetime-local], .a2-field textarea {
+  width: 100%; border: 1px solid var(--line2); border-radius: var(--r-s); background: var(--bg); color: var(--fg); padding: 7px 9px; font: inherit; font-size: var(--t-m); min-width: 0; }
+.a2-field textarea { resize: vertical; min-height: 68px; font-family: var(--font-ui); }
+.a2-field.bad input, .a2-field.bad textarea { border-color: var(--bad); }
+.a2-field input[type=range] { width: 100%; accent-color: var(--focus); }
+.a2-slider-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.a2-slider-head output { font-family: var(--font-mono); font-size: var(--t-s); color: var(--fg2); font-variant-numeric: tabular-nums; }
+.a2-options { display: grid; gap: 6px; }
+.a2-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.a2-chip { border: 1px solid var(--line2); background: var(--panel); color: var(--fg); border-radius: 999px; padding: 5px 12px; font: inherit; font-size: var(--t-s); cursor: pointer; }
+.a2-chip:hover { background: var(--sunk); }
+.a2-chip.on { background: var(--ink); color: var(--on-ink); border-color: var(--ink); }
+.a2-filter { margin-bottom: 6px; }
+.a2-check { color: var(--bad); font-size: var(--t-xs); }
+
+.a2-button-wrap { display: inline-flex; flex-direction: column; gap: 4px; align-items: flex-start; min-width: 0; }
+.a2-button { height: auto; min-height: 32px; padding: 5px 14px; }
+.a2-button .a2-text { line-height: 1.3; }
+.a2-button.borderless { border-color: transparent; background: none; color: var(--link); padding-inline: 4px; }
+.a2-button.borderless:hover { text-decoration: underline; background: none; }
+.a2-button .a2-icon { color: inherit; width: 18px; height: 18px; }
+.a2-tabs { display: grid; gap: 10px; min-width: 0; }
+.a2-tabs > .tabs { padding: 0; flex-wrap: wrap; }
+.a2-modal-trigger { display: inline-flex; }
+.a2-dialog { position: relative; }
+.a2-dialog-close { position: absolute; top: 6px; right: 6px; z-index: 1; }
+.a2-dialog .dlg-body { padding-top: 22px; }
+
+.a2-wait { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: var(--t-s); border: 1px dashed var(--line2); border-radius: var(--r-m); padding: 12px 14px; }
+.a2-stub { color: var(--muted); font-size: var(--t-s); border: 1px dashed var(--line); border-radius: var(--r-m); padding: 8px 12px; }
+.a2-link { border: 0; background: none; padding: 0; color: var(--link); cursor: pointer; font: inherit; }
+.a2-link:hover { text-decoration: underline; }
+.a2-foot { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: var(--t-xs); padding-inline: 2px; }
+.a2-foot span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.a2-json { margin: 0; font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--r-m); padding: 10px 12px; color: var(--fg2); }
+.a2-problems { border: 1px solid var(--line); border-radius: var(--r-m); padding: 8px 12px; font-size: var(--t-s); color: var(--fg2); background: var(--warn-bg); }
+.a2-problems summary { cursor: pointer; }
+.a2-problems ul { margin: 8px 0; padding-left: 18px; display: grid; gap: 4px; }
+.a2-problems code { font-family: var(--font-mono); font-size: 11.5px; }
+
+/* the user's side of an interface: a pressed button */
+.bubble.a2-action { display: inline-flex; align-items: center; gap: 8px; white-space: normal; }
+.bubble.a2-action .a2-icon { width: 16px; height: 16px; }
+.a2-action-json { align-self: flex-end; width: min(88%, 640px); }
+
+@media (max-width: 560px) {
+  .a2-row { gap: 10px; }
+  .a2-surface { padding: 12px; }
+}

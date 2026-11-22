@@ -160,3 +160,9 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 - **Zero build outputs or large binaries:** Never commit `target/`, `build/`, `*.o`, `*.so`, `*.elf`, `*.recipe`, model weights (`*.safetensors`, `*.gguf`, `*.bin`, `*.pt`), pixel dumps, or runtime logs/locks. Keep every tracked file small and auditable.
 - **Third-party code & licenses:** Any vendored third-party dependency goes under `third_party/` with its license file and an entry in `THIRD_PARTY_NOTICES.md`.
 - **Keep docs in sync with code:** Whenever adding, renaming, or removing CLI flags or `GAUDIUM_*` environment variables, update the reference documentation and help text in the same commit.
+
+---
+
+## 10. Temporary Testing Defaults (revert before a release)
+
+- **A2UI is on by default in the Web UI while it is being tested.** `DEFAULTS.a2ui` in `ui/js/lib/settings.js` is `true` so that "Interactive interfaces (A2UI)" is ticked without visiting the settings (it still only takes effect on a server started with `--a2ui`, and a browser that has saved the setting keeps its own value). The intended shipping default is `false`: A2UI adds about 2,100 tokens of instructions to every request's system turn. Set it back to `false` when testing ends, and remove this entry.

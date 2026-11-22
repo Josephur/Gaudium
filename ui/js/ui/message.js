@@ -8,9 +8,28 @@ import { useFollow } from './follow.js';
 import { methodInfo, familyAt, liveStats, finalStats, stepsFromSamples, fmtInt, fmt1, fmt2, fmtMs, fmtPct, fmtBytes } from '../lib/stats.js';
 import { requestSections } from '../lib/model.js';
 import { parseArgs } from '../lib/stream.js';
+import { splitContent, hasA2ui, readUserTurn, actionLabel } from '../lib/a2ui.js';
+import { A2uiBlock, A2Icon } from './a2ui.js';
 
 function Markdown({ text, cls = 'answer' }) {
   return html`<div class=${cls} dangerouslySetInnerHTML=${{ __html: renderMarkdown(text) }}></div>`;
+}
+
+// A reply's text: Markdown, with the model's interface blocks (A2UI) drawn where they stand. segKey: this segment's key
+// among the conversation's blocks (lib/a2ui.js blocksOfPath).
+function Content({ text, live, segKey, rt, act, busy }) {
+  if (!live && !hasA2ui(text)) return html`<${Markdown} text=${text} />`;
+  let n = 0;
+  return splitContent(text, { live }).map((p, i) => (p.t === 'text' ? html`<${Markdown} key=${`t${i}`} text=${p.text} />`
+    : html`<${A2uiBlock} key=${`b${i}`} rt=${rt} blockKey=${`${segKey}:${n++}`} raw=${p.raw} closed=${p.closed} live=${live} onAction=${act.a2uiSend} onReport=${act.a2uiReport} busy=${busy} />`));
+}
+
+// A user turn made by pressing a button of an interface: what was pressed, with the message it sent one click away.
+function ActionTurn({ turn }) {
+  const [open, setOpen] = useState(false);
+  return html`<div class="bubble a2-action"><${A2Icon} name=${turn[0].error ? 'warning' : 'send'} /><span>${turn.map(actionLabel).join(' · ')}</span>
+      <button type="button" class="a2-link" aria-expanded=${open} onClick=${() => setOpen(!open)}>${open ? 'hide' : 'details'}</button></div>
+    ${open ? html`<pre class="a2-json a2-action-json">${JSON.stringify(turn.length === 1 ? turn[0] : turn, null, 2)}</pre>` : null}`;
 }
 
 function Branch({ sib, onNav }) {
@@ -50,14 +69,15 @@ function Edit({ initial, onSave, onCancel, label }) {
 
 export const UserMessage = memo(function UserMessage({ m, sib, act, busy }) {
   const [editing, setEditing] = useState(false);
+  const turn = readUserTurn(m.content);   // a pressed button of an interface, not typed text
   return html`<div class="msg user" data-id=${m.id}>
     ${m.attachments && m.attachments.length ? html`<div class="atts">${m.attachments.map((a) => html`<${Attachment} a=${a} big />`)}</div>` : null}
     ${editing ? html`<${Edit} initial=${m.content || ''} label="Send" onCancel=${() => setEditing(false)} onSave=${(t) => { setEditing(false); act.editUser(m.id, t); }} />`
-      : (m.content ? html`<div class="bubble">${m.content}</div>` : null)}
+      : turn.length ? html`<${ActionTurn} turn=${turn} />` : (m.content ? html`<div class="bubble">${m.content}</div>` : null)}
     <div class="msg-meta">
       <${Branch} sib=${sib} onNav=${(d) => act.nav(m.id, d)} />
       <button class="icon-btn" title="Copy" onClick=${() => act.copy(m.content || '')}><${Icon} name="copy" /></button>
-      <button class="icon-btn" title="Edit (makes a branch)" disabled=${busy} onClick=${() => setEditing(true)}><${Icon} name="edit" /></button>
+      ${turn.length ? null : html`<button class="icon-btn" title="Edit (makes a branch)" disabled=${busy} onClick=${() => setEditing(true)}><${Icon} name="edit" /></button>`}
       <button class="icon-btn" title="Delete this message and what follows" disabled=${busy} onClick=${() => act.remove(m.id)}><${Icon} name="trash" /></button>
     </div>
   </div>`;
@@ -179,7 +199,7 @@ export const AssistantMessage = memo(function AssistantMessage({ m, sib, act, li
         ${sum && (g.content || liveSeg) ? html`<${Summary} g=${g} live=${liveSeg} compacted=${isNode ? m.compacted : g.compacted} inTurn=${!isNode} auto=${isNode && m.auto} />` : null}
         ${!sum && g.reasoning ? html`<${Thinking} text=${g.reasoning} live=${liveSeg} inReasoning=${liveSeg && !g.content && !(g.toolCalls || []).length && live.inReasoning} pref=${view.settings.showReasoning}
             onSkip=${liveSeg && view.canSkip ? () => act.skipReasoning() : null} ms=${g.reasoningMs} />` : null}
-        ${!sum && g.content ? html`<${Markdown} text=${g.content} />` : null}
+        ${!sum && g.content ? html`<${Content} text=${g.content} live=${liveSeg} segKey=${`${m.id}:${i}`} rt=${view.a2ui} act=${act} busy=${busy} />` : null}
         ${sum ? null : (g.toolCalls || []).map((c) => html`<${ToolCard} c=${c} act=${act} live=${liveSeg} />`)}
         ${g.error ? html`<div class="err"><b>${g.error.code ? `Error ${g.error.code}` : 'Error'}</b>: ${sum ? 'the summary failed: ' : ''}${g.error.message}${g.error.hint && !sum ? html`<div class="notice">${g.error.hint}</div>` : null}
           ${overflow && !isNode && g.error.canCompact !== false && act.compactRetry ? html`<div class="err-actions"><button class="btn primary" disabled=${busy} onClick=${() => act.compactRetry(m.id)}><${Icon} name="compact" />Compact and retry</button></div>` : null}</div>` : null}

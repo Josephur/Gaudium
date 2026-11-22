@@ -762,6 +762,7 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
         "seed",
         "min_p",
         "gaudium_method",
+        "gaudium_a2ui",
         "reasoning_effort",
         "coupled",
         "draft_trunc",

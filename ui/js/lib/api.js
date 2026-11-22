@@ -1,5 +1,6 @@
 // The server API: OpenAI-compatible endpoints and Gaudium extensions.
 import { readSSE, newSegment, applyChunk } from './stream.js';
+import { BASIC_CATALOG } from './a2ui.js';
 
 let apiKey = '';
 export const setApiKey = (k) => { apiKey = k || ''; };
@@ -45,6 +46,7 @@ export function buildBody(messages, s, tools) {
   const mt = num(s.max_tokens); if (mt != null && isFinite(mt) && mt > 0) b.max_tokens = mt;
   if (s.method && s.method !== 'default') b.gaudium_method = s.method;
   if (tools && tools.length) b.tools = tools;
+  if (s.a2ui) b.gaudium_a2ui = { supportedCatalogIds: [BASIC_CATALOG] };   // this page draws A2UI surfaces: the server adds the model's instructions
   if (s.custom && s.custom.trim()) { try { Object.assign(b, JSON.parse(s.custom)); } catch { /* shown as invalid in settings */ } }
   return b;
 }

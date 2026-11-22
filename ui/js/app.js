@@ -17,6 +17,7 @@ import { finalStats, methodInfo, greedyOnly, setDfName, fmtInt, contextUsed } fr
 import { modelDesc, modelFacts, precisionShort, hasDrafter, dfFamilyName } from './lib/model.js';
 import { reserveTokens, compactPercent, projection, summaryMaxTokens, usedLive, estimateMessages, estimateText, longestText, elideMessage } from './lib/context.js';
 import { newSegment } from './lib/stream.js';
+import { blocksOfPath, syncRuntime, wrapMessage, errorMessage } from './lib/a2ui.js';
 import { loadSettings, saveSettings, applyTheme, effectiveDark, loadDockCollapsed, saveDockCollapsed } from './lib/settings.js';
 
 const settings0 = loadSettings();
@@ -189,7 +190,13 @@ function methodPlan(s) {
 }
 const forcedGreedy = (s) => { const p = methodPlan(s); return !!(p && p.kind === 'greedy'); };
 // the settings a request is built from: temperature 0 when the plan is greedy
-function sendSettings() { const s = effSettings(S().settings); return forcedGreedy(s) ? { ...s, temperature: 0 } : s; }
+// (interactive interfaces are declared only to a server that offers them: it refuses the declaration otherwise)
+const a2uiOffered = () => !!(S().props && S().props.a2ui && S().props.a2ui.enabled);
+function sendSettings() {
+  let s = effSettings(S().settings);
+  if (s.a2ui && !a2uiOffered()) s = { ...s, a2ui: false };
+  return forcedGreedy(s) ? { ...s, temperature: 0 } : s;
+}
 function defaultMethod(snap) {
   const e = engineInfo(); const g = snap && snap.greedy != null ? snap.greedy : predictedGreedy(snap || {});
   return g ? e.greedy : e.sampled;
@@ -434,7 +441,7 @@ let ctxTimer = 0, ctxSeq = 0;
 const hashStr = (t) => { let h = 0; for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };
 function ctxKeyOf(conv, path) {
   const leaf = path[path.length - 1]; const s = S().settings;
-  return [conv.id, leaf ? leaf.id : '-', leaf ? (leaf.segments || []).length : 0, hashStr(s.system || ''), s.thinking, s.effort, s.sendReasoning ? 1 : 0,
+  return [conv.id, leaf ? leaf.id : '-', leaf ? (leaf.segments || []).length : 0, hashStr(s.system || ''), s.thinking, s.effort, s.sendReasoning ? 1 : 0, s.a2ui && a2uiOffered() ? 1 : 0,
     collectTools().defs.map((t) => t.function && t.function.name).join(',')].join('|');
 }
 function measuredContext(path) {
@@ -523,7 +530,16 @@ function send(text, atts) {
   try { localStorage.setItem('gaudium-ui.last', conv.id); } catch { /* no storage */ }
   run(conv.id, a.id);
 }
+// The interfaces (A2UI surfaces) of the open chat: the blocks of the shown path, applied in order (lib/a2ui.js).
+let a2uiRt = null;
+function a2uiFor(path, st) {
+  a2uiRt = syncRuntime(a2uiRt, blocksOfPath(path, st ? { id: st.msgId, seg: st.seg } : null));
+  return a2uiRt;
+}
 const act = {
+  // a pressed button of an interface, and a report of what was wrong with one: each is a user turn the model answers
+  a2uiSend: (msg) => send(wrapMessage(msg), []),
+  a2uiReport: (errors) => send(errors.slice(0, 6).map((e) => wrapMessage(errorMessage(e))).join('\n'), []),
   copy: async (t) => { try { await navigator.clipboard.writeText(t); toast('Copied.'); } catch { toast('The browser refused the clipboard.'); } },
   nav: (id, d) => { const { conv, messages } = current(); commit(conv, switchSibling(messages, id, d), { now: false }); },
   regenerate: (aid) => {
@@ -712,7 +728,8 @@ export function App() {
   const efforts = (s.props && s.props.chat_template_caps && s.props.chat_template_caps.reasoning_effort_levels) || ['low', 'medium', 'xhigh'];
   const vision = !s.props || !s.props.modalities || s.props.modalities.vision !== false;
   const audio = !!(s.props && s.props.modalities && s.props.modalities.audio);   // only when the server advertises audio support
-  const view = useMemo(() => ({ settings: s.settings, precision, desc, themeKey: s.themeKey + (s.libs || 0), mock: s.hello && s.hello.backend === 'mock', defaultMethod, nCtx: s.hello ? s.hello.n_ctx : 0 }), [s.settings, s.hello, s.themeKey, s.libs, precision, desc]);
+  const a2ui = a2uiFor(path, st);
+  const view = useMemo(() => ({ settings: s.settings, precision, desc, themeKey: s.themeKey + (s.libs || 0), mock: s.hello && s.hello.backend === 'mock', defaultMethod, nCtx: s.hello ? s.hello.n_ctx : 0, a2ui }), [s.settings, s.hello, s.themeKey, s.libs, precision, desc, a2ui]);
   const liveView = st ? { ...view, engine: s.engine, engineAt: s.engineAt, now: s.now, engineReady: !s.engine || s.engine.state === 'ready', canSkip: !!(s.hello ? s.hello.supports_inject : true) } : view;
   // the chat follows the stream while the reader is at the bottom (a new chat or a new turn starts there)
   const streamedHere = useRef(false);   // the open chat had a stream in the last render

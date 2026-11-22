@@ -86,6 +86,13 @@ fn print_usage() {
          \x20 --fp8-act <id=file>   FP8 activation-scale table for FP8 model <id> (repeatable)\n\
          \x20 --fp8-cache <id=dir>  Cache directory for model <id>'s quantised FP8 matrices\n\
          \x20 --api-key <key>       Optional Bearer / X-Api-Key auth token\n\
+         \x20 --a2ui                Offer A2UI 1.0 interfaces (or GAUDIUM_A2UI=1): a chat request that\n\
+         \x20                       declares its renderer in the field gaudium_a2ui (true, or an\n\
+         \x20                       object with supportedCatalogIds) gets the instructions that teach\n\
+         \x20                       the model to write <a2ui-json> interface blocks in its reply;\n\
+         \x20                       the Web UI then offers interactive interfaces in its settings.\n\
+         \x20                       GET /gaudium/a2ui shows what is offered and the instructions.\n\
+         \x20                       Requests that declare nothing are unchanged\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \n\
          Live status environment variables:\n\
@@ -1546,6 +1553,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 .and_then(|d| d.parent().map(|p| p.join("queue.conf")))
         });
     let mut api_key: Option<String> = env::var("GAUDIUM_API_KEY").ok().filter(|s| !s.is_empty());
+    let mut a2ui = env::var("GAUDIUM_A2UI").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
     let mut verbose = false;
     let mut per_model: Vec<(String, ModelRunOptions)> = Vec::new();
     let mut draft_k: Vec<u64> = Vec::new();
@@ -1667,6 +1675,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 queue_config = Some(PathBuf::from(next_val(&mut i, "--queue-config")?))
             }
             "--api-key" => api_key = Some(next_val(&mut i, "--api-key")?),
+            "--a2ui" => a2ui = true,
             "--verbose" => verbose = true,
             other => return Err(format!("unknown --serve flag '{other}'")),
         }
@@ -1701,6 +1710,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         idle_park_secs,
         queue_config,
         api_key,
+        a2ui,
         verbose,
         per_model,
         draft_k,

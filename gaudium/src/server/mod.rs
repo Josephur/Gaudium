@@ -6,6 +6,8 @@
 //!   `/health`, `/tokenize`, `/detokenize`, `/slots`, `/models/load`, `/models/unload`)
 //! - Gaudium UI telemetry & card-lifecycle endpoints (`/gaudium/ui`, `/gaudium/engine`,
 //!   `/gaudium/live`, `/gaudium/events`, `/gaudium/count_tokens`, `/v1/chat/completions/control`)
+//! - A2UI interfaces as a per-request option (`--a2ui`, the request field `gaudium_a2ui`,
+//!   `/gaudium/a2ui`; see `a2ui.rs`)
 //!
 //! Single-card safety & verified core invariants:
 //! - Uses `core::lifecycle::can_switch_resident_model` before switching resident models or parking.
@@ -33,6 +35,7 @@ use crate::model_spec::{ModelFamily, ModelSpec};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use crate::verified::{BackendState, ReqEvent};
 
+mod a2ui;
 mod anthropic;
 mod chat;
 mod jinja;
@@ -68,6 +71,9 @@ pub struct ServerConfig {
     /// Card-queue settings file (`queue.conf`), re-read on every turn decision; missing = defaults.
     pub queue_config: Option<PathBuf>,
     pub api_key: Option<String>,
+    /// Offer A2UI: a request that declares renderer capabilities (`gaudium_a2ui`) gets the
+    /// instructions that teach the model to write interface blocks.
+    pub a2ui: bool,
     pub verbose: bool,
     /// Per-model options keyed by served model id.
     pub per_model: Vec<(String, ModelRunOptions)>,
@@ -732,7 +738,7 @@ impl AppState {
              \"supports_system_role\":true,\"supports_preserve_reasoning\":true,\"supports_reasoning_effort\":false,\
              \"supports_object_arguments\":false,\"reasoning_effort_levels\":[]}},\
              \"bos_token\":{},\"eos_token\":{},\"build_info\":{},\"is_sleeping\":false,\
-             \"cors_proxy_enabled\":false",
+             \"cors_proxy_enabled\":false,\"a2ui\":{}",
             m.max_ctx,
             jq(&m.id),
             jq(&m.dir.display().to_string()),
@@ -740,6 +746,7 @@ impl AppState {
             jq(m.chat.as_ref().map_or("", |t| t.token("bos_token"))),
             jq(m.chat.as_ref().map_or("<|im_end|>", |t| t.token("eos_token"))),
             jq(&format!("gaudium-rust {}", env!("CARGO_PKG_VERSION"))),
+            a2ui::capabilities_json(self.cfg.a2ui, false),
         );
         // what this model is and how it runs (the same description the event stream carries)
         out.push_str(&format!(
@@ -1399,6 +1406,13 @@ fn handle_connection(state: Arc<AppState>, mut stream: TcpStream) {
             );
             write_json(&mut stream, 200, &body);
         }
+        ("GET", "/gaudium/a2ui") => {
+            write_json(
+                &mut stream,
+                200,
+                &a2ui::capabilities_json(state.cfg.a2ui, true),
+            );
+        }
         ("GET", "/gaudium/engine") => {
             write_json(&mut stream, 200, &state.engine_status_json(false));
         }
@@ -1614,7 +1628,7 @@ fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut TcpStre
     };
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
     let m = &state.models[idx];
-    let prompt = match prepare_prompt(m, &val) {
+    let prompt = match prepare_prompt(state.cfg.a2ui, m, &val) {
         Ok(p) => p,
         Err(e) => {
             write_error(stream, 400, "invalid_request_error", &e);
@@ -1865,7 +1879,23 @@ impl Api {
 
 /// The prompt of a chat request: rendered with the model's own chat template, else with the
 /// built-in text template of its family (which has no tools).
-fn prepare_prompt(m: &RegisteredModel, body: &JsonValue) -> Result<ChatPrompt, String> {
+fn prepare_prompt(
+    a2ui_enabled: bool,
+    m: &RegisteredModel,
+    body: &JsonValue,
+) -> Result<ChatPrompt, String> {
+    // a request that declares A2UI renderer capabilities gets the instructions in its system turn
+    let (with_a2ui, a2ui_note) = match a2ui::apply(a2ui_enabled, body)? {
+        a2ui::Applied::Injected(b) => (Some(b), None),
+        a2ui::Applied::Unchanged { note } => (None, note),
+    };
+    let body = with_a2ui.as_ref().unwrap_or(body);
+    let mut prompt = render_prompt(m, body)?;
+    prompt.ignored.extend(a2ui_note);
+    Ok(prompt)
+}
+
+fn render_prompt(m: &RegisteredModel, body: &JsonValue) -> Result<ChatPrompt, String> {
     if let Some(t) = &m.chat {
         return chat::render_chat(t, body);
     }
@@ -1942,7 +1972,7 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut TcpSt
     };
     let rendered = anthropic::translate(&val).and_then(|t| {
         let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
-        prepare_prompt(m, &t.chat).map(|p| m.tokenizer.encode(&p.text, true).len())
+        prepare_prompt(state.cfg.a2ui, m, &t.chat).map(|p| m.tokenizer.encode(&p.text, true).len())
     });
     match rendered {
         Ok(n) => write_json(stream, 200, &format!("{{\"input_tokens\":{n}}}")),
@@ -1958,7 +1988,7 @@ fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut TcpSt
         return;
     };
     let m = &state.models[state.find_model(val.get("model").and_then(|v| v.as_str()))];
-    match prepare_prompt(m, &val) {
+    match prepare_prompt(state.cfg.a2ui, m, &val) {
         Ok(p) => write_json(stream, 200, &format!("{{\"prompt\":{}}}", jq(&p.text))),
         Err(e) => write_error(stream, 400, "invalid_request_error", &e),
     }
@@ -1976,7 +2006,7 @@ fn run_chat(
     let t_arrival = Instant::now();
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
     let m = &state.models[idx];
-    let prompt = match prepare_prompt(m, val) {
+    let prompt = match prepare_prompt(state.cfg.a2ui, m, val) {
         Ok(p) => p,
         Err(e) => {
             api.error(stream, 400, "invalid_request_error", &e);

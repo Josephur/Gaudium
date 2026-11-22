@@ -36,6 +36,7 @@ export function SettingsDialog({ settings, vision = true, set, onClose, props, m
   const [tab, setTab] = useState(tab0 || 'general');
   const s = settings;
   const def = (props && props.default_generation_settings && props.default_generation_settings.params) || {};
+  const a2uiOffered = !!(props && props.a2ui && props.a2ui.enabled);
   const num = (k, label, help, step = 'any', ph) => html`<${Field} id=${'s-' + k} label=${label} help=${help}>
     <input id=${'s-' + k} type="number" step=${step} value=${s[k]} placeholder=${ph != null ? `server default: ${ph}` : 'server default'} onInput=${(e) => set(k, e.target.value)} /></${Field}>`;
   let customOk = true; if (s.custom.trim()) { try { JSON.parse(s.custom); } catch { customOk = false; } }
@@ -53,6 +54,8 @@ export function SettingsDialog({ settings, vision = true, set, onClose, props, m
         ${num('pasteToFile', 'Long paste becomes a file at', 'Characters; 0 keeps every paste in the message.', '1')}
       </div>
       <label class="check"><input type="checkbox" checked=${s.telemetry} onChange=${(e) => set('telemetry', e.target.checked)} /><span>Show the engine readout while a reply streams (speed, tokens per step, HBM flow, the step split)</span></label>
+      <label class=${cx('check', !a2uiOffered && 'off')} title=${a2uiOffered ? '' : 'The server was started without --a2ui'}><input type="checkbox" id="s-a2ui" disabled=${!a2uiOffered} checked=${!!s.a2ui && a2uiOffered} onChange=${(e) => set('a2ui', e.target.checked)} />
+        <span>Interactive interfaces (A2UI): the model may answer with forms, pickers, cards and buttons that are drawn in the chat, and it is told what you press. This adds the format's instructions to the system prompt of every request${a2uiOffered ? '.' : ' (the server was started without --a2ui).'}</span></label>
       <${Field} id="s-key" label="API key" help="Only if the server was started with --api-key. Kept in this browser.">
         <input id="s-key" type="password" value=${s.apiKey} autocomplete="off" onInput=${(e) => set('apiKey', e.target.value)} /></${Field}>` : null}
     ${tab === 'sampling' ? html`
