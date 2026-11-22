@@ -997,6 +997,9 @@ pub fn build_cache(cfg: &ServerConfig, only: &[String]) -> Result<(), String> {
     }
 }
 
+/// Longest wait for a connection before the accept loop looks at the stop request again.
+const ACCEPT_WAIT_MS: i32 = 200;
+
 pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
     if cfg.models.is_empty() {
         return Err("at least one --model <dir> is required for --serve".into());
@@ -1173,7 +1176,12 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
                 thread::spawn(move || handle_connection(st, stream));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
+                // Nothing to accept: wait for a connection, not for a sleep tick (a request is
+                // taken when it arrives). The timeout bounds how long a stop request waits.
+                crate::signals::wait_readable(
+                    std::os::fd::AsRawFd::as_raw_fd(&listener),
+                    ACCEPT_WAIT_MS,
+                );
             }
             Err(e) => {
                 eprintln!("[server] accept error: {e}");
