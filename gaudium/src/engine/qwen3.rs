@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use crate::core::budget::SequenceBudget;
 use crate::engine::packer::WeightPacker;
+use crate::engine::qwen3_traffic;
 use crate::kernels::KernelEnv;
 use crate::live_report::LiveReporter;
 use crate::model_spec::{ModelFamily, ModelSpec};
@@ -38,13 +39,18 @@ use crate::synapse::ops::u32_params;
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{align_up, HbmCat};
 
+pub mod prefill;
+#[path = "request_reset.rs"]
+mod request_reset;
+mod vision_hooks;
+
 /// KV cache chunk length (matches `CHUNK = 4096` in `attn_prep_gaudi2.c`).
 pub const KV_CHUNK: u64 = 4096;
 /// Maximum prefill tile width pre-planned into the activation scratch arena.
-pub const MAX_PREFILL_TILE: u64 = 256;
+pub const MAX_PREFILL_TILE: u64 = prefill::TILE_MAX;
 /// Minimum pre-planned shared workspace bytes so lazily compiled remainder tiles never need HBM allocs.
 const MIN_SHARED_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
-/// Reusable host pinned staging buffer size for chunked weight uploads & KV/state zeroing.
+/// Reusable host pinned staging buffer size for chunked weight uploads.
 const STAGE_BUF_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -55,7 +61,42 @@ pub struct Qwen3Config {
     pub cache_dir: Option<PathBuf>,
     pub no_cache: bool,
     pub prefill_tile: u64,
+    /// [prefill] Prefill levers, `k=v[,k=v..]` (`engine/qwen3/prefill.rs`); `None`:
+    /// `GAUDIUM_PREFILL`, else the defaults.
+    pub prefill: Option<String>,
     pub verbose: bool,
+    /// Largest image (in patches) the vision tower is planned for; 0 = no image input.
+    pub vision_max_patches: u64,
+    /// Image tokens one request may hold (0 = the tokens of one largest image).
+    pub vision_max_tokens: u64,
+    /// Patch counts whose tower recipes are compiled at start-up (others on first use).
+    pub vision_precompile: Vec<u64>,
+    /// Evaluate the tower's GELU with the BF16 kernel (default: in F32).
+    pub vision_gelu_bf16: bool,
+    /// Speculative decoding (`--spec`); `None` = the non-speculative `K = 0` engine.
+    pub spec: Option<spec::SpecConfig>,
+    /// [moe/fp8] Device precision of the projection / MLP weight matrices (`engine/fp8_graph.rs`).
+    pub precision: crate::engine::fp8_graph::WeightPrecision,
+    /// [moe/fp8] Activation-scale table of the FP8 graphs. Default: `GAUDIUM_FP8_ACT`, else
+    /// `<model_dir>-gaudium-pc/act_scales_lc.txt`.
+    pub fp8_act: Option<PathBuf>,
+    /// [moe/fp8] Optional directory caching the quantised FP8 matrices (or `GAUDIUM_FP8_CACHE`).
+    pub fp8_cache: Option<PathBuf>,
+    /// [moe/fp8] Calibration load: BF16 graphs, every prefill records the GEMM input sites.
+    pub fp8_calibrate: bool,
+    /// [moe] Routed MoE form: stacked BF16 experts read through the vendor expert-select node
+    /// (decode reads only the routed experts); default: the dense-masked wide MLP.
+    pub moe_routed: bool,
+    /// Prompt-tail tile lengths `1..=N` whose prefill recipes are loaded (compiled on a recipe
+    /// cache miss) while the engine loads, so the first request of a prompt length does not pay
+    /// for them inside its time to first token. 0 = on first use (the default).
+    pub prefill_warm_rows: u64,
+    /// Per-request device state reset: `auto` (default), `dirty` or `full`
+    /// (`engine/request_reset.rs`); `None` reads `GAUDIUM_REQUEST_RESET`.
+    pub request_reset: Option<String>,
+    /// [step] Step-recipe options: DeltaNet verify state, drafter precision / readout width,
+    /// device traces (`engine/step_opts.rs`).
+    pub step: crate::engine::step_opts::StepOpts,
 }
 
 impl Qwen3Config {
@@ -67,7 +108,21 @@ impl Qwen3Config {
             cache_dir: None,
             no_cache: false,
             prefill_tile: MAX_PREFILL_TILE,
+            prefill: None,
             verbose: false,
+            vision_max_patches: 0,
+            vision_max_tokens: 0,
+            vision_precompile: Vec::new(),
+            vision_gelu_bf16: false,
+            spec: None,
+            precision: crate::engine::fp8_graph::WeightPrecision::Auto,
+            fp8_act: None,
+            fp8_cache: None,
+            fp8_calibrate: false,
+            moe_routed: false,
+            prefill_warm_rows: 0,
+            request_reset: None,
+            step: crate::engine::step_opts::StepOpts::from_env(),
         }
     }
 }
@@ -82,6 +137,32 @@ pub struct Qwen3GenParams {
     pub seed: u64,
     pub stop_on_eos: bool,
     pub extra_eos_ids: Vec<i32>,
+    /// Teacher forcing for exactness checks: when set, generated position `i` continues with
+    /// `force_tokens[i]` instead of the engine's own greedy token, and every position where the
+    /// two differ is recorded in `Qwen3GenReport::forks` with both BF16 logits.
+    pub force_tokens: Option<Vec<i32>>,
+    /// Sampled speculative requests: the drafter draws its drafts with the verify's position
+    /// noise on its own scores (DSpine's coupled walk). Never changes the tokens, only how many
+    /// drafts are accepted. `false`: the drafter's greedy chain.
+    pub coupled: bool,
+    /// Coupled drafts also apply top-k / top-p / min-p to the drafter's candidates.
+    pub draft_trunc: bool,
+    /// Debug check: every row the card samples is sampled again on the host from the card's own
+    /// logits with the bit-exact CPU twin; rows and mismatches are counted in the report.
+    /// Runs one launch at a time.
+    pub sample_check: bool,
+    /// Run this request on the non-speculative `K = 0` path of an engine loaded with `--spec`
+    /// (the exactness reference of the speculative stream, without a second engine load).
+    pub non_speculative: bool,
+    /// Measurement runs on an engine loaded with several `--draft-k` widths: verify exactly this
+    /// many drafts per launch (one of the listed widths) instead of the width policy's choice.
+    pub spec_k: Option<u64>,
+    /// [step] Measurement: verify exactly this many drafts in every launch of the request (one
+    /// of the engine's `--draft-k` widths) instead of letting the width policy choose.
+    pub force_draft_k: Option<u64>,
+    /// [step] Run the `K = 0` decode of this request as the plain loop (one host round trip per
+    /// token) even where the enqueue-ahead loop applies: the reference of `--compare-k0`.
+    pub k0_plain: bool,
 }
 
 impl Default for Qwen3GenParams {
@@ -95,11 +176,19 @@ impl Default for Qwen3GenParams {
             seed: 0,
             stop_on_eos: true,
             extra_eos_ids: Vec::new(),
+            force_tokens: None,
+            coupled: true,
+            draft_trunc: true,
+            sample_check: false,
+            non_speculative: false,
+            spec_k: None,
+            force_draft_k: None,
+            k0_plain: false,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Qwen3GenReport {
     pub prompt_tokens: usize,
     pub generated_tokens: Vec<i32>,
@@ -110,7 +199,56 @@ pub struct Qwen3GenReport {
     pub ms_per_step: f64,
     pub stopped_by_eos: bool,
     pub stopped_by_cancel: bool,
+    /// Teacher-forced positions where the engine's greedy token differed from the forced one.
+    pub forks: Vec<ForkRecord>,
+    /// Decode launches after the first token (`K = 0`: one per token).
+    pub launches: u64,
+    /// Decode tokens per launch (`K = 0`: 1.0).
+    pub tokens_per_launch: f64,
+    /// Decode method label, e.g. `K=0 BF16 greedy` or `dspine K=15 BF16 greedy`.
+    pub method: String,
+    /// Speculative runs: `P(draft i accepted | verified)` per draft position; empty at `K = 0`.
+    pub accept_per_pos: Vec<f64>,
+    /// Speculative runs: drafts verified over the request, and how many of them were accepted.
+    pub drafted: u64,
+    pub draft_accepted: u64,
+    /// `sample_check`: rows sampled again on the host, and how many differed from the card.
+    pub sample_check_rows: u64,
+    pub sample_check_mismatches: u64,
+    /// Part of `ttft_ms` spent loading or compiling recipes this request used for the first
+    /// time in the process (a prefill tile length, a step family).
+    pub ttft_recipe_ms: f64,
 }
+
+/// One greedy-vs-reference disagreement observed under teacher forcing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForkRecord {
+    /// Index into the generated stream (0 = first generated token).
+    pub pos: usize,
+    pub engine_token: i32,
+    pub forced_token: i32,
+    /// BF16 logits of the two tokens at this position, widened to f32.
+    pub engine_logit: f32,
+    pub forced_logit: f32,
+}
+
+#[path = "qwen3_samp.rs"]
+mod samp_rt;
+#[path = "spec.rs"]
+pub mod spec;
+// [moe hook] routed-form prefill: the routed-experts recipe of a tile
+#[path = "moe_rt.rs"]
+mod moe_rt;
+// [moe hook] recipe pre-compilation without the card
+#[path = "qwen3_build_cache.rs"]
+mod build_cache_rt;
+pub use build_cache_rt::build_cache;
+// [step] device-trace windows of the decode loops
+#[path = "qwen3_prof.rs"]
+mod prof_rt;
+// [step] enqueue-ahead greedy K=0 decode (token fed back on the card)
+#[path = "qwen3_k0pipe.rs"]
+mod k0pipe;
 
 /// Required kernel ELFs for plain Qwen3 (`DH=128, NKV=8, GQ=4`).
 const QWEN3_G8Q4_ELFS: &[&str] = &[
@@ -169,7 +307,7 @@ fn add_rmsnorm(
 
 /// Helper: fused residual add + RMSNorm (`gaudium_fused_add_norm`).
 #[allow(clippy::too_many_arguments)]
-fn add_fused_add_norm(
+pub(crate) fn add_fused_add_norm(
     gb: &mut GraphBuilder,
     spec: &ModelSpec,
     a: TensorId,
@@ -199,7 +337,7 @@ fn add_fused_add_norm(
 }
 
 /// Helper: BF16 linear projection `y {N, T} = W {K, N}^T . x {K, T}`.
-fn add_linear_bf16(
+pub(crate) fn add_linear_bf16(
     gb: &mut GraphBuilder,
     x: TensorId,
     w_name: &str,
@@ -208,6 +346,10 @@ fn add_linear_bf16(
     t: u64,
     y_name: &str,
 ) -> TensorId {
+    // [fp8 hook] the quantisable matrices of an FP8 graph: site cast + fp8_gemm (same names)
+    if gb.fp8_weights() && crate::engine::fp8_graph::is_fp8_matrix(w_name) {
+        return crate::engine::fp8_graph::add_linear_fp8(gb, x, w_name, k, n, t, y_name);
+    }
     let w = gb.get_or_add_persistent_tensor(w_name, SynDataType::Bf16, &[k, n]);
     let y = gb.add_persistent_tensor(y_name, SynDataType::Bf16, &[n, t]);
     gb.op_gemm(format!("{y_name}_gemm"), x, w, y, false, true);
@@ -253,6 +395,20 @@ fn append_post_and_mlp(
         );
         (x2, h2)
     };
+
+    // [moe hook] router + dense-masked wide MLP + layer tail replace the dense SwiGLU MLP
+    if spec.is_moe() {
+        return crate::engine::moe::append_moe_mlp(
+            gb,
+            spec,
+            x2,
+            h2,
+            lpfx,
+            t,
+            fused_anorm,
+            wnext_norm,
+        );
+    }
 
     let gate = add_linear_bf16(
         gb,
@@ -323,6 +479,7 @@ fn append_attn_layer(
     let gq = nh / nkv;
     let r = gq * t;
     let b = nkv * nch;
+    gb.set_fp8_weights(spec.fp8_weights); // [fp8 hook]
 
     let g_aprep = if dh == 128 {
         "gaudium_attn128_prep"
@@ -464,6 +621,7 @@ fn append_linear_layer(
     let qkvz_dim = spec.gdn_qkvz_dim();
     let hvp = spec.gdn_hvp();
     let ba_dim = spec.gdn_ba_dim();
+    gb.set_fp8_weights(spec.fp8_weights); // [fp8 hook]
 
     let h = match h_pre {
         Some(h_in) => h_in,
@@ -578,7 +736,27 @@ pub fn build_embed_graph(spec: &ModelSpec, t: u64) -> GraphBuilder {
 
 /// Builds the shared `T = 1` readout graph `g_qwen_head_T1`.
 pub fn build_head_t1_graph(spec: &ModelSpec) -> GraphBuilder {
-    let mut gb = GraphBuilder::new("g_qwen_head_T1");
+    build_head_t1_graph_as(spec, None)
+}
+
+/// The readout of a sampled request (`g_qwen_shead_T1`): the on-card sampler in place of the
+/// argmax, at the sequence index in `samp_pos0`. `elf_hashes` = the sampler kernels.
+pub fn build_sampled_head_t1_graph(
+    spec: &ModelSpec,
+    elf_hashes: &[(String, String)],
+) -> GraphBuilder {
+    build_head_t1_graph_as(spec, Some(elf_hashes))
+}
+
+fn build_head_t1_graph_as(spec: &ModelSpec, sampled: Option<&[(String, String)]>) -> GraphBuilder {
+    let mut gb = GraphBuilder::new(if sampled.is_some() {
+        "g_qwen_shead_T1"
+    } else {
+        "g_qwen_head_T1"
+    });
+    for (k, h) in sampled.unwrap_or(&[]) {
+        gb.record_kernel_elf_hash(k, h);
+    }
     let x_in = gb.add_persistent_tensor("x_in", SynDataType::Bf16, &[spec.hidden, 1]);
     let h_final = add_rmsnorm(&mut gb, spec, x_in, "w_final", "h_final", 1);
     let lm_w = if spec.tie_word_embeddings {
@@ -587,6 +765,17 @@ pub fn build_head_t1_graph(spec: &ModelSpec) -> GraphBuilder {
         "W_lm"
     };
     let logits = add_linear_bf16(&mut gb, h_final, lm_w, spec.hidden, spec.vocab, 1, "logits");
+    if sampled.is_some() {
+        let pos0 =
+            gb.add_persistent_tensor(crate::engine::sampler::SAMP_POS0, SynDataType::Int32, &[1]);
+        let at = crate::engine::sampler::SamplerAt {
+            base: pos0,
+            off: 0,
+            role: 0,
+        };
+        crate::engine::sampler::append_sampler(&mut gb, logits, spec.vocab, 1, &at, "tokens");
+        return gb;
+    }
     let tokens = gb.add_persistent_tensor("tokens", SynDataType::Int32, &[1, 1]);
     gb.op_argmax_bf16("argmax", logits, tokens, 0);
     gb
@@ -638,7 +827,33 @@ pub fn build_decode_step_graph(
     nch: u64,
     elf_hashes: &[(String, String)],
 ) -> GraphBuilder {
-    let mut gb = GraphBuilder::new(format!("g_qwen_step_C{nch}"));
+    build_decode_step_graph_as(spec, lmax, nch, elf_hashes, false)
+}
+
+/// The decode step of a sampled request (`g_qwen_sstep_C{nch}`): the same trunk, the on-card
+/// sampler in place of the argmax (the row samples the token at sequence index `cursor + 1`).
+/// `elf_hashes` must include the sampler kernels.
+pub fn build_sampled_decode_step_graph(
+    spec: &ModelSpec,
+    lmax: u64,
+    nch: u64,
+    elf_hashes: &[(String, String)],
+) -> GraphBuilder {
+    build_decode_step_graph_as(spec, lmax, nch, elf_hashes, true)
+}
+
+fn build_decode_step_graph_as(
+    spec: &ModelSpec,
+    lmax: u64,
+    nch: u64,
+    elf_hashes: &[(String, String)],
+    sampled: bool,
+) -> GraphBuilder {
+    let mut gb = GraphBuilder::new(if sampled {
+        format!("g_qwen_sstep_C{nch}")
+    } else {
+        format!("g_qwen_step_C{nch}")
+    });
     for (k, h) in elf_hashes {
         gb.record_kernel_elf_hash(k, h);
     }
@@ -705,6 +920,15 @@ pub fn build_decode_step_graph(
         "W_lm"
     };
     let logits = add_linear_bf16(&mut gb, h_final, lm_w, spec.hidden, spec.vocab, 1, "logits");
+    if sampled {
+        let at = crate::engine::sampler::SamplerAt {
+            base: cursor,
+            off: 1,
+            role: 0,
+        };
+        crate::engine::sampler::append_sampler(&mut gb, logits, spec.vocab, 1, &at, "tokens");
+        return gb;
+    }
     let tokens = gb.add_persistent_tensor("tokens", SynDataType::Int32, &[1, 1]);
     gb.op_argmax_bf16("argmax", logits, tokens, 0);
     gb
@@ -741,29 +965,52 @@ pub struct Qwen3Engine {
     embed_recipes: HashMap<u64, CompiledRecipe>,
     attn_layer_recipes: HashMap<(u64, u64), CompiledRecipe>, // (T, nch)
     lin_layer_recipes: HashMap<u64, CompiledRecipe>,         // T
+    // [moe hook] routed-experts prefill recipes (owns recipes: must drop before `dev`)
+    moe_rx: moe_rt::RoutedPrefill,
 
     // Reusable pinned host staging buffers (must drop before `dev`)
-    stage_io: PinnedBuf,   // small scalar + logits D2H/H2D
-    stage_zero: PinnedBuf, // 64 MiB zero buffer for KV/state reset
+    stage_io: PinnedBuf, // small scalar + logits D2H/H2D
 
     // HBM address maps (all sub-allocated from sealed arenas owned by `dev`)
     weights_addr: BTreeMap<String, u64>,
     kv_addr: BTreeMap<String, (u64, u64)>, // L{l}_kcache / vcache -> (addr, bytes)
     gdn_state: BTreeMap<usize, GdnLayerState>, // linear layer idx -> ping-pong S & cs buffers
-    pf_attn_scratch: BTreeMap<String, u64>,
-    pf_lin_scratch: BTreeMap<String, u64>,
+    /// [prefill] tile-recipe forms, scratch region and per-recipe scratch layouts
+    pf: prefill::TileRt,
     pf_x0: u64,
     pf_x1: u64,
     pf_ids: u64,
     pf_cursor: u64,
     head_scratch: BTreeMap<String, u64>,
     step_launches: Vec<[PreparedLaunch; 2]>, // [nch - 1][gdn_parity]
+    /// [step] the same recipes bound for enqueue-ahead K=0 decode: parity `p` reads its token
+    /// from `[step_ids, step_tokens][p]` and its cursor from `[step_cursor, step_cursor_b][p]`,
+    /// and writes its token to the other token buffer. Empty: the plain loop only.
+    step_fb_launches: Vec<[PreparedLaunch; 2]>,
+    step_cursor_b: u64,
     step_ids: u64,
     step_cursor: u64,
     step_tokens: u64,
     step_logits: u64,
     hbm_bytes: [u64; 5],
+    /// Per-request reset bookkeeping (mode, KV high-water mark, last reset time).
+    reset: request_reset::ResetState,
+    /// Print recipe / timing diagnostics (`Qwen3Config::verbose`).
+    verbose: bool,
     live: LiveReporter,
+    // Speculative decoding runtime (owns recipes: must drop before `dev`)
+    specdec: Option<spec::SpecRuntime>,
+    // On-card sampler of the non-speculative path (owns recipes: must drop before `dev`);
+    // `None`: the vocabulary or the kernel directory cannot carry it (host sampler instead).
+    samp: Option<samp_rt::SampRt>,
+
+    // Image input (recipes + pinned staging inside; must drop before `dev`)
+    vision: Option<crate::vision::vit::VisionTower>,
+    vision_req: vision_hooks::VisionRequestState,
+    /// [fp8 hook] calibration load: running maxima of the GEMM input sites
+    calib: Option<crate::engine::fp8_graph::ActCalibrator>,
+    /// [step] device-trace windows (`--profile-steps`)
+    prof: Option<prof_rt::ProfRt>,
 
     // Device handle (dropped LAST!)
     dev: HpuDevice,
@@ -778,9 +1025,26 @@ impl Qwen3Engine {
     /// Initializes the Gaudi 2 device, validates the model against the verified core, compiles/loads
     /// core recipes, plans & seals HBM arenas (`AllocGuard`), and uploads Safetensors weights.
     pub fn load(cfg: &Qwen3Config) -> Result<Self, String> {
+        Self::load_or_plan(cfg, false)?
+            .ok_or_else(|| "internal error: the load produced no engine".to_string())
+    }
+
+    /// Fills the recipe cache for `cfg` and prints its exact device memory plan WITHOUT opening
+    /// the card (graph compilation needs only an initialized SynapseAI): every recipe a load
+    /// compiles, plus the step and prefill recipes of every KV chunk count that a load only takes
+    /// from the cache. Safe to run while another process owns the card.
+    pub fn build_cache(cfg: &Qwen3Config) -> Result<(), String> {
+        Self::load_or_plan(cfg, true).map(|_| ())
+    }
+
+    /// `plan_only`: stop after the recipes and the memory plan (`Ok(None)`), no device.
+    fn load_or_plan(cfg: &Qwen3Config, plan_only: bool) -> Result<Option<Self>, String> {
         let t_start = Instant::now();
-        let live =
-            LiveReporter::from_env("gaudium-rust", env!("CARGO_PKG_VERSION"), "engine", true);
+        let live = if plan_only {
+            LiveReporter::disabled()
+        } else {
+            LiveReporter::from_env("gaudium-rust", env!("CARGO_PKG_VERSION"), "engine", true)
+        };
         let model_name = cfg
             .model_dir
             .file_name()
@@ -790,10 +1054,12 @@ impl Qwen3Engine {
         live.set_model(&model_name);
         live.set_phase("loading", "opening device and compiling recipes");
 
-        let spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
+        let mut spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
             .map_err(|e| format!("load config.json: {e}"))?;
         spec.validate()
             .map_err(|e| format!("verified ModelSpec validation failed: {e}"))?;
+        // [moe/fp8 hook] run precision (and the FP8 calibration table) before any graph is built
+        let fp8_act_table = crate::engine::fp8_pack::resolve_precision(cfg, &mut spec)?;
 
         let required_elfs: &[&str] = match spec.family {
             ModelFamily::Qwen3
@@ -815,6 +1081,10 @@ impl Qwen3Engine {
             {
                 QWEN35_27B_ELFS
             }
+            // [moe hook] Qwen3.5 MoE (DH=256 NKV=2 NH=16 HK=16 HV=32, dense-masked experts)
+            ModelFamily::Qwen35Moe if crate::engine::moe::supported_shape(&spec) => {
+                crate::engine::moe::QWEN35_MOE_ELFS
+            }
             _ => {
                 return Err(format!(
                     "Qwen3Engine currently supports dense Qwen3 (DH=128 NKV=8 NH=32) and dense Qwen3.5/3.8 hybrid (DH=256 NKV=4 NH=24 HK=16 HV=48); got family={:?}, DH={}, NKV={}, NH={}, HK={}, HV={}, moe={}",
@@ -830,23 +1100,64 @@ impl Qwen3Engine {
         };
 
         let has_gdn = spec.n_linear_layers() > 0;
+        let reset_mode = request_reset::ResetMode::from_config(cfg.request_reset.as_deref())?;
         let max_ctx = align_up(cfg.max_ctx.max(KV_CHUNK), KV_CHUNK);
         let max_chunks = max_ctx / KV_CHUNK;
-        let prefill_tile = cfg.prefill_tile.clamp(1, MAX_PREFILL_TILE);
+        let pf_opts = prefill::PrefillOpts::from_config(cfg)?;
 
         // 2. Configure TPC-C kernel ELFs & Synapse GC glue BEFORE opening SynapseAI
         let kenv = KernelEnv::configure_from_dir(&cfg.kernels_dir)?;
         let elf_hashes = kenv.fingerprint_hashes(required_elfs)?;
+        // [prefill] the tile forms of this model; `prefill_tile` is the widest candidate until
+        // the HBM plan below settles the width
+        let mut pf = prefill::TileRt::new(pf_opts, &spec, &kenv, &elf_hashes)?;
+        let prefill_tile = pf.tile();
 
         // 3. Load SynapseAI & open Gaudi 2 device
         let api =
             Arc::new(SynapseApi::load_default().map_err(|e| format!("load libSynapse.so: {e}"))?);
         let driver_version = api.driver_version().unwrap_or_else(|_| "unknown".into());
-        let mut dev = HpuDevice::open_gaudi2(Arc::clone(&api))
-            .map_err(|e| format!("open Gaudi 2 device: {e}"))?;
-        let (free_hbm, total_hbm) = dev
-            .memory_info()
-            .map_err(|e| format!("query HBM info: {e}"))?;
+        let t_open = Instant::now();
+        // Declared before every recipe: recipes are dropped before the session / the device.
+        let _compile_session = if plan_only {
+            Some(
+                crate::synapse::device::CompileSession::open(Arc::clone(&api))
+                    .map_err(|e| format!("initialize SynapseAI (no device): {e}"))?,
+            )
+        } else {
+            None
+        };
+        let dev_opt = if plan_only {
+            None
+        } else {
+            Some(
+                HpuDevice::open_gaudi2(Arc::clone(&api))
+                    .map_err(|e| format!("open Gaudi 2 device: {e}"))?,
+            )
+        };
+        let (free_hbm, total_hbm) = match &dev_opt {
+            Some(dev) => dev
+                .memory_info()
+                .map_err(|e| format!("query HBM info: {e}"))?,
+            None => (0, 0),
+        };
+        // [step] device traces: the profiler's own device buffer is planned with the rest
+        let prof = match &dev_opt {
+            Some(dev) if !cfg.step.profile.is_empty() => Some(
+                crate::synapse::profiler::Profiler::new(dev.device_id(), cfg.step.profile.clone())
+                    .map_err(|e| format!("profiler: {e}"))?,
+            ),
+            _ => None,
+        };
+        let prof_bytes = match &prof {
+            Some(p) => align_up(
+                p.required_bytes()
+                    .map_err(|e| format!("profiler memory query: {e}"))?,
+                256,
+            ),
+            None => 0,
+        };
+        let open_s = t_open.elapsed().as_secs_f64();
 
         let cache = if cfg.no_cache {
             RecipeCache::disabled()
@@ -856,7 +1167,10 @@ impl Qwen3Engine {
             RecipeCache::from_env()
         };
 
-        if cfg.verbose {
+        if cfg.verbose || plan_only {
+            if plan_only {
+                eprintln!("[gaudium] build-cache: SynapseAI initialized without a device; the card is not opened");
+            }
             eprintln!(
                 "[gaudium] device=Gaudi2 driver={} HBM={:.2}/{:.2} GiB family={:?} layers={} (attn={}, lin={}) max_ctx={} ({} chunks)",
                 driver_version,
@@ -873,17 +1187,6 @@ impl Qwen3Engine {
 
         // 4. Build graph specs to calculate EXACT HBM layout up front
         let head_gb = build_head_t1_graph(&spec);
-        let pf_attn_max_gb =
-            build_prefill_attn_layer_graph(&spec, prefill_tile, max_ctx, max_chunks, &elf_hashes);
-        let pf_lin_max_gb = if has_gdn {
-            Some(build_prefill_linear_layer_graph(
-                &spec,
-                prefill_tile,
-                &elf_hashes,
-            ))
-        } else {
-            None
-        };
         let step_gbs: Vec<GraphBuilder> = (1..=max_chunks)
             .map(|nch| build_decode_step_graph(&spec, max_ctx, nch, &elf_hashes))
             .collect();
@@ -904,6 +1207,12 @@ impl Qwen3Engine {
                 step_act_specs.insert(name, bytes);
             }
         }
+        // request sampler parameters (written per sampled request; a few bytes)
+        for (name, bytes) in crate::engine::sampler::sampler_param_specs() {
+            step_act_specs.insert(name.to_string(), bytes);
+        }
+        // [step] second cursor buffer of the enqueue-ahead K=0 decode
+        step_act_specs.insert("cursor_b".to_string(), 4);
         if !spec.norm_plus1 {
             weight_specs
                 .entry("norm_ones".to_string())
@@ -914,40 +1223,6 @@ impl Qwen3Engine {
             .or_insert(spec.hidden * 2);
         if has_gdn {
             weight_specs.entry("zero_slot".to_string()).or_insert(4);
-        }
-
-        // Prefill scratch specs (sized for `prefill_tile` & `max_chunks`)
-        let mut pf_attn_act_specs: BTreeMap<String, u64> = BTreeMap::new();
-        for (name, _dt, _dims, bytes) in pf_attn_max_gb.persistent_tensor_specs() {
-            if name == "x_in"
-                || name == "L_out"
-                || name == "cursor"
-                || name == "rope_c"
-                || name == "rope_s"
-                || name == "norm_ones"
-                || is_generic_layer_weight(&name)
-                || name == "L_kcache"
-                || name == "L_vcache"
-            {
-                continue;
-            }
-            pf_attn_act_specs.insert(name, bytes);
-        }
-
-        let mut pf_lin_act_specs: BTreeMap<String, u64> = BTreeMap::new();
-        if let Some(ref gb) = pf_lin_max_gb {
-            for (name, _dt, _dims, bytes) in gb.persistent_tensor_specs() {
-                if name == "x_in"
-                    || name == "L_out"
-                    || name == "zero_slot"
-                    || name == "norm_ones"
-                    || is_generic_layer_weight(&name)
-                    || matches!(name.as_str(), "L_S_in" | "L_S_out" | "L_cs_in" | "L_cs_out")
-                {
-                    continue;
-                }
-                pf_lin_act_specs.insert(name, bytes);
-            }
         }
 
         let mut head_act_specs: BTreeMap<String, u64> = BTreeMap::new();
@@ -965,11 +1240,23 @@ impl Qwen3Engine {
             .map_err(|e| format!("compile head_T1: {e}"))?;
         let mut step_recipes = Vec::with_capacity(step_gbs.len());
         let mut max_ws = head_t1.ws_size;
+        // Cached step recipes are loaded on several threads; the rest compile here in order.
+        let mut step_cached = crate::synapse::graph::load_cached_parallel(
+            step_gbs.len(),
+            crate::synapse::graph::recipe_load_threads(),
+            &api,
+            &cache,
+            &driver_version,
+            |i| step_gbs[i].clone(),
+        );
         for (idx, gb) in step_gbs.iter().enumerate() {
-            let r = gb
-                .compile(Arc::clone(&api), &cache, &driver_version)
-                .map_err(|e| format!("compile decode step (chunks={}): {e}", idx + 1))?;
-            if cfg.verbose {
+            let r = match std::mem::replace(&mut step_cached[idx], Ok(None)) {
+                Ok(Some(r)) => r,
+                _ => gb
+                    .compile(Arc::clone(&api), &cache, &driver_version)
+                    .map_err(|e| format!("compile decode step (chunks={}): {e}", idx + 1))?,
+            };
+            if cfg.verbose && (!r.from_cache || idx == 0 || idx + 1 == step_gbs.len()) {
                 eprintln!(
                     "[gaudium] recipe {} cache_hit={} ws={:.2} MiB",
                     r.name,
@@ -984,47 +1271,64 @@ impl Qwen3Engine {
         let mut attn_layer_recipes: HashMap<(u64, u64), CompiledRecipe> = HashMap::new();
         let mut lin_layer_recipes: HashMap<u64, CompiledRecipe> = HashMap::new();
         let mut embed_recipes: HashMap<u64, CompiledRecipe> = HashMap::new();
-        if prefill_tile > 1 {
-            let pf_c1_gb =
-                build_prefill_attn_layer_graph(&spec, prefill_tile, max_ctx, 1, &elf_hashes);
-            let r_pf = pf_c1_gb
-                .compile(Arc::clone(&api), &cache, &driver_version)
-                .map_err(|e| format!("compile prefill attn layer T={prefill_tile} C=1: {e}"))?;
-            max_ws = max_ws.max(r_pf.ws_size);
-            if cfg.verbose {
-                eprintln!(
-                    "[gaudium] recipe {} cache_hit={} ws={:.2} MiB",
-                    r_pf.name,
-                    r_pf.from_cache,
-                    r_pf.ws_size as f64 / (1024.0 * 1024.0)
-                );
-            }
-            attn_layer_recipes.insert((prefill_tile, 1), r_pf);
-
-            if let Some(ref lin_gb) = pf_lin_max_gb {
-                let r_lin = lin_gb
-                    .compile(Arc::clone(&api), &cache, &driver_version)
-                    .map_err(|e| format!("compile prefill lin layer T={prefill_tile}: {e}"))?;
-                max_ws = max_ws.max(r_lin.ws_size);
-                if cfg.verbose {
-                    eprintln!(
-                        "[gaudium] recipe {} cache_hit={} ws={:.2} MiB",
-                        r_lin.name,
-                        r_lin.from_cache,
-                        r_lin.ws_size as f64 / (1024.0 * 1024.0)
-                    );
-                }
-                lin_layer_recipes.insert(prefill_tile, r_lin);
-            }
-
-            let emb_gb = build_embed_graph(&spec, prefill_tile);
-            let r_emb = emb_gb
-                .compile(Arc::clone(&api), &cache, &driver_version)
-                .map_err(|e| format!("compile embed T={prefill_tile}: {e}"))?;
-            max_ws = max_ws.max(r_emb.ws_size);
-            embed_recipes.insert(prefill_tile, r_emb);
+        // [moe hook] routed form: the routed-experts prefill recipe of a full tile
+        let mut moe_rx = moe_rt::RoutedPrefill::prepare(
+            &spec,
+            prefill_tile,
+            &api,
+            &cache,
+            &driver_version,
+            cfg.verbose,
+        )?;
+        max_ws = max_ws.max(moe_rx.max_ws());
+        // Sampled recipe families (separate from the greedy ones above, which stay as they are).
+        // The step of every chunk count is compiled now for a small context of a non-speculative
+        // engine; otherwise the first and the last, the others on first use.
+        let samp_eager: Vec<u64> = if cfg.spec.is_none() && max_chunks <= 8 {
+            (1..=max_chunks).collect()
+        } else if max_chunks > 1 {
+            vec![1, max_chunks]
+        } else {
+            vec![1]
+        };
+        let mut samp = samp_rt::SampRt::prepare(
+            &spec,
+            &kenv,
+            &elf_hashes,
+            max_ctx,
+            &samp_eager,
+            &api,
+            &cache,
+            &driver_version,
+            cfg.verbose,
+        )?;
+        if let Some(s) = &samp {
+            max_ws = max_ws.max(s.max_ws());
         }
-        if cfg.verbose {
+        let mut specdec = match &cfg.spec {
+            Some(sc) => Some(spec::SpecRuntime::prepare(
+                sc,
+                &spec,
+                &kenv,
+                &elf_hashes,
+                max_ctx,
+                max_chunks,
+                prefill_tile,
+                &api,
+                &cache,
+                &driver_version,
+                cfg.verbose || plan_only,
+                samp.is_some(),
+                plan_only,
+                &cfg.step,
+            )?),
+            None => None,
+        };
+        if let Some(sd) = &specdec {
+            max_ws = max_ws.max(sd.max_ws());
+        }
+        let recipes_s = t_comp.elapsed().as_secs_f64();
+        if cfg.verbose || plan_only {
             eprintln!(
                 "[gaudium] core recipes ready in {:.2}s (max_ws={:.2} MiB)",
                 t_comp.elapsed().as_secs_f64(),
@@ -1032,9 +1336,20 @@ impl Qwen3Engine {
             );
         }
 
+        // Vision tower (opt-in): planned from its graph descriptions, recipes for the image
+        // sizes known now compiled before the HBM plan so their workspace is counted.
+        let mut vision = vision_hooks::plan_vision(&spec, cfg)?;
+        if let Some(v) = vision.as_mut() {
+            max_ws = max_ws.max(v.precompile(&api, &cache, &driver_version, cfg.verbose)?);
+        }
+        let (vis_weights_bytes, vis_act_bytes) = vision.as_ref().map_or((0, 0), |v| {
+            (v.memory_plan().weights_bytes(), v.memory_plan().act_bytes())
+        });
+
         // 6. Compute exact arena sizes & check HBM fit via verified `core::hbm`!
         let align256 = |n: u64| align_up(n.max(256), 256);
-        let weights_bytes: u64 = weight_specs.values().map(|&b| align256(b)).sum();
+        let weights_bytes: u64 =
+            weight_specs.values().map(|&b| align256(b)).sum::<u64>() + vis_weights_bytes;
 
         let s_one_bytes = if has_gdn {
             64 * 256 * spec.gdn_v_heads * 4
@@ -1047,29 +1362,207 @@ impl Qwen3Engine {
             0
         };
         let n_lin = spec.n_linear_layers() as u64;
-        let gdn_state_bytes = n_lin * (2 * align256(s_one_bytes) + 2 * align256(cs_one_bytes));
+        // Speculative steps keep one state checkpoint per verify row: each buffer is a ring of slots.
+        let gdn_slots = specdec.as_ref().map_or(1, |sd| sd.gdn_slots());
+        // [step] the replay form of the verify rows keeps one recurrent state per buffer
+        let s_ring_bytes = s_one_bytes * specdec.as_ref().map_or(1, |sd| sd.gdn_state_slots());
+        let cs_ring_bytes = cs_one_bytes * gdn_slots;
+        let gdn_state_bytes = n_lin * (2 * align256(s_ring_bytes) + 2 * align256(cs_ring_bytes));
         let kv_bytes: u64 = kv_specs.values().map(|&b| align256(b)).sum::<u64>() + gdn_state_bytes;
 
         let pf_x_bytes = align256(spec.hidden * prefill_tile * 2);
         let pf_ids_bytes = align256(prefill_tile * 4);
         let pf_cursor_bytes = 256u64;
-        let act_bytes: u64 = pf_x_bytes * 2
+        let pf_const_bytes = pf.const_bytes();
+        let act_fixed_bytes: u64 = pf_x_bytes * 2
             + pf_ids_bytes
             + pf_cursor_bytes
-            + pf_attn_act_specs
-                .values()
-                .map(|&b| align256(b))
-                .sum::<u64>()
-            + pf_lin_act_specs.values().map(|&b| align256(b)).sum::<u64>()
+            + pf_const_bytes
             + head_act_specs.values().map(|&b| align256(b)).sum::<u64>()
-            + step_act_specs.values().map(|&b| align256(b)).sum::<u64>();
+            + step_act_specs.values().map(|&b| align256(b)).sum::<u64>()
+            + vis_act_bytes;
+        let spec_bytes = specdec.as_ref().map_or([0u64; 3], |sd| sd.planned_bytes());
+        let headroom = 512 * 1024 * 1024;
+
+        // [prefill] the widest tile whose recipe scratch fits beside the rest of this plan, and
+        // that width's full-tile recipes (their workspaces are part of the plan)
+        let (pf_scratch_bytes, pf_ws) = {
+            let other = weights_bytes
+                .saturating_add(kv_bytes)
+                .saturating_add(act_fixed_bytes)
+                .saturating_add(spec_bytes.iter().sum());
+            let fits = |scratch: u64, ws: u64| {
+                let ws = align256(max_ws.max(ws).max(MIN_SHARED_WORKSPACE_BYTES));
+                match &dev_opt {
+                    Some(dev) => dev
+                        .check_plan_fits(
+                            other.saturating_add(align256(scratch)).saturating_add(ws),
+                            headroom,
+                        )
+                        .is_ok(),
+                    // plan only (the card is not opened): the widest tile; a load that finds it
+                    // does not fit settles on a narrower one and compiles that width's recipes
+                    None => true,
+                }
+            };
+            pf.settle(
+                &spec,
+                max_ctx,
+                max_chunks,
+                &elf_hashes,
+                &api,
+                &cache,
+                &driver_version,
+                &mut attn_layer_recipes,
+                &mut lin_layer_recipes,
+                &mut embed_recipes,
+                cfg.verbose,
+                &fits,
+            )?
+        };
+        let pf_scratch_bytes = align256(pf_scratch_bytes);
+        let prefill_tile = pf.tile();
+        max_ws = max_ws.max(pf_ws);
+
+        // Last-tile recipes: a prompt whose length is not a multiple of the tile ends in a tile
+        // of 1 .. tile-1 rows, which has its own embed / attention / DeltaNet recipes. Those of
+        // the first KV chunk (every prompt below one chunk, i.e. most chat requests) are taken
+        // from the recipe cache here, on several threads, so a new prompt length does not load
+        // or compile them inside a request; `build_cache` compiles them, and also the last-tile
+        // attention recipes of the full context to learn the largest workspace one can need.
+        if prefill_tile > 1 {
+            let t_tail = Instant::now();
+            let tails: Vec<u64> = (1..prefill_tile).collect();
+            let threads = crate::synapse::graph::recipe_load_threads();
+            let n = tails.len();
+            // jobs: [attn (T, 1)] ++ [embed T] ++ [lin T, hybrid models only]
+            let kinds = if has_gdn { 3 } else { 2 };
+            let describe = |pf: &prefill::TileRt, i: usize| -> GraphBuilder {
+                let t = tails[i % n];
+                match i / n {
+                    0 => pf.attn_graph(&spec, t, max_ctx, 1, &elf_hashes),
+                    1 => build_embed_graph(&spec, t),
+                    _ => pf.lin_graph(&spec, t, &elf_hashes),
+                }
+            };
+            let mut loaded = crate::synapse::graph::load_cached_parallel(
+                kinds * n,
+                threads,
+                &api,
+                &cache,
+                &driver_version,
+                |i| describe(&pf, i),
+            );
+            let (mut hits, mut built, mut tail_ws) = (0u64, 0u64, 0u64);
+            for (i, slot) in loaded.iter_mut().enumerate() {
+                let t = tails[i % n];
+                let r = match std::mem::replace(slot, Ok(None)) {
+                    Ok(Some(r)) => Some(r),
+                    _ if plan_only => Some(
+                        describe(&pf, i)
+                            .compile(Arc::clone(&api), &cache, &driver_version)
+                            .map_err(|e| format!("compile last-tile recipe T={t}: {e}"))?,
+                    ),
+                    _ => None,
+                };
+                let Some(r) = r else { continue };
+                if r.from_cache {
+                    hits += 1;
+                } else {
+                    built += 1;
+                }
+                tail_ws = tail_ws.max(r.ws_size);
+                // a tile recipe's scratch tensors get their places in the planned region
+                match i / n {
+                    0 => {
+                        let gb = describe(&pf, i);
+                        pf.register_attn(&gb, t, 1)?;
+                        attn_layer_recipes.insert((t, 1), r);
+                    }
+                    1 => {
+                        embed_recipes.insert(t, r);
+                    }
+                    _ => {
+                        let gb = describe(&pf, i);
+                        pf.register_lin(&gb, t)?;
+                        lin_layer_recipes.insert(t, r);
+                    }
+                }
+            }
+            // full-context last tiles: compiled by `build_cache` only, to measure their workspace
+            let mut far_ws = 0u64;
+            if plan_only && max_chunks > 1 {
+                for &t in &tails {
+                    let r = pf
+                        .attn_graph(&spec, t, max_ctx, max_chunks, &elf_hashes)
+                        .compile(Arc::clone(&api), &cache, &driver_version)
+                        .map_err(|e| format!("compile last-tile attn T={t} C={max_chunks}: {e}"))?;
+                    far_ws = far_ws.max(r.ws_size);
+                }
+            }
+            max_ws = max_ws.max(tail_ws).max(far_ws);
+            if cfg.verbose || plan_only {
+                eprintln!(
+                    "[gaudium] last-tile recipes (1..{} rows, first chunk): {hits} from the cache, {built} compiled, {} left for first use ({:.2}s); largest workspace {:.2} MiB{}",
+                    prefill_tile - 1,
+                    (kinds * n) as u64 - hits - built,
+                    t_tail.elapsed().as_secs_f64(),
+                    tail_ws as f64 / (1024.0 * 1024.0),
+                    if plan_only && max_chunks > 1 {
+                        format!(
+                            ", at {max_chunks} chunks {:.2} MiB",
+                            far_ws as f64 / (1024.0 * 1024.0)
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
+        let act_bytes: u64 = act_fixed_bytes + pf_scratch_bytes;
         let ws_bytes = align256(max_ws.max(MIN_SHARED_WORKSPACE_BYTES));
 
         let planned_total = weights_bytes
             .saturating_add(kv_bytes)
             .saturating_add(act_bytes)
-            .saturating_add(ws_bytes);
-        let headroom = 512 * 1024 * 1024;
+            .saturating_add(ws_bytes)
+            .saturating_add(prof_bytes)
+            .saturating_add(spec_bytes.iter().sum());
+        // The whole plan, before the fit check, so a refused configuration shows where it went.
+        if cfg.verbose || plan_only {
+            let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            eprintln!(
+                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} + state rings {:.2} ({} slots) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
+                gib(planned_total),
+                gib(weights_bytes),
+                gib(kv_bytes.saturating_sub(gdn_state_bytes)),
+                gib(gdn_state_bytes),
+                gdn_slots,
+                gib(act_bytes),
+                gib(spec_bytes[0]),
+                gib(spec_bytes[1]),
+                gib(spec_bytes[2]),
+                gib(ws_bytes),
+                if plan_only {
+                    " (card not opened: free HBM unknown, headroom 0.50 GiB)".to_string()
+                } else {
+                    format!(
+                        "; card free {:.2} of {:.2} GiB, headroom {:.2}",
+                        gib(free_hbm),
+                        gib(total_hbm),
+                        gib(headroom)
+                    )
+                }
+            );
+        }
+        let Some(mut dev) = dev_opt else {
+            eprintln!(
+                "[gaudium] build-cache done in {:.1}s: recipes for max_ctx={} are in the cache; no engine loaded",
+                t_start.elapsed().as_secs_f64(),
+                max_ctx
+            );
+            return Ok(None);
+        };
         dev.check_plan_fits(planned_total, headroom)
             .map_err(|e| format!("HBM plan check failed: {e}"))?;
 
@@ -1081,6 +1574,15 @@ impl Qwen3Engine {
                 act_bytes as f64 / (1024.0 * 1024.0),
                 ws_bytes as f64 / (1024.0 * 1024.0),
             );
+            if let Some(v) = vision.as_ref() {
+                eprintln!(
+                    "[gaudium] HBM plan vision (included above): weights={:.2} MiB, acts={:.2} MiB (max {} patches, {} image tokens)",
+                    vis_weights_bytes as f64 / (1024.0 * 1024.0),
+                    vis_act_bytes as f64 / (1024.0 * 1024.0),
+                    v.max_patches(),
+                    v.max_tokens(),
+                );
+            }
         }
 
         // 7. Allocate arenas and seal AllocGuard
@@ -1112,10 +1614,10 @@ impl Qwen3Engine {
         let mut gdn_state = BTreeMap::new();
         for l in 0..(spec.n_layers as usize) {
             if !spec.is_full_attention_layer(l) {
-                let s0 = suballoc(&mut kv_arena, s_one_bytes)?;
-                let s1 = suballoc(&mut kv_arena, s_one_bytes)?;
-                let cs0 = suballoc(&mut kv_arena, cs_one_bytes)?;
-                let cs1 = suballoc(&mut kv_arena, cs_one_bytes)?;
+                let s0 = suballoc(&mut kv_arena, s_ring_bytes)?;
+                let s1 = suballoc(&mut kv_arena, s_ring_bytes)?;
+                let cs0 = suballoc(&mut kv_arena, cs_ring_bytes)?;
+                let cs1 = suballoc(&mut kv_arena, cs_ring_bytes)?;
                 gdn_state.insert(
                     l,
                     GdnLayerState {
@@ -1133,14 +1635,14 @@ impl Qwen3Engine {
         let pf_ids = suballoc(&mut act_arena, pf_ids_bytes)?;
         let pf_cursor = suballoc(&mut act_arena, pf_cursor_bytes)?;
 
-        let mut pf_attn_scratch = BTreeMap::new();
-        for (name, &bytes) in &pf_attn_act_specs {
-            pf_attn_scratch.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
-        }
-        let mut pf_lin_scratch = BTreeMap::new();
-        for (name, &bytes) in &pf_lin_act_specs {
-            pf_lin_scratch.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
-        }
+        // [prefill] one scratch region for every tile recipe (+ the cast constant)
+        let pf_scratch_base = suballoc(&mut act_arena, pf_scratch_bytes)?;
+        let pf_const_one = if pf_const_bytes > 0 {
+            suballoc(&mut act_arena, pf_const_bytes)?
+        } else {
+            0
+        };
+        pf.set_addresses(pf_scratch_base, pf_const_one);
         let mut head_scratch = BTreeMap::new();
         for (name, &bytes) in &head_act_specs {
             head_scratch.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
@@ -1149,16 +1651,52 @@ impl Qwen3Engine {
         for (name, &bytes) in &step_act_specs {
             step_act_addr.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
         }
+        if let Some(v) = vision.as_mut() {
+            v.allocate(&mut weights_arena, &mut act_arena)?;
+        }
 
+        if let Some(sd) = &mut specdec {
+            sd.allocate(&mut dev)?;
+            if cfg.verbose {
+                eprintln!(
+                    "[gaudium] spec HBM plan: weights={:.2} GiB, drafter kv={:.2} MiB, acts={:.2} MiB, state rings={} slots ({:.2} GiB)",
+                    spec_bytes[0] as f64 / (1024.0 * 1024.0 * 1024.0),
+                    spec_bytes[1] as f64 / (1024.0 * 1024.0),
+                    spec_bytes[2] as f64 / (1024.0 * 1024.0),
+                    gdn_slots,
+                    gdn_state_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
+        }
+
+        if prof_bytes > 0 {
+            let addr = dev
+                .dmalloc(prof_bytes, HbmCat::CatScratch, "profiler_trace_buffer")
+                .map_err(|e| format!("alloc profiler buffer: {e}"))?;
+            prof.as_ref()
+                .expect("profiler planned")
+                .set_user_buffer(addr)
+                .map_err(|e| format!("profiler buffer: {e}"))?;
+        }
         dev.seal_with_shared_workspace(ws_bytes)
             .map_err(|e| format!("seal HBM allocations: {e}"))?;
 
+        // Every K/V cache and state ring starts as zeros (a masked row must be finite): filled
+        // on the device while the weights upload, ahead of any launch on the compute stream.
+        let t_zero = Instant::now();
+        let mut zero_regions = vec![(kv_arena.base(), kv_bytes)];
+        if let Some(sd) = &specdec {
+            zero_regions.extend(sd.cache_regions());
+        }
+        let zeroed_bytes = request_reset::enqueue_load_zero(&dev, &zero_regions)?;
+        let zero_enqueue_s = t_zero.elapsed().as_secs_f64();
+
         let kv_only_bytes = kv_bytes.saturating_sub(gdn_state_bytes);
         let hbm_bytes = [
-            weights_bytes,
-            kv_only_bytes,
+            weights_bytes + spec_bytes[0],
+            kv_only_bytes + spec_bytes[1],
             gdn_state_bytes,
-            act_bytes,
+            act_bytes + spec_bytes[2],
             ws_bytes,
         ];
         live.set_hbm_bytes(
@@ -1191,16 +1729,27 @@ impl Qwen3Engine {
         }
 
         // 8. Upload weights + RoPE tables from zero-copy mmap Safetensors into `weights_arena`
+        let before_upload_s = t_start.elapsed().as_secs_f64();
         let t_up = Instant::now();
         let store =
             SafetensorsStore::open(&cfg.model_dir).map_err(|e| format!("open safetensors: {e}"))?;
-        let packer = WeightPacker::new(&store, &spec);
+        // [moe/fp8 hook] FP8 checkpoints / FP8 device weights / MoE wide MLPs
+        let ext_packer = crate::engine::fp8_pack::ExtPacker::new(
+            &store,
+            &spec,
+            fp8_act_table,
+            crate::engine::fp8_pack::cache_dir_of(cfg),
+        );
+        let mut packer = WeightPacker::new(&store, &spec);
+        packer.ext = Some(&ext_packer);
 
         let mut stage_upload = dev
             .alloc_pinned(STAGE_BUF_BYTES)
             .map_err(|e| format!("alloc pinned upload stage: {e}"))?;
 
+        let t_rope = Instant::now();
         let (rope_c_bytes, rope_s_bytes) = packer.build_rope_tables(max_ctx as usize);
+        let rope_build_s = t_rope.elapsed().as_secs_f64();
         if let Some(&addr) = weights_addr.get("rope_c") {
             dev.upload_h2d_chunked(&rope_c_bytes, addr, &mut stage_upload)
                 .map_err(|e| format!("upload rope_c: {e}"))?;
@@ -1211,24 +1760,115 @@ impl Qwen3Engine {
         }
 
         let mut uploaded_bytes = (rope_c_bytes.len() + rope_s_bytes.len()) as u64;
+        // Trunk weights: packed on this thread, copied into a pinned ring by a few threads and
+        // handed to the DMA without waiting for it (`synapse/upload.rs`).
+        let mut pack_s = 0.0f64;
+        let up_threads = crate::synapse::upload::H2dStreamer::default_threads();
+        let mut up = crate::synapse::upload::H2dStreamer::new(
+            &dev,
+            crate::synapse::upload::RING_BUFS,
+            crate::synapse::upload::RING_BUF_BYTES,
+            up_threads,
+        )
+        .map_err(|e| format!("alloc pinned upload ring: {e}"))?;
         for (name, &addr) in &weights_addr {
             if name == "rope_c" || name == "rope_s" {
                 continue;
             }
             let expected = weight_specs[name];
+            let t_pack = Instant::now();
+            // a concatenation of checkpoint tensors goes up part by part, with no host copy
+            if let Some(parts) = packer.concat_parts(name)? {
+                pack_s += t_pack.elapsed().as_secs_f64();
+                let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
+                if total != expected {
+                    return Err(format!(
+                        "weight '{name}' parts hold {total} bytes != expected graph tensor size {expected}"
+                    ));
+                }
+                let mut at = addr;
+                for part in parts {
+                    up.put(part, at)
+                        .map_err(|e| format!("upload weight '{name}': {e}"))?;
+                    at += part.len() as u64;
+                }
+                uploaded_bytes += expected;
+                continue;
+            }
             let data = packer.pack_weight(name)?;
+            pack_s += t_pack.elapsed().as_secs_f64();
             if data.len() as u64 != expected {
                 return Err(format!(
                     "weight '{name}' packed size {} != expected graph tensor size {expected}",
                     data.len()
                 ));
             }
-            dev.upload_h2d_chunked(&data, addr, &mut stage_upload)
+            up.put(&data, addr)
                 .map_err(|e| format!("upload weight '{name}': {e}"))?;
             uploaded_bytes += expected;
         }
-        stage_upload.as_mut_slice().fill(0);
-        let stage_zero = stage_upload;
+        let up_stats = up
+            .finish()
+            .map_err(|e| format!("finish trunk weight upload: {e}"))?;
+        let trunk_upload_s = t_up.elapsed().as_secs_f64();
+        if cfg.verbose {
+            let gib = up_stats.bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            eprintln!(
+                "[gaudium] trunk weight upload: {:.2} GiB in {:.2}s ({:.2} GiB/s) = RoPE tables {:.2}s + packing {:.2}s + staging copy {:.2}s + direct file reads {:.2}s ({:.2} GiB not in the page cache) on {} threads + waiting for the link {:.2}s; {} transfers",
+                gib,
+                trunk_upload_s,
+                gib / trunk_upload_s.max(1e-6),
+                rope_build_s,
+                pack_s,
+                up_stats.copy_s,
+                up_stats.direct_s,
+                up_stats.direct_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                up_threads,
+                up_stats.wait_s,
+                up_stats.transfers
+            );
+        }
+        if let Some(v) = vision.as_mut() {
+            v.finish_load(&dev)?;
+            uploaded_bytes += v.upload_weights(&dev, &store, &mut stage_upload)?;
+        }
+        // The sampler parameter tensors are bound like tables by every sampled recipe family
+        // (they live in the activation arena; `samp_rsel` is the constant row selector 0).
+        for (name, _) in crate::engine::sampler::sampler_param_specs() {
+            weights_addr.insert(name.to_string(), step_act_addr[name]);
+        }
+        dev.upload_h2d_chunked(
+            &[0u8; 4],
+            weights_addr[crate::engine::sampler::SAMP_RSEL],
+            &mut stage_upload,
+        )
+        .map_err(|e| format!("upload samp_rsel: {e}"))?;
+        let t_spec_fin = Instant::now();
+        if let Some(sd) = &mut specdec {
+            sd.finish(
+                &dev,
+                &spec,
+                &packer,
+                &mut stage_upload,
+                cfg.cache_dir.as_deref().filter(|_| !cfg.no_cache),
+                &weights_addr,
+                &kv_addr,
+                &gdn_state,
+                pf_cursor,
+            )?;
+        }
+        let spec_finish_s = t_spec_fin.elapsed().as_secs_f64();
+        pf.finish_load(&dev)?; // [prefill]
+                               // [moe hook] routed form: bind the routed-experts prefill recipe, zero its padded rows
+        moe_rx.finish(
+            &dev,
+            &spec,
+            prefill_tile,
+            [&pf.attn_pool(prefill_tile, 1), &pf.lin_pool(prefill_tile)],
+            &stage_upload,
+        )?;
+        drop(stage_upload); // the upload staging memory is not needed after the load
+        ext_packer.log_summary(cfg.verbose); // [moe/fp8 hook]
 
         let logits_bytes = (spec.vocab as usize) * 2;
         let stage_io_bytes = logits_bytes.max((prefill_tile as usize) * 4).max(4096);
@@ -1247,6 +1887,18 @@ impl Qwen3Engine {
             );
         }
 
+        // SAFETY: the compute stream belongs to `dev`.
+        unsafe { dev.sync_stream(dev.compute_stream()) }
+            .map_err(|e| format!("zero device state at load: {e}"))?;
+        if cfg.verbose {
+            eprintln!(
+                "[gaudium] KV caches + state rings zeroed on the device: {:.2} GiB (enqueue {:.1} ms; complete within {:.2}s of the seal, overlapped with the upload)",
+                zeroed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                zero_enqueue_s * 1000.0,
+                t_zero.elapsed().as_secs_f64()
+            );
+        }
+
         // Pre-validate decode-step launches for BOTH GDN ping-pong parities (0 and 1)!
         let mut base_step_addrs = BTreeMap::new();
         for (k, &v) in &weights_addr {
@@ -1260,30 +1912,79 @@ impl Qwen3Engine {
         }
 
         let mut step_launches = Vec::with_capacity(step_recipes.len());
+        // The binding pool of each parity is the same for every chunk count: built once.
+        let parity_pool = |parity: usize| -> BTreeMap<String, u64> {
+            let mut pool = base_step_addrs.clone();
+            for (&l, st) in &gdn_state {
+                pool.insert(format!("L{l}_S_in"), st.s[parity]);
+                pool.insert(format!("L{l}_S_out"), st.s[1 - parity]);
+                pool.insert(format!("L{l}_cs_in"), st.cs[parity]);
+                pool.insert(format!("L{l}_cs_out"), st.cs[1 - parity]);
+            }
+            pool
+        };
+        let parity_pools = [parity_pool(0), parity_pool(1)];
         for r in &step_recipes {
             let build_for_parity = |parity: usize| -> Result<PreparedLaunch, String> {
-                let mut pool = base_step_addrs.clone();
-                for (&l, st) in &gdn_state {
-                    pool.insert(format!("L{l}_S_in"), st.s[parity]);
-                    pool.insert(format!("L{l}_S_out"), st.s[1 - parity]);
-                    pool.insert(format!("L{l}_cs_in"), st.cs[parity]);
-                    pool.insert(format!("L{l}_cs_out"), st.cs[1 - parity]);
-                }
-                let exact = select_exact_bindings(r, &pool)?;
+                let exact = select_exact_bindings(r, &parity_pools[parity])?;
                 r.prepare_launch(&exact)
                     .map_err(|e| format!("prepare decode step launch (parity={parity}): {e}"))
             };
             step_launches.push([build_for_parity(0)?, build_for_parity(1)?]);
         }
 
+        if let Some(s) = samp.as_mut() {
+            s.finish(&dev, &base_step_addrs, &gdn_state)?;
+        }
+
         let step_ids = *step_act_addr.get("ids").ok_or("missing step 'ids'")?;
         let step_cursor = *step_act_addr.get("cursor").ok_or("missing step 'cursor'")?;
         let step_tokens = *step_act_addr.get("tokens").ok_or("missing step 'tokens'")?;
         let step_logits = *step_act_addr.get("logits").ok_or("missing step 'logits'")?;
+        // [step] enqueue-ahead bindings of the same step recipes (`engine/qwen3_k0pipe.rs`)
+        let step_cursor_b = step_act_addr["cursor_b"];
+        let mut step_fb_launches = Vec::new();
+        if cfg.step.k0_pipeline {
+            for r in &step_recipes {
+                let build_for_parity = |parity: usize| -> Result<PreparedLaunch, String> {
+                    let mut pool = base_step_addrs.clone();
+                    for (&l, st) in &gdn_state {
+                        pool.insert(format!("L{l}_S_in"), st.s[parity]);
+                        pool.insert(format!("L{l}_S_out"), st.s[1 - parity]);
+                        pool.insert(format!("L{l}_cs_in"), st.cs[parity]);
+                        pool.insert(format!("L{l}_cs_out"), st.cs[1 - parity]);
+                    }
+                    if parity == 1 {
+                        pool.insert("ids".to_string(), step_tokens);
+                        pool.insert("tokens".to_string(), step_ids);
+                        pool.insert("cursor".to_string(), step_cursor_b);
+                    }
+                    let exact = select_exact_bindings(r, &pool)?;
+                    r.prepare_launch(&exact).map_err(|e| {
+                        format!("prepare enqueue-ahead decode step launch (parity={parity}): {e}")
+                    })
+                };
+                step_fb_launches.push([build_for_parity(0)?, build_for_parity(1)?]);
+            }
+        }
 
         live.set_phase("idle", "ready");
+        if cfg.verbose {
+            let total = t_start.elapsed().as_secs_f64();
+            let upload_all = t_up.elapsed().as_secs_f64();
+            eprintln!(
+                "[gaudium] start-up {:.2}s = device open {:.2} + recipes {:.2} + plan/alloc/other {:.2} + trunk weights {:.2} + drafter/vision weights, tables and launches {:.2} + launch preparation {:.2}",
+                total,
+                open_s,
+                recipes_s,
+                (before_upload_s - open_s - recipes_s).max(0.0),
+                trunk_upload_s,
+                spec_finish_s,
+                (upload_all - trunk_upload_s - spec_finish_s).max(0.0),
+            );
+        }
 
-        Ok(Self {
+        let mut eng = Self {
             spec,
             max_ctx,
             max_chunks,
@@ -1296,27 +1997,69 @@ impl Qwen3Engine {
             embed_recipes,
             attn_layer_recipes,
             lin_layer_recipes,
+            moe_rx,
             stage_io,
-            stage_zero,
             weights_addr,
             kv_addr,
             gdn_state,
-            pf_attn_scratch,
-            pf_lin_scratch,
+            pf,
             pf_x0,
             pf_x1,
             pf_ids,
             pf_cursor,
             head_scratch,
             step_launches,
+            step_fb_launches,
+            step_cursor_b,
             step_ids,
             step_cursor,
             step_tokens,
             step_logits,
             hbm_bytes,
+            reset: request_reset::ResetState::new(reset_mode, cfg.verbose),
+            verbose: cfg.verbose,
             live,
+            vision,
+            vision_req: vision_hooks::VisionRequestState::default(),
+            specdec,
+            samp,
+            calib: cfg
+                .fp8_calibrate
+                .then(crate::engine::fp8_graph::ActCalibrator::new),
+            prof: prof.map(prof_rt::ProfRt::new),
             dev,
-        })
+        };
+        eng.warm_prefill_tiles(cfg.prefill_warm_rows, cfg.verbose)?;
+        Ok(Some(eng))
+    }
+
+    /// Loads (or compiles into the recipe cache) the single-chunk prefill recipes of every
+    /// prompt-tail length `1..=rows`. A prompt's last tile has `prompt_len mod prefill_tile` rows
+    /// and one recipe set per length; without this the first request of a length loads them
+    /// inside its time to first token (tens of milliseconds from the recipe cache, hundreds on a
+    /// cache miss, measured on Gaudi 2 with the 64-layer hybrid model).
+    fn warm_prefill_tiles(&mut self, rows: u64, verbose: bool) -> Result<(), String> {
+        let rows = rows.min(self.prefill_tile.saturating_sub(1));
+        if rows == 0 {
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        let has_gdn = !self.gdn_state.is_empty();
+        for t in 1..=rows {
+            self.ensure_embed_recipe(t)?;
+            self.ensure_attn_layer_recipe(t, 1)?;
+            if has_gdn {
+                self.ensure_lin_layer_recipe(t)?;
+            }
+            moe_rt::ensure(self, t)?; // [moe hook] routed-experts recipe of the tail's padded rows
+        }
+        if verbose {
+            eprintln!(
+                "[gaudium] prefill recipes of prompt-tail lengths 1..={rows} ready in {:.2}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        Ok(())
     }
 
     pub fn spec(&self) -> &ModelSpec {
@@ -1327,33 +2070,48 @@ impl Qwen3Engine {
         self.max_ctx
     }
 
+    /// Reader of this engine's measured live `profile` block.
+    pub fn live_profile(&self) -> crate::live_report::ProfileHandle {
+        self.live.profile_handle()
+    }
+
     /// Exact 5-category HBM ledger bytes `[weights, kv, state, scratch, workspace]`.
     pub fn hbm_bytes(&self) -> [u64; 5] {
         self.hbm_bytes
     }
 
-    /// Zeroes all KV caches and GDN initial recurrent/conv states (slot 0) before a new request.
-    fn clear_request_state(&self) -> Result<(), String> {
-        for &(addr, bytes) in self.kv_addr.values() {
-            self.dev
-                .zero_hbm_chunked(addr, bytes, &self.stage_zero)
-                .map_err(|e| format!("zero kv cache: {e}"))?;
+    /// [fp8 hook] The activation-scale table of a calibration load (`Qwen3Config::fp8_calibrate`).
+    pub fn fp8_calibration(&self) -> Option<BTreeMap<String, crate::fp8::ActScale>> {
+        self.calib.as_ref().map(|c| c.table())
+    }
+
+    /// Wall time of the reset that preceded the last request, in ms (it runs before the prefill
+    /// timer starts, so it is not part of `ttft_ms`).
+    pub fn last_reset_ms(&self) -> f64 {
+        self.reset.last_ms()
+    }
+
+    /// A recipe that was not ready when a request needed it: the request waited for it.
+    fn note_late_recipe(&self, r: &CompiledRecipe, since: Instant) {
+        if self.verbose {
+            eprintln!(
+                "[gaudium] recipe {} was not ready: the request waited {:.1} ms for it ({})",
+                r.name,
+                since.elapsed().as_secs_f64() * 1000.0,
+                if r.from_cache {
+                    "loaded from the recipe cache"
+                } else {
+                    "compiled"
+                }
+            );
         }
-        for st in self.gdn_state.values() {
-            self.dev
-                .zero_hbm_chunked(st.s[0], st.s_bytes, &self.stage_zero)
-                .map_err(|e| format!("zero GDN S state: {e}"))?;
-            self.dev
-                .zero_hbm_chunked(st.cs[0], st.cs_bytes, &self.stage_zero)
-                .map_err(|e| format!("zero GDN conv state: {e}"))?;
-        }
-        Ok(())
     }
 
     fn ensure_embed_recipe(&mut self, t: u64) -> Result<(), String> {
         if self.embed_recipes.contains_key(&t) {
             return Ok(());
         }
+        let t0 = Instant::now();
         let gb = build_embed_graph(&self.spec, t);
         let mut r = gb
             .compile(
@@ -1364,6 +2122,7 @@ impl Qwen3Engine {
             .map_err(|e| format!("compile embed T={t}: {e}"))?;
         r.bind_shared_workspace(&self.dev)
             .map_err(|e| format!("bind embed T={t} ws: {e}"))?;
+        self.note_late_recipe(&r, t0);
         self.embed_recipes.insert(t, r);
         Ok(())
     }
@@ -1372,7 +2131,11 @@ impl Qwen3Engine {
         if self.attn_layer_recipes.contains_key(&(t, nch)) {
             return Ok(());
         }
-        let gb = build_prefill_attn_layer_graph(&self.spec, t, self.max_ctx, nch, &self.elf_hashes);
+        let t0 = Instant::now();
+        let gb = self
+            .pf
+            .attn_graph(&self.spec, t, self.max_ctx, nch, &self.elf_hashes);
+        self.pf.register_attn(&gb, t, nch)?; // [prefill] scratch layout in the planned region
         let mut r = gb
             .compile(
                 Arc::clone(self.dev.api()),
@@ -1382,6 +2145,7 @@ impl Qwen3Engine {
             .map_err(|e| format!("compile attn layer T={t} C={nch}: {e}"))?;
         r.bind_shared_workspace(&self.dev)
             .map_err(|e| format!("bind attn layer T={t} C={nch} ws: {e}"))?;
+        self.note_late_recipe(&r, t0);
         self.attn_layer_recipes.insert((t, nch), r);
         Ok(())
     }
@@ -1390,7 +2154,9 @@ impl Qwen3Engine {
         if self.lin_layer_recipes.contains_key(&t) {
             return Ok(());
         }
-        let gb = build_prefill_linear_layer_graph(&self.spec, t, &self.elf_hashes);
+        let t0 = Instant::now();
+        let gb = self.pf.lin_graph(&self.spec, t, &self.elf_hashes);
+        self.pf.register_lin(&gb, t)?; // [prefill] scratch layout in the planned region
         let mut r = gb
             .compile(
                 Arc::clone(self.dev.api()),
@@ -1400,6 +2166,7 @@ impl Qwen3Engine {
             .map_err(|e| format!("compile lin layer T={t}: {e}"))?;
         r.bind_shared_workspace(&self.dev)
             .map_err(|e| format!("bind lin layer T={t} ws: {e}"))?;
+        self.note_late_recipe(&r, t0);
         self.lin_layer_recipes.insert(t, r);
         Ok(())
     }
@@ -1416,6 +2183,7 @@ impl Qwen3Engine {
             .map_err(|e| format!("write step inputs H2D: {e}"))
     }
 
+    #[allow(dead_code)]
     fn write_i32_scalar(&mut self, hbm_addr: u64, val: i32) -> Result<(), String> {
         self.stage_io.as_mut_slice()[..4].copy_from_slice(&val.to_le_bytes());
         self.dev
@@ -1447,18 +2215,29 @@ impl Qwen3Engine {
         for &ch in raw.as_chunks::<2>().0 {
             bf16.push(u16::from_le_bytes(ch));
         }
-        let sp = SampleParams {
-            temperature: params.temperature,
-            top_k: params.top_k,
-            top_p: params.top_p,
-            min_p: params.min_p,
-            seed: params.seed,
-            coupled: true,
-            draft_trunc: true,
-        };
-        let dev_sp = sp.to_dev(self.spec.vocab);
+        let dev_sp = samp_rt::dev_params(params, self.spec.vocab);
         let res = sample_row(&bf16, &dev_sp, 0, seq_pos, true);
         Ok(res.token as i32)
+    }
+
+    /// The token of a readout row: read from the card (greedy argmax, or the on-card sampler of
+    /// a sampled request, which `sample_check` compares with the host twin), or sampled on the
+    /// host when the engine has no on-card sampler. `n` = sequence index of the token.
+    fn read_row_token(
+        &mut self,
+        params: &Qwen3GenParams,
+        tokens_hbm: u64,
+        logits_hbm: u64,
+        n: u32,
+    ) -> Result<i32, String> {
+        if params.temperature > 0.0 && self.samp.is_none() {
+            return self.sample_from_logits(logits_hbm, params, n);
+        }
+        let tok = self.read_i32_scalar(tokens_hbm)?;
+        if params.temperature > 0.0 && params.sample_check {
+            samp_rt::check_row(self, logits_hbm, n, tok)?;
+        }
+        Ok(tok)
     }
 
     /// Runs full prefill + autoregressive decode for `prompt_ids`, invoking `on_token` for every
@@ -1498,13 +2277,25 @@ impl Qwen3Engine {
         let is_eos = |tok: i32| eos_ids.contains(&tok);
         let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
 
-        let method_label = if params.temperature > 0.0 {
-            format!("K=0 BF16 T={:.2}", params.temperature)
+        let wprec = if self.spec.fp8_weights { "FP8" } else { "BF16" }; // [fp8 hook]
+        let method_label = if let Some(sd) = &self.specdec {
+            sd.method_label(params.temperature).replace(
+                " BF16 ",
+                if self.spec.fp8_weights {
+                    " FP8 "
+                } else {
+                    " BF16 "
+                },
+            )
+        } else if params.temperature > 0.0 {
+            format!("K=0 {wprec} T={:.2}", params.temperature)
         } else {
-            "K=0 BF16 greedy".to_string()
+            format!("K=0 {wprec} greedy")
         };
         self.live
             .begin_request(prompt_ids.len() as u64, &method_label, "");
+        spec::readout::arm(self, params.temperature > 0.0); // [readout hook] step byte model
+        self.live.prefill_progress(0);
 
         let res = self.run_generate_inner(
             prompt_ids,
@@ -1515,6 +2306,7 @@ impl Qwen3Engine {
             &mut on_token,
         );
         self.live.end_request();
+        request_reset::end_request(self, prompt_ids.len() as u64, &res);
         res
     }
 
@@ -1527,33 +2319,53 @@ impl Qwen3Engine {
         is_cancelled: &impl Fn() -> bool,
         on_token: &mut impl FnMut(i32),
     ) -> Result<Qwen3GenReport, String> {
-        self.clear_request_state()?;
+        request_reset::begin_request(self, prompt_ids.len() as u64, budget.max_new())?;
+        spec::begin_request(self, prompt_ids);
+        prof_rt::begin_request(self);
         let mut gdn_parity: usize = 0;
+        // A sampled request runs the sampled recipe families; its parameters go to the card now.
+        let samp_on = params.temperature > 0.0 && self.samp.is_some();
+        if let Some(s) = self.samp.as_mut() {
+            s.reset_checks();
+        }
+        if samp_on {
+            samp_rt::begin_request(self, params, prompt_ids.len())?;
+        }
+        // first-use recipe loads / compiles inside the time to first token
+        let mut ttft_recipe_ms = 0.0f64;
 
         let t_prefill = Instant::now();
+        // Image input: tower launches + this request's slot-indexed RoPE rows (inside TTFT).
+        // `None` for a text-only request, which launches exactly what it did before.
+        let vis_layout = self.vision_begin_request(prompt_ids, budget.max_new())?;
         let mut generated = Vec::with_capacity(budget.max_new() as usize);
         let mut stopped_by_eos = false;
         let mut stopped_by_cancel = false;
+        let mut forks: Vec<ForkRecord> = Vec::new();
+        let mut first_logits_hbm = self.step_logits;
 
         // ---- PREFILL PHASE ----
         let first_tok: i32 = if prompt_ids.len() == 1 {
             self.write_step_inputs(prompt_ids[0], 0)?;
-            self.step_recipes[0]
-                .launch_prepared(&self.dev, &self.step_launches[0][gdn_parity])
-                .map_err(|e| format!("launch step (prompt len 1): {e}"))?;
+            if samp_on {
+                ttft_recipe_ms += samp_rt::ensure_step(self, 1)?;
+                samp_rt::launch_step(self, 1, gdn_parity)?;
+            } else {
+                self.step_recipes[0]
+                    .launch_prepared(&self.dev, &self.step_launches[0][gdn_parity])
+                    .map_err(|e| format!("launch step (prompt len 1): {e}"))?;
+            }
             unsafe { self.dev.sync_stream(self.dev.compute_stream()) }
                 .map_err(|e| format!("sync compute (prompt len 1): {e}"))?;
             gdn_parity ^= 1;
-            if params.temperature > 0.0 {
-                self.sample_from_logits(self.step_logits, params, 0)?
-            } else {
-                self.read_i32_scalar(self.step_tokens)?
-            }
+            self.read_row_token(params, self.step_tokens, self.step_logits, 1)?
         } else {
             let mut pos = 0usize;
             let n_layers = self.spec.n_layers as usize;
             let has_gdn = !self.gdn_state.is_empty();
             let mut last_tile_len = 0u64;
+            let pf_profile = self.pf.opts.profile;
+            self.pf.begin_request();
 
             while pos < prompt_ids.len() {
                 if is_cancelled() {
@@ -1565,21 +2377,39 @@ impl Qwen3Engine {
                 let nch = end_pos.div_ceil(KV_CHUNK).clamp(1, self.max_chunks);
                 last_tile_len = tile_len;
 
+                let t_recipes = Instant::now();
                 self.ensure_embed_recipe(tile_len)?;
                 self.ensure_attn_layer_recipe(tile_len, nch)?;
                 if has_gdn {
                     self.ensure_lin_layer_recipe(tile_len)?;
                 }
+                moe_rt::ensure(self, tile_len)?; // [moe hook] routed-experts recipe of the tile
+                ttft_recipe_ms += t_recipes.elapsed().as_secs_f64() * 1000.0;
 
+                let t_tile = prefill::now();
                 let tile_bytes = (tile_len as usize) * 4;
                 for (k, &id) in prompt_ids[pos..pos + tile_len as usize].iter().enumerate() {
                     self.stage_io.as_mut_slice()[k * 4..k * 4 + 4]
                         .copy_from_slice(&id.to_le_bytes());
                 }
+                // the tile's ids and its cursor in one synchronised upload
+                let cur_off = tile_bytes.next_multiple_of(64);
+                self.stage_io.as_mut_slice()[cur_off..cur_off + 4]
+                    .copy_from_slice(&(pos as i32).to_le_bytes());
                 self.dev
-                    .copy_h2d_pinned_sync(&self.stage_io, tile_bytes, self.pf_ids)
-                    .map_err(|e| format!("upload prefill ids: {e}"))?;
-                self.write_i32_scalar(self.pf_cursor, pos as i32)?;
+                    .copy_h2d_pinned_batch_sync(
+                        &self.stage_io,
+                        &[(0, tile_bytes, self.pf_ids), (cur_off, 4, self.pf_cursor)],
+                    )
+                    .map_err(|e| format!("upload prefill ids / cursor: {e}"))?;
+                self.pf.timers.upload_ms += prefill::ms_since(t_tile);
+                let t_submit = prefill::now();
+                // profile runs: device time of one launch, by synchronising right after it
+                let prof = |dev: &HpuDevice, t0: std::time::Instant| -> Result<f64, String> {
+                    unsafe { dev.sync_stream(dev.compute_stream()) }
+                        .map_err(|e| format!("sync prefill profile: {e}"))?;
+                    Ok(prefill::ms_since(t0))
+                };
 
                 // Launch embed(tile_len) -> pf_x0
                 let mut emb_pool = BTreeMap::new();
@@ -1588,16 +2418,25 @@ impl Qwen3Engine {
                 emb_pool.insert("x0".to_string(), self.pf_x0);
                 let emb_recipe = &self.embed_recipes[&tile_len];
                 let emb_bind = select_exact_bindings(emb_recipe, &emb_pool)?;
+                let t_l = prefill::now();
                 emb_recipe
                     .launch_checked(&self.dev, &emb_bind)
                     .map_err(|e| format!("launch embed T={tile_len}: {e}"))?;
+                if pf_profile {
+                    let ms = prof(&self.dev, t_l)?;
+                    self.pf.timers.class(&format!("embed T{tile_len}"), ms);
+                }
+                if let Some(layout) = vis_layout.as_ref() {
+                    // image-pad rows of this tile take the tower's embeddings (device copy)
+                    self.vision_splice_tile(layout, pos, tile_len as usize, self.pf_x0)?;
+                }
 
                 // Prepare reusable pools for attention & linear layers
+                // [moe hook] routed form: where this tile's layer recipes leave their scratch
+                let (rx_attn_scratch, rx_lin_scratch) =
+                    (self.pf.attn_pool(tile_len, nch), self.pf.lin_pool(tile_len));
                 let attn_recipe = &self.attn_layer_recipes[&(tile_len, nch)];
-                let mut apool = BTreeMap::new();
-                for (k, &v) in &self.pf_attn_scratch {
-                    apool.insert(k.clone(), v);
-                }
+                let mut apool = self.pf.attn_pool(tile_len, nch);
                 apool.insert("cursor".to_string(), self.pf_cursor);
                 apool.insert("rope_c".to_string(), self.weights_addr["rope_c"]);
                 apool.insert("rope_s".to_string(), self.weights_addr["rope_s"]);
@@ -1607,9 +2446,7 @@ impl Qwen3Engine {
 
                 let mut lpool = BTreeMap::new();
                 if has_gdn {
-                    for (k, &v) in &self.pf_lin_scratch {
-                        lpool.insert(k.clone(), v);
-                    }
+                    lpool = self.pf.lin_pool(tile_len);
                     lpool.insert("zero_slot".to_string(), self.weights_addr["zero_slot"]);
                     if let Some(&ones) = self.weights_addr.get("norm_ones") {
                         lpool.insert("norm_ones".to_string(), ones);
@@ -1621,6 +2458,10 @@ impl Qwen3Engine {
                         (self.pf_x0, self.pf_x1)
                     } else {
                         (self.pf_x1, self.pf_x0)
+                    };
+                    let (xin, xout) = match &self.specdec {
+                        Some(sd) => sd.prefill_io(l, xin, xout),
+                        None => (xin, xout),
                     };
 
                     if self.spec.is_full_attention_layer(l) {
@@ -1641,10 +2482,23 @@ impl Qwen3Engine {
                             "L_vcache".to_string(),
                             self.kv_addr[&format!("L{l}_vcache")].0,
                         );
+                        // [moe/fp8 hook] router, FP8 weight scales, site cast scales of layer l
+                        crate::engine::moe::bind_ext_layer_weights(
+                            &self.weights_addr,
+                            l,
+                            &mut apool,
+                        );
                         let abind = select_exact_bindings(attn_recipe, &apool)?;
+                        let t_l = prefill::now();
                         attn_recipe.launch_checked(&self.dev, &abind).map_err(|e| {
                             format!("launch prefill attn layer {l} T={tile_len}: {e}")
                         })?;
+                        if pf_profile {
+                            let ms = prof(&self.dev, t_l)?;
+                            self.pf
+                                .timers
+                                .class(&format!("attn T{tile_len} C{nch}"), ms);
+                        }
                     } else {
                         let lin_recipe = &self.lin_layer_recipes[&tile_len];
                         lpool.insert("x_in".to_string(), xin);
@@ -1661,19 +2515,90 @@ impl Qwen3Engine {
                         lpool.insert("L_S_out".to_string(), st.s[1 - gdn_parity]);
                         lpool.insert("L_cs_in".to_string(), st.cs[gdn_parity]);
                         lpool.insert("L_cs_out".to_string(), st.cs[1 - gdn_parity]);
+                        // [moe/fp8 hook] router, FP8 weight scales, site cast scales of layer l
+                        crate::engine::moe::bind_ext_layer_weights(
+                            &self.weights_addr,
+                            l,
+                            &mut lpool,
+                        );
                         let lbind = select_exact_bindings(lin_recipe, &lpool)?;
+                        let t_l = prefill::now();
                         lin_recipe.launch_checked(&self.dev, &lbind).map_err(|e| {
                             format!("launch prefill lin layer {l} T={tile_len}: {e}")
                         })?;
+                        if pf_profile {
+                            let ms = prof(&self.dev, t_l)?;
+                            self.pf.timers.class(&format!("lin T{tile_len}"), ms);
+                        }
+                    }
+                    // [moe hook] routed form: this layer's routed experts and tail -> xout
+                    self.moe_rx.launch_layer(
+                        &self.dev,
+                        if self.spec.is_full_attention_layer(l) {
+                            &rx_attn_scratch
+                        } else {
+                            &rx_lin_scratch
+                        },
+                        &self.weights_addr,
+                        self.prefill_tile,
+                        l,
+                        tile_len,
+                        xout,
+                    )?;
+                    // [fp8 hook] calibration load: read back this layer's GEMM input sites
+                    if let Some(cal) = self.calib.as_mut() {
+                        unsafe { self.dev.sync_stream(self.dev.compute_stream()) }
+                            .map_err(|e| format!("sync calibration layer {l}: {e}"))?;
+                        let scratch = if self.spec.is_full_attention_layer(l) {
+                            &apool
+                        } else {
+                            &lpool
+                        };
+                        crate::engine::fp8_graph::calibrate_layer(
+                            cal, &self.dev, &self.spec, scratch, l, tile_len,
+                        )?;
                     }
                 }
 
+                if self.specdec.is_some() {
+                    let t_l = prefill::now();
+                    spec::prefill_tile_hook(self, pos as u64, tile_len)?;
+                    if pf_profile {
+                        let ms = prof(&self.dev, t_l)?;
+                        self.pf.timers.class("drafter context", ms);
+                    }
+                }
+                self.pf.timers.submit_ms += prefill::ms_since(t_submit);
+                let t_wait = prefill::now();
                 unsafe { self.dev.sync_stream(self.dev.compute_stream()) }
                     .map_err(|e| format!("sync prefill tile at pos={pos}: {e}"))?;
+                self.pf.timers.wait_ms += prefill::ms_since(t_wait);
+                self.pf.timers.tiles += 1;
+                self.pf.timers.launches += n_layers as u64 + 1;
                 if has_gdn {
                     gdn_parity ^= 1;
                 }
                 pos += tile_len as usize;
+                self.live.prefill_tile(
+                    pos as u64,
+                    n_layers as u64 + 1,
+                    (tile_len << 16) | nch,
+                    || {
+                        // [prefill] the byte model of the tile forms actually launched
+                        let attn = (self.spec.n_full_attention_layers() > 0).then(|| {
+                            self.pf
+                                .attn_graph(&self.spec, tile_len, self.max_ctx, nch, &[])
+                        });
+                        let lin = has_gdn.then(|| self.pf.lin_graph(&self.spec, tile_len, &[]));
+                        qwen3_traffic::prefill_tile_of(
+                            &self.spec,
+                            tile_len,
+                            nch,
+                            attn.as_ref(),
+                            lin.as_ref(),
+                        )
+                    },
+                );
             }
 
             if stopped_by_cancel {
@@ -1688,6 +2613,12 @@ impl Qwen3Engine {
                     ms_per_step: 0.0,
                     stopped_by_eos: false,
                     stopped_by_cancel: true,
+                    forks: Vec::new(),
+                    launches: 0,
+                    tokens_per_launch: 0.0,
+                    method: String::new(),
+                    accept_per_pos: Vec::new(),
+                    ..Qwen3GenReport::default()
                 });
             }
 
@@ -1714,27 +2645,39 @@ impl Qwen3Engine {
                 "W_lm"
             };
             hpool.insert(lm_w.to_string(), self.weights_addr[lm_w]);
+            if samp_on {
+                for (name, _) in crate::engine::sampler::sampler_param_specs() {
+                    hpool.insert(name.to_string(), self.weights_addr[name]);
+                }
+            }
 
-            let hbind = select_exact_bindings(&self.head_t1, &hpool)?;
-            self.head_t1
-                .launch_checked(&self.dev, &hbind)
+            // a sampled request reads out through the sampled head (same buffers, the on-card
+            // sampler at sequence index `prompt_len` in place of the argmax)
+            let head = match self.samp.as_ref().filter(|_| samp_on) {
+                Some(s) => s.head(),
+                None => &self.head_t1,
+            };
+            let hbind = select_exact_bindings(head, &hpool)?;
+            head.launch_checked(&self.dev, &hbind)
                 .map_err(|e| format!("launch head_T1: {e}"))?;
             unsafe { self.dev.sync_stream(self.dev.compute_stream()) }
                 .map_err(|e| format!("sync head_T1: {e}"))?;
+            first_logits_hbm = self.head_scratch["logits"];
 
-            if params.temperature > 0.0 {
-                self.sample_from_logits(
-                    self.head_scratch["logits"],
-                    params,
-                    (prompt_ids.len() - 1) as u32,
-                )?
-            } else {
-                self.read_i32_scalar(self.head_scratch["tokens"])?
-            }
+            self.read_row_token(
+                params,
+                self.head_scratch["tokens"],
+                self.head_scratch["logits"],
+                prompt_ids.len() as u32,
+            )?
         };
 
         let ttft_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         let prefill_tok_s = (prompt_ids.len() as f64) / (ttft_ms / 1000.0).max(1e-9);
+        if prompt_ids.len() > 1 {
+            self.pf.report(prompt_ids.len(), ttft_ms); // [prefill] profile / stats runs only
+        }
+        let first_tok = self.apply_force(params, 0, first_tok, first_logits_hbm, &mut forks)?;
 
         if budget.remaining() > 0 && !is_cancelled() {
             budget.record_emitted(1);
@@ -1748,12 +2691,119 @@ impl Qwen3Engine {
             stopped_by_cancel = true;
         }
 
+        // ---- SPECULATIVE DECODE PHASE (requests of an engine loaded with `--spec`) ----
+        if self
+            .specdec
+            .as_ref()
+            .is_some_and(|sd| params.temperature <= 0.0 || sd.handles_sampled())
+            && !params.non_speculative
+            && !stopped_by_eos
+            && !stopped_by_cancel
+            && !generated.is_empty()
+        {
+            let method = self
+                .specdec
+                .as_ref()
+                .map(|sd| {
+                    sd.method_label(params.temperature).replace(
+                        " BF16 ",
+                        if self.spec.fp8_weights {
+                            " FP8 "
+                        } else {
+                            " BF16 "
+                        },
+                    )
+                })
+                .unwrap_or_default();
+            let out = spec::decode(
+                self,
+                prompt_ids.len(),
+                params,
+                budget,
+                is_eos,
+                is_cancelled,
+                on_token,
+                &mut generated,
+                gdn_parity,
+            )?;
+            let launches = out.stats.launches;
+            let (sample_check_rows, sample_check_mismatches) =
+                self.samp.as_ref().map_or((0, 0), |s| {
+                    (s.check_rows + s.walk_rows, s.check_bad + s.walk_bad)
+                });
+            return Ok(Qwen3GenReport {
+                sample_check_rows,
+                sample_check_mismatches,
+                ttft_recipe_ms,
+                prompt_tokens: prompt_ids.len(),
+                generated_tokens: generated,
+                ttft_ms,
+                prefill_tok_s,
+                decode_ms: out.decode_ms,
+                decode_tok_s: if out.decode_tokens > 0 {
+                    out.decode_tokens as f64 / (out.decode_ms / 1000.0).max(1e-9)
+                } else {
+                    0.0
+                },
+                ms_per_step: if launches > 0 {
+                    out.decode_ms / launches as f64
+                } else {
+                    0.0
+                },
+                stopped_by_eos: out.stopped_by_eos,
+                stopped_by_cancel: out.stopped_by_cancel,
+                forks,
+                launches,
+                tokens_per_launch: if launches > 0 {
+                    out.decode_tokens as f64 / launches as f64
+                } else {
+                    0.0
+                },
+                method,
+                accept_per_pos: out.stats.accept_per_pos(),
+                drafted: out.stats.widths.iter().map(|(k, n)| k * n).sum(),
+                draft_accepted: out
+                    .stats
+                    .accept_hist
+                    .iter()
+                    .enumerate()
+                    .map(|(a, n)| a as u64 * n)
+                    .sum(),
+            });
+        }
+
         // ---- DECODE PHASE (1 monolithic synLaunch per token, ping-pong GDN parity!) ----
         let t_decode = Instant::now();
         let mut cur_tok = first_tok;
         let mut decode_steps = 0usize;
+        // [step] greedy requests decode enqueue-ahead (same recipes, token fed back on the card)
+        let mut piped_ms: Option<f64> = None;
+        if !samp_on
+            && k0pipe::usable(self, params)
+            && !stopped_by_eos
+            && !stopped_by_cancel
+            && budget.remaining() > 0
+        {
+            let out = k0pipe::decode(
+                self,
+                prompt_ids.len(),
+                params,
+                budget,
+                is_eos,
+                is_cancelled,
+                on_token,
+                &mut generated,
+                gdn_parity,
+                first_tok,
+            )?;
+            decode_steps = out.steps;
+            stopped_by_eos = out.eos;
+            stopped_by_cancel = out.cancel;
+            piped_ms = Some(out.decode_ms);
+        }
 
-        while !stopped_by_eos && !stopped_by_cancel && budget.remaining() > 0 {
+        while piped_ms.is_none() && !stopped_by_eos && !stopped_by_cancel && budget.remaining() > 0
+        {
             if is_cancelled() {
                 stopped_by_cancel = true;
                 break;
@@ -1762,23 +2812,47 @@ impl Qwen3Engine {
             let nch = (cursor_val + 1)
                 .div_ceil(KV_CHUNK)
                 .clamp(1, self.max_chunks) as usize;
+            prof_rt::before_launch(self, decode_steps as u64, 0)?;
 
             self.write_step_inputs(cur_tok, cursor_val as i32)?;
 
-            self.step_recipes[nch - 1]
-                .launch_prepared(&self.dev, &self.step_launches[nch - 1][gdn_parity])
-                .map_err(|e| {
-                    format!("launch decode step {decode_steps} (cursor={cursor_val}): {e}")
+            if samp_on {
+                samp_rt::ensure_step(self, nch as u64)?;
+            }
+            self.live.launch_begin_with(nch as u64, || {
+                qwen3_traffic::decode_step(&self.spec, self.max_ctx, nch as u64)
+            });
+            if samp_on {
+                samp_rt::launch_step(self, nch as u64, gdn_parity).map_err(|e| {
+                    format!("decode step {decode_steps} (cursor={cursor_val}): {e}")
                 })?;
+            } else {
+                self.step_recipes[nch - 1]
+                    .launch_prepared(&self.dev, &self.step_launches[nch - 1][gdn_parity])
+                    .map_err(|e| {
+                        format!("launch decode step {decode_steps} (cursor={cursor_val}): {e}")
+                    })?;
+            }
+            self.live.launch_submitted();
             unsafe { self.dev.sync_stream(self.dev.compute_stream()) }
                 .map_err(|e| format!("sync decode step {decode_steps}: {e}"))?;
             gdn_parity ^= 1;
 
-            let next_tok = if params.temperature > 0.0 {
-                self.sample_from_logits(self.step_logits, params, cursor_val as u32)?
-            } else {
-                self.read_i32_scalar(self.step_tokens)?
-            };
+            // the row at `cursor_val` yields the token at sequence index `cursor_val + 1`
+            let next_tok = self.read_row_token(
+                params,
+                self.step_tokens,
+                self.step_logits,
+                cursor_val as u32 + 1,
+            )?;
+
+            let next_tok = self.apply_force(
+                params,
+                generated.len(),
+                next_tok,
+                self.step_logits,
+                &mut forks,
+            )?;
 
             decode_steps += 1;
             budget.record_emitted(1);
@@ -1792,7 +2866,10 @@ impl Qwen3Engine {
             }
         }
 
-        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+        let decode_ms = piped_ms.unwrap_or_else(|| t_decode.elapsed().as_secs_f64() * 1000.0);
+        if piped_ms.is_none() {
+            prof_rt::end_request(self, decode_steps as u64)?;
+        }
         let decode_tok_s = if decode_steps > 0 {
             (decode_steps as f64) / (decode_ms / 1000.0).max(1e-9)
         } else {
@@ -1814,7 +2891,66 @@ impl Qwen3Engine {
             ms_per_step,
             stopped_by_eos,
             stopped_by_cancel,
+            forks,
+            launches: decode_steps as u64,
+            tokens_per_launch: if decode_steps > 0 { 1.0 } else { 0.0 },
+            method: {
+                let wprec = if self.spec.fp8_weights { "FP8" } else { "BF16" };
+                if params.temperature > 0.0 {
+                    format!("K=0 {wprec} T={:.2}", params.temperature)
+                } else {
+                    format!("K=0 {wprec} greedy")
+                }
+            },
+            accept_per_pos: Vec::new(),
+            sample_check_rows: self.samp.as_ref().map_or(0, |s| s.check_rows),
+            sample_check_mismatches: self.samp.as_ref().map_or(0, |s| s.check_bad),
+            ttft_recipe_ms,
+            ..Qwen3GenReport::default()
         })
+    }
+
+    /// Under teacher forcing, compares the engine's greedy token at generated position `pos`
+    /// with the forced one, records a fork (with both logits) when they differ, and returns the
+    /// token generation continues with.
+    fn apply_force(
+        &mut self,
+        params: &Qwen3GenParams,
+        pos: usize,
+        engine_tok: i32,
+        logits_hbm: u64,
+        forks: &mut Vec<ForkRecord>,
+    ) -> Result<i32, String> {
+        let Some(forced) = params
+            .force_tokens
+            .as_ref()
+            .and_then(|f| f.get(pos).copied())
+        else {
+            return Ok(engine_tok);
+        };
+        if forced == engine_tok {
+            return Ok(engine_tok);
+        }
+        let vocab = self.spec.vocab as usize;
+        self.dev
+            .copy_d2h_pinned_sync(logits_hbm, &mut self.stage_io, vocab * 2)
+            .map_err(|e| format!("read logits D2H (fork trace): {e}"))?;
+        let raw = self.stage_io.as_slice();
+        let logit_of = |tok: i32| -> f32 {
+            let i = tok as usize;
+            if tok < 0 || i >= vocab {
+                return f32::NAN;
+            }
+            crate::fp8::bf16_to_f32(u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]))
+        };
+        forks.push(ForkRecord {
+            pos,
+            engine_token: engine_tok,
+            forced_token: forced,
+            engine_logit: logit_of(engine_tok),
+            forced_logit: logit_of(forced),
+        });
+        Ok(forced)
     }
 }
 
@@ -1846,7 +2982,7 @@ fn is_gdn_state_tensor(name: &str) -> bool {
         || name.ends_with("_cs_out")
 }
 
-fn is_weight_or_table(name: &str) -> bool {
+pub(crate) fn is_weight_or_table(name: &str) -> bool {
     if matches!(
         name,
         "embed_table" | "W_lm" | "w_final" | "norm_ones" | "rope_c" | "rope_s" | "zero_slot"
@@ -1856,6 +2992,10 @@ fn is_weight_or_table(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix('L') {
         if let Some(sep) = rest.find('_') {
             if rest[..sep].chars().all(|c| c.is_ascii_digit()) && !rest[..sep].is_empty() {
+                // [moe/fp8 hook] router, shared gate, FP8 weight scales and site cast scales
+                if crate::engine::moe::is_ext_layer_weight(&rest[sep + 1..]) {
+                    return true;
+                }
                 return matches!(
                     &rest[sep + 1..],
                     "w_in"
@@ -1883,7 +3023,14 @@ fn is_weight_or_table(name: &str) -> bool {
     false
 }
 
-fn is_generic_layer_weight(name: &str) -> bool {
+pub(crate) fn is_generic_layer_weight(name: &str) -> bool {
+    // [moe/fp8 hook] the generic per-layer names of the extra layer weights
+    if name
+        .strip_prefix("L_")
+        .is_some_and(crate::engine::moe::is_ext_layer_weight)
+    {
+        return true;
+    }
     matches!(
         name,
         "L_w_in"

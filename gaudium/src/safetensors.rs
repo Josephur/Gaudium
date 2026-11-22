@@ -93,6 +93,24 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, length: usize) -> i32;
+    fn madvise(addr: *mut c_void, length: usize, advice: i32) -> i32;
+}
+const MADV_WILLNEED: i32 = 3;
+
+/// Read-ahead hint for a slice of a mapped file about to be read from start to end: the kernel
+/// queues the whole (page-rounded) range instead of faulting it in page by page, which is what
+/// decides the read rate when the file is not in the page cache. A no-op for other memory.
+pub fn advise_willneed(bytes: &[u8]) {
+    const PAGE: usize = 4096;
+    let start = (bytes.as_ptr() as usize) & !(PAGE - 1);
+    let end = (bytes.as_ptr() as usize + bytes.len()).next_multiple_of(PAGE);
+    if end > start {
+        // SAFETY: `madvise(MADV_WILLNEED)` does not change the mapping's contents or
+        // protection; a range it cannot act on only makes the call fail.
+        unsafe {
+            madvise(start as *mut c_void, end - start, MADV_WILLNEED);
+        }
+    }
 }
 
 const PROT_READ: i32 = 1;

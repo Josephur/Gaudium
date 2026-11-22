@@ -853,6 +853,44 @@ pub fn format_qwen3_chat(
     s
 }
 
+/// Formats a single-turn user prompt with the Gemma 4 turn template:
+/// `<bos>[<|turn>system\n[<|think|>\n]{system}<turn|>\n]<|turn>user\n{user}<turn|>\n<|turn>model\n`.
+///
+/// `close_empty_thought`: the model's template ends a non-thinking generation prompt with an empty
+/// thought channel (`<|channel>thought\n<channel|>`); see [`gemma4_template_closes_thought`].
+pub fn format_gemma4_chat(
+    user_prompt: &str,
+    system_prompt: Option<&str>,
+    enable_thinking: bool,
+    close_empty_thought: bool,
+) -> String {
+    let sys = system_prompt.map(str::trim).filter(|s| !s.is_empty());
+    let mut s = String::from("<bos>");
+    if enable_thinking || sys.is_some() {
+        s.push_str("<|turn>system\n");
+        if enable_thinking {
+            s.push_str("<|think|>\n");
+        }
+        if let Some(sys) = sys {
+            s.push_str(sys);
+        }
+        s.push_str("<turn|>\n");
+    }
+    s.push_str("<|turn>user\n");
+    s.push_str(user_prompt.trim());
+    s.push_str("<turn|>\n<|turn>model\n");
+    if !enable_thinking && close_empty_thought {
+        s.push_str("<|channel>thought\n<channel|>");
+    }
+    s
+}
+
+/// True when a Gemma 4 `chat_template.jinja` closes an empty thought channel after the generation
+/// prompt of a non-thinking request (the larger sizes' templates do, the small sizes' do not).
+pub fn gemma4_template_closes_thought(chat_template: &str) -> bool {
+    chat_template.contains("<|channel>thought\\n<channel|>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +943,26 @@ mod tests {
         assert_eq!(ids, vec![260, 259, 261]);
         assert_eq!(tok.decode(&ids, false), "<|im_start|>hello<|im_end|>");
         assert_eq!(tok.decode(&ids, true), "hello");
+    }
+
+    #[test]
+    fn gemma4_chat_template_forms() {
+        assert_eq!(
+            format_gemma4_chat(" Hi there \n", None, false, false),
+            "<bos><|turn>user\nHi there<turn|>\n<|turn>model\n"
+        );
+        assert_eq!(
+            format_gemma4_chat("Hi", None, false, true),
+            "<bos><|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        );
+        assert_eq!(
+            format_gemma4_chat("Hi", Some("Be brief."), true, true),
+            "<bos><|turn>system\n<|think|>\nBe brief.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+        );
+        assert!(gemma4_template_closes_thought(
+            "{{- '<|turn>model\\n' -}}{%- if not enable_thinking -%}{{- '<|channel>thought\\n<channel|>' -}}"
+        ));
+        assert!(!gemma4_template_closes_thought("{{- '<|turn>model\\n' -}}"));
     }
 
     #[test]

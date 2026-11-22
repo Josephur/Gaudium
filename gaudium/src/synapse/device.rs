@@ -152,6 +152,11 @@ impl HpuDevice {
             .transition(DevEvent::EvStreamsCreate)
             .map_err(|e| SynapseError::Guard(format!("{e:?}")))?;
 
+        // The runtime replaces SIGINT/SIGTERM dispositions while initializing; a signal it
+        // handles terminates in-flight API calls (`synSynapseTerminated`) instead of letting the
+        // engine stop between synced launches. Put the engine's stop-request handler back.
+        crate::signals::reassert();
+
         Ok(Self {
             api,
             guard,
@@ -504,6 +509,41 @@ impl HpuDevice {
         unsafe { self.sync_stream(self.h2d) }
     }
 
+    /// Enqueues one H2D transfer of `bytes` at `src_off` of a pinned buffer, NOT synchronized:
+    /// the buffer range must stay untouched until the H2D stream (or an event recorded on it
+    /// after this call) is synchronized.
+    pub fn enqueue_h2d_pinned(
+        &self,
+        src: &PinnedBuf,
+        src_off: usize,
+        bytes: usize,
+        dst_hbm: u64,
+    ) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("h2d refused: {e:?}")))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        if src_off.saturating_add(bytes) > src.len {
+            return Err(SynapseError::InvalidArg(format!(
+                "enqueue_h2d_pinned: {}..{} > pinned capacity {}",
+                src_off,
+                src_off.saturating_add(bytes),
+                src.len
+            )));
+        }
+        syn_check("synMemCopyAsync(H2D)", unsafe {
+            (self.api.syn_mem_copy_async)(
+                self.h2d,
+                (src.ptr as u64) + (src_off as u64),
+                bytes as u64,
+                dst_hbm,
+                SynDmaDir::HostToDram as u32,
+            )
+        })
+    }
+
     /// Copies `bytes` from `src_hbm` into the start of a pinned host buffer (blocking on D2H stream).
     pub fn copy_d2h_pinned_sync(
         &self,
@@ -535,6 +575,31 @@ impl HpuDevice {
         unsafe { self.sync_stream(self.d2h) }
     }
 
+    /// Enqueues an HBM -> HBM copy on the compute stream, ordered with the recipe launches of
+    /// that stream. NOT synchronized: the caller syncs the compute stream like after a launch.
+    pub fn copy_d2d_compute(
+        &self,
+        src_hbm: u64,
+        bytes: u64,
+        dst_hbm: u64,
+    ) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("d2d refused: {e:?}")))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        syn_check("synMemCopyAsync(D2D)", unsafe {
+            (self.api.syn_mem_copy_async)(
+                self.compute,
+                src_hbm,
+                bytes,
+                dst_hbm,
+                SynDmaDir::DramToDram as u32,
+            )
+        })
+    }
+
     /// Uploads an arbitrarily large host slice to HBM in chunks using one reusable `PinnedBuf`.
     pub fn upload_h2d_chunked(
         &self,
@@ -553,19 +618,47 @@ impl HpuDevice {
         Ok(())
     }
 
-    /// Zero-fills `bytes` of device HBM using a pre-zeroed `PinnedBuf` (in chunks of `zero_stage.len()`).
+    /// Enqueues a device-side zero fill of `[dst_hbm, dst_hbm + bytes)` on the compute stream
+    /// (`synMemsetD32Async`: a DMA engine writes the zeros, nothing crosses the host link), in
+    /// pieces of at most 1 GiB. `bytes` must be a multiple of 4. NOT synchronized: the fill is
+    /// ordered with the recipe launches of the compute stream, and the caller syncs that stream
+    /// when it needs the completion (or an error) before going on.
+    pub fn zero_hbm_compute(&self, dst_hbm: u64, bytes: u64) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("device zero fill refused: {e:?}")))?;
+        if !bytes.is_multiple_of(4) {
+            return Err(SynapseError::InvalidArg(format!(
+                "zero_hbm_compute: {bytes} bytes is not a multiple of 4"
+            )));
+        }
+        const PIECE: u64 = 1 << 30;
+        let mut off = 0u64;
+        while off < bytes {
+            let n = (bytes - off).min(PIECE);
+            // SAFETY: the range lies inside a live device allocation of this `HpuDevice`.
+            syn_check("synMemsetD32Async", unsafe {
+                (self.api.syn_memset_d32_async)(dst_hbm + off, 0, (n / 4) as usize, self.compute)
+            })?;
+            off += n;
+        }
+        Ok(())
+    }
+
+    /// Zero-fills `bytes` of device HBM on the device ([`Self::zero_hbm_compute`]) and waits for
+    /// it. Only a tail of fewer than 4 bytes is written from the pre-zeroed `zero_stage`.
     pub fn zero_hbm_chunked(
         &self,
         dst_hbm: u64,
         bytes: u64,
         zero_stage: &PinnedBuf,
     ) -> Result<(), SynapseError> {
-        let cap = zero_stage.len() as u64;
-        let mut off = 0u64;
-        while off < bytes {
-            let n = (bytes - off).min(cap) as usize;
-            self.copy_h2d_pinned_sync(zero_stage, n, dst_hbm + off)?;
-            off += n as u64;
+        let body = bytes & !3;
+        self.zero_hbm_compute(dst_hbm, body)?;
+        // SAFETY: the compute stream is owned by `self`.
+        unsafe { self.sync_stream(self.compute)? };
+        if body < bytes {
+            self.copy_h2d_pinned_sync(zero_stage, (bytes - body) as usize, dst_hbm + body)?;
         }
         Ok(())
     }
@@ -616,6 +709,31 @@ impl Drop for HpuDevice {
             (self.api.syn_destroy)();
         }
         let _ = self.guard.transition(DevEvent::EvDevClose);
+    }
+}
+
+/// SynapseAI initialized without acquiring a device: graph compilation and recipe
+/// (de)serialization only. Holds no card, so it can run beside a process that does.
+///
+/// Must outlive every `CompiledRecipe` created under it (declare it first).
+pub struct CompileSession {
+    api: Arc<SynapseApi>,
+}
+
+impl CompileSession {
+    pub fn open(api: Arc<SynapseApi>) -> Result<Self, SynapseError> {
+        // SAFETY: first Synapse lifecycle call of this process.
+        syn_check("synInitialize", unsafe { (api.syn_initialize)() })?;
+        Ok(Self { api })
+    }
+}
+
+impl Drop for CompileSession {
+    fn drop(&mut self) {
+        // SAFETY: matches the `synInitialize` of `open`; no device was acquired.
+        unsafe {
+            (self.api.syn_destroy)();
+        }
     }
 }
 

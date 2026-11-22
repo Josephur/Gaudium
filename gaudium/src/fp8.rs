@@ -276,6 +276,35 @@ pub fn cache_load_fp8(
     Ok(Some((w8, scale)))
 }
 
+/// Like [`cache_load_fp8`], with the codes left in the page cache: the `.w8` file is mapped, not
+/// read, so the only copy of a cached matrix is the one into the upload staging memory.
+pub fn cache_map_fp8(
+    dir: &Path,
+    name: &str,
+    n: usize,
+    k: usize,
+) -> io::Result<Option<(crate::safetensors::MappedShard, Vec<f32>)>> {
+    let p_w8 = dir.join(format!("{name}.w8"));
+    let p_sc = dir.join(format!("{name}.scale"));
+    let (Ok(m_w8), Ok(m_sc)) = (fs::metadata(&p_w8), fs::metadata(&p_sc)) else {
+        return Ok(None);
+    };
+    if m_w8.len() != (n * k) as u64 || m_sc.len() != (n * 4) as u64 || n * k < 8 {
+        return Ok(None);
+    }
+    let sc_bytes = fs::read(&p_sc)?;
+    let mut scale = Vec::with_capacity(n);
+    for c in sc_bytes.as_chunks::<4>().0 {
+        scale.push(f32::from_le_bytes(*c));
+    }
+    let map = crate::safetensors::MappedShard::open(&p_w8)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    if map.as_bytes().len() != n * k {
+        return Ok(None);
+    }
+    Ok(Some((map, scale)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

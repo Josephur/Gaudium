@@ -1,0 +1,1538 @@
+//! Prefill tile recipes of the Qwen3 / Qwen3.5 engine: their throughput forms, the scratch plan
+//! they share, and the per-launch profile of the tile loop.
+//!
+//! A prompt is prefilled tile by tile through generic single-layer recipes (one launch per layer,
+//! bound to that layer's weights, caches and states). What bounds a tile on Gaudi 2 differs per
+//! layer kind, so each kind has its own form here:
+//!
+//! - **Gated DeltaNet layers** (`mme`): the serial per-row recurrence kernel keeps one TPC busy
+//!   per value head while the MME idles. The chunked form runs 64-row chunks as batched MME GEMMs
+//!   (`O = (G q - P W) S + P U`, `S' = gL S + (tail k)^T (U - W S)`): the TPCs only build the
+//!   chunk coefficients and invert the 16x16 diagonal blocks, the MME finishes the inverse with
+//!   an exact Neumann series and carries the state through three small nodes per chunk. The state
+//!   enters and leaves in the decode kernels' blob layout, so decode continues from it unchanged.
+//!   The conv prep and the gated norm run row-parallel, one special-function table per kernel
+//!   (`rows = 2`), instead of one index-space point per channel block.
+//! - **Full-attention layers** (`fastexp`, `groups`): the chunk softmax is VPU-bound, so the tile
+//!   recipes use the build with a 13-operation `exp` and an unmasked path for history chunks, and
+//!   split the chunk loop into groups (`QK_g -> softmax_g -> PV_g`) so the MME multiplies one
+//!   group while the TPCs sweep another.
+//! - **Half-width core** (`s16`): a score written as BF16 in 1/512 octaves halves both the bytes
+//!   the QK GEMM writes and the vectors the softmax sweeps (128 lanes instead of 64); `s16 = 2`
+//!   also stores `P` as FP8. It changes the numerics of the prefill attention (a score keeps 8
+//!   significant bits), so it is the default only where the weights are FP8 already.
+//!
+//! Every lever is a field of [`PrefillOpts`] (`--prefill k=v,..` or `GAUDIUM_PREFILL`); with all
+//! of them off the engine builds the plain per-layer recipes of `qwen3.rs`, bit for bit.
+//!
+//! Scratch: a tile recipe's activations are persistent tensors (the compiler never has to place
+//! them), and only one tile recipe runs at a time, so all of them are laid out in ONE planned
+//! region sized by the largest recipe ([`TileRt::plan_bytes`]): nothing is allocated per recipe.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
+
+use super::{
+    add_linear_bf16, add_rmsnorm, append_post_and_mlp, build_embed_graph,
+    build_prefill_attn_layer_graph, build_prefill_linear_layer_graph, is_generic_layer_weight,
+    Qwen3Config, KV_CHUNK,
+};
+use crate::kernels::KernelEnv;
+use crate::model_spec::{ModelFamily, ModelSpec};
+use crate::synapse::ffi::{SynDataType, SynapseApi};
+use crate::synapse::graph::{CompiledRecipe, GraphBuilder, TensorId};
+use crate::synapse::ops::{as_param_bytes, u32_params, ConvertToFp8Params, TransposeParams};
+use crate::synapse::recipe_cache::RecipeCache;
+use crate::verified::align_up;
+
+/// Rows of one DeltaNet chunk of the MME recurrence (the solve kernel's blocks are 16 rows; 64
+/// rows is the largest chunk whose coefficient rows fit the TPC's local memory beside a table).
+pub const GDN_CHUNK: u64 = 64;
+/// Widest prefill tile the engine plans for.
+pub const TILE_MAX: u64 = 512;
+/// Tile widths tried in order when the width is not fixed: the widest whose scratch fits.
+const TILE_CANDIDATES: [u64; 2] = [512, 256];
+/// `CAST_ROUND_HALF_NE` of `ns_ConvertToFp8::Params::round_mode`.
+const CAST_ROUND_HALF_NE: u32 = 0;
+
+/// The prefill levers as the user sets them (`--prefill`, `GAUDIUM_PREFILL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillOpts {
+    /// Rows of a full tile (multiple of 64, at most [`TILE_MAX`]); 0 = the widest that fits.
+    pub tile: u64,
+    /// DeltaNet recurrence as chunked MME GEMMs.
+    pub mme: bool,
+    /// Conv prep / gated norm kernels of the MME form: 0 = one point per channel block,
+    /// 1 = row-parallel (two tables per kernel), 2 = row-parallel, one table per kernel.
+    pub rows: u32,
+    /// Tile attention recipes use the fast-`exp` chunk softmax and the unrolled combine.
+    pub fastexp: bool,
+    /// Chunk groups of a tile attention layer (1 = one QK / softmax / PV node each).
+    pub groups: u64,
+    /// Half-width attention core: 0 = f32 scores, 1 = BF16 scores, 2 = BF16 scores and FP8 `P`;
+    /// `None` = by model (2 for dense FP8 weights, else 0).
+    pub s16: Option<u32>,
+    /// Synchronise after every prefill launch and report the device time per recipe class.
+    pub profile: bool,
+    /// Report the host-side split of the tile loop (uploads, launch calls, waiting) per request.
+    pub stats: bool,
+}
+
+impl Default for PrefillOpts {
+    fn default() -> Self {
+        Self {
+            tile: 0,
+            mme: true,
+            rows: 2,
+            fastexp: true,
+            groups: 16,
+            s16: None,
+            profile: false,
+            stats: false,
+        }
+    }
+}
+
+impl PrefillOpts {
+    /// The plain per-layer recipes of `qwen3.rs` on 256-row tiles.
+    pub fn plain() -> Self {
+        Self {
+            tile: 256,
+            mme: false,
+            rows: 0,
+            fastexp: false,
+            groups: 1,
+            s16: Some(0),
+            profile: false,
+            stats: false,
+        }
+    }
+
+    /// Parses `k=v[,k=v..]`: `tile`, `mme`, `rows`, `fastexp`, `groups`, `s16`, and the bare
+    /// words `plain` (every lever off, 256-row tiles), `profile` and `stats`. Later entries win.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let mut o = Self::default();
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let (k, v) = match part.split_once('=') {
+                Some((k, v)) => (k.trim(), Some(v.trim())),
+                None => (part, None),
+            };
+            let num = |what: &str| -> Result<u64, String> {
+                v.ok_or_else(|| format!("prefill option '{what}' needs a value"))?
+                    .parse::<u64>()
+                    .map_err(|_| format!("prefill option '{part}': not a number"))
+            };
+            match k {
+                "plain" => {
+                    let (profile, stats) = (o.profile, o.stats);
+                    o = Self::plain();
+                    o.profile = profile;
+                    o.stats = stats;
+                }
+                "profile" => o.profile = v.is_none_or(|v| v != "0"),
+                "stats" => o.stats = v.is_none_or(|v| v != "0"),
+                "tile" => {
+                    let t = num("tile")?;
+                    if t != 0 && (t % 64 != 0 || t > TILE_MAX) {
+                        return Err(format!(
+                            "prefill tile {t}: must be a multiple of 64 up to {TILE_MAX} (0 = automatic)"
+                        ));
+                    }
+                    o.tile = t;
+                }
+                "mme" => o.mme = num("mme")? != 0,
+                "rows" => {
+                    let r = num("rows")?;
+                    if r > 2 {
+                        return Err(format!("prefill rows {r}: 0, 1 or 2"));
+                    }
+                    o.rows = r as u32;
+                }
+                "fastexp" => o.fastexp = num("fastexp")? != 0,
+                "groups" => o.groups = num("groups")?.max(1),
+                "s16" => {
+                    let s = num("s16")?;
+                    if s > 2 {
+                        return Err(format!("prefill s16 {s}: 0, 1 or 2"));
+                    }
+                    o.s16 = Some(s as u32);
+                }
+                other => {
+                    return Err(format!(
+                        "unknown prefill option '{other}' (tile, mme, rows, fastexp, groups, s16, plain, profile, stats)"
+                    ))
+                }
+            }
+        }
+        Ok(o)
+    }
+
+    /// The options of a load: `Qwen3Config::prefill`, else `GAUDIUM_PREFILL`, else the defaults.
+    pub fn from_config(cfg: &Qwen3Config) -> Result<Self, String> {
+        let mut o = match &cfg.prefill {
+            Some(s) => Self::parse(s)?,
+            None => match std::env::var("GAUDIUM_PREFILL") {
+                Ok(s) => Self::parse(&s).map_err(|e| format!("GAUDIUM_PREFILL: {e}"))?,
+                Err(_) => Self::default(),
+            },
+        };
+        // an explicit narrower `Qwen3Config::prefill_tile` still caps the tile
+        if cfg.prefill_tile < TILE_MAX && (o.tile == 0 || o.tile > cfg.prefill_tile) {
+            o.tile = cfg.prefill_tile.max(1);
+        }
+        Ok(o)
+    }
+}
+
+/// The recipe forms one model's tiles are built in ([`PrefillOpts`] resolved against the model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileForm {
+    pub mme: bool,
+    pub rows: u32,
+    pub fastexp: bool,
+    pub groups: u64,
+    pub s16: u32,
+}
+
+impl TileForm {
+    pub const PLAIN: Self = Self {
+        mme: false,
+        rows: 0,
+        fastexp: false,
+        groups: 1,
+        s16: 0,
+    };
+
+    /// Resolves the levers for `spec`. The throughput forms are built for the dense families
+    /// whose kernel shapes were measured: plain Qwen3 (attention levers) and the dense hybrid
+    /// (all levers). MoE models keep the plain recipes.
+    pub fn resolve(o: &PrefillOpts, spec: &ModelSpec) -> Self {
+        let dense_hybrid = spec.family == ModelFamily::Qwen35Dense
+            && !spec.is_moe()
+            && spec.head_dim == 256
+            && spec.gdn_k_heads == 16
+            && spec.gdn_v_heads == 48;
+        let plain_qwen3 = spec.family == ModelFamily::Qwen3
+            && spec.n_linear_layers() == 0
+            && !spec.is_moe()
+            && spec.head_dim == 128;
+        if !dense_hybrid && !plain_qwen3 {
+            return Self::PLAIN;
+        }
+        let mme = o.mme && dense_hybrid && spec.n_linear_layers() > 0;
+        let fastexp = o.fastexp;
+        let s16_default = if dense_hybrid && spec.fp8_weights {
+            2
+        } else {
+            0
+        };
+        let s16 = if fastexp && dense_hybrid {
+            o.s16.unwrap_or(s16_default)
+        } else {
+            0
+        };
+        Self {
+            mme,
+            rows: if mme { o.rows } else { 0 },
+            fastexp,
+            groups: if fastexp { o.groups.max(1) } else { 1 },
+            s16,
+        }
+    }
+
+    /// Kernel ELFs the tile recipes of this form use beyond the engine's base set.
+    pub fn extra_elfs(&self, spec: &ModelSpec) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.mme {
+            v.extend([
+                "GAUDIUM_GATEC_ELF",
+                "GAUDIUM_CHUNK_ELF",
+                "GAUDIUM_SOLVE_ELF",
+                "GAUDIUM_RELAYS_ELF",
+                "GAUDIUM_RELAY_ELF",
+            ]);
+            match self.rows {
+                0 => {}
+                1 => v.extend(["GAUDIUM_PREPS2_ELF", "GAUDIUM_POST2_ELF"]),
+                _ => v.extend([
+                    "GAUDIUM_PREPA_ELF",
+                    "GAUDIUM_PREPB_ELF",
+                    "GAUDIUM_POSTA_ELF",
+                    "GAUDIUM_POSTB_ELF",
+                ]),
+            }
+        }
+        if self.fastexp {
+            v.push("GAUDIUM_ASOFTCX_ELF");
+            v.push(if spec.head_dim == 128 {
+                "GAUDIUM_A128COMBX_ELF"
+            } else {
+                "GAUDIUM_ACOMBX_ELF"
+            });
+        }
+        if self.s16 > 0 {
+            v.push(if self.s16 >= 2 {
+                "GAUDIUM_ASOFT16P8_ELF"
+            } else {
+                "GAUDIUM_ASOFT16_ELF"
+            });
+            v.extend(["GAUDIUM_AVNAT_ELF", "GAUDIUM_AQS16_ELF"]);
+        }
+        v
+    }
+
+    /// Tile widths tried when the width is not fixed, widest first. The 512-row tile was
+    /// measured with the tile forms only, so a model on the serial DeltaNet kernels or the
+    /// plain softmax keeps the 256-row tile those recipes were validated at.
+    pub fn tile_candidates(&self, spec: &ModelSpec) -> &'static [u64] {
+        if self.fastexp && (self.mme || spec.n_linear_layers() == 0) {
+            &TILE_CANDIDATES
+        } else {
+            &TILE_CANDIDATES[1..]
+        }
+    }
+
+    fn label(&self) -> String {
+        format!(
+            "DeltaNet {} | attention softmax {}, {} chunk group(s), {}",
+            if self.mme {
+                match self.rows {
+                    0 => "chunked on the MME (per-block prep/post)",
+                    1 => "chunked on the MME (row-parallel prep/post)",
+                    _ => "chunked on the MME (row-parallel one-table prep/post)",
+                }
+            } else {
+                "serial on the TPCs"
+            },
+            if self.fastexp { "fast-exp" } else { "plain" },
+            self.groups,
+            match self.s16 {
+                0 => "f32 scores",
+                1 => "BF16 scores",
+                _ => "BF16 scores + FP8 P",
+            }
+        )
+    }
+}
+
+// ============================================================================
+// Graph builders
+// ============================================================================
+
+/// Sizes of the chunk groups of an `nch`-chunk attention core split into at most `groups`.
+pub fn chunk_groups(nch: u64, groups: u64) -> Vec<u64> {
+    let ng = groups.clamp(1, nch.max(1));
+    let per = nch.div_ceil(ng);
+    let mut out = Vec::new();
+    let mut c0 = 0;
+    while c0 < nch {
+        let n = per.min(nch - c0);
+        out.push(n);
+        c0 += n;
+    }
+    out
+}
+
+/// Views of `src {d0, d1, NKV * nch}` per chunk group along the outermost axis (no copies).
+#[allow(clippy::too_many_arguments)]
+fn group_views(
+    gb: &mut GraphBuilder,
+    src: TensorId,
+    name: &str,
+    dtype: SynDataType,
+    d0: u64,
+    d1: u64,
+    nkv: u64,
+    gsz: &[u64],
+) -> Vec<TensorId> {
+    if gsz.len() == 1 {
+        return vec![src];
+    }
+    let parts: Vec<TensorId> = gsz
+        .iter()
+        .enumerate()
+        .map(|(g, &n)| gb.add_intermediate(format!("{name}_v{g}"), dtype, &[d0, d1, nkv * n]))
+        .collect();
+    gb.op_split(format!("{name}_split"), src, &parts, 2);
+    parts
+}
+
+/// Appends one full-attention layer in its tile form (fast-`exp` softmax, chunk groups,
+/// optionally the half-width core). Tensor names shared with the plain layer keep their meaning.
+#[allow(clippy::too_many_arguments)]
+fn append_attn_layer_tile(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    x: TensorId,
+    cursor: TensorId,
+    rope_c: TensorId,
+    rope_s: TensorId,
+    lpfx: &str,
+    t: u64,
+    nch: u64,
+    form: &TileForm,
+) -> TensorId {
+    let hid = spec.hidden;
+    let nh = spec.n_heads;
+    let nkv = spec.n_kv_heads;
+    let dh = spec.head_dim;
+    let r = (nh / nkv) * t;
+    let b = nkv * nch;
+    gb.set_fp8_weights(spec.fp8_weights);
+
+    let (g_aprep, g_acomb, g_apost) = if dh == 128 {
+        (
+            "gaudium_attn128_prep",
+            "gaudium_attn128_combine",
+            "gaudium_attn128_post",
+        )
+    } else {
+        (
+            "gaudium_attn_prep",
+            "gaudium_attn_combine",
+            "gaudium_attn_post_f32",
+        )
+    };
+
+    let h = add_rmsnorm(gb, spec, x, &format!("{lpfx}w_in"), &format!("{lpfx}h"), t);
+    let qg = add_linear_bf16(
+        gb,
+        h,
+        &format!("{lpfx}W_qg"),
+        hid,
+        spec.qg_dim(),
+        t,
+        &format!("{lpfx}qg"),
+    );
+    let k = add_linear_bf16(
+        gb,
+        h,
+        &format!("{lpfx}W_k"),
+        hid,
+        spec.kv_dim(),
+        t,
+        &format!("{lpfx}k"),
+    );
+    let v = add_linear_bf16(
+        gb,
+        h,
+        &format!("{lpfx}W_v"),
+        hid,
+        spec.kv_dim(),
+        t,
+        &format!("{lpfx}v"),
+    );
+
+    let qn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}qn_w"), SynDataType::Float, &[dh]);
+    let kn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}kn_w"), SynDataType::Float, &[dh]);
+    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), SynDataType::Bf16, &[dh, r, b]);
+    let kcache = gb.add_persistent_tensor(
+        format!("{lpfx}kcache"),
+        SynDataType::Bf16,
+        &[dh, KV_CHUNK, b],
+    );
+    let vcache = gb.add_persistent_tensor(
+        format!("{lpfx}vcache"),
+        SynDataType::Bf16,
+        &[dh, KV_CHUNK, b],
+    );
+    gb.add_node(
+        g_aprep,
+        format!("{lpfx}attn_prep"),
+        &[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor],
+        &[qb, kcache, vcache],
+        &u32_params(&[0u32]),
+    );
+
+    let ao = gb.add_persistent_tensor(format!("{lpfx}ao"), SynDataType::Float, &[dh, r, nkv]);
+    let s16 = form.s16 > 0;
+    let gsz = chunk_groups(nch, form.groups);
+    if gsz.len() == 1 && !s16 {
+        // one group: the plain node chain with the tile builds of the softmax and the combine
+        let scores = gb.add_persistent_tensor(
+            format!("{lpfx}scores"),
+            SynDataType::Float,
+            &[KV_CHUNK, r, b],
+        );
+        gb.op_batch_gemm(format!("{lpfx}qk"), qb, kcache, scores, false, true);
+        let pm = gb.add_persistent_tensor(format!("{lpfx}P"), SynDataType::Bf16, &[KV_CHUNK, r, b]);
+        let stats =
+            gb.add_persistent_tensor(format!("{lpfx}stats"), SynDataType::Float, &[64, 2, r, b]);
+        gb.add_node(
+            "gaudium_attn_softmax_chunk",
+            format!("{lpfx}softmax"),
+            &[scores, cursor],
+            &[pm, stats],
+            &u32_params(&[t as u32, nch as u32, 0, 0, 1]),
+        );
+        let ao_part =
+            gb.add_persistent_tensor(format!("{lpfx}ao_part"), SynDataType::Float, &[dh, r, b]);
+        gb.op_batch_gemm(format!("{lpfx}pv"), pm, vcache, ao_part, false, false);
+        gb.add_node(
+            g_acomb,
+            format!("{lpfx}combine"),
+            &[ao_part, stats],
+            &[ao],
+            &u32_params(&[nch as u32, 1]),
+        );
+    } else {
+        // half-width core: queries in the score unit of the 128-lane softmax, V chunks in the
+        // key order of its P. Kept persistent (scratch) so no recipe's workspace grows with the
+        // context.
+        let p8 = form.s16 >= 2;
+        let (qsrc, vsrc, vdt) = if s16 {
+            let qs =
+                gb.add_persistent_tensor(format!("{lpfx}qs16"), SynDataType::Bf16, &[dh, r, b]);
+            gb.add_node(
+                "gaudium_attn_qs16",
+                format!("{lpfx}qs16"),
+                &[qb],
+                &[qs],
+                &[],
+            );
+            let vn = gb.add_persistent_tensor(
+                format!("{lpfx}vnat"),
+                SynDataType::Bf16,
+                &[dh, KV_CHUNK, b],
+            );
+            gb.add_node(
+                "gaudium_attn_vnat",
+                format!("{lpfx}vnat"),
+                &[vcache],
+                &[vn],
+                &u32_params(&[u32::from(p8)]),
+            );
+            if p8 {
+                // P and the PV GEMM's V as FP8: V / 2 through the vendor cast (unit scale)
+                let v8 = gb.add_persistent_tensor(
+                    format!("{lpfx}vnat8"),
+                    SynDataType::Fp8_143,
+                    &[dh, KV_CHUNK, b],
+                );
+                let one = gb.get_or_add_persistent_tensor("fp8_one", SynDataType::Float, &[1]);
+                let cp = ConvertToFp8Params {
+                    round_mode: CAST_ROUND_HALF_NE,
+                };
+                gb.add_node(
+                    "convert_to_fp8_bf16",
+                    format!("{lpfx}vnat_cast"),
+                    &[vn, one],
+                    &[v8],
+                    as_param_bytes(&cp),
+                );
+                (qs, v8, SynDataType::Fp8_143)
+            } else {
+                (qs, vn, SynDataType::Bf16)
+            }
+        } else {
+            (qb, vcache, SynDataType::Bf16)
+        };
+        let sdt = if s16 {
+            SynDataType::Bf16
+        } else {
+            SynDataType::Float
+        };
+        let pdt = if p8 {
+            SynDataType::Fp8_143
+        } else {
+            SynDataType::Bf16
+        };
+        let qv = group_views(
+            gb,
+            qsrc,
+            &format!("{lpfx}qb"),
+            SynDataType::Bf16,
+            dh,
+            r,
+            nkv,
+            &gsz,
+        );
+        let kv = group_views(
+            gb,
+            kcache,
+            &format!("{lpfx}kc"),
+            SynDataType::Bf16,
+            dh,
+            KV_CHUNK,
+            nkv,
+            &gsz,
+        );
+        let vv = group_views(gb, vsrc, &format!("{lpfx}vc"), vdt, dh, KV_CHUNK, nkv, &gsz);
+        let mut aops = Vec::with_capacity(gsz.len());
+        let mut sts = Vec::with_capacity(gsz.len());
+        let mut c0 = 0u64;
+        for (g, &n) in gsz.iter().enumerate() {
+            let gp = format!("{lpfx}g{g}_");
+            let bg = nkv * n;
+            let sc = gb.add_persistent_tensor(format!("{gp}scores"), sdt, &[KV_CHUNK, r, bg]);
+            gb.op_batch_gemm(format!("{gp}qk"), qv[g], kv[g], sc, false, true);
+            let pg = gb.add_persistent_tensor(format!("{gp}P"), pdt, &[KV_CHUNK, r, bg]);
+            let stg =
+                gb.add_persistent_tensor(format!("{gp}stats"), SynDataType::Float, &[64, 2, r, bg]);
+            let base = (c0 * KV_CHUNK) as u32;
+            if s16 {
+                gb.add_node(
+                    "gaudium_attn_softmax16",
+                    format!("{gp}softmax"),
+                    &[sc, cursor],
+                    &[pg, stg],
+                    &u32_params(&[t as u32, n as u32, 0, base]),
+                );
+            } else {
+                gb.add_node(
+                    "gaudium_attn_softmax_chunk",
+                    format!("{gp}softmax"),
+                    &[sc, cursor],
+                    &[pg, stg],
+                    &u32_params(&[t as u32, n as u32, 0, 0, 1, base]),
+                );
+            }
+            let ag =
+                gb.add_persistent_tensor(format!("{gp}ao_part"), SynDataType::Float, &[dh, r, bg]);
+            gb.op_batch_gemm(format!("{gp}pv"), pg, vv[g], ag, false, false);
+            aops.push(ag);
+            sts.push(stg);
+            c0 += n;
+        }
+        let comb = u32_params(&[nch as u32, 1]);
+        if gsz.len() > 1 {
+            let ao_part =
+                gb.add_persistent_tensor(format!("{lpfx}ao_part"), SynDataType::Float, &[dh, r, b]);
+            let stats = gb.add_persistent_tensor(
+                format!("{lpfx}stats"),
+                SynDataType::Float,
+                &[64, 2, r, b],
+            );
+            gb.op_concat(format!("{lpfx}ao_cat"), &aops, ao_part, 2);
+            gb.op_concat(format!("{lpfx}st_cat"), &sts, stats, 3);
+            gb.add_node(
+                g_acomb,
+                format!("{lpfx}combine"),
+                &[ao_part, stats],
+                &[ao],
+                &comb,
+            );
+        } else {
+            gb.add_node(
+                g_acomb,
+                format!("{lpfx}combine"),
+                &[aops[0], sts[0]],
+                &[ao],
+                &comb,
+            );
+        }
+    }
+
+    let core = gb.add_persistent_tensor(format!("{lpfx}core"), SynDataType::Bf16, &[nh * dh, t]);
+    gb.add_node(g_apost, format!("{lpfx}attn_post"), &[ao, qg], &[core], &[]);
+    let attn = add_linear_bf16(
+        gb,
+        core,
+        &format!("{lpfx}W_o"),
+        nh * dh,
+        hid,
+        t,
+        &format!("{lpfx}attn"),
+    );
+    append_post_and_mlp(gb, spec, x, attn, lpfx, t, false, None).0
+}
+
+/// The chunked gated-delta recurrence of one layer from the matrix state `s0` over `nchk` chunks
+/// of `c` rows: coefficients on the TPCs, inverse and products on the MME, then the serial state
+/// chain. Returns `(X {128, 2c, hv, nchk}, state after the last chunk)`; rows `< c` of chunk `j`
+/// of `X` are the outputs of rows `j*c ..`.
+#[allow(clippy::too_many_arguments)]
+fn append_chunk_core(
+    gb: &mut GraphBuilder,
+    lpfx: &str,
+    c: u64,
+    nchk: u64,
+    hv: u64,
+    s0: TensorId,
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    gate: TensorId,
+) -> (TensorId, TensorId) {
+    const D: u64 = 128;
+    let f32t = SynDataType::Float;
+    let tp = c * nchk;
+    let a = |gb: &mut GraphBuilder, n: &str, dims: &[u64]| {
+        gb.add_persistent_tensor(format!("{lpfx}{n}"), f32t, dims)
+    };
+    let cc = [c, c, hv, nchk];
+
+    let gbt = a(gb, "gbT", &[tp, 128]);
+    let tpar = TransposeParams {
+        permutation: [1, 0, 0, 0, 0],
+        tensor_dim: 2,
+    };
+    gb.add_node(
+        "transpose",
+        format!("{lpfx}gbT"),
+        &[gate],
+        &[gbt],
+        as_param_bytes(&tpar),
+    );
+    let kk = a(gb, "KK", &cc);
+    let qk = a(gb, "QK", &cc);
+    gb.op_batch_gemm(format!("{lpfx}KK"), k, k, kk, false, true);
+    gb.op_batch_gemm(format!("{lpfx}QK"), q, k, qk, false, true);
+
+    let m3 = a(gb, "M3", &[c, 2 * c, hv, nchk]);
+    let an = a(gb, "An", &cc);
+    let gb2 = a(gb, "gb2", &[c, 2, hv, nchk]);
+    let gq0 = a(gb, "GQ0", &[D, 2 * c, hv, nchk]);
+    let ak = a(gb, "AK", &[D, 2 * c, hv, nchk]);
+    let gl = a(gb, "gL", &[1, 1, hv, nchk]);
+    gb.add_node(
+        "gaudium_gdn_chunk",
+        format!("{lpfx}chunk"),
+        &[gbt, kk, qk, q, k],
+        &[m3, an, gb2, gq0, ak, gl],
+        &[],
+    );
+
+    // (I + A)^-1 diag(beta): 16x16 diagonal blocks on the TPC, the rest by the exact Neumann
+    // series of the block-strictly-lower remainder on the MME
+    let d0n = a(gb, "D0n", &cc);
+    let dn = a(gb, "Dn", &cc);
+    let dg = a(gb, "Dg", &cc);
+    let lp = a(gb, "Lp", &cc);
+    let id = a(gb, "Id", &cc);
+    gb.add_node(
+        "gaudium_gdn_solve",
+        format!("{lpfx}solve"),
+        &[an, gb2],
+        &[d0n, dn, dg, lp, id],
+        &[],
+    );
+    let gemm3 = |gb: &mut GraphBuilder,
+                 n: String,
+                 x: TensorId,
+                 y: TensorId,
+                 z: TensorId,
+                 out: TensorId,
+                 ta: bool| {
+        let p = crate::synapse::ops::GemmParams::new(ta, false);
+        gb.add_node("batch_gemm", n, &[x, y, z], &[out], as_param_bytes(&p));
+    };
+    let y = a(gb, "Y", &cc);
+    gb.op_batch_gemm(format!("{lpfx}Y"), d0n, lp, y, false, false);
+    let mut n = a(gb, "N1", &cc);
+    gemm3(gb, format!("{lpfx}N1"), d0n, lp, id, n, false);
+    for it in 2..(c / 16) {
+        let n2 = a(gb, &format!("N{it}"), &cc);
+        gemm3(gb, format!("{lpfx}N{it}"), y, n, id, n2, false);
+        n = n2;
+    }
+    let mw = a(gb, "Mw", &cc);
+    let mun = a(gb, "Mun", &cc);
+    gb.op_batch_gemm(format!("{lpfx}Mun"), n, dn, mun, false, false);
+    gb.op_batch_gemm(format!("{lpfx}Mw"), n, dg, mw, false, false);
+
+    // chunk-batched products
+    let m2 = a(gb, "M2", &[c, 2 * c, hv, nchk]);
+    let un = a(gb, "Un", &[D, c, hv, nchk]);
+    let cx = a(gb, "CX", &[D, 2 * c, hv, nchk]);
+    let ax = a(gb, "AX", &[D, 2 * c, hv, nchk]);
+    gb.op_batch_gemm(format!("{lpfx}M2"), m3, mw, m2, false, false);
+    gb.op_batch_gemm(format!("{lpfx}Un"), mun, v, un, false, false);
+    gb.op_batch_gemm(format!("{lpfx}CX"), m3, un, cx, false, false);
+    gemm3(gb, format!("{lpfx}AX"), m2, k, gq0, ax, false);
+
+    // per-chunk operands: views along the outermost axis
+    let split = |gb: &mut GraphBuilder, src: TensorId, n: &str, dims: &[u64]| -> Vec<TensorId> {
+        let parts: Vec<TensorId> = (0..nchk)
+            .map(|j| gb.add_intermediate(format!("{lpfx}{n}_{j}"), f32t, dims))
+            .collect();
+        gb.op_split(format!("{lpfx}{n}_split"), src, &parts, 3);
+        parts
+    };
+    let axj = split(gb, ax, "AXj", &[D, 2 * c, hv, 1]);
+    let cxj = split(gb, cx, "CXj", &[D, 2 * c, hv, 1]);
+    let akj = split(gb, ak, "AKj", &[D, 2 * c, hv, 1]);
+    let glj = split(gb, gl, "gLj", &[1, 1, hv, 1]);
+
+    // the serial chain over chunks: three nodes per chunk
+    let mut xs = Vec::with_capacity(nchk as usize);
+    let mut s = s0;
+    for j in 0..nchk as usize {
+        let xj = gb.add_intermediate(format!("{lpfx}X_{j}"), f32t, &[D, 2 * c, hv, 1]);
+        gemm3(gb, format!("{lpfx}X_{j}"), axj[j], s, cxj[j], xj, false);
+        let sd = a(gb, &format!("mSd_{j}"), &[D, D, hv, 1]);
+        gb.add_node(
+            "mult_fwd_f32",
+            format!("{lpfx}Sd_{j}"),
+            &[s, glj[j]],
+            &[sd],
+            &[],
+        );
+        let sn = a(gb, &format!("mS{}", j + 1), &[D, D, hv, 1]);
+        gemm3(gb, format!("{lpfx}Supd_{j}"), akj[j], xj, sd, sn, true);
+        xs.push(xj);
+        s = sn;
+    }
+    let x_all = a(gb, "X", &[D, 2 * c, hv, nchk]);
+    gb.op_concat(format!("{lpfx}Xcat"), &xs, x_all, 3);
+    (x_all, s)
+}
+
+/// Appends one Gated DeltaNet layer with the chunked MME recurrence. The interface to the engine
+/// is the plain layer's: `(x_in, S_in, cs_in) -> (out, S_out, cs_out)`, states in the decode
+/// kernels' blob layout.
+fn append_linear_layer_mme(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    x: TensorId,
+    slot: TensorId,
+    lpfx: &str,
+    t: u64,
+    form: &TileForm,
+) -> TensorId {
+    let hid = spec.hidden;
+    let hv = spec.gdn_v_heads;
+    let hk = spec.gdn_k_heads;
+    let dl = spec.gdn_v_dim;
+    let qkv = spec.gdn_qkv_dim();
+    let hvp = spec.gdn_hvp();
+    let f32t = SynDataType::Float;
+    let c = GDN_CHUNK;
+    let nchk = t.div_ceil(c);
+    let tp = c * nchk;
+    gb.set_fp8_weights(spec.fp8_weights);
+
+    let h = add_rmsnorm(gb, spec, x, &format!("{lpfx}w_in"), &format!("{lpfx}h"), t);
+    let qkvz = add_linear_bf16(
+        gb,
+        h,
+        &format!("{lpfx}W_qkvz"),
+        hid,
+        spec.gdn_qkvz_dim(),
+        t,
+        &format!("{lpfx}qkvz"),
+    );
+    let ba = add_linear_bf16(
+        gb,
+        h,
+        &format!("{lpfx}W_ba"),
+        hid,
+        spec.gdn_ba_dim(),
+        t,
+        &format!("{lpfx}ba"),
+    );
+
+    let conv_w = gb.get_or_add_persistent_tensor(format!("{lpfx}conv_w"), f32t, &[qkv, 4]);
+    let conv_b = gb.get_or_add_persistent_tensor(format!("{lpfx}conv_b"), f32t, &[qkv]);
+    let cs_in = gb.add_persistent_tensor(format!("{lpfx}cs_in"), f32t, &[qkv, 3, 1]);
+    let cs_out = gb.add_persistent_tensor(format!("{lpfx}cs_out"), f32t, &[qkv, 3]);
+    let cs_ckpt = gb.add_persistent_tensor(format!("{lpfx}cs_ckpt"), f32t, &[qkv, 3, 1]);
+    let a_log = gb.get_or_add_persistent_tensor(format!("{lpfx}A_log"), f32t, &[hvp]);
+    let dt_bias = gb.get_or_add_persistent_tensor(format!("{lpfx}dt_bias"), f32t, &[hvp]);
+    let norm_w = gb.get_or_add_persistent_tensor(format!("{lpfx}norm_w"), f32t, &[dl]);
+    let s_in = gb.add_persistent_tensor(format!("{lpfx}S_in"), f32t, &[64, 256, hv, 1]);
+    let s_out = gb.add_persistent_tensor(format!("{lpfx}S_out"), f32t, &[64, 256, hv]);
+
+    // q / k / v in the chunked layout: row t at {., t % c, head, t / c}; pad rows are zero
+    let q = gb.add_persistent_tensor(format!("{lpfx}q"), f32t, &[dl, c, hv, nchk]);
+    let k = gb.add_persistent_tensor(format!("{lpfx}k"), f32t, &[dl, c, hv, nchk]);
+    let v = gb.add_persistent_tensor(format!("{lpfx}v"), f32t, &[dl, c, hv, nchk]);
+    // flags: bit5 chunked layout, bit6 row-parallel build, chunk rows in the high half
+    let pf = 32u32 | ((c as u32) << 16) | if form.rows >= 1 { 64 } else { 0 };
+    if form.rows >= 2 {
+        let y = gb.add_intermediate(format!("{lpfx}y"), f32t, &[128, t, 2 * hk]);
+        gb.add_node(
+            "gaudium_gdn_prepa",
+            format!("{lpfx}gdn_prepa"),
+            &[qkvz, conv_w, cs_in, conv_b, slot],
+            &[y, v, cs_out, cs_ckpt],
+            &u32_params(&[pf]),
+        );
+        gb.add_node(
+            "gaudium_gdn_prepb",
+            format!("{lpfx}gdn_prepb"),
+            &[y],
+            &[q, k],
+            &u32_params(&[c as u32]),
+        );
+    } else {
+        gb.add_node(
+            "gaudium_gdn_prep",
+            format!("{lpfx}gdn_prep"),
+            &[qkvz, conv_w, cs_in, conv_b, slot],
+            &[q, k, v, cs_out, cs_ckpt],
+            &u32_params(&[pf]),
+        );
+    }
+
+    // gate: lanes 0..63 the chunk-local cumulative log decay, 64..127 beta
+    let gate = gb.add_persistent_tensor(format!("{lpfx}gb"), f32t, &[128, tp]);
+    gb.add_node(
+        "gaudium_gdn_gate",
+        format!("{lpfx}gdn_gate"),
+        &[ba, a_log, dt_bias],
+        &[gate],
+        &u32_params(&[c as u32]),
+    );
+
+    // state blob -> matrix, the chunk recurrence, matrix -> blob
+    let s0 = gb.add_persistent_tensor(format!("{lpfx}mS0"), f32t, &[128, 128, hv, 1]);
+    gb.add_node(
+        "gaudium_gdn_relayout",
+        format!("{lpfx}relay_in"),
+        &[s_in, slot],
+        &[s0],
+        &u32_params(&[0]),
+    );
+    let (x_all, s_last) = append_chunk_core(gb, lpfx, c, nchk, hv, s0, q, k, v, gate);
+    gb.add_node(
+        "gaudium_gdn_relayout",
+        format!("{lpfx}relay_out"),
+        &[s_last],
+        &[s_out],
+        &u32_params(&[1]),
+    );
+
+    let core = gb.add_persistent_tensor(format!("{lpfx}core"), SynDataType::Bf16, &[hv * dl, t]);
+    if form.rows >= 2 {
+        let rn = gb.add_intermediate(format!("{lpfx}rn"), f32t, &[64, t, hv]);
+        gb.add_node(
+            "gaudium_gdn_posta",
+            format!("{lpfx}gdn_posta"),
+            &[x_all],
+            &[rn],
+            &u32_params(&[c as u32]),
+        );
+        gb.add_node(
+            "gaudium_gdn_postb",
+            format!("{lpfx}gdn_postb"),
+            &[x_all, qkvz, norm_w, rn],
+            &[core],
+            &u32_params(&[c as u32]),
+        );
+    } else {
+        gb.add_node(
+            "gaudium_gdn_post",
+            format!("{lpfx}gdn_post"),
+            &[x_all, qkvz, norm_w],
+            &[core],
+            &u32_params(&[pf]),
+        );
+    }
+
+    let attn = add_linear_bf16(
+        gb,
+        core,
+        &format!("{lpfx}W_o"),
+        hv * dl,
+        hid,
+        t,
+        &format!("{lpfx}attn"),
+    );
+    append_post_and_mlp(gb, spec, x, attn, lpfx, t, false, None).0
+}
+
+/// The single-layer full-attention tile graph of `form` (`t` rows over `nch` cache chunks).
+/// `elf_base` are the engine's base kernel hashes (the plain form's fingerprint), `elf_tile` the
+/// hashes of the tile forms' kernels.
+pub fn build_attn_tile_graph(
+    spec: &ModelSpec,
+    t: u64,
+    lmax: u64,
+    nch: u64,
+    form: &TileForm,
+    elf_base: &[(String, String)],
+    elf_tile: &[(String, String)],
+) -> GraphBuilder {
+    if !form.fastexp {
+        return build_prefill_attn_layer_graph(spec, t, lmax, nch, elf_base);
+    }
+    let tag = match form.s16 {
+        0 => "x",
+        1 => "h",
+        _ => "h8",
+    };
+    let mut gb = GraphBuilder::new(format!(
+        "g_qwen_attn{tag}_T{t}_C{nch}_G{}",
+        chunk_groups(nch, form.groups).len()
+    ));
+    for (k, h) in elf_base.iter().chain(elf_tile) {
+        gb.record_kernel_elf_hash(k, h);
+    }
+    let x_in = gb.add_persistent_tensor("x_in", SynDataType::Bf16, &[spec.hidden, t]);
+    let cursor = gb.add_persistent_tensor("cursor", SynDataType::Int32, &[1]);
+    let rope_c = gb.add_persistent_tensor("rope_c", SynDataType::Float, &[128, lmax]);
+    let rope_s = gb.add_persistent_tensor("rope_s", SynDataType::Float, &[128, lmax]);
+    let _ = append_attn_layer_tile(
+        &mut gb, spec, x_in, cursor, rope_c, rope_s, "L_", t, nch, form,
+    );
+    gb
+}
+
+/// The single-layer Gated DeltaNet tile graph of `form` (`t` rows).
+pub fn build_lin_tile_graph(
+    spec: &ModelSpec,
+    t: u64,
+    form: &TileForm,
+    elf_base: &[(String, String)],
+    elf_tile: &[(String, String)],
+) -> GraphBuilder {
+    if !form.mme {
+        return build_prefill_linear_layer_graph(spec, t, elf_base);
+    }
+    let mut gb = GraphBuilder::new(format!("g_qwen_linm{}_T{t}", form.rows));
+    for (k, h) in elf_base.iter().chain(elf_tile) {
+        gb.record_kernel_elf_hash(k, h);
+    }
+    let x_in = gb.add_persistent_tensor("x_in", SynDataType::Bf16, &[spec.hidden, t]);
+    let slot = gb.get_or_add_persistent_tensor("zero_slot", SynDataType::Int32, &[1]);
+    let _ = append_linear_layer_mme(&mut gb, spec, x_in, slot, "L_", t, form);
+    gb
+}
+
+// ============================================================================
+// Scratch plan
+// ============================================================================
+
+/// Is `name` a tile-recipe tensor the tile loop binds itself (input / output rows, caches,
+/// states, tables, weights)? Everything else is scratch laid out in the shared region.
+fn is_loop_bound(name: &str) -> bool {
+    matches!(
+        name,
+        "x_in"
+            | "L_out"
+            | "cursor"
+            | "rope_c"
+            | "rope_s"
+            | "norm_ones"
+            | "zero_slot"
+            | "fp8_one"
+            | "L_kcache"
+            | "L_vcache"
+            | "L_S_in"
+            | "L_S_out"
+            | "L_cs_in"
+            | "L_cs_out"
+    ) || is_generic_layer_weight(name)
+}
+
+/// Offsets of a tile graph's scratch tensors in the shared region, and the bytes they span.
+fn scratch_layout(gb: &GraphBuilder) -> (BTreeMap<String, u64>, u64) {
+    let mut map = BTreeMap::new();
+    let mut off = 0u64;
+    for (name, _dt, _dims, bytes) in gb.persistent_tensor_specs() {
+        if is_loop_bound(&name) {
+            continue;
+        }
+        map.insert(name, off);
+        off += align_up(bytes.max(256), 256);
+    }
+    (map, off)
+}
+
+/// Per-request timers of the tile loop.
+#[derive(Debug, Default)]
+pub(super) struct TileTimers {
+    pub tiles: u64,
+    pub launches: u64,
+    /// Host time in the ids / cursor uploads, in the launch calls (pools, checks, enqueue) and
+    /// waiting for the tile's last launch.
+    pub upload_ms: f64,
+    pub submit_ms: f64,
+    pub wait_ms: f64,
+    /// Profile runs: device time per recipe class (launch call to its synchronisation).
+    classes: BTreeMap<String, (u64, f64)>,
+}
+
+impl TileTimers {
+    pub(super) fn class(&mut self, name: &str, ms: f64) {
+        match self.classes.get_mut(name) {
+            Some(e) => {
+                e.0 += 1;
+                e.1 += ms;
+            }
+            None => {
+                self.classes.insert(name.to_string(), (1, ms));
+            }
+        }
+    }
+}
+
+/// Tile-recipe state of one loaded engine: the forms, the tile width, the scratch region and
+/// the scratch layout of every compiled tile recipe.
+pub(super) struct TileRt {
+    pub opts: PrefillOpts,
+    pub form: TileForm,
+    tile: u64,
+    elf_tile: Vec<(String, String)>,
+    scratch_base: u64,
+    scratch_bytes: u64,
+    /// Device address of the f32 constant 1.0 the FP8 cast of the half-width core reads.
+    const_one: u64,
+    attn_layout: HashMap<(u64, u64), BTreeMap<String, u64>>,
+    lin_layout: HashMap<u64, BTreeMap<String, u64>>,
+    pub timers: TileTimers,
+}
+
+impl TileRt {
+    /// Resolves the forms for `spec` and fingerprints the kernels they add.
+    pub(super) fn new(
+        opts: PrefillOpts,
+        spec: &ModelSpec,
+        kenv: &KernelEnv,
+        elf_base: &[(String, String)],
+    ) -> Result<Self, String> {
+        let form = TileForm::resolve(&opts, spec);
+        let mut elf_tile = Vec::new();
+        for (k, h) in kenv.fingerprint_hashes(&form.extra_elfs(spec))? {
+            if !elf_base.iter().any(|(bk, _)| *bk == k) {
+                elf_tile.push((k, h));
+            }
+        }
+        Ok(Self {
+            opts,
+            form,
+            tile: if opts.tile > 0 {
+                opts.tile
+            } else {
+                form.tile_candidates(spec)[0]
+            },
+            elf_tile,
+            scratch_base: 0,
+            scratch_bytes: 0,
+            const_one: 0,
+            attn_layout: HashMap::new(),
+            lin_layout: HashMap::new(),
+            timers: TileTimers::default(),
+        })
+    }
+
+    /// Rows of a full tile (the widest candidate until [`Self::settle`] chose).
+    pub(super) fn tile(&self) -> u64 {
+        self.tile
+    }
+
+    /// Bytes of the `fp8_one` constant buffer (0 when no recipe reads it).
+    pub(super) fn const_bytes(&self) -> u64 {
+        if self.form.s16 >= 2 {
+            256
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn attn_graph(
+        &self,
+        spec: &ModelSpec,
+        t: u64,
+        lmax: u64,
+        nch: u64,
+        elf_base: &[(String, String)],
+    ) -> GraphBuilder {
+        build_attn_tile_graph(spec, t, lmax, nch, &self.form, elf_base, &self.elf_tile)
+    }
+
+    pub(super) fn lin_graph(
+        &self,
+        spec: &ModelSpec,
+        t: u64,
+        elf_base: &[(String, String)],
+    ) -> GraphBuilder {
+        build_lin_tile_graph(spec, t, &self.form, elf_base, &self.elf_tile)
+    }
+
+    /// Scratch bytes of the largest tile recipe at `tile` rows: every chunk count up to
+    /// `max_chunks` of the attention layer, and the DeltaNet layer.
+    pub(super) fn plan_bytes(
+        &self,
+        spec: &ModelSpec,
+        tile: u64,
+        lmax: u64,
+        max_chunks: u64,
+    ) -> u64 {
+        let mut bytes = 0u64;
+        if spec.n_full_attention_layers() > 0 {
+            for nch in 1..=max_chunks {
+                let gb = self.attn_graph(spec, tile, lmax, nch, &[]);
+                bytes = bytes.max(scratch_layout(&gb).1);
+            }
+        }
+        if spec.n_linear_layers() > 0 {
+            bytes = bytes.max(scratch_layout(&self.lin_graph(spec, tile, &[])).1);
+        }
+        bytes
+    }
+
+    /// Chooses the tile width (the widest candidate for which `fits(scratch_bytes, workspace)`
+    /// holds; a fixed width is taken as is), compiles that width's full-tile recipes into the
+    /// engine's maps and returns `(scratch bytes, largest workspace)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn settle(
+        &mut self,
+        spec: &ModelSpec,
+        lmax: u64,
+        max_chunks: u64,
+        elf_base: &[(String, String)],
+        api: &std::sync::Arc<SynapseApi>,
+        cache: &RecipeCache,
+        driver_version: &str,
+        attn: &mut HashMap<(u64, u64), CompiledRecipe>,
+        lin: &mut HashMap<u64, CompiledRecipe>,
+        embed: &mut HashMap<u64, CompiledRecipe>,
+        verbose: bool,
+        fits: &dyn Fn(u64, u64) -> bool,
+    ) -> Result<(u64, u64), String> {
+        let candidates: Vec<u64> = if self.opts.tile > 0 {
+            vec![self.opts.tile]
+        } else {
+            self.form.tile_candidates(spec).to_vec()
+        };
+        let mut chosen = None;
+        for (i, &tile) in candidates.iter().enumerate() {
+            let last = i + 1 == candidates.len();
+            let scratch = self.plan_bytes(spec, tile, lmax, max_chunks);
+            if !last && !fits(scratch, 0) {
+                continue;
+            }
+            // the full-tile recipes of this width, one attention recipe per chunk count a prompt
+            // can reach: their workspaces are part of the plan, and no request pays for a
+            // full-tile recipe inside its time to first token
+            let t_build = Instant::now();
+            let mut ws = 0u64;
+            let mut built: Vec<((u64, u64), CompiledRecipe)> = Vec::new();
+            if spec.n_full_attention_layers() > 0 && tile > 1 {
+                for nch in 1..=max_chunks {
+                    let gb = self.attn_graph(spec, tile, lmax, nch, elf_base);
+                    let r = gb
+                        .compile(std::sync::Arc::clone(api), cache, driver_version)
+                        .map_err(|e| format!("compile prefill attn layer T={tile} C={nch}: {e}"))?;
+                    ws = ws.max(r.ws_size);
+                    built.push(((tile, nch), r));
+                }
+            }
+            if !last && !fits(scratch, ws) {
+                continue;
+            }
+            if verbose && !built.is_empty() {
+                eprintln!(
+                    "[gaudium] prefill attention recipes T={tile} C=1..{max_chunks}: {} from the cache, {} compiled, {:.2}s, largest ws={:.2} MiB",
+                    built.iter().filter(|b| b.1.from_cache).count(),
+                    built.iter().filter(|b| !b.1.from_cache).count(),
+                    t_build.elapsed().as_secs_f64(),
+                    ws as f64 / (1024.0 * 1024.0)
+                );
+            }
+            for (key, r) in built {
+                let gb = self.attn_graph(spec, key.0, lmax, key.1, &[]);
+                self.attn_layout.insert(key, scratch_layout(&gb).0);
+                attn.insert(key, r);
+            }
+            if spec.n_linear_layers() > 0 && tile > 1 {
+                let gb = self.lin_graph(spec, tile, elf_base);
+                let r = gb
+                    .compile(std::sync::Arc::clone(api), cache, driver_version)
+                    .map_err(|e| format!("compile prefill lin layer T={tile}: {e}"))?;
+                if verbose {
+                    eprintln!(
+                        "[gaudium] recipe {} cache_hit={} ws={:.2} MiB",
+                        r.name,
+                        r.from_cache,
+                        r.ws_size as f64 / (1024.0 * 1024.0)
+                    );
+                }
+                ws = ws.max(r.ws_size);
+                self.lin_layout.insert(tile, scratch_layout(&gb).0);
+                lin.insert(tile, r);
+            }
+            if tile > 1 {
+                let r = build_embed_graph(spec, tile)
+                    .compile(std::sync::Arc::clone(api), cache, driver_version)
+                    .map_err(|e| format!("compile embed T={tile}: {e}"))?;
+                ws = ws.max(r.ws_size);
+                embed.insert(tile, r);
+            }
+            chosen = Some((tile, scratch, ws));
+            break;
+        }
+        let (tile, scratch, ws) = chosen.expect("at least one tile candidate");
+        self.tile = tile;
+        self.scratch_bytes = scratch;
+        if verbose {
+            eprintln!(
+                "[gaudium] prefill: tile {tile} rows, {} | scratch {:.2} GiB",
+                self.form.label(),
+                scratch as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+        Ok((scratch, ws))
+    }
+
+    /// Records where the planned scratch region (and the constant buffer) were allocated.
+    pub(super) fn set_addresses(&mut self, scratch_base: u64, const_one: u64) {
+        self.scratch_base = scratch_base;
+        self.const_one = const_one;
+    }
+
+    /// Fills the constant buffer after the allocations are sealed.
+    pub(super) fn finish_load(
+        &self,
+        dev: &crate::synapse::device::HpuDevice,
+    ) -> Result<(), String> {
+        if self.const_one != 0 {
+            dev.copy_h2d_sync(&1.0f32.to_le_bytes(), self.const_one)
+                .map_err(|e| format!("upload prefill constant: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Registers the scratch layout of a newly built attention tile recipe; refuses a recipe
+    /// whose scratch would not fit the planned region (nothing is allocated after sealing).
+    pub(super) fn register_attn(
+        &mut self,
+        gb: &GraphBuilder,
+        t: u64,
+        nch: u64,
+    ) -> Result<(), String> {
+        let (map, bytes) = scratch_layout(gb);
+        self.check_fits("attention", t, bytes)?;
+        self.attn_layout.insert((t, nch), map);
+        Ok(())
+    }
+
+    /// Registers the scratch layout of a newly built DeltaNet tile recipe.
+    pub(super) fn register_lin(&mut self, gb: &GraphBuilder, t: u64) -> Result<(), String> {
+        let (map, bytes) = scratch_layout(gb);
+        self.check_fits("DeltaNet", t, bytes)?;
+        self.lin_layout.insert(t, map);
+        Ok(())
+    }
+
+    fn check_fits(&self, what: &str, t: u64, bytes: u64) -> Result<(), String> {
+        if bytes > self.scratch_bytes {
+            return Err(format!(
+                "prefill {what} recipe of {t} rows needs {bytes} B of scratch, the plan holds {} B",
+                self.scratch_bytes
+            ));
+        }
+        Ok(())
+    }
+
+    fn pool_of(&self, layout: Option<&BTreeMap<String, u64>>) -> BTreeMap<String, u64> {
+        let mut pool = BTreeMap::new();
+        if let Some(l) = layout {
+            for (name, &off) in l {
+                pool.insert(name.clone(), self.scratch_base + off);
+            }
+        }
+        if self.const_one != 0 {
+            pool.insert("fp8_one".to_string(), self.const_one);
+        }
+        pool
+    }
+
+    /// Scratch bindings of the attention tile recipe `(t, nch)`.
+    pub(super) fn attn_pool(&self, t: u64, nch: u64) -> BTreeMap<String, u64> {
+        self.pool_of(self.attn_layout.get(&(t, nch)))
+    }
+
+    /// Scratch bindings of the DeltaNet tile recipe of `t` rows.
+    pub(super) fn lin_pool(&self, t: u64) -> BTreeMap<String, u64> {
+        self.pool_of(self.lin_layout.get(&t))
+    }
+
+    /// Starts the timers of a request.
+    pub(super) fn begin_request(&mut self) {
+        self.timers = TileTimers::default();
+    }
+
+    /// Prints the timers of the request that just prefilled (`profile` / `stats` only).
+    pub(super) fn report(&self, prompt_tokens: usize, ttft_ms: f64) {
+        if !self.opts.profile && !self.opts.stats {
+            return;
+        }
+        let t = &self.timers;
+        eprintln!(
+            "[prefill] {prompt_tokens} tok, {} tiles of {} rows, {} launches in {ttft_ms:.1} ms: host uploads {:.1} ms, launch calls {:.1} ms, waiting {:.1} ms",
+            t.tiles, self.tile, t.launches, t.upload_ms, t.submit_ms, t.wait_ms
+        );
+        if self.opts.profile {
+            let total: f64 = t.classes.values().map(|e| e.1).sum();
+            for (name, (n, ms)) in &t.classes {
+                eprintln!(
+                    "[prefill]   {name:<24} {n:>6} launches {ms:>10.1} ms  {:>8.3} ms each  {:>5.1} %",
+                    ms / (*n as f64).max(1.0),
+                    100.0 * ms / total.max(1e-9)
+                );
+            }
+        }
+    }
+}
+
+/// A clock for the tile loop's timers.
+pub(super) fn now() -> Instant {
+    Instant::now()
+}
+
+/// Milliseconds since `t0`.
+pub(super) fn ms_since(t0: Instant) -> f64 {
+    t0.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dense_spec() -> ModelSpec {
+        let cfg = r#"{
+          "architectures": ["Qwen3_5ForConditionalGeneration"],
+          "model_type": "qwen3_5",
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "vocab_size": 248320,
+            "rms_norm_eps": 1e-6,
+            "full_attention_interval": 4
+          }
+        }"#;
+        ModelSpec::from_config_json(cfg).unwrap()
+    }
+
+    #[test]
+    fn options_parse_and_reject() {
+        assert_eq!(PrefillOpts::parse("").unwrap(), PrefillOpts::default());
+        let o = PrefillOpts::parse("tile=256, groups=8,s16=1,profile").unwrap();
+        assert_eq!(
+            (o.tile, o.groups, o.s16, o.profile),
+            (256, 8, Some(1), true)
+        );
+        let p = PrefillOpts::parse("stats,plain").unwrap();
+        assert!(p.stats && !p.mme && !p.fastexp && p.tile == 256);
+        assert!(PrefillOpts::parse("tile=100").is_err());
+        assert!(PrefillOpts::parse("tile=1024").is_err());
+        assert!(PrefillOpts::parse("s16=3").is_err());
+        assert!(PrefillOpts::parse("warp=9").is_err());
+    }
+
+    #[test]
+    fn chunk_groups_cover_every_chunk_once() {
+        assert_eq!(chunk_groups(1, 16), vec![1]);
+        assert_eq!(chunk_groups(8, 16), vec![1; 8]);
+        assert_eq!(chunk_groups(17, 16), vec![2, 2, 2, 2, 2, 2, 2, 2, 1]);
+        assert_eq!(chunk_groups(20, 16), vec![2; 10]);
+        assert_eq!(chunk_groups(64, 16), vec![4; 16]);
+        assert_eq!(chunk_groups(64, 1), vec![64]);
+        for nch in 1..=64u64 {
+            for g in [1u64, 4, 8, 16] {
+                let v = chunk_groups(nch, g);
+                assert_eq!(v.iter().sum::<u64>(), nch);
+                assert!(v.len() as u64 <= g);
+            }
+        }
+    }
+
+    #[test]
+    fn forms_resolve_per_model_and_precision() {
+        let mut spec = dense_spec();
+        let f = TileForm::resolve(&PrefillOpts::default(), &spec);
+        assert!(f.mme && f.fastexp && f.rows == 2 && f.groups == 16 && f.s16 == 0);
+        spec.fp8_weights = true;
+        assert_eq!(TileForm::resolve(&PrefillOpts::default(), &spec).s16, 2);
+        assert_eq!(
+            TileForm::resolve(&PrefillOpts::parse("s16=0").unwrap(), &spec).s16,
+            0
+        );
+        assert_eq!(
+            TileForm::resolve(&PrefillOpts::plain(), &spec),
+            TileForm::PLAIN
+        );
+        // the wide tile only with the forms it was measured with
+        assert_eq!(f.tile_candidates(&spec), &[512, 256]);
+        assert_eq!(TileForm::PLAIN.tile_candidates(&spec), &[256]);
+        let serial = TileForm::resolve(&PrefillOpts::parse("mme=0").unwrap(), &spec);
+        assert_eq!(serial.tile_candidates(&spec), &[256]);
+    }
+
+    #[test]
+    fn plain_form_builds_the_plain_recipes() {
+        let spec = dense_spec();
+        let elfs = vec![("K".to_string(), "h".to_string())];
+        let a = build_attn_tile_graph(&spec, 256, 8192, 2, &TileForm::PLAIN, &elfs, &[]);
+        let b = build_prefill_attn_layer_graph(&spec, 256, 8192, 2, &elfs);
+        assert_eq!(a.fingerprint("d"), b.fingerprint("d"));
+        let a = build_lin_tile_graph(&spec, 256, &TileForm::PLAIN, &elfs, &[]);
+        let b = build_prefill_linear_layer_graph(&spec, 256, &elfs);
+        assert_eq!(a.fingerprint("d"), b.fingerprint("d"));
+    }
+
+    #[test]
+    fn tile_graphs_keep_the_loop_interface_and_plan_scratch() {
+        let spec = dense_spec();
+        let form = TileForm::resolve(&PrefillOpts::default(), &spec);
+        let lin = build_lin_tile_graph(&spec, 512, &form, &[], &[]);
+        let names: Vec<String> = lin
+            .persistent_tensor_specs()
+            .into_iter()
+            .map(|s| s.0)
+            .collect();
+        for n in [
+            "x_in",
+            "L_out",
+            "L_S_in",
+            "L_S_out",
+            "L_cs_in",
+            "L_cs_out",
+            "zero_slot",
+        ] {
+            assert!(names.iter().any(|x| x == n), "missing {n}");
+        }
+        // calibration sites keep their names
+        for n in ["L_h", "L_core", "L_h2", "L_m"] {
+            assert!(names.iter().any(|x| x == n), "missing {n}");
+        }
+        // 8 chunks of 64 rows: three nodes per chunk in the serial chain
+        let nodes = lin.node_io_views();
+        assert_eq!(nodes.iter().filter(|n| n.guid == "mult_fwd_f32").count(), 8);
+        // a remainder tile pads to whole chunks
+        let lin70 = build_lin_tile_graph(&spec, 70, &form, &[], &[]);
+        assert!(lin70
+            .persistent_tensor_specs()
+            .iter()
+            .any(|s| s.0 == "L_gb" && s.2 == vec![128, 128]));
+
+        let att = build_attn_tile_graph(&spec, 256, 262144, 64, &form, &[], &[]);
+        let nodes = att.node_io_views();
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|n| n.guid == "gaudium_attn_softmax_chunk")
+                .count(),
+            16
+        );
+        // grouping never changes the scratch a chunk count needs by more than the concat copies
+        let one = TileForm { groups: 1, ..form };
+        let att1 = build_attn_tile_graph(&spec, 256, 262144, 64, &one, &[], &[]);
+        let (_, grouped) = scratch_layout(&att);
+        let (_, single) = scratch_layout(&att1);
+        assert!(grouped >= single && grouped < single + single / 8);
+
+        // half-width core: BF16 scores and FP8 P halve the big buffers
+        let h8 = TileForm { s16: 2, ..form };
+        let att8 = build_attn_tile_graph(&spec, 256, 262144, 64, &h8, &[], &[]);
+        assert!(scratch_layout(&att8).1 < grouped * 3 / 4);
+        assert!(att8
+            .persistent_tensor_specs()
+            .iter()
+            .any(|s| s.0 == "fp8_one"));
+        assert!(!scratch_layout(&att8).0.contains_key("fp8_one"));
+    }
+}

@@ -55,6 +55,25 @@ struct NodeSpec {
     params: Vec<u8>,
 }
 
+/// One tensor as seen by a graph node (`GraphBuilder::node_io_views`).
+#[derive(Debug, Clone)]
+pub struct TensorView<'a> {
+    pub id: usize,
+    pub name: &'a str,
+    pub dims: &'a [u64],
+    pub bytes: u64,
+    pub persistent: bool,
+}
+
+/// One graph node with its input / output tensors (`GraphBuilder::node_io_views`).
+#[derive(Debug, Clone)]
+pub struct NodeIoView<'a> {
+    pub guid: &'a str,
+    pub name: &'a str,
+    pub inputs: Vec<TensorView<'a>>,
+    pub outputs: Vec<TensorView<'a>>,
+}
+
 /// Pure, host-testable graph description & fingerprinter that compiles into a verified `CompiledRecipe`.
 #[derive(Debug, Clone)]
 pub struct GraphBuilder {
@@ -68,6 +87,9 @@ pub struct GraphBuilder {
     no_pipeline_mgmt: bool,
     no_persistent_reuse: bool,
     kernel_elf_hashes: Vec<(String, String)>,
+    /// [fp8] The quantisable weight matrices of this graph are `fp8_143` (`engine/fp8_graph.rs`).
+    /// A build-time switch only: the tensors and nodes it leads to are what the fingerprint covers.
+    fp8_weights: bool,
 }
 
 impl GraphBuilder {
@@ -83,7 +105,49 @@ impl GraphBuilder {
             no_pipeline_mgmt: false,
             no_persistent_reuse: false,
             kernel_elf_hashes: Vec::new(),
+            fp8_weights: false,
         }
+    }
+
+    /// [fp8] Selects FP8 (`true`) or BF16 (`false`) for the quantisable weight matrices built next.
+    pub fn set_fp8_weights(&mut self, enabled: bool) {
+        self.fp8_weights = enabled;
+    }
+
+    /// [fp8] Whether the quantisable weight matrices of this graph are built as `fp8_143`.
+    pub fn fp8_weights(&self) -> bool {
+        self.fp8_weights
+    }
+
+    /// Name of a tensor declared in this graph.
+    pub fn tensor_name(&self, id: TensorId) -> &str {
+        &self.tensors[id.0].name
+    }
+
+    /// Finds a persistent tensor of this graph by name.
+    pub fn find_persistent_tensor(&self, name: &str) -> Option<TensorId> {
+        self.tensors
+            .iter()
+            .position(|t| t.section.is_some() && t.name == name)
+            .map(TensorId)
+    }
+
+    /// Finds any tensor of this graph (persistent or intermediate) by name.
+    pub fn find_tensor(&self, name: &str) -> Option<TensorId> {
+        self.tensors
+            .iter()
+            .position(|t| t.name == name)
+            .map(TensorId)
+    }
+
+    /// Name of the recipe this graph compiles to.
+    pub fn recipe_name(&self) -> &str {
+        &self.recipe_name
+    }
+
+    /// Renames the recipe of a graph that a wrapper extends after another builder created it.
+    pub fn set_recipe_name(&mut self, recipe_name: impl Into<String>) {
+        self.recipe_name = recipe_name.into();
     }
 
     pub fn set_nopm(&mut self, enabled: bool) {
@@ -245,6 +309,31 @@ impl GraphBuilder {
             .sum()
     }
 
+    /// Read-only view of every node with the names, dims and byte sizes of its tensors, for
+    /// host-side byte / FLOP models (live profiling). Never changes the graph or its fingerprint.
+    pub fn node_io_views(&self) -> Vec<NodeIoView<'_>> {
+        let view = |id: &TensorId| {
+            let t = &self.tensors[id.0];
+            let elems: u64 = t.dims.iter().copied().product();
+            TensorView {
+                id: id.0,
+                name: t.name.as_str(),
+                dims: t.dims.as_slice(),
+                bytes: elems.saturating_mul(t.dtype.byte_size()),
+                persistent: t.section.is_some(),
+            }
+        };
+        self.nodes
+            .iter()
+            .map(|n| NodeIoView {
+                guid: n.guid.as_str(),
+                name: n.name.as_str(),
+                inputs: n.inputs.iter().map(view).collect(),
+                outputs: n.outputs.iter().map(view).collect(),
+            })
+            .collect()
+    }
+
     /// Computes a deterministic SHA-256 fingerprint covering 100% of sections, tensors, nodes,
     /// params, dependencies, compiler attributes, and normalized kernel ELF hashes.
     pub fn fingerprint(&self, driver_version: &str) -> String {
@@ -326,26 +415,12 @@ impl GraphBuilder {
         driver_version: &str,
     ) -> Result<CompiledRecipe, SynapseError> {
         let fp = self.fingerprint(driver_version);
-        let mut guard = RecipeGuard::new();
 
         // 1. Try verified cache hit first
-        if let Some(cached_path) = cache.lookup_verified(&self.recipe_name, &fp) {
-            let cpath = CString::new(cached_path.to_string_lossy().as_bytes())
-                .map_err(|e| SynapseError::InvalidArg(e.to_string()))?;
-            let mut handle: SynRecipeHandle = std::ptr::null_mut();
-            let st = unsafe { (api.syn_recipe_deserialize)(&mut handle, cpath.as_ptr()) };
-            if st == 0 && !handle.is_null() {
-                guard.compile();
-                return CompiledRecipe::from_handle(
-                    api,
-                    handle,
-                    guard,
-                    self.recipe_name.clone(),
-                    fp,
-                    true,
-                );
-            }
+        if let Some(r) = self.load_cached_fp(&api, cache, &fp)? {
+            return Ok(r);
         }
+        let mut guard = RecipeGuard::new();
 
         // 2. Cache miss: check GC_KERNEL_PATH before invoking graph compiler so failures are actionable
         if std::env::var("GC_KERNEL_PATH")
@@ -421,6 +496,47 @@ impl GraphBuilder {
         }
 
         CompiledRecipe::from_handle(api, handle, guard, self.recipe_name.clone(), fp, false)
+    }
+
+    /// Loads this graph's recipe from `cache` when it is there (verified file), without ever
+    /// invoking the graph compiler: `Ok(None)` on a miss. For recipes that are worth having ready
+    /// but not worth a compile now.
+    pub fn load_cached(
+        &self,
+        api: &Arc<SynapseApi>,
+        cache: &RecipeCache,
+        driver_version: &str,
+    ) -> Result<Option<CompiledRecipe>, SynapseError> {
+        self.load_cached_fp(api, cache, &self.fingerprint(driver_version))
+    }
+
+    fn load_cached_fp(
+        &self,
+        api: &Arc<SynapseApi>,
+        cache: &RecipeCache,
+        fp: &str,
+    ) -> Result<Option<CompiledRecipe>, SynapseError> {
+        let Some(cached_path) = cache.lookup_verified(&self.recipe_name, fp) else {
+            return Ok(None);
+        };
+        let cpath = CString::new(cached_path.to_string_lossy().as_bytes())
+            .map_err(|e| SynapseError::InvalidArg(e.to_string()))?;
+        let mut handle: SynRecipeHandle = std::ptr::null_mut();
+        let st = unsafe { (api.syn_recipe_deserialize)(&mut handle, cpath.as_ptr()) };
+        if st != 0 || handle.is_null() {
+            return Ok(None);
+        }
+        let mut guard = RecipeGuard::new();
+        guard.compile();
+        CompiledRecipe::from_handle(
+            Arc::clone(api),
+            handle,
+            guard,
+            self.recipe_name.clone(),
+            fp.to_owned(),
+            true,
+        )
+        .map(Some)
     }
 
     fn build_and_compile_graph(
@@ -728,6 +844,70 @@ impl CompiledRecipe {
         let prepared = self.prepare_launch(bindings)?;
         self.launch_prepared(dev, &prepared)
     }
+}
+
+// SAFETY: a `CompiledRecipe` exclusively owns its recipe handle and launch metadata; the
+// SynapseAI calls made through it are thread-safe, so the owner may move to another thread.
+unsafe impl Send for CompiledRecipe {}
+
+/// One cache lookup: the recipe, `None` on a miss, or the error of a failed load.
+pub type CachedRecipe = Result<Option<CompiledRecipe>, SynapseError>;
+
+/// Loads the recipes of `n` graphs from `cache` on up to `threads` threads; `build(i)` describes
+/// graph `i`. Entry `i` is `Ok(None)` when that recipe is not in the cache. Nothing is compiled.
+///
+/// Graph description, fingerprint, file verification and deserialization of one recipe are
+/// independent of every other recipe's, so a start-up that takes hundreds of cached recipes does
+/// not have to do them one after another.
+pub fn load_cached_parallel<F>(
+    n: usize,
+    threads: usize,
+    api: &Arc<SynapseApi>,
+    cache: &RecipeCache,
+    driver_version: &str,
+    build: F,
+) -> Vec<CachedRecipe>
+where
+    F: Fn(usize) -> GraphBuilder + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let slots: Vec<Mutex<Option<CachedRecipe>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let work = || loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= n {
+            break;
+        }
+        let res = build(i).load_cached(api, cache, driver_version);
+        *slots[i].lock().unwrap_or_else(|p| p.into_inner()) = Some(res);
+    };
+    let threads = threads.clamp(1, n.max(1));
+    if threads == 1 {
+        work();
+    } else {
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(work);
+            }
+        });
+    }
+    slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap_or_else(|p| p.into_inner())
+                .unwrap_or(Ok(None))
+        })
+        .collect()
+}
+
+/// Threads for [`load_cached_parallel`] on this host.
+pub fn recipe_load_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
 }
 
 /// Pre-validated launch descriptor for zero-allocation hot-path recipe launches.

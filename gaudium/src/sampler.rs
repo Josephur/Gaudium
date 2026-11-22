@@ -283,10 +283,14 @@ impl Default for SearchState {
     }
 }
 
+/// Test thresholds of one search round over the key bracket `[lo, hi]`, exactly as the kernels
+/// derive them: a bracket of at most 16 keys is tested key by key (unused lanes test `PINF`),
+/// a wider one at stride `ceil(n / 16)` (clamped to the last key).
 pub fn round_thresholds(lo: i32, hi: i32) -> ([i32; NTH], [f32; NTH]) {
     let n = hi - lo + 1;
     let mut tk = [0i32; NTH];
     let mut tv = [PINF; NTH];
+    let s = (n + NTH as i32 - 1) / NTH as i32;
     for j in 0..NTH {
         if n <= NTH as i32 {
             tk[j] = lo + (j as i32);
@@ -296,7 +300,7 @@ pub fn round_thresholds(lo: i32, hi: i32) -> ([i32; NTH], [f32; NTH]) {
                 PINF
             };
         } else {
-            let k = lo + ((j as i64) * (n as i64) / (NTH as i64)) as i32;
+            let k = (lo + (j as i32) * s).min(65535);
             tk[j] = k;
             tv[j] = val_of_key(k);
         }
@@ -560,6 +564,116 @@ pub fn sample_row(
     }
 }
 
+/// CPU twin of the coupled DSpine walk kernel (`gaudium_ds_cwalk`), operation for operation.
+///
+/// `scores` f32 `{16, 16, S}` (`[s][j][k]`: row `s`, sender lane `j`, candidate `k`), `cand` i32
+/// `{16, T}` (`[t][k]`), `cs` = the card's per-row scale (`alpha / rms_t`, its fourth output),
+/// `base` = the block anchor's sequence index. Returns the `S` drafts. Without `F_COUPLED` it is
+/// the greedy walk on the raw scores.
+#[allow(clippy::needless_range_loop)] // lane-indexed on purpose: mirrors the kernel's lanes
+pub fn ds_cwalk(
+    scores: &[f32],
+    cand: &[i32],
+    cs: &[f32],
+    s_rows: usize,
+    dev: &DevSampleParams,
+    base: u32,
+) -> Vec<i32> {
+    let flags = dev.i[3];
+    let coupled = (flags & F_COUPLED) != 0;
+    let trunc = coupled && (flags & F_DTRUNC) != 0;
+    let (inv_t, d_t, topp, mpc) = (dev.f[0], dev.f[1], dev.f[2], dev.f[3]);
+    let topk = dev.i[0];
+    const WNEG: f32 = -3.0e38;
+    let mut out = Vec::with_capacity(s_rows);
+    let mut prev = 0usize;
+    for s in 0..s_rows {
+        let r = &scores[(s * 16 + prev) * 16..(s * 16 + prev) * 16 + 16];
+        let cv = &cand[(s + 1) * 16..(s + 1) * 16 + 16];
+        let mut z = [0f32; 16];
+        if !coupled {
+            z.copy_from_slice(r);
+        } else {
+            let mut y = [0f32; 16];
+            let mut m = WNEG;
+            for k in 0..16 {
+                y[k] = r[k] * cs[s];
+                m = m.max(y[k]);
+            }
+            let mut x = [0f32; 16];
+            let mut w = [0f32; 16];
+            for k in 0..16 {
+                let in_c = y[k] >= m - d_t;
+                x[k] = (y[k] - m) * inv_t;
+                w[k] = if in_c { mexp(x[k].max(-30.0)) } else { 0.0 };
+            }
+            let mut cnt = [0f32; 16];
+            let mut mass = [0f32; 16];
+            for p in 0..16 {
+                for k in 0..16 {
+                    // (the kernel adds a selected 0.0 otherwise, which changes nothing)
+                    if y[p] >= y[k] {
+                        cnt[k] += 1.0;
+                        mass[k] += w[p];
+                    }
+                }
+            }
+            let mut thr = m - d_t;
+            if trunc {
+                let mut tk = thr;
+                if topk > 0 {
+                    tk = WNEG;
+                    for k in 0..16 {
+                        if cnt[k] >= topk as f32 {
+                            tk = tk.max(y[k]);
+                        }
+                    }
+                    tk = tk.max(thr);
+                }
+                thr = tk;
+                if (flags & F_TOPP) != 0 {
+                    let in_k = |k: usize| y[k] >= tk && y[k] >= m - d_t;
+                    let mut tot = 0f32;
+                    for k in 0..16 {
+                        if in_k(k) {
+                            tot = tot.max(mass[k]);
+                        }
+                    }
+                    let tgt = tot * topp;
+                    let mut tp = WNEG;
+                    for k in 0..16 {
+                        if in_k(k) && mass[k] >= tgt {
+                            tp = tp.max(y[k]);
+                        }
+                    }
+                    thr = thr.max(tp);
+                }
+                if (flags & F_MINP) != 0 {
+                    thr = thr.max(m + mpc);
+                }
+            }
+            let rk = row_key(
+                dev.i[1] as u32,
+                dev.i[2] as u32,
+                base.wrapping_add(s as u32 + 1),
+            );
+            for k in 0..16 {
+                let zz = x[k] + gumbel(rk, cv[k] as u32);
+                z[k] = if y[k] >= thr { zz } else { WNEG };
+            }
+        }
+        let mut best = 0usize;
+        for k in 1..16 {
+            if z[k] > z[best] {
+                best = k; // ties -> the lowest lane
+            }
+        }
+        out.push(cv[best]);
+        prev = best;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,5 +737,94 @@ mod tests {
         // Verify polynomial accuracy for mlog / mexp
         assert!((mlog(0.5) - 0.5f32.ln()).abs() < 1e-5);
         assert!((mexp(-2.5) - (-2.5f32).exp()).abs() < 1e-5);
+    }
+    #[test]
+    fn round_thresholds_match_the_kernel_stride() {
+        // a bracket of at most 16 keys is tested key by key, the unused lanes with PINF
+        let lo = key_of(1.0);
+        let (tk, tv) = round_thresholds(lo, lo + 4);
+        assert_eq!(&tk[..5], &[lo, lo + 1, lo + 2, lo + 3, lo + 4]);
+        assert_eq!(tv[0], 1.0);
+        assert_eq!(tv[4], val_of_key(lo + 4));
+        assert!(tv[5..].iter().all(|&v| v == PINF));
+        // a wider bracket: stride ceil(n / 16), clamped to the last key
+        let (tk, _) = round_thresholds(lo, lo + 999);
+        assert_eq!(tk[0], lo);
+        assert_eq!(tk[1], lo + 63); // ceil(1000 / 16) = 63
+        assert_eq!(tk[15], lo + 15 * 63);
+        let (tk, _) = round_thresholds(65000, 65535);
+        assert!(tk.iter().all(|&k| k <= 65535));
+    }
+
+    #[test]
+    fn top_k_threshold_search_is_exact_on_a_wide_row() {
+        // 4096 distinct logits: the support under top-k must be exactly the k largest
+        let n = 4096usize;
+        let vals: Vec<f32> = (0..n)
+            .map(|i| bf16_to_f32(f32_to_bf16_rne(-8.0 + (i as f32) * 0.0039)))
+            .collect();
+        let logits: Vec<u16> = vals.iter().map(|&v| f32_to_bf16_rne(v)).collect();
+        for k in [1u64, 2, 20, 300] {
+            let p = SampleParams {
+                temperature: 1.0,
+                top_k: k,
+                top_p: 1.0,
+                min_p: 0.0,
+                seed: 3,
+                coupled: true,
+                draft_trunc: true,
+            };
+            let dev = p.to_dev(n as u64);
+            let res = sample_row(&logits, &dev, 0, 11, true);
+            let mut sorted = vals.clone();
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let kth = sorted[k as usize - 1];
+            assert_eq!(res.thr, kth, "top_k={k}");
+            assert!(vals[res.token] >= kth);
+        }
+    }
+
+    #[test]
+    fn coupled_walk_without_the_flag_is_the_greedy_walk() {
+        let s_rows = 3usize;
+        let mut scores = vec![0f32; s_rows * 16 * 16];
+        let mut cand = vec![0i32; (s_rows + 1) * 16];
+        for (i, c) in cand.iter_mut().enumerate() {
+            *c = 1000 + i as i32;
+        }
+        // row 0 from lane 0 prefers lane 5; row 1 from lane 5 prefers lane 2; row 2 from lane 2 -> 9
+        scores[5] = 4.0;
+        scores[(16 + 5) * 16 + 2] = 3.0;
+        scores[(2 * 16 + 2) * 16 + 9] = 2.0;
+        let greedy = SampleParams {
+            temperature: 1.0,
+            coupled: false,
+            ..SampleParams::default()
+        }
+        .to_dev(248_320);
+        let cs = vec![1.0f32; s_rows];
+        let d = ds_cwalk(&scores, &cand, &cs, s_rows, &greedy, 100);
+        assert_eq!(d, vec![1000 + 16 + 5, 1000 + 32 + 2, 1000 + 48 + 9]);
+        // coupled at a very low temperature follows the same dominant candidates
+        let cold = SampleParams {
+            temperature: 0.01,
+            coupled: true,
+            ..SampleParams::default()
+        }
+        .to_dev(248_320);
+        let d2 = ds_cwalk(&scores, &cand, &cs, s_rows, &cold, 100);
+        assert_eq!(d2, d);
+        // and is a pure function of (seed, base)
+        let warm = SampleParams {
+            temperature: 1.0,
+            seed: 9,
+            coupled: true,
+            ..SampleParams::default()
+        }
+        .to_dev(248_320);
+        assert_eq!(
+            ds_cwalk(&scores, &cand, &cs, s_rows, &warm, 100),
+            ds_cwalk(&scores, &cand, &cs, s_rows, &warm, 100)
+        );
     }
 }

@@ -86,6 +86,12 @@ pub struct ModelSpec {
     // Multimodal / FP8 flags
     pub has_vision: bool,
     pub fp8_quantized: bool,
+    /// [fp8] Run precision chosen at load (not a checkpoint property): the projection and MLP
+    /// matrices are per-output-channel `fp8_143` on the device (`engine/fp8_graph.rs`).
+    pub fp8_weights: bool,
+    /// [moe] Run form chosen at load: the routed experts run through the vendor expert-select
+    /// node on stacked BF16 expert tensors instead of the dense-masked wide MLP (`engine/moe.rs`).
+    pub moe_routed: bool,
     pub gemma4: Option<Gemma4Spec>,
 }
 
@@ -397,6 +403,8 @@ impl ModelSpec {
             moe_intermediate,
             has_vision,
             fp8_quantized,
+            fp8_weights: false,
+            moe_routed: false,
             gemma4,
         };
         Ok(spec)

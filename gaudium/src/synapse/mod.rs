@@ -5,4 +5,6 @@ pub mod device;
 pub mod ffi;
 pub mod graph;
 pub mod ops;
+pub mod profiler;
 pub mod recipe_cache;
+pub mod upload;

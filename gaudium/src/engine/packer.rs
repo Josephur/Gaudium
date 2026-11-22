@@ -18,6 +18,9 @@ pub struct WeightPacker<'a> {
     spec: &'a ModelSpec,
     /// Permute `W_v` rows per KV head via `lane128`/`lane256` for Gaudium's chunked TPC attention kernels.
     pub chunked_attn: bool,
+    /// [moe/fp8 hook] Extension asked first for every device tensor: FP8 checkpoints, FP8 device
+    /// weights and MoE wide MLPs (`engine/fp8_pack.rs`).
+    pub ext: Option<&'a crate::engine::fp8_pack::ExtPacker<'a>>,
 }
 
 impl<'a> WeightPacker<'a> {
@@ -26,7 +29,13 @@ impl<'a> WeightPacker<'a> {
             store,
             spec,
             chunked_attn: true,
+            ext: None,
         }
+    }
+
+    /// The checkpoint this packer reads (drafter heads stored beside the trunk pack from it).
+    pub fn store(&self) -> &'a SafetensorsStore {
+        self.store
     }
 
     fn tensor_ref(&self, suffix: &str) -> Result<(String, &'a TensorMeta), String> {
@@ -106,9 +115,43 @@ impl<'a> WeightPacker<'a> {
         }
     }
 
+    /// The parts of a device tensor that is a plain concatenation of checkpoint tensors, in
+    /// device order and straight from the mapped checkpoint, so an upload can send them one
+    /// after the other without first copying them into one buffer. `None`: use [`Self::pack_weight`].
+    ///
+    /// Covers the Gated DeltaNet input projection `L{l}_W_qkvz` = `in_proj_qkv | in_proj_z` of a
+    /// plain BF16 checkpoint run in BF16 (the largest tensor `pack_weight` has to build); the
+    /// concatenated bytes are exactly what `pack_weight` returns for it.
+    pub fn concat_parts(&self, name: &str) -> Result<Option<Vec<&'a [u8]>>, String> {
+        let m = self.spec;
+        if m.fp8_quantized || m.fp8_weights || m.is_moe() {
+            return Ok(None); // the extension packer owns the matrices of those models
+        }
+        let Some(layer) = name
+            .strip_prefix('L')
+            .and_then(|r| r.strip_suffix("_W_qkvz"))
+            .and_then(|l| l.parse::<usize>().ok())
+        else {
+            return Ok(None);
+        };
+        if layer >= m.n_layers as usize || m.is_full_attention_layer(layer) {
+            return Ok(None);
+        }
+        let lpfx = format!("layers.{layer}.");
+        let (fa, ta) = self.tensor_ref(&format!("{lpfx}linear_attn.in_proj_qkv.weight"))?;
+        self.need_bf16(&fa, ta, m.gdn_qkv_dim(), Some(m.hidden))?;
+        let (fz, tz) = self.tensor_ref(&format!("{lpfx}linear_attn.in_proj_z.weight"))?;
+        self.need_bf16(&fz, tz, m.gdn_v_heads * m.gdn_v_dim, Some(m.hidden))?;
+        Ok(Some(vec![self.raw_bytes(&fa)?, self.raw_bytes(&fz)?]))
+    }
+
     /// Packs a named device weight tensor into its exact HBM byte representation.
     /// Returns `Cow::Borrowed` directly from the mmap shard whenever no layout transform is needed.
     pub fn pack_weight(&self, name: &str) -> Result<Cow<'a, [u8]>, String> {
+        // [moe/fp8 hook] tensors the extension owns never reach the BF16 paths below
+        if let Some(packed) = self.ext.and_then(|e| e.pack(name, self.chunked_attn)) {
+            return packed;
+        }
         let m = self.spec;
         let hid = m.hidden;
         let inter = m.intermediate;
@@ -387,27 +430,55 @@ impl<'a> WeightPacker<'a> {
         let mut c = vec![1.0f32; 128 * lmax];
         let mut s = vec![0.0f32; 128 * lmax];
 
-        for pos in 0..lmax {
-            let base = pos * 128;
-            let p = pos as f64;
-            for j in 0..np {
-                let fe = theta.powf(-2.0 * (2 * j) as f64 / rot as f64);
-                let fo = theta.powf(-2.0 * (2 * j + 1) as f64 / rot as f64);
-                let ce = (p * fe).cos() as f32;
-                let se = (p * fe).sin() as f32;
-                let co = (p * fo).cos() as f32;
-                let so = (p * fo).sin() as f32;
+        // The frequencies depend on the lane only: computed once, not per position.
+        let freq: Vec<(f64, f64)> = (0..np)
+            .map(|j| {
+                (
+                    theta.powf(-2.0 * (2 * j) as f64 / rot as f64),
+                    theta.powf(-2.0 * (2 * j + 1) as f64 / rot as f64),
+                )
+            })
+            .collect();
+        // Rows are independent: a long context's table is filled by several threads.
+        let fill = |pos0: usize, c: &mut [f32], s: &mut [f32]| {
+            for (k, (c, s)) in c.chunks_mut(128).zip(s.chunks_mut(128)).enumerate() {
+                let p = (pos0 + k) as f64;
+                for (j, &(fe, fo)) in freq.iter().enumerate() {
+                    let ce = (p * fe).cos() as f32;
+                    let se = (p * fe).sin() as f32;
+                    let co = (p * fo).cos() as f32;
+                    let so = (p * fo).sin() as f32;
 
-                c[base + j] = ce;
-                c[base + np + j] = ce;
-                s[base + j] = -se;
-                s[base + np + j] = se;
+                    c[j] = ce;
+                    c[np + j] = ce;
+                    s[j] = -se;
+                    s[np + j] = se;
 
-                c[base + 64 + j] = co;
-                c[base + 64 + np + j] = co;
-                s[base + 64 + j] = -so;
-                s[base + 64 + np + j] = so;
+                    c[64 + j] = co;
+                    c[64 + np + j] = co;
+                    s[64 + j] = -so;
+                    s[64 + np + j] = so;
+                }
             }
+        };
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let rows_per = lmax.div_ceil(threads).max(1024);
+        if lmax <= rows_per {
+            fill(0, &mut c, &mut s);
+        } else {
+            std::thread::scope(|scope| {
+                for (i, (c, s)) in c
+                    .chunks_mut(rows_per * 128)
+                    .zip(s.chunks_mut(rows_per * 128))
+                    .enumerate()
+                {
+                    let fill = &fill;
+                    scope.spawn(move || fill(i * rows_per, c, s));
+                }
+            });
         }
 
         (f32_slice_to_bytes(&c), f32_slice_to_bytes(&s))
@@ -425,6 +496,107 @@ fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal safetensors file image: `(name, dtype, shape, bytes)` entries.
+    fn st_image(entries: &[(&str, &str, Vec<u64>, Vec<u8>)]) -> Vec<u8> {
+        let mut hdr = String::from("{");
+        let mut payload = Vec::new();
+        for (i, (name, dtype, shape, data)) in entries.iter().enumerate() {
+            if i > 0 {
+                hdr.push(',');
+            }
+            let shape_s: Vec<String> = shape.iter().map(u64::to_string).collect();
+            hdr.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+                shape_s.join(","),
+                payload.len(),
+                payload.len() + data.len()
+            ));
+            payload.extend_from_slice(data);
+        }
+        hdr.push('}');
+        let mut out = Vec::new();
+        out.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn concat_parts_are_exactly_the_packed_deltanet_projection() {
+        // a small hybrid model: layer 0 linear (Gated DeltaNet), layer 1 full attention
+        let cfg = r#"{
+          "architectures": ["Qwen3_5ForConditionalGeneration"],
+          "model_type": "qwen3_5",
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "vocab_size": 128,
+            "rms_norm_eps": 1e-6,
+            "full_attention_interval": 2,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 8,
+            "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 4,
+            "rope_parameters": {"rope_theta": 10000000.0, "partial_rotary_factor": 0.25}
+          }
+        }"#;
+        let spec = ModelSpec::from_config_json(cfg).unwrap();
+        assert!(!spec.is_full_attention_layer(0) && spec.is_full_attention_layer(1));
+        let (hid, qkv, z) = (
+            spec.hidden,
+            spec.gdn_qkv_dim(),
+            spec.gdn_v_heads * spec.gdn_v_dim,
+        );
+        let bytes = |rows: u64, seed: u8| -> Vec<u8> {
+            (0..rows * hid * 2)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        };
+        let pfx = &spec.text_prefix;
+        let n_qkv = format!("{pfx}layers.0.linear_attn.in_proj_qkv.weight");
+        let n_z = format!("{pfx}layers.0.linear_attn.in_proj_z.weight");
+        let dir = std::env::temp_dir().join(format!("gaudium-concat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("model.safetensors"),
+            st_image(&[
+                (&n_qkv, "BF16", vec![qkv, hid], bytes(qkv, 1)),
+                (&n_z, "BF16", vec![z, hid], bytes(z, 2)),
+            ]),
+        )
+        .unwrap();
+        let store = SafetensorsStore::open(&dir).unwrap();
+        let packer = WeightPacker::new(&store, &spec);
+
+        let parts = packer
+            .concat_parts("L0_W_qkvz")
+            .unwrap()
+            .expect("a concatenation");
+        assert_eq!(parts.len(), 2);
+        let joined: Vec<u8> = parts.concat();
+        let packed = packer.pack_weight("L0_W_qkvz").unwrap();
+        assert_eq!(joined.len() as u64, spec.gdn_qkvz_dim() * hid * 2);
+        assert!(joined == packed.as_ref(), "parts differ from pack_weight");
+        // every other tensor keeps the packing path
+        assert!(packer.concat_parts("L1_W_qg").unwrap().is_none());
+        assert!(packer.concat_parts("L1_W_qkvz").unwrap().is_none()); // an attention layer
+        assert!(packer.concat_parts("embed_table").unwrap().is_none());
+        // a model whose matrices the extension packer owns is never bypassed
+        let mut fp8 = spec.clone();
+        fp8.fp8_weights = true;
+        assert!(WeightPacker::new(&store, &fp8)
+            .concat_parts("L0_W_qkvz")
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn rope_tables_qwen3_8b_and_qwen38_27b() {
@@ -491,5 +663,50 @@ mod tests {
         assert!((read_f32(&rc27, 128 + 16) - 1.0f32.cos()).abs() < 1e-6);
         assert_eq!(read_f32(&rc27, 128 + 32), 1.0);
         assert_eq!(read_f32(&rs27, 128 + 32), 0.0);
+
+        // A table long enough to be filled by several threads is bit-identical to the
+        // position-by-position formula, at every row (the tables decide token exactness).
+        let lmax = 5000usize;
+        let (rc, rs) = packer27.build_rope_tables(lmax);
+        let (theta, rot) = (spec27.rope_theta, spec27.rotary_dim as usize);
+        let np = rot / 4;
+        for pos in [0usize, 1, 1023, 1024, 1025, 2047, 2048, 4095, 4096, 4999] {
+            let p = pos as f64;
+            for j in 0..np {
+                let fe = theta.powf(-2.0 * (2 * j) as f64 / rot as f64);
+                let fo = theta.powf(-2.0 * (2 * j + 1) as f64 / rot as f64);
+                let base = pos * 128;
+                let want = [
+                    (base + j, (p * fe).cos() as f32, -((p * fe).sin() as f32)),
+                    (base + np + j, (p * fe).cos() as f32, (p * fe).sin() as f32),
+                    (
+                        base + 64 + j,
+                        (p * fo).cos() as f32,
+                        -((p * fo).sin() as f32),
+                    ),
+                    (
+                        base + 64 + np + j,
+                        (p * fo).cos() as f32,
+                        (p * fo).sin() as f32,
+                    ),
+                ];
+                for (i, c, s) in want {
+                    assert_eq!(
+                        read_f32(&rc, i).to_bits(),
+                        c.to_bits(),
+                        "cos pos {pos} lane {j}"
+                    );
+                    assert_eq!(
+                        read_f32(&rs, i).to_bits(),
+                        s.to_bits(),
+                        "sin pos {pos} lane {j}"
+                    );
+                }
+            }
+            // lanes outside the rotary part keep the identity rotation
+            assert_eq!(read_f32(&rc, pos * 128 + 2 * np), 1.0);
+            assert_eq!(read_f32(&rs, pos * 128 + 2 * np), 0.0);
+        }
+        assert_eq!(rc.len(), lmax * 128 * 4);
     }
 }

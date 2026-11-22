@@ -25,11 +25,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::budget::SequenceBudget;
 use crate::core::lifecycle::{can_switch_resident_model, RequestGuard};
-use crate::engine::qwen3::{Qwen3Config, Qwen3Engine, Qwen3GenParams, KV_CHUNK};
+use crate::engine::qwen3::{Qwen3Config, Qwen3GenParams, KV_CHUNK};
+use crate::engine::{load_engine, GenEngine};
 use crate::json::{self, JsonValue};
 use crate::model_spec::{ModelFamily, ModelSpec};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use crate::verified::{BackendState, ReqEvent};
+
+mod readout;
+mod stream_out;
+
+use readout::{DrafterFacts, RunFacts, Timings};
+use stream_out::StreamOut;
 
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_MAX_TOKENS: u64 = 2048;
@@ -52,8 +59,36 @@ pub struct ServerConfig {
     pub no_cache: bool,
     pub lazy: bool,
     pub idle_park_secs: u64,
+    /// Card-queue settings file (`queue.conf`), re-read on every turn decision; missing = defaults.
+    pub queue_config: Option<PathBuf>,
     pub api_key: Option<String>,
     pub verbose: bool,
+    /// Per-model options keyed by served model id.
+    pub per_model: Vec<(String, ModelRunOptions)>,
+    /// Draft widths for models with a drafter (one value = fixed, several = adaptive).
+    pub draft_k: Vec<u64>,
+}
+
+/// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
+/// acceptance as the full vocabulary at about 1 ms less per launch).
+const OWN_MTP_DRAFT_VOCAB: u64 = 98_304;
+
+/// Optional per-model run configuration (speculative drafter, FP8 tables).
+#[derive(Debug, Clone, Default)]
+pub struct ModelRunOptions {
+    /// Drafter checkpoint: enables speculative decoding for this model.
+    pub draft_model: Option<PathBuf>,
+    /// Speculative decoding with the model's own MTP head (no drafter checkpoint).
+    pub own_mtp: bool,
+    /// Mixture-of-experts model: the routed expert form instead of the dense-masked one.
+    pub moe_routed: bool,
+    /// Context size for this model instead of the server-wide one (still clamped to the
+    /// model's own limit).
+    pub max_ctx: Option<u64>,
+    /// FP8 activation-scale table for an FP8 checkpoint.
+    pub fp8_act: Option<PathBuf>,
+    /// Directory caching the quantised FP8 matrices.
+    pub fp8_cache: Option<PathBuf>,
 }
 
 struct RegisteredModel {
@@ -63,6 +98,51 @@ struct RegisteredModel {
     tokenizer: Arc<Tokenizer>,
     extra_eos_ids: Vec<i32>,
     max_ctx: u64,
+    /// Gemma 4 only: the model's template closes an empty thought channel after the generation
+    /// prompt of a non-thinking request.
+    gemma_closes_thought: bool,
+    /// Gemma 4 only: ids of the tokens that open and close a channel (`<|channel>`,
+    /// `<channel|>`); a thinking reply writes its reasoning between them.
+    channel_ids: Option<(i32, i32)>,
+    /// Sampler settings of a request that names none: the model's own `generation_config.json`.
+    gen_defaults: SamplerDefaults,
+}
+
+/// Sampler settings a request falls back to (temperature, top-k, top-p).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SamplerDefaults {
+    temperature: f32,
+    top_k: u64,
+    top_p: f32,
+}
+
+impl SamplerDefaults {
+    const FALLBACK: Self = Self {
+        temperature: 0.7,
+        top_k: 20,
+        top_p: 0.8,
+    };
+
+    /// Reads `generation_config.json` text; a missing or unusable key keeps the fallback value.
+    fn from_generation_config(text: &str) -> Self {
+        let mut d = Self::FALLBACK;
+        if let Ok(v) = crate::json::parse_json(text) {
+            if let Some(t) = v.get("temperature").and_then(|x| x.as_f64()) {
+                if t.is_finite() && t >= 0.0 {
+                    d.temperature = t as f32;
+                }
+            }
+            if let Some(k) = v.get("top_k").and_then(|x| x.as_u64()) {
+                d.top_k = k;
+            }
+            if let Some(p) = v.get("top_p").and_then(|x| x.as_f64()) {
+                if p > 0.0 && p <= 1.0 {
+                    d.top_p = p as f32;
+                }
+            }
+        }
+        d
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +177,7 @@ impl Lifecycle {
 }
 
 struct EngineSlot {
-    engine: Option<Qwen3Engine>,
+    engine: Option<Box<dyn GenEngine>>,
     resident_idx: Option<usize>,
     lifecycle: Lifecycle,
     detail: String,
@@ -106,9 +186,18 @@ struct EngineSlot {
     admin_parked: bool,
     hold: bool,
     active_requests: u64,
+    /// Chat requests that arrived and are waiting for the card (a model load or another
+    /// request), by model index.
+    waiting: Vec<u64>,
     switches: u64,
     last_switch_s: Option<f64>,
+    last_warmup_s: Option<f64>,
+    last_live_json: Option<String>,
+    /// The newest `request` event (for `/gaudium/live`, which a polling client reads).
+    last_request_json: Option<String>,
     hbm_bytes: Option<[u64; 5]>,
+    /// How the resident model runs, read from its loaded engine.
+    facts: Option<RunFacts>,
 }
 
 struct EventHubState {
@@ -164,6 +253,11 @@ impl EventHub {
     fn last_seq(&self) -> u64 {
         self.mu.lock().unwrap().seq
     }
+
+    fn close(&self) {
+        self.mu.lock().unwrap().closed = true;
+        self.cv.notify_all();
+    }
 }
 
 struct AppState {
@@ -175,9 +269,21 @@ struct AppState {
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     next_req_id: AtomicU64,
     hub: EventHub,
+    /// Data types of a model's step graph by `(model, fp8 weights, routed experts)`.
+    dtypes: Mutex<HashMap<(usize, bool, bool), Option<crate::engine::qwen3_traffic::StepDtypes>>>,
+    /// Chat requests take turns on the card through this queue (model load + generation in one turn).
+    turns: TurnQueue,
 }
 
 impl AppState {
+    /// The model loaded and ready on the card, if any.
+    fn ready_model(&self) -> Option<usize> {
+        match self.slot.lock().unwrap().lifecycle {
+            Lifecycle::Ready(i) => Some(i),
+            _ => None,
+        }
+    }
+
     fn find_model(&self, requested: Option<&str>) -> usize {
         let Some(name) = requested.filter(|s| !s.is_empty()) else {
             return self.slot.lock().unwrap().resident_idx.unwrap_or(0);
@@ -196,41 +302,208 @@ impl AppState {
     }
 
     fn publish_engine_event(&self) {
-        let payload = self.engine_status_json(true);
-        self.hub.publish(payload);
+        let hello = self.hello_json();
+        let eng = self.engine_status_json(true);
+        self.hub.publish(hello);
+        self.hub.publish(eng);
+    }
+
+    /// The drafter the configuration gives model `idx`: `(checkpoint, kind, draft widths)`.
+    /// The drafter kind is read off the checkpoint directory name: a block drafter (`dflash2`,
+    /// one width), a model's own per-token drafter (`mtp`, a `-assistant` checkpoint) or a
+    /// DSpine drafter (`dspine`, an adaptive pair of widths). `--draft-k` sets the DSpine widths.
+    ///
+    /// A model configured to draft with its own MTP head has no checkpoint (`None`): 4 drafts
+    /// per launch, 3 in the routed mixture-of-experts form (its measured best widths).
+    fn planned_drafter(&self, idx: usize) -> Option<(Option<PathBuf>, &'static str, Vec<u64>)> {
+        let id = &self.models[idx].id;
+        let (_, opts) = self.cfg.per_model.iter().find(|(k, _)| k == id)?;
+        if opts.own_mtp {
+            return Some((None, "mtp", vec![if opts.moe_routed { 3 } else { 4 }]));
+        }
+        let dir = opts.draft_model.as_ref()?;
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let (kind, draft_k) = if name.contains("dflash") {
+            ("dflash2", vec![7])
+        } else if name.ends_with("-assistant") {
+            ("mtp", vec![4])
+        } else if !self.cfg.draft_k.is_empty() {
+            ("dspine", self.cfg.draft_k.clone())
+        } else {
+            ("dspine", vec![7, 15])
+        };
+        Some((Some(dir.clone()), kind, draft_k))
+    }
+
+    /// How model `idx` runs: read from its engine while it is resident, else what the
+    /// configuration will load (`from_engine == false`).
+    fn run_facts(&self, idx: usize) -> RunFacts {
+        {
+            let s = self.slot.lock().unwrap();
+            if let (Some(f), Lifecycle::Ready(r)) = (&s.facts, &s.lifecycle) {
+                if *r == idx {
+                    return f.clone();
+                }
+            }
+        }
+        let m = &self.models[idx];
+        RunFacts {
+            from_engine: false,
+            // the engine's automatic precision: FP8 graphs for a block-FP8 checkpoint
+            fp8_weights: m.spec.fp8_quantized,
+            moe_routed: self
+                .cfg
+                .per_model
+                .iter()
+                .any(|(id, o)| *id == m.id && o.moe_routed),
+            drafter: self.planned_drafter(idx).map(|(dir, kind, mut ks)| {
+                ks.sort_unstable_by(|a, b| b.cmp(a));
+                DrafterFacts {
+                    kind: kind.to_string(),
+                    draft_k: ks,
+                    // every device drafter verifies sampled requests too
+                    samples: true,
+                    tree: None,
+                    matrix: None,
+                    checkpoint: dir.as_deref().and_then(dir_name),
+                }
+            }),
+            vision: false,
+            hbm_bytes: None,
+        }
+    }
+
+    /// Data types of model `idx`'s step graph under `facts` (built once per precision / form).
+    fn step_dtypes(
+        &self,
+        idx: usize,
+        facts: &RunFacts,
+    ) -> Option<crate::engine::qwen3_traffic::StepDtypes> {
+        let key = (idx, facts.fp8_weights, facts.moe_routed);
+        if let Some(v) = self.dtypes.lock().unwrap().get(&key) {
+            return v.clone();
+        }
+        let mut spec = self.models[idx].spec.clone();
+        spec.fp8_weights = facts.fp8_weights;
+        spec.moe_routed = facts.moe_routed;
+        // a graph description only; a shape the builders refuse yields no data types
+        let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::engine::qwen3_traffic::step_dtypes(&spec)
+        }))
+        .ok()
+        .flatten();
+        self.dtypes.lock().unwrap().insert(key, v.clone());
+        v
+    }
+
+    fn model_desc_with(&self, idx: usize, facts: &RunFacts) -> String {
+        let m = &self.models[idx];
+        let dt = self.step_dtypes(idx, facts);
+        readout::model_desc_json(
+            &m.id,
+            &dir_name(&m.dir).unwrap_or_else(|| m.id.clone()),
+            &m.spec,
+            m.max_ctx,
+            facts,
+            dt.as_ref(),
+        )
+    }
+
+    fn engine_info_json(&self, idx: usize, startup_s: Option<f64>) -> String {
+        let m = &self.models[idx];
+        let facts = self.run_facts(idx);
+        let desc = self.model_desc_with(idx, &facts);
+        let (greedy, sampled, loaded, greedy_only) = readout::method_set(facts.drafter.as_ref());
+        let startup_str = startup_s
+            .filter(|_| facts.from_engine)
+            .map(|v| format!(",\"startup_s\":{v:.1}"))
+            .unwrap_or_default();
+        format!(
+            "{{\"model\":{},\"precision\":{},\"n_ctx\":{},\"greedy\":{},\"sampled\":{},\
+             \"methods\":{},\"greedy_only\":[{}],\"speculative\":{},\"build\":{}{startup_str},\
+             \"model_desc\":{desc}}}",
+            jq(&m.id),
+            jq(readout::precision_word(&facts)),
+            m.max_ctx,
+            jq(&greedy),
+            jq(&sampled),
+            jq(&loaded),
+            greedy_only
+                .iter()
+                .map(|g| jq(g))
+                .collect::<Vec<_>>()
+                .join(","),
+            facts.drafter.is_some(),
+            jq(&format!("gaudium-rust {}", env!("CARGO_PKG_VERSION"))),
+        )
     }
 
     fn hello_json(&self) -> String {
-        let (res_idx, state_str) = {
+        let (res_idx, state_str, warmup_s) = {
             let s = self.slot.lock().unwrap();
-            (s.resident_idx.unwrap_or(0), s.lifecycle.as_str())
+            (
+                s.resident_idx.unwrap_or(0),
+                s.lifecycle.as_str(),
+                s.last_warmup_s,
+            )
         };
         let m = &self.models[res_idx];
+        let facts = self.run_facts(res_idx);
+        let info = self.engine_info_json(res_idx, warmup_s);
+        let desc = self.model_desc_with(res_idx, &facts);
+        let (greedy, sampled, loaded, greedy_only) = readout::method_set(facts.drafter.as_ref());
         format!(
             "{{\"type\":\"hello\",\"backend\":\"engine\",\"model\":{},\"n_ctx\":{},\"vision\":false,\
-             \"speculative\":false,\"build\":{},\"supports_inject\":false,\"mock_card\":false,\
+             \"speculative\":{},\"precision\":{},\
+             \"methods\":{{\"greedy\":{},\"sampled\":{},\"loaded\":{},\"greedy_only\":[{}]}},\
+             \"engine_info\":{info},\"model_desc\":{desc},\
+             \"build\":{},\"supports_inject\":false,\"mock_card\":false,\
              \"state\":{},\"ui\":{{\"root\":\"gaudium\",\"gaudium\":\"/\",\"llama\":\"/\"}},\
              \"api\":{{\"events\":\"/gaudium/events\",\"live\":\"/gaudium/live\",\"engine\":\"/gaudium/engine\",\
              \"count_tokens\":\"/gaudium/count_tokens\",\"version\":1}}}}",
             jq(&m.id),
             m.max_ctx,
+            facts.drafter.is_some(),
+            jq(readout::precision_word(&facts)),
+            jq(&greedy),
+            jq(&sampled),
+            jq(&loaded),
+            greedy_only.iter().map(|g| jq(g)).collect::<Vec<_>>().join(","),
             jq(&format!("gaudium-rust {}", env!("CARGO_PKG_VERSION"))),
             jq(state_str),
         )
     }
 
     fn engine_status_json(&self, include_type: bool) -> String {
+        // per-model facts first: `run_facts` takes the slot lock itself
+        let per_model: Vec<(bool, &'static str, String, String)> = (0..self.models.len())
+            .map(|i| {
+                let f = self.run_facts(i);
+                let (g, smp, _, _) = readout::method_set(f.drafter.as_ref());
+                (f.drafter.is_some(), readout::precision_word(&f), g, smp)
+            })
+            .collect();
         let s = self.slot.lock().unwrap();
         let res_idx = s.resident_idx.unwrap_or(0);
         let state_for_s = s.since.elapsed().as_secs();
         let idle_for_s = s.last_activity.elapsed().as_secs();
         let active_reqs = s.active_requests;
+        let waiting_total: u64 = s.waiting.iter().sum();
         let state_str = s.lifecycle.as_str();
         let detail = s.detail.clone();
         let hold = s.hold;
         let admin_parked = s.admin_parked;
         let switches = s.switches;
         let last_switch_s = s.last_switch_s;
+        let last_warmup_s = s.last_warmup_s;
+        let last_error = match &s.lifecycle {
+            Lifecycle::Failed(err) => err.clone(),
+            _ => String::new(),
+        };
         let resident_id = self.models[res_idx].id.clone();
         let switching_to = match s.lifecycle {
             Lifecycle::Loading(idx) if Some(idx) != s.resident_idx => {
@@ -251,60 +524,128 @@ impl AppState {
             };
             let is_res = s.resident_idx == Some(i) && matches!(s.lifecycle, Lifecycle::Ready(_));
             models_arr.push_str(&format!(
-                "{{\"id\":{},\"state\":{},\"resident\":{},\"running\":{},\"waiting\":0,\"n_ctx\":{},\"vision\":false,\"speculative\":false}}",
+                "{{\"id\":{},\"state\":{},\"resident\":{},\"running\":{},\"waiting\":{},\"n_ctx\":{},\"vision\":false,\"speculative\":{},\"precision\":{},\"greedy\":{},\"sampled\":{}}}",
                 jq(&m.id),
                 jq(mstate),
                 is_res,
                 if is_res { active_reqs } else { 0 },
+                s.waiting.get(i).copied().unwrap_or(0),
                 m.max_ctx,
+                per_model[i].0,
+                jq(per_model[i].1),
+                jq(&per_model[i].2),
+                jq(&per_model[i].3),
             ));
         }
         models_arr.push(']');
         drop(s);
 
-        let mut out = String::with_capacity(512);
+        let info = self.engine_info_json(res_idx, last_warmup_s);
+        let holder_str = if state_str == "ready" || state_str == "loading" {
+            "\"server/gaudium-rust\""
+        } else {
+            "\"\""
+        };
+        let card_holder_str = if state_str == "ready" || state_str == "loading" {
+            "\"server/gaudium-rust\""
+        } else {
+            "null"
+        };
+        let warmup_val = last_warmup_s
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "null".into());
+        // the last measured start of this process; unknown (null) before the first one
+        let expected_ready = warmup_val.clone();
+        // this server's only idle rule: it releases the card after `--idle-park` seconds idle
+        let idle_yield = if self.cfg.idle_park_secs > 0 {
+            format!("\"idle_yield_s\":{},", self.cfg.idle_park_secs)
+        } else {
+            String::new()
+        };
+
+        let mut out = String::with_capacity(1024);
         out.push('{');
         if include_type {
             out.push_str("\"type\":\"engine\",");
         }
         out.push_str(&format!(
-            "\"state\":{},\"detail\":{},\"state_for_s\":{},\"idle_for_s\":{},\"idle_park_s\":{},\
-             \"hold\":{},\"admin_parked\":{},\"running\":{},\"residency\":\"swap\",\"resident\":{},\
-             \"switching_to\":{},\"switches\":{},\"last_switch_s\":{},\"models\":{},\"card\":{{\"owner\":\"gaudium-rust\",\"holder\":{}}}}}",
+            "\"available\":true,\"mock\":false,\"state\":{},\"detail\":{},\"state_for_s\":{},\
+             \"holder\":{holder_str},\"owner\":\"server/gaudium-rust\",\"waiting_jobs\":{waiting_total},\
+             \"idle_s\":{idle_for_s},\"idle_for_s\":{idle_for_s},{idle_yield}\
+             \"idle_release_s\":{},\"idle_park_s\":{},\
+             \"expected_ready_s\":{expected_ready},\"last_warmup_s\":{warmup_val},\"last_start_to_ready_s\":{warmup_val},\
+             \"last_error\":{},\"info\":{info},\
+             \"hold\":{hold},\"admin_parked\":{admin_parked},\"running\":{active_reqs},\"residency\":\"swap\",\"resident\":{},\
+             \"switching_to\":{},\"switches\":{switches},\"last_switch_s\":{},\"models\":{models_arr},\
+             \"card\":{{\"owner\":\"server/gaudium-rust\",\"holder\":{card_holder_str},\"waiting_jobs\":{waiting_total}}}}}",
             jq(state_str),
             jq(&detail),
             state_for_s,
-            idle_for_s,
             self.cfg.idle_park_secs,
-            hold,
-            admin_parked,
-            active_reqs,
+            self.cfg.idle_park_secs,
+            jq(&last_error),
             jq(&resident_id),
             switching_to.as_deref().map(jq).unwrap_or_else(|| "null".into()),
-            switches,
             last_switch_s
                 .map(|v| format!("{v:.1}"))
                 .unwrap_or_else(|| "null".into()),
-            models_arr,
-            if state_str == "ready" || state_str == "loading" {
-                "\"gaudium-rust\""
-            } else {
-                "null"
-            },
         ));
         out
     }
 
     fn live_snapshot_json(&self) -> String {
-        format!(
-            "{{\"hello\":{},\"engine\":{}}}",
+        let (last_live, last_req) = {
+            let s = self.slot.lock().unwrap();
+            (s.last_live_json.clone(), s.last_request_json.clone())
+        };
+        let mut out = format!(
+            "{{\"hello\":{},\"engine\":{}",
             self.hello_json(),
             self.engine_status_json(true),
+        );
+        if let Some(r) = last_req {
+            out.push_str(&format!(",\"request\":{r}"));
+        }
+        if let Some(live) = last_live {
+            out.push_str(&format!(",\"live\":{live}"));
+        }
+        out.push_str(&format!(",\"seq\":{}}}", self.hub.last_seq()));
+        out
+    }
+
+    /// The one slot of this server: whether it is busy, and what the resident model runs as.
+    fn slots_json(&self) -> String {
+        let (active, idx) = {
+            let s = self.slot.lock().unwrap();
+            (s.active_requests, s.resident_idx.unwrap_or(0))
+        };
+        let m = &self.models[idx];
+        let facts = self.run_facts(idx);
+        let (greedy, sampled, _, _) = readout::method_set(facts.drafter.as_ref());
+        format!(
+            "[{{\"id\":0,\"is_processing\":{},\"model\":{},\"n_ctx\":{},\"speculative\":{},\
+             \"precision\":{},\"greedy\":{},\"sampled\":{},\"loaded\":{}}}]",
+            active > 0,
+            jq(&m.id),
+            m.max_ctx,
+            facts.drafter.is_some(),
+            jq(readout::precision_word(&facts)),
+            jq(&greedy),
+            jq(&sampled),
+            facts.from_engine,
         )
+    }
+
+    /// Publishes a `request` event and keeps it for `/gaudium/live`.
+    fn publish_request(&self, json: String) {
+        self.slot.lock().unwrap().last_request_json = Some(json.clone());
+        self.hub.publish(json);
     }
 
     fn model_entry_json(&self, idx: usize) -> String {
         let m = &self.models[idx];
+        let facts = self.run_facts(idx);
+        let (greedy, sampled, _, _) = readout::method_set(facts.drafter.as_ref());
         let s = self.slot.lock().unwrap();
         let (status_val, resident) = match &s.lifecycle {
             Lifecycle::Ready(r) if *r == idx => ("loaded", true),
@@ -314,16 +655,27 @@ impl AppState {
         };
         drop(s);
 
+        let n_ctx_train = crate::engine::model_max_positions(&m.dir)
+            .map_or("null".to_string(), |n| n.to_string());
         let mut out = format!(
             "{{\"id\":{},\"object\":\"model\",\"owned_by\":\"gaudium\",\"created\":0,\
              \"context_length\":{},\"architecture\":{{\"input_modalities\":[\"text\"]}},\
-             \"meta\":{{\"n_ctx_train\":262144,\"speculative\":false,\"family\":{},\"layers\":{},\"hidden\":{}}}",
+             \"meta\":{{\"n_ctx_train\":{n_ctx_train},\"speculative\":{},\"precision\":{},\
+             \"greedy\":{},\"sampled\":{},\"family\":{},\"layers\":{},\"hidden\":{}",
             jq(&m.id),
             m.max_ctx,
+            facts.drafter.is_some(),
+            jq(readout::precision_word(&facts)),
+            jq(&greedy),
+            jq(&sampled),
             jq(&format!("{:?}", m.spec.family)),
             m.spec.n_layers,
             m.spec.hidden,
         );
+        if let Some(d) = &facts.drafter {
+            out.push_str(&format!(",\"drafter\":{}", jq(&d.kind)));
+        }
+        out.push('}');
         if self.models.len() > 1 {
             out.push_str(&format!(
                 ",\"status\":{{\"value\":{}}},\"resident\":{}",
@@ -337,10 +689,13 @@ impl AppState {
 
     fn props_json(&self, idx: usize, include_router: bool) -> String {
         let m = &self.models[idx];
+        let speculative = self.run_facts(idx).drafter.is_some();
+        let gd = m.gen_defaults;
+        let (d_temp, d_top_k, d_top_p) = (gd.temperature, gd.top_k, gd.top_p);
         let mut out = format!(
-            "{{\"default_generation_settings\":{{\"n_ctx\":{},\"params\":{{\"seed\":-1,\"temperature\":0.7,\
-             \"top_k\":20,\"top_p\":0.8,\"min_p\":0.0,\"max_tokens\":-1,\"n_predict\":-1,\"stream\":false,\
-             \"timings_per_token\":false,\"reasoning_format\":\"auto\",\"speculative\":false,\
+            "{{\"default_generation_settings\":{{\"n_ctx\":{},\"params\":{{\"seed\":-1,\"temperature\":{d_temp},\
+             \"top_k\":{d_top_k},\"top_p\":{d_top_p},\"min_p\":0.0,\"max_tokens\":-1,\"n_predict\":-1,\"stream\":false,\
+             \"timings_per_token\":false,\"reasoning_format\":\"auto\",\"speculative\":{speculative},\
              \"samplers\":[\"top_k\",\"top_p\",\"min_p\",\"temperature\"]}}}},\
              \"total_slots\":1,\"model_alias\":{},\"model_path\":{},\
              \"modalities\":{{\"vision\":false,\"audio\":false,\"video\":false}},\
@@ -358,6 +713,11 @@ impl AppState {
             self.cfg.ui_dir.is_some(),
             jq(&format!("gaudium-rust {}", env!("CARGO_PKG_VERSION"))),
         );
+        // what this model is and how it runs (the same description the event stream carries)
+        out.push_str(&format!(
+            ",\"model_desc\":{}",
+            self.model_desc_with(idx, &self.run_facts(idx))
+        ));
         if include_router && self.models.len() > 1 {
             out.push_str(",\"role\":\"router\",\"max_instances\":1,\"models_autoload\":true");
         }
@@ -393,12 +753,14 @@ impl AppState {
                 s.since = Instant::now();
                 s.engine = None; // drops Qwen3Engine -> drains streams & releases /dev/accel/accel0
                 s.hbm_bytes = None;
+                s.facts = None;
                 s.lifecycle = Lifecycle::Parked;
             }
             if !can_switch_resident_model(s.active_requests, s.lifecycle.as_backend_state()) {
                 return Err("verified single-resident guard refused card switch".into());
             }
             s.admin_parked = false;
+            s.resident_idx = Some(target_idx);
             s.lifecycle = Lifecycle::Loading(target_idx);
             s.detail = format!("loading {} onto Gaudi 2", self.models[target_idx].id);
             s.since = Instant::now();
@@ -417,17 +779,53 @@ impl AppState {
         qcfg.cache_dir = self.cfg.cache_dir.clone();
         qcfg.no_cache = self.cfg.no_cache;
         qcfg.verbose = self.cfg.verbose;
+        if let Some((_, opts)) = self.cfg.per_model.iter().find(|(id, _)| *id == m.id) {
+            qcfg.fp8_act = opts.fp8_act.clone();
+            qcfg.fp8_cache = opts.fp8_cache.clone();
+            qcfg.moe_routed = opts.moe_routed;
+        }
+        let drafter_dir = self
+            .planned_drafter(target_idx)
+            .and_then(|(dir, kind, draft_k)| {
+                use crate::engine::qwen3::spec::{SpecConfig, SpecMethod};
+                let method = match (kind, dir.clone()) {
+                    ("dflash2", Some(draft_model)) => SpecMethod::DFlash2 { draft_model },
+                    ("mtp", Some(draft_model)) => SpecMethod::Assistant { draft_model },
+                    // the model's own MTP head; draft readouts over the low token ids and the
+                    // control-token block only (drafts are guesses: the output is unchanged)
+                    ("mtp", None) => SpecMethod::Mtp {
+                        tree: None,
+                        reference: Vec::new(),
+                        draft_vocab: OWN_MTP_DRAFT_VOCAB,
+                    },
+                    (_, Some(draft_model)) => SpecMethod::DSpine { draft_model },
+                    (_, None) => return None,
+                };
+                qcfg.spec = Some(SpecConfig { method, draft_k });
+                dir
+            });
 
-        match Qwen3Engine::load(&qcfg) {
+        match load_engine(&qcfg) {
             Ok(eng) => {
                 let dt = t0.elapsed().as_secs_f64();
                 let hbm = eng.hbm_bytes();
+                // what the readout says about this model comes from the engine that loaded it
+                let facts = RunFacts {
+                    from_engine: true,
+                    fp8_weights: eng.spec().fp8_weights,
+                    moe_routed: eng.spec().moe_routed,
+                    drafter: eng.spec_info().map(|i| {
+                        DrafterFacts::from_engine(&i, drafter_dir.as_deref().and_then(dir_name))
+                    }),
+                    vision: eng.vision_spec().is_some(),
+                    hbm_bytes: Some(hbm),
+                };
                 let mut s = self.slot.lock().unwrap();
-                let swapped = s.resident_idx.is_some() && s.resident_idx != Some(target_idx);
-                if swapped {
+                if need_drop_prev {
                     s.switches += 1;
                     s.last_switch_s = Some(dt);
                 }
+                s.last_warmup_s = Some(dt);
                 s.engine = Some(eng);
                 s.resident_idx = Some(target_idx);
                 s.lifecycle = Lifecycle::Ready(target_idx);
@@ -435,6 +833,7 @@ impl AppState {
                 s.since = Instant::now();
                 s.last_activity = Instant::now();
                 s.hbm_bytes = Some(hbm);
+                s.facts = Some(facts);
                 drop(s);
                 self.publish_engine_event();
                 if self.cfg.verbose {
@@ -445,6 +844,7 @@ impl AppState {
             Err(e) => {
                 let mut s = self.slot.lock().unwrap();
                 s.engine = None;
+                s.facts = None;
                 s.lifecycle = Lifecycle::Failed(e.clone());
                 s.detail = format!("load failed: {e}");
                 s.since = Instant::now();
@@ -468,8 +868,9 @@ impl AppState {
             s.lifecycle = Lifecycle::Stopping;
             s.detail = reason.to_string();
             s.since = Instant::now();
-            s.engine = None; // drains streams & releases device
+            s.engine = None; // drains streams & releases device + unlinks cardlock holder/live/shm
             s.hbm_bytes = None;
+            s.facts = None;
         }
         s.lifecycle = Lifecycle::Parked;
         s.detail = reason.to_string();
@@ -488,6 +889,12 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
     if cfg.models.is_empty() {
         return Err("at least one --model <dir> is required for --serve".into());
     }
+    // Shared stop-request handler; re-asserted by the device layer after every card open, because
+    // the runtime replaces signal dispositions while initializing.
+    crate::signals::install();
+    // The readout reads each engine's launch feed and profile block in-process, whether or not
+    // a live-record directory is configured.
+    crate::live_report::enable_in_memory();
 
     let max_ctx = crate::verified::align_up(cfg.max_ctx.max(KV_CHUNK), KV_CHUNK);
     let mut models = Vec::with_capacity(cfg.models.len());
@@ -499,24 +906,46 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         let tok = Tokenizer::from_model_dir(&entry.dir)
             .map_err(|e| format!("load tokenizer.json for '{}': {e}", entry.id))?;
         let mut extra_eos_ids = Vec::new();
-        for special in ["<|im_end|>", "<|endoftext|>"] {
+        for special in ["<|im_end|>", "<|endoftext|>", "<turn|>"] {
             if let Some(id) = tok.token_id(special) {
                 extra_eos_ids.push(id);
             }
         }
+        let channel_ids = (spec.family == ModelFamily::Gemma4)
+            .then(|| tok.token_id("<|channel>").zip(tok.token_id("<channel|>")))
+            .flatten();
         models.push(RegisteredModel {
             id: entry.id.clone(),
             dir: entry.dir.clone(),
             spec,
+            channel_ids,
             tokenizer: Arc::new(tok),
             extra_eos_ids,
-            max_ctx,
+            // `--max-ctx` (or the model's own `--model-ctx`), clamped to the model's own limit.
+            max_ctx: crate::engine::clamp_ctx_to_model(
+                cfg.per_model
+                    .iter()
+                    .find(|(id, _)| *id == entry.id)
+                    .and_then(|(_, o)| o.max_ctx)
+                    .map_or(max_ctx, |c| {
+                        crate::verified::align_up(c.max(KV_CHUNK), KV_CHUNK)
+                    }),
+                &entry.dir,
+            ),
+            gen_defaults: std::fs::read_to_string(entry.dir.join("generation_config.json"))
+                .map(|t| SamplerDefaults::from_generation_config(&t))
+                .unwrap_or(SamplerDefaults::FALLBACK),
+            gemma_closes_thought: std::fs::read_to_string(entry.dir.join("chat_template.jinja"))
+                .map(|t| crate::tokenizer::gemma4_template_closes_thought(&t))
+                .unwrap_or(false),
         });
     }
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
+    let _ = listener.set_nonblocking(true);
 
+    let n_models = models.len();
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
         models,
@@ -534,14 +963,21 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             admin_parked: false,
             hold: false,
             active_requests: 0,
+            waiting: vec![0; n_models],
             switches: 0,
             last_switch_s: None,
+            last_warmup_s: None,
+            last_live_json: None,
+            last_request_json: None,
             hbm_bytes: None,
+            facts: None,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
         next_req_id: AtomicU64::new(1),
         hub: EventHub::new(),
+        dtypes: Mutex::new(HashMap::new()),
+        turns: TurnQueue::default(),
     });
 
     // Optional eager warm-up in a background thread so HTTP/UI responds immediately!
@@ -564,6 +1000,9 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         thread::Builder::new()
             .name("gaudium-idle-park".into())
             .spawn(move || loop {
+                if crate::signals::term_requested() {
+                    break;
+                }
                 thread::sleep(Duration::from_secs(5));
                 let should_park = {
                     let s = st.slot.lock().unwrap();
@@ -596,17 +1035,26 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             .unwrap_or_else(|| "none".into()),
     );
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
+    while !crate::signals::term_requested() {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
                 let st = Arc::clone(&state);
                 thread::spawn(move || handle_connection(st, stream));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+            }
             Err(e) => {
                 eprintln!("[server] accept error: {e}");
+                thread::sleep(Duration::from_millis(50));
             }
         }
     }
+
+    // Graceful shutdown on SIGINT / SIGTERM: close SSE streams and release card + cardlock!
+    state.hub.close();
+    let _ = state.park(false, "server shutdown");
     Ok(())
 }
 
@@ -706,12 +1154,13 @@ fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest>, String> 
     }))
 }
 
-fn write_response(
+fn write_response_with_body(
     stream: &mut TcpStream,
     status: u16,
     reason: &str,
     content_type: &str,
     body: &[u8],
+    send_body: bool,
 ) {
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
@@ -719,16 +1168,26 @@ fn write_response(
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
          Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+         Access-Control-Allow-Methods: GET, HEAD, POST, DELETE, OPTIONS\r\n\
          Access-Control-Allow-Headers: Content-Type, Authorization, X-Api-Key\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
-    if !body.is_empty() {
+    if send_body && !body.is_empty() {
         let _ = stream.write_all(body);
     }
     let _ = stream.flush();
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+) {
+    write_response_with_body(stream, status, reason, content_type, body, true);
 }
 
 fn write_json(stream: &mut TcpStream, status: u16, json: &str) {
@@ -763,12 +1222,29 @@ fn write_error(stream: &mut TcpStream, status: u16, err_type: &str, msg: &str) {
 fn write_sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
     let head = "HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream; charset=utf-8\r\n\
+                Transfer-Encoding: chunked\r\n\
                 Cache-Control: no-cache, no-store\r\n\
                 X-Accel-Buffering: no\r\n\
                 Access-Control-Allow-Origin: *\r\n\
                 Connection: close\r\n\r\n";
     stream.write_all(head.as_bytes())?;
     stream.flush()
+}
+
+fn write_sse_chunk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let prefix = format!("{:x}\r\n", data.len());
+    stream.write_all(prefix.as_bytes())?;
+    stream.write_all(data)?;
+    stream.write_all(b"\r\n")?;
+    stream.flush()
+}
+
+fn write_sse_end(stream: &mut TcpStream) {
+    let _ = stream.write_all(b"0\r\n\r\n");
+    let _ = stream.flush();
 }
 
 fn check_auth(cfg: &ServerConfig, req: &HttpRequest) -> bool {
@@ -871,12 +1347,7 @@ fn handle_connection(state: Arc<AppState>, mut stream: TcpStream) {
         }
         ("GET", "/gaudium/events") => handle_events_sse(&state, &mut stream),
         ("GET", "/slots") => {
-            let active = state.slot.lock().unwrap().active_requests;
-            write_json(
-                &mut stream,
-                200,
-                &format!("[{{\"id\":0,\"is_processing\":{}}}]", active > 0),
-            );
+            write_json(&mut stream, 200, &state.slots_json());
         }
         ("POST", "/v1/streams/lookup") => write_json(&mut stream, 200, "[]"),
         ("POST", "/tokenize") => handle_tokenize(&state, &req, &mut stream),
@@ -886,7 +1357,8 @@ fn handle_connection(state: Arc<AppState>, mut stream: TcpStream) {
         ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") => {
             handle_chat_completions(&state, &req, &mut stream);
         }
-        ("GET", _) => handle_static_ui(&state, &req.path, &mut stream),
+        ("GET", _) => handle_static_ui(&state, &req.path, &mut stream, true),
+        ("HEAD", _) => handle_static_ui(&state, &req.path, &mut stream, false),
         _ => write_error(
             &mut stream,
             404,
@@ -903,11 +1375,13 @@ fn handle_events_sse(state: &AppState, stream: &mut TcpStream) {
     let mut seq = state.hub.last_seq();
     let init = [state.hello_json(), state.engine_status_json(true)];
     for msg in &init {
-        if stream
-            .write_all(format!("data: {msg}\n\n").as_bytes())
-            .is_err()
-            || stream.flush().is_err()
-        {
+        if write_sse_chunk(stream, format!("data: {msg}\n\n").as_bytes()).is_err() {
+            return;
+        }
+    }
+    let last_live = state.slot.lock().unwrap().last_live_json.clone();
+    if let Some(live) = last_live {
+        if write_sse_chunk(stream, format!("data: {live}\n\n").as_bytes()).is_err() {
             return;
         }
     }
@@ -917,22 +1391,19 @@ fn handle_events_sse(state: &AppState, stream: &mut TcpStream) {
             break;
         }
         if evs.is_empty() {
-            if stream.write_all(b":\n\n").is_err() || stream.flush().is_err() {
+            if write_sse_chunk(stream, b":\n\n").is_err() {
                 break;
             }
             continue;
         }
         for (s, payload) in evs {
             seq = s;
-            if stream
-                .write_all(format!("data: {payload}\n\n").as_bytes())
-                .is_err()
-                || stream.flush().is_err()
-            {
+            if write_sse_chunk(stream, format!("data: {payload}\n\n").as_bytes()).is_err() {
                 return;
             }
         }
     }
+    write_sse_end(stream);
 }
 
 fn handle_engine_action(state: &Arc<AppState>, req: &HttpRequest, stream: &mut TcpStream) {
@@ -951,6 +1422,14 @@ fn handle_engine_action(state: &Arc<AppState>, req: &HttpRequest, stream: &mut T
 
     let result: Result<String, String> = match action.as_str() {
         "start" | "unpark" | "load" => {
+            {
+                let mut s = state.slot.lock().unwrap();
+                if s.active_requests == 0 {
+                    s.resident_idx = Some(idx);
+                    s.admin_parked = false;
+                }
+            }
+            state.publish_engine_event();
             let st_clone = Arc::clone(state);
             thread::spawn(move || {
                 let _ = st_clone.ensure_loaded(idx, true);
@@ -983,7 +1462,7 @@ fn handle_engine_action(state: &Arc<AppState>, req: &HttpRequest, stream: &mut T
             stream,
             200,
             &format!(
-                "{{\"ok\":true,\"message\":{},\"status\":{}}}",
+                "{{\"success\":true,\"ok\":true,\"message\":{},\"status\":{}}}",
                 jq(&msg),
                 state.engine_status_json(false)
             ),
@@ -1072,7 +1551,7 @@ fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut TcpStre
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
     let m = &state.models[idx];
     let preopen_think = m.spec.family == ModelFamily::Qwen35Dense;
-    let prompt_text = match build_chat_prompt(&val, preopen_think) {
+    let prompt_text = match build_model_chat_prompt(m, &val, preopen_think) {
         Ok(p) => p,
         Err(e) => {
             write_error(stream, 400, "invalid_request_error", &e);
@@ -1096,6 +1575,183 @@ fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut TcpStre
     );
 }
 
+/// How far a request for the loaded model may jump the queue: the oldest request is never passed over once
+/// it has waited `max_wait` or been passed over `max_skips` times. Read from the card-queue settings file
+/// (`queue.conf`, keys `group_max_wait_min` and `group_max_skips`), the same file the card lock reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TurnLimits {
+    max_wait: Duration,
+    max_skips: u32,
+}
+
+impl Default for TurnLimits {
+    fn default() -> Self {
+        Self {
+            max_wait: Duration::from_secs(45 * 60),
+            max_skips: 3,
+        }
+    }
+}
+
+impl TurnLimits {
+    /// `key=value` lines, `#` starts a comment; a missing file, key or unparsable value keeps the default.
+    fn parse(text: &str) -> Self {
+        let mut l = Self::default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("");
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let Ok(v) = v.trim().parse::<u64>() else {
+                continue;
+            };
+            match k.trim() {
+                "group_max_wait_min" => l.max_wait = Duration::from_secs(v.saturating_mul(60)),
+                "group_max_skips" => l.max_skips = u32::try_from(v).unwrap_or(u32::MAX),
+                _ => {}
+            }
+        }
+        l
+    }
+
+    fn read(path: Option<&Path>) -> Self {
+        path.and_then(|p| fs::read_to_string(p).ok())
+            .map(|t| Self::parse(&t))
+            .unwrap_or_default()
+    }
+}
+
+/// The chat server's card queue. Requests get the card in arrival order, except that a request for the
+/// model already loaded goes ahead of older requests for another model, so the card is not unloaded and
+/// reloaded between them. The model index is the whole configuration: every load option is fixed per model
+/// at startup, and per-request settings (sampling, method) never reload the card. The oldest request is
+/// never passed over beyond the `TurnLimits` of the settings file.
+#[derive(Default)]
+struct TurnQueue {
+    mu: Mutex<TurnState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct TurnState {
+    busy: bool,
+    next_id: u64,
+    waiting: Vec<TurnWaiter>,
+}
+
+struct TurnWaiter {
+    id: u64,
+    model: usize,
+    since: Instant,
+    skips: u32,
+}
+
+/// The waiter that gets the card next: its position in `waiting` (arrival order).
+fn next_turn(
+    waiting: &[TurnWaiter],
+    ready: Option<usize>,
+    now: Instant,
+    lim: TurnLimits,
+) -> Option<usize> {
+    let first = waiting.first()?;
+    let due = now.duration_since(first.since) >= lim.max_wait || first.skips >= lim.max_skips;
+    match ready {
+        Some(m) if first.model != m && !due => {
+            Some(waiting.iter().position(|w| w.model == m).unwrap_or(0))
+        }
+        _ => Some(0),
+    }
+}
+
+/// Holding the card: dropping it hands the card to the next waiter.
+struct Turn<'a>(&'a TurnQueue);
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        self.0.mu.lock().unwrap().busy = false;
+        self.0.cv.notify_all();
+    }
+}
+
+impl TurnQueue {
+    /// Waits for this request's turn on the card. `ready` reads the model loaded now (it takes the slot
+    /// lock; this queue's lock is always taken first).
+    fn acquire(
+        &self,
+        model: usize,
+        ready: impl Fn() -> Option<usize>,
+        limits: impl Fn() -> TurnLimits,
+    ) -> Turn<'_> {
+        let mut st = self.mu.lock().unwrap();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.waiting.push(TurnWaiter {
+            id,
+            model,
+            since: Instant::now(),
+            skips: 0,
+        });
+        loop {
+            if !st.busy {
+                if let Some(pos) = next_turn(&st.waiting, ready(), Instant::now(), limits()) {
+                    if st.waiting[pos].id == id {
+                        for w in &mut st.waiting[..pos] {
+                            w.skips += 1;
+                        }
+                        st.waiting.remove(pos);
+                        st.busy = true;
+                        return Turn(self);
+                    }
+                }
+            }
+            // a timed wait, so a waiter that becomes due by waiting is noticed without a release
+            st = self.cv.wait_timeout(st, Duration::from_secs(1)).unwrap().0;
+        }
+    }
+}
+
+/// One chat request's place in the card queue: counted in `EngineSlot::waiting` from its arrival
+/// until it holds the card, and removed on any early exit (load error, client gone).
+struct WaitTicket<'a> {
+    state: &'a AppState,
+    idx: usize,
+    counted: bool,
+}
+
+impl<'a> WaitTicket<'a> {
+    fn enter(state: &'a AppState, idx: usize) -> Self {
+        if let Some(w) = state.slot.lock().unwrap().waiting.get_mut(idx) {
+            *w += 1;
+        }
+        state.publish_engine_event();
+        Self {
+            state,
+            idx,
+            counted: true,
+        }
+    }
+
+    /// Leaves the queue under the caller's slot lock, so `running` and `waiting` move together.
+    fn leave(&mut self, s: &mut EngineSlot) {
+        if std::mem::take(&mut self.counted) {
+            if let Some(w) = s.waiting.get_mut(self.idx) {
+                *w = w.saturating_sub(1);
+            }
+        }
+    }
+}
+
+impl Drop for WaitTicket<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            let mut s = self.state.slot.lock().unwrap();
+            self.leave(&mut s);
+            drop(s);
+            self.state.publish_engine_event();
+        }
+    }
+}
+
 fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
@@ -1112,6 +1768,7 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut TcpStre
 }
 
 fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+    let t_arrival = Instant::now();
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
@@ -1120,7 +1777,7 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
     let m = &state.models[idx];
     let preopen_think = m.spec.family == ModelFamily::Qwen35Dense;
-    let prompt_text = match build_chat_prompt(&val, preopen_think) {
+    let prompt_text = match build_model_chat_prompt(m, &val, preopen_think) {
         Ok(p) => p,
         Err(e) => {
             write_error(stream, 400, "invalid_request_error", &e);
@@ -1130,17 +1787,32 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
     let prompt_ids = m.tokenizer.encode(&prompt_text, true);
     let n_prompt = prompt_ids.len() as u64;
     let stream_mode = val.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let enable_thinking = val
-        .get("chat_template_kwargs")
-        .and_then(|v| v.get("enable_thinking"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    // Qwen templates think unless told not to; the Gemma 4 template thinks only when asked.
+    let is_gemma = m.spec.family == ModelFamily::Gemma4;
+    let enable_thinking = requested_thinking(&val, !is_gemma);
+    // Gemma 4 writes its reasoning between two special tokens, which never reach the text.
+    let mut channel = m
+        .channel_ids
+        .filter(|_| enable_thinking)
+        .map(|(open, close)| ChannelSplitter::new(open, close, GEMMA4_THOUGHT_LABEL));
     let temperature = val
         .get("temperature")
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.7) as f32;
-    let top_p = val.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
-    let top_k = val.get("top_k").and_then(|v| v.as_u64()).unwrap_or(20);
+        .map_or(m.gen_defaults.temperature, |t| t as f32);
+    let top_p = val
+        .get("top_p")
+        .and_then(|v| v.as_f64())
+        .map_or(m.gen_defaults.top_p, |p| p as f32);
+    let top_k = val
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(m.gen_defaults.top_k);
+    // Sampled drafts follow the verify's noise unless the request turns that off.
+    let coupled = val.get("coupled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let draft_trunc = val
+        .get("draft_trunc")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let min_p = val.get("min_p").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
     let seed = val.get("seed").and_then(|v| v.as_u64()).unwrap_or_else(|| {
         SystemTime::now()
@@ -1180,11 +1852,31 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
             .collect(),
         _ => Vec::new(),
     };
+    let is_greedy = temperature <= 0.0;
 
-    // Ensure target model is loaded on Gaudi 2 before starting generation.
-    if let Err(e) = state.ensure_loaded(idx, false) {
-        write_error(stream, 503, "unavailable_error", &e);
-        return;
+    // The method this request takes follows from the model's drafter and from greedy / sampled;
+    // a request may name it (`gaudium_method`) but can not pick another one.
+    let (m_greedy, m_sampled, m_loaded, _) =
+        readout::method_set(state.run_facts(idx).drafter.as_ref());
+    let method = if is_greedy { m_greedy } else { m_sampled };
+    if let Some(want) = val
+        .get("gaudium_method")
+        .and_then(|v| v.as_str())
+        .filter(|w| !w.is_empty() && *w != "default")
+    {
+        if want != method {
+            write_error(
+                stream,
+                400,
+                "invalid_request_error",
+                &format!(
+                    "method '{want}' is not available for this request: this engine runs {m_loaded} \
+                     ({} requests: {method})",
+                    if is_greedy { "greedy" } else { "sampled" }
+                ),
+            );
+            return;
+        }
     }
 
     let req_num = state.next_req_id.fetch_add(1, Ordering::Relaxed);
@@ -1192,6 +1884,38 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    let max_new = budget.max_new().max(1);
+    // the fields every `request` event of this job starts with
+    let req_base = |phase: &str, queued_ms: f64| {
+        format!(
+            "\"type\":\"request\",\"job\":{req_num},\"phase\":{},\"background\":false,\
+             \"method\":{},\"greedy\":{is_greedy},\"prompt_tokens\":{n_prompt},\"images\":0,\
+             \"max_new\":{max_new},\"queued_ms\":{queued_ms:.1}",
+            jq(phase),
+            jq(&method),
+        )
+    };
+    state.publish_request(format!("{{{}}}", req_base("queued", 0.0)));
+    // Counts this request in the card queue until it holds the card; any early return leaves it.
+    let mut ticket = WaitTicket::enter(state, idx);
+    // One turn covers the model load and the generation, so no request for another model can swap the card
+    // between them; a request for the model already on the card may go ahead of older ones (TurnQueue).
+    let turn = state.turns.acquire(
+        idx,
+        || state.ready_model(),
+        || TurnLimits::read(state.cfg.queue_config.as_deref()),
+    );
+
+    // Ensure target model is loaded on Gaudi 2 before starting generation.
+    if let Err(e) = state.ensure_loaded(idx, false) {
+        state.publish_request(format!(
+            "{{{},\"message\":{}}}",
+            req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
+            jq(&e)
+        ));
+        write_error(stream, 503, "unavailable_error", &e);
+        return;
+    }
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     state
@@ -1209,48 +1933,57 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
         return;
     }
 
-    let mut params = Qwen3GenParams {
-        max_new: budget.max_new(),
+    let params = Qwen3GenParams {
+        max_new,
         temperature,
         top_p,
         top_k,
         min_p,
         seed,
+        coupled,
+        draft_trunc,
         stop_on_eos: true,
         extra_eos_ids: m.extra_eos_ids.clone(),
+        ..Qwen3GenParams::default()
     };
-    if params.max_new == 0 {
-        params.max_new = 1;
-    }
 
     // Acquire card op lock for exclusive Gaudi 2 execution.
     let _op = state.card_op.lock().unwrap();
     {
         let mut s = state.slot.lock().unwrap();
         s.active_requests += 1;
+        ticket.leave(&mut s);
         s.last_activity = Instant::now();
     }
+    state.publish_engine_event();
     let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
 
     // Take engine temporarily out of slot so status endpoints never block while generating!
-    let mut engine = {
+    let (mut engine, hbm_bytes) = {
         let mut s = state.slot.lock().unwrap();
         match s.engine.take() {
-            Some(e) if s.resident_idx == Some(idx) => e,
+            Some(e) if s.resident_idx == Some(idx) => (e, s.hbm_bytes),
             other => {
                 s.engine = other;
                 s.active_requests = s.active_requests.saturating_sub(1);
                 drop(s);
                 state.cancels.lock().unwrap().remove(&req_id);
                 let msg = "model unloaded concurrently; retry request";
+                state.publish_request(format!(
+                    "{{{},\"message\":{}}}",
+                    req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
+                    jq(msg)
+                ));
                 if stream_mode {
-                    let _ = stream.write_all(
+                    let _ = write_sse_chunk(
+                        stream,
                         format!(
                             "data: {{\"error\":{{\"message\":{}}}}}\n\ndata: [DONE]\n\n",
                             jq(msg)
                         )
                         .as_bytes(),
                     );
+                    write_sse_end(stream);
                 } else {
                     write_error(stream, 503, "unavailable_error", msg);
                 }
@@ -1258,80 +1991,124 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
             }
         }
     };
+    // From here the engine has the request: everything before was the wait for the card (the
+    // model load, or another request).
+    let queued_ms = t_arrival.elapsed().as_secs_f64() * 1e3;
+    state.publish_request(format!("{{{}}}", req_base("prefill", queued_ms)));
 
     let mut decoder = StreamDecoder::new(&m.tokenizer);
-    let mut splitter = ThinkSplitter::new(enable_thinking, preopen_think);
+    let mut splitter = ThinkSplitter::new(enable_thinking && !is_gemma, preopen_think);
     let mut full_reasoning = String::new();
     let mut full_content = String::new();
-    let mut write_failed = false;
     let mut hit_stop = false;
     let mut started_decode = false;
     let tok_ref = Arc::clone(&m.tokenizer);
     let model_id = m.id.clone();
+    let timings_per_token = val
+        .get("timings_per_token")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(stream_mode);
+    let return_progress = val
+        .get("return_progress")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    if stream_mode {
-        // Send initial role chunk immediately so UI shows the assistant turn is active.
+    // The engine's launch feed and profile block (both measured by the engine's own reporter).
+    let live = engine.live_profile().filter(|h| h.is_live());
+    let out_stream = if stream_mode {
+        stream.try_clone().ok()
+    } else {
+        None
+    };
+    let stream_ok = !stream_mode || out_stream.is_some();
+    let out = Arc::new(Mutex::new(StreamOut::new(
+        out_stream,
+        &req_id,
+        &model_id,
+        created,
+        timings_per_token,
+        return_progress,
+        n_prompt,
+        live.is_some(),
+        Arc::clone(&cancel_flag),
+    )));
+    if !stream_ok {
+        cancel_flag.store(true, Ordering::Relaxed);
+    }
+    {
+        // The role chunk goes out now, so a client times its request from the moment the engine
+        // took it.
+        let mut o = out.lock().unwrap();
         let init_chunk = format!(
-            "data: {{\"id\":{},\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":{},\
-             \"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
-            jq(&req_id),
-            jq(&model_id),
+            "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
+            o.chunk_head(),
         );
-        if stream.write_all(init_chunk.as_bytes()).is_err() || stream.flush().is_err() {
-            write_failed = true;
-            cancel_flag.store(true, Ordering::Relaxed);
-        }
+        o.write(&init_chunk);
+    }
+    if let Some(h) = &live {
+        let sink_out = Arc::clone(&out);
+        h.set_launch_sink(Some(Box::new(move |ev| {
+            sink_out.lock().unwrap().on_event(ev);
+        })));
     }
 
-    let report = engine.generate_cancellable(&prompt_ids, &params, Some(&cancel_flag), |tok_id| {
-        if !started_decode {
-            started_decode = true;
-            let _ = rguard.apply(ReqEvent::EvReqPrefillDone);
-        }
-        if tok_ref.is_special(tok_id) {
-            return;
-        }
-        let piece = decoder.push(tok_id);
-        if piece.is_empty() {
-            return;
-        }
-        let (r_delta, c_delta) = splitter.push(&piece);
-        if !r_delta.is_empty() {
-            full_reasoning.push_str(&r_delta);
-        }
-        if !c_delta.is_empty() {
-            full_content.push_str(&c_delta);
-            if !stop_seqs.is_empty() && stop_seqs.iter().any(|st| full_content.ends_with(st)) {
-                hit_stop = true;
-                cancel_flag.store(true, Ordering::Relaxed);
-            }
-        }
-        if stream_mode && !write_failed && (!r_delta.is_empty() || !c_delta.is_empty()) {
-            let mut delta = String::from("{");
-            let mut first = true;
-            if !r_delta.is_empty() {
-                delta.push_str(&format!("\"reasoning_content\":{}", jq(&r_delta)));
-                first = false;
-            }
-            if !c_delta.is_empty() {
-                if !first {
-                    delta.push(',');
+    let mut last_live_pub = Instant::now();
+    let report =
+        engine.generate_cancellable(&prompt_ids, &params, Some(&cancel_flag), &mut |tok_id| {
+            let (r_delta, c_delta) = if channel.as_mut().is_some_and(|c| c.marker(tok_id))
+                || tok_ref.is_special(tok_id)
+            {
+                (String::new(), String::new())
+            } else {
+                let piece = decoder.push(tok_id);
+                match channel.as_mut() {
+                    _ if piece.is_empty() => (String::new(), String::new()),
+                    Some(c) => c.text(&piece),
+                    None => splitter.push(&piece),
                 }
-                delta.push_str(&format!("\"content\":{}", jq(&c_delta)));
+            };
+            full_reasoning.push_str(&r_delta);
+            if !c_delta.is_empty() {
+                full_content.push_str(&c_delta);
+                if !stop_seqs.is_empty() && stop_seqs.iter().any(|st| full_content.ends_with(st)) {
+                    hit_stop = true;
+                    cancel_flag.store(true, Ordering::Relaxed);
+                }
             }
-            delta.push('}');
-            let chunk = format!(
-                "data: {{\"id\":{},\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":{},\
-                 \"choices\":[{{\"index\":0,\"delta\":{delta},\"finish_reason\":null}}]}}\n\n",
-                jq(&req_id),
-                jq(&model_id),
-            );
-            if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
-                write_failed = true;
-                cancel_flag.store(true, Ordering::Relaxed);
+            let (timings, seen) = {
+                let mut o = out.lock().unwrap();
+                o.push_token(&r_delta, &c_delta);
+                (o.timings(), o.seen_tokens())
+            };
+            if !started_decode {
+                started_decode = true;
+                let _ = rguard.apply(ReqEvent::EvReqPrefillDone);
+                state.publish_request(format!(
+                    "{{{},\"timings\":{}}}",
+                    req_base("decode", queued_ms),
+                    timings.json()
+                ));
             }
-        }
-    });
+            let now = Instant::now();
+            if seen >= 3 && now.duration_since(last_live_pub).as_millis() >= 400 {
+                last_live_pub = now;
+                if let Some(h) = &live {
+                    let rec = readout::live_record_json(
+                        "decode",
+                        &method,
+                        h.request_rates().as_ref(),
+                        hbm_bytes,
+                        h.snapshot().as_deref(),
+                    );
+                    state.hub.publish(format!(
+                    "{{\"type\":\"live\",\"job\":{req_num},\"source\":\"engine\",\"record\":{rec}}}"
+                ));
+                }
+            }
+        });
+    if let Some(h) = &live {
+        h.set_launch_sink(None);
+    }
 
     // Return engine cleanly to slot & decrement active counter!
     {
@@ -1340,17 +2117,22 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
         s.active_requests = s.active_requests.saturating_sub(1);
         s.last_activity = Instant::now();
     }
+    drop(turn);
     state.cancels.lock().unwrap().remove(&req_id);
 
-    // Flush decoder + splitter tail
+    // Flush decoder + splitter tail, after any text the last launch left unwritten
     let tail = decoder.flush();
-    let (r_tail, c_tail) = splitter.finish(&tail);
-    if !r_tail.is_empty() {
-        full_reasoning.push_str(&r_tail);
-    }
-    if !c_tail.is_empty() {
-        full_content.push_str(&c_tail);
-    }
+    let (r_tail, c_tail) = match channel.as_mut() {
+        Some(c) => c.text(&tail),
+        None => splitter.finish(&tail),
+    };
+    full_reasoning.push_str(&r_tail);
+    full_content.push_str(&c_tail);
+    let mut out = out.lock().unwrap();
+    let (mut r_rest, mut c_rest) = out.take_pending();
+    r_rest.push_str(&r_tail);
+    c_rest.push_str(&c_tail);
+    let first_token_ms = out.first_token_ms();
 
     match report {
         Ok(rep) => {
@@ -1366,56 +2148,115 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
             } else {
                 "length"
             };
-            let n_gen = rep.generated_tokens.len();
-            let timings = format!(
-                "{{\"prompt_n\":{},\"prompt_ms\":{:.2},\"prompt_per_token_ms\":{:.3},\"prompt_per_second\":{:.2},\
-                 \"predicted_n\":{},\"predicted_ms\":{:.2},\"predicted_per_token_ms\":{:.3},\"predicted_per_second\":{:.2},\"cache_n\":0}}",
-                rep.prompt_tokens,
-                rep.ttft_ms,
-                rep.ttft_ms / (rep.prompt_tokens.max(1) as f64),
-                rep.prefill_tok_s,
-                n_gen,
-                rep.decode_ms,
-                rep.ms_per_step,
-                rep.decode_tok_s,
+            let n_gen = rep.generated_tokens.len() as u64;
+            let summary = live.as_ref().and_then(|h| h.request_summary());
+            // Launches: the engine's report; an engine whose report carries none is taken at its
+            // launch feed; with neither, the count is unknown and left out.
+            let launches = if rep.launches > 0 || n_gen <= 1 {
+                Some(rep.launches)
+            } else {
+                summary.as_ref().map(|s| s.launches)
+            };
+            let timings = Timings {
+                prompt_n: rep.prompt_tokens as u64,
+                prompt_ms: rep.ttft_ms,
+                predicted_n: n_gen,
+                predicted_ms: rep.decode_ms,
+                launches,
+                draft_n: rep.drafted,
+                draft_n_accepted: rep.draft_accepted,
+            };
+            let timings_json = timings.json();
+
+            let profile = live.as_ref().and_then(|h| h.final_snapshot());
+            let final_live = format!(
+                "{{\"type\":\"live\",\"job\":{req_num},\"source\":\"engine\",\"record\":{}}}",
+                readout::live_record_json(
+                    "decode",
+                    &method,
+                    summary.as_ref(),
+                    hbm_bytes,
+                    profile.as_deref(),
+                )
             );
+            state.slot.lock().unwrap().last_live_json = Some(final_live.clone());
+            state.hub.publish(final_live);
+
             let usage = format!(
                 "{{\"prompt_tokens\":{},\"completion_tokens\":{n_gen},\"total_tokens\":{}}}",
                 rep.prompt_tokens,
-                rep.prompt_tokens + n_gen
+                rep.prompt_tokens as u64 + n_gen
             );
-            let gaudium_meta = format!(
-                "{{\"method\":\"K=0 BF16\",\"steps\":{},\"ttft_ms\":{:.2},\"decode_tok_s\":{:.2}}}",
-                n_gen.saturating_sub(1),
+            let seed_json = if is_greedy {
+                "null".to_string()
+            } else {
+                seed.to_string()
+            };
+            // The request's details. Times: `queued_ms` request received -> the engine took it
+            // (model load, other requests); `reset_ms` the engine took it -> its prefill began
+            // (per-request state reset); `prefill_ms` the engine's own prefill clock up to the
+            // first token; `ttft_ms` the engine took it -> first token (reset + prefill).
+            let mut details = format!(
+                "{{\"method\":{},\"engine_method\":{},\"prefill_ms\":{:.2},\"decode_loop_ms\":{:.2},\
+                 \"queued_ms\":{queued_ms:.2}",
+                jq(&method),
+                jq(&rep.method),
                 rep.ttft_ms,
-                rep.decode_tok_s
+                rep.decode_ms,
             );
+            if let Some(t) = first_token_ms {
+                details.push_str(&format!(
+                    ",\"ttft_ms\":{t:.2},\"reset_ms\":{:.2}",
+                    (t - rep.ttft_ms).max(0.0)
+                ));
+            }
+            if let Some(l) = launches {
+                details.push_str(&format!(",\"steps\":{l}"));
+                if l > 0 {
+                    details.push_str(&format!(
+                        ",\"ms_per_step\":{:.3},\"tok_per_step\":{:.3},\"decode_tok_s\":{:.2}",
+                        rep.decode_ms / l as f64,
+                        n_gen.saturating_sub(1) as f64 / l as f64,
+                        rep.decode_tok_s,
+                    ));
+                }
+            }
+            if let Some(sum) = summary.as_ref().filter(|s| !s.log.is_empty()) {
+                details.push_str(&format!(",\"aseq\":{}", jq(&readout::aseq(&sum.log))));
+            }
+            if let Some(sec) = readout::spec_section_json(&timings) {
+                details.push_str(&format!(",\"spec\":{sec}"));
+            }
+            details.push_str(&format!(
+                ",\"sampling\":{{\"greedy\":{is_greedy},\"temperature\":{temperature:.3},\"top_k\":{top_k},\
+                 \"top_p\":{top_p:.3},\"min_p\":{min_p:.3},\"seed\":{seed_json}}}}}"
+            ));
+            state.publish_request(format!(
+                "{{{},\"timings\":{timings_json},\"details\":{details}}}",
+                req_base(finish_reason, queued_ms)
+            ));
 
             if stream_mode {
-                if !write_failed {
-                    let mut tail_delta = String::from("{");
-                    let mut first = true;
-                    if !r_tail.is_empty() {
-                        tail_delta.push_str(&format!("\"reasoning_content\":{}", jq(&r_tail)));
-                        first = false;
+                let mut tail_delta = String::from("{");
+                if !r_rest.is_empty() {
+                    tail_delta.push_str(&format!("\"reasoning_content\":{}", jq(&r_rest)));
+                }
+                if !c_rest.is_empty() {
+                    if tail_delta.len() > 1 {
+                        tail_delta.push(',');
                     }
-                    if !c_tail.is_empty() {
-                        if !first {
-                            tail_delta.push(',');
-                        }
-                        tail_delta.push_str(&format!("\"content\":{}", jq(&c_tail)));
-                    }
-                    tail_delta.push('}');
-                    let final_chunk = format!(
-                        "data: {{\"id\":{},\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":{},\
-                         \"choices\":[{{\"index\":0,\"delta\":{tail_delta},\"finish_reason\":{}}}],\
-                         \"usage\":{usage},\"timings\":{timings},\"gaudium\":{gaudium_meta}}}\n\ndata: [DONE]\n\n",
-                        jq(&req_id),
-                        jq(&model_id),
-                        jq(finish_reason),
-                    );
-                    let _ = stream.write_all(final_chunk.as_bytes());
-                    let _ = stream.flush();
+                    tail_delta.push_str(&format!("\"content\":{}", jq(&c_rest)));
+                }
+                tail_delta.push('}');
+                let final_chunk = format!(
+                    "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{tail_delta},\"finish_reason\":{}}}],\
+                     \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}\n\ndata: [DONE]\n\n",
+                    out.chunk_head(),
+                    jq(finish_reason),
+                );
+                out.write(&final_chunk);
+                if !out.write_failed {
+                    write_sse_end(stream);
                 }
             } else {
                 let mut msg = format!("{{\"role\":\"assistant\",\"content\":{}", jq(&full_content));
@@ -1426,7 +2267,7 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
                 let resp = format!(
                     "{{\"id\":{},\"object\":\"chat.completion\",\"created\":{created},\"model\":{},\
                      \"choices\":[{{\"index\":0,\"message\":{msg},\"finish_reason\":{}}}],\
-                     \"usage\":{usage},\"timings\":{timings},\"gaudium\":{gaudium_meta}}}",
+                     \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}",
                     jq(&req_id),
                     jq(&model_id),
                     jq(finish_reason),
@@ -1436,15 +2277,17 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
         }
         Err(e) => {
             let _ = rguard.apply(ReqEvent::EvReqFail);
+            state.publish_request(format!(
+                "{{{},\"message\":{}}}",
+                req_base("error", queued_ms),
+                jq(&e)
+            ));
             if stream_mode {
-                let _ = stream.write_all(
-                    format!(
-                        "data: {{\"error\":{{\"message\":{},\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n",
-                        jq(&e)
-                    )
-                    .as_bytes(),
-                );
-                let _ = stream.flush();
+                out.write(&format!(
+                    "data: {{\"error\":{{\"message\":{},\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n",
+                    jq(&e)
+                ));
+                write_sse_end(stream);
             } else {
                 write_error(stream, 500, "server_error", &e);
             }
@@ -1456,7 +2299,17 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
 // Static Gaudium UI File Server
 // ============================================================================
 
-fn handle_static_ui(state: &AppState, url_path: &str, stream: &mut TcpStream) {
+fn resolve_static_rel(url_path: &str) -> &str {
+    match url_path {
+        "/" | "" | "/ui" | "/ui/" => "index.html",
+        "/sw.js" | "/ui/sw-reset.js" => "sw-reset.js",
+        other => other
+            .strip_prefix("/ui/")
+            .unwrap_or_else(|| other.trim_start_matches('/')),
+    }
+}
+
+fn handle_static_ui(state: &AppState, url_path: &str, stream: &mut TcpStream, send_body: bool) {
     let Some(ui_root) = state.cfg.ui_dir.as_deref() else {
         write_error(
             stream,
@@ -1467,11 +2320,7 @@ fn handle_static_ui(state: &AppState, url_path: &str, stream: &mut TcpStream) {
         return;
     };
 
-    let rel = match url_path {
-        "/" | "" => "index.html",
-        "/sw.js" => "sw-reset.js",
-        other => other.trim_start_matches('/'),
-    };
+    let rel = resolve_static_rel(url_path);
     let Some(safe_path) = safe_join(ui_root, rel) else {
         write_error(stream, 400, "invalid_request_error", "invalid static path");
         return;
@@ -1485,7 +2334,7 @@ fn handle_static_ui(state: &AppState, url_path: &str, stream: &mut TcpStream) {
     match fs::read(&target) {
         Ok(bytes) => {
             let mime = mime_type_for(&target);
-            write_response(stream, 200, "OK", mime, &bytes);
+            write_response_with_body(stream, 200, "OK", mime, &bytes, send_body);
         }
         Err(_) => write_error(
             stream,
@@ -1515,7 +2364,7 @@ fn mime_type_for(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "html" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
-        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" | "webmanifest" => "application/json; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
@@ -1531,6 +2380,151 @@ fn mime_type_for(path: &Path) -> &'static str {
 // ============================================================================
 // ChatML Prompt Builder & Streaming `<think>...</think>` Splitter
 // ============================================================================
+
+/// Builds the chat prompt in the registered model's own template family.
+fn build_model_chat_prompt(
+    m: &RegisteredModel,
+    body: &JsonValue,
+    preopen_think: bool,
+) -> Result<String, String> {
+    if m.spec.family == ModelFamily::Gemma4 {
+        build_gemma4_chat_prompt(
+            body,
+            requested_thinking(body, false),
+            m.gemma_closes_thought,
+        )
+    } else {
+        build_chat_prompt(body, preopen_think)
+    }
+}
+
+/// `chat_template_kwargs.enable_thinking` of a request body, else the family's `default`.
+fn requested_thinking(body: &JsonValue, default: bool) -> bool {
+    body.get("chat_template_kwargs")
+        .and_then(|v| v.get("enable_thinking"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
+/// Builds a Gemma 4 turn-template prompt from an OpenAI `/v1/chat/completions` JSON body, as the
+/// model's chat template renders a text conversation without tools:
+/// - a system turn first when the conversation starts with a system message or thinking is on;
+///   with thinking it opens with `<|think|>`;
+/// - one turn per further message (`assistant` is `model`);
+/// - the generation prompt `<|turn>model\n`, followed by an empty closed thought channel for a
+///   non-thinking request when the model's template writes one (`close_empty_thought`).
+///
+/// A thinking reply opens its thought channel itself; [`ChannelSplitter`] takes it apart.
+pub fn build_gemma4_chat_prompt(
+    body: &JsonValue,
+    enable_thinking: bool,
+    close_empty_thought: bool,
+) -> Result<String, String> {
+    let Some(msgs) = body.get("messages").and_then(|v| v.as_array()) else {
+        return Err("'messages' must be a non-empty array".into());
+    };
+    if msgs.is_empty() {
+        return Err("'messages' must not be empty".into());
+    }
+    fn role_of(msg: &JsonValue) -> &str {
+        msg.get("role").and_then(|v| v.as_str()).unwrap_or("user")
+    }
+    let first_is_system = matches!(role_of(&msgs[0]), "system" | "developer");
+    let mut out = String::from("<bos>");
+    if enable_thinking || first_is_system {
+        out.push_str("<|turn>system\n");
+        if enable_thinking {
+            out.push_str("<|think|>\n");
+        }
+        if first_is_system {
+            out.push_str(extract_message_text(msgs[0].get("content")).trim());
+        }
+        out.push_str("<turn|>\n");
+    }
+    for msg in &msgs[usize::from(first_is_system)..] {
+        let role = match role_of(msg) {
+            "assistant" => "model",
+            other => other,
+        };
+        let content = extract_message_text(msg.get("content"));
+        out.push_str("<|turn>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(content.trim());
+        out.push_str("<turn|>\n");
+    }
+    out.push_str("<|turn>model\n");
+    if !enable_thinking && close_empty_thought {
+        out.push_str("<|channel>thought\n<channel|>");
+    }
+    Ok(out)
+}
+
+/// Name line of Gemma 4's reasoning channel: the text right after the opening token.
+const GEMMA4_THOUGHT_LABEL: &str = "thought\n";
+
+/// Splits a reply whose reasoning lies between two special tokens (which are never decoded to
+/// text) into `(reasoning_content, content)`: Gemma 4's `<|channel>thought\n ... <channel|>`.
+#[derive(Debug)]
+pub struct ChannelSplitter {
+    open: i32,
+    close: i32,
+    label: &'static str,
+    in_channel: bool,
+    /// Bytes of `label` still expected at the start of the channel's text.
+    label_left: usize,
+}
+
+impl ChannelSplitter {
+    pub fn new(open: i32, close: i32, label: &'static str) -> Self {
+        Self {
+            open,
+            close,
+            label,
+            in_channel: false,
+            label_left: 0,
+        }
+    }
+
+    /// Whether `token` opens or closes the channel (it then carries no text).
+    pub fn marker(&mut self, token: i32) -> bool {
+        if token == self.open {
+            self.in_channel = true;
+            self.label_left = self.label.len();
+            true
+        } else if token == self.close {
+            self.in_channel = false;
+            self.label_left = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// One piece of decoded text -> `(reasoning, content)`.
+    pub fn text(&mut self, piece: &str) -> (String, String) {
+        if !self.in_channel {
+            return (String::new(), piece.to_string());
+        }
+        // the channel's name line is not part of the reasoning; it may arrive in several pieces
+        let mut rest = piece;
+        while self.label_left > 0 && !rest.is_empty() {
+            let want = &self.label[self.label.len() - self.label_left..];
+            let n = want
+                .bytes()
+                .zip(rest.bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if n == 0 {
+                self.label_left = 0; // another channel name: keep its text
+                break;
+            }
+            self.label_left -= n;
+            rest = &rest[n..];
+        }
+        (rest.to_string(), String::new())
+    }
+}
 
 /// Builds a Qwen3 / Qwen3.5 ChatML prompt from an OpenAI `/v1/chat/completions` JSON body.
 pub fn build_chat_prompt(body: &JsonValue, preopen_think: bool) -> Result<String, String> {
@@ -1691,21 +2685,12 @@ fn trailing_tag_prefix_len(haystack: &str, tag: &str) -> usize {
 }
 
 fn jq(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    readout::jq(s)
+}
+
+/// Last component of a path, as a name (never a whole path) for descriptions.
+fn dir_name(p: &Path) -> Option<String> {
+    p.file_name().and_then(|n| n.to_str()).map(str::to_string)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1768,7 +2753,111 @@ fn _keep_btree(_: BTreeMap<String, String>) {}
 
 #[cfg(test)]
 mod tests {
+    use super::{next_turn, TurnLimits, TurnWaiter};
+    use std::time::{Duration, Instant};
+
+    fn waiters(models: &[usize], now: Instant) -> Vec<TurnWaiter> {
+        models
+            .iter()
+            .enumerate()
+            .map(|(i, &model)| TurnWaiter {
+                id: i as u64,
+                model,
+                since: now,
+                skips: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turn_queue_runs_the_loaded_model_first_within_its_limits() {
+        let now = Instant::now();
+        let lim = TurnLimits::default();
+        let mut w = waiters(&[1, 0, 0], now);
+        assert_eq!(
+            next_turn(&w, Some(0), now, lim),
+            Some(1),
+            "the loaded model goes ahead"
+        );
+        assert_eq!(
+            next_turn(&w, Some(1), now, lim),
+            Some(0),
+            "the oldest already matches"
+        );
+        assert_eq!(
+            next_turn(&w, None, now, lim),
+            Some(0),
+            "nothing loaded: arrival order"
+        );
+        assert_eq!(
+            next_turn(&w, Some(2), now, lim),
+            Some(0),
+            "no waiter for the loaded model"
+        );
+        w[0].skips = lim.max_skips;
+        assert_eq!(
+            next_turn(&w, Some(0), now, lim),
+            Some(0),
+            "passed over too often"
+        );
+        let mut w = waiters(&[1, 0], now);
+        w[0].since = now - lim.max_wait - Duration::from_secs(1);
+        assert_eq!(next_turn(&w, Some(0), now, lim), Some(0), "waited too long");
+        w[0].since = now - lim.max_wait + Duration::from_secs(60);
+        assert_eq!(
+            next_turn(&w, Some(0), now, lim),
+            Some(1),
+            "inside the wait limit"
+        );
+        assert_eq!(next_turn(&[], Some(0), now, lim), None);
+    }
+
+    #[test]
+    fn turn_limits_read_the_queue_settings_file() {
+        let d = TurnLimits::default();
+        assert_eq!(d.max_wait, Duration::from_secs(45 * 60));
+        assert_eq!(d.max_skips, 3);
+        let l = TurnLimits::parse(
+            "# card queue\ngroup_max_wait_min = 10  # minutes\ngroup_max_skips=5\n",
+        );
+        assert_eq!(
+            l,
+            TurnLimits {
+                max_wait: Duration::from_secs(600),
+                max_skips: 5
+            }
+        );
+        assert_eq!(
+            TurnLimits::parse("group_max_wait_min=abc\nother=1\n"),
+            d,
+            "bad values keep defaults"
+        );
+        assert_eq!(TurnLimits::read(None), d);
+    }
+
     use super::*;
+
+    #[test]
+    fn sampler_defaults_come_from_generation_config() {
+        let d = SamplerDefaults::from_generation_config(
+            r#"{"do_sample": true, "temperature": 1.0, "top_k": 20, "top_p": 0.95}"#,
+        );
+        assert_eq!(
+            d,
+            SamplerDefaults {
+                temperature: 1.0,
+                top_k: 20,
+                top_p: 0.95
+            }
+        );
+        // Missing or unusable keys keep the fallback values.
+        let d = SamplerDefaults::from_generation_config(r#"{"top_p": 7.0}"#);
+        assert_eq!(d, SamplerDefaults::FALLBACK);
+        assert_eq!(
+            SamplerDefaults::from_generation_config("not json"),
+            SamplerDefaults::FALLBACK
+        );
+    }
 
     #[test]
     fn think_splitter_handles_split_tags_and_plain_content() {
@@ -1825,10 +2914,87 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_prompt_follows_the_template_with_and_without_thinking() {
+        let body = json::parse_json(
+            r#"{"messages": [
+                {"role": "system", "content": " Be brief. "},
+                {"role": "user", "content": "Hi!"},
+                {"role": "assistant", "content": "Hello."},
+                {"role": "user", "content": [{"type": "text", "text": "Again?"}]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            build_gemma4_chat_prompt(&body, false, true).unwrap(),
+            "<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nHi!<turn|>\n<|turn>model\nHello.<turn|>\n\
+             <|turn>user\nAgain?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        );
+        // thinking: the system turn opens with the think token and no channel is pre-closed
+        assert_eq!(
+            build_gemma4_chat_prompt(&body, true, true).unwrap(),
+            "<bos><|turn>system\n<|think|>\nBe brief.<turn|>\n<|turn>user\nHi!<turn|>\n<|turn>model\nHello.<turn|>\n\
+             <|turn>user\nAgain?<turn|>\n<|turn>model\n"
+        );
+        let plain =
+            json::parse_json(r#"{"messages": [{"role": "user", "content": "Hi"}]}"#).unwrap();
+        assert_eq!(
+            build_gemma4_chat_prompt(&plain, true, false).unwrap(),
+            "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+        );
+        assert_eq!(
+            build_gemma4_chat_prompt(&plain, false, false).unwrap(),
+            "<bos><|turn>user\nHi<turn|>\n<|turn>model\n"
+        );
+        assert!(!requested_thinking(&plain, false) && requested_thinking(&plain, true));
+        let off =
+            json::parse_json(r#"{"chat_template_kwargs": {"enable_thinking": false}}"#).unwrap();
+        assert!(!requested_thinking(&off, true));
+    }
+
+    #[test]
+    fn channel_splitter_separates_the_thought_channel_by_its_tokens() {
+        let (open, close) = (100, 101);
+        let mut c = ChannelSplitter::new(open, close, GEMMA4_THOUGHT_LABEL);
+        let mut r = String::new();
+        let mut a = String::new();
+        let mut feed = |c: &mut ChannelSplitter, piece: &str| {
+            let (rd, cd) = c.text(piece);
+            r.push_str(&rd);
+            a.push_str(&cd);
+        };
+        assert!(!c.marker(7));
+        assert!(c.marker(open));
+        // the channel name arrives split over two pieces
+        for p in ["thou", "ght\nThe user", " greets me.\n"] {
+            feed(&mut c, p);
+        }
+        assert!(c.marker(close));
+        for p in ["Hello", "!"] {
+            feed(&mut c, p);
+        }
+        assert_eq!(r, "The user greets me.\n");
+        assert_eq!(a, "Hello!");
+
+        // a reply that never opens the channel is all content; another channel name is kept
+        let mut c = ChannelSplitter::new(open, close, GEMMA4_THOUGHT_LABEL);
+        assert_eq!(c.text("Hi"), (String::new(), "Hi".to_string()));
+        assert!(c.marker(open));
+        assert_eq!(c.text("final\nx"), ("final\nx".to_string(), String::new()));
+    }
+
+    #[test]
     fn safe_join_blocks_path_traversal() {
         let root = Path::new("/srv/ui");
+        assert_eq!(resolve_static_rel("/"), "index.html");
+        assert_eq!(resolve_static_rel("/ui/"), "index.html");
+        assert_eq!(resolve_static_rel("/sw.js"), "sw-reset.js");
+        assert_eq!(resolve_static_rel("/ui/js/main.js"), "js/main.js");
         assert_eq!(
-            safe_join(root, "js/app.js"),
+            resolve_static_rel("/ui/vendor/preact/preact.module.js"),
+            "vendor/preact/preact.module.js"
+        );
+        assert_eq!(
+            safe_join(root, resolve_static_rel("/ui/js/app.js")),
             Some(PathBuf::from("/srv/ui/js/app.js"))
         );
         assert_eq!(safe_join(root, "../etc/passwd"), None);

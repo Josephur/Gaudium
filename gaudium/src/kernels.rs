@@ -67,6 +67,10 @@ const STATIC_ELF_VARS: &[(&str, &str)] = &[
     ("GAUDIUM_GDN_ELF", "gdn_f32_gaudi2.o"),
     ("GAUDIUM_GDNS_ELF", "gdn_f32s_gaudi2.o"),
     ("GAUDIUM_GDNT_ELF", "gdn_f32t_gaudi2.o"),
+    // replay recurrence of the verify rows (served by the step glue library)
+    ("GAUDIUM_GDNR_ELF", "gdn_f32r_gaudi2.o"),
+    // slotted row recurrence with its gate scalars as vector loads (served by the step glue library)
+    ("GAUDIUM_GDNV_ELF", "gdn_f32v_gaudi2.o"),
     ("GAUDIUM_PREP_ELF", "gdn_prep_gaudi2.o"),
     ("GAUDIUM_PREPS_ELF", "gdn_preps_gaudi2.o"),
     ("GAUDIUM_PREPD_ELF", "gdn_prepd_gaudi2.o"),
@@ -297,6 +301,9 @@ pub fn all_elf_mappings() -> Vec<(String, String)> {
     out
 }
 
+/// Glue plugin of the step kernels added after the first kernel set (`kernels/glue/st_glue.cpp`).
+pub const STEP_GLUE: &str = "libgaudium_st.so";
+
 /// Resolved kernel & glue environment for a Gaudium run.
 #[derive(Debug, Clone)]
 pub struct KernelEnv {
@@ -332,6 +339,10 @@ impl KernelEnv {
         gc_parts.push(tpc_glue.to_string_lossy().into_owned());
         if ga_glue.is_file() {
             gc_parts.push(ga_glue.to_string_lossy().into_owned());
+        }
+        let st_glue = kernels_dir.join(STEP_GLUE);
+        if st_glue.is_file() {
+            gc_parts.push(st_glue.to_string_lossy().into_owned());
         }
         if let Ok(existing) = std::env::var("GC_KERNEL_PATH") {
             for part in existing.split(':').filter(|s| !s.is_empty()) {
@@ -381,6 +392,18 @@ impl KernelEnv {
             kernels_dir: kernels_dir.to_path_buf(),
             gc_kernel_path,
             present_elfs,
+        })
+    }
+
+    /// Hash of the step glue library, for the fingerprints of the recipes that use its kernels
+    /// (`None`: not in the kernels directory). It is not part of [`Self::fingerprint_hashes`], so
+    /// recipes without those kernels keep their keys whether or not the library is installed.
+    pub fn step_glue_hash(&self) -> Option<Result<(String, String), String>> {
+        let p = self.kernels_dir.join(STEP_GLUE);
+        p.is_file().then(|| {
+            std::fs::read(&p)
+                .map(|raw| (STEP_GLUE.to_string(), sha256_hex(&raw)))
+                .map_err(|e| format!("read {}: {e}", p.display()))
         })
     }
 

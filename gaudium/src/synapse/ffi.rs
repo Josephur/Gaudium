@@ -326,6 +326,8 @@ pub struct SynapseApi {
     pub syn_event_elapsed_time:
         unsafe extern "C" fn(*mut u64, SynEventHandle, SynEventHandle) -> SynStatus,
     pub syn_mem_copy_async: unsafe extern "C" fn(SynStreamHandle, u64, u64, u64, u32) -> SynStatus,
+    /// `synMemsetD32Async(device address, value, number of 32-bit elements, stream)`.
+    pub syn_memset_d32_async: unsafe extern "C" fn(u64, u32, usize, SynStreamHandle) -> SynStatus,
     pub syn_graph_create: unsafe extern "C" fn(*mut SynGraphHandle, u32) -> SynStatus,
     pub syn_graph_destroy: unsafe extern "C" fn(SynGraphHandle) -> SynStatus,
     pub syn_graph_compile: unsafe extern "C" fn(
@@ -487,6 +489,7 @@ impl SynapseApi {
                 syn_event_synchronize: load_sym(handle, "synEventSynchronize")?,
                 syn_event_elapsed_time: load_sym(handle, "synEventElapsedTime")?,
                 syn_mem_copy_async: load_sym(handle, "synMemCopyAsync")?,
+                syn_memset_d32_async: load_sym(handle, "synMemsetD32Async")?,
                 syn_graph_create: load_sym(handle, "synGraphCreate")?,
                 syn_graph_destroy: load_sym(handle, "synGraphDestroy")?,
                 syn_graph_compile: load_sym(handle, "synGraphCompile")?,
