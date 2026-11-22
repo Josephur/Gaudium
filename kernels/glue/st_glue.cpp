@@ -5,6 +5,9 @@
 //                      loads: bit-identical outputs (gdn_f32v_gaudi2.c)                                                 ELF: GAUDIUM_GDNV_ELF
 //   gaudium_gdn_f32r   gated DeltaNet recurrence of a verify step without per-row state checkpoints: the accepted rows of the
 //                      previous step are applied to the state again from their stored updates (gdn_f32r_gaudi2.c)   ELF: GAUDIUM_GDNR_ELF
+//   gaudium_ds_ctxr    context K / V rows of a block drafter's layer into rings of any length (ds_ctxr_gaudi2.c)       ELF: GAUDIUM_DSCTXR_ELF
+//   gaudium_ds_softr   block softmax over a context ring and the causal block, sweeping only the slots a row can see
+//                      (ds_softr_gaudi2.c)                                                                          ELF: GAUDIUM_DSSOFTR_ELF
 // The graph compiler needs the GetShapeInference and GetLibVersion entry points or it skips the library.
 #include "tpc_kernel_lib_interface.h"
 #include <cstdio>
@@ -66,7 +69,7 @@ extern "C" {
 uint64_t GetLibVersion() { return 78813002322618477ULL; }   // the interface version libgaudium_tpc.so reports
 GlueCodeReturn GetShapeInference(_IN_ DeviceId, _IN_ const ShapeInferenceParams*, _OUT_ ShapeInferenceOutput*) { return GLUE_SUCCESS; }
 
-static const char* GUIDS[] = {"gaudium_gdn_f32r", "gaudium_gdn_f32v"};
+static const char* GUIDS[] = {"gaudium_gdn_f32r", "gaudium_gdn_f32v", "gaudium_ds_ctxr", "gaudium_ds_softr"};
 GlueCodeReturn GetKernelGuids(_IN_ DeviceId deviceId, _INOUT_ uint32_t* kernelCount, _OUT_ GuidInfo* guids) {
     const uint32_t n = sizeof(GUIDS) / sizeof(GUIDS[0]);
     if (deviceId != DEVICE_ID_GAUDI2) { if (kernelCount) *kernelCount = 0; return GLUE_SUCCESS; }
@@ -137,6 +140,49 @@ GlueCodeReturn InstantiateTpcKernel(_IN_ HabanaKernelParams* p, _INOUT_ HabanaKe
         pattern(out->outputTensorAccessPattern[2], p->outputTensors[2], 2);
         out->kernel.paramsNr = 2; out->kernel.scalarParams[0] = (uint32_t)T; out->kernel.scalarParams[1] = node_u32(p, 0);
         return put_elf(out, "GAUDIUM_GDNV_ELF");
+    }
+    if (g == "gaudium_ds_ctxr") {
+        // kc, vc bf16 {1024, T}; kn_w f32 {128}; rope_c, rope_s f32 {128, L}; cursor i32 {1}; depth i32 {>= T}; lim i32 {2} (not read)
+        // -> kring, vring bf16 {128, RG, 8}
+        if (p->inputTensorNr != 8) { p->inputTensorNr = 8; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
+        if (p->outputTensorNr != 2) { p->outputTensorNr = 2; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
+        const TensorDataType in[8] = {DATA_BF16, DATA_BF16, DATA_F32, DATA_F32, DATA_F32, DATA_I32, DATA_I32, DATA_I32}, ot[2] = {DATA_BF16, DATA_BF16};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        const Tensor& k = p->inputTensors[0]; const Tensor& kr = p->outputTensors[0]; const Tensor& vr = p->outputTensors[1];
+        const uint64_t T = k.geometry.maxSizes[1], RG = kr.geometry.maxSizes[1];
+        if (k.geometry.maxSizes[0] != 1024 || p->inputTensors[1].geometry.maxSizes[0] != 1024 || p->inputTensors[1].geometry.maxSizes[1] != T
+            || p->inputTensors[2].geometry.maxSizes[0] != 128 || p->inputTensors[6].geometry.maxSizes[0] < T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        // a ring is whole 128-row blocks (the V row permutation) and no pass writes a slot twice
+        if (kr.geometry.dims != 3 || vr.geometry.dims != 3 || kr.geometry.maxSizes[0] != 128 || kr.geometry.maxSizes[2] != 8
+            || vr.geometry.maxSizes[0] != 128 || vr.geometry.maxSizes[2] != 8 || vr.geometry.maxSizes[1] != RG
+            || RG < 128 || RG % 128 || T < 1 || T > RG) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 8;   // the kv heads
+        for (uint32_t i = 0; i < 8; ++i) pattern(out->inputTensorAccessPattern[i], p->inputTensors[i], -1);
+        for (uint32_t i = 0; i < 2; ++i) pattern(out->outputTensorAccessPattern[i], p->outputTensors[i], -1);
+        out->kernel.paramsNr = 2; out->kernel.scalarParams[0] = (uint32_t)T; out->kernel.scalarParams[1] = (uint32_t)RG;
+        return put_elf(out, "GAUDIUM_DSCTXR_ELF");
+    }
+    if (g == "gaudium_ds_softr") {
+        // sc f32 {RG, R, 8}; sb f32 {128, R, 8}; cur i32 {1}; lim i32 {2} -> Pc bf16 {RG, R, 8}, Pb bf16 {128, R, 8}; node params: T, W
+        if (p->inputTensorNr != 4) { p->inputTensorNr = 4; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
+        if (p->outputTensorNr != 2) { p->outputTensorNr = 2; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
+        const TensorDataType in[4] = {DATA_F32, DATA_F32, DATA_I32, DATA_I32}, ot[2] = {DATA_BF16, DATA_BF16};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        const Tensor& sc = p->inputTensors[0]; const Tensor& sb = p->inputTensors[1];
+        const uint64_t RG = sc.geometry.maxSizes[0], R = sc.geometry.maxSizes[1], G = sc.geometry.maxSizes[2];
+        const uint32_t T = node_u32(p, 0), W = node_u32(p, 1);
+        // RG >= W + 256: the aligned sweeps of a wrapped window's two slot ranges never meet (ds_softr_gaudi2.c)
+        if (sc.geometry.dims != 3 || T == 0 || T > 64 || R % T || W < 2 || RG < 128 || RG % 128 || RG < (uint64_t)W + 256) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (sb.geometry.maxSizes[0] != 128 || sb.geometry.maxSizes[1] != R || sb.geometry.maxSizes[2] != G) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        for (uint32_t i = 0; i < 2; ++i) {
+            const Tensor& o = p->outputTensors[i];
+            if (o.geometry.dims != 3 || o.geometry.maxSizes[0] != (i ? 128 : RG) || o.geometry.maxSizes[1] != R || o.geometry.maxSizes[2] != G) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        }
+        out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = R * G;   // one (query row, kv group) per index-space point
+        for (uint32_t i = 0; i < 4; ++i) pattern(out->inputTensorAccessPattern[i], p->inputTensors[i], -1);
+        for (uint32_t i = 0; i < 2; ++i) pattern(out->outputTensorAccessPattern[i], p->outputTensors[i], -1);
+        out->kernel.paramsNr = 3; out->kernel.scalarParams[0] = T; out->kernel.scalarParams[1] = (uint32_t)RG; out->kernel.scalarParams[2] = W;
+        return put_elf(out, "GAUDIUM_DSSOFTR_ELF");
     }
     return GLUE_NODE_NOT_FOUND;
 }

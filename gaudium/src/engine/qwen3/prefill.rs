@@ -76,6 +76,9 @@ pub struct PrefillOpts {
     pub profile: bool,
     /// Report the host-side split of the tile loop (uploads, launch calls, waiting) per request.
     pub stats: bool,
+    /// Measurement: after the first request, time every half-layer recipe form over this many
+    /// launches (0 = off). The engine serves nothing afterwards.
+    pub half_probe: u32,
 }
 
 impl Default for PrefillOpts {
@@ -89,6 +92,7 @@ impl Default for PrefillOpts {
             s16: None,
             profile: false,
             stats: false,
+            half_probe: 0,
         }
     }
 }
@@ -105,6 +109,7 @@ impl PrefillOpts {
             s16: Some(0),
             profile: false,
             stats: false,
+            half_probe: 0,
         }
     }
 
@@ -124,11 +129,13 @@ impl PrefillOpts {
             };
             match k {
                 "plain" => {
-                    let (profile, stats) = (o.profile, o.stats);
+                    let (profile, stats, half_probe) = (o.profile, o.stats, o.half_probe);
                     o = Self::plain();
                     o.profile = profile;
                     o.stats = stats;
+                    o.half_probe = half_probe;
                 }
+                "halfprobe" => o.half_probe = num("halfprobe")?.min(10_000) as u32,
                 "profile" => o.profile = v.is_none_or(|v| v != "0"),
                 "stats" => o.stats = v.is_none_or(|v| v != "0"),
                 "tile" => {
@@ -159,7 +166,7 @@ impl PrefillOpts {
                 }
                 other => {
                     return Err(format!(
-                        "unknown prefill option '{other}' (tile, mme, rows, fastexp, groups, s16, plain, profile, stats)"
+                        "unknown prefill option '{other}' (tile, mme, rows, fastexp, groups, s16, plain, profile, stats, halfprobe)"
                     ))
                 }
             }
@@ -361,6 +368,48 @@ fn group_views(
 /// optionally the half-width core). Tensor names shared with the plain layer keep their meaning.
 #[allow(clippy::too_many_arguments)]
 fn append_attn_layer_tile(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    x: TensorId,
+    cursor: TensorId,
+    rope_c: TensorId,
+    rope_s: TensorId,
+    lpfx: &str,
+    t: u64,
+    nch: u64,
+    form: &TileForm,
+) -> TensorId {
+    let core = append_attn_first_tile(gb, spec, x, cursor, rope_c, rope_s, lpfx, t, nch, form);
+    append_second_half(gb, spec, x, core, lpfx, t)
+}
+
+/// The second half of a layer, the same for both layer kinds: the output projection of the
+/// attention / DeltaNet rows `core`, the residual add, the post norm and the MLP.
+fn append_second_half(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    x: TensorId,
+    core: TensorId,
+    lpfx: &str,
+    t: u64,
+) -> TensorId {
+    let core_dim = spec.n_heads * spec.head_dim;
+    let attn = add_linear_bf16(
+        gb,
+        core,
+        &format!("{lpfx}W_o"),
+        core_dim,
+        spec.hidden,
+        t,
+        &format!("{lpfx}attn"),
+    );
+    append_post_and_mlp(gb, spec, x, attn, lpfx, t, false, None).0
+}
+
+/// The first half of a full-attention tile layer: everything up to the attention rows `core`
+/// (`{heads * head_dim, t}` BF16), which it returns. Writes the tile's K / V rows.
+#[allow(clippy::too_many_arguments)]
+fn append_attn_first_tile(
     gb: &mut GraphBuilder,
     spec: &ModelSpec,
     x: TensorId,
@@ -625,16 +674,7 @@ fn append_attn_layer_tile(
 
     let core = gb.add_persistent_tensor(format!("{lpfx}core"), SynDataType::Bf16, &[nh * dh, t]);
     gb.add_node(g_apost, format!("{lpfx}attn_post"), &[ao, qg], &[core], &[]);
-    let attn = add_linear_bf16(
-        gb,
-        core,
-        &format!("{lpfx}W_o"),
-        nh * dh,
-        hid,
-        t,
-        &format!("{lpfx}attn"),
-    );
-    append_post_and_mlp(gb, spec, x, attn, lpfx, t, false, None).0
+    core
 }
 
 /// The chunked gated-delta recurrence of one layer from the matrix state `s0` over `nchk` chunks
@@ -790,6 +830,31 @@ fn append_linear_layer_mme(
     t: u64,
     form: &TileForm,
 ) -> TensorId {
+    let core = append_linear_first_mme(gb, spec, x, slot, lpfx, t, form);
+    let attn = add_linear_bf16(
+        gb,
+        core,
+        &format!("{lpfx}W_o"),
+        spec.gdn_v_heads * spec.gdn_v_dim,
+        spec.hidden,
+        t,
+        &format!("{lpfx}attn"),
+    );
+    append_post_and_mlp(gb, spec, x, attn, lpfx, t, false, None).0
+}
+
+/// The first half of a Gated DeltaNet tile layer with the chunked MME recurrence: everything up
+/// to the gated, normed recurrence rows `core` (`{value heads * value dim, t}` BF16), which it
+/// returns. Reads and writes the layer's recurrent and conv state.
+fn append_linear_first_mme(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    x: TensorId,
+    slot: TensorId,
+    lpfx: &str,
+    t: u64,
+    form: &TileForm,
+) -> TensorId {
     let hid = spec.hidden;
     let hv = spec.gdn_v_heads;
     let hk = spec.gdn_k_heads;
@@ -919,17 +984,7 @@ fn append_linear_layer_mme(
             &u32_params(&[pf]),
         );
     }
-
-    let attn = add_linear_bf16(
-        gb,
-        core,
-        &format!("{lpfx}W_o"),
-        hv * dl,
-        hid,
-        t,
-        &format!("{lpfx}attn"),
-    );
-    append_post_and_mlp(gb, spec, x, attn, lpfx, t, false, None).0
+    core
 }
 
 /// The single-layer full-attention tile graph of `form` (`t` rows over `nch` cache chunks).
@@ -988,6 +1043,256 @@ pub fn build_lin_tile_graph(
     let slot = gb.get_or_add_persistent_tensor("zero_slot", SynDataType::Int32, &[1]);
     let _ = append_linear_layer_mme(&mut gb, spec, x_in, slot, "L_", t, form);
     gb
+}
+
+// ============================================================================
+// Half-layer graphs: two tiles in flight
+// ============================================================================
+//
+// A tile layer is a serial chain that alternates between the engine classes: its first half
+// (the projections, then the attention core or the DeltaNet recurrence) keeps the TPCs busy
+// most of the time, its second half (output projection and MLP) the MME. Inside one launch the
+// card runs nodes of different engine classes at once when no tensor connects them, so a recipe
+// that holds the SECOND half of one tile's layer and the FIRST half of the next tile's layer
+// lets the big weight GEMMs of the one run under the kernels of the other. The two bodies are
+// built exactly like the halves of the full-layer recipes (same nodes, same shapes: the same
+// bits), then their nodes are put in the creation order a cost model of the two engine queues
+// picks ([`weave_order`]).
+
+/// The first half a half-layer graph carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FirstHalf {
+    /// Gated DeltaNet layer (chunked MME recurrence).
+    Lin,
+    /// Full-attention layer over this many KV chunks.
+    Attn(u64),
+}
+
+/// Layer prefix of the second-half body of a half-layer graph (the first half keeps `L_`).
+pub const SECOND_PFX: &str = "G_";
+
+/// Engine class a node keeps busy, for the weave's cost model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eng {
+    Mme,
+    Tpc,
+}
+
+/// Estimated device time of a node in microseconds and its engine class. The figures are node
+/// spans of a 512-row FP8 tile on the card, scaled by the rows; a node the table does not know
+/// counts as a short TPC node. Only the ORDER of the two bodies' nodes depends on these numbers.
+fn node_cost(guid: &str, name: &str, t: u64) -> (Eng, f64) {
+    let scale = t as f64 / 512.0;
+    let mme = matches!(guid, "gemm" | "batch_gemm" | "fp8_gemm_bf16");
+    // strip the layer prefix (`L_` / `G_`) and a chunk-group prefix (`g3_`)
+    let base = name.split_once('_').map_or(name, |(_, r)| r);
+    let base = match base.split_once('_') {
+        Some((g, r)) if g.len() > 1 && g.starts_with('g') && g[1..].bytes().all(|b| b.is_ascii_digit()) => r,
+        _ => base,
+    };
+    let us = if mme {
+        match base {
+            "qkvz_gemm" => 104.0,
+            "gate_gemm" => 111.0,
+            "up_gemm" => 156.0,
+            "mo_gemm" => 116.0,
+            "attn_gemm" => 45.0,
+            "qg_gemm" => 83.0,
+            "k_gemm" => 42.0,
+            "v_gemm" => 19.0,
+            "qk" => 66.0,
+            "pv" => 35.0,
+            "CX" | "M2" => 31.0,
+            "QK" | "AX" => 25.0,
+            b if b.starts_with("X_") => 13.0,
+            b if b.starts_with("Supd_") => 6.0,
+            _ => 16.0,
+        }
+    } else {
+        match base {
+            "attn_prep" => 149.0,
+            "softmax" => 141.0,
+            "solve" => 72.0,
+            "combine" => 62.0,
+            "gdn_prepa" => 60.0,
+            "chunk" => 50.0,
+            "silu" | "mul" => 32.0,
+            "gdn_posta" | "gdn_postb" => 34.0,
+            "gdn_prepb" | "attn_post" => 26.0,
+            "relay_in" | "relay_out" | "gdn_gate" | "vnat" | "qs16" => 18.0,
+            _ => 6.0,
+        }
+    };
+    (if mme { Eng::Mme } else { Eng::Tpc }, us * scale)
+}
+
+/// Creation order for the nodes of two independent bodies `a` and `b` (each a list of node
+/// indices in its own creation order): the order a dispatcher would start them in if every
+/// engine class ran one node at a time and each body ran its nodes one after another. The card
+/// executes each engine's queue in order, so this order lets a body's MME node start while the
+/// other body is on the TPCs instead of waiting behind its next MME node.
+fn weave_order(cost: &dyn Fn(usize) -> (Eng, f64), a: &[usize], b: &[usize]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(a.len() + b.len());
+    let (mut ia, mut ib) = (0usize, 0usize);
+    let (mut ready_a, mut ready_b) = (0.0f64, 0.0f64);
+    let mut free = [0.0f64; 2];
+    let slot = |e: Eng| usize::from(e == Eng::Tpc);
+    while ia < a.len() || ib < b.len() {
+        let start = |i: usize, list: &[usize], ready: f64| -> Option<(f64, Eng, f64)> {
+            list.get(i).map(|&n| {
+                let (e, us) = cost(n);
+                (ready.max(free[slot(e)]), e, us)
+            })
+        };
+        let (sa, sb) = (start(ia, a, ready_a), start(ib, b, ready_b));
+        let take_a = match (sa, sb) {
+            (Some(x), Some(y)) => x.0 <= y.0,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if take_a {
+            let (s, e, us) = sa.expect("a has a node");
+            ready_a = s + us;
+            free[slot(e)] = s + us;
+            order.push(a[ia]);
+            ia += 1;
+        } else {
+            let (s, e, us) = sb.expect("b has a node");
+            ready_b = s + us;
+            free[slot(e)] = s + us;
+            order.push(b[ib]);
+            ib += 1;
+        }
+    }
+    order
+}
+
+/// How the nodes of a two-body half-layer graph are ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Weave {
+    /// The order [`weave_order`] picks.
+    Cost,
+    /// The second-half body's nodes, then the first-half body's.
+    SecondFirst,
+    /// The first-half body's nodes, then the second-half body's.
+    FirstFirst,
+}
+
+/// A half-layer tile graph of `t` rows: the first half `first` of a layer (prefix `L_`, the
+/// names of the full-layer graph; its result `L_core` is a tensor the tile loop binds), the
+/// second half of a layer (prefix [`SECOND_PFX`]: `G_x_in`, `G_core` -> `G_out`), or both as two
+/// independent bodies.
+#[allow(clippy::too_many_arguments)]
+pub fn build_half_graph(
+    spec: &ModelSpec,
+    t: u64,
+    lmax: u64,
+    first: Option<FirstHalf>,
+    second: bool,
+    weave: Weave,
+    form: &TileForm,
+    elf_base: &[(String, String)],
+    elf_tile: &[(String, String)],
+) -> GraphBuilder {
+    let ftag = match first {
+        None => String::new(),
+        Some(FirstHalf::Lin) => format!("_Fl{}", form.rows),
+        Some(FirstHalf::Attn(nch)) => format!(
+            "_Fa{}_C{nch}_G{}",
+            form.s16,
+            chunk_groups(nch, form.groups).len()
+        ),
+    };
+    let wtag = match (first.is_some() && second, weave) {
+        (false, _) | (true, Weave::Cost) => "",
+        (true, Weave::SecondFirst) => "_wG",
+        (true, Weave::FirstFirst) => "_wF",
+    };
+    let mut gb = GraphBuilder::new(format!(
+        "g_qwen_half{}{ftag}_T{t}{wtag}",
+        if second { "_G" } else { "" }
+    ));
+    for (k, h) in elf_base.iter().chain(elf_tile) {
+        gb.record_kernel_elf_hash(k, h);
+    }
+    let n0 = gb.node_count();
+    if second {
+        let core_dim = spec.n_heads * spec.head_dim;
+        gb.set_fp8_weights(spec.fp8_weights);
+        let x = gb.add_persistent_tensor(
+            format!("{SECOND_PFX}x_in"),
+            SynDataType::Bf16,
+            &[spec.hidden, t],
+        );
+        let core = gb.add_persistent_tensor(
+            format!("{SECOND_PFX}core"),
+            SynDataType::Bf16,
+            &[core_dim, t],
+        );
+        let _ = append_second_half(&mut gb, spec, x, core, SECOND_PFX, t);
+    }
+    let n1 = gb.node_count();
+    match first {
+        None => {}
+        Some(FirstHalf::Lin) => {
+            let x_in = gb.add_persistent_tensor("x_in", SynDataType::Bf16, &[spec.hidden, t]);
+            let slot = gb.get_or_add_persistent_tensor("zero_slot", SynDataType::Int32, &[1]);
+            let _ = append_linear_first_mme(&mut gb, spec, x_in, slot, "L_", t, form);
+        }
+        Some(FirstHalf::Attn(nch)) => {
+            let x_in = gb.add_persistent_tensor("x_in", SynDataType::Bf16, &[spec.hidden, t]);
+            let cursor = gb.add_persistent_tensor("cursor", SynDataType::Int32, &[1]);
+            let rope_c = gb.add_persistent_tensor("rope_c", SynDataType::Float, &[128, lmax]);
+            let rope_s = gb.add_persistent_tensor("rope_s", SynDataType::Float, &[128, lmax]);
+            let _ = append_attn_first_tile(
+                &mut gb, spec, x_in, cursor, rope_c, rope_s, "L_", t, nch, form,
+            );
+        }
+    }
+    let n2 = gb.node_count();
+    if n1 > n0 && n2 > n1 {
+        let (g, f): (Vec<usize>, Vec<usize>) = ((n0..n1).collect(), (n1..n2).collect());
+        let order: Vec<usize> = match weave {
+            Weave::SecondFirst => (0..n2).collect(),
+            Weave::FirstFirst => (0..n0).chain(n1..n2).chain(n0..n1).collect(),
+            Weave::Cost => {
+                let costs: Vec<(Eng, f64)> = gb
+                    .node_io_views()
+                    .iter()
+                    .map(|n| node_cost(n.guid, n.name, t))
+                    .collect();
+                let woven = weave_order(&|i| costs[i], &f, &g);
+                (0..n0).chain(woven).collect()
+            }
+        };
+        let ok = gb.reorder_nodes(&order);
+        debug_assert!(ok, "weave is a permutation");
+    }
+    gb
+}
+
+/// Is `name` a tensor of a half-layer graph that the tile loop binds itself, beyond those of a
+/// full-layer graph: the hand-over rows between the halves and the second body's rows and
+/// weights.
+fn is_half_bound(name: &str) -> bool {
+    name == "L_core"
+        || name.strip_prefix(SECOND_PFX).is_some_and(|s| {
+            matches!(s, "x_in" | "core" | "out") || is_generic_layer_weight(&format!("L_{s}"))
+        })
+}
+
+/// Offsets of a half-layer graph's scratch tensors in the shared region, and the bytes they span.
+pub(super) fn half_scratch_layout(gb: &GraphBuilder) -> (BTreeMap<String, u64>, u64) {
+    let mut map = BTreeMap::new();
+    let mut off = 0u64;
+    for (name, _dt, _dims, bytes) in gb.persistent_tensor_specs() {
+        if is_loop_bound(&name) || is_half_bound(&name) {
+            continue;
+        }
+        map.insert(name, off);
+        off += align_up(bytes.max(256), 256);
+    }
+    (map, off)
 }
 
 // ============================================================================
@@ -1110,6 +1415,21 @@ impl TileRt {
     /// Rows of a full tile (the widest candidate until [`Self::settle`] chose).
     pub(super) fn tile(&self) -> u64 {
         self.tile
+    }
+
+    /// `(base address, bytes)` of the planned scratch region.
+    pub(super) fn scratch_region(&self) -> (u64, u64) {
+        (self.scratch_base, self.scratch_bytes)
+    }
+
+    /// Hashes of the kernels the tile forms add to the engine's base set.
+    pub(super) fn elf_tile(&self) -> &[(String, String)] {
+        &self.elf_tile
+    }
+
+    /// Device address of the f32 constant 1.0 (None: no recipe of this form reads it).
+    pub(super) fn const_one_addr(&self) -> Option<u64> {
+        (self.const_one != 0).then_some(self.const_one)
     }
 
     /// Bytes of the `fp8_one` constant buffer (0 when no recipe reads it).

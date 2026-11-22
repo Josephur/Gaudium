@@ -86,16 +86,51 @@ pub struct GraphBuilder {
     graph_attrs: Vec<(SynGraphAttribute, u64)>,
     no_pipeline_mgmt: bool,
     no_persistent_reuse: bool,
+    /// Graph-compiler settings applied while this graph compiles (`synConfigurationSet` names and
+    /// values, set with the experimental flags on and restored afterwards). Part of the
+    /// fingerprint: a setting changes what is compiled.
+    gc_settings: Vec<(String, String)>,
     kernel_elf_hashes: Vec<(String, String)>,
     /// [fp8] The quantisable weight matrices of this graph are `fp8_143` (`engine/fp8_graph.rs`).
     /// A build-time switch only: the tensors and nodes it leads to are what the fingerprint covers.
     fp8_weights: bool,
 }
 
+/// Measurement switch: graph-compiler settings for the graphs of this process.
+/// `GAUDIUM_GC_SET` holds `NAME=value[,NAME=value...]`; `GAUDIUM_GC_ONLY` limits them to recipes
+/// whose name starts with one of its `|`-separated prefixes. They are part of each graph's
+/// settings, so its fingerprint.
+fn env_gc_settings(recipe_name: &str) -> Vec<(String, String)> {
+    static SETS: std::sync::OnceLock<(Vec<(String, String)>, Vec<String>)> =
+        std::sync::OnceLock::new();
+    let (sets, only) = SETS.get_or_init(|| {
+        let sets = std::env::var("GAUDIUM_GC_SET")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|kv| kv.trim().split_once('='))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect();
+        let only = std::env::var("GAUDIUM_GC_ONLY")
+            .unwrap_or_default()
+            .split('|')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        (sets, only)
+    });
+    if !only.is_empty() && !only.iter().any(|p| recipe_name.starts_with(p.as_str())) {
+        return Vec::new();
+    }
+    sets.clone()
+}
+
 impl GraphBuilder {
     pub fn new(recipe_name: impl Into<String>) -> Self {
+        let recipe_name = recipe_name.into();
+        let gc_settings = env_gc_settings(&recipe_name);
         Self {
-            recipe_name: recipe_name.into(),
+            recipe_name,
             device_type: SynDeviceType::Gaudi2,
             sections: Vec::new(),
             tensors: Vec::new(),
@@ -104,6 +139,7 @@ impl GraphBuilder {
             graph_attrs: Vec::new(),
             no_pipeline_mgmt: false,
             no_persistent_reuse: false,
+            gc_settings,
             kernel_elf_hashes: Vec::new(),
             fp8_weights: false,
         }
@@ -140,6 +176,41 @@ impl GraphBuilder {
             .map(TensorId)
     }
 
+    /// Nodes created so far.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Puts the nodes in a new creation order: node `order[i]` becomes node `i`. The graph
+    /// compiler keeps the creation order of nodes that do not depend on each other, so this is
+    /// how a graph with several independent bodies chooses the order its engines' queues get.
+    /// `order` must be a permutation of `0..node_count()` (anything else leaves the graph as it is
+    /// and returns `false`); the fingerprint follows the new order.
+    pub fn reorder_nodes(&mut self, order: &[usize]) -> bool {
+        let n = self.nodes.len();
+        let mut seen = vec![false; n];
+        if order.len() != n
+            || order
+                .iter()
+                .any(|&i| i >= n || std::mem::replace(&mut seen[i], true))
+        {
+            return false;
+        }
+        let mut new_index = vec![0usize; n];
+        for (new, &old) in order.iter().enumerate() {
+            new_index[old] = new;
+        }
+        let mut old_nodes: Vec<Option<NodeSpec>> = self.nodes.drain(..).map(Some).collect();
+        self.nodes = order
+            .iter()
+            .map(|&old| old_nodes[old].take().expect("permutation"))
+            .collect();
+        for d in &mut self.deps {
+            *d = (NodeId(new_index[d.0 .0]), NodeId(new_index[d.1 .0]));
+        }
+        true
+    }
+
     /// Name of the recipe this graph compiles to.
     pub fn recipe_name(&self) -> &str {
         &self.recipe_name
@@ -157,6 +228,11 @@ impl GraphBuilder {
     /// Disables persistent-output buffer reuse in the graph compiler (fixes placement-guard hazards).
     pub fn set_noreuse(&mut self, enabled: bool) {
         self.no_persistent_reuse = enabled;
+    }
+
+    /// Compiles this graph with the graph-compiler setting `key` = `value` (see `gc_settings`).
+    pub fn set_gc_setting(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.gc_settings.push((key.into(), value.into()));
     }
 
     pub fn set_graph_attr(&mut self, attr: SynGraphAttribute, value: u64) {
@@ -403,6 +479,15 @@ impl GraphBuilder {
             h.update_str(k);
             h.update_str(d);
         }
+        // graphs without extra compiler settings keep the keys they had before the field existed
+        if !self.gc_settings.is_empty() {
+            h.update_str("gc-settings");
+            h.update_u64(self.gc_settings.len() as u64);
+            for (k, v) in &self.gc_settings {
+                h.update_str(k);
+                h.update_str(v);
+            }
+        }
         h.finalize_hex()
     }
 
@@ -433,7 +518,8 @@ impl GraphBuilder {
         }
 
         // Apply compiler settings, construct graph, compile, and DESTROY graph immediately
-        let use_exp = self.no_pipeline_mgmt || self.no_persistent_reuse;
+        let use_exp =
+            self.no_pipeline_mgmt || self.no_persistent_reuse || !self.gc_settings.is_empty();
         if use_exp {
             let k = CString::new("ENABLE_EXPERIMENTAL_FLAGS").unwrap();
             let v = CString::new("true").unwrap();
@@ -450,6 +536,33 @@ impl GraphBuilder {
             let _ = unsafe { (api.syn_configuration_set)(k.as_ptr(), v.as_ptr()) };
         }
 
+        // extra settings: remember what each one was, so the next compile sees the defaults again
+        let mut gc_saved: Vec<(CString, Option<CString>)> = Vec::new();
+        for (key, value) in &self.gc_settings {
+            let (Ok(k), Ok(v)) = (CString::new(key.as_str()), CString::new(value.as_str())) else {
+                continue;
+            };
+            let mut buf = vec![0u8; 256];
+            let st = unsafe {
+                (api.syn_configuration_get)(k.as_ptr(), buf.as_mut_ptr().cast(), buf.len() as u64)
+            };
+            let old = (st == 0)
+                .then(|| buf.iter().position(|&b| b == 0).map(|n| buf[..n].to_vec()))
+                .flatten()
+                .and_then(|b| CString::new(b).ok());
+            let st = unsafe { (api.syn_configuration_set)(k.as_ptr(), v.as_ptr()) };
+            if st != 0 {
+                eprintln!("[gaudium] graph compiler setting {key}={value} was refused (status {st})");
+            } else if std::env::var_os("GAUDIUM_GC_TRACE").is_some() {
+                eprintln!(
+                    "[gaudium] graph compiler setting {key}: {} -> {value} ({})",
+                    old.as_ref().map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|| "?".into()),
+                    self.recipe_name
+                );
+            }
+            gc_saved.push((k, old));
+        }
+
         let mut graph: SynGraphHandle = std::ptr::null_mut();
         syn_check("synGraphCreate", unsafe {
             (api.syn_graph_create)(&mut graph, self.device_type as u32)
@@ -463,6 +576,11 @@ impl GraphBuilder {
         }
 
         // Restore compiler toggles if modified
+        for (k, old) in gc_saved.iter().rev() {
+            if let Some(v) = old {
+                let _ = unsafe { (api.syn_configuration_set)(k.as_ptr(), v.as_ptr()) };
+            }
+        }
         if self.no_pipeline_mgmt {
             let k = CString::new("ENABLE_PIPELINE_MANAGEMENT").unwrap();
             let v = CString::new("true").unwrap();
@@ -955,5 +1073,49 @@ mod tests {
         let mut g3 = g1.clone();
         g3.record_kernel_elf_hash("gdn_f32", "deadbeef");
         assert_ne!(fp1, g3.fingerprint("1.24.2"));
+    }
+
+    #[test]
+    fn compiler_settings_are_part_of_the_fingerprint() {
+        let build = || {
+            let mut g = GraphBuilder::new("add_bf16");
+            let a = g.add_persistent_tensor("a", SynDataType::Bf16, &[128]);
+            let b = g.add_persistent_tensor("b", SynDataType::Bf16, &[128]);
+            let out = g.add_persistent_tensor("out", SynDataType::Bf16, &[128]);
+            g.add_node("add_fwd_bf16", "n0", &[a, b], &[out], &[]);
+            g
+        };
+        let plain = build().fingerprint("1.24.2");
+        let mut g = build();
+        g.set_gc_setting("DEFAULT_PIPELINE_DEPTH", "1");
+        let one = g.fingerprint("1.24.2");
+        assert_ne!(plain, one, "a compiler setting changes what is compiled");
+        let mut g = build();
+        g.set_gc_setting("DEFAULT_PIPELINE_DEPTH", "2");
+        assert_ne!(one, g.fingerprint("1.24.2"), "so does its value");
+        let mut g = build();
+        g.set_gc_setting("DEFAULT_PIPELINE_DEPTH", "1");
+        assert_eq!(one, g.fingerprint("1.24.2"));
+    }
+
+    #[test]
+    fn reordering_nodes_keeps_dependencies_on_their_nodes() {
+        let mut g = GraphBuilder::new("three");
+        let a = g.add_persistent_tensor("a", SynDataType::Bf16, &[128]);
+        let b = g.add_persistent_tensor("b", SynDataType::Bf16, &[128]);
+        let c = g.add_persistent_tensor("c", SynDataType::Bf16, &[128]);
+        let d = g.add_persistent_tensor("d", SynDataType::Bf16, &[128]);
+        let n0 = g.add_node("add_fwd_bf16", "n0", &[a, a], &[b], &[]);
+        let _n1 = g.add_node("add_fwd_bf16", "n1", &[a, a], &[c], &[]);
+        let n2 = g.add_node("add_fwd_bf16", "n2", &[a, a], &[d], &[]);
+        g.add_dependency(n0, n2);
+        assert_eq!(g.node_count(), 3);
+        assert!(!g.reorder_nodes(&[0, 1]), "not a permutation of the nodes");
+        assert!(!g.reorder_nodes(&[0, 0, 1]));
+        assert!(g.reorder_nodes(&[2, 0, 1]));
+        let names: Vec<String> = g.node_io_views().iter().map(|n| n.name.to_string()).collect();
+        assert_eq!(names, ["n2", "n0", "n1"]);
+        // the dependency still runs from n0 to n2, at their new places
+        assert_eq!(g.deps, vec![(NodeId(1), NodeId(0))]);
     }
 }

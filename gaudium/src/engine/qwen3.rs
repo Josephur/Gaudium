@@ -246,6 +246,8 @@ pub use build_cache_rt::build_cache;
 // [step] device-trace windows of the decode loops
 #[path = "qwen3_prof.rs"]
 mod prof_rt;
+#[path = "qwen3_halfprobe.rs"]
+mod halfprobe;
 // [step] enqueue-ahead greedy K=0 decode (token fed back on the card)
 #[path = "qwen3_k0pipe.rs"]
 mod k0pipe;
@@ -1556,6 +1558,18 @@ impl Qwen3Engine {
             );
         }
         let Some(mut dev) = dev_opt else {
+            if pf.opts.half_probe > 0 {
+                halfprobe::compile_only(
+                    &spec,
+                    prefill_tile,
+                    max_ctx,
+                    &pf.form,
+                    &elf_hashes,
+                    pf.elf_tile(),
+                    &api,
+                    &driver_version,
+                )?;
+            }
             eprintln!(
                 "[gaudium] build-cache done in {:.1}s: recipes for max_ctx={} are in the cache; no engine loaded",
                 t_start.elapsed().as_secs_f64(),
@@ -2307,6 +2321,11 @@ impl Qwen3Engine {
         );
         self.live.end_request();
         request_reset::end_request(self, prompt_ids.len() as u64, &res);
+        // [prefill] measurement of the half-layer recipe forms, once, after the first request
+        if res.is_ok() && self.pf.opts.half_probe > 0 {
+            let n = std::mem::take(&mut self.pf.opts.half_probe);
+            halfprobe::run(self, n)?;
+        }
         res
     }
 
@@ -2366,6 +2385,8 @@ impl Qwen3Engine {
             let mut last_tile_len = 0u64;
             let pf_profile = self.pf.opts.profile;
             self.pf.begin_request();
+            // [profile] index of the next prefill launch (`--profile-steps pA-B`)
+            let mut pf_launch: u64 = 0;
 
             while pos < prompt_ids.len() {
                 if is_cancelled() {
@@ -2419,6 +2440,8 @@ impl Qwen3Engine {
                 let emb_recipe = &self.embed_recipes[&tile_len];
                 let emb_bind = select_exact_bindings(emb_recipe, &emb_pool)?;
                 let t_l = prefill::now();
+                prof_rt::before_prefill_launch(&mut self.prof, &self.dev, pf_launch)?;
+                pf_launch += 1;
                 emb_recipe
                     .launch_checked(&self.dev, &emb_bind)
                     .map_err(|e| format!("launch embed T={tile_len}: {e}"))?;
@@ -2490,6 +2513,8 @@ impl Qwen3Engine {
                         );
                         let abind = select_exact_bindings(attn_recipe, &apool)?;
                         let t_l = prefill::now();
+                        prof_rt::before_prefill_launch(&mut self.prof, &self.dev, pf_launch)?;
+                        pf_launch += 1;
                         attn_recipe.launch_checked(&self.dev, &abind).map_err(|e| {
                             format!("launch prefill attn layer {l} T={tile_len}: {e}")
                         })?;
@@ -2523,6 +2548,8 @@ impl Qwen3Engine {
                         );
                         let lbind = select_exact_bindings(lin_recipe, &lpool)?;
                         let t_l = prefill::now();
+                        prof_rt::before_prefill_launch(&mut self.prof, &self.dev, pf_launch)?;
+                        pf_launch += 1;
                         lin_recipe.launch_checked(&self.dev, &lbind).map_err(|e| {
                             format!("launch prefill lin layer {l} T={tile_len}: {e}")
                         })?;
@@ -2601,6 +2628,7 @@ impl Qwen3Engine {
                 );
             }
 
+            prof_rt::end_prefill(&mut self.prof, &self.dev, pf_launch)?;
             if stopped_by_cancel {
                 let ttft_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
                 return Ok(Qwen3GenReport {

@@ -30,6 +30,13 @@ cc2d96177d64bd71  dev_alloc_launch_disjoint  law dev_alloc_launch_disjoint : for
 66013e0cb837f25a  dev_closed_absorbing  law dev_closed_absorbing : for ev : DevEvent { dev_step ( DevClosed { } , ev ) == DevClosed { } : DevState }
 ebbddef48543f39e  dev_drain_blocks_all  law dev_drain_blocks_all : for + s : DevState { Bool.or ( dev_can_alloc ( dev_drain ( s ) ) , Bool.or ( dev_can_dma ( dev_drain ( s ) ) , dev_can_launch ( dev_drain ( s ) ) ) ) == False { } : Bool }
 55d549147ef088a6  dev_drain_idempotent  law dev_drain_idempotent : for s : DevState { dev_drain ( dev_drain ( s ) ) == dev_drain ( s ) : DevState }
+33b5711274c7c96f  ds_ctx_rows_linear_without_ring  law ds_ctx_rows_linear_without_ring : for l : Nat { ds_ctx_rows ( 0n , l ) == l : Nat }
+89f184e7cd33ee14  ds_ctx_rows_never_exceed_linear  law ds_ctx_rows_never_exceed_linear : for + ring : Nat for + l : Nat { Nat.is_le ( ds_ctx_rows ( ring , l ) , l ) == True { } : Bool }
+b48c8a581f14cf08  ds_draft_rows_inside_vocab  law ds_draft_rows_inside_vocab : for + a : Nat for + v : Nat for h : Bool { Nat.is_le ( ds_draft_rows ( Nat.min ( a , v ) , v , h ) , v ) == True { } : Bool }
+59a4caed82357976  ds_no_draft_rows_no_map  law ds_no_draft_rows_no_map : for v : Nat { ds_draft_mapped ( 0n , v ) == False { } : Bool }
+e5ac6739516742cc  ds_ring_holds_window_and_pass  law ds_ring_holds_window_and_pass : for w : Nat for p : Nat for g : Nat { Nat.is_le ( Nat.add ( Nat.add ( w , p ) , g ) , ds_ring_rows ( w , p , g ) ) == True { } : Bool }
+a0a0a67e1d6ae93a  ds_ring_needs_its_kernels  law ds_ring_needs_its_kernels : for w : Nat for + l : Nat for + r : Nat { ds_ring_pick ( False { } , w , l , r ) == 0n : Nat }
+d64aa69324dcf18f  ds_window_rows_split  law ds_window_rows_split : for + nv : Nat for + hi : Nat { Nat.add ( ds_win_low ( nv , hi ) , ds_win_wrap ( nv , hi ) ) == nv : Nat }
 a09474b00bc19d2b  effective_max_new_le_room  law effective_max_new_le_room : for unb : Bool for + req : Nat for + p : Nat for + lmax : Nat { Nat.is_le ( effective_max_new ( unb , req , p , lmax ) , prompt_room ( p , lmax ) ) == True { } : Bool }
 b8a418606825f53b  empty_prompt_rejected  law empty_prompt_rejected : for lmax : Nat { prompt_admitted ( 0n , lmax ) == False { } : Bool }
 0a0dc9c6c90582ef  finish_calls_reported_unless_cancelled  law finish_calls_reported_unless_cancelled : for + e : GenEnd { Bool.xor ( fr_is_tool_calls ( finish_reason ( e , True { } ) ) , ge_is_cancelled ( e ) ) == True { } : Bool }

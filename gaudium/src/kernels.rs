@@ -71,6 +71,9 @@ const STATIC_ELF_VARS: &[(&str, &str)] = &[
     ("GAUDIUM_GDNR_ELF", "gdn_f32r_gaudi2.o"),
     // slotted row recurrence with its gate scalars as vector loads (served by the step glue library)
     ("GAUDIUM_GDNV_ELF", "gdn_f32v_gaudi2.o"),
+    // a block drafter's context as rings of its sliding window (served by the step glue library)
+    ("GAUDIUM_DSCTXR_ELF", "ds_ctxr_gaudi2.o"),
+    ("GAUDIUM_DSSOFTR_ELF", "ds_softr_gaudi2.o"),
     ("GAUDIUM_PREP_ELF", "gdn_prep_gaudi2.o"),
     ("GAUDIUM_PREPS_ELF", "gdn_preps_gaudi2.o"),
     ("GAUDIUM_PREPD_ELF", "gdn_prepd_gaudi2.o"),

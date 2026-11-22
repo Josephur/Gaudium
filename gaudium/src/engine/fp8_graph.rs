@@ -69,6 +69,10 @@ pub const FP8_MATRIX_SUFFIXES: [&str; 8] = [
 /// Splits a layer tensor name into its layer index and suffix: `"L12_W_o"` -> `(Some(12), "W_o")`,
 /// the generic per-layer prefill form `"L_W_o"` -> `(None, "W_o")`. `None` for any other name.
 pub fn split_layer_name(name: &str) -> Option<(Option<usize>, &str)> {
+    // the second-half body of a two-body prefill recipe names its (generic) layer `G_`
+    if let Some(suffix) = name.strip_prefix("G_") {
+        return Some((None, suffix));
+    }
     let rest = name.strip_prefix('L')?;
     let sep = rest.find('_')?;
     let (digits, suffix) = (&rest[..sep], &rest[sep + 1..]);
@@ -300,6 +304,8 @@ mod tests {
     fn layer_names_split_and_classify() {
         assert_eq!(split_layer_name("L12_W_o"), Some((Some(12), "W_o")));
         assert_eq!(split_layer_name("L_W_down"), Some((None, "W_down")));
+        assert_eq!(split_layer_name("G_W_down"), Some((None, "W_down")));
+        assert!(is_fp8_matrix("G_W_gate"));
         assert_eq!(split_layer_name("Lx_W_o"), None);
         assert_eq!(split_layer_name("embed_table"), None);
         assert!(is_fp8_matrix("L3_W_qkvz"));

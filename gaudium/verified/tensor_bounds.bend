@@ -431,3 +431,181 @@ law qwen36_35b_moe_dims_valid:
 
 def qwen36_35b_moe_dims_valid():
   {==}
+
+# ============================================================================
+# 6. Drafter context rings & draft readout rows
+# ============================================================================
+# A block drafter that looks back a bounded window keeps its context K / V rows in rings
+# (slot = position mod rows) instead of one row per context position, and reads its drafts from
+# every vocabulary row or from a subset. The sizes and the choices are decided here; the ring
+# kernels (TPC) and the graph builders (Rust shell) take the results.
+
+def tn_min_le_r(a: Nat, b: Nat) -> {Nat.is_le(Nat.min(a, b), b) == True{} : Bool}:
+  match a:
+    case 0n:
+      match b:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+p:
+      match b:
+        case 0n: {==}
+        case 1n+q:
+          tn_min_le_r(p, q)
+
+def tn_min_sub_split(nv: Nat, hi: Nat) -> {Nat.add(Nat.min(nv, hi), Nat.sub(nv, hi)) == nv : Nat}:
+  match nv:
+    case 0n:
+      match hi:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+p:
+      match hi:
+        case 0n: {==}
+        case 1n+q:
+          %tn_min_sub_split(p, q) : {1n+Nat.add(Nat.min(p, q), Nat.sub(p, q)) == 1n+_ : Nat}
+          {==}
+
+# Rows of a context ring: whole 128-row blocks that hold a sliding window, the rows one context
+# pass may write past the cursor, and the guard that keeps the two swept slot ranges apart.
+def ds_ring_rows(window: Nat, pass_rows: Nat, guard: Nat) -> Nat:
+  align128(Nat.add(Nat.add(window, pass_rows), guard))
+
+def ds_ring_pick_if(rows: Nat, use_ring: Bool) -> Nat:
+  match use_ring:
+    case True{}:
+      rows
+    case False{}:
+      0n
+
+# Rows of the rings to keep, 0 = linear caches (one row per context position): rings need their
+# kernels, a window shorter than the context, and fewer rows than a linear cache has.
+def ds_ring_pick(have_ring: Bool, window: Nat, +lmax: Nat, +rows: Nat) -> Nat:
+  ds_ring_pick_if(rows, Bool.and(have_ring, Bool.and(Nat.is_lt(window, lmax), Nat.is_lt(rows, lmax))))
+
+def ds_ctx_rows_if(ring: Nat, lmax: Nat, linear: Bool) -> Nat:
+  match linear:
+    case True{}:
+      lmax
+    case False{}:
+      Nat.min(ring, lmax)
+
+# Rows of one context cache: the ring's (never more than a linear cache's), or with no ring
+# (`ring` = 0) one per context position.
+def ds_ctx_rows(+ring: Nat, lmax: Nat) -> Nat:
+  ds_ctx_rows_if(ring, lmax, Nat.is_eq(ring, 0n))
+
+# Context rows a block row at offset `t` may read: its window less the block rows before it,
+# at most the `span` rows the request has written.
+def ds_win_rows(window: Nat, t: Nat, span: Nat) -> Nat:
+  Nat.min(Nat.sub(Nat.sub(window, 1n), t), span)
+
+# Those rows' slots: the ones below the write slot `hi` (the swept range A) and the ones that
+# wrapped to the top of the ring (range B).
+def ds_win_low(nv: Nat, hi: Nat) -> Nat:
+  Nat.min(nv, hi)
+
+def ds_win_wrap(nv: Nat, hi: Nat) -> Nat:
+  Nat.sub(nv, hi)
+
+def ds_draft_rows_if(asked: Nat, vocab: Nat, every_row: Bool) -> Nat:
+  match every_row:
+    case True{}:
+      vocab
+    case False{}:
+      asked
+
+# Rows of the draft readout: the rows the run asks for; with none asked (0), every vocabulary
+# row when the readout has an FP8 copy (half the bytes of the BF16 readout), else 0 = the plain
+# BF16 readout of the target. Which rows a run gets by default is a tuning choice of this
+# function's body, not a law: the laws below only bound the result.
+def ds_draft_rows(+asked: Nat, vocab: Nat, fp8_head: Bool) -> Nat:
+  ds_draft_rows_if(asked, vocab, Bool.and(fp8_head, Nat.is_eq(asked, 0n)))
+
+# Does the draft readout need the row-to-token map? Today: a non-empty proper subset of the
+# rows (the lowest ids plus a control-token block, so a row index is not a token id).
+def ds_draft_mapped(+nvd: Nat, vocab: Nat) -> Bool:
+  Bool.and(Nat.is_gt(nvd, 0n), Nat.is_lt(nvd, vocab))
+
+# LAW TN.DR1: a ring holds the window, the rows of a pass and the guard: a pass never writes a
+# slot that a window of the same step reads.
+law ds_ring_holds_window_and_pass:
+  for w: Nat
+  for p: Nat
+  for g: Nat
+  {Nat.is_le(Nat.add(Nat.add(w, p), g), ds_ring_rows(w, p, g)) == True{} : Bool}
+
+def ds_ring_holds_window_and_pass(w, p, g):
+  tn_align_if_ge(Nat.add(Nat.add(w, p), g), 128n, Nat.is_eq(128n, 0n))
+
+# LAW TN.DR2: without the ring kernels the context stays linear, whatever the sizes.
+law ds_ring_needs_its_kernels:
+  for w: Nat
+  for +l: Nat
+  for +r: Nat
+  {ds_ring_pick(False{}, w, l, r) == 0n : Nat}
+
+def ds_ring_needs_its_kernels(w, l, r):
+  {==}
+
+# LAW TN.DR3: a context cache never has more rows than the linear cache it replaces, so rings
+# can only shrink the device memory plan.
+law ds_ctx_rows_never_exceed_linear:
+  for +ring: Nat
+  for +l: Nat
+  {Nat.is_le(ds_ctx_rows(ring, l), l) == True{} : Bool}
+
+def tn_ctx_rows_if_le(ring: Nat, +l: Nat, linear: Bool) -> {Nat.is_le(ds_ctx_rows_if(ring, l, linear), l) == True{} : Bool}:
+  match linear:
+    case True{}:
+      Equal.sym(Bool, True{}, Nat.is_le(l, l), tn_le_refl(l))
+    case False{}:
+      tn_min_le_r(ring, l)
+
+def ds_ctx_rows_never_exceed_linear(ring, l):
+  tn_ctx_rows_if_le(ring, l, Nat.is_eq(ring, 0n))
+
+# LAW TN.DR4: no ring means one row per context position.
+law ds_ctx_rows_linear_without_ring:
+  for l: Nat
+  {ds_ctx_rows(0n, l) == l : Nat}
+
+def ds_ctx_rows_linear_without_ring(l):
+  {==}
+
+# LAW TN.DR5: the two swept slot ranges hold exactly the rows a block row may read: none is
+# lost at the wrap and none is read twice.
+law ds_window_rows_split:
+  for +nv: Nat
+  for +hi: Nat
+  {Nat.add(ds_win_low(nv, hi), ds_win_wrap(nv, hi)) == nv : Nat}
+
+def ds_window_rows_split(nv, hi):
+  tn_min_sub_split(nv, hi)
+
+# LAW TN.DR6: the draft readout never has more rows than the vocabulary, for any request that
+# itself stays inside the vocabulary: the readout GEMM cannot address a row the head lacks.
+# (Which rows are read by default is not fixed here.)
+def tn_draft_rows_if_le(asked: Nat, +vocab: Nat, every_row: Bool) -> {Nat.is_le(ds_draft_rows_if(Nat.min(asked, vocab), vocab, every_row), vocab) == True{} : Bool}:
+  match every_row:
+    case True{}:
+      Equal.sym(Bool, True{}, Nat.is_le(vocab, vocab), tn_le_refl(vocab))
+    case False{}:
+      tn_min_le_r(asked, vocab)
+
+law ds_draft_rows_inside_vocab:
+  for +a: Nat
+  for +v: Nat
+  for h: Bool
+  {Nat.is_le(ds_draft_rows(Nat.min(a, v), v, h), v) == True{} : Bool}
+
+def ds_draft_rows_inside_vocab(a, v, h):
+  tn_draft_rows_if_le(a, v, Bool.and(h, Nat.is_eq(Nat.min(a, v), 0n)))
+
+# LAW TN.DR7: with no draft readout of its own (0 rows: the target's plain readout) there is no
+# row-to-token map to bind.
+law ds_no_draft_rows_no_map:
+  for v: Nat
+  {ds_draft_mapped(0n, v) == False{} : Bool}
+
+def ds_no_draft_rows_no_map(v):
+  {==}

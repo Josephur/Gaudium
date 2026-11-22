@@ -23,7 +23,7 @@ use super::super::*;
 use crate::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use crate::json::{parse_json, JsonValue};
 use crate::synapse::recipe_cache::Sha256;
-use crate::verified::lane256;
+use crate::verified::{ds_ctx_rows, ds_draft_mapped, ds_draft_rows, ds_ring_pick, ds_ring_rows, lane256};
 
 #[path = "packer_dspine.rs"]
 mod packer_dspine;
@@ -47,6 +47,21 @@ pub const DSPINE_ELFS: &[&str] = &[
     "GAUDIUM_DSBASE_ELF",
     "GAUDIUM_DSSCORE_ELF",
 ];
+
+/// Kernel ELFs of the ring form of the context caches ([`DSpineCfg::ring`]), served by the step
+/// glue library.
+pub const DSPINE_RING_ELFS: &[&str] = &["GAUDIUM_DSCTXR_ELF", "GAUDIUM_DSSOFTR_ELF"];
+
+/// Slots a context ring keeps beyond a window and the rows of one context pass: the softmax
+/// kernel sweeps 128-aligned slot ranges, and the two ranges of a wrapped window must not meet.
+pub const RING_GUARD: u64 = 256;
+
+/// Rows of a context ring for a sliding window of `window` positions when one context pass
+/// writes at most `pass_rows` rows: a whole number of 128-row blocks holding the window, the
+/// rows a pass may write past the cursor, and the guard.
+pub fn ring_rows(window: u64, pass_rows: u64) -> u64 {
+    ds_ring_rows(window, pass_rows, RING_GUARD)
+}
 
 /// Drafter attention shape fixed by the shared block-attention kernels: 32 query / 8 KV heads x 128.
 const D_DH: u64 = 128;
@@ -77,8 +92,15 @@ pub struct DSpineCfg {
     pub intermediate: u64,
     pub vocab: u64,
     /// Run option, not part of the checkpoint: rows of the block readout's draft vocabulary
-    /// (`ds_W_lmd`, a copy of those `lm_head` rows; 0 = the full `lm_head`).
+    /// (`ds_W_lmd`, a copy of those `lm_head` rows; 0 = the full `lm_head` as it is, BF16;
+    /// the vocabulary's size = every row, as the FP8 copy of an FP8 readout).
     pub nvd: u64,
+    /// Run option: rows of the context rings (0 = linear caches of the engine's context size).
+    /// The context attention reads at most `window` positions back, so a ring of
+    /// [`ring_rows`] slots (slot = position mod rows) holds everything a block can see: the
+    /// caches, the score / probability tensors and the two context GEMMs of every layer then
+    /// have the window's size instead of the engine's context size.
+    pub ring: u64,
     /// Run option: the layers' weight GEMMs run as FP8 (`<W>_f8` codes with one power-of-two
     /// scale per output channel, one static cast per input site). Drafts only: the verify, the
     /// context pass and the bridge stay BF16.
@@ -201,6 +223,7 @@ impl DSpineCfg {
             intermediate: num(&j, "intermediate_size")?,
             vocab: num(&j, "vocab_size")?,
             nvd: 0,
+            ring: 0,
             fp8: false,
             fp8_head: false,
         };
@@ -218,6 +241,20 @@ impl DSpineCfg {
             ));
         }
         Ok(cfg)
+    }
+
+    /// Rows of a context cache in an engine of `lmax` context positions: the ring's when the
+    /// context is kept as rings, else one row per position.
+    pub fn ctx_rows(&self, lmax: u64) -> u64 {
+        ds_ctx_rows(self.ring, lmax)
+    }
+
+    /// Chooses the form of the context caches for an engine of `lmax` positions whose context
+    /// passes write at most `pass_rows` rows: rings when the checkpoint's window is bounded, the
+    /// ring kernels are there (`have_ring`) and a ring is smaller than a linear cache.
+    pub fn plan_context(&mut self, lmax: u64, pass_rows: u64, have_ring: bool) {
+        let rows = ring_rows(self.window.min(lmax), pass_rows.max(self.block));
+        self.ring = ds_ring_pick(have_ring, self.window, lmax, rows);
     }
 
     /// The drafter reads the target's hidden states and shares its `lm_head`.
@@ -423,18 +460,23 @@ pub fn append_ctx_pass(
         );
         let kn_w =
             gb.get_or_add_persistent_tensor(format!("{lp}kn_w"), SynDataType::Float, &[D_DH]);
+        let rows = dc.ctx_rows(lmax);
         let kcache = gb.get_or_add_persistent_tensor(
             format!("{lp}kcache"),
             SynDataType::Bf16,
-            &[D_DH, lmax, D_NKV],
+            &[D_DH, rows, D_NKV],
         );
         let vcache = gb.get_or_add_persistent_tensor(
             format!("{lp}vcache"),
             SynDataType::Bf16,
-            &[D_DH, lmax, D_NKV],
+            &[D_DH, rows, D_NKV],
         );
         gb.add_node(
-            "gaudium_df_ctx",
+            if dc.ring > 0 {
+                "gaudium_ds_ctxr"
+            } else {
+                "gaudium_df_ctx"
+            },
             format!("ctx_{lp}kv"),
             &[kc, vc, kn_w, rope_c, rope_s, cursor, depth, fix],
             &[kcache, vcache],
@@ -527,24 +569,30 @@ fn append_spine_layer(
         &[qb, kblk, vblk],
         &[],
     );
+    // the context keys: one row per position, or the ring of the window (`dc.ring`)
+    let rows = dc.ctx_rows(lmax);
     let kcache = gb.get_or_add_persistent_tensor(
         format!("{lp}kcache"),
         SynDataType::Bf16,
-        &[D_DH, lmax, D_NKV],
+        &[D_DH, rows, D_NKV],
     );
     let vcache = gb.get_or_add_persistent_tensor(
         format!("{lp}vcache"),
         SynDataType::Bf16,
-        &[D_DH, lmax, D_NKV],
+        &[D_DH, rows, D_NKV],
     );
-    let sc = gb.add_persistent_tensor(format!("{lp}sc"), SynDataType::Float, &[lmax, r4, D_NKV]);
+    let sc = gb.add_persistent_tensor(format!("{lp}sc"), SynDataType::Float, &[rows, r4, D_NKV]);
     let sb = gb.add_persistent_tensor(format!("{lp}sb"), SynDataType::Float, &[128, r4, D_NKV]);
     gb.op_batch_gemm(format!("{lp}qk_ctx"), qb, kcache, sc, false, true);
     gb.op_batch_gemm(format!("{lp}qk_blk"), qb, kblk, sb, false, true);
-    let pc = gb.add_persistent_tensor(format!("{lp}Pc"), SynDataType::Bf16, &[lmax, r4, D_NKV]);
+    let pc = gb.add_persistent_tensor(format!("{lp}Pc"), SynDataType::Bf16, &[rows, r4, D_NKV]);
     let pb = gb.add_persistent_tensor(format!("{lp}Pb"), SynDataType::Bf16, &[128, r4, D_NKV]);
     gb.add_node(
-        "gaudium_ds_softmax",
+        if dc.ring > 0 {
+            "gaudium_ds_softr"
+        } else {
+            "gaudium_ds_softmax"
+        },
         format!("{lp}softmax"),
         &[sc, sb, cur_blk, fix],
         &[pc, pb],
@@ -742,7 +790,9 @@ pub fn append_block_pass(
     let pv = gb.add_persistent_tensor("blk_pv", SynDataType::Float, &[64, TOPK, TOPK_CH, t]);
     let pi = gb.add_persistent_tensor("blk_pi", SynDataType::Int32, &[64, TOPK, TOPK_CH, t]);
     gb.add_node("gaudium_df_topk1", "blk_topk1", &[logits], &[pv, pi], &[]);
-    let cand_name = if dv { "blk_cand_l" } else { "blk_cand" };
+    // a subset's row indices map back to token ids; every row in id order needs no map
+    let mapped = ds_draft_mapped(dc.nvd, vocab);
+    let cand_name = if mapped { "blk_cand_l" } else { "blk_cand" };
     let mut cand = gb.add_persistent_tensor(cand_name, SynDataType::Int32, &[TOPK, t]);
     let unary = gb.add_persistent_tensor("blk_unary", SynDataType::Float, &[TOPK, t]);
     gb.add_node(
@@ -752,7 +802,7 @@ pub fn append_block_pass(
         &[cand, unary],
         &[],
     );
-    if dv {
+    if mapped {
         cand = append_dv_map(gb, cand, &[TOPK, t], "blk_cand", "ds_dv_ids", dc.nvd);
     }
 
@@ -986,7 +1036,13 @@ impl DSpine {
         draft_dir: &Path,
         opts: &crate::engine::step_opts::StepOpts,
     ) -> Result<String, String> {
-        self.cfg.nvd = opts.draft_rows(spec.vocab, super::mtp::DV_TAIL)?;
+        // The block proposes from the whole vocabulary unless the run names a subset: a token
+        // outside a subset can never be drafted, and outside English text and code a large
+        // share of the tokens lies above any "lowest ids" cut.
+        self.cfg.nvd = match opts.draft_vocab {
+            None => 0,
+            Some(_) => opts.draft_rows(spec.vocab, super::mtp::DV_TAIL)?,
+        };
         let table = opts
             .draft_fp8_act
             .clone()
@@ -1010,8 +1066,11 @@ impl DSpine {
                     }
                 }
             }
-            // the readout's site is optional: a table calibrated without it keeps a BF16 head
-            self.cfg.fp8_head = self.cfg.nvd > 0 && act.contains_key(&fp8_site(self.cfg.nl, "xin"));
+            // the readout's site is optional: a table calibrated without it keeps a BF16 head.
+            // A full-vocabulary FP8 readout is the "subset" of every row (half the bytes of the
+            // BF16 `lm_head` per block).
+            self.cfg.fp8_head = act.contains_key(&fp8_site(self.cfg.nl, "xin"));
+            self.cfg.nvd = ds_draft_rows(self.cfg.nvd, spec.vocab, self.cfg.fp8_head);
             self.act = act;
             self.f8_dir = table.parent().map(Path::to_path_buf);
             self.cfg.fp8 = true;
@@ -1019,7 +1078,7 @@ impl DSpine {
         if let Some(out) = &opts.draft_fp8_calibrate {
             self.calib = Some((out.clone(), crate::engine::fp8_graph::ActCalibrator::new()));
         }
-        let vocab = if self.cfg.nvd > 0 {
+        let vocab = if ds_draft_mapped(self.cfg.nvd, spec.vocab) {
             format!("draft vocabulary {} of {} rows", self.cfg.nvd, spec.vocab)
         } else {
             "full-vocabulary readout".to_string()
@@ -1864,6 +1923,75 @@ mod tests {
         ] {
             assert!(!is_drafter_weight(a), "{a}");
         }
+    }
+
+    #[test]
+    fn context_rings_are_chosen_by_window_kernels_and_size() {
+        let mut dc = DSpineCfg::from_json(CFG_27B).unwrap();
+        assert_eq!(dc.window, 8192);
+        // serving context: the window is far shorter, a ring holds window + tile + guard
+        dc.plan_context(262_144, 512, true);
+        assert_eq!(dc.ring, 8960);
+        assert_eq!(dc.ring % 128, 0);
+        assert_eq!(dc.ctx_rows(262_144), 8960);
+        // no ring kernels in the kernel directory: linear caches
+        dc.plan_context(262_144, 512, false);
+        assert_eq!((dc.ring, dc.ctx_rows(262_144)), (0, 262_144));
+        // a context no longer than the window, or one a ring would not be smaller than
+        dc.plan_context(4096, 512, true);
+        assert_eq!((dc.ring, dc.ctx_rows(4096)), (0, 4096));
+        dc.plan_context(8192, 512, true);
+        assert_eq!(dc.ring, 0);
+        dc.plan_context(8960, 512, true);
+        assert_eq!(dc.ring, 0);
+        dc.plan_context(12_288, 512, true);
+        assert_eq!(dc.ring, 8960);
+    }
+
+    /// The slot arithmetic of the ring kernels (`gaudium_ds_ctxr`, `gaudium_ds_softr`), written
+    /// with the verified window functions, against the positions a block row may read.
+    #[test]
+    fn ring_slots_of_a_window_are_its_positions() {
+        use crate::verified::{ds_win_low, ds_win_rows, ds_win_wrap};
+        use std::collections::BTreeSet;
+        for (rg, w, tmax) in [(384u64, 100u64, 16u64), (512, 200, 16), (1024, 513, 64), (768, 64, 128)] {
+            assert!(rg % 128 == 0 && rg >= w + tmax + 128, "the glue's condition on a ring");
+            for cur in (0..3 * rg + 7).step_by(37).chain([rg - 1, rg, rg + 1, 2 * rg]) {
+                for flo in [0u64, cur / 2, cur] {
+                    let span = cur.saturating_sub(flo);
+                    // the slot after the newest context row, in 1..=rg
+                    let hi = (cur + rg - 1) % rg + 1;
+                    // slots the pass of this step writes
+                    let written: BTreeSet<u64> = (0..tmax).map(|t| (cur + t) % rg).collect();
+                    for t in 0..tmax.min(16) {
+                        let nv = ds_win_rows(w, t, span);
+                        let (low, wrap) = (ds_win_low(nv, hi), ds_win_wrap(nv, hi));
+                        let slots: BTreeSet<u64> = (hi - low..hi).chain(rg - wrap..rg).collect();
+                        let want: BTreeSet<u64> = (cur - nv..cur).map(|p| p % rg).collect();
+                        assert_eq!(slots, want, "rg {rg} w {w} cur {cur} flo {flo} t {t}");
+                        assert_eq!(slots.len() as u64, nv, "no slot is read twice");
+                        assert!(slots.is_disjoint(&written), "a pass never writes a visible slot");
+                        // the oldest visible position: the window's start or the request's
+                        assert_eq!(cur - nv, (cur + t).saturating_sub(w - 1).max(flo).min(cur));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn draft_readout_rows_follow_the_request_and_the_fp8_copy() {
+        use crate::verified::{ds_draft_mapped, ds_draft_rows};
+        let v = 248_320u64;
+        // no subset asked: every row with an FP8 copy of the readout, the plain readout without
+        assert_eq!(ds_draft_rows(0, v, true), v);
+        assert_eq!(ds_draft_rows(0, v, false), 0);
+        // a subset asked is kept either way
+        assert_eq!(ds_draft_rows(98_304, v, true), 98_304);
+        assert_eq!(ds_draft_rows(98_304, v, false), 98_304);
+        // only a proper subset maps rows to token ids
+        assert!(ds_draft_mapped(98_304, v));
+        assert!(!ds_draft_mapped(v, v) && !ds_draft_mapped(0, v));
     }
 
     #[test]

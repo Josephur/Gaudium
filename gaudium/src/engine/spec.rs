@@ -996,8 +996,31 @@ impl SpecRuntime {
             SpecMethod::DSpine { draft_model } => {
                 let mut d = dspine::DSpine::open(draft_model, spec)?;
                 let how = d.configure(spec, draft_model, opts)?;
+                // context caches: rings of the sliding window when the ring kernels are there
+                let have_ring = dspine::DSPINE_RING_ELFS
+                    .iter()
+                    .all(|e| kenv.present_elfs.contains_key(*e))
+                    && kenv.step_glue_hash().is_some();
+                if opts.draft_ring == Some(true) && !have_ring {
+                    return Err(format!(
+                        "--draft-ring 1: the ring kernels ({}) or the step glue library {} are missing from the kernels directory",
+                        dspine::DSPINE_RING_ELFS.join(", "),
+                        crate::kernels::STEP_GLUE
+                    ));
+                }
+                d.cfg.plan_context(
+                    max_ctx,
+                    prefill_tile.max(t_max),
+                    opts.draft_ring.unwrap_or(have_ring),
+                );
                 if verbose {
                     eprintln!("[gaudium] dspine drafter: {how}");
+                    if d.cfg.ring > 0 {
+                        eprintln!(
+                            "[gaudium] dspine drafter: context rings of {} rows (window {}) instead of {} rows per cache",
+                            d.cfg.ring, d.cfg.window, max_ctx
+                        );
+                    }
                 }
                 if t_max > d.cfg.block {
                     return Err(format!(
@@ -1007,6 +1030,9 @@ impl SpecRuntime {
                     ));
                 }
                 extra.extend_from_slice(dspine::DSPINE_ELFS);
+                if d.cfg.ring > 0 {
+                    extra.extend_from_slice(dspine::DSPINE_RING_ELFS);
+                }
                 Some(d)
             }
             // --- mtptree ---
@@ -1072,10 +1098,11 @@ impl SpecRuntime {
             extra.push(GDNV_ELF);
         }
         let mut elf_hashes = trunk_elf_hashes.to_vec();
-        if gdn_replay || gdn_fast {
+        let ring_ctx = drafter.as_ref().is_some_and(|d| d.cfg.ring > 0);
+        if gdn_replay || gdn_fast || ring_ctx {
             elf_hashes.push(kenv.step_glue_hash().ok_or_else(|| {
                 format!(
-                    "--gdn-verify replay / --gdn-fast-rows 1: the step glue library {} is missing from the kernels directory",
+                    "--gdn-verify replay / --gdn-fast-rows 1 / --draft-ring 1: the step glue library {} is missing from the kernels directory",
                     crate::kernels::STEP_GLUE
                 )
             })??);

@@ -74,24 +74,65 @@ pub(super) fn before_launch(
         return Ok(true);
     };
     let req = p.request;
-    if p.prof.wants_stop(req, idx) {
+    if p.prof.wants_stop(req, idx, false) {
         if in_flight > 0 {
             return Ok(false);
         }
         report(p, dev, idx)?;
     }
-    if p.prof.wants_start(req, idx) {
+    if p.prof.wants_start(req, idx, false) {
         if in_flight > 0 {
             return Ok(false);
         }
         unsafe { dev.sync_stream(dev.compute_stream()) }
             .map_err(|e| format!("profile: drain before start: {e}"))?;
         p.prof
-            .start(req, idx)
+            .start(req, idx, false)
             .map_err(|e| format!("profile start: {e}"))?;
         p.open_at = idx;
     }
     Ok(true)
+}
+
+/// Before enqueueing prefill launch `idx` (the tile loop's launches in order: the embedding, then
+/// one per layer, tile after tile) of the running request. A window edge drains the compute
+/// stream here: a profiled prefill is not a timing run.
+pub(super) fn before_prefill_launch(
+    prof: &mut Option<ProfRt>,
+    dev: &HpuDevice,
+    idx: u64,
+) -> Result<(), String> {
+    let Some(p) = prof.as_mut() else {
+        return Ok(());
+    };
+    let req = p.request;
+    if p.prof.wants_stop(req, idx, true) {
+        report(p, dev, idx)?;
+    }
+    if p.prof.wants_start(req, idx, true) {
+        unsafe { dev.sync_stream(dev.compute_stream()) }
+            .map_err(|e| format!("profile: drain before start: {e}"))?;
+        p.prof
+            .start(req, idx, true)
+            .map_err(|e| format!("profile start: {e}"))?;
+        p.open_at = idx;
+    }
+    Ok(())
+}
+
+/// End of the prefill tile loop after `launched` launches: closes a prefill window still open.
+pub(super) fn end_prefill(
+    prof: &mut Option<ProfRt>,
+    dev: &HpuDevice,
+    launched: u64,
+) -> Result<(), String> {
+    let Some(p) = prof.as_mut() else {
+        return Ok(());
+    };
+    if p.prof.open_window().is_some_and(|w| w.prefill) {
+        report(p, dev, launched)?;
+    }
+    Ok(())
 }
 
 /// End of a decode loop that launched `launched` steps: closes a window the request ended in.

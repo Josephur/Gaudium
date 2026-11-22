@@ -66,6 +66,10 @@ pub struct StepOpts {
     /// Calibration run: the drafter stays BF16, its GEMM input sites are read back after every
     /// launch, and the table is written here when the process ends.
     pub draft_fp8_calibrate: Option<PathBuf>,
+    /// Context caches of a block drafter with a sliding window as rings of that window instead
+    /// of one row per context position (drafts only; the step then costs the same at every
+    /// context size). `None`: when the ring kernels and their glue library are installed.
+    pub draft_ring: Option<bool>,
     /// DeltaNet state handling of the verify rows.
     pub gdn_verify: GdnVerify,
     /// Checkpoint form: run the rows with the kernel build that takes its per-row gate scalars as
@@ -85,6 +89,7 @@ impl Default for StepOpts {
             draft_fp8: None,
             draft_fp8_act: None,
             draft_fp8_calibrate: None,
+            draft_ring: None,
             gdn_verify: GdnVerify::default(),
             gdn_fast_rows: None,
             k0_pipeline: true,
@@ -94,11 +99,18 @@ impl Default for StepOpts {
 
 impl StepOpts {
     /// Defaults, with the environment's overrides: `GAUDIUM_DRAFT_VOCAB` (rows, 0 = full),
-    /// `GAUDIUM_DRAFT_FP8` (0 / 1), `GAUDIUM_DRAFT_FP8_ACT` (table path), `GAUDIUM_GDN_VERIFY`
-    /// (`checkpoint` / `replay` / `mme`), `GAUDIUM_GDN_FAST_ROWS` (0 / 1), `GAUDIUM_K0_PIPELINE` (0 / 1). A value that does not parse is
-    /// ignored.
+    /// `GAUDIUM_DRAFT_FP8` (0 / 1), `GAUDIUM_DRAFT_FP8_ACT` (table path), `GAUDIUM_DRAFT_RING`
+    /// (0 / 1), `GAUDIUM_GDN_VERIFY` (`checkpoint` / `replay` / `mme`), `GAUDIUM_GDN_FAST_ROWS`
+    /// (0 / 1), `GAUDIUM_K0_PIPELINE` (0 / 1). A value that does not parse is ignored.
     pub fn from_env() -> Self {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let switch = |k: &str| {
+            var(k).and_then(|v| match v.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            })
+        };
         Self {
             profile: Vec::new(),
             draft_vocab: var("GAUDIUM_DRAFT_VOCAB").and_then(|v| v.trim().parse().ok()),
@@ -109,6 +121,7 @@ impl StepOpts {
             }),
             draft_fp8_act: var("GAUDIUM_DRAFT_FP8_ACT").map(PathBuf::from),
             draft_fp8_calibrate: None,
+            draft_ring: switch("GAUDIUM_DRAFT_RING"),
             gdn_verify: var("GAUDIUM_GDN_VERIFY")
                 .and_then(|v| GdnVerify::parse(v.trim()))
                 .unwrap_or_default(),

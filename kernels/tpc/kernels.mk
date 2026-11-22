@@ -566,5 +566,12 @@ KERNEL_OBJS += $(KDIR)/gdn_f32r_gaudi2.o
 $(KDIR)/gdn_f32v_gaudi2.o: $(TPC_SRC)/gdn_f32v_gaudi2.c | $(KDIR)
 	cd $(TPC_SRC) && $(TPC_CC) -march=gaudi2 -O2 -x c++ -c $(notdir $<) -o $@
 KERNEL_OBJS += $(KDIR)/gdn_f32v_gaudi2.o
+# ds_ctxr / ds_softr: a block drafter's context as rings of its sliding window (cost independent of the engine's context size)
+$(KDIR)/ds_ctxr_gaudi2.o: $(TPC_SRC)/ds_ctxr_gaudi2.c | $(KDIR)
+	cd $(TPC_SRC) && $(TPC_CC) -march=gaudi2 -O2 -x c++ -c $(notdir $<) -o $@
+KERNEL_OBJS += $(KDIR)/ds_ctxr_gaudi2.o
+$(KDIR)/ds_softr_gaudi2.o: $(TPC_SRC)/ds_softr_gaudi2.c | $(KDIR)
+	cd $(TPC_SRC) && $(TPC_CC) -march=gaudi2 -O2 -x c++ -c $(notdir $<) -o $@
+KERNEL_OBJS += $(KDIR)/ds_softr_gaudi2.o
 $(KDIR)/libgaudium_st.so: $(GLUE_SRC)/st_glue.cpp $(GLUE_SRC)/elf_record.inc | $(KDIR)
 	$(CXX) -O2 -std=c++17 -fPIC -shared -I$(HABANA_INC) $< -o $@

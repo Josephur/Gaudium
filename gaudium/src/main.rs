@@ -103,6 +103,15 @@ fn print_usage() {
          \x20                       or full (see --request-reset under Generate options)\n\
          \x20 GAUDIUM_UPLOAD_DIRECT 0 = never read weight files with direct I/O at load (default:\n\
          \x20                       weight bytes that are not in the page cache are read directly)\n\
+         Measurement switches of the graph compiler (not for serving; each is part of the recipe\n\
+         fingerprints it touches):\n\
+         \x20 GAUDIUM_GC_SET        `NAME=value[,NAME=value..]`: graph-compiler settings applied to\n\
+         \x20                       the graphs this process compiles (set for the compile, then\n\
+         \x20                       restored); GAUDIUM_GC_ONLY limits them to recipes whose name\n\
+         \x20                       starts with one of its `|`-separated prefixes; GAUDIUM_GC_TRACE\n\
+         \x20                       prints each setting's previous value\n\
+         \x20 GAUDIUM_HALFPROBE_GC  Sets of such settings (sets separated by `;`) that --prefill\n\
+         \x20                       halfprobe=N times on the tile layers, each against the default\n\
          Qwen prefill environment variables:\n\
          \x20 GAUDIUM_PREFILL       Prefill levers `k=v,..` when --prefill is not given (see --prefill\n\
          \x20                       under Generate options). Changes the compiled tile recipes; with\n\
@@ -154,7 +163,9 @@ fn print_usage() {
          \x20                       of the same engine (same seed and sampler settings), then as\n\
          \x20                       configured (speculatively with --spec, enqueue-ahead K=0\n\
          \x20                       without), and report identity or the first divergence\n\
-         \x20 --profile-steps <A-B[@R][:file]>  Device trace of decode launches A..B (0-based) of\n\
+         \x20 --profile-steps <[p]A-B[@R][:file]>  Device trace of decode launches A..B (0-based; with\n\
+         \x20                       a leading p: of prefill launches A..B, counted over the tile\n\
+         \x20                       loop's embed and layer launches) of\n\
          \x20                       request R (default 0; with --compare-k0 the K=0 reference of a\n\
          \x20                       prompt is the request before its speculative run): prints the\n\
          \x20                       launch split by node family and engine, and the idle time by\n\
@@ -204,9 +215,13 @@ fn print_usage() {
          \x20 --k0-first            Same as --compare-k0\n\
          \x20 --draft-vocab <N>     Draft readouts over N token ids only: the lowest ids plus the\n\
          \x20                       control-token block at the lowest EOS id (multiple of 128; 0 =\n\
-         \x20                       the full vocabulary). Default: 98304 for dspine / dflash2 (or\n\
-         \x20                       GAUDIUM_DRAFT_VOCAB), the full vocabulary for mtp. Drafts are\n\
-         \x20                       guesses: the output is unchanged, only acceptance can move\n\
+         \x20                       the full vocabulary; or GAUDIUM_DRAFT_VOCAB). Default: the full\n\
+         \x20                       vocabulary for dspine (as an FP8 copy of the readout when the\n\
+         \x20                       drafter's FP8 table has its site) and for mtp, 98304 for\n\
+         \x20                       dflash2. A token outside the subset is never drafted (a large\n\
+         \x20                       share of the tokens outside English text and code); the subset\n\
+         \x20                       reads fewer bytes per block. Drafts are guesses: the output is\n\
+         \x20                       unchanged, only acceptance and the step time can move\n\
          \x20 --draft-fp8 <0|1>     DSpine drafter layers as FP8 weight GEMMs (default, or\n\
          \x20                       GAUDIUM_DRAFT_FP8: on when the drafter's activation-scale table\n\
          \x20                       exists). The verify stays as it is: the output is unchanged\n\
@@ -215,6 +230,12 @@ fn print_usage() {
          \x20 --draft-fp8-calibrate <f>  Calibration run for that table: the drafter runs BF16, one\n\
          \x20                       launch at a time, its GEMM input sites are read back after every\n\
          \x20                       launch and the table is written to <f> after each request\n\
+         \x20 --draft-ring <0|1>    DSpine context caches as rings of the checkpoint's sliding window\n\
+         \x20                       instead of one row per context position: the drafter's share of\n\
+         \x20                       a step then does not grow with --max-ctx (default, or\n\
+         \x20                       GAUDIUM_DRAFT_RING: on when the ring kernels and the step glue\n\
+         \x20                       library are in the kernels directory). Drafts only: the output\n\
+         \x20                       is unchanged\n\
          \x20 --width-sweep         Measurement: every request runs once per fixed verify width of\n\
          \x20                       --draft-k, then once with the width policy (compare the\n\
          \x20                       policy against the best fixed width per prompt)\n\
@@ -272,7 +293,11 @@ fn print_usage() {
          \x20                       attention chunk groups, s16=0|1|2 half-width attention core (BF16\n\
          \x20                       scores; 2: + FP8 P; default 2 with dense FP8 weights, else 0: it\n\
          \x20                       changes the prefill numerics), plain = every lever off, stats /\n\
-         \x20                       profile = print the tile loop's host split / per-recipe times\n\
+         \x20                       profile = print the tile loop's host split / per-recipe times,\n\
+         \x20                       halfprobe=N = measurement: after the last request, time whole\n\
+         \x20                       tile layers, their halves and two halves in one recipe over N\n\
+         \x20                       launches each (with --build-cache: compile them without the\n\
+         \x20                       card and the recipe cache, for the compiler's own dumps)\n\
          \x20 --dump-tokens         Print generated token IDs to stderr\n\
          \x20 --force-tokens-file <p> Teacher-force this reference stream (comma/whitespace token IDs)\n\
          \x20                       and report every position where greedy K=0 disagrees, with logits\n\
@@ -374,6 +399,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let mut gdn_verify: Option<gaudium::engine::step_opts::GdnVerify> = None;
     let mut k0_pipeline: Option<bool> = None;
     let mut gdn_fast_rows: Option<bool> = None;
+    let mut draft_ring: Option<bool> = None;
     let mut width_sweep = false;
 
     let mut i = 0usize;
@@ -527,6 +553,12 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                 gdn_fast_rows = Some(parse_switch(
                     &next_val(&mut i, "--gdn-fast-rows")?,
                     "--gdn-fast-rows",
+                )?)
+            }
+            "--draft-ring" => {
+                draft_ring = Some(parse_switch(
+                    &next_val(&mut i, "--draft-ring")?,
+                    "--draft-ring",
                 )?)
             }
             "--k0-pipeline" => {
@@ -712,6 +744,9 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     }
     if gdn_fast_rows.is_some() {
         cfg.step.gdn_fast_rows = gdn_fast_rows;
+    }
+    if draft_ring.is_some() {
+        cfg.step.draft_ring = draft_ring;
     }
     if draft_vocab_set && matches!(spec_method.as_deref(), Some("dspine" | "dflash2")) {
         // the block drafters' readout rows (the MTP head takes its own below)

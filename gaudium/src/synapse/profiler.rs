@@ -43,25 +43,33 @@ pub fn setup_env() {
     }
 }
 
-/// Decode launches `[first, last]` (0-based) of request number `request` (0-based count of the
-/// engine's generate calls) to trace.
+/// Launches `[first, last]` (0-based) of request number `request` (0-based count of the engine's
+/// generate calls) to trace: decode launches, or with `prefill` the launches of the prefill tile
+/// loop in their order (the embedding, then one per layer, tile after tile).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileWindow {
     pub first: u64,
     pub last: u64,
     pub request: u64,
+    /// The window counts prefill launches instead of decode launches (`pA-B`).
+    pub prefill: bool,
     /// Where the raw events go as tab-separated text (None: summary only).
     pub dump: Option<std::path::PathBuf>,
 }
 
 impl ProfileWindow {
-    /// `A-B`, `A-B@R`, each optionally followed by `:<events file>`.
+    /// `A-B`, `A-B@R`, each optionally followed by `:<events file>`; a leading `p` counts the
+    /// launches of the prefill tile loop instead of the decode launches.
     pub fn parse(s: &str) -> Result<Self, String> {
         let (head, dump) = match s.split_once(':') {
             Some((r, f)) => (r, Some(std::path::PathBuf::from(f))),
             None => (s, None),
         };
-        let bad = || format!("--profile-steps '{s}': expected A-B[@request][:<events file>]");
+        let (head, prefill) = match head.strip_prefix('p') {
+            Some(rest) => (rest, true),
+            None => (head, false),
+        };
+        let bad = || format!("--profile-steps '{s}': expected [p]A-B[@request][:<events file>]");
         let (range, request) = match head.split_once('@') {
             Some((r, q)) => (r, q.trim().parse::<u64>().map_err(|_| bad())?),
             None => (head, 0),
@@ -78,6 +86,7 @@ impl ProfileWindow {
             first,
             last,
             request,
+            prefill,
             dump,
         })
     }
@@ -223,27 +232,26 @@ impl Profiler {
             .map(|(w, _)| w)
     }
 
-    /// The open window ends before launch `idx` of request `req` (or belongs to another request).
-    pub fn wants_stop(&self, req: u64, idx: u64) -> bool {
+    /// The open window ends before launch `idx` (a prefill launch when `prefill`, else a decode
+    /// launch) of request `req`, or belongs to another request or to the other phase.
+    pub fn wants_stop(&self, req: u64, idx: u64, prefill: bool) -> bool {
         self.open_window()
-            .is_some_and(|w| w.request != req || idx > w.last)
+            .is_some_and(|w| w.request != req || w.prefill != prefill || idx > w.last)
     }
 
-    /// A window that has not run yet starts at launch `idx` of request `req`.
-    pub fn wants_start(&self, req: u64, idx: u64) -> bool {
-        self.windows
-            .iter()
-            .any(|(w, st)| *st == State::Idle && w.request == req && w.first == idx)
+    /// A window that has not run yet starts at launch `idx` of that phase of request `req`.
+    pub fn wants_start(&self, req: u64, idx: u64, prefill: bool) -> bool {
+        self.windows.iter().any(|(w, st)| {
+            *st == State::Idle && w.request == req && w.prefill == prefill && w.first == idx
+        })
     }
 
     /// Starts the trace of the window at launch `idx` of request `req`. The caller has drained
     /// the compute stream and closed any open window.
-    pub fn start(&mut self, req: u64, idx: u64) -> Result<(), SynapseError> {
-        let Some(i) = self
-            .windows
-            .iter()
-            .position(|(w, st)| *st == State::Idle && w.request == req && w.first == idx)
-        else {
+    pub fn start(&mut self, req: u64, idx: u64, prefill: bool) -> Result<(), SynapseError> {
+        let Some(i) = self.windows.iter().position(|(w, st)| {
+            *st == State::Idle && w.request == req && w.prefill == prefill && w.first == idx
+        }) else {
             return Ok(());
         };
         // SAFETY: device open, profiler template set before `synInitialize`.
@@ -621,6 +629,13 @@ mod tests {
         assert!(ProfileWindow::parse("5-2").is_err());
         assert!(ProfileWindow::parse("0-100").is_err());
         assert!(ProfileWindow::parse("abc").is_err());
+        // a leading p counts the prefill tile loop's launches
+        assert!(!ProfileWindow::parse("24-27").unwrap().prefill);
+        let w = ProfileWindow::parse("p66-129@1:ev.tsv").unwrap();
+        assert!(w.prefill);
+        assert_eq!((w.first, w.last, w.request, w.launches()), (66, 129, 1, 64));
+        assert!(ProfileWindow::parse("p").is_err());
+        assert!(ProfileWindow::parse("q1-2").is_err());
     }
 
     #[test]
