@@ -1,10 +1,10 @@
 # Gaudium Gaudi 2 TPC-C kernels & Synapse GC glue build.
 # Run on a host/container with the Intel Gaudi SDK (tpc-clang + /usr/include/habanalabs).
 #
-#   make -j16              Build all TPC-C kernels + libgaudium_tpc.so + libgaudium_ga.so + libgaudium_st.so
-#   make -j16 qwen3        Build the minimal Qwen3-8B kernel subset + libgaudium_tpc.so
-#   make glue              Build only the Synapse Graph Compiler glue plugins
-#   make clean             Remove built kernel artifacts in $(KDIR)
+#   make -j"$(nproc)"         Build all TPC-C kernels + libgaudium_tpc.so + libgaudium_ga.so + libgaudium_st.so
+#   make -j"$(nproc)" qwen3   Build the minimal Qwen3-8B kernel subset + libgaudium_tpc.so
+#   make glue                 Build only the Synapse Graph Compiler glue plugins
+#   make clean                Remove built kernel artifacts in $(KDIR)
 
 SHELL      := /bin/bash
 ROOT       := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
