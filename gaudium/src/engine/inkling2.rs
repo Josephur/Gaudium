@@ -35,7 +35,8 @@
 //!
 //! Speculative decoding verifies the last token and its drafts in one pass of several rows (a row
 //! of a wider pass has the logits of a one-row step, so the stream is the `K = 0` stream). The
-//! drafts come from the checkpoint's block drafter (`mtp.safetensors`, child module `mtp`: its
+//! drafts come from the checkpoint's block drafter (`mtp.safetensors`, or a GGUF model's drafter
+//! file beside it; child module `mtp`: its
 //! context is computed from taps of the prefill tiles and of every verify pass, a block costs one
 //! more launch) or from a known stream on the host (tests).
 
@@ -1300,12 +1301,14 @@ impl Inkling2Engine {
         // the checkpoint's own block drafter (`--spec mtp`, `--draft-model <id>=mtp`)
         let mtp_cfg = match spec_cfg.as_ref().map(|s| &s.method) {
             Some(SpecMethod::Mtp { tree: None, .. }) => {
-                if gguf.is_some() {
-                    return Err("Inkling 2: the drafter loads from the checkpoint directory's mtp.safetensors; a GGUF model file carries none".into());
+                // [drafter of a GGUF model] its own drafter file beside the model (`mtp::gguf`)
+                if let Some(g) = &gguf {
+                    Some(mtp::gguf::model_drafter(&cfg.model_dir, g)?)
+                } else {
+                    let txt = std::fs::read_to_string(cfg.model_dir.join("config.json"))
+                        .map_err(|e| format!("read config.json: {e}"))?;
+                    Some(mtp::MtpConfig::from_config_json(&txt)?)
                 }
-                let txt = std::fs::read_to_string(cfg.model_dir.join("config.json"))
-                    .map_err(|e| format!("read config.json: {e}"))?;
-                Some(mtp::MtpConfig::from_config_json(&txt)?)
             }
             _ => None,
         };

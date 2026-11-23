@@ -121,7 +121,8 @@ Serve options:
                         dflash (7 drafts per launch), a model's own drafter when it
                         ends in -assistant (4 drafts), otherwise DSpine. <id>=mtp
                         drafts with the model's own MTP head (no checkpoint; 4 drafts,
-                        3 in the routed mixture-of-experts form)
+                        3 in the routed mixture-of-experts form; an Inkling 2 model:
+                        its block drafter, 7 drafts, as --spec mtp finds it)
   --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster
                         decode, more device memory, its own token stream)
   --model-ctx <id=N>    Context size for model <id> instead of --max-ctx
@@ -369,7 +370,9 @@ Generate options:
                         block drafter (one --draft-k width, default 7).
                         An Inkling 2 model: mtp drafts with the checkpoint's block
                         drafter (mtp.safetensors beside the model; up to 7 drafts per
-                        block, pass --draft-k 7 for all of them).
+                        block, pass --draft-k 7 for all of them). A GGUF model reads
+                        it from a drafter GGUF beside the model file or in a dspark/
+                        directory there (BF16 before Q8_0 when several match).
                         Chain modes are token-identical to K=0 (sampled: same seed)
   --draft-model <dir>   Drafter checkpoint directory (with --spec dspine / dflash2;
                         assistant: default <model_dir>-assistant)
