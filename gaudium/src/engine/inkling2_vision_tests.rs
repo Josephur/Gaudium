@@ -336,6 +336,11 @@ fn plan_of_the_largest_image() {
     // the f32 scores of all heads dominate the activations
     assert_eq!(p.acts["vb_scores"], 4097 * 4097 * 16 * 4);
     assert!(p.act_bytes() < 5 << 30, "{} bytes", p.act_bytes());
+    eprintln!(
+        "tower plan at 4096 patches / 16384 tokens: weights {} bytes, activations {} bytes",
+        p.weights_bytes(),
+        p.act_bytes()
+    );
     assert!(IkvPlan::new(d, &text, 3, 16, 256).is_err());
 }
 
