@@ -1356,3 +1356,108 @@ def px_keepalive_wait_within_interval(s, l, q, e):
       px_le_refl(e)
     case False{} False{}:
       px_le_refl(e)
+
+# ============================================================================
+# 10. The Origin of a Redirect Chain
+# ============================================================================
+# Headers that may carry a credential go to the origin the page named and nowhere else. A
+# redirect chain carries one flag: the request is still with that origin. Each hop updates it
+# from whether the hop's target is of that origin (the comparison of the two origins is text
+# handling and stays in the shell).
+
+# was:   the flag before this hop (true for the request the page sent)
+# stays: the target of this hop is of the origin the page named
+def px_hop_same_origin(was: Bool, stays: Bool) -> Bool:
+  match was:
+    case False{}:
+      False{}
+    case True{}:
+      stays
+
+# LAW 10.1: Once a redirect left the origin the page named, the flag is never true again, on
+# this hop or any later one (each hop starts from the flag the hop before left).
+law px_hop_left_stays_left:
+  for s: Bool
+  {px_hop_same_origin(False{}, s) == False{} : Bool}
+
+def px_hop_left_stays_left(s):
+  {==}
+
+# LAW 10.2: A hop to another origin clears the flag.
+law px_hop_off_origin_clears:
+  for +w: Bool
+  {px_hop_same_origin(w, False{}) == False{} : Bool}
+
+def px_hop_off_origin_clears(w):
+  match w:
+    case True{}: {==}
+    case False{}: {==}
+
+# (That a hop which stays on the named origin keeps the flag is today's behaviour, pinned by a
+# Rust test and by no law: a later version may be stricter and drop credentials on every hop.)
+
+# LAW 10.3: After a redirect left the origin, a header that may carry a credential is never
+# forwarded again, whatever later hops do.
+law px_hop_left_keeps_bound_headers:
+  for +p: Bool
+  for s: Bool
+  {px_req_header_goes(p, PxRhBound{}, px_hop_same_origin(False{}, s)) == False{} : Bool}
+
+def px_hop_left_keeps_bound_headers(p, s):
+  match p:
+    case True{}: {==}
+    case False{}: {==}
+
+# ============================================================================
+# 11. Writes to the Page
+# ============================================================================
+# A page that stops reading must not hold an exchange (a handler thread and a connection to the
+# target) past its limits. Every write to the page is bounded by what is left of them: the idle
+# limit counted from the page's last progress, and the total limit of the exchange.
+
+# How long one write to the page may block.
+def px_write_wait(idle_left: Nat, total_left: Nat) -> Nat:
+  Nat.min(idle_left, total_left)
+
+# The page took nothing for the whole idle limit, or the exchange is out of time: the write is
+# not tried again and the exchange ends.
+def px_write_gives_up(+idle_left: Nat, +total_left: Nat) -> Bool:
+  Nat.is_eq(px_write_wait(idle_left, total_left), 0n)
+
+# LAW 11.1: A write never waits past what is left of the idle limit.
+law px_write_wait_within_idle:
+  for +i: Nat
+  for +t: Nat
+  {Nat.is_le(px_write_wait(i, t), i) == True{} : Bool}
+
+def px_write_wait_within_idle(i, t):
+  px_min_le_l(i, t)
+
+# LAW 11.2: A write never waits past what is left of the exchange.
+law px_write_wait_within_total:
+  for +i: Nat
+  for +t: Nat
+  {Nat.is_le(px_write_wait(i, t), t) == True{} : Bool}
+
+def px_write_wait_within_total(i, t):
+  px_min_le_r(i, t)
+
+# LAW 11.3: An exchange that is out of time writes nothing more.
+law px_write_spent_gives_up:
+  for +i: Nat
+  {px_write_gives_up(i, 0n) == True{} : Bool}
+
+def px_write_spent_gives_up(i):
+  match i:
+    case 0n: {==}
+    case 1n+p: {==}
+
+# LAW 11.4: A page that took nothing for the whole idle limit gets nothing more.
+law px_write_idle_gives_up:
+  for +t: Nat
+  {px_write_gives_up(0n, t) == True{} : Bool}
+
+def px_write_idle_gives_up(t):
+  match t:
+    case 0n: {==}
+    case 1n+p: {==}

@@ -177,9 +177,10 @@ Serve options:
                         also allows the target, so an MCP server on this machine
                         needs this option only
   --mcp-proxy-max-mb <N>  Largest response the proxy passes on, in MiB (default: 64)
-  --mcp-proxy-timeout <secs>  Longest silence of a target before the proxy gives up
-                        (default: 600). An idle event stream gets a comment line
-                        every 20 s so that a front end does not cut it
+  --mcp-proxy-timeout <secs>  Longest silence of a target, or wait on a page that
+                        stopped reading, before the proxy gives up (default: 600).
+                        An idle event stream gets a comment line every 20 s so
+                        that a front end does not cut it
   --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets
                         besides the system's (an MCP server with a private certificate)
   --verbose             Print server, HBM, and recipe diagnostics

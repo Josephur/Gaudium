@@ -385,22 +385,124 @@ fn target_urls_are_parsed_and_the_odd_ones_refused() {
 #[test]
 fn redirect_locations_resolve_against_the_target() {
     let base = parse_target("https://example.com:8443/a/b?x=1", Ok(())).unwrap();
+    for (loc, want) in [
+        ("http://other.example.com/x", "http://other.example.com/x"),
+        ("//other.example.com/x", "https://other.example.com/x"),
+        ("/root", "https://example.com:8443/root"),
+        ("sibling", "https://example.com:8443/a/sibling"),
+        // the query-only reference keeps the path, the fragment-only one path and query
+        ("?x=2", "https://example.com:8443/a/b?x=2"),
+        ("#frag", "https://example.com:8443/a/b?x=1#frag"),
+        ("", "https://example.com:8443/a/b?x=1"),
+        ("  /trimmed  ", "https://example.com:8443/trimmed"),
+        ("../up/./here", "https://example.com:8443/up/here"),
+        // a URL inside a query is not a scheme of the reference
+        (
+            "/go?to=http://other.example.com/",
+            "https://example.com:8443/go?to=http://other.example.com/",
+        ),
+    ] {
+        assert_eq!(resolve_location(&base, loc), want, "{loc:?}");
+    }
+    // the fragment never travels: the request goes to the base's path and query
+    let next = parse_target(&resolve_location(&base, "#frag"), Ok(())).unwrap();
+    assert_eq!(next.path, "/a/b?x=1");
+    let base6 = parse_target("http://[2001:db8::1]:8931/mcp", Ok(())).unwrap();
     assert_eq!(
-        resolve_location(&base, "http://other.example.com/x"),
-        "http://other.example.com/x"
+        resolve_location(&base6, "?s=1"),
+        "http://[2001:db8::1]:8931/mcp?s=1"
     );
-    assert_eq!(
-        resolve_location(&base, "//other.example.com/x"),
-        "https://other.example.com/x"
+
+    // the examples of RFC 3986, section 5.4 (normal and abnormal), base http://a/b/c/d;p?q
+    let base = parse_target("http://a/b/c/d;p?q", Ok(())).unwrap();
+    for (loc, want) in [
+        ("g:h", "g:h"),
+        ("g", "http://a/b/c/g"),
+        ("./g", "http://a/b/c/g"),
+        ("g/", "http://a/b/c/g/"),
+        ("/g", "http://a/g"),
+        ("//g", "http://g"),
+        ("?y", "http://a/b/c/d;p?y"),
+        ("g?y", "http://a/b/c/g?y"),
+        ("#s", "http://a/b/c/d;p?q#s"),
+        ("g#s", "http://a/b/c/g#s"),
+        ("g?y#s", "http://a/b/c/g?y#s"),
+        (";x", "http://a/b/c/;x"),
+        ("g;x", "http://a/b/c/g;x"),
+        ("g;x?y#s", "http://a/b/c/g;x?y#s"),
+        ("", "http://a/b/c/d;p?q"),
+        (".", "http://a/b/c/"),
+        ("./", "http://a/b/c/"),
+        ("..", "http://a/b/"),
+        ("../", "http://a/b/"),
+        ("../g", "http://a/b/g"),
+        ("../..", "http://a/"),
+        ("../../", "http://a/"),
+        ("../../g", "http://a/g"),
+        ("../../../g", "http://a/g"),
+        ("../../../../g", "http://a/g"),
+        ("/./g", "http://a/g"),
+        ("/../g", "http://a/g"),
+        ("g.", "http://a/b/c/g."),
+        (".g", "http://a/b/c/.g"),
+        ("g..", "http://a/b/c/g.."),
+        ("..g", "http://a/b/c/..g"),
+        ("./../g", "http://a/b/g"),
+        ("./g/.", "http://a/b/c/g/"),
+        ("g/./h", "http://a/b/c/g/h"),
+        ("g/../h", "http://a/b/c/h"),
+        ("g;x=1/./y", "http://a/b/c/g;x=1/y"),
+        ("g;x=1/../y", "http://a/b/c/y"),
+        ("g?y/./x", "http://a/b/c/g?y/./x"),
+        ("g?y/../x", "http://a/b/c/g?y/../x"),
+        ("g#s/./x", "http://a/b/c/g#s/./x"),
+        ("g#s/../x", "http://a/b/c/g#s/../x"),
+        ("http:g", "http:g"),
+    ] {
+        assert_eq!(resolve_location(&base, loc), want, "{loc:?}");
+    }
+    // a reference with a scheme but no `//` is no target (the strict reading of section 5.2.2)
+    assert!(parse_target(&resolve_location(&base, "http:g"), Ok(())).is_err());
+}
+
+#[test]
+fn shown_urls_hold_no_user_part_query_or_fragment() {
+    for (url, want) in [
+        ("http://example.com/mcp?token=t#f", "http://example.com/mcp"),
+        ("https://user:pw@example.com/x", "https://example.com/x"),
+        (
+            "https://user:pw@example.com:8443",
+            "https://example.com:8443",
+        ),
+        ("http://a@b:pw@example.com/", "http://example.com/"),
+        ("http://user@example.com", "http://example.com"),
+        // malformed: no scheme, one slash, backslashes, an open bracket, no slashes
+        ("user:pw@example.com/x", "example.com/x"),
+        ("http:/user:pw@example.com/x", "http:/example.com/x"),
+        ("http:\\\\user:pw@example.com\\x", "http:\\\\example.com\\x"),
+        ("http://user:pw@[::1", "http://[::1"),
+        ("http:user:pw@example.com", "example.com"),
+        ("//user:pw@example.com/", "//example.com/"),
+        // an `@` in the path is no user part
+        (
+            "http://example.com/users/@me",
+            "http://example.com/users/@me",
+        ),
+        ("http://user:pw@example.com/@me", "http://example.com/@me"),
+        ("http://example.com?x=@user:pw", "http://example.com"),
+    ] {
+        assert_eq!(shown_url(url), want, "{url:?}");
+    }
+    // the scheme of a refused URL is shown only when it is a scheme
+    let e = parse_target("user:secret-pw@example.com://x", Ok(()))
+        .err()
+        .unwrap();
+    assert!(
+        e.contains("not a scheme") && !e.contains("secret-pw"),
+        "{e}"
     );
-    assert_eq!(
-        resolve_location(&base, "/root"),
-        "https://example.com:8443/root"
-    );
-    assert_eq!(
-        resolve_location(&base, "sibling"),
-        "https://example.com:8443/a/sibling"
-    );
+    let e = parse_target("gopher://example.com/", Ok(())).err().unwrap();
+    assert!(e.contains("(scheme: gopher)"), "{e}");
 }
 
 #[test]
@@ -1058,6 +1160,19 @@ fn redirects_are_followed_by_the_proxy_through_the_same_checks() {
         )
     });
     let last_port = last.port;
+    // another origin that sends the request back to the first one
+    let first_port = Arc::new(AtomicU64::new(0));
+    let back = {
+        let first_port = Arc::clone(&first_port);
+        target(None, move |_, s| {
+            let _ = write!(
+                s,
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/landed\r\nContent-Length: 0\r\n\r\n",
+                first_port.load(Ordering::Relaxed)
+            );
+        })
+    };
+    let back_port = back.port;
     let first = target(None, move |req, s| {
         let to = |status: u16, location: String| {
             format!(
@@ -1076,6 +1191,12 @@ fn redirects_are_followed_by_the_proxy_through_the_same_checks() {
                     ),
                 )
             }
+            "/q/b?x=1" => to(302, "?x=2".into()),
+            "/d/e/f" => to(302, "../g/./h?k=1".into()),
+            "/q/b?x=2" | "/d/g/h?k=1" => {
+                return ok_json(s, "", &format!("{{\"path\":\"{}\"}}", req.path))
+            }
+            "/away" => to(302, format!("http://127.0.0.1:{back_port}/")),
             "/moved" => to(302, format!("http://127.0.0.1:{last_port}/a")),
             "/kept" => to(307, format!("http://127.0.0.1:{last_port}/a")),
             "/see" => to(303, format!("http://127.0.0.1:{last_port}/a")),
@@ -1096,9 +1217,11 @@ fn redirects_are_followed_by_the_proxy_through_the_same_checks() {
         &[
             &format!("127.0.0.1:{}", first.port),
             &format!("127.0.0.1:{last_port}"),
+            &format!("127.0.0.1:{back_port}"),
         ],
     );
     p.resolver = Box::new(|host, _| panic!("{host} was looked up"));
+    first_port.store(u64::from(first.port), Ordering::Relaxed);
     let p = Arc::new(p);
     let auth = [
         "x-gaudium-proxy-header-authorization: Bearer mcp-token",
@@ -1111,6 +1234,21 @@ fn redirects_are_followed_by_the_proxy_through_the_same_checks() {
         (r.status, r.text().as_str()),
         (200, "{\"auth\":\"Bearer mcp-token\"}")
     );
+
+    // relative references resolve against the whole URL: the query-only one keeps the path,
+    // dot segments go
+    for (path, landed) in [("/q/b?x=1", "/q/b?x=2"), ("/d/e/f", "/d/g/h?k=1")] {
+        let r = get(&p, &first.url(path));
+        assert_eq!(
+            (r.status, r.text()),
+            (200, format!("{{\"path\":\"{landed}\"}}")),
+            "{path}"
+        );
+    }
+
+    // once a redirect left the origin, coming back to it does not bring the headers back
+    let r = send(&p, "GET", &first.url("/away"), &auth, "");
+    assert_eq!((r.status, r.text().as_str()), (200, "{\"auth\":\"-\"}"));
 
     // to another origin: a POST becomes a GET without its body on 302 and 303, stays a POST on
     // 307; headers that may carry a credential stay behind, content negotiation goes along
@@ -1468,6 +1606,98 @@ fn a_target_that_stalls_or_is_down_ends_the_request() {
     );
 }
 
+/// A page that sends its request and then never reads its answer. The target sends without
+/// end; the exchange must still end within the proxy's limits, let go of the handler and close
+/// the connection to the target.
+fn a_page_that_stops_reading(tls: Option<(TlsServer, crate::tls::TlsClient)>) {
+    let (closed_tx, closed_rx) = mpsc::channel::<()>();
+    let t = target(None, move |_, s| {
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n");
+        let block = vec![b'x'; 64 * 1024];
+        // until the proxy lets go of the connection (at most 256 MiB)
+        for _ in 0..4096 {
+            if s.write_all(&block).is_err() {
+                break;
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+    let mut p = proxy(&[], &["127.0.0.1"]);
+    p.limits.idle_ms = 300;
+    p.limits.max_response = 1 << 30;
+    let p = Arc::new(p);
+
+    let (server, client) = match tls {
+        Some((s, c)) => (Some(s), Some(c)),
+        None => (None, None),
+    };
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let handler = Arc::clone(&p);
+    thread::spawn(move || {
+        let (tcp, _) = l.accept().unwrap();
+        let mut conn = Conn::open(tcp, server.as_ref()).expect("a connection");
+        let req = super::super::read_http_request(&mut conn)
+            .unwrap()
+            .expect("a request");
+        handler.handle(&req, true, &mut conn);
+        drop(conn);
+        let _ = done_tx.send(());
+    });
+    let raw = format!(
+        "GET /cors-proxy?url={} HTTP/1.1\r\nHost: localhost:8090\r\n\r\n",
+        query(&t.url("/endless"))
+    );
+    let tcp = TcpStream::connect(addr).unwrap();
+    // the page's end stays open until the checks below are done, and is never read
+    let _page: Box<dyn Duplex> = match client {
+        None => {
+            let mut c = tcp;
+            c.write_all(raw.as_bytes()).unwrap();
+            Box::new(c)
+        }
+        Some(client) => {
+            let mut c = client.connect(tcp, "localhost").unwrap();
+            c.write_all(raw.as_bytes()).unwrap();
+            Box::new(c)
+        }
+    };
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the handler let go of the exchange");
+    closed_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the connection to the target was closed");
+    let v = crate::json::parse_json(&p.status_json()).unwrap();
+    let n = |k: &str| {
+        v.get("counts")
+            .and_then(|c| c.get(k))
+            .and_then(|x| x.as_f64())
+    };
+    assert_eq!((n("proxied"), n("stalled")), (Some(1.0), Some(1.0)));
+    let text = p.status_json();
+    assert!(
+        text.contains("\"result\":\"stalled\"") && text.contains("the page took nothing for"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_page_that_stops_reading_ends_the_exchange() {
+    a_page_that_stops_reading(None);
+}
+
+#[test]
+fn a_page_that_stops_reading_over_https_ends_the_exchange() {
+    let Some(tc) = test_cert(&["DNS:localhost"]) else {
+        return;
+    };
+    let server = TlsServer::new(&tc.cert, &tc.key).unwrap();
+    let client = crate::tls::TlsClient::new(Some(&tc.cert)).unwrap();
+    a_page_that_stops_reading(Some((server, client)));
+}
+
 // ------------------------------------------------------------------------------------------------
 // HTTPS targets
 // ------------------------------------------------------------------------------------------------
@@ -1608,4 +1838,41 @@ fn decisions_are_counted_and_listed_without_the_query_of_a_url() {
         "{text}"
     );
     assert!(!text.contains("secret-in-query"), "{text}");
+
+    // a user part is refused, and neither the log nor the answer nor the decisions hold it,
+    // however the URL is written
+    for url in [
+        "http://user:secret-pw@example.com:8931/mcp",
+        "https://user:secret-pw@example.com/",
+        "user:secret-pw@example.com/x",
+        "http:\\\\user:secret-pw@example.com/",
+        "http://user:secret-pw@[::1",
+        "user:secret-pw@example.com://x",
+    ] {
+        let r = get(&p, url);
+        assert_eq!(r.status, 400, "{url}");
+        assert!(!r.text().contains("secret-pw"), "{url}: {}", r.text());
+    }
+    let r = send(
+        &p,
+        "GET",
+        &t.url("/"),
+        &[
+            "Sec-Fetch-Site: cross-site",
+            "Origin: https://user:secret-pw@evil.example",
+        ],
+        "",
+    );
+    assert_eq!(r.status, 403);
+    assert!(
+        r.error().contains("(https://evil.example)"),
+        "{}",
+        r.error()
+    );
+    let text = p.status_json();
+    assert!(!text.contains("secret-pw"), "{text}");
+    assert!(
+        text.contains("\"url\":\"http://example.com:8931/mcp\""),
+        "{text}"
+    );
 }

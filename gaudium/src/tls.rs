@@ -535,6 +535,13 @@ impl TlsStream {
     pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
         self.tcp.set_write_timeout(t)
     }
+
+    /// Ends the connection at once: the socket is shut down and no TLS goodbye is sent when the
+    /// stream is dropped (a peer that stopped reading could hold that write).
+    pub fn abandon(&mut self) {
+        self.broken = true;
+        let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl Read for TlsStream {

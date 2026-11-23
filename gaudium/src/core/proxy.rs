@@ -8,12 +8,12 @@ use std::net::IpAddr;
 
 use crate::verified::{
     px_addr_check, px_addr_join, px_addr_passes, px_body_fits, px_cap_bytes, px_cap_ok, px_expired,
-    px_gate, px_keepalive_due, px_keepalive_wait, px_match_resolves, px_net_bits_at,
-    px_net_bits_ok, px_net_byte_match, px_port_ok, px_read_wait, px_redirect_follows,
-    px_redirect_keeps_body, px_redirect_kind, px_redirect_left, px_redirect_may,
-    px_redirect_method, px_req_header_goes, px_resp_cut, px_resp_header_passes, px_resp_take,
-    px_site_ok, px_start, px_start_refuses, px_start_serves, px_time_left, px_url_check, px_url_ok,
-    px_v4_class, px_v6_class,
+    px_gate, px_hop_same_origin, px_keepalive_due, px_keepalive_wait, px_match_resolves,
+    px_net_bits_at, px_net_bits_ok, px_net_byte_match, px_port_ok, px_read_wait,
+    px_redirect_follows, px_redirect_keeps_body, px_redirect_kind, px_redirect_left,
+    px_redirect_may, px_redirect_method, px_req_header_goes, px_resp_cut, px_resp_header_passes,
+    px_resp_take, px_site_ok, px_start, px_start_refuses, px_start_serves, px_time_left,
+    px_url_check, px_url_ok, px_v4_class, px_v6_class, px_write_gives_up, px_write_wait,
 };
 pub use crate::verified::{
     PxAddr as AddrVerdict, PxAddrClass as AddrClass, PxGate as Gate, PxMatch as ListMatch,
@@ -151,6 +151,12 @@ pub fn req_header_goes(prefixed: bool, kind: ReqHeader, same_origin: bool) -> bo
     px_req_header_goes(prefixed, kind, same_origin)
 }
 
+/// After a hop of a redirect chain: the request is still with the origin the page named. `was`:
+/// it was before this hop; `stays`: the hop's target is of that origin.
+pub fn hop_same_origin(was: bool, stays: bool) -> bool {
+    px_hop_same_origin(was, stays)
+}
+
 /// A response header of the target reaches the page.
 pub fn resp_header_passes(kind: RespHeader) -> bool {
     px_resp_header_passes(kind)
@@ -191,6 +197,17 @@ pub fn expired(elapsed: u64, limit: u64) -> bool {
 /// How long one read from the target may block.
 pub fn read_wait(idle_left: u64, total_left: u64, tick: u64) -> u64 {
     px_read_wait(idle_left, total_left, tick)
+}
+
+/// How long one write to the page may block.
+pub fn write_wait(idle_left: u64, total_left: u64) -> u64 {
+    px_write_wait(idle_left, total_left)
+}
+
+/// The page took nothing for the whole idle limit, or the exchange is out of time: the write is
+/// not tried again and the exchange ends.
+pub fn write_gives_up(idle_left: u64, total_left: u64) -> bool {
+    px_write_gives_up(idle_left, total_left)
 }
 
 /// A keep-alive comment line is due on an event stream.
@@ -386,6 +403,10 @@ mod tests {
         assert_eq!(keepalive_wait(true, true, 25, 20), 0);
         assert_eq!(keepalive_wait(true, false, 25, 20), 20);
         assert_eq!(keepalive_wait(false, true, 5, 20), 20);
+        assert_eq!(write_wait(500, 900), 500);
+        assert_eq!(write_wait(500, 90), 90);
+        assert!(write_gives_up(0, 900) && write_gives_up(500, 0));
+        assert!(!write_gives_up(1, 1));
     }
 
     #[test]
@@ -446,6 +467,12 @@ mod tests {
         assert!(!req_header_goes(true, PxRhBound, false));
         assert!(!req_header_goes(true, PxRhFraming, true));
         assert!(!req_header_goes(false, PxRhNeutral, true));
+        // a redirect chain: once off the named origin, never back on it
+        let mut same = true;
+        for (stays, want) in [(true, true), (false, false), (true, false), (true, false)] {
+            same = hop_same_origin(same, stays);
+            assert_eq!(same, want);
+        }
         assert!(resp_header_passes(RespHeader::PxRpPlain));
         for k in [
             RespHeader::PxRpFraming,
