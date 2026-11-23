@@ -107,7 +107,7 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
   - **Who reviews.** A second agent, never the session that wrote the laws, running on the most capable model available to it at high reasoning effort or above. It works from the `.bend` sources and the Rust call sites, not from the author's summary.
   - **What it checks, law by law.** The law states a bound or a safety property as section 3a requires, and fixes no default, tuning constant, threshold or exact formula. It is not vacuous: it constrains the function it names, and that function is the one the Rust shell calls (no Rust condition restates it). Its proof is checked by `BEND_VERDICT=require cargo check`. The reviewer names the legitimate future change the law would forbid, or says that there is none.
   - **What happens next.** The reviewer writes its verdict for each law in the pull request. Laws that pass are sealed on that pull request's branch with `RUSTY_BENDS_UPDATE_LAWS=1`, and the lock's diff must only add lines. A law the reviewer doubts is corrected and reviewed again, or left out of the lock with the reason stated; it is never sealed to get the change merged.
-  - The user is still asked before any law that is already locked is touched (the rule above), and still approves the merge (section 12).
+  - The user is still asked before any law that is already locked is touched (the rule above), and still approves the merge (section 11).
 - **Incremental vertical slices:** Keep `cargo check` and `cargo test` green after every slice.
 
 ---
@@ -170,13 +170,7 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 
 ---
 
-## 10. Temporary Testing Defaults (revert before a release)
-
-- **A2UI is on by default in the Web UI while it is being tested.** `DEFAULTS.a2ui` in `ui/js/lib/settings.js` is `true` so that "Interactive interfaces (A2UI)" is ticked without visiting the settings (it still only takes effect on a server started with `--a2ui`, and a browser that has saved the setting keeps its own value). The intended shipping default is `false`: A2UI adds about 2,100 tokens of instructions to every request's system turn. Set it back to `false` when testing ends, and remove this entry.
-
----
-
-## 11. Leave the Card Serving When Testing Is Done
+## 10. Leave the Card Serving When Testing Is Done
 
 When card testing is complete, leave the server running for the user with this configuration (site-specific service names, model paths and run helpers are in `AGENTS.local.md`):
 
@@ -191,7 +185,7 @@ Before ending the session, confirm that the server is up and answers a request f
 
 ---
 
-## 12. Every Change Lands Through a Pull Request
+## 11. Every Change Lands Through a Pull Request
 
 `main` moves only by merging pull requests. This holds for every change by every author, including one-line fixes and documentation.
 
