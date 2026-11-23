@@ -62,6 +62,9 @@ use crate::verified::{
 #[path = "inkling2_packer.rs"]
 pub mod packer;
 
+#[path = "inkling2_gguf.rs"]
+pub mod gguf_source;
+
 /// Rows of one chunk of a global layer's K / V cache (the softmax kernel stages one chunk).
 pub const IK_CHUNK: u64 = 4096;
 /// Largest prefill tile planned into the activation scratch.
@@ -1212,10 +1215,22 @@ impl Inkling2Engine {
         live.set_model(&model_name);
         live.set_phase("loading", "opening device and compiling recipes");
 
-        let spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
-            .map_err(|e| format!("load config.json: {e}"))?;
+        // A GGUF file (or a directory of its shards) carries the geometry in its metadata.
+        let gguf = if crate::gguf::looks_like_gguf(&cfg.model_dir) {
+            Some(Arc::new(
+                crate::gguf::Gguf::open(&cfg.model_dir).map_err(|e| format!("open GGUF: {e}"))?,
+            ))
+        } else {
+            None
+        };
+        let spec = match &gguf {
+            Some(g) => ModelSpec::from_config_json(&gguf_source::config_json(g)?)
+                .map_err(|e| format!("GGUF metadata: {e}"))?,
+            None => ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
+                .map_err(|e| format!("load config.json: {e}"))?,
+        };
         if spec.family != ModelFamily::Inkling2 {
-            return Err("Inkling2Engine: config.json is not an Inkling 2 model".into());
+            return Err("Inkling2Engine: the model is not an Inkling 2 model".into());
         }
         spec.validate()
             .map_err(|e| format!("verified ModelSpec validation failed: {e}"))?;
@@ -1229,7 +1244,15 @@ impl Inkling2Engine {
             return Err("Inkling 2: speculative decoding is not wired up for this family yet".into());
         }
 
-        let (max_pos, gen_eos) = read_model_limits(cfg);
+        let (max_pos, gen_eos) = match &gguf {
+            Some(g) => (
+                g.arch_kv("context_length").and_then(|v| v.as_u64()).unwrap_or(0),
+                g.get_u64("tokenizer.ggml.eos_token_id")
+                    .map(|e| vec![e as i32])
+                    .unwrap_or_default(),
+            ),
+            None => read_model_limits(cfg),
+        };
         let max_ctx = align_up(cfg.max_ctx.max(IK_CHUNK), IK_CHUNK);
         if max_pos > 0 && max_ctx > max_pos {
             return Err(format!(
@@ -1481,11 +1504,23 @@ impl Inkling2Engine {
 
         // ---- Upload weights and tables from the mmap'd checkpoint ----
         let t_up = Instant::now();
-        let store = crate::safetensors::SafetensorsStore::open(&cfg.model_dir)
-            .map_err(|e| format!("open safetensors: {e}"))?;
-        let source = packer::StSource::new(&store)
-            .with_amax_bf16(std::env::var("GAUDIUM_IK_AMAX_BF16").is_ok_and(|v| v == "1"));
-        let packer = packer::IkPacker::new(&source, &dims, max_ctx);
+        let store;
+        let st_source;
+        let gg_source;
+        let source: &dyn packer::IkSource = match &gguf {
+            Some(g) => {
+                gg_source = gguf_source::GgufSource::new(Arc::clone(g))?;
+                &gg_source
+            }
+            None => {
+                store = crate::safetensors::SafetensorsStore::open(&cfg.model_dir)
+                    .map_err(|e| format!("open safetensors: {e}"))?;
+                st_source = packer::StSource::new(&store)
+                    .with_amax_bf16(std::env::var("GAUDIUM_IK_AMAX_BF16").is_ok_and(|v| v == "1"));
+                &st_source
+            }
+        };
+        let packer = packer::IkPacker::new(source, &dims, max_ctx);
         let mut stage_upload = dev
             .alloc_pinned(STAGE_BUF_BYTES)
             .map_err(|e| format!("alloc pinned upload stage: {e}"))?;
@@ -1503,7 +1538,6 @@ impl Inkling2Engine {
                 .map_err(|e| format!("upload weight '{name}': {e}"))?;
             uploaded_bytes += expected;
         }
-        drop(store);
         if cfg.verbose {
             let dt = t_up.elapsed().as_secs_f64();
             eprintln!(

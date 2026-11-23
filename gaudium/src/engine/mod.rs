@@ -225,6 +225,18 @@ impl GenEngine for inkling2::Inkling2Engine {
 
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
 pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
+    if crate::gguf::looks_like_gguf(&cfg.model_dir) {
+        // a GGUF file names its family in its metadata
+        let g = crate::gguf::Gguf::open(&cfg.model_dir).map_err(|e| format!("open GGUF: {e}"))?;
+        if inkling2::gguf_source::is_family(&g) {
+            drop(g);
+            return Ok(Box::new(inkling2::Inkling2Engine::load(cfg)?));
+        }
+        return Err(format!(
+            "no live Gaudi 2 engine loads a GGUF file of architecture '{}' yet",
+            g.arch()
+        ));
+    }
     let spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
         .map_err(|e| format!("load config.json: {e}"))?;
     match spec.family {

@@ -23,9 +23,11 @@ use crate::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use crate::safetensors::{SafetensorsStore, TensorMeta};
 use crate::verified::{ik_bias_src, ik_nib_row_bytes, ik_nib_row_scales};
 
-/// Values of the sixteen 4-bit codes (sign, two exponent bits, one mantissa bit).
+/// Values of the sixteen 4-bit codes (sign, two exponent bits, one mantissa bit). Code 8 is a
+/// negative zero in the format; it is stored as the same weight, a positive zero, so that every
+/// source of one model gives one byte image.
 const E2M1: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 /// Value of an 8-bit float with 4 exponent and 3 mantissa bits (bias 7, no infinities).

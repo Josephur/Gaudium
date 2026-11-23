@@ -489,6 +489,7 @@ or reads it to rewrite a file.
 | `GAUDIUM_IMAGE_PIPELINE_REF_DIR` | `vision::media::tests::reference_pipeline_records_match_bit_for_bit` (`--ignored`) | A directory written by `gaudium/tests/data/vision/make_pipeline_refs.py`: image files with the patch rows of the checkpoint's own image processor, which must match bit for bit. |
 | `GAUDIUM_VISION_REF_DIR` | `vision::tests::reference_prompt_records_match_bit_for_bit` (`--ignored`) | A directory of reference prompt records (token ids, image grids, positions, patch rows) that the prompt layout and the image preprocessing must reproduce. |
 | `GAUDIUM_GGUF_REF_DIR` | `gguf::tests::reference_gguf_files_open_and_decode` (`--ignored`) | A directory of published GGUF files (and its `dspark/` subdirectory): every file must open, the Inkling 2 Mini model must have its 744 tensors with architecture `inkling2_loop` and NVFP4 weights, every NVFP4 tensor its per-expert `.scale`, and one row of every type must decode to finite numbers. |
+| `GAUDIUM_INKLING2_GGUF` | `engine::inkling2::gguf_source::tests::gguf_and_checkpoint_pack_the_same_device_tensors` (`--ignored`, with `GAUDIUM_INKLING2_DIR`) | A GGUF file of the same Inkling 2 model as the checkpoint directory `GAUDIUM_INKLING2_DIR`: both must pack byte-identical device tensors. |
 | `GAUDIUM_UPDATE_REFERENCE` | `tests/reference_docs.rs` | `1` = rewrite the copy of the help text on this page from the binary instead of failing when it differs. |
 
 <!-- test-variables:end -->
