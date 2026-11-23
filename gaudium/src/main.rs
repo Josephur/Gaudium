@@ -51,10 +51,11 @@ fn print_usage() {
          \x20 gaudium --fp8-pack --model <dir> --fp8-cache <dir>\n\
          \x20                                           Quantise a Gemma 4 BF16 checkpoint's matrices into an\n\
          \x20                                           FP8 cache directory (host only, no card)\n\
+         \x20 gaudium --help | -h                       Print this text\n\
          \n\
          Serve options:\n\
-         \x20 --host <addr>         Bind address (default: 0.0.0.0)\n\
-         \x20 --port <N>            Bind port (default: 8090)\n\
+         \x20 --host <addr>         Bind address (or GAUDIUM_SERVE_HOST; default: 0.0.0.0)\n\
+         \x20 --port <N>            Bind port (or GAUDIUM_SERVE_PORT; default: 8090)\n\
          \x20 --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap)\n\
          \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
          \x20 --ui-dir <dir>        Gaudium Web UI bundle directory (or GAUDIUM_UI_DIR)\n\
@@ -106,7 +107,7 @@ fn print_usage() {
          \x20                       above: its largest image in patches, or off for text only\n\
          \x20 --fp8-act <id=file>   FP8 activation-scale table for FP8 model <id> (repeatable)\n\
          \x20 --fp8-cache <id=dir>  Cache directory for model <id>'s quantised FP8 matrices\n\
-         \x20 --api-key <key>       Optional Bearer / X-Api-Key auth token\n\
+         \x20 --api-key <key>       Optional Bearer / X-Api-Key auth token (or GAUDIUM_API_KEY)\n\
          \x20 --a2ui                Offer A2UI 1.0 interfaces (or GAUDIUM_A2UI=1): a chat request that\n\
          \x20                       declares its renderer in the field gaudium_a2ui (true, or an\n\
          \x20                       object with supportedCatalogIds) gets the instructions that teach\n\
@@ -124,13 +125,41 @@ fn print_usage() {
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \n\
          Live status environment variables:\n\
-         \x20 GAUDI_LIVE_DIR        Directory for live dashboard JSON records (GAUDI_LIVE=0 disables)\n\
+         \x20 GAUDI_LIVE_DIR        Directory for live dashboard JSON records (GAUDI_LIVE=0 disables).\n\
+         \x20                       A directory that does not exist turns the records off\n\
+         \x20 GAUDIUM_LIVE_ROOT     Used when GAUDI_LIVE_DIR is unset: the records go to\n\
+         \x20                       <root>/.cardlock/live\n\
+         \x20 GAUDI_LIVE_TAG        First part of the record's file name, <tag>.<pid>.json (default:\n\
+         \x20                       the host name)\n\
+         \x20 GAUDI_CARD_OWNER      Owner name written in the record and in the card lock's holder\n\
+         \x20                       file (default: server/<engine>)\n\
+         \x20 GAUDI_CARDLOCK_DIR    Card-lock directory that gets the holder file and the lock log\n\
+         \x20                       (default: the parent of a records directory named `live`)\n\
+         \x20 GAUDI_CARD_NO_HBM_REPORT  1 = do not publish the device memory in use to\n\
+         \x20                       /dev/shm/mem_usage_accel<N>\n\
+         \x20 GAUDI_CARD_ACCEL_INDEX  The <N> of that file (default: 0)\n\
          \n\
          Engine environment variables:\n\
          \x20 GAUDIUM_REQUEST_RESET Device state zeroed before each request: auto (default), dirty\n\
          \x20                       or full (see --request-reset under Generate options)\n\
          \x20 GAUDIUM_UPLOAD_DIRECT 0 = never read weight files with direct I/O at load (default:\n\
          \x20                       weight bytes that are not in the page cache are read directly)\n\
+         \x20 GAUDIUM_ACQUIRE_RETRIES  Attempts to acquire the card at start, 2 s apart (default: 10)\n\
+         \x20 GAUDIUM_SYNAPSE_LIB   The SynapseAI library to load, tried before\n\
+         \x20                       /usr/lib/habanalabs/libSynapse.so and the loader's search path\n\
+         \x20 GAUDIUM_<KERNEL>_ELF  One TPC kernel's ELF file, read by the graph-compiler glue. When\n\
+         \x20                       unset, the engine sets it to that kernel's file in the kernels\n\
+         \x20                       directory\n\
+         \x20 GAUDIUM_W4_GLUE_DEBUG Set (any value) = the graph-compiler glue of the MoE W4 kernels\n\
+         \x20                       prints the tensor shapes of a node it refuses\n\
+         SDK environment variables the engine reads and completes:\n\
+         \x20 GC_KERNEL_PATH        The engine puts its glue libraries first, keeps the entries\n\
+         \x20                       already there and adds the SDK's TPC kernel library\n\
+         \x20 HABANA_SCAL_BIN_PATH / HABANA_PLUGINS_LIB_PATH\n\
+         \x20                       Left as set; when unset, set to the SDK's usual directories if\n\
+         \x20                       those exist\n\
+         \x20 HABANA_PROFILE        The SDK profiler's settings. --profile-steps sets its own when\n\
+         \x20                       this is unset\n\
          Measurement switches of the graph compiler (not for serving; each is part of the recipe\n\
          fingerprints it touches):\n\
          \x20 GAUDIUM_GC_SET        `NAME=value[,NAME=value..]`: graph-compiler settings applied to\n\

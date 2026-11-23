@@ -160,7 +160,8 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 - **Zero secrets, anywhere:** No API keys, bearer tokens, private keys, passwords, or local MCP/agent configs (`.agents/`, `.env*`, `config.env`) in any tracked file or test log.
 - **Zero build outputs or large binaries:** Never commit `target/`, `build/`, `*.o`, `*.so`, `*.elf`, `*.recipe`, model weights (`*.safetensors`, `*.gguf`, `*.bin`, `*.pt`), pixel dumps, or runtime logs/locks. Keep every tracked file small and auditable.
 - **Third-party code & licenses:** Any vendored third-party dependency goes under `third_party/` with its license file and an entry in `THIRD_PARTY_NOTICES.md`.
-- **Keep docs in sync with code:** Whenever adding, renaming, or removing CLI flags or `GAUDIUM_*` environment variables, update the reference documentation and help text in the same commit.
+- **Every flag and environment variable is documented, in the same change:** A command-line flag the binary accepts has its line in `gaudium --help` (`print_usage` in `gaudium/src/main.rs`). An environment variable the engine reads (Rust or kernel glue) is named in `--help` too, and one that only tests read is listed in `docs/reference.md`. `docs/reference.md` holds a copy of the help text: refresh it with `GAUDIUM_UPDATE_REFERENCE=1 cargo test --test reference_docs` and commit it. Renaming or removing a flag or variable updates the same places. The test `gaudium/tests/reference_docs.rs` reads the sources and fails `cargo test` on a flag or variable that is missing, stale, or not in the copy; never get past it by building a name at run time, by moving a read into test code, or by adding to the test's exception lists (those are for other programs' flags and for the general process environment such as `HOME`).
+- **Keep the other docs in sync with code:** a change that alters what a document describes updates that document in the same commit.
 
 ---
 
