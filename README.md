@@ -54,14 +54,16 @@ You need:
   `tpc-clang`, headers under `/usr/include/habanalabs`) to build the kernels and run on the card.
 - Rust (stable) and [Bend 2](https://github.com/bendlang/bend) at the version in
   `gaudium/bend.pin` (looked up at `~/.bend/bin/bend`, or set `BEND_BIN`).
-- Optionally Lean (via `~/.elan/bin`) so the build also checks every proof
-  (`BEND_VERDICT=require`).
+- Lean (via `~/.elan/bin` or `PATH`), so the build also kernel-checks every proof. The
+  commands below use `BEND_VERDICT=require`, which fails without Lean; on a host without
+  it, leave `BEND_VERDICT` unset (proofs are then only type-checked, with a warning) or set
+  it to `off`.
 
 ```bash
 # Kernels and glue plugins (on the Gaudi host, needs the Intel Gaudi SDK)
 make -C kernels -j16
 
-# Engine: checks every Bend law, then builds the Rust binary
+# Engine: checks every Bend law (needs Lean with BEND_VERDICT=require), then builds
 cd gaudium
 BEND_VERDICT=require cargo build --release
 cargo test
