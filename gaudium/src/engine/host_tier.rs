@@ -41,9 +41,10 @@ use super::*;
 use crate::cache_ram::{digest128, EngineId, HostCache, SharedCache};
 use crate::synapse::xfer::{Piece, XferRing, XferStats};
 use crate::verified::{
-    hc_clean_hi, hc_clean_join_hi, hc_clean_join_lo, hc_clean_lo, hc_copy_wins, hc_loses_unsaved,
-    hc_must_flush, hc_ring_stale, hc_rows_saveable, hc_tile_clean, hc_written_hi, hc_written_lo,
-    pc_boundary,
+    hc_clean_hi, hc_clean_join_hi, hc_clean_join_lo, hc_clean_lo, hc_copy_wins, hc_layout,
+    hc_loses_unsaved, hc_must_flush, hc_ring_floor, hc_ring_restore, hc_ring_save, hc_rows_added,
+    hc_rows_complete, hc_save_ok, hc_state_wanted, hc_tile_clean, hc_tile_copied, hc_written_hi,
+    hc_written_lo, pc_boundary, pc_request_may_reuse, HcLayout,
 };
 
 /// Tiles whose rows one copy call takes (a waiting request is noticed between ring buffers
@@ -53,6 +54,9 @@ const ROUND_TILES: u64 = 64;
 const RATE_MIN_BYTES: u64 = 32 * 1024 * 1024;
 /// Bytes the rates are first measured with, when the engine is loaded.
 const CALIBRATE_BYTES: u64 = 128 * 1024 * 1024;
+/// Rows of a K/V block: the engine writes cache rows in blocks of this many, so a tile whose
+/// rows are to be one range per head is a whole number of them.
+const KV_BLOCK_ROWS: u64 = 128;
 
 /// How long the card is left idle after a response before the save starts: a request that
 /// arrives inside it (a client that answers a tool call at once) never waits for a copy.
@@ -205,31 +209,33 @@ impl RowLayout {
         row_bytes: u64,
         tile: u64,
     ) -> Result<Self, String> {
-        if caches.is_empty() || tile == 0 || chunks == 0 || heads == 0 || row_bytes == 0 {
-            return Err("no K/V caches to copy".into());
-        }
-        if !chunk_rows.is_multiple_of(tile) || !tile.is_multiple_of(128) {
-            return Err(format!(
-                "a prefill tile of {tile} rows does not divide a K/V chunk of {chunk_rows} rows into whole 128-row blocks"
-            ));
-        }
-        let expect = chunks
-            .saturating_mul(heads)
-            .saturating_mul(chunk_rows)
-            .saturating_mul(row_bytes);
-        if cache_bytes != expect {
-            return Err(format!(
-                "a K/V cache of {cache_bytes} bytes is not {chunks} chunks x {heads} heads x {chunk_rows} rows x {row_bytes} bytes"
-            ));
-        }
-        Ok(Self {
-            caches,
+        // whether these caches can be copied tile by tile is the verified `hc_layout`'s decision
+        match hc_layout(
+            caches.len() as u64,
             chunks,
             chunk_rows,
             heads,
             row_bytes,
             tile,
-        })
+            KV_BLOCK_ROWS,
+            cache_bytes,
+        ) {
+            HcLayout::HcLayoutOk => Ok(Self {
+                caches,
+                chunks,
+                chunk_rows,
+                heads,
+                row_bytes,
+                tile,
+            }),
+            HcLayout::HcLayoutEmpty => Err("no K/V caches to copy".into()),
+            HcLayout::HcLayoutTile => Err(format!(
+                "a prefill tile of {tile} rows does not divide a K/V chunk of {chunk_rows} rows into whole {KV_BLOCK_ROWS}-row blocks"
+            )),
+            HcLayout::HcLayoutSize => Err(format!(
+                "a K/V cache of {cache_bytes} bytes is not {chunks} chunks x {heads} heads x {chunk_rows} rows x {row_bytes} bytes"
+            )),
+        }
     }
 
     /// Host bytes of one tile's rows.
@@ -249,7 +255,7 @@ impl RowLayout {
 
     /// Appends the pieces of tile `t`, whose rows live at `host`: per cache, per head, the
     /// tile's rows of that head. The host bytes follow each other in that order.
-    pub fn tile_pieces(&self, t: u64, host: *mut u8, out: &mut Vec<Piece>) {
+    pub(crate) fn tile_pieces(&self, t: u64, host: *mut u8, out: &mut Vec<Piece>) {
         let row = t * self.tile;
         let (chunk, in_chunk) = (row / self.chunk_rows, row % self.chunk_rows);
         let len = (self.tile * self.row_bytes) as usize;
@@ -453,6 +459,11 @@ impl HostTier {
             self.unsaved = false;
         }
 
+        // a request that may take nothing over from the device (a cold one, or one after the
+        // K/V rows were zeroed: its plan forgets the table) gets nothing copied back for it
+        if !pc_request_may_reuse(wanted, rows_zeroed, table.enabled()) {
+            return Ok(None);
+        }
         let tile = self.rows.tile;
         let cache = Arc::clone(&self.cache);
         let mut store = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -467,9 +478,11 @@ impl HostTier {
         let copy_tiles: Vec<u64> = (0..found.tiles)
             .filter(|&t| !hc_tile_clean(linked, t, lo, hi))
             .collect();
-        let ring_copy = self.ring_bytes > 0
-            && store.ring_serves(found.entry, found.tiles)
-            && self.ring_owner != Some(found.entry);
+        let ring_copy = hc_ring_restore(
+            self.ring_bytes,
+            store.ring_serves(found.entry, found.tiles),
+            self.ring_owner == Some(found.entry),
+        );
         let bytes = copy_tiles.len() as u64 * self.rows.tile_bytes()
             + self.state_bytes
             + if ring_copy { self.ring_bytes } else { 0 };
@@ -483,10 +496,12 @@ impl HostTier {
         let t0 = Instant::now();
         // the table describes the restored rows from here on; the state's slot is in the
         // middle of a write until the copy has ended
-        let ring_from = match view.ring {
-            Some((_, from)) if self.ring_bytes > 0 => from,
-            _ => found.pos,
-        };
+        let ring_from = hc_ring_floor(
+            self.ring_bytes,
+            view.ring.is_some(),
+            view.ring.map_or(0, |(_, from)| from),
+            found.pos,
+        );
         let slot = table.adopt_restored(&view.tokens, &view.images, found.tiles, ring_from);
         let mut pieces: Vec<Piece> = Vec::new();
         for &t in &copy_tiles {
@@ -629,7 +644,7 @@ impl HostTier {
             rep.complete = true;
             return Ok(rep);
         };
-        if !hc_rows_saveable(upto, tile, held.len() as u64) || upto > self.rows.tiles() {
+        if !hc_save_ok(upto, tile, held.len() as u64, self.rows.tiles()) {
             self.unsaved = false;
             return Ok(rep);
         }
@@ -639,14 +654,20 @@ impl HostTier {
         let cache = Arc::clone(&self.cache);
         let mut store = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.clean.retain(|id, _| store.contains(*id));
-        let extra = kept.len() as u64 * HostCache::charge_of(self.state_bytes)
-            + if self.ring_bytes > 0 {
-                HostCache::charge_of(self.ring_bytes)
-            } else {
-                0
-            };
-        let Some(target) = store.open_save(self.id, tile, tile_bytes, held, images, upto, extra)
-        else {
+        // the store charges the save for what it adds to the entry it continues, and for
+        // nothing that entry keeps
+        let kept_tiles: Vec<u64> = kept.iter().map(|&(k, _)| k).collect();
+        let Some(target) = store.open_save(
+            self.id,
+            tile,
+            tile_bytes,
+            held,
+            images,
+            upto,
+            &kept_tiles,
+            self.state_bytes,
+            self.ring_bytes,
+        ) else {
             // no room for this prefix at all: not asked again until the device holds another
             self.unsaved = false;
             store.settle();
@@ -691,10 +712,14 @@ impl HostTier {
                 Ok(x) => x,
                 Err(e) => return Err(fail(&mut store, self, e)),
             };
-            let now = store.end_rows(entry, have + (done / per_tile) as u64);
+            // the tiles of the batch whose pieces all arrived (`hc_tile_copied`), in order
+            let done_tiles = (0..n)
+                .take_while(|&i| hc_tile_copied(i, per_tile as u64, done as u64))
+                .count() as u64;
+            let now = store.end_rows(entry, have + done_tiles);
             rep.bytes += st.bytes;
             Self::note_rate(&mut self.rates.to_host, &st);
-            if now > have {
+            if hc_rows_added(have, now) {
                 grew = true;
                 let (lo, hi) = self.clean.get(&entry).copied().unwrap_or((have, have));
                 self.clean.insert(
@@ -705,7 +730,7 @@ impl HostTier {
                     ),
                 );
             }
-            if now < have + n {
+            if !hc_rows_complete(now, have + n) {
                 complete = false;
                 rep.yielded = true;
             }
@@ -716,7 +741,7 @@ impl HostTier {
         if complete && store.contains(entry) {
             let have_states = store.states_of(entry);
             for &(k, slot) in &kept {
-                if have_states.contains(&k) || k > store.tiles_of(entry) {
+                if !hc_state_wanted(have_states.contains(&k), k, store.tiles_of(entry)) {
                     continue;
                 }
                 if stop() {
@@ -733,8 +758,7 @@ impl HostTier {
                     Ok(x) => x,
                     Err(e) => return Err(fail(&mut store, self, e)),
                 };
-                let whole = done == pieces.len();
-                store.end_state(entry, k, whole);
+                let whole = store.end_state(entry, k, done as u64, pieces.len() as u64);
                 rep.bytes += st.bytes;
                 grew |= whole;
                 if !whole {
@@ -747,10 +771,8 @@ impl HostTier {
         }
 
         // the drafter rings, whole, when the entry has no image or outgrew the one it has
-        if complete
-            && self.ring_bytes > 0
-            && store.contains(entry)
-            && hc_ring_stale(store.has_ring(entry), grew)
+        if store.contains(entry)
+            && hc_ring_save(self.ring_bytes, complete, store.has_ring(entry), grew)
         {
             if stop() {
                 complete = false;
@@ -761,8 +783,8 @@ impl HostTier {
                     Ok(x) => x,
                     Err(e) => return Err(fail(&mut store, self, e)),
                 };
-                let whole = done == pieces.len();
-                store.end_ring(entry, table.ring_from(), whole);
+                let whole =
+                    store.end_ring(entry, table.ring_from(), done as u64, pieces.len() as u64);
                 rep.bytes += st.bytes;
                 if whole {
                     self.ring_owner = Some(entry);
@@ -817,10 +839,50 @@ impl HostTier {
     }
 }
 
-/// Identity of a loaded engine for the store: a digest of everything that decides the bytes of
-/// a row or of a state (the model's files, the precisions, the context and the tile, the
-/// kernels, the drafter, the vision tower), and of the layout the copies use.
-pub(super) fn engine_identity(cfg: &Qwen3Config, eng: &Qwen3Engine, layout: &str) -> EngineId {
+/// What must be the same on two engines for the bytes of a saved entry to mean the same on
+/// both: the K/V caches (how many, their names in the order their rows are laid out in a
+/// segment, their chunks, heads, rows and row bytes), the prefill tile, and the sizes of the
+/// ranges of a kept position's state and of the drafter's rings, each in copy order. Never a
+/// device address: an engine that is loaded again (after the release of the card, after
+/// another model) may get its buffers elsewhere, and what it saved before is still its own.
+pub fn layout_fingerprint(
+    cache_names: &[String],
+    rows: &RowLayout,
+    state: &[(u64, u64)],
+    ring: &[(u64, u64)],
+) -> String {
+    let sizes = |ranges: &[(u64, u64)]| {
+        ranges
+            .iter()
+            .map(|&(_, bytes)| bytes.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "caches={}[{}]|chunks={}|chunk_rows={}|heads={}|row_bytes={}|tile={}|state=[{}]|ring=[{}]",
+        rows.caches.len(),
+        cache_names.join(","),
+        rows.chunks,
+        rows.chunk_rows,
+        rows.heads,
+        rows.row_bytes,
+        rows.tile,
+        sizes(state),
+        sizes(ring),
+    )
+}
+
+/// The identity the store stamps entries with: a digest of what decides the bytes of a row or
+/// of a state on this engine (`engine`, [`engine_text`]) and of the layout the copies use
+/// (`layout`, [`layout_fingerprint`]).
+pub fn identity_of(engine: &str, layout: &str) -> EngineId {
+    digest128(format!("{engine}|layout={layout}").as_bytes())
+}
+
+/// Everything that decides the bytes of a row or of a state on a loaded engine, as text: the
+/// model's files, the precisions, the context and the tile, the kernels, the drafter, the
+/// vision tower.
+pub(super) fn engine_text(cfg: &Qwen3Config, eng: &Qwen3Engine) -> String {
     /// Names, sizes and modification times of the files of `dir` (`all`), or of its weight and
     /// configuration files only.
     fn files_of(dir: &std::path::Path, all: bool) -> String {
@@ -871,8 +933,8 @@ pub(super) fn engine_identity(cfg: &Qwen3Config, eng: &Qwen3Engine, layout: &str
         };
         format!("{sc:?}|{dir}")
     });
-    let text = format!(
-        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8_act={}|fp8_cache={:?}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}|layout={layout}",
+    format!(
+        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8_act={}|fp8_cache={:?}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
         cfg.model_dir.display(),
         files_of(&cfg.model_dir, false),
         eng.spec,
@@ -895,8 +957,7 @@ pub(super) fn engine_identity(cfg: &Qwen3Config, eng: &Qwen3Engine, layout: &str
         cfg.vision_max_patches,
         cfg.vision_max_tokens,
         cfg.vision_gelu_bf16,
-    );
-    digest128(text.as_bytes())
+    )
 }
 
 /// Builds the tier of a loaded engine and its transfer ring, when the configuration has a
@@ -913,6 +974,7 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         return Ok(());
     }
     // the trunk K/V caches: one size, chunk-major, `n_kv_heads` heads of BF16 rows
+    let cache_names: Vec<String> = eng.kv_addr.keys().cloned().collect();
     let caches: Vec<u64> = eng.kv_addr.values().map(|&(a, _)| a).collect();
     let cache_bytes = eng.kv_addr.values().next().map_or(0, |&(_, b)| b);
     if eng.kv_addr.values().any(|&(_, b)| b != cache_bytes) {
@@ -950,15 +1012,14 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         Some(sd) if sd.context_rows() > 0 => sd.cache_regions(),
         _ => Vec::new(),
     };
-    let layout = format!(
-        "{rows:?}|slots={}|state={:?}|ring={:?}",
-        slots.len(),
-        slots
-            .first()
-            .map(|s| s.iter().map(|&(_, b)| b).collect::<Vec<_>>()),
-        ring.iter().map(|&(_, b)| b).collect::<Vec<_>>()
+    // the identity never holds a device address (`layout_fingerprint`)
+    let layout = layout_fingerprint(
+        &cache_names,
+        &rows,
+        slots.first().map_or(&[][..], |s| s.as_slice()),
+        &ring,
     );
-    let id = engine_identity(cfg, eng, &layout);
+    let id = identity_of(&engine_text(cfg, eng), &layout);
     // The ring: a few buffers of untouched memory, each mapped for the device on its own (the
     // one pinned host memory of the tier, planned when the server started). An engine that
     // cannot get it serves without the tier: no model fails to load for lack of a cache.
@@ -1631,6 +1692,172 @@ mod tests {
     }
 
     #[test]
+    fn a_next_turn_fits_a_nearly_full_cache_when_only_its_new_part_does() {
+        let tile_bytes = FakeDev::new(1, false).layout.tile_bytes();
+        let seg = HostCache::charge_of(tile_bytes);
+        let state = HostCache::charge_of(4608);
+        // the first turn leaves four tiles and three kept positions; the budget has room for
+        // exactly what the next turn adds (two tiles, two positions) and not a byte more
+        let cache = Arc::new(SharedCache::new(
+            4 * seg + 3 * state + 2 * seg + 2 * state,
+            0,
+            false,
+            false,
+        ));
+        let mut r = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        let a1 = prompt(4 * 512 + 100, 1);
+        r.request(&a1, true);
+        assert!(r.idle().complete);
+        assert_eq!(cache.stats().held_bytes, 4 * seg + 3 * state);
+        let mut a2 = a1.clone();
+        a2.extend(prompt(1100, 5));
+        assert_eq!(r.request(&a2, true).0, 4 * 512);
+        // The save is charged for the two tiles and the two positions it adds. The positions
+        // the entry keeps are in the ledger already: charged again, the save would not fit, the
+        // entry would stay at the first turn and the conversation would prefill on its return.
+        let rep = r.idle();
+        assert!(rep.complete);
+        assert_eq!(rep.bytes, 2 * tile_bytes + 2 * 4608);
+        let st = cache.stats();
+        assert_eq!((st.entries, st.refused, st.evictions), (1, 0, 0));
+        assert_eq!(st.held_rows, 6 * 512);
+        assert!(st.held_bytes <= st.budget_bytes);
+        // it comes back from host memory at its last kept position after the card was released
+        let mut r2 = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        let mut a3 = a2.clone();
+        a3.extend(prompt(300, 6));
+        let (resume, rep) = r2.request(&a3, true);
+        assert_eq!((resume, rep.tier), (6 * 512, Tier::Host));
+    }
+
+    #[test]
+    fn a_request_after_the_rows_were_zeroed_gets_nothing_copied_back() {
+        let mut r = rig(64 << 20, 4);
+        let a1 = prompt(6 * 512 + 100, 1);
+        r.request(&a1, true);
+        assert!(r.idle().complete);
+        let b = prompt(3 * 512 + 50, 2);
+        r.request(&b, true);
+        r.idle();
+        // the reset zeroed the K/V rows before this request: its plan forgets the table and
+        // prefills everything, so nothing is copied for it
+        let mut a2 = a1.clone();
+        a2.extend(prompt(700, 5));
+        let restored = r
+            .tier
+            .begin_request(&mut r.table, &mut r.dev, &a2, &[], true, true)
+            .unwrap();
+        assert!(restored.is_none());
+        assert_eq!(r.dev.up, 0);
+        let plan = r.table.plan_from(&a2, &[], true, true, restored);
+        assert_eq!(plan.resume, 0);
+        // the entry is still there for the turn after it
+        assert_eq!(r.cache.stats().entries, 2);
+    }
+
+    #[test]
+    fn the_identity_ignores_device_addresses_and_follows_everything_that_must_match() {
+        /// One engine's layout: the K/V caches at `at`, with these dimensions; a kept
+        /// position's state ranges and the drafter rings as `(address, bytes)`.
+        #[derive(Clone)]
+        struct L {
+            names: Vec<&'static str>,
+            at: Vec<u64>,
+            dims: (u64, u64, u64, u64, u64),
+            state: Vec<(u64, u64)>,
+            ring: Vec<(u64, u64)>,
+        }
+        fn fingerprint(l: &L) -> String {
+            let (chunks, chunk_rows, heads, row_bytes, tile) = l.dims;
+            let rows = RowLayout::new(
+                l.at.clone(),
+                chunks * heads * chunk_rows * row_bytes,
+                chunks,
+                chunk_rows,
+                heads,
+                row_bytes,
+                tile,
+            )
+            .unwrap();
+            let names: Vec<String> = l.names.iter().map(|n| n.to_string()).collect();
+            layout_fingerprint(&names, &rows, &l.state, &l.ring)
+        }
+        let id = |l: &L| identity_of("the engine", &fingerprint(l));
+        let base = L {
+            names: vec!["L0_kcache", "L0_vcache"],
+            at: vec![0x1000_0000, 0x1400_0000],
+            dims: (2, 4096, 2, 16, 512),
+            state: vec![(0x2000_0000, 4096), (0x2000_1000, 512)],
+            ring: vec![(0x3000_0000, 8192)],
+        };
+        // the same engine loaded again with every buffer somewhere else: the same identity,
+        // so it finds the entries it saved before
+        let moved = L {
+            at: vec![0x7700_0000, 0x5500_0000],
+            state: vec![(0x9000_0000, 4096), (0x4000_0000, 512)],
+            ring: vec![(0x1234_5000, 8192)],
+            ..base.clone()
+        };
+        assert_eq!(fingerprint(&moved), fingerprint(&base));
+        assert_eq!(id(&moved), id(&base));
+        // no address is in what is hashed
+        let text = fingerprint(&base);
+        for addr in [
+            0x1000_0000u64,
+            0x1400_0000,
+            0x2000_0000,
+            0x2000_1000,
+            0x3000_0000,
+        ] {
+            assert!(
+                !text.contains(&addr.to_string()) && !text.contains(&format!("{addr:x}")),
+                "{text}"
+            );
+        }
+        // each thing that must match for the bytes to mean the same changes it
+        let with = |f: &dyn Fn(&mut L)| {
+            let mut l = base.clone();
+            f(&mut l);
+            id(&l)
+        };
+        let others = [
+            // the number of caches
+            with(&|l| {
+                l.names.push("L1_kcache");
+                l.at.push(0x1800_0000);
+            }),
+            // their order
+            with(&|l| l.names.swap(0, 1)),
+            // another cache in the same place
+            with(&|l| l.names[1] = "L1_kcache"),
+            // chunks, rows of a chunk, heads, row bytes, tile
+            with(&|l| l.dims.0 = 4),
+            with(&|l| l.dims.1 = 8192),
+            with(&|l| l.dims.2 = 4),
+            with(&|l| l.dims.3 = 32),
+            with(&|l| l.dims.4 = 256),
+            // the size of a state range, their order, their number
+            with(&|l| l.state[0].1 = 8192),
+            with(&|l| l.state.swap(0, 1)),
+            with(&|l| l.state.push((0x2000_2000, 512))),
+            // the rings: their size, and whether there are any
+            with(&|l| l.ring[0].1 = 16384),
+            with(&|l| l.ring.clear()),
+        ];
+        for (i, other) in others.iter().enumerate() {
+            assert_ne!(*other, id(&base), "change {i} left the identity as it was");
+            for (j, third) in others.iter().enumerate().skip(i + 1) {
+                assert_ne!(other, third, "changes {i} and {j} give one identity");
+            }
+        }
+        // and so does anything else that decides the bytes (the engine's own text)
+        assert_ne!(
+            identity_of("another engine", &fingerprint(&base)),
+            id(&base)
+        );
+    }
+
+    #[test]
     fn today_s_tuning_values() {
         // pinned here, not in a law: each may change with measurements
         use crate::synapse::xfer::{COPY_THREADS, RING_BUFS, RING_BUF_BYTES};
@@ -1650,6 +1877,19 @@ mod tests {
         // the rings are copied again when the entry has no image or grew
         use crate::verified::hc_ring_stale;
         assert!(hc_ring_stale(false, false) && hc_ring_stale(true, true));
+        // ... and copied back unless the device's rings are that image already
+        assert!(hc_ring_restore(8192, true, false) && !hc_ring_restore(8192, true, true));
+        // a restore with an image takes the image's first valid position, one without takes
+        // the resume point
+        assert_eq!(hc_ring_floor(8192, true, 700, 2048), 700);
+        assert_eq!(hc_ring_floor(8192, false, 700, 2048), 2048);
+        assert_eq!(hc_ring_floor(0, true, 700, 2048), 2048);
+        // tiles of a batch count as copied one whole tile at a time (4 pieces to a tile)
+        let copied = |done| (0..3).take_while(|&i| hc_tile_copied(i, 4, done)).count();
+        assert_eq!(
+            (copied(0), copied(3), copied(4), copied(11), copied(12)),
+            (0, 0, 1, 2, 3)
+        );
         // a copy wins when it takes less time than the prefill it replaces: 2 GiB at
         // 14 GiB/s against 32,256 rows at 6,500 rows per second
         assert!(hc_copy_wins(2 << 30, 14 << 30, 32_256, 6_500));

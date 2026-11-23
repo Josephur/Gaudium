@@ -36,8 +36,9 @@ use crate::core::kv_pool::{is_prefix_reuse_valid, PrefixReuseQuery};
 use crate::verified::{
     pc_abort, pc_anchor_tiles, pc_begin_write, pc_boundary, pc_cap, pc_capture_ok, pc_class_usable,
     pc_commit_done, pc_cost, pc_image_limit, pc_image_same, pc_is_free, pc_ladder_tiles,
-    pc_may_take, pc_prefill_rows, pc_readable, pc_request_may_reuse, pc_retain, pc_reused_rows,
-    pc_ring_flo, pc_ring_from, pc_slot_tiles, pc_victim_better, pc_victim_class, PcSlot,
+    pc_may_take, pc_prefill_rows, pc_readable, pc_reads_resume_slot, pc_request_may_reuse,
+    pc_resume_pick, pc_retain, pc_reused_rows, pc_ring_after, pc_ring_flo, pc_slot_tiles,
+    pc_table_void, pc_victim_better, pc_victim_class, PcSlot,
 };
 
 /// Positions an engine keeps when the configuration names no count.
@@ -281,8 +282,9 @@ impl PrefixCache {
         self.cur_resume = 0;
     }
 
-    /// The kept position a request resumes from: the furthest one the verified rule allows
-    /// among `states` (the slots as the request's prompt leaves them), `(position, slot)`.
+    /// The kept position a request resumes from, `(position, slot)`: among `states` (the slots
+    /// as the request's prompt leaves them) the one the verified choice keeps
+    /// (`pc_resume_pick`: a readable slot at a position the reuse rule allows, the furthest).
     fn best_resume(
         &self,
         states: &[PcSlot],
@@ -295,11 +297,8 @@ impl PrefixCache {
         let mut resume_slot = None;
         if pc_request_may_reuse(wanted, rows_zeroed, self.supported) {
             for (i, &state) in states.iter().enumerate() {
-                if !pc_readable(state) {
-                    continue;
-                }
                 let pos = pc_boundary(pc_slot_tiles(state), self.tile);
-                let ok = is_prefix_reuse_valid(PrefixReuseQuery {
+                let valid = is_prefix_reuse_valid(PrefixReuseQuery {
                     snap_pos: pos,
                     lcp: cap,
                     prompt_len,
@@ -309,7 +308,7 @@ impl PrefixCache {
                     need_dflash: self.ctx_rows > 0,
                     dflash_upto: self.held.len() as u64,
                 });
-                if ok && pos > resume {
+                if pc_resume_pick(pc_readable(state), valid, pos, resume) {
                     resume = pos;
                     resume_slot = Some(i);
                 }
@@ -328,7 +327,7 @@ impl PrefixCache {
         wanted: bool,
         rows_zeroed: bool,
     ) -> Peek {
-        if rows_zeroed || !self.supported {
+        if pc_table_void(rows_zeroed, self.supported) {
             return Peek::default();
         }
         let (_, cap) = shared_rows(prompt, images, &self.held, &self.held_images);
@@ -359,6 +358,9 @@ impl PrefixCache {
     /// memory ([`Self::adopt_restored`]): `restored` = `(common token prefix, shared rows)` of
     /// the new prompt and that whole saved prompt. The table holds only the restored part of
     /// it, so the rows the two prompts share are taken from the comparison the restore made.
+    /// (Nothing is restored for a request whose table is forgotten here, `pc_table_void`: the
+    /// host tier asks `pc_request_may_reuse` first. Such a request resumes nowhere whatever
+    /// `restored` says.)
     pub fn plan_from(
         &mut self,
         prompt: &[i32],
@@ -371,7 +373,7 @@ impl PrefixCache {
         self.stats.requests += 1;
         let p = prompt.len() as u64;
         let tile = self.tile;
-        if rows_zeroed || !self.supported {
+        if pc_table_void(rows_zeroed, self.supported) {
             self.clear();
         }
         if !self.supported {
@@ -382,7 +384,7 @@ impl PrefixCache {
         }
         // how far the new prompt is the held one (a cold request still leaves those rows as
         // they are: it writes the same rows again)
-        let (lcp, cap) = match restored.filter(|_| !rows_zeroed) {
+        let (lcp, cap) = match restored {
             Some(shared) => shared,
             None => shared_rows(prompt, images, &self.held, &self.held_images),
         };
@@ -536,10 +538,9 @@ impl PrefixCache {
         for s in &mut self.slots {
             s.state = pc_abort(s.state);
         }
-        if self.ctx_rows > 0 {
-            self.ring_from =
-                pc_ring_from(self.ring_from, self.cur_resume, written_end, self.ctx_rows);
-        }
+        // (nothing is tracked on an engine without a ring: `pc_ring_after`)
+        self.ring_from =
+            pc_ring_after(self.ring_from, self.cur_resume, written_end, self.ctx_rows);
     }
 
     // ---- what the host-RAM tier reads and writes (`engine/host_tier.rs`) ----
@@ -693,7 +694,8 @@ pub(super) fn state_io(
             .ok_or_else(|| format!("prefix cache: slot {slot} has no state buffer for layer {l}"))
     };
     let resume_tiles = plan.resume / tile.max(1);
-    let src = if tile_idx == resume_tiles && plan.resume > 0 {
+    // which tile reads the resume slot is the verified function's decision
+    let src = if pc_reads_resume_slot(tile_idx, resume_tiles, plan.resume) {
         plan.resume_slot
     } else {
         plan.capture_at(tile_idx)
@@ -997,5 +999,19 @@ mod tests {
         let back: Vec<u64> = (0..5).map(crate::verified::pc_ladder_back).collect();
         assert_eq!(back, vec![0, 1, 3, 7, 15]);
         assert_eq!(DEFAULT_SLOTS, 8);
+        // which kept position: a readable slot at a position the rule allows, the furthest
+        assert!(pc_resume_pick(true, true, 1024, 512) && pc_resume_pick(true, true, 512, 0));
+        assert!(!pc_resume_pick(true, true, 512, 512) && !pc_resume_pick(true, true, 512, 1024));
+        assert!(!pc_resume_pick(false, true, 1024, 512) && !pc_resume_pick(true, false, 1024, 512));
+        // the table is forgotten after zeroed rows and on an engine that cannot resume
+        assert!(pc_table_void(true, true) && pc_table_void(false, false));
+        assert!(!pc_table_void(false, true));
+        // the tile at the resume point reads the resume slot, and no other
+        assert!(pc_reads_resume_slot(3, 3, 1536));
+        assert!(!pc_reads_resume_slot(4, 3, 1536) && !pc_reads_resume_slot(0, 0, 0));
+        // the ring's first valid position is tracked only on an engine that has a ring
+        assert_eq!(crate::verified::pc_ring_after(100, 512, 9000, 8960), 100);
+        assert_eq!(crate::verified::pc_ring_after(100, 512, 9500, 8960), 540);
+        assert_eq!(crate::verified::pc_ring_after(100, 512, 9500, 0), 100);
     }
 }

@@ -1269,3 +1269,939 @@ def hc_flush_only_for_a_loss_aux(a: Bool, b: Bool) -> {Bool.and(Bool.and(a, b), 
 
 def hc_flush_only_for_a_loss(u, r, c, k):
   hc_flush_only_for_a_loss_aux(hc_loses_unsaved(u, c, k), Nat.is_gt(r, 0n))
+
+# ============================================================================
+# 12. Choices among candidates, guards of the steps above, and what a save adds
+# ============================================================================
+#
+# The shell loops over entries, positions and segments; which one is taken, whether a step may
+# run and how many bytes it is charged is decided here.
+
+# ---- helper lemmas of this section (erased before Rust codegen) ----
+
+def hc_absurd(b: Bool, h: {False{} == True{} : Bool}) -> {b == True{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: h
+
+# c <= d  ->  c <= b + d
+def hc_le_add_l(+c: Nat, +d: Nat, +b: Nat, +h: {Nat.is_le(c, d) == True{} : Bool}) -> {Nat.is_le(c, Nat.add(b, d)) == True{} : Bool}:
+  match b:
+    case 0n:
+      h
+    case 1n+bp:
+      hc_le_step_r(c, Nat.add(bp, d), hc_le_add_l(c, d, bp, h))
+
+# a <= b and c <= d  ->  a + c <= b + d
+def hc_le_add_mono(+a: Nat, +b: Nat, +c: Nat, +d: Nat, +h1: {Nat.is_le(a, b) == True{} : Bool}, +h2: {Nat.is_le(c, d) == True{} : Bool}) -> {Nat.is_le(Nat.add(a, c), Nat.add(b, d)) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      h2
+    case 0n 1n+bp:
+      hc_le_add_l(c, d, 1n+bp, h2)
+    case 1n+ap 0n:
+      hc_absurd(Nat.is_le(Nat.add(1n+ap, c), Nat.add(0n, d)), h1)
+    case 1n+ap 1n+bp:
+      hc_le_add_mono(ap, bp, c, d, h1, h2)
+
+# a <= b  ->  a * c <= b * c
+def hc_le_mul_mono(+a: Nat, +b: Nat, +c: Nat, +h: {Nat.is_le(a, b) == True{} : Bool}) -> {Nat.is_le(Nat.mul(a, c), Nat.mul(b, c)) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      hc_zero_le(Nat.mul(1n+bp, c))
+    case 1n+ap 0n:
+      hc_absurd(Nat.is_le(Nat.mul(1n+ap, c), Nat.mul(0n, c)), h)
+    case 1n+ap 1n+bp:
+      hc_le_add_mono(c, c, Nat.mul(ap, c), Nat.mul(bp, c), hc_le_refl(c), hc_le_mul_mono(ap, bp, c, h))
+
+def hc_gt_refl(n: Nat) -> {Nat.is_gt(n, n) == False{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+p:
+      hc_gt_refl(p)
+
+def hc_eq_refl(n: Nat) -> {Nat.is_eq(n, n) == True{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+p:
+      hc_eq_refl(p)
+
+# a > b and b > a never hold together
+def hc_gt_gt_excl(+a: Nat, +b: Nat) -> {Bool.and(Nat.is_gt(a, b), Nat.is_gt(b, a)) == False{} : Bool}:
+  match a b:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+ap 1n+bp:
+      hc_gt_gt_excl(ap, bp)
+
+# a > b and a <= b never hold together
+def hc_gt_le_excl(+a: Nat, +b: Nat) -> {Bool.and(Nat.is_gt(a, b), Nat.is_le(a, b)) == False{} : Bool}:
+  match a b:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+ap 1n+bp:
+      hc_gt_le_excl(ap, bp)
+
+# n < n + (1 + x)
+def hc_lt_add_succ(n: Nat, x: Nat) -> {True{} == Nat.is_lt(n, Nat.add(n, 1n+x)) : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+p:
+      hc_lt_add_succ(p, x)
+
+# n - (n + x) == 0
+def hc_sub_add_zero(n: Nat, x: Nat) -> {Nat.sub(n, Nat.add(n, x)) == 0n : Nat}:
+  match n:
+    case 0n:
+      match x:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+p:
+      hc_sub_add_zero(p, x)
+
+# ---- 12.1 which place a request resumes from ----
+
+# Is candidate a (a resume point at row `a_pos`, in an entry last used at tick `a_used`) a
+# better place to resume from than candidate b? The further point, and among equal points the
+# entry used more recently.
+def hc_resume_better(+a_pos: Nat, a_used: Nat, +b_pos: Nat, b_used: Nat) -> Bool:
+  Bool.or(Nat.is_gt(a_pos, b_pos), Bool.and(Nat.is_eq(a_pos, b_pos), Nat.is_gt(a_used, b_used)))
+
+# ---- 12.2 which entry a save goes into ----
+
+# Does the save of the held prompt go into this entry instead of the best one found so far
+# (`best_common`: the tiles the prompt shares with that one, 0 while there is none)? Only an
+# entry of this engine that can be read, that the prompt continues (`hc_continues`), and that
+# shares more whole tiles with the prompt.
+def hc_continue_pick(same_engine: Bool, readable: Bool, +common: Nat, tiles: Nat, best_common: Nat) -> Bool:
+  Bool.and(Bool.and(same_engine, readable), Bool.and(hc_continues(common, tiles), Nat.is_gt(common, best_common)))
+
+# Does the kept position after `state_tiles` whole tiles stay when its entry is cut to `keep`?
+def hc_state_survives_cut(state_tiles: Nat, keep: Nat) -> Bool:
+  Nat.is_le(state_tiles, keep)
+
+# ---- 12.3 guards of a restore ----
+
+# May a restore read the entry up to the state after `tiles` whole tiles? Only an entry that
+# is readable, and only tiles it holds.
+def hc_may_read(+e: HcEntry, tiles: Nat) -> Bool:
+  Bool.and(hc_readable(e), Nat.is_le(tiles, hc_tiles(e)))
+
+# The restore ended. `ok`: every byte reached the device.
+def hc_read_done(e: HcEntry, ok: Bool) -> HcEntry:
+  match ok:
+    case True{}:
+      hc_end_read(e)
+    case False{}:
+      hc_abort(e)
+
+# Does a restore copy the entry's ring image to the device? Only on an engine that has rings
+# (`ring_bytes`), only an image that serves the resume point (`hc_ring_serves`), and not when
+# the device's rings are that image already.
+def hc_ring_restore(ring_bytes: Nat, serves: Bool, on_device: Bool) -> Bool:
+  Bool.and(Nat.is_gt(ring_bytes, 0n), Bool.and(serves, Bool.not(on_device)))
+
+# First position whose drafter row counts as valid after a restore that resumes at
+# `resume_pos`: the first one valid in the entry's image when the engine has rings and the
+# image serves the resume point, else the resume point itself (the rings then hold rows of
+# whatever ran before).
+def hc_ring_floor(ring_bytes: Nat, has_image: Bool, image_from: Nat, resume_pos: Nat) -> Nat:
+  match ring_bytes has_image:
+    case 0n True{}:
+      resume_pos
+    case 0n False{}:
+      resume_pos
+    case 1n+p True{}:
+      image_from
+    case 1n+p False{}:
+      resume_pos
+
+# ---- 12.4 guards of a save ----
+
+# May a save copy the rows of `upto` whole tiles? Only rows a prefill wrote
+# (`hc_rows_saveable`), and only tiles the K/V caches hold.
+def hc_save_ok(+upto: Nat, tile: Nat, held_rows: Nat, cache_tiles: Nat) -> Bool:
+  Bool.and(hc_rows_saveable(upto, tile, held_rows), Nat.is_le(upto, cache_tiles))
+
+# Are the rows of tile `index` of a batch (0: its first) complete in host memory, with `done`
+# of the batch's pieces copied and `per_tile` pieces to a tile? Only when every piece of that
+# tile and of the tiles before it is.
+def hc_tile_copied(index: Nat, per_tile: Nat, done: Nat) -> Bool:
+  Nat.is_le(Nat.mul(1n+index, per_tile), done)
+
+# Did a copy leave its entry more whole tiles than it had?
+def hc_rows_added(before: Nat, after: Nat) -> Bool:
+  Nat.is_lt(before, after)
+
+# Does the entry hold every tile a batch of rows set out to reach?
+def hc_rows_complete(tiles_now: Nat, target: Nat) -> Bool:
+  Nat.is_le(target, tiles_now)
+
+# Is a copy of `all` pieces whole, with `done` of them finished?
+def hc_copy_whole(done: Nat, all: Nat) -> Bool:
+  Nat.is_le(all, done)
+
+# Does a save copy the state at a kept position? Only one the entry lacks, at a position its
+# rows reach.
+def hc_state_wanted(already: Bool, state_tiles: Nat, entry_tiles: Nat) -> Bool:
+  Bool.and(Bool.not(already), Nat.is_le(state_tiles, entry_tiles))
+
+# Is the state a save just copied kept by its entry? Only a whole copy, at a position inside
+# the rows the entry holds.
+def hc_state_kept(done: Nat, all: Nat, state_tiles: Nat, entry_tiles: Nat) -> Bool:
+  Bool.and(hc_copy_whole(done, all), Nat.is_le(state_tiles, entry_tiles))
+
+# May the kept position after `state_tiles` tiles leave an entry that has one too many? Never
+# the one the save just reached (`last_tiles`): the next turn resumes there.
+def hc_state_may_leave(state_tiles: Nat, last_tiles: Nat) -> Bool:
+  Bool.not(Nat.is_eq(state_tiles, last_tiles))
+
+# Does a save copy the drafter's rings? Only on an engine that has rings, only when everything
+# before them was copied whole (a save that was cut short gives the card up at once), and only
+# when the entry's image is stale (`hc_ring_stale`).
+def hc_ring_save(ring_bytes: Nat, complete: Bool, has_image: Bool, grew: Bool) -> Bool:
+  Bool.and(Nat.is_gt(ring_bytes, 0n), Bool.and(complete, hc_ring_stale(has_image, grew)))
+
+# May the server's idle work take the engine? Only a ready engine that no request is using.
+def hc_idle_may_take(active: Nat, ready: Bool) -> Bool:
+  Bool.and(ready, Nat.is_eq(active, 0n))
+
+# May the K/V caches of an engine be copied tile by tile, and if not, why not?
+type HcLayout is Data:
+  HcLayoutOk{}
+  HcLayoutEmpty{}
+  HcLayoutTile{}
+  HcLayoutSize{}
+
+def hc_layout_pick(some: Bool, tiled: Bool, sized: Bool) -> HcLayout:
+  match some:
+    case False{}:
+      HcLayoutEmpty{}
+    case True{}:
+      match tiled:
+        case False{}:
+          HcLayoutTile{}
+        case True{}:
+          match sized:
+            case True{}:
+              HcLayoutOk{}
+            case False{}:
+              HcLayoutSize{}
+
+# `caches` caches of `cache_bytes` each, `chunks` chunks of `chunk_rows` rows, `heads` heads
+# of rows of `row_bytes`; rows are written in blocks of `block` rows. A tile's rows are one
+# device range per cache and head only when the tile divides a chunk and is whole blocks, and
+# the ranges are where the copies expect them only when a cache is exactly chunks x heads x
+# rows x row bytes.
+def hc_layout(caches: Nat, +chunks: Nat, +chunk_rows: Nat, +heads: Nat, +row_bytes: Nat, +tile: Nat, block: Nat, cache_bytes: Nat) -> HcLayout:
+  hc_layout_pick(
+    Bool.and(Nat.is_gt(caches, 0n), Bool.and(Nat.is_gt(tile, 0n), Bool.and(Nat.is_gt(chunks, 0n), Bool.and(Nat.is_gt(heads, 0n), Nat.is_gt(row_bytes, 0n))))),
+    Bool.and(Nat.is_eq(Nat.mod(chunk_rows, tile), 0n), Nat.is_eq(Nat.mod(tile, block), 0n)),
+    Nat.is_eq(cache_bytes, Nat.mul(Nat.mul(Nat.mul(chunks, heads), chunk_rows), row_bytes))
+  )
+
+def hc_layout_ok(l: HcLayout) -> Bool:
+  match l:
+    case HcLayoutOk{}:
+      True{}
+    case HcLayoutEmpty{}:
+      False{}
+    case HcLayoutTile{}:
+      False{}
+    case HcLayoutSize{}:
+      False{}
+
+# ---- 12.5 what a save adds to its entry ----
+
+# Tiles a save to `upto` whole tiles adds to an entry that holds `have` of them.
+def hc_new_tiles(upto: Nat, have: Nat) -> Nat:
+  Nat.sub(upto, have)
+
+# Does an entry gain rows or positions in a save that adds `new_tiles` tiles and the state at
+# all but `held_states` of the `kept` positions?
+def hc_save_grows(new_tiles: Nat, kept: Nat, held_states: Nat) -> Bool:
+  Bool.or(Nat.is_gt(new_tiles, 0n), Nat.is_gt(Nat.sub(kept, held_states), 0n))
+
+def hc_ring_part(ring_copy: Bool, ring_charge: Nat) -> Nat:
+  match ring_copy:
+    case True{}:
+      ring_charge
+    case False{}:
+      0n
+
+# Bytes a save adds to the entry it writes into: the rows of the tiles the entry lacks, the
+# state at the kept positions it lacks (`held_states` of the `kept` positions are in the entry
+# already, and in the ledger), and a ring image when one is copied.
+def hc_save_need(upto: Nat, have: Nat, tile_charge: Nat, kept: Nat, held_states: Nat, state_charge: Nat, ring_copy: Bool, ring_charge: Nat) -> Nat:
+  Nat.add(Nat.add(Nat.mul(hc_new_tiles(upto, have), tile_charge), Nat.mul(Nat.sub(kept, held_states), state_charge)), hc_ring_part(ring_copy, ring_charge))
+
+# ---- 12.6 spare segments and the host ----
+#
+# A segment an entry gave up during a save stays mapped until the save ends, for the save to
+# take again. It is taken again only by an allocation of exactly its size.
+
+# Bytes of the spare segments of one size that an allocation of `wanted_segments` of that
+# size takes again.
+def hc_spare_credit(+spare_segments: Nat, +wanted_segments: Nat, seg_charge: Nat) -> Nat:
+  Nat.mul(Nat.min(spare_segments, wanted_segments), seg_charge)
+
+# Bytes a save may take now without evicting: the budget's free bytes, and no more than the
+# host has available plus what the save gave back and takes again.
+def hc_take_now(+budget_free: Nat, +host_available: Nat, reusable: Nat) -> Nat:
+  hc_free_now(budget_free, Nat.add(host_available, reusable))
+
+# Do the spare segments an allocation cannot take again go back to the system first? When the
+# host cannot give what the allocation needs beyond what it takes again, and there are some.
+def hc_spares_return(need: Nat, host_available: Nat, reusable: Nat, unusable: Nat) -> Bool:
+  Bool.and(Nat.is_gt(unusable, 0n), Nat.is_lt(Nat.add(host_available, reusable), need))
+
+# ---- 12.7 laws ----
+
+def hc_resume_better_same(+p: Nat, au: Nat, bu: Nat) -> {hc_resume_better(p, au, p, bu) == Nat.is_gt(au, bu) : Bool}:
+  match p:
+    case 0n: {==}
+    case 1n+pp:
+      hc_resume_better_same(pp, au, bu)
+
+# LAW HC.58: no candidate is a better place to resume from than itself.
+law hc_resume_better_irreflexive:
+  for +p: Nat
+  for +u: Nat
+  {hc_resume_better(p, u, p, u) == False{} : Bool}
+
+def hc_resume_better_irreflexive(p, u):
+  %Equal.sym(Bool, hc_resume_better(p, u, p, u), Nat.is_gt(u, u), hc_resume_better_same(p, u, u)) : {_ == False{} : Bool}
+  hc_gt_refl(u)
+
+# LAW HC.59: a candidate with a nearer resume point is never preferred to one with a further
+# point.
+law hc_resume_nearer_never_better:
+  for +ap: Nat
+  for +au: Nat
+  for +bp: Nat
+  for +bu: Nat
+  {Bool.and(hc_resume_better(ap, au, bp, bu), Nat.is_lt(ap, bp)) == False{} : Bool}
+
+def hc_resume_nearer_never_better(ap, au, bp, bu):
+  match ap bp:
+    case 0n 0n:
+      hc_and_false_r(Nat.is_gt(au, bu))
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+app 1n+bpp:
+      hc_resume_nearer_never_better(app, au, bpp, bu)
+
+# LAW HC.60: among equal resume points the choice depends on the use order alone, never on
+# where the point lies.
+law hc_resume_tie_by_use_order_alone:
+  for +p: Nat
+  for +q: Nat
+  for +au: Nat
+  for +bu: Nat
+  {hc_resume_better(p, au, p, bu) == hc_resume_better(q, au, q, bu) : Bool}
+
+def hc_resume_tie_by_use_order_alone(p, q, au, bu):
+  %Equal.sym(Bool, hc_resume_better(q, au, q, bu), Nat.is_gt(au, bu), hc_resume_better_same(q, au, bu)) : {hc_resume_better(p, au, p, bu) == _ : Bool}
+  hc_resume_better_same(p, au, bu)
+
+# LAW HC.61: two candidates are never each preferred to the other.
+law hc_resume_better_asymmetric:
+  for +ap: Nat
+  for +au: Nat
+  for +bp: Nat
+  for +bu: Nat
+  {Bool.and(hc_resume_better(ap, au, bp, bu), hc_resume_better(bp, bu, ap, au)) == False{} : Bool}
+
+def hc_resume_better_asymmetric(ap, au, bp, bu):
+  match ap bp:
+    case 0n 0n:
+      hc_gt_gt_excl(au, bu)
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+app 1n+bpp:
+      hc_resume_better_asymmetric(app, au, bpp, bu)
+
+# LAW HC.62: a save never goes into an entry made by an engine of another identity.
+law hc_other_engine_never_continued:
+  for +r: Bool
+  for +c: Nat
+  for +t: Nat
+  for +b: Nat
+  {hc_continue_pick(False{}, r, c, t, b) == False{} : Bool}
+
+def hc_other_engine_never_continued(r, c, t, b):
+  {==}
+
+# LAW HC.63: nor into an entry that is being written or read.
+law hc_unreadable_never_continued:
+  for +s: Bool
+  for +c: Nat
+  for +t: Nat
+  for +b: Nat
+  {hc_continue_pick(s, False{}, c, t, b) == False{} : Bool}
+
+def hc_unreadable_never_continued(s, c, t, b):
+  match s:
+    case True{}: {==}
+    case False{}: {==}
+
+def hc_pick_needs_aux(g: Bool, x: Bool, y: Bool) -> {Bool.and(Bool.and(g, Bool.and(x, y)), Bool.not(x)) == False{} : Bool}:
+  match g:
+    case False{}:
+      {==}
+    case True{}:
+      match x:
+        case False{}:
+          {==}
+        case True{}:
+          hc_and_false_r(y)
+
+# LAW HC.64: nor into an entry the prompt does not continue.
+law hc_pick_only_what_continues:
+  for +s: Bool
+  for +r: Bool
+  for +c: Nat
+  for +t: Nat
+  for +b: Nat
+  {Bool.and(hc_continue_pick(s, r, c, t, b), Bool.not(hc_continues(c, t))) == False{} : Bool}
+
+def hc_pick_only_what_continues(s, r, c, t, b):
+  hc_pick_needs_aux(Bool.and(s, r), hc_continues(c, t), Nat.is_gt(c, b))
+
+def hc_pick_more_aux(g: Bool, x: Bool, y: Bool, z: Bool, h: {Bool.and(y, z) == False{} : Bool}) -> {Bool.and(Bool.and(g, Bool.and(x, y)), z) == False{} : Bool}:
+  match g:
+    case False{}:
+      {==}
+    case True{}:
+      match x:
+        case False{}:
+          {==}
+        case True{}:
+          h
+
+# LAW HC.65: an entry that shares no more whole tiles with the prompt than the best one found
+# so far never takes its place.
+law hc_pick_never_for_fewer_shared:
+  for +s: Bool
+  for +r: Bool
+  for +c: Nat
+  for +t: Nat
+  for +b: Nat
+  {Bool.and(hc_continue_pick(s, r, c, t, b), Nat.is_le(c, b)) == False{} : Bool}
+
+def hc_pick_never_for_fewer_shared(s, r, c, t, b):
+  hc_pick_more_aux(Bool.and(s, r), hc_continues(c, t), Nat.is_gt(c, b), Nat.is_le(c, b), hc_gt_le_excl(c, b))
+
+# LAW HC.66: a kept position past the tiles its entry is cut to never stays.
+law hc_state_past_cut_never_survives:
+  for +k: Nat
+  for +c: Nat
+  {Bool.and(hc_state_survives_cut(k, c), Nat.is_lt(c, k)) == False{} : Bool}
+
+def hc_state_past_cut_never_survives(k, c):
+  hc_le_lt_excl(k, c)
+
+# LAW HC.67: a vacant entry is never read.
+law hc_vacant_never_read:
+  for +t: Nat
+  {hc_may_read(HcVacant{}, t) == False{} : Bool}
+
+def hc_vacant_never_read(t):
+  {==}
+
+# LAW HC.68: an entry that is being written is never read, whatever it was before.
+law hc_written_entry_never_read:
+  for +e: HcEntry
+  for +u: Nat
+  for +t: Nat
+  {hc_may_read(hc_begin_write(e, u), t) == False{} : Bool}
+
+def hc_written_entry_never_read(e, u, t):
+  match e:
+    case HcVacant{}: {==}
+    case HcHeld{h}: {==}
+    case HcWriting{h, w}: {==}
+    case HcReading{h}: {==}
+
+# LAW HC.69: a restore never reads tiles past the ones its entry holds.
+law hc_read_within_held_tiles:
+  for +e: HcEntry
+  for +t: Nat
+  {Bool.and(hc_may_read(e, t), Nat.is_lt(hc_tiles(e), t)) == False{} : Bool}
+
+def hc_read_within_held_tiles(e, t):
+  hc_and3_excl(hc_readable(e), Nat.is_le(t, hc_tiles(e)), Nat.is_lt(hc_tiles(e), t), hc_le_lt_excl(t, hc_tiles(e)))
+
+# LAW HC.70: after a restore that failed, the entry is never readable.
+law hc_failed_restore_never_readable:
+  for +e: HcEntry
+  {hc_readable(hc_read_done(hc_begin_read(e), False{})) == False{} : Bool}
+
+def hc_failed_restore_never_readable(e):
+  match e:
+    case HcVacant{}: {==}
+    case HcHeld{h}: {==}
+    case HcWriting{h, w}: {==}
+    case HcReading{h}: {==}
+
+# LAW HC.71: the end of a restore never leaves an entry more rows than it had.
+law hc_read_done_never_adds_rows:
+  for +e: HcEntry
+  for +ok: Bool
+  {Nat.is_le(hc_tiles(hc_read_done(e, ok)), hc_tiles(e)) == True{} : Bool}
+
+def hc_read_done_never_adds_rows(e, ok):
+  match e:
+    case HcVacant{}:
+      match ok:
+        case True{}: {==}
+        case False{}: {==}
+    case HcHeld{h}:
+      match ok:
+        case True{}:
+          hc_le_refl(h)
+        case False{}:
+          hc_le_refl(h)
+    case HcWriting{h, w}:
+      match ok:
+        case True{}:
+          hc_le_refl(h)
+        case False{}:
+          hc_zero_le(h)
+    case HcReading{h}:
+      match ok:
+        case True{}:
+          hc_le_refl(h)
+        case False{}:
+          hc_zero_le(h)
+
+# LAW HC.72: an engine without rings never copies a ring image to the device.
+law hc_no_rings_nothing_restored:
+  for +s: Bool
+  for +o: Bool
+  {hc_ring_restore(0n, s, o) == False{} : Bool}
+
+def hc_no_rings_nothing_restored(s, o):
+  {==}
+
+# LAW HC.73: a ring image that does not serve the resume point is never copied to the device.
+law hc_unserving_ring_never_restored:
+  for +b: Nat
+  for +o: Bool
+  {hc_ring_restore(b, False{}, o) == False{} : Bool}
+
+def hc_unserving_ring_never_restored(b, o):
+  hc_and_false_r(Nat.is_gt(b, 0n))
+
+# LAW HC.74: without an image that serves the resume point, no drafter row before the resume
+# point ever counts as valid ...
+law hc_ring_floor_without_image:
+  for +b: Nat
+  for +f: Nat
+  for +r: Nat
+  {Nat.is_le(r, hc_ring_floor(b, False{}, f, r)) == True{} : Bool}
+
+def hc_ring_floor_without_image(b, f, r):
+  match b:
+    case 0n:
+      hc_le_refl(r)
+    case 1n+_:
+      hc_le_refl(r)
+
+# LAW HC.75: ... nor on an engine without rings.
+law hc_ring_floor_without_rings:
+  for +i: Bool
+  for +f: Nat
+  for +r: Nat
+  {Nat.is_le(r, hc_ring_floor(0n, i, f, r)) == True{} : Bool}
+
+def hc_ring_floor_without_rings(i, f, r):
+  match i:
+    case True{}:
+      hc_le_refl(r)
+    case False{}:
+      hc_le_refl(r)
+
+# LAW HC.76: with an image, no row before the first one valid in it ever counts as valid.
+law hc_ring_floor_within_image:
+  for +b: Nat
+  for +f: Nat
+  for +r: Nat
+  {Nat.is_le(f, hc_ring_floor(1n+b, True{}, f, r)) == True{} : Bool}
+
+def hc_ring_floor_within_image(b, f, r):
+  hc_le_refl(f)
+
+# LAW HC.77: a save never copies rows past the ones a prefill wrote ...
+law hc_save_only_prefilled_rows:
+  for +u: Nat
+  for +tile: Nat
+  for +h: Nat
+  for +c: Nat
+  {Bool.and(hc_save_ok(u, tile, h, c), Nat.is_lt(h, Nat.mul(u, tile))) == False{} : Bool}
+
+def hc_save_only_prefilled_rows(u, tile, h, c):
+  hc_tile_below_and(hc_rows_saveable(u, tile, h), Nat.is_le(u, c), Nat.is_lt(h, Nat.mul(u, tile)), hc_le_lt_excl(Nat.mul(u, tile), h))
+
+# LAW HC.78: ... nor tiles the K/V caches do not hold.
+law hc_save_within_caches:
+  for +u: Nat
+  for +tile: Nat
+  for +h: Nat
+  for +c: Nat
+  {Bool.and(hc_save_ok(u, tile, h, c), Nat.is_lt(c, u)) == False{} : Bool}
+
+def hc_save_within_caches(u, tile, h, c):
+  hc_and3_excl(hc_rows_saveable(u, tile, h), Nat.is_le(u, c), Nat.is_lt(c, u), hc_le_lt_excl(u, c))
+
+# LAW HC.79: a tile never counts as copied while a piece of it, or of a tile before it in the
+# batch, is missing.
+law hc_tile_short_of_pieces_never_copied:
+  for +i: Nat
+  for +p: Nat
+  for +d: Nat
+  {Bool.and(hc_tile_copied(i, p, d), Nat.is_lt(d, Nat.mul(1n+i, p))) == False{} : Bool}
+
+def hc_tile_short_of_pieces_never_copied(i, p, d):
+  hc_le_lt_excl(Nat.mul(1n+i, p), d)
+
+# LAW HC.80: an entry that holds no more tiles than before never counts as grown: no device
+# tile is taken for its copy on the strength of a copy that added none.
+law hc_no_new_rows_never_added:
+  for +b: Nat
+  for +a: Nat
+  {Bool.and(hc_rows_added(b, a), Nat.is_le(a, b)) == False{} : Bool}
+
+def hc_no_new_rows_never_added(b, a):
+  hc_lt_le_excl(b, a)
+
+# LAW HC.81: rows that stopped short of their target are never taken for complete.
+law hc_short_rows_never_complete:
+  for +n: Nat
+  for +t: Nat
+  {Bool.and(hc_rows_complete(n, t), Nat.is_lt(n, t)) == False{} : Bool}
+
+def hc_short_rows_never_complete(n, t):
+  hc_le_lt_excl(t, n)
+
+# LAW HC.82: a copy with a piece missing is never whole.
+law hc_part_copy_never_whole:
+  for +d: Nat
+  for +a: Nat
+  {Bool.and(hc_copy_whole(d, a), Nat.is_lt(d, a)) == False{} : Bool}
+
+def hc_part_copy_never_whole(d, a):
+  hc_le_lt_excl(a, d)
+
+# (That a state the entry already holds is not copied again is today's saving, pinned by Rust
+# tests and by no law: `end_state` replaces a state it is given again. What a law states is
+# that such a state is never charged, HC.92.)
+
+# LAW HC.83: the state at a position past the rows the entry holds is never copied.
+law hc_state_past_rows_never_wanted:
+  for +a: Bool
+  for +k: Nat
+  for +t: Nat
+  {Bool.and(hc_state_wanted(a, k, t), Nat.is_lt(t, k)) == False{} : Bool}
+
+def hc_state_past_rows_never_wanted(a, k, t):
+  hc_and3_excl(Bool.not(a), Nat.is_le(k, t), Nat.is_lt(t, k), hc_le_lt_excl(k, t))
+
+# LAW HC.84: a state whose copy has a piece missing is never kept ...
+law hc_part_state_never_kept:
+  for +d: Nat
+  for +a: Nat
+  for +k: Nat
+  for +t: Nat
+  {Bool.and(hc_state_kept(d, a, k, t), Nat.is_lt(d, a)) == False{} : Bool}
+
+def hc_part_state_never_kept(d, a, k, t):
+  hc_tile_below_and(hc_copy_whole(d, a), Nat.is_le(k, t), Nat.is_lt(d, a), hc_le_lt_excl(a, d))
+
+# LAW HC.85: ... nor one at a position past the rows the entry holds.
+law hc_state_past_rows_never_kept:
+  for +d: Nat
+  for +a: Nat
+  for +k: Nat
+  for +t: Nat
+  {Bool.and(hc_state_kept(d, a, k, t), Nat.is_lt(t, k)) == False{} : Bool}
+
+def hc_state_past_rows_never_kept(d, a, k, t):
+  hc_and3_excl(hc_copy_whole(d, a), Nat.is_le(k, t), Nat.is_lt(t, k), hc_le_lt_excl(k, t))
+
+# LAW HC.86: the position a save just reached never leaves its entry to make room for others.
+law hc_last_position_never_leaves:
+  for +k: Nat
+  {hc_state_may_leave(k, k) == False{} : Bool}
+
+def hc_last_position_never_leaves(k):
+  %Equal.sym(Bool, Nat.is_eq(k, k), True{}, hc_eq_refl(k)) : {Bool.not(_) == False{} : Bool}
+  {==}
+
+# LAW HC.87: an engine without rings never copies a ring image out.
+law hc_no_rings_nothing_saved:
+  for +c: Bool
+  for +i: Bool
+  for +g: Bool
+  {hc_ring_save(0n, c, i, g) == False{} : Bool}
+
+def hc_no_rings_nothing_saved(c, i, g):
+  {==}
+
+# LAW HC.88: a save that was cut short never goes on to copy the rings: it gives the card up.
+law hc_cut_short_save_copies_no_ring:
+  for +b: Nat
+  for +i: Bool
+  for +g: Bool
+  {hc_ring_save(b, False{}, i, g) == False{} : Bool}
+
+def hc_cut_short_save_copies_no_ring(b, i, g):
+  hc_and_false_r(Nat.is_gt(b, 0n))
+
+# LAW HC.89: idle work never takes the engine while a request is using it ...
+law hc_idle_never_takes_a_busy_engine:
+  for +a: Nat
+  for +r: Bool
+  {hc_idle_may_take(1n+a, r) == False{} : Bool}
+
+def hc_idle_never_takes_a_busy_engine(a, r):
+  match r:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW HC.90: ... nor an engine that is not ready.
+law hc_idle_never_takes_an_unready_engine:
+  for +a: Nat
+  {hc_idle_may_take(a, False{}) == False{} : Bool}
+
+def hc_idle_never_takes_an_unready_engine(a):
+  {==}
+
+def hc_ring_part_le(c: Bool, r: Nat) -> {Nat.is_le(hc_ring_part(c, r), r) == True{} : Bool}:
+  match c:
+    case True{}:
+      hc_le_refl(r)
+    case False{}:
+      hc_zero_le(r)
+
+# LAW HC.91: what a save is charged never exceeds the full charge of what it leaves in the
+# entry: every tile up to its target, the state at every kept position, and a ring image.
+law hc_save_need_within_full_charge:
+  for +u: Nat
+  for +h: Nat
+  for +tc: Nat
+  for +k: Nat
+  for +a: Nat
+  for +sc: Nat
+  for +f: Bool
+  for +rc: Nat
+  {Nat.is_le(hc_save_need(u, h, tc, k, a, sc, f, rc), Nat.add(Nat.add(Nat.mul(u, tc), Nat.mul(k, sc)), rc)) == True{} : Bool}
+
+def hc_save_need_within_full_charge(u, h, tc, k, a, sc, f, rc):
+  hc_le_add_mono(
+    Nat.add(Nat.mul(Nat.sub(u, h), tc), Nat.mul(Nat.sub(k, a), sc)),
+    Nat.add(Nat.mul(u, tc), Nat.mul(k, sc)),
+    hc_ring_part(f, rc),
+    rc,
+    hc_le_add_mono(
+      Nat.mul(Nat.sub(u, h), tc),
+      Nat.mul(u, tc),
+      Nat.mul(Nat.sub(k, a), sc),
+      Nat.mul(k, sc),
+      hc_le_mul_mono(Nat.sub(u, h), u, tc, hc_sub_le_self(u, h)),
+      hc_le_mul_mono(Nat.sub(k, a), k, sc, hc_sub_le_self(k, a))
+    ),
+    hc_ring_part_le(f, rc)
+  )
+
+# LAW HC.92: the states an entry already holds add nothing to what a save is charged: with
+# every kept position held, the charge is that of a save with no kept position at all.
+law hc_held_states_never_charged:
+  for +u: Nat
+  for +h: Nat
+  for +tc: Nat
+  for +k: Nat
+  for +x: Nat
+  for +sc: Nat
+  for +f: Bool
+  for +rc: Nat
+  {hc_save_need(u, h, tc, k, Nat.add(k, x), sc, f, rc) == hc_save_need(u, h, tc, 0n, 0n, sc, f, rc) : Nat}
+
+def hc_held_states_never_charged(u, h, tc, k, x, sc, f, rc):
+  %Equal.sym(Nat, Nat.sub(k, Nat.add(k, x)), 0n, hc_sub_add_zero(k, x)) : {Nat.add(Nat.add(Nat.mul(Nat.sub(u, h), tc), Nat.mul(_, sc)), hc_ring_part(f, rc)) == Nat.add(Nat.add(Nat.mul(Nat.sub(u, h), tc), Nat.mul(0n, sc)), hc_ring_part(f, rc)) : Nat}
+  {==}
+
+def hc_add_zero_le(n: Nat) -> {Nat.is_le(Nat.add(n, 0n), n) == True{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+p:
+      hc_add_zero_le(p)
+
+# LAW HC.93: the tiles a save adds never take its entry past its target, nor past what the
+# entry held: no row beyond the ones the save was allowed to copy is ever asked for.
+law hc_new_tiles_within_target:
+  for +h: Nat
+  for +u: Nat
+  {Nat.is_le(Nat.add(h, hc_new_tiles(u, h)), Nat.max(h, u)) == True{} : Bool}
+
+def hc_new_tiles_within_target(h, u):
+  match h u:
+    case 0n 0n: {==}
+    case 0n 1n+up:
+      hc_le_refl(up)
+    case 1n+hp 0n:
+      hc_add_zero_le(hp)
+    case 1n+hp 1n+up:
+      hc_new_tiles_within_target(hp, up)
+
+# LAW HC.94: a save never takes more spare bytes again than the spare segments of that size
+# hold ...
+law hc_spare_credit_within_spares:
+  for +s: Nat
+  for +w: Nat
+  for +c: Nat
+  {Nat.is_le(hc_spare_credit(s, w, c), Nat.mul(s, c)) == True{} : Bool}
+
+def hc_spare_credit_within_spares(s, w, c):
+  hc_le_mul_mono(Nat.min(s, w), s, c, hc_min_le_l(s, w))
+
+# LAW HC.95: ... nor more than the allocation asks for: a spare segment it cannot take again
+# is never counted as memory it has.
+law hc_spare_credit_within_wanted:
+  for +s: Nat
+  for +w: Nat
+  for +c: Nat
+  {Nat.is_le(hc_spare_credit(s, w, c), Nat.mul(w, c)) == True{} : Bool}
+
+def hc_spare_credit_within_wanted(s, w, c):
+  hc_le_mul_mono(Nat.min(s, w), w, c, hc_min_le_r(s, w))
+
+# LAW HC.96: what a save may take never exceeds the budget's free bytes ...
+law hc_take_now_within_budget:
+  for +f: Nat
+  for +a: Nat
+  for +r: Nat
+  {Nat.is_le(hc_take_now(f, a, r), f) == True{} : Bool}
+
+def hc_take_now_within_budget(f, a, r):
+  hc_min_le_l(f, Nat.add(a, r))
+
+# LAW HC.97: ... nor what the host has available plus what the save itself gave back and
+# takes again.
+law hc_take_now_within_host_and_reuse:
+  for +f: Nat
+  for +a: Nat
+  for +r: Nat
+  {Nat.is_le(hc_take_now(f, a, r), Nat.add(a, r)) == True{} : Bool}
+
+def hc_take_now_within_host_and_reuse(f, a, r):
+  hc_min_le_r(f, Nat.add(a, r))
+
+# LAW HC.98: when the host cannot give what an allocation needs, the spare segments the
+# allocation cannot take again always go back to the system first: no entry is evicted, no save
+# refused and no fresh memory mapped while the store sits on memory it cannot use.
+law hc_unusable_spares_go_first:
+  for +a: Nat
+  for +r: Nat
+  for +x: Nat
+  for +u: Nat
+  {hc_spares_return(Nat.add(Nat.add(a, r), 1n+x), a, r, 1n+u) == True{} : Bool}
+
+def hc_unusable_spares_go_first(a, r, x, u):
+  %hc_lt_add_succ(Nat.add(a, r), x) : {Bool.and(True{}, _) == True{} : Bool}
+  {==}
+
+# LAW HC.99: nothing is returned when there is nothing the allocation cannot use.
+law hc_no_unusable_spares_nothing_returned:
+  for +n: Nat
+  for +a: Nat
+  for +r: Nat
+  {hc_spares_return(n, a, r, 0n) == False{} : Bool}
+
+def hc_no_unusable_spares_nothing_returned(n, a, r):
+  {==}
+
+def hc_layout_tile_aux(some: Bool, t1: Bool, t2: Bool, sized: Bool) -> {Bool.and(hc_layout_ok(hc_layout_pick(some, Bool.and(t1, t2), sized)), Bool.not(t1)) == False{} : Bool}:
+  match some:
+    case False{}:
+      {==}
+    case True{}:
+      match t1:
+        case False{}:
+          {==}
+        case True{}:
+          hc_and_false_r(hc_layout_ok(hc_layout_pick(True{}, t2, sized)))
+
+# LAW HC.100: caches whose chunks the prefill tile does not divide are never copied tile by
+# tile: a tile's rows would not be one range per head.
+law hc_layout_tile_divides_a_chunk:
+  for +c: Nat
+  for +ch: Nat
+  for +cr: Nat
+  for +h: Nat
+  for +rb: Nat
+  for +t: Nat
+  for +b: Nat
+  for +cb: Nat
+  {Bool.and(hc_layout_ok(hc_layout(c, ch, cr, h, rb, t, b, cb)), Bool.not(Nat.is_eq(Nat.mod(cr, t), 0n))) == False{} : Bool}
+
+def hc_layout_tile_divides_a_chunk(c, ch, cr, h, rb, t, b, cb):
+  hc_layout_tile_aux(
+    Bool.and(Nat.is_gt(c, 0n), Bool.and(Nat.is_gt(t, 0n), Bool.and(Nat.is_gt(ch, 0n), Bool.and(Nat.is_gt(h, 0n), Nat.is_gt(rb, 0n))))),
+    Nat.is_eq(Nat.mod(cr, t), 0n),
+    Nat.is_eq(Nat.mod(t, b), 0n),
+    Nat.is_eq(cb, Nat.mul(Nat.mul(Nat.mul(ch, h), cr), rb))
+  )
+
+def hc_layout_size_aux(some: Bool, tiled: Bool, sized: Bool) -> {Bool.and(hc_layout_ok(hc_layout_pick(some, tiled, sized)), Bool.not(sized)) == False{} : Bool}:
+  match some:
+    case False{}:
+      {==}
+    case True{}:
+      match tiled:
+        case False{}:
+          {==}
+        case True{}:
+          match sized:
+            case True{}:
+              {==}
+            case False{}:
+              {==}
+
+# LAW HC.101: nor caches of any other size than chunks x heads x rows x row bytes: no copy
+# ever addresses a range the layout did not account for.
+law hc_layout_cache_size_matches:
+  for +c: Nat
+  for +ch: Nat
+  for +cr: Nat
+  for +h: Nat
+  for +rb: Nat
+  for +t: Nat
+  for +b: Nat
+  for +cb: Nat
+  {Bool.and(hc_layout_ok(hc_layout(c, ch, cr, h, rb, t, b, cb)), Bool.not(Nat.is_eq(cb, Nat.mul(Nat.mul(Nat.mul(ch, h), cr), rb)))) == False{} : Bool}
+
+def hc_layout_cache_size_matches(c, ch, cr, h, rb, t, b, cb):
+  hc_layout_size_aux(
+    Bool.and(Nat.is_gt(c, 0n), Bool.and(Nat.is_gt(t, 0n), Bool.and(Nat.is_gt(ch, 0n), Bool.and(Nat.is_gt(h, 0n), Nat.is_gt(rb, 0n))))),
+    Bool.and(Nat.is_eq(Nat.mod(cr, t), 0n), Nat.is_eq(Nat.mod(t, b), 0n)),
+    Nat.is_eq(cb, Nat.mul(Nat.mul(Nat.mul(ch, h), cr), rb))
+  )
+
+# LAW HC.102: an engine without K/V caches has nothing to copy.
+law hc_layout_no_caches_never_ok:
+  for +ch: Nat
+  for +cr: Nat
+  for +h: Nat
+  for +rb: Nat
+  for +t: Nat
+  for +b: Nat
+  for +cb: Nat
+  {hc_layout_ok(hc_layout(0n, ch, cr, h, rb, t, b, cb)) == False{} : Bool}
+
+def hc_layout_no_caches_never_ok(ch, cr, h, rb, t, b, cb):
+  {==}

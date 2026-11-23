@@ -13,6 +13,7 @@
 //! and moves on to the next one, so the link and the host copy threads work at the same time:
 //! - device to host: the DMA fills buffers while the buffers it finished are copied out;
 //! - host to device: buffers are filled from host memory while the DMA drains the ones before.
+//!
 //! Pieces whose device ranges touch become one DMA command, so the number of commands follows
 //! the layout of the device buffers, not the layout of the host copy.
 //!

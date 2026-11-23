@@ -986,9 +986,11 @@ impl AppState {
         };
         let taken = {
             let mut s = self.slot.lock().unwrap();
-            match (s.active_requests, matches!(s.lifecycle, Lifecycle::Ready(_))) {
-                (0, true) => s.engine.take(),
-                _ => None,
+            let ready = matches!(s.lifecycle, Lifecycle::Ready(_));
+            if crate::verified::hc_idle_may_take(s.active_requests, ready) {
+                s.engine.take()
+            } else {
+                None
             }
         };
         let Some(mut engine) = taken else { return };

@@ -27,7 +27,10 @@
 //! save, and a segment that is reused costs neither an unmap nor fresh pages: measured on the
 //! Gaudi 2 host, memory that was written before takes a copy at about twice the rate of fresh
 //! memory); what the save does not take goes back to the system when it ends
-//! ([`HostCache::settle`]). Nothing here is pinned.
+//! ([`HostCache::settle`]). A spare segment is taken again only by an allocation of exactly its
+//! size, so it counts as memory the save has only then (`hc_spare_credit`); when the host
+//! cannot give what an allocation needs, the spare segments of other sizes go back to the
+//! system before anything else happens (`hc_spares_return`). Nothing here is pinned.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -36,10 +39,13 @@ use crate::core::kv_pool::BlockPoolTracker;
 use crate::engine::qwen3::prefix_cache::{shared_rows, ImageId};
 use crate::hostmem::AnonMap;
 use crate::verified::{
-    hc_abort, hc_begin_read, hc_begin_write, hc_busy, hc_can_evict, hc_continues, hc_end_read,
-    hc_end_write, hc_evict_before, hc_free_now, hc_may_restore, hc_pins, hc_readable, hc_resumable,
-    hc_resume_valid, hc_ring_cover_after_cut, hc_ring_serves, hc_room, hc_shared_tiles,
-    hc_state_leaves_first, hc_states_over, hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
+    hc_abort, hc_begin_read, hc_begin_write, hc_busy, hc_can_evict, hc_continue_pick,
+    hc_copy_whole, hc_end_write, hc_evict_before, hc_may_read, hc_may_restore, hc_new_tiles,
+    hc_pins, hc_read_done, hc_readable, hc_resumable, hc_resume_better, hc_resume_valid,
+    hc_ring_cover_after_cut, hc_ring_save, hc_ring_serves, hc_room, hc_save_grows, hc_save_need,
+    hc_shared_tiles, hc_spare_credit, hc_spares_return, hc_state_kept, hc_state_leaves_first,
+    hc_state_may_leave, hc_state_survives_cut, hc_state_wanted, hc_states_over, hc_take_now,
+    hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
 };
 
 /// Identity of the engine an entry was made by: a digest of everything that decides the bytes
@@ -231,24 +237,44 @@ impl HostCache {
         self
     }
 
-    /// Bytes a save may take now without evicting, with `back` bytes it is about to give back
-    /// itself: the budget's free bytes, and no more than the host has available.
-    fn free_now(&self, back: u64) -> u64 {
-        let budget_free = self.ledger.free().saturating_add(back);
+    /// What the host can give this process now (`u64::MAX`: not asked; the budget alone bounds
+    /// the store). The spare segments are still mapped, so they count as held.
+    fn host_now(&self) -> u64 {
         match self.host_available {
-            // the spare segments are memory the store already has
-            Some(ask) => hc_free_now(
-                budget_free,
-                ask(self.ledger.allocated().saturating_add(self.spare_bytes()))
-                    .saturating_add(back)
-                    .saturating_add(self.spare_bytes()),
-            ),
-            None => budget_free,
+            Some(ask) => ask(self.mapped_bytes()),
+            None => u64::MAX,
         }
+    }
+
+    /// Bytes the store has mapped: what its entries hold, and the spare segments of the copy
+    /// in progress.
+    pub fn mapped_bytes(&self) -> u64 {
+        self.ledger.allocated().saturating_add(self.spare_bytes())
     }
 
     fn spare_bytes(&self) -> u64 {
         self.spare.iter().map(Seg::charged).sum()
+    }
+
+    /// Spare segments of exactly `charge` bytes: the ones an allocation of that size takes
+    /// again.
+    fn spares_of(&self, charge: u64) -> u64 {
+        self.spare.iter().filter(|s| s.charged() == charge).count() as u64
+    }
+
+    /// Bytes of the spare segments an allocation of `charge` bytes cannot take again.
+    fn spare_bytes_not_of(&self, charge: u64) -> u64 {
+        self.spare
+            .iter()
+            .filter(|s| s.charged() != charge)
+            .map(Seg::charged)
+            .sum()
+    }
+
+    /// The spare segments an allocation of `charge` bytes cannot take again go back to the
+    /// system now.
+    fn return_spares_not_of(&mut self, charge: u64) {
+        self.spare.retain(|s| s.charged() == charge);
     }
 
     /// A copy has ended: the segments it did not take go back to the system. Between copies
@@ -323,7 +349,7 @@ impl HostCache {
 
     fn remove(&mut self, id: u64) {
         if let Some(mut e) = self.entries.remove(&id) {
-            let mut segs: Vec<Seg> = e.rows.drain(..).collect();
+            let mut segs: Vec<Seg> = std::mem::take(&mut e.rows);
             segs.extend(e.states.drain(..).map(|(_, s)| s));
             segs.extend(e.ring.take().map(|r| r.seg));
             segs.extend(e.pending.take());
@@ -342,14 +368,32 @@ impl HostCache {
             .sum()
     }
 
-    /// Makes `need` bytes free for `target`, evicting the entries used least recently, or says
-    /// that it cannot (and then evicts nothing).
-    fn make_room(&mut self, need: u64, target: Option<u64>) -> bool {
+    /// Makes room for `count` segments of `seg` charged bytes each in entry `target`, or says
+    /// that it cannot. What may be taken at once is the verified `hc_take_now`: the budget's
+    /// free bytes, and no more than the host has available plus the spare segments of that size
+    /// the allocation takes again (`hc_spare_credit`). When the host cannot give the rest, the
+    /// spare segments of other sizes go back to the system first (`hc_spares_return`: they are
+    /// mapped memory nothing here can use); then the entries used least recently leave. A
+    /// request that cannot be met even so evicts nothing.
+    fn make_room(&mut self, target: Option<u64>, seg: u64, count: u64) -> bool {
+        let need = seg.saturating_mul(count);
         loop {
-            match hc_room(need, self.free_now(0), self.evictable(target)) {
-                HcRoom::HcFits => return true,
-                HcRoom::HcRefuse => return false,
-                HcRoom::HcEvict => {}
+            let host = self.host_now();
+            let reusable = hc_spare_credit(self.spares_of(seg), count, seg);
+            let room = hc_room(
+                need,
+                hc_take_now(self.ledger.free(), host, reusable),
+                self.evictable(target),
+            );
+            if room == HcRoom::HcFits {
+                return true;
+            }
+            if hc_spares_return(need, host, reusable, self.spare_bytes_not_of(seg)) {
+                self.return_spares_not_of(seg);
+                continue;
+            }
+            if room == HcRoom::HcRefuse {
+                return false;
             }
             let mut victim: Option<(u64, u64)> = None;
             for (&id, e) in &self.entries {
@@ -377,8 +421,9 @@ impl HostCache {
 
     // ---- lookup ----
 
-    /// The entry and kept position a request can resume from: the furthest position any entry
-    /// of this engine offers for the prompt (the more recently used entry among equals).
+    /// The entry and kept position a request can resume from: among the positions the entries
+    /// of this engine offer for the prompt, the one the verified order prefers
+    /// (`hc_resume_better`: the furthest, and among equals the entry used more recently).
     pub fn find(
         &self,
         engine: EngineId,
@@ -402,11 +447,7 @@ impl HostCache {
                 if !hc_resume_valid(pos, cap, p, tile, saved_rows) {
                     continue;
                 }
-                let better = match &best {
-                    None => true,
-                    Some((f, used)) => pos > f.pos || (pos == f.pos && e.used > *used),
-                };
-                if better {
+                if best.is_none_or(|(f, used)| hc_resume_better(pos, e.used, f.pos, used)) {
                     best = Some((
                         Found {
                             entry: id,
@@ -443,7 +484,7 @@ impl HostCache {
         self.tick += 1;
         let tick = self.tick;
         let e = self.entries.get_mut(&id)?;
-        if !hc_readable(e.life) || tiles > hc_tiles(e.life) {
+        if !hc_may_read(e.life, tiles) {
             return None;
         }
         let state = e.states.iter().find(|(k, _)| *k == tiles)?.1.map.as_ptr();
@@ -476,11 +517,7 @@ impl HostCache {
         let Some(e) = self.entries.get_mut(&id) else {
             return;
         };
-        e.life = if ok {
-            hc_end_read(e.life)
-        } else {
-            hc_abort(e.life)
-        };
+        e.life = hc_read_done(e.life, ok);
         if !hc_readable(e.life) {
             self.remove(id);
         }
@@ -488,11 +525,13 @@ impl HostCache {
 
     // ---- save ----
 
-    /// Chooses the entry a save of the prompt `held` (with `upto_tiles` whole tiles to keep)
-    /// writes into: the entry of this engine that the prompt continues (it is cut to the tiles
-    /// they share), else a new one. `extra` = bytes of the states and the ring image the save
-    /// wants beside the rows. `None`: the save has no room even with every other entry gone,
-    /// and nothing was changed.
+    /// Chooses the entry a save of the prompt `held` writes into: the entry of this engine that
+    /// the prompt continues (`hc_continue_pick`; it is cut to the tiles they share), else a new
+    /// one. The save is to reach `upto_tiles` whole tiles and the state at the positions `kept`
+    /// (whole tiles each), with segments of `tile_bytes`, `state_bytes` and `ring_bytes`
+    /// (0: no drafter rings). It is charged for what it adds to the entry and for nothing the
+    /// entry keeps (`hc_save_need`). `None`: that has no room even with every other entry
+    /// gone, and nothing was changed.
     #[allow(clippy::too_many_arguments)]
     pub fn open_save(
         &mut self,
@@ -502,56 +541,83 @@ impl HostCache {
         held: &[i32],
         images: &[ImageId],
         upto_tiles: u64,
-        extra: u64,
+        kept: &[u64],
+        state_bytes: u64,
+        ring_bytes: u64,
     ) -> Option<SaveTarget> {
         // the entry this prompt continues: the one it shares the most whole tiles with
-        let mut cont: Option<(u64, u64)> = None;
+        // (`have`: those tiles, 0 while there is none)
+        let mut cont: Option<u64> = None;
+        let mut have = 0u64;
         for (&id, e) in &self.entries {
-            if e.engine != engine || e.tile != tile || !hc_readable(e.life) {
-                continue;
-            }
             let (_, cap) = shared_rows(held, images, &e.tokens, &e.images);
             let tiles = hc_tiles(e.life);
             let common = hc_shared_tiles(cap, tile, tiles);
-            if hc_continues(common, tiles) && cont.is_none_or(|(_, c)| common > c) {
-                cont = Some((id, common));
+            let same = e.engine == engine && e.tile == tile;
+            if hc_continue_pick(same, hc_readable(e.life), common, tiles, have) {
+                cont = Some(id);
+                have = common;
             }
         }
-        let (have, cut_bytes) = match cont {
-            Some((id, common)) => {
-                let e = &self.entries[&id];
-                let cut: u64 = e.rows[(common as usize).min(e.rows.len())..]
+        // what the cut gives back, and what the entry keeps of what the save is to reach
+        let entry = cont.map(|id| &self.entries[&id]);
+        let cut_bytes = entry.map_or(0, |e| {
+            e.rows[(have as usize).min(e.rows.len())..]
+                .iter()
+                .map(Seg::charged)
+                .sum::<u64>()
+                + e.states
                     .iter()
-                    .map(Seg::charged)
+                    .filter(|(k, _)| !hc_state_survives_cut(*k, have))
+                    .map(|(_, s)| s.charged())
                     .sum::<u64>()
-                    + e.states
-                        .iter()
-                        .filter(|(k, _)| *k > common)
-                        .map(|(_, s)| s.charged())
-                        .sum::<u64>();
-                (common, cut)
-            }
-            None => (0, 0),
+        });
+        let keeps = |k: u64| {
+            entry.is_some_and(|e| {
+                e.states
+                    .iter()
+                    .any(|(s, _)| *s == k && hc_state_survives_cut(*s, have))
+            })
         };
-        let need = upto_tiles
-            .saturating_sub(have)
-            .saturating_mul(Self::charge_of(tile_bytes))
-            .saturating_add(extra);
-        let target = cont.map(|(id, _)| id);
-        if hc_room(need, self.free_now(cut_bytes), self.evictable(target)) == HcRoom::HcRefuse {
+        let held_states = kept
+            .iter()
+            .filter(|&&k| !hc_state_wanted(keeps(k), k, upto_tiles))
+            .count() as u64;
+        let has_image = entry.is_some_and(|e| e.ring.is_some());
+        let n_kept = kept.len() as u64;
+        let grows = hc_save_grows(hc_new_tiles(upto_tiles, have), n_kept, held_states);
+        let need = hc_save_need(
+            upto_tiles,
+            have,
+            Self::charge_of(tile_bytes),
+            n_kept,
+            held_states,
+            Self::charge_of(state_bytes),
+            hc_ring_save(ring_bytes, true, has_image, grows),
+            Self::charge_of(ring_bytes),
+        );
+        let target = cont;
+        // Everything the cut gives back counts here: a segment of it is taken again, or goes
+        // back to the system before fresh memory is mapped (`make_room`).
+        let free = hc_take_now(
+            self.ledger.free().saturating_add(cut_bytes),
+            self.host_now(),
+            cut_bytes.saturating_add(self.spare_bytes()),
+        );
+        if hc_room(need, free, self.evictable(target)) == HcRoom::HcRefuse {
             self.stats.refused += 1;
             if self.verbose {
                 let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
                 eprintln!(
-                    "[cache-ram] not saved: a prefix of {} rows needs {:.2} GiB; the budget is {:.2} GiB with {:.2} GiB in entries that cannot leave now{}",
+                    "[cache-ram] not saved: a prefix of {} rows needs {:.2} GiB more; the budget is {:.2} GiB with {:.2} GiB in entries that cannot leave now{}",
                     pc_boundary(upto_tiles, tile),
                     gib(need),
                     gib(self.ledger.capacity()),
                     gib(self.ledger.allocated().saturating_sub(self.evictable(target))),
                     match self.host_available {
-                        Some(ask) => format!(
+                        Some(_) => format!(
                             ", and the host has {:.2} GiB available",
-                            gib(ask(self.ledger.allocated()))
+                            gib(self.host_now())
                         ),
                         None => String::new(),
                     },
@@ -562,15 +628,17 @@ impl HostCache {
         self.tick += 1;
         let tick = self.tick;
         let id = match cont {
-            Some((id, common)) => {
+            Some(id) => {
                 let e = self.entries.get_mut(&id).expect("entry");
-                e.life = hc_truncate(e.life, common);
+                e.life = hc_truncate(e.life, have);
                 let keep = hc_tiles(e.life);
                 let mut gone: Vec<Seg> =
                     e.rows.drain((keep as usize).min(e.rows.len())..).collect();
-                let (kept, cut): (Vec<_>, Vec<_>) =
-                    e.states.drain(..).partition(|(k, _)| *k <= keep);
-                e.states = kept;
+                let (stay, cut): (Vec<_>, Vec<_>) = e
+                    .states
+                    .drain(..)
+                    .partition(|(k, _)| hc_state_survives_cut(*k, keep));
+                e.states = stay;
                 gone.extend(cut.into_iter().map(|(_, s)| s));
                 if let Some(r) = e.ring.as_mut() {
                     r.tiles = hc_ring_cover_after_cut(r.tiles, keep);
@@ -614,8 +682,9 @@ impl HostCache {
     /// A save starts to copy the rows of the next `n` tiles into entry `id`: their segments,
     /// in tile order. `None`: no room (nothing was changed).
     pub fn begin_rows(&mut self, id: u64, n: u64, tile_bytes: u64) -> Option<Vec<*mut u8>> {
-        let charge = Self::charge_of(tile_bytes).saturating_mul(n);
-        if !self.entries.contains_key(&id) || !self.make_room(charge, Some(id)) {
+        if !self.entries.contains_key(&id)
+            || !self.make_room(Some(id), Self::charge_of(tile_bytes), n)
+        {
             return None;
         }
         let mut segs = Vec::with_capacity(n as usize);
@@ -661,7 +730,7 @@ impl HostCache {
     /// A save starts to copy one more piece of entry `id` (a state, or the ring image) of
     /// `bytes`: where it goes. `None`: no room.
     pub fn begin_piece(&mut self, id: u64, bytes: u64) -> Option<*mut u8> {
-        if !self.entries.contains_key(&id) || !self.make_room(Self::charge_of(bytes), Some(id)) {
+        if !self.entries.contains_key(&id) || !self.make_room(Some(id), Self::charge_of(bytes), 1) {
             return None;
         }
         let mut seg = self.alloc(bytes)?;
@@ -675,16 +744,20 @@ impl HostCache {
         Some(ptr)
     }
 
-    /// The copy of a state ended. `complete`: all of it is in host memory; then the entry holds
-    /// the state after `tiles` whole tiles (replacing one it had for that position).
-    pub fn end_state(&mut self, id: u64, tiles: u64, complete: bool) {
+    /// The copy of a state ended with `done` of its `all` pieces in host memory. The entry
+    /// holds the state after `tiles` whole tiles from now on (replacing one it had for that
+    /// position) when the verified `hc_state_kept` says so: a whole copy, at a position inside
+    /// its rows. Returns whether it does.
+    pub fn end_state(&mut self, id: u64, tiles: u64, done: u64, all: u64) -> bool {
         let Some(e) = self.entries.get_mut(&id) else {
-            return;
+            return false;
         };
         e.life = hc_end_write(e.life, hc_tiles(e.life));
         let mut gone: Vec<Seg> = Vec::new();
+        let mut kept = false;
         if let Some(seg) = e.pending.take() {
-            if complete && tiles <= hc_tiles(e.life) {
+            kept = hc_state_kept(done, all, tiles, hc_tiles(e.life));
+            if kept {
                 if let Some(i) = e.states.iter().position(|(k, _)| *k == tiles) {
                     gone.push(e.states.remove(i).1);
                 }
@@ -697,20 +770,23 @@ impl HostCache {
         for s in gone {
             self.release(s);
         }
+        kept
     }
 
-    /// The copy of the ring image ended. `complete`: all of it is in host memory; then it is
-    /// the entry's image, valid from position `from` for the tiles the entry holds now. An
-    /// incomplete copy is dropped and leaves the image the entry had, which goes on serving
-    /// the tiles it was taken with.
-    pub fn end_ring(&mut self, id: u64, from: u64, complete: bool) {
+    /// The copy of the ring image ended with `done` of its `all` pieces in host memory. A whole
+    /// copy (`hc_copy_whole`) is the entry's image from now on, valid from position `from` for
+    /// the tiles the entry holds now. Any other is dropped and leaves the image the entry had,
+    /// which goes on serving the tiles it was taken with. Returns whether the image was taken.
+    pub fn end_ring(&mut self, id: u64, from: u64, done: u64, all: u64) -> bool {
         let Some(e) = self.entries.get_mut(&id) else {
-            return;
+            return false;
         };
         e.life = hc_end_write(e.life, hc_tiles(e.life));
         let mut gone: Vec<Seg> = Vec::new();
+        let mut whole = false;
         if let Some(seg) = e.pending.take() {
-            if complete {
+            whole = hc_copy_whole(done, all);
+            if whole {
                 let tiles = hc_tiles(e.life);
                 gone.extend(
                     e.ring
@@ -724,10 +800,11 @@ impl HostCache {
         for s in gone {
             self.release(s);
         }
+        whole
     }
 
     /// Drops the kept positions of entry `id` beyond `cap`, the ones nearest the start of the
-    /// prompt first. Never the one after `keep_tiles` whole tiles.
+    /// prompt first. Never the one after `keep_tiles` whole tiles (`hc_state_may_leave`).
     pub fn trim_states(&mut self, id: u64, cap: u64, keep_tiles: u64) {
         let Some(e) = self.entries.get_mut(&id) else {
             return;
@@ -736,7 +813,7 @@ impl HostCache {
         while hc_states_over(e.states.len() as u64, cap) {
             let mut first: Option<usize> = None;
             for (i, (k, _)) in e.states.iter().enumerate() {
-                if *k == keep_tiles {
+                if !hc_state_may_leave(*k, keep_tiles) {
                     continue;
                 }
                 if first.is_none_or(|f| hc_state_leaves_first(*k, e.states[f].0)) {
@@ -883,7 +960,7 @@ mod tests {
     /// Saves the first `tiles` tiles of `p` with states after each of `at`, as an engine would:
     /// every copy completes.
     fn save(c: &mut HostCache, p: &[i32], tiles: u64, at: &[u64]) -> Option<u64> {
-        let t = c.open_save(ENG, T, TB, p, &[], tiles, at.len() as u64 * SB)?;
+        let t = c.open_save(ENG, T, TB, p, &[], tiles, at, SB, 0)?;
         let n = tiles.saturating_sub(t.have_tiles);
         if n > 0 {
             let segs = c.begin_rows(t.entry, n, TB)?;
@@ -899,7 +976,7 @@ mod tests {
             }
             let ptr = c.begin_piece(t.entry, SB)?;
             unsafe { ptr.write_bytes(k as u8, 16) };
-            c.end_state(t.entry, k, true);
+            assert!(c.end_state(t.entry, k, 1, 1));
         }
         Some(t.entry)
     }
@@ -945,12 +1022,14 @@ mod tests {
             cols: 16,
             pixels: [px, 1],
         };
-        let t = c.open_save(ENG, T, TB, &p, &[img(1)], 6, 2 * SB).unwrap();
+        let t = c
+            .open_save(ENG, T, TB, &p, &[img(1)], 6, &[2, 6], SB, 0)
+            .unwrap();
         c.begin_rows(t.entry, 6, TB).unwrap();
         c.end_rows(t.entry, 6);
         for k in [2u64, 6] {
             c.begin_piece(t.entry, SB).unwrap();
-            c.end_state(t.entry, k, true);
+            c.end_state(t.entry, k, 1, 1);
         }
         let mut p2 = p.clone();
         p2.extend(prompt(300, 9));
@@ -1087,10 +1166,183 @@ mod tests {
     }
 
     #[test]
+    fn spare_segments_of_another_size_go_back_to_the_host_before_fresh_memory_is_mapped() {
+        // a host of 20 MiB; the budget (64 MiB) is not what bounds the store
+        fn available(held: u64) -> u64 {
+            (20 * MIB).saturating_sub(held)
+        }
+        const HOST: u64 = 20 * MIB;
+        let mut c = HostCache::new(64 * MIB, false);
+        c.host_available = Some(available);
+        // an entry of one engine: three tiles of 4 MiB and a state (14 MiB)
+        let a = save(&mut c, &prompt(3 * 512 + 50, 1), 3, &[3]).unwrap();
+        assert_eq!(c.mapped_bytes(), 3 * TB + SB);
+        // A save of another engine, whose tiles are 6 MiB: two of them and a state (14 MiB).
+        // The host has 6 MiB left, so the first entry leaves, and none of its segments is of a
+        // size these tiles can take again.
+        const TB2: u64 = 6 * MIB;
+        let p = prompt(2 * 512 + 50, 2);
+        let t = c
+            .open_save([9, 9], T, TB2, &p, &[], 2, &[2], SB, 0)
+            .unwrap();
+        let segs = c.begin_rows(t.entry, 2, TB2).unwrap();
+        assert!(!c.contains(a));
+        assert_eq!(c.stats().evictions, 1);
+        // They went back to the system before the tiles were mapped: the store never has more
+        // mapped than the host can give. (Counted as free while still mapped, they would stand
+        // beside the new tiles: 26 MiB on a host of 20.)
+        assert_eq!(c.spare_bytes(), 0);
+        assert_eq!(c.mapped_bytes(), 2 * TB2);
+        assert!(c.mapped_bytes() <= HOST);
+        for s in &segs {
+            unsafe { s.write_bytes(7, TB2 as usize) };
+        }
+        assert_eq!(c.end_rows(t.entry, 2), 2);
+        c.begin_piece(t.entry, SB).unwrap();
+        assert!(c.end_state(t.entry, 2, 1, 1));
+        assert!(c.mapped_bytes() <= HOST);
+        c.settle();
+        assert_eq!(c.held_bytes(), 2 * TB2 + SB);
+        // A save that cannot fit even with the spare segments returned and every entry gone is
+        // refused, and evicts nothing for it.
+        assert!(save(&mut c, &prompt(5 * 512 + 50, 3), 5, &[5]).is_none());
+        assert!(c.contains(t.entry));
+        assert_eq!((c.stats().refused, c.stats().evictions), (1, 1));
+    }
+
+    #[test]
+    fn a_host_with_room_leaves_the_spare_segments_to_the_save() {
+        // the budget bounds this store (5 tiles and 2 states); the host has room to spare
+        fn available(held: u64) -> u64 {
+            (256 * MIB).saturating_sub(held)
+        }
+        let mut c = HostCache::new(5 * TB + 2 * SB, false);
+        c.host_available = Some(available);
+        let a = save(&mut c, &prompt(2 * 512 + 50, 1), 2, &[2]).unwrap();
+        let b = save(&mut c, &prompt(2 * 512 + 50, 2), 2, &[2]).unwrap();
+        // a third conversation: the older entry leaves for its two tiles
+        let p = prompt(2 * 512 + 50, 3);
+        let t = c.open_save(ENG, T, TB, &p, &[], 2, &[2], SB, 0).unwrap();
+        c.begin_rows(t.entry, 2, TB).unwrap();
+        assert!(!c.contains(a) && c.contains(b));
+        // its tiles were taken again; its state segment, which the tiles could not use, is
+        // still there for the state that follows (nothing made the store return it)
+        assert_eq!(c.spare_bytes(), SB);
+        c.end_rows(t.entry, 2);
+        c.begin_piece(t.entry, SB).unwrap();
+        assert!(c.end_state(t.entry, 2, 1, 1));
+        assert_eq!(c.spare_bytes(), 0);
+        assert_eq!(c.held_bytes(), 4 * TB + 2 * SB);
+    }
+
+    #[test]
+    fn an_extension_is_charged_only_for_what_it_adds() {
+        // room for six tiles and three states, to the byte
+        let mut c = HostCache::new(6 * TB + 3 * SB, false);
+        let p1 = prompt(4 * 512 + 100, 0);
+        let id = save(&mut c, &p1, 4, &[2, 4]).unwrap();
+        assert_eq!(c.held_bytes(), 4 * TB + 2 * SB);
+        // The next turn: two more tiles and one more position. The budget has exactly that
+        // left. The two states the entry keeps are in the ledger already and are not copied
+        // again, so they are not charged again.
+        let mut p2 = p1.clone();
+        p2.extend(prompt(1100, 3));
+        assert_eq!(save(&mut c, &p2, 6, &[2, 4, 6]), Some(id));
+        assert_eq!(
+            (c.stats().refused, c.stats().evictions, c.stats().entries),
+            (0, 0, 1)
+        );
+        assert_eq!(c.held_bytes(), c.budget_bytes());
+        assert_eq!((c.tiles_of(id), c.states_of(id)), (6, vec![2, 4, 6]));
+        // a save that has nothing to add is not refused by a full budget
+        let t = c
+            .open_save(ENG, T, TB, &p2, &[], 6, &[2, 4, 6], SB, 0)
+            .unwrap();
+        assert_eq!((t.entry, t.have_tiles), (id, 6));
+        assert_eq!(c.stats().refused, 0);
+        // what really does not fit is still refused, and the entry stays as it is
+        let mut p3 = p2.clone();
+        p3.extend(prompt(600, 4));
+        assert!(save(&mut c, &p3, 7, &[2, 4, 6, 7]).is_none());
+        assert_eq!(c.stats().refused, 1);
+        assert_eq!((c.tiles_of(id), c.states_of(id)), (6, vec![2, 4, 6]));
+        // a branch gives back what it cuts: three tiles and a state go, three tiles and a
+        // state come, in a budget that has nothing free
+        let mut p4 = p2[..3 * 512 + 9].to_vec();
+        p4.extend(prompt(3 * 512, 8));
+        assert_eq!(save(&mut c, &p4, 6, &[2, 6]), Some(id));
+        assert_eq!(c.stats().refused, 1);
+        assert_eq!((c.tiles_of(id), c.states_of(id)), (6, vec![2, 6]));
+        c.settle();
+        assert_eq!(c.held_bytes(), 6 * TB + 2 * SB);
+    }
+
+    #[test]
+    fn among_equal_resume_points_the_entry_used_last_is_chosen() {
+        let mut c = HostCache::new(256 * MIB, false);
+        // two conversations with the same first tile (a system prompt), each with a kept
+        // position at its end
+        let sys = prompt(600, 1);
+        let mut a = sys.clone();
+        a.extend(prompt(5 * 512, 2));
+        let mut b = sys.clone();
+        b.extend(prompt(3 * 512, 3));
+        let ia = save(&mut c, &a, 5, &[1, 5]).unwrap();
+        let ib = save(&mut c, &b, 3, &[1, 3]).unwrap();
+        assert_ne!(ia, ib);
+        // a third prompt shares only that tile: both entries offer row 512, and the one used
+        // last is taken
+        let mut d = sys.clone();
+        d.extend(prompt(900, 4));
+        let f = c.find(ENG, T, &d, &[], true, true).unwrap();
+        assert_eq!((f.entry, f.pos), (ib, 512));
+        c.begin_read(ia, 1).unwrap();
+        c.end_read(ia, true);
+        assert_eq!(c.find(ENG, T, &d, &[], true, true).unwrap().entry, ia);
+        // a further point is taken whichever entry was used last
+        c.begin_read(ia, 1).unwrap();
+        c.end_read(ia, true);
+        let mut b2 = b.clone();
+        b2.extend(prompt(300, 9));
+        let f = c.find(ENG, T, &b2, &[], true, true).unwrap();
+        assert_eq!((f.entry, f.pos), (ib, 3 * 512));
+    }
+
+    #[test]
+    fn today_s_choices_and_charges() {
+        // which place to resume from: the further point, then the entry used last
+        assert!(hc_resume_better(1024, 1, 512, 9));
+        assert!(!hc_resume_better(512, 9, 1024, 1));
+        assert!(hc_resume_better(512, 9, 512, 1) && !hc_resume_better(512, 1, 512, 9));
+        // which entry a save goes into: one it continues, the one it shares the most with
+        assert!(hc_continue_pick(true, true, 4, 6, 3));
+        assert!(!hc_continue_pick(true, true, 3, 6, 3));
+        assert!(!hc_continue_pick(true, true, 2, 6, 0));
+        assert!(!hc_continue_pick(false, true, 4, 6, 3) && !hc_continue_pick(true, false, 4, 6, 3));
+        // what a save adds: two new tiles, one new state of three, a ring image
+        assert_eq!(hc_save_need(6, 4, TB, 3, 2, SB, true, SB), 2 * TB + 2 * SB);
+        assert_eq!(hc_save_need(6, 6, TB, 3, 3, SB, false, SB), 0);
+        // the rings are copied (and charged) for an entry without an image and for one that
+        // grows, on an engine that has rings
+        assert!(hc_ring_save(SB, true, false, false) && hc_ring_save(SB, true, true, true));
+        assert!(!hc_ring_save(SB, true, true, false) && !hc_ring_save(0, true, false, true));
+        assert!(hc_save_grows(1, 3, 3) && hc_save_grows(0, 3, 2) && !hc_save_grows(0, 3, 3));
+        // spare segments count for the allocations that take them again
+        assert_eq!(hc_spare_credit(3, 2, TB), 2 * TB);
+        assert_eq!(hc_spare_credit(1, 2, TB), TB);
+        assert_eq!(hc_take_now(10 * MIB, 4 * MIB, 2 * MIB), 6 * MIB);
+        assert_eq!(hc_take_now(5 * MIB, 4 * MIB, 2 * MIB), 5 * MIB);
+        // ... and the others go back when the host is short, not before
+        assert!(hc_spares_return(12 * MIB, 6 * MIB, 0, 14 * MIB));
+        assert!(!hc_spares_return(12 * MIB, 12 * MIB, 0, 14 * MIB));
+        assert!(!hc_spares_return(12 * MIB, 6 * MIB, 0, 0));
+    }
+
+    #[test]
     fn a_save_cut_short_keeps_the_tiles_that_finished_and_a_failed_one_leaves_nothing() {
         let mut c = HostCache::new(256 * MIB, false);
         let p = prompt(6 * 512 + 100, 0);
-        let t = c.open_save(ENG, T, TB, &p, &[], 6, SB).unwrap();
+        let t = c.open_save(ENG, T, TB, &p, &[], 6, &[6], SB, 0).unwrap();
         assert!(c.begin_rows(t.entry, 6, TB).is_some());
         // while the rows are written the entry cannot be read, found or evicted
         assert!(c.find(ENG, T, &p, &[], true, true).is_none());
@@ -1102,17 +1354,18 @@ mod tests {
         // without a state nothing can resume from it yet
         assert!(c.find(ENG, T, &p, &[], true, true).is_none());
         // the save goes on later: the same entry, from the tiles it has
-        let t2 = c.open_save(ENG, T, TB, &p, &[], 6, SB).unwrap();
+        let t2 = c.open_save(ENG, T, TB, &p, &[], 6, &[6], SB, 0).unwrap();
         assert_eq!((t2.entry, t2.have_tiles), (t.entry, 4));
         c.begin_rows(t2.entry, 2, TB).unwrap();
         assert_eq!(c.end_rows(t2.entry, 6), 6);
         // a state whose copy did not finish is not kept; one that finished is
         c.begin_piece(t2.entry, SB).unwrap();
-        c.end_state(t2.entry, 6, false);
+        // (one of its two pieces did not arrive)
+        assert!(!c.end_state(t2.entry, 6, 1, 2));
         assert!(c.states_of(t2.entry).is_empty());
         assert_eq!(c.held_bytes(), 6 * TB);
         c.begin_piece(t2.entry, SB).unwrap();
-        c.end_state(t2.entry, 6, true);
+        assert!(c.end_state(t2.entry, 6, 2, 2));
         assert_eq!(c.find(ENG, T, &p, &[], true, true).unwrap().pos, 6 * 512);
         // a copy that failed drops the whole entry and gives its bytes back
         c.begin_rows(t2.entry, 1, TB).unwrap();
@@ -1131,7 +1384,7 @@ mod tests {
     fn a_save_cut_short_before_its_first_tile_leaves_no_entry() {
         let mut c = HostCache::new(256 * MIB, false);
         let p = prompt(3 * 512 + 100, 0);
-        let t = c.open_save(ENG, T, TB, &p, &[], 3, SB).unwrap();
+        let t = c.open_save(ENG, T, TB, &p, &[], 3, &[3], SB, 0).unwrap();
         c.begin_rows(t.entry, 3, TB).unwrap();
         assert_eq!(c.end_rows(t.entry, 0), 0);
         assert!(!c.contains(t.entry));
@@ -1156,18 +1409,18 @@ mod tests {
         let p = prompt(2 * 512 + 100, 0);
         let id = save(&mut c, &p, 2, &[2]).unwrap();
         c.begin_piece(id, SB).unwrap();
-        c.end_ring(id, 700, true);
+        assert!(c.end_ring(id, 700, 1, 1));
         assert!(c.has_ring(id));
         assert_eq!(c.begin_read(id, 2).unwrap().ring.unwrap().1, 700);
         c.end_read(id, true);
         let held = c.held_bytes();
         // a newer image replaces it
         c.begin_piece(id, SB).unwrap();
-        c.end_ring(id, 900, true);
+        assert!(c.end_ring(id, 900, 1, 1));
         assert_eq!(c.held_bytes(), held);
         // a copy that did not finish drops the piece and keeps the entry
         c.begin_piece(id, SB).unwrap();
-        c.end_ring(id, 950, false);
+        assert!(!c.end_ring(id, 950, 0, 1));
         assert_eq!(c.held_bytes(), held);
         assert!(c.contains(id));
     }
