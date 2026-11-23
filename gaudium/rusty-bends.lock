@@ -4,6 +4,11 @@ f63387e5e0ac3c8b  a2ui_enabled_request_runs  law a2ui_enabled_request_runs : for
 464c4deed8191922  a2ui_insert_adds_one  law a2ui_insert_adds_one : for n : Nat { a2ui_msg_count ( n , a2ui_place ( False { } ) ) == 1n + n : Nat }
 818fca1491a0c029  a2ui_place_adds_at_most_one  law a2ui_place_adds_at_most_one : for + n : Nat for + p : A2uiPlace { Nat.is_le ( a2ui_msg_count ( n , p ) , 1n + n ) == True { } : Bool }
 c7331b2bb18ed54f  a2ui_place_keeps_messages  law a2ui_place_keeps_messages : for + n : Nat for + p : A2uiPlace { Nat.is_le ( n , a2ui_msg_count ( n , p ) ) == True { } : Bool }
+603b7e4fdf4976bd  a2ui_prompt_empty_rejected  law a2ui_prompt_empty_rejected : for c : Nat { a2ui_prompt_size_ok ( 0n , c ) == False { } : Bool }
+befad067c4fa9616  a2ui_prompt_invalid_never_loads  law a2ui_prompt_invalid_never_loads : for + c : Bool { a2ui_prompt_loads ( a2ui_prompt_pick ( c , False { } ) ) == False { } : Bool }
+42faf90ea6fc8122  a2ui_prompt_load_xor_warn  law a2ui_prompt_load_xor_warn : for + p : A2PromptPick { Bool.and ( a2ui_prompt_loads ( p ) , a2ui_prompt_warns ( p ) ) == False { } : Bool }
+b0c3840f3f9bfec4  a2ui_prompt_reject_warns  law a2ui_prompt_reject_warns : { a2ui_prompt_warns ( a2ui_prompt_pick ( True { } , False { } ) ) == True { } : Bool }
+17320f20121fc1f5  a2ui_prompt_unchanged_quiet  law a2ui_prompt_unchanged_quiet : for + v : Bool { Bool.or ( a2ui_prompt_loads ( a2ui_prompt_pick ( False { } , v ) ) , a2ui_prompt_warns ( a2ui_prompt_pick ( False { } , v ) ) ) == False { } : Bool }
 c6d3f96fdd50f5f8  a2ui_refusal_never_injects  law a2ui_refusal_never_injects : for + d : A2uiDecision { Bool.and ( a2ui_refuses ( d ) , a2ui_injects ( d ) ) == False { } : Bool }
 5e00beefc18bd215  a2ui_refuses_iff_disabled  law a2ui_refuses_iff_disabled : for + e : Bool for + r : Bool for + c : Bool { a2ui_refuses ( a2ui_decide ( r , e , c ) ) == Bool.and ( r , Bool.not ( e ) ) : Bool }
 21e723c75cb614f8  a2ui_scan_empty_list  law a2ui_scan_empty_list : for m : Nat { a2ui_ids_scanned ( 0n , m ) == 0n : Nat }
@@ -75,7 +80,15 @@ ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat
 72939e08483e2782  live_write_forced_not_deferred  law live_write_forced_not_deferred : for has_writer : Bool { lw_is_defer ( live_write_route ( has_writer , True { } ) ) == False { } : Bool }
 2e68cb9c0d45b0de  live_write_no_writer_no_defer  law live_write_no_writer_no_defer : for force : Bool { lw_is_defer ( live_write_route ( False { } , force ) ) == False { } : Bool }
 37c4cba4beb87a11  live_write_off_the_caller  law live_write_off_the_caller : for force : Bool { lw_is_inline ( live_write_route ( True { } , force ) ) == False { } : Bool }
+9c50354edb3ef860  media_count_over_refused  law media_count_over_refused : for + m : Nat for + extra : Nat { media_count_ok ( Nat.add ( 1n + m , extra ) , m ) == False { } : Bool }
+b78d879fb880f84b  media_empty_refused  law media_empty_refused : for m : Nat { media_bytes_ok ( 0n , m ) == False { } : Bool }
+1fc661db6e325264  media_inline_always_allowed  law media_inline_always_allowed : for a : Bool { media_source_allowed ( MsInline { } , a ) == True { } : Bool }
+d9c2a2fe466391df  media_oversized_refused  law media_oversized_refused : for + m : Nat for + extra : Nat { media_bytes_ok ( Nat.add ( 1n + m , extra ) , m ) == False { } : Bool }
+25c6c5b940cf3cbe  media_remote_follows_setting  law media_remote_follows_setting : for a : Bool { media_source_allowed ( MsRemote { } , a ) == a : Bool }
+ef45a806ccc81bf8  media_zero_height_refused  law media_zero_height_refused : for + w : Nat for m : Nat { media_canvas_ok ( w , 0n , m ) == False { } : Bool }
+61de762b8557772c  media_zero_width_refused  law media_zero_width_refused : for h : Nat for m : Nat { media_canvas_ok ( 0n , h , m ) == False { } : Bool }
 ba223807cabf30d6  moe_zero_experts_rejected  law moe_zero_experts_rejected : for + ek : Nat for + ef : Nat { moe_dims_valid ( 0n , ek , ef ) == False { } : Bool }
+7d7f156c04961994  orient_mirror_in_range  law orient_mirror_in_range : for + i : Nat for + p : Nat { Nat.is_le ( orient_mirror ( i , 1n + p ) , p ) == True { } : Bool }
 1b6bb5e0fe9aa632  oversized_prompt_rejected  law oversized_prompt_rejected : for + lmax : Nat for + extra : Nat { prompt_admitted ( Nat.add ( served_ctx ( lmax ) , extra ) , lmax ) == False { } : Bool }
 84e37afe4c2e2159  pfx_reuse_at_prompt_end_false  law pfx_reuse_at_prompt_end_false : for + p : Nat for lcp : Nat for + tile : Nat for nm : Bool for mu : Nat for nd : Bool for du : Nat { pfx_reuse_valid ( p , lcp , p , tile , nm , mu , nd , du ) == False { } : Bool }
 88c72e192da91a43  pfx_reuse_zero_lcp_false  law pfx_reuse_zero_lcp_false : for + pos : Nat for p : Nat for + tile : Nat for nm : Bool for mu : Nat for nd : Bool for du : Nat { pfx_reuse_valid ( pos , 0n , p , tile , nm , mu , nd , du ) == False { } : Bool }
@@ -135,6 +148,21 @@ d6f5f339fd83fcd8  tool_invalid_choice_never_forces  law tool_invalid_choice_neve
 fb48a38269eaafac  tree_over_max_nodes_rejected  law tree_over_max_nodes_rejected : for + mn : Nat for + extra : Nat for + sp : Nat for md : Nat for tk : Nat { tree_shape_bounds_valid ( Nat.add ( mn , 1n + extra ) , sp , mn , md , tk ) == False { } : Bool }
 f438ba027c288a28  tree_self_parent_rejected  law tree_self_parent_rejected : for + i : Nat for + d : Nat for pd : Nat for r : Nat for + sp : Nat for tk : Nat { tree_node_valid ( i , i , d , pd , r , sp , tk ) == False { } : Bool }
 09ae686fe3d30743  unsupported_method_refuses_sampling  law unsupported_method_refuses_sampling : { sampling_request_admitted ( False { } , True { } ) == False { } : Bool }
+95d8e8e470b18e0a  vid_frame_index_in_range  law vid_frame_index_in_range : for + raw : Nat for + p : Nat { Nat.is_le ( vid_frame_index ( raw , 1n + p ) , p ) == True { } : Bool }
+673301e5bd807518  vid_group_frame_in_range  law vid_group_frame_in_range : for + g : Nat for + s : Nat for + t : Nat for + p : Nat { Nat.is_le ( vid_group_frame ( g , s , t , 1n + p ) , p ) == True { } : Bool }
+dc30cbbbb0fa4675  vid_groups_zero_temporal  law vid_groups_zero_temporal : for f : Nat { vid_groups ( f , 0n ) == 0n : Nat }
+654cd74e38d74436  vid_keep_le_max  law vid_keep_le_max : for + r : Nat for + mn : Nat for + mx : Nat for + total : Nat { Nat.is_le ( vid_keep_count ( r , mn , mx , total ) , mx ) == True { } : Bool }
+e3b0d5391fa13f91  vid_keep_le_total  law vid_keep_le_total : for + r : Nat for + mn : Nat for + mx : Nat for + total : Nat { Nat.is_le ( vid_keep_count ( r , mn , mx , total ) , total ) == True { } : Bool }
+6ab6e71e1c96ccf6  vid_pixel_budget_le_frames  law vid_pixel_budget_le_frames : for + mx : Nat for + f : Nat for + cap : Nat { Nat.is_le ( vid_pixel_budget ( mx , f , cap ) , Nat.mul ( f , cap ) ) == True { } : Bool }
+84967816919e1d0e  vid_pixel_budget_le_model  law vid_pixel_budget_le_model : for + mx : Nat for + f : Nat for + cap : Nat { Nat.is_le ( vid_pixel_budget ( mx , f , cap ) , mx ) == True { } : Bool }
+d4381dc700340734  vid_rows_budget_zero_groups  law vid_rows_budget_zero_groups : for r : Nat for k : Nat for c : Nat { vid_rows_pixel_budget ( r , k , 0n , c ) == 0n : Nat }
+73ee8edd604e0b3e  vis_pixel_cap_le_model  law vis_pixel_cap_le_model : for + mx : Nat for + tp : Nat for + ps : Nat { Nat.is_le ( vis_pixel_cap ( mx , tp , ps ) , mx ) == True { } : Bool }
+2288b811fd20aa18  vis_pixel_cap_le_tower  law vis_pixel_cap_le_tower : for + mx : Nat for + tp : Nat for + ps : Nat { Nat.is_le ( vis_pixel_cap ( mx , tp , ps ) , Nat.mul ( tp , ps ) ) == True { } : Bool }
+96dfc9ae72184595  vis_plain_decode_always_ok  law vis_plain_decode_always_ok : { vis_drafter_ok ( VdNone { } ) == True { } : Bool }
+0d8da77fa48e204f  vis_rows_full_refuses  law vis_rows_full_refuses : for + cap : Nat for + extra : Nat { vis_rows_fit ( cap , 1n + extra , cap ) == False { } : Bool }
+9c1d124ed35699fb  vis_rows_left_le_cap  law vis_rows_left_le_cap : for + used : Nat for + cap : Nat { Nat.is_le ( vis_rows_left ( used , cap ) , cap ) == True { } : Bool }
+ed5641dd62da3f42  vis_rows_take_le_cap  law vis_rows_take_le_cap : for + used : Nat for + add : Nat for + cap : Nat { Nat.is_le ( vis_rows_take ( used , add , cap ) , cap ) == True { } : Bool }
+0ff07e6808e39a9b  vis_token_cap_le_ctx  law vis_token_cap_le_ctx : for + c : Nat for + ctx : Nat { Nat.is_le ( vis_token_cap ( c , ctx ) , ctx ) == True { } : Bool }
 bf27fed2cf696824  vit_zero_h_rejected  law vit_zero_h_rejected : for + t : Nat for + w : Nat for m : Nat { vit_grid_valid ( t , 0n , w , m ) == False { } : Bool }
 ba31aa6c874875b7  wave_lag_follows_lead  law wave_lag_follows_lead : for m : Nat for h : Nat for + p : Nat { Nat.is_lt ( wave_step ( m , False { } , h , p ) , wave_step ( m , True { } , h , p ) ) == True { } : Bool }
 976317570747274f  wave_next_pair_follows  law wave_next_pair_follows : for m : Nat for h : Nat for + q : Nat { Nat.is_lt ( wave_step ( m , True { } , h , 1n + 1n + q ) , wave_step ( 1n + m , False { } , h , 1n + 1n + q ) ) == True { } : Bool }
