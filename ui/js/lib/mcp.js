@@ -79,8 +79,23 @@ export const isNetworkError = (e) => e instanceof TypeError || /Failed to fetch|
 // probe: what the same request through gaudium-server's proxy gave (it sends no browser Origin): {ok} | {status, message} |
 // {unreachable, message} (the proxy could not connect) | {proxyError, message} (the proxy refused, e.g. its address guard);
 // null when there was no probe.
+// An HTTPS page may not call a plain-HTTP address at all (browsers block it as mixed content, except for this computer's own
+// loopback names), whatever the MCP server allows: only the server proxy reaches such a server from an HTTPS page.
+export const isMixedContent = (pageOrigin, url) => /^https:/i.test(pageOrigin || '') && /^http:/i.test(url || '')
+  && !/^http:\/\/(localhost|127(\.\d+){3}|\[::1\])(:\d+)?(\/|$)/i.test(url);
+
 export function connectFailureText({ url, origin, proxyEnabled, viaProxy = false, probe = null }) {
   if (viaProxy) return `The page could not reach gaudium-server's proxy for ${url}. Check that gaudium-server is running.`;
+  if (isMixedContent(origin, url)) {
+    const lines = [`This page is open over HTTPS and ${url} is plain HTTP: a browser does not let an HTTPS page call a plain-HTTP address, whatever the MCP server allows.`];
+    if (probe && probe.ok) lines.push('Through gaudium-server\'s proxy it answers.');
+    else if (probe && probe.status) lines.push(`Through gaudium-server's proxy it answers HTTP ${probe.status}${probe.message ? `: ${probe.message}` : ''}.`);
+    else if (probe && probe.unreachable) lines.push(`gaudium-server's proxy cannot reach it${probe.message ? ` (${probe.message})` : ''}: check its address and that it is running.`);
+    else if (probe && probe.proxyError) lines.push(`gaudium-server's proxy did not try it: ${probe.message}.`);
+    lines.push(proxyEnabled ? 'Tick "Use the server proxy" for this server: gaudium-server then connects instead of the browser.'
+      : 'Start gaudium-server with --mcp-proxy and use its proxy (gaudium-server then connects instead of the browser), or give the MCP server an https:// address.');
+    return lines.join('\n');
+  }
   const lines = [`The browser got no answer it may read from ${url}. Likely causes, most likely first:`,
     `1. The server refuses this page's origin (${origin}). Add ${origin} to its allowed origins (for mcp-searxng: MCP_HTTP_ALLOWED_ORIGINS).`,
     '2. The server sends no CORS headers, so the browser hides its answer.',

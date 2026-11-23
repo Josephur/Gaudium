@@ -25,6 +25,7 @@ pub mod sampler;
 pub mod server;
 pub mod signals;
 pub mod synapse;
+pub mod tls;
 pub mod tokenizer;
 pub mod tree;
 pub mod vision;

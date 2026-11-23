@@ -20,7 +20,9 @@ use gaudium::engine::{load_engine, GenEngine};
 use gaudium::fp8::{bf16_to_f32, f32_to_bf16_rne, store_act_scales};
 use gaudium::model_spec::ModelSpec;
 use gaudium::safetensors::SafetensorsStore;
-use gaudium::server::{parse_model_arg, run_server, ModelRunOptions, ServerConfig};
+use gaudium::server::{
+    parse_model_arg, run_server, ModelRunOptions, ProxyOptions, ServerConfig,
+};
 use gaudium::synapse::device::HpuDevice;
 use gaudium::synapse::ffi::{SynDataType, SynapseApi};
 use gaudium::synapse::graph::GraphBuilder;
@@ -131,6 +133,39 @@ fn print_usage() {
          \x20                       never names the <a2ui-json> tags is not used: the last good\n\
          \x20                       version (or the built-in text) stays, the reason is logged and\n\
          \x20                       shown under instructions_source in GET /gaudium/a2ui\n\
+         \x20 --tls-cert <file>     Serve HTTPS as well: the PEM certificate (with its chain) for\n\
+         \x20 --tls-key <file>      the server, and its unencrypted PEM private key. HTTP and HTTPS\n\
+         \x20                       then share the port: http://host:port and https://host:port both\n\
+         \x20                       answer, and clients that used plain HTTP go on working. Opened\n\
+         \x20                       over https the Web UI may use the microphone and the clipboard\n\
+         \x20                       from other machines. TLS comes from the system's OpenSSL 3\n\
+         \x20                       (libssl.so.3), loaded when asked for: without it the server\n\
+         \x20                       starts, says that HTTPS is not offered, and serves plain HTTP.\n\
+         \x20                       Behind a front end that ends TLS itself give neither option\n\
+         \x20 --mcp-proxy           Offer the MCP proxy (/cors-proxy) to the Web UI: the server\n\
+         \x20                       makes the requests to an MCP server instead of the browser (for\n\
+         \x20                       servers without CORS headers, servers only this machine\n\
+         \x20                       reaches, and plain-http servers used from an https page). Off\n\
+         \x20                       by default. It needs the targets it may reach (the two options\n\
+         \x20                       below); requests need the API key when one is set; a page of\n\
+         \x20                       another site cannot drive it. GET /gaudium/proxy shows its\n\
+         \x20                       settings and last decisions\n\
+         \x20 --mcp-proxy-allow <list>  Targets the proxy may reach, comma separated (repeatable):\n\
+         \x20                       host, host:port, *.domain, an address, an address range\n\
+         \x20                       (192.0.2.0/24), or * for any target (* needs --api-key). Each\n\
+         \x20                       address a target resolves to must be public, and the\n\
+         \x20                       connection goes to the address that was checked\n\
+         \x20 --mcp-proxy-allow-private <list>  Targets that may be reached although their address\n\
+         \x20                       is loopback, private or link-local: the same forms without *\n\
+         \x20                       (localhost:8931, 127.0.0.1, 192.168.0.0/16). An entry here\n\
+         \x20                       also allows the target, so an MCP server on this machine\n\
+         \x20                       needs this option only\n\
+         \x20 --mcp-proxy-max-mb <N>  Largest response the proxy passes on, in MiB (default: 64)\n\
+         \x20 --mcp-proxy-timeout <secs>  Longest silence of a target before the proxy gives up\n\
+         \x20                       (default: 600). An idle event stream gets a comment line\n\
+         \x20                       every 20 s so that a front end does not cut it\n\
+         \x20 --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets\n\
+         \x20                       besides the system's (an MCP server with a private certificate)\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \n\
          Live status environment variables:\n\
@@ -1687,6 +1722,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let mut verbose = false;
+    let mut mcp_proxy = ProxyOptions::default();
+    let mut tls_cert: Option<PathBuf> = None;
+    let mut tls_key: Option<PathBuf> = None;
     let mut per_model: Vec<(String, ModelRunOptions)> = Vec::new();
     let mut draft_k: Vec<u64> = Vec::new();
     let mut build_cache = false;
@@ -1858,6 +1896,30 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             "--a2ui-prompt" => {
                 a2ui_prompt = Some(PathBuf::from(next_val(&mut i, "--a2ui-prompt")?))
             }
+            "--tls-cert" => tls_cert = Some(PathBuf::from(next_val(&mut i, "--tls-cert")?)),
+            "--tls-key" => tls_key = Some(PathBuf::from(next_val(&mut i, "--tls-key")?)),
+            "--mcp-proxy" => mcp_proxy.enabled = true,
+            "--mcp-proxy-allow" => mcp_proxy
+                .allow
+                .push(next_val(&mut i, "--mcp-proxy-allow")?),
+            "--mcp-proxy-allow-private" => mcp_proxy
+                .allow_private
+                .push(next_val(&mut i, "--mcp-proxy-allow-private")?),
+            "--mcp-proxy-max-mb" => {
+                let s = next_val(&mut i, "--mcp-proxy-max-mb")?;
+                mcp_proxy.max_response_mb = s
+                    .parse()
+                    .map_err(|_| format!("invalid --mcp-proxy-max-mb '{s}'"))?;
+            }
+            "--mcp-proxy-timeout" => {
+                let s = next_val(&mut i, "--mcp-proxy-timeout")?;
+                mcp_proxy.idle_timeout_s = s
+                    .parse()
+                    .map_err(|_| format!("invalid --mcp-proxy-timeout '{s}'"))?;
+            }
+            "--mcp-proxy-ca" => {
+                mcp_proxy.ca_file = Some(PathBuf::from(next_val(&mut i, "--mcp-proxy-ca")?))
+            }
             "--verbose" => verbose = true,
             other => return Err(format!("unknown --serve flag '{other}'")),
         }
@@ -1901,6 +1963,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         vision_max_patches,
         vision_max_tokens,
         prefix_slots,
+        mcp_proxy,
+        tls_cert,
+        tls_key,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {
