@@ -994,6 +994,9 @@ pub struct Qwen3Engine {
     driver_version: String,
     cache: RecipeCache,
     elf_hashes: Vec<(String, String)>,
+    /// The FP8 inputs this load used (the activation-scale table as parsed, the cached
+    /// matrices as found): part of the identity the host-RAM tier stamps entries with.
+    fp8_id: String,
 
     // Recipes (must drop before `dev`)
     head_t1: CompiledRecipe,
@@ -2065,6 +2068,9 @@ impl Qwen3Engine {
         let t_up = Instant::now();
         let store =
             SafetensorsStore::open(&cfg.model_dir).map_err(|e| format!("open safetensors: {e}"))?;
+        // what the host tier's identity says about this load's FP8 inputs: the table as parsed
+        // (now), the cache files as used (after the upload)
+        let fp8_table_id = crate::engine::fp8_pack::act_table_id(&fp8_act_table);
         // [moe/fp8 hook] FP8 checkpoints / FP8 device weights / MoE wide MLPs
         let ext_packer = crate::engine::fp8_pack::ExtPacker::new(
             &store,
@@ -2201,6 +2207,10 @@ impl Qwen3Engine {
         )?;
         drop(stage_upload); // the upload staging memory is not needed after the load
         ext_packer.log_summary(cfg.verbose); // [moe/fp8 hook]
+        let fp8_id = format!(
+            "table={fp8_table_id}|cache_files={}",
+            ext_packer.cache_files_id()
+        );
 
         let logits_bytes = (spec.vocab as usize) * 2;
         let stage_io_bytes = logits_bytes.max((prefill_tile as usize) * 4).max(4096);
@@ -2324,6 +2334,7 @@ impl Qwen3Engine {
             driver_version,
             cache,
             elf_hashes,
+            fp8_id,
             head_t1,
             step_recipes,
             embed_recipes,

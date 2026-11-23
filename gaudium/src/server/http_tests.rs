@@ -1276,6 +1276,54 @@ fn served_engine_configuration_follows_the_server_options() {
 /// The host-RAM tier as a client sees it: where a request's reused rows came from and what was
 /// copied for it, the store and the engine's measured rates in `/props`, and the two moments
 /// the server gives the engine for its saves (after a response, before a release).
+/// A connection that ends while a chat request still holds the card must leave that request's
+/// idle work pending: the request's own connection does it once the card is free.
+#[test]
+fn idle_work_stays_pending_until_a_connection_can_start_it() {
+    use crate::engine::qwen3::host_tier::TierReport;
+    let cache = Arc::new(crate::cache_ram::SharedCache::new(8 << 30, 256 << 20, false, false));
+    let h = harness_with_cache(Some(Arc::clone(&cache)));
+    h.tier.lock().unwrap().next.push_back(TierReport::default());
+    h.script("First.");
+    assert_eq!(h.chat("").0, 200);
+    let idles = || h.tier.lock().unwrap().idle_waiting.len();
+    let due = || h.state.slot.lock().unwrap().idle_due;
+    assert_eq!((idles(), due()), (1, false));
+    // A chat request is at its end: it has left idle work pending and still holds the card.
+    h.state.slot.lock().unwrap().idle_due = true;
+    let card = h.state.card_op.lock().unwrap();
+    // Another connection (a token count: no card) comes and goes meanwhile. It cannot start
+    // the work, and it must not mark it done.
+    let (status, text) = h.post(
+        "/gaudium/count_tokens",
+        r#"{"messages":[{"role":"user","content":"Weather in Oslo?"}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    assert_eq!((idles(), due()), (1, true));
+    // The chat request lets go of the card and its connection ends: now the work is done, once.
+    drop(card);
+    h.state.idle_work();
+    assert_eq!((idles(), due()), (2, false));
+    // nothing is pending: a connection that ends starts nothing
+    let (status, _) = h.post(
+        "/gaudium/count_tokens",
+        r#"{"messages":[{"role":"user","content":"Weather in Oslo?"}]}"#,
+    );
+    assert_eq!(status, 200);
+    assert_eq!((idles(), due()), (2, false));
+    // work that is pending while a request uses the engine waits for that request too
+    {
+        let mut s = h.state.slot.lock().unwrap();
+        s.idle_due = true;
+        s.active_requests = 1;
+    }
+    h.state.idle_work();
+    assert_eq!((idles(), due()), (2, true));
+    h.state.slot.lock().unwrap().active_requests = 0;
+    h.state.idle_work();
+    assert_eq!((idles(), due()), (3, false));
+}
+
 #[test]
 fn the_host_tier_is_reported_and_given_its_idle_time() {
     use crate::engine::qwen3::host_tier::{Tier, TierReport};

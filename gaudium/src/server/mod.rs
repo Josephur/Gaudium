@@ -973,11 +973,16 @@ impl AppState {
     }
 
     /// The engine's idle time after a chat request (the host-RAM tier saves what the card holds
-    /// for its conversation). Runs on the thread of the request that just ended, after its
-    /// connection was closed, and only while the card is free: a request that already holds or
-    /// waits for the card comes first, and the work gives way to one that arrives.
+    /// for its conversation). Called when any connection has ended, on that connection's
+    /// thread, and done only while the card is free: a request that already holds or waits
+    /// for the card comes first, and the work gives way to one that arrives.
+    ///
+    /// The work a chat request left pending stays pending until a caller can really start it
+    /// (the verified `hc_idle_starts`, `hc_idle_left`). A connection that ends while the
+    /// request still holds the card finds the card busy and changes nothing; the request's own
+    /// connection, or whichever ends next, then does the work.
     fn idle_work(&self) {
-        if self.host_cache.is_none() || !std::mem::take(&mut self.slot.lock().unwrap().idle_due) {
+        if self.host_cache.is_none() {
             return;
         }
         // not while another request has the card (it saves what it would overwrite itself)
@@ -986,8 +991,10 @@ impl AppState {
         };
         let taken = {
             let mut s = self.slot.lock().unwrap();
-            let ready = matches!(s.lifecycle, Lifecycle::Ready(_));
-            if crate::verified::hc_idle_may_take(s.active_requests, ready) {
+            let ready = matches!(s.lifecycle, Lifecycle::Ready(_)) && s.engine.is_some();
+            let starts = crate::verified::hc_idle_starts(s.idle_due, s.active_requests, ready);
+            s.idle_due = crate::verified::hc_idle_left(s.idle_due, starts);
+            if starts {
                 s.engine.take()
             } else {
                 None

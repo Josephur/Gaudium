@@ -1016,71 +1016,92 @@ pub fn identity_of(engine: &str, layout: &str) -> EngineId {
     digest128(format!("{engine}|layout={layout}").as_bytes())
 }
 
+/// Names, sizes and modification times of the files of `dir` (`all`), or of its weight and
+/// configuration files only.
+fn files_of(dir: &std::path::Path, all: bool) -> String {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let keep = all
+                || name.ends_with(".safetensors")
+                || name.ends_with(".json")
+                || name.ends_with(".txt");
+            let md = e.metadata().ok()?;
+            if !md.is_file() {
+                return None;
+            }
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            keep.then(|| format!("{name}:{}:{mtime}", md.len()))
+        })
+        .collect();
+    v.sort();
+    v.join(",")
+}
+
+/// The FP8 files of a DSpine drafter in `draft_dir`, as a load finds them: its activation-scale
+/// table (the one the run options name, else the one in its default FP8 directory) by its
+/// content, and the files of that table's directory, which is where the drafter keeps its
+/// quantised matrices, by name, size and modification time. A drafter only proposes tokens, so
+/// none of this can change an answer; it decides what the saved context rings hold.
+pub(super) fn drafter_fp8_text(
+    draft_dir: &std::path::Path,
+    step: &crate::engine::step_opts::StepOpts,
+) -> String {
+    let table = spec::dspine::act_table_path(draft_dir, step);
+    let content = match std::fs::read(&table) {
+        Ok(bytes) => {
+            let d = digest128(&bytes);
+            format!("{}:{:016x}{:016x}", bytes.len(), d[0], d[1])
+        }
+        Err(_) => "absent".into(),
+    };
+    format!(
+        "table={content}|files={}",
+        table.parent().map_or(String::new(), |d| files_of(d, true))
+    )
+}
+
 /// Everything that decides the bytes of a row or of a state on a loaded engine, as text: the
 /// model's files, the precisions, the context and the tile, the kernels, the drafter, the
 /// vision tower.
+///
+/// Every input is named as the load resolved it, never only as the setting that may name it:
+/// the FP8 activation-scale table and the cached FP8 matrices come from the load itself
+/// (`Qwen3Engine::fp8_id`: the table as parsed, the cache files as used), wherever the
+/// setting, an environment variable or the default place pointed; the prefill levers are the
+/// resolved ones; the drafter's FP8 files are read where its load reads them.
 pub(super) fn engine_text(cfg: &Qwen3Config, eng: &Qwen3Engine) -> String {
-    /// Names, sizes and modification times of the files of `dir` (`all`), or of its weight and
-    /// configuration files only.
-    fn files_of(dir: &std::path::Path, all: bool) -> String {
-        let mut v: Vec<String> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let keep = all
-                    || name.ends_with(".safetensors")
-                    || name.ends_with(".json")
-                    || name.ends_with(".txt");
-                let md = e.metadata().ok()?;
-                if !md.is_file() {
-                    return None;
-                }
-                let mtime = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_nanos());
-                keep.then(|| format!("{name}:{}:{mtime}", md.len()))
-            })
-            .collect();
-        v.sort();
-        v.join(",")
-    }
-    let file_of = |p: &Option<PathBuf>| -> String {
-        p.as_ref().map_or(String::new(), |p| {
-            let md = std::fs::metadata(p).ok();
-            format!(
-                "{}:{}:{}",
-                p.display(),
-                md.as_ref().map_or(0, |m| m.len()),
-                md.and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_nanos())
-            )
-        })
-    };
     let drafter = cfg.spec.as_ref().map(|sc| {
         let dir = match &sc.method {
-            spec::SpecMethod::DSpine { draft_model }
-            | spec::SpecMethod::DFlash2 { draft_model }
+            spec::SpecMethod::DSpine { draft_model } => format!(
+                "{}|fp8={}",
+                files_of(draft_model, false),
+                drafter_fp8_text(draft_model, &cfg.step)
+            ),
+            spec::SpecMethod::DFlash2 { draft_model }
             | spec::SpecMethod::Assistant { draft_model } => files_of(draft_model, false),
             _ => String::new(),
         };
         format!("{sc:?}|{dir}")
     });
     format!(
-        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8_act={}|fp8_cache={:?}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
+        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8={}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
         cfg.model_dir.display(),
         files_of(&cfg.model_dir, false),
         eng.spec,
         eng.max_ctx,
         eng.prefill_tile,
-        cfg.prefill,
+        // the levers as resolved (`--prefill`, else `GAUDIUM_PREFILL`, else the defaults)
+        eng.pf.opts,
         cfg.precision,
-        file_of(&cfg.fp8_act),
-        cfg.fp8_cache,
+        eng.fp8_id,
         cfg.moe_routed,
         cfg.request_reset,
         cfg.step,
@@ -2227,6 +2248,123 @@ mod tests {
             identity_of("another engine", &fingerprint(&base)),
             id(&base)
         );
+    }
+
+    #[test]
+    fn the_identity_follows_the_fp8_table_a_load_reads_wherever_it_is_found() {
+        use crate::engine::fp8_pack::{
+            act_path_with, act_table_id, default_fp8_dir, ACT_TABLE_FILE,
+        };
+        let root = std::env::temp_dir().join(format!("gaudium-fp8-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let model = root.join("models").join("M");
+        let default_place = default_fp8_dir(&model).join(ACT_TABLE_FILE);
+        let by_env = root.join("from-env").join("scales.txt");
+        let by_setting = root.join("from-setting").join("scales.txt");
+        let write = |path: &std::path::Path, k: i32| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!("L0_h {k} 12.5 1.25\nL0_core 2 7 0.5\nL0_h2 3 12 1\nL0_m 1 3 0.25\n"),
+            )
+            .unwrap();
+        };
+        for p in [&default_place, &by_env, &by_setting] {
+            write(p, 3);
+        }
+        // the identity of the engine a load gives, from the table that load reads: resolved as
+        // the load resolves it, parsed as the load parses it
+        let id = |cfg: &Qwen3Config, env: &dyn Fn(&str) -> Option<PathBuf>| {
+            let path = act_path_with(cfg, env);
+            let act = crate::fp8::load_act_scales(&path).unwrap();
+            (
+                path,
+                identity_of(
+                    &format!("the engine|fp8=table={}", act_table_id(&act)),
+                    "the layout",
+                ),
+            )
+        };
+        let no_env = |_: &str| -> Option<PathBuf> { None };
+        let env = {
+            let by_env = by_env.clone();
+            move |name: &str| (name == "GAUDIUM_FP8_ACT").then(|| by_env.clone())
+        };
+        let plain = Qwen3Config::new(model.clone(), root.join("kernels"));
+        let mut set = plain.clone();
+        set.fp8_act = Some(by_setting.clone());
+        // (configuration, environment, the file that load reads, the two it does not)
+        type Env<'a> = &'a dyn Fn(&str) -> Option<PathBuf>;
+        type Case<'a> = (&'a Qwen3Config, Env<'a>, &'a PathBuf, [&'a PathBuf; 2]);
+        let cases: [Case; 3] = [
+            (&set, &env, &by_setting, [&by_env, &default_place]),
+            (&plain, &env, &by_env, [&by_setting, &default_place]),
+            (&plain, &no_env, &default_place, [&by_setting, &by_env]),
+        ];
+        for (cfg, env, read, others) in cases {
+            for p in [&default_place, &by_env, &by_setting] {
+                write(p, 3);
+            }
+            let (path, before) = id(cfg, env);
+            assert_eq!(&path, read);
+            // a table that the load does not read changes nothing
+            for other in others {
+                write(other, 5);
+            }
+            assert_eq!(id(cfg, env).1, before, "{}", read.display());
+            // the one it reads, with another scale: another engine
+            write(read, 4);
+            assert_ne!(id(cfg, env).1, before, "{}", read.display());
+            // the same scales again: the same engine, whenever the file was written
+            write(read, 3);
+            assert_eq!(id(cfg, env).1, before, "{}", read.display());
+        }
+        // the same scales give one identity wherever the table lies; a BF16 load names none
+        for p in [&default_place, &by_env, &by_setting] {
+            write(p, 3);
+        }
+        assert_eq!(id(&set, &env).1, id(&plain, &no_env).1);
+        assert_eq!(act_table_id(&std::collections::BTreeMap::new()), "none");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_identity_follows_the_drafter_s_fp8_files() {
+        use crate::engine::step_opts::StepOpts;
+        let root = std::env::temp_dir().join(format!("gaudium-drafter-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let draft = root.join("Drafter-b16");
+        let fp8_dir = spec::dspine::default_fp8_dir(&draft);
+        std::fs::create_dir_all(&draft).unwrap();
+        std::fs::create_dir_all(&fp8_dir).unwrap();
+        let table = fp8_dir.join(spec::dspine::ACT_TABLE_FILE);
+        let opts = StepOpts::default();
+        // no table: named as absent
+        let none = drafter_fp8_text(&draft, &opts);
+        assert!(none.starts_with("table=absent|"), "{none}");
+        std::fs::write(&table, "ds_L0_x 3 12 1\n").unwrap();
+        let first = drafter_fp8_text(&draft, &opts);
+        assert_ne!(first, none);
+        // another scale in the table, or another cached matrix beside it: another text
+        std::fs::write(&table, "ds_L0_x 4 12 1\n").unwrap();
+        let second = drafter_fp8_text(&draft, &opts);
+        assert_ne!(second, first);
+        std::fs::write(fp8_dir.join("W-0123.w8"), [1u8, 2, 3]).unwrap();
+        let third = drafter_fp8_text(&draft, &opts);
+        assert_ne!(third, second);
+        // a table the run options name is the one that counts
+        let elsewhere = root.join("elsewhere").join("ds.txt");
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        std::fs::write(&elsewhere, "ds_L0_x 3 12 1\n").unwrap();
+        let named = StepOpts {
+            draft_fp8_act: Some(elsewhere.clone()),
+            ..StepOpts::default()
+        };
+        let by_option = drafter_fp8_text(&draft, &named);
+        assert_ne!(by_option, third);
+        std::fs::write(&table, "ds_L0_x 9 12 1\n").unwrap();
+        assert_eq!(drafter_fp8_text(&draft, &named), by_option);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

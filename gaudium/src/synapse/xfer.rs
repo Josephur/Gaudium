@@ -40,8 +40,9 @@ use crate::hostmem::AnonMap;
 use crate::synapse::device::{DeviceEvent, HpuDevice, PinnedBuf};
 use crate::synapse::ffi::{SynDeviceId, SynStreamHandle, SynapseApi, SynapseError};
 use crate::verified::{
-    xf_buf_full, xf_cmd_joins, xf_next_buf, xf_part_full, xf_part_take, xf_probe_dev_off,
-    xf_probe_span, xf_probe_span_fits, xf_slice_fits, xf_slice_off, xf_take,
+    hc_budget_fits, xf_buf_full, xf_cmd_joins, xf_next_buf, xf_part_full, xf_part_take,
+    xf_probe_dev_off, xf_probe_host_need, xf_probe_span, xf_probe_span_fits, xf_slice_fits,
+    xf_slice_off, xf_take,
 };
 
 /// Buffers and bytes per buffer of the ring an engine keeps.
@@ -927,6 +928,35 @@ pub unsafe fn stream_copy(src: *const u8, dst: *mut u8, len: usize) {
     unsafe { std::ptr::copy_nonoverlapping(src, dst, len) }
 }
 
+/// Whether the probe may take its host memory: the ordinary memory it holds at its peak
+/// (`xf_probe_host_need`: a buffer of `device_bytes`, or the two buffers of `copy_bytes` of the
+/// host-copy test) and the `ring_bytes` pinned beside it must fit in what the host and the
+/// control groups of this process have left (`hc_budget_fits`). The pages of a mapping exist
+/// only once a copy writes them, so a probe that does not fit would be stopped by the kernel
+/// in the middle of transfers, not by a failed allocation; an error here says what is missing
+/// before anything is allocated.
+fn probe_admission(
+    device_bytes: u64,
+    copy_bytes: u64,
+    ring_bytes: u64,
+    mem: &crate::hostmem::HostMemory,
+) -> Result<(), String> {
+    let need = xf_probe_host_need(device_bytes, copy_bytes);
+    let available = mem.available();
+    if hc_budget_fits(need, ring_bytes, available) {
+        return Ok(());
+    }
+    let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+    Err(format!(
+        "the copy probe needs {:.2} GiB of host memory ({:.2} GiB of buffers and {:.2} GiB of pinned transfer buffers), and {:.2} GiB are available ({}). Give it fewer GiB, or free host memory",
+        g(need.saturating_add(ring_bytes)),
+        g(need),
+        g(ring_bytes),
+        g(available),
+        mem.describe()
+    ))
+}
+
 /// Measures the copies of this machine and card and prints them: the raw link in both
 /// directions for two kinds of pinned memory and several command sizes, the host copy alone,
 /// and whole copies through the ring. `gib`: device bytes used, in GiB.
@@ -934,6 +964,17 @@ pub fn probe(gib: u64) -> Result<(), String> {
     use crate::verified::HbmCat;
     let gib = gib.clamp(1, 16);
     let bytes = gib << 30;
+    // the host-copy test at the end: two buffers of this size
+    let copy_bytes = (1u64 << 30).min(bytes);
+    // host memory first: nothing is allocated, and no card is opened, for a probe that would
+    // not fit
+    let mem = crate::hostmem::HostMemory::read();
+    probe_admission(
+        bytes,
+        copy_bytes,
+        XferRing::planned_bytes(RING_BUFS, RING_BUF_BYTES),
+        &mem,
+    )?;
     let api = Arc::new(SynapseApi::load_default().map_err(|e| format!("load libSynapse.so: {e}"))?);
     let mut dev =
         HpuDevice::open_gaudi2(Arc::clone(&api)).map_err(|e| format!("open Gaudi 2: {e}"))?;
@@ -947,7 +988,6 @@ pub fn probe(gib: u64) -> Result<(), String> {
     // SAFETY: the stream belongs to `dev`.
     unsafe { dev.sync_stream(dev.compute_stream()) }.map_err(|e| format!("sync: {e}"))?;
     let g = |b: u64| b as f64 / (1u64 << 30) as f64;
-    let mem = crate::hostmem::HostMemory::read();
     println!(
         "copy probe: {gib} GiB of device memory; host: {}; {} logical CPUs",
         mem.describe(),
@@ -1016,7 +1056,7 @@ pub fn probe(gib: u64) -> Result<(), String> {
         }
     }
     // the host copy alone, between two anonymous mappings
-    let n = (1usize << 30).min(bytes as usize);
+    let n = copy_bytes as usize;
     let mut a = AnonMap::new(n as u64)?;
     a.as_mut_slice().fill(1);
     for threads in [1usize, 2, 4, 6, 8] {
@@ -1419,6 +1459,45 @@ mod tests {
             )
             .is_err());
         assert_eq!(small.serial.get(), 0);
+    }
+
+    #[test]
+    fn the_probe_is_refused_when_the_host_cannot_hold_its_buffers() {
+        use crate::hostmem::{Group, HostMemory};
+        let gib = 1u64 << 30;
+        let ring = XferRing::planned_bytes(RING_BUFS, RING_BUF_BYTES);
+        assert_eq!(ring, 256 << 20);
+        // the default probe: 2 GiB of device bytes, a host-copy test of two 1 GiB buffers
+        let host = |bytes: u64| HostMemory::of_host(bytes);
+        assert!(probe_admission(2 * gib, gib, ring, &host(2 * gib + ring)).is_ok());
+        let e = probe_admission(2 * gib, gib, ring, &host(2 * gib + ring - 1)).unwrap_err();
+        assert!(
+            e.contains("needs 2.25 GiB") && e.contains("2.25 GiB are available"),
+            "{e}"
+        );
+        // a probe of 1 GiB holds more in its host-copy test (two buffers) than in its copies
+        assert!(probe_admission(gib, gib, ring, &host(2 * gib + ring)).is_ok());
+        assert!(probe_admission(gib, gib, ring, &host(2 * gib)).is_err());
+        // a control group above the process bounds it, whatever the host has
+        let limited = HostMemory {
+            host_available: 64 * gib,
+            groups: vec![
+                Group {
+                    limit: None,
+                    in_use: Some(gib),
+                },
+                Group {
+                    limit: Some(3 * gib),
+                    in_use: Some(gib),
+                },
+            ],
+        };
+        let e = probe_admission(2 * gib, gib, ring, &limited).unwrap_err();
+        assert!(
+            e.contains("2.00 GiB are available") && e.contains("the group above"),
+            "{e}"
+        );
+        assert!(probe_admission(gib, 256 << 20, ring, &limited).is_ok());
     }
 
     #[test]

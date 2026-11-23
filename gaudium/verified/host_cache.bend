@@ -3103,3 +3103,91 @@ law hc_last_position_is_due:
 def hc_last_position_is_due(k, x, c):
   %hc_le_add_r(k, x) : {Bool.and(Bool.and(True{}, _), True{}) == True{} : Bool}
   {==}
+
+# ============================================================================
+# 19. Pending idle work, and the host memory of the copy probe
+# ============================================================================
+
+# A chat request leaves idle work pending (the save of what the card holds). Any connection
+# that ends looks whether it can start it. Is it started now? Only when some is pending and the
+# engine may be taken (`hc_idle_may_take`).
+def hc_idle_starts(due: Bool, active: Nat, ready: Bool) -> Bool:
+  Bool.and(due, hc_idle_may_take(active, ready))
+
+# Is idle work still pending after a caller looked? Unless that caller started it.
+def hc_idle_left(due: Bool, started: Bool) -> Bool:
+  Bool.and(due, Bool.not(started))
+
+# Ordinary host memory the copy probe holds at its peak: one buffer as large as the device
+# bytes it moves, or the two buffers of its host-copy test.
+def xf_probe_host_need(+device_bytes: Nat, +copy_bytes: Nat) -> Nat:
+  Nat.max(device_bytes, Nat.add(copy_bytes, copy_bytes))
+
+# LAW HC.142: idle work is never started on an engine a request is using ...
+law hc_idle_never_starts_on_a_busy_engine:
+  for +d: Bool
+  for +a: Nat
+  for +r: Bool
+  {hc_idle_starts(d, 1n+a, r) == False{} : Bool}
+
+def hc_idle_never_starts_on_a_busy_engine(d, a, r):
+  %Equal.sym(Bool, hc_idle_may_take(1n+a, r), False{}, hc_idle_never_takes_a_busy_engine(a, r)) : {Bool.and(d, _) == False{} : Bool}
+  hc_and_false_r(d)
+
+# LAW HC.143: ... nor on one that is not ready ...
+law hc_idle_never_starts_on_an_unready_engine:
+  for +d: Bool
+  for +a: Nat
+  {hc_idle_starts(d, a, False{}) == False{} : Bool}
+
+def hc_idle_never_starts_on_an_unready_engine(d, a):
+  hc_and_false_r(d)
+
+# LAW HC.144: ... nor when none is pending.
+law hc_idle_never_starts_without_work:
+  for +a: Nat
+  for +r: Bool
+  {hc_idle_starts(False{}, a, r) == False{} : Bool}
+
+def hc_idle_never_starts_without_work(a, r):
+  {==}
+
+# LAW HC.145: work that a caller could not start is never marked done: it stays as pending as
+# the caller found it.
+law hc_idle_unstarted_work_stays:
+  for +d: Bool
+  {hc_idle_left(d, False{}) == d : Bool}
+
+def hc_idle_unstarted_work_stays(d):
+  match d:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW HC.146: so pending work is still pending after a caller that found the engine in use.
+law hc_idle_busy_engine_keeps_work_pending:
+  for +a: Nat
+  for +r: Bool
+  {hc_idle_left(True{}, hc_idle_starts(True{}, 1n+a, r)) == True{} : Bool}
+
+def hc_idle_busy_engine_keeps_work_pending(a, r):
+  %Equal.sym(Bool, hc_idle_may_take(1n+a, r), False{}, hc_idle_never_takes_a_busy_engine(a, r)) : {Bool.and(True{}, Bool.not(Bool.and(True{}, _))) == True{} : Bool}
+  {==}
+
+# LAW HC.147: the probe's host memory is never counted below the buffer it copies the device
+# bytes into ...
+law xf_probe_need_covers_the_buffer:
+  for +b: Nat
+  for +c: Nat
+  {Nat.is_le(b, xf_probe_host_need(b, c)) == True{} : Bool}
+
+def xf_probe_need_covers_the_buffer(b, c):
+  hc_le_max_l(b, Nat.add(c, c))
+
+# LAW HC.148: ... nor below the two buffers of its host-copy test.
+law xf_probe_need_covers_the_copy:
+  for +b: Nat
+  for +c: Nat
+  {Nat.is_le(Nat.add(c, c), xf_probe_host_need(b, c)) == True{} : Bool}
+
+def xf_probe_need_covers_the_copy(b, c):
+  hc_le_max_r(b, Nat.add(c, c))
