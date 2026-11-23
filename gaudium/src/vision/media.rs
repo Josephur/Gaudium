@@ -267,6 +267,8 @@ pub struct MediaCounts {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestMedia {
     pub items: Vec<MediaItem>,
+    /// The template's text for one image (`VisionSpec::image_block`; empty: `IMAGE_BLOCK`).
+    pub image_block: String,
     /// Host time spent decoding and preparing (ms).
     pub host_ms: f64,
 }
@@ -592,6 +594,7 @@ impl RequestMedia {
         }
         Ok(Self {
             items,
+            image_block: serve.spec.image_block.clone(),
             host_ms: t0.elapsed().as_secs_f64() * 1000.0,
         })
     }
@@ -635,15 +638,20 @@ impl RequestMedia {
     /// block per temporal patch with its time in front. Image blocks stay as they are. The
     /// blocks in the text must be this request's media, in order.
     pub fn expand_text(&self, prompt: &str) -> Result<String, String> {
+        let image_block = if self.image_block.is_empty() {
+            IMAGE_BLOCK
+        } else {
+            self.image_block.as_str()
+        };
         let mut out = String::with_capacity(prompt.len());
         let mut rest = prompt;
         for it in &self.items {
             let (block, what) = match it {
-                MediaItem::Image(_) => (IMAGE_BLOCK, "image"),
+                MediaItem::Image(_) => (image_block, "image"),
                 MediaItem::Video(_) => (VIDEO_BLOCK, "video"),
             };
             // the next block of either kind must be this item's
-            let next = [IMAGE_BLOCK, VIDEO_BLOCK]
+            let next = [image_block, VIDEO_BLOCK]
                 .iter()
                 .filter_map(|b| rest.find(b).map(|at| (at, *b)))
                 .min();
@@ -659,7 +667,7 @@ impl RequestMedia {
             }
             out.push_str(&rest[..at]);
             match it {
-                MediaItem::Image(_) => out.push_str(IMAGE_BLOCK),
+                MediaItem::Image(_) => out.push_str(image_block),
                 MediaItem::Video(v) => {
                     for &t in &v.times {
                         out.push_str(&time_label(t));
@@ -669,7 +677,7 @@ impl RequestMedia {
             }
             rest = &rest[at + block.len()..];
         }
-        if rest.contains(IMAGE_BLOCK) || rest.contains(VIDEO_BLOCK) {
+        if rest.contains(image_block) || rest.contains(VIDEO_BLOCK) {
             return Err(
                 "the prompt has more image or video placeholders than the conversation has images and videos".into(),
             );

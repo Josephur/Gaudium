@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use crate::fp8::f32_to_bf16_rne;
-use crate::vision::VisionSpec;
+use crate::vision::{ImageProcessor, VisionSpec};
 
 /// Uncompressed 8-bit RGB image, rows top to bottom, 3 bytes per pixel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,6 +443,9 @@ pub fn image_target_size(
     height: usize,
     vs: &VisionSpec,
 ) -> Result<(usize, usize), String> {
+    if vs.processor == ImageProcessor::Tiles {
+        return crate::engine::inkling2::vision::padded_size(width, height, vs);
+    }
     smart_resize(
         height,
         width,
@@ -501,6 +504,9 @@ fn patch_rows_bf16(
 
 /// Full host pipeline: resize, normalise, patch rows in merge order, BF16.
 pub fn prepare_image(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, String> {
+    if vs.processor == ImageProcessor::Tiles {
+        return crate::engine::inkling2::vision::prepare_tiles(img, vs);
+    }
     let (rh, rw, resized) = resize_for_tower(img, vs)?;
     let frames = vec![resized.as_slice(); vs.temporal as usize];
     Ok(patch_rows_bf16(
@@ -516,6 +522,9 @@ pub fn prepare_image(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, S
 /// The same patch rows as f32 (before BF16 rounding): what the reference processor returns as
 /// `pixel_values`. Used to check the pipeline against stored reference dumps.
 pub fn patch_rows_f32(img: &RgbImage, vs: &VisionSpec) -> Result<(usize, usize, Vec<f32>), String> {
+    if vs.processor == ImageProcessor::Tiles {
+        return crate::engine::inkling2::vision::tile_rows_f32(img, vs);
+    }
     let (rh, rw, resized) = resize_for_tower(img, vs)?;
     let p = vs.patch as usize;
     let (grid_h, grid_w) = (rh / p, rw / p);

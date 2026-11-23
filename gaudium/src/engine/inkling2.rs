@@ -59,6 +59,10 @@ use crate::verified::{align_up, ik_bias_off, ik_bias_width, ik_gate_off, ik_kx_w
 #[path = "inkling2_packer.rs"]
 pub mod packer;
 
+// Image input (vision tower, preprocessing, hand-over to the prefill).
+#[path = "inkling2_vision.rs"]
+pub mod vision;
+
 /// Rows of one chunk of a global layer's K / V cache (the softmax kernel stages one chunk).
 pub const IK_CHUNK: u64 = 4096;
 /// Largest prefill tile planned into the activation scratch.
@@ -1157,6 +1161,8 @@ pub struct Inkling2Engine {
 
     // Reusable pinned host staging buffer (must drop before `dev`)
     stage_io: PinnedBuf,
+    // vision: the image tower and its request state (recipes and pinned memory: before `dev`)
+    vision: Option<vision::IkVision>,
 
     // HBM address maps (sub-allocated from sealed arenas owned by `dev`)
     weights_addr: BTreeMap<String, u64>,
@@ -1269,6 +1275,10 @@ impl Inkling2Engine {
             RecipeCache::from_env()
         };
 
+        // vision: the image tower's share of the plan (none without image input)
+        let mut vision = vision::IkVision::plan(cfg, &IkDims::from_spec(&spec, IK_MAX_PREFILL_TILE)?)?;
+        let vis_bytes = vision.as_ref().map_or(0, |v| v.plan_bytes().0 + v.plan_bytes().1);
+
         // ---- Plan: the largest prefill tile whose exact plan fits the card ----
         let mut tile = cfg.prefill_tile.clamp(1, IK_MAX_PREFILL_TILE);
         let (dims, plan) = loop {
@@ -1277,7 +1287,7 @@ impl Inkling2Engine {
                 d.n_apps = n.clamp(1, d.apps.len());
             }
             let p = IkPlan::build(&d, max_ctx, max_chunks, tile);
-            let total = p.total(MIN_SHARED_WORKSPACE_BYTES);
+            let total = p.total(MIN_SHARED_WORKSPACE_BYTES) + vis_bytes;
             match dev.check_plan_fits(total, HBM_HEADROOM_BYTES) {
                 Ok(_) => break (d, p),
                 Err(e) if tile <= IK_MIN_PREFILL_TILE => {
@@ -1352,7 +1362,12 @@ impl Inkling2Engine {
             .compile(Arc::clone(&api), &cache, &driver_version)
             .map_err(|e| format!("compile decode step (1 chunk): {e}"))?;
         note(&step1);
-        let max_ws = head.ws_size.max(step1.ws_size);
+        // vision: the tower's largest planned recipes, so the shared workspace covers them
+        let vis_ws = match vision.as_mut() {
+            Some(v) => v.compile_planned(&api, &cache, &driver_version, cfg.verbose)?,
+            None => 0,
+        };
+        let max_ws = head.ws_size.max(step1.ws_size).max(vis_ws);
         if cfg.verbose {
             eprintln!(
                 "[gaudium] core recipes ready in {:.2}s (max_ws={:.2} MiB)",
@@ -1367,7 +1382,7 @@ impl Inkling2Engine {
         let kv_bytes = plan.kv_bytes();
         let ring_bytes = plan.ring_bytes();
         let act_bytes = plan.act_bytes();
-        let planned_total = plan.total(ws_bytes);
+        let planned_total = plan.total(ws_bytes) + vis_bytes;
         dev.check_plan_fits(planned_total, HBM_HEADROOM_BYTES)
             .map_err(|e| format!("HBM plan check failed: {e}"))?;
         if cfg.verbose {
@@ -1436,11 +1451,15 @@ impl Inkling2Engine {
         let pf_ids = suballoc(&mut act_arena, plan.pf_ids_bytes)?;
         let pf_cursor = suballoc(&mut act_arena, 256)?;
         let (buf_of_src, _) = source_buffers(&dims.wires[..dims.n_apps], dims.fin_states());
+        if let Some(v) = vision.as_mut() {
+            v.allocate(&mut dev)?;
+        }
 
         dev.seal_with_shared_workspace(ws_bytes)
             .map_err(|e| format!("seal HBM allocations: {e}"))?;
 
-        let hbm_bytes = [weights_bytes, kv_bytes, ring_bytes, act_bytes, ws_bytes];
+        let (vis_w, vis_a) = vision.as_ref().map_or((0, 0), |v| v.plan_bytes());
+        let hbm_bytes = [weights_bytes + vis_w, kv_bytes, ring_bytes, act_bytes + vis_a, ws_bytes];
         live.set_hbm_bytes(
             hbm_bytes[0],
             hbm_bytes[1],
@@ -1480,6 +1499,9 @@ impl Inkling2Engine {
             uploaded_bytes += expected;
         }
         drop(packer);
+        if let Some(v) = vision.as_mut() {
+            uploaded_bytes += v.upload(&dev, &store, &mut stage_upload)?;
+        }
         drop(store);
         if cfg.verbose {
             let dt = t_up.elapsed().as_secs_f64();
@@ -1537,6 +1559,7 @@ impl Inkling2Engine {
             app_recipes: HashMap::new(),
             pf_prepared: (0..n_apps).map(|_| None).collect(),
             stage_io,
+            vision,
             weights_addr,
             kv_addr,
             step_act_addr,
@@ -1871,6 +1894,11 @@ impl Inkling2Engine {
         cancel: Option<&AtomicBool>,
         mut on_token: impl FnMut(i32),
     ) -> Result<GenReport, String> {
+        // vision: the request's images (taken even when the request fails) against its
+        // placeholder rows
+        if let Some(v) = self.vision.as_mut() {
+            v.begin_request(prompt_ids, self.step_prefill)?;
+        }
         if prompt_ids.is_empty() {
             return Err("prompt must contain at least 1 token".into());
         }
@@ -1935,6 +1963,8 @@ impl Inkling2Engine {
         let mut pos = 0usize;
         let mut last_tile = 0u64;
         let mut recipe_ms = 0.0f64;
+        // vision: the tower runs first, its features land in the feature buffer
+        self.ikv_run_tower()?;
         while pos < prompt_ids.len() {
             if is_cancelled() {
                 return Ok(None);
@@ -1960,8 +1990,9 @@ impl Inkling2Engine {
                 .map_err(|e| format!("upload prefill ids: {e}"))?;
             self.write_i32_scalar(self.pf_cursor, pos as i32)?;
 
-            // embedding of the tile's rows into the buffer of source 0
-            {
+            // embedding of the tile's rows into the buffer of source 0 (vision: image rows take
+            // their features)
+            if !self.ikv_embed_tile(prompt_ids, pos, t)? {
                 let mut pool = self.pf_scratch.clone();
                 for name in ["embed", "w_embed"] {
                     pool.insert(name.to_string(), self.weights_addr[name]);

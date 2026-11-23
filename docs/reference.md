@@ -129,10 +129,12 @@ Serve options:
                         WebP, or a list of frames with their rate) in chat requests.
                         A model drafted by a block or an MTP drafter is served text
                         only (plain decode and DSpine run with image input)
-  --vision-max-patches <N>  Largest image the vision tower is planned for, in 16x16
-                        patches (default: 4096 = 1024x1024 pixels). Larger images are
-                        resized down to it; the tower's device memory grows with N^2
-                        (160 bytes x N^2: 2.5 GiB at 4096, 10 GiB at 8192)
+  --vision-max-patches <N>  Largest image the vision tower is planned for, in the
+                        model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:
+                        1024x1024 pixels, larger images are resized down to it; 20x20
+                        for Inkling 2, which never resizes: an image of more than N/4
+                        tiles of 40x40 pixels is refused). The tower's device memory
+                        grows with N^2 (about 160 bytes x N^2: 2.5 GiB at 4096)
   --vision-max-tokens <N>  Image tokens one request may hold, all images and video
                         frames together (default: 16384; 10 KiB of device memory each)
   --model-vision <id=N|off>  The vision tower of model <id> instead of the two options
@@ -254,6 +256,20 @@ Qwen prefill environment variables:
                         BF16 weights streams may differ between settings at exact BF16
                         logit ties, s16 > 0 is not token-identical to s16=0.
 
+Inkling 2 environment variables (debug):
+  GAUDIUM_IK_AMAX_BF16  1 = decode the 4-bit experts with their per-expert scale rounded
+                        to BF16 first, as the reference loader does (default: f32)
+  GAUDIUM_IK_APPS       Load only the first <n> layer applications (quick kernel checks;
+                        the output is not the model's)
+  GAUDIUM_IK_STEP_PREFILL  1 = prefill the prompt one row at a time through the decode
+                        step (takes no image)
+  GAUDIUM_IK_DUMP       Directory: every tensor of the decode step after the prompt is
+                        written there
+  GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first
+                        image request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence
+                        rows x 1024) and img<k>_feat (tokens x 2304) as raw BF16 (it
+                        syncs after each one; debug)
+
 Gemma 4 environment variables:
   GAUDIUM_G4_NORM       Layer RMS-norm node: row | tile | vendor (default: tile for sizes with
                         per-layer inputs, else vendor). Changes compiled graphs; streams may
@@ -316,9 +332,9 @@ Generate options:
                         PPM, decoded as the server decodes a request's image;
                         repeatable, in prompt order
   --image-raw <WxH:f>   Image input, raw RGB8 file with explicit size; repeatable
-  --vision-max-patches <N>  Largest image the vision tower is planned for, in
-                        16x16 patches (default: the largest --image; larger images
-                        are resized down to fit)
+  --vision-max-patches <N>  Largest image the vision tower is planned for, in the
+                        model's patches (default: the largest --image; Qwen3.5 / 3.8
+                        resize larger images down to fit, Inkling 2 refuses them)
   --vision-gelu-bf16    Evaluate the vision tower's GELU in BF16 (default: F32);
                         slightly faster, slightly less accurate image embeddings
   --dump-vision-emb <p> Write the image embeddings (tokens x hidden, raw BF16) to a file
@@ -470,7 +486,7 @@ or reads it to rewrite a file.
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `GAUDIUM_INKLING2_DIR` | `tokenizer::tests::inkling2_ids_match_the_reference`, `server::chat::tests::inkling2_template_renders_like_jinja2`, `server::chat::tests::inkling2_requests_render_through_the_model_template` (`--ignored`) | An Inkling 2 model directory: its `tokenizer.json` must encode and decode the cases of `gaudium/tests/data/tokenizer/inkling2_cases.json` exactly, and its `chat_template.jinja` must render the contexts of `gaudium/tests/data/chat/inkling2_renders.json` as Jinja2 does (both written by the generator scripts next to them). |
+| `GAUDIUM_INKLING2_DIR` | `tokenizer::tests::inkling2_ids_match_the_reference`, `server::chat::tests::inkling2_template_renders_like_jinja2`, `server::chat::tests::inkling2_requests_render_through_the_model_template`, `engine::inkling2::vision::tests::pos_rows_match_the_reference` (`--ignored`) | An Inkling 2 model directory: its `tokenizer.json` must encode and decode the cases of `gaudium/tests/data/tokenizer/inkling2_cases.json` exactly, its `chat_template.jinja` must render the contexts of `gaudium/tests/data/chat/inkling2_renders.json` as Jinja2 does, and the vision tower's position rows and class row resampled from its checkpoint must match `gaudium/tests/data/vision/inkling2/fixture.json` bit for bit (all written by the generator scripts next to them). |
 | `GAUDIUM_IMAGE_REF_DIR` | the decoder tests in `src/vision/decode/` (`--ignored`) | A directory of image files with the raw RGB dump the reference image library wrote for each; every file must decode to the same bytes. |
 | `GAUDIUM_IMAGE_PIPELINE_REF_DIR` | `vision::media::tests::reference_pipeline_records_match_bit_for_bit` (`--ignored`) | A directory written by `gaudium/tests/data/vision/make_pipeline_refs.py`: image files with the patch rows of the checkpoint's own image processor, which must match bit for bit. |
 | `GAUDIUM_VISION_REF_DIR` | `vision::tests::reference_prompt_records_match_bit_for_bit` (`--ignored`) | A directory of reference prompt records (token ids, image grids, positions, patch rows) that the prompt layout and the image preprocessing must reproduce. |

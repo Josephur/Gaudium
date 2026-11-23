@@ -151,10 +151,12 @@ fn print_usage() {
          \x20                       WebP, or a list of frames with their rate) in chat requests.\n\
          \x20                       A model drafted by a block or an MTP drafter is served text\n\
          \x20                       only (plain decode and DSpine run with image input)\n\
-         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in 16x16\n\
-         \x20                       patches (default: 4096 = 1024x1024 pixels). Larger images are\n\
-         \x20                       resized down to it; the tower's device memory grows with N^2\n\
-         \x20                       (160 bytes x N^2: 2.5 GiB at 4096, 10 GiB at 8192)\n\
+         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\
+         \x20                       model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:\n\
+         \x20                       1024x1024 pixels, larger images are resized down to it; 20x20\n\
+         \x20                       for Inkling 2, which never resizes: an image of more than N/4\n\
+         \x20                       tiles of 40x40 pixels is refused). The tower's device memory\n\
+         \x20                       grows with N^2 (about 160 bytes x N^2: 2.5 GiB at 4096)\n\
          \x20 --vision-max-tokens <N>  Image tokens one request may hold, all images and video\n\
          \x20                       frames together (default: 16384; 10 KiB of device memory each)\n\
          \x20 --model-vision <id=N|off>  The vision tower of model <id> instead of the two options\n\
@@ -276,6 +278,20 @@ fn print_usage() {
          \x20                       BF16 weights streams may differ between settings at exact BF16\n\
          \x20                       logit ties, s16 > 0 is not token-identical to s16=0.\n\
          \n\
+         Inkling 2 environment variables (debug):\n\
+         \x20 GAUDIUM_IK_AMAX_BF16  1 = decode the 4-bit experts with their per-expert scale rounded\n\
+         \x20                       to BF16 first, as the reference loader does (default: f32)\n\
+         \x20 GAUDIUM_IK_APPS       Load only the first <n> layer applications (quick kernel checks;\n\
+         \x20                       the output is not the model's)\n\
+         \x20 GAUDIUM_IK_STEP_PREFILL  1 = prefill the prompt one row at a time through the decode\n\
+         \x20                       step (takes no image)\n\
+         \x20 GAUDIUM_IK_DUMP       Directory: every tensor of the decode step after the prompt is\n\
+         \x20                       written there\n\
+         \x20 GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first\n\
+         \x20                       image request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence\n\
+         \x20                       rows x 1024) and img<k>_feat (tokens x 2304) as raw BF16 (it\n\
+         \x20                       syncs after each one; debug)\n\
+         \n\
          Gemma 4 environment variables:\n\
          \x20 GAUDIUM_G4_NORM       Layer RMS-norm node: row | tile | vendor (default: tile for sizes with\n\
          \x20                       per-layer inputs, else vendor). Changes compiled graphs; streams may\n\
@@ -338,9 +354,9 @@ fn print_usage() {
          \x20                       PPM, decoded as the server decodes a request's image;\n\
          \x20                       repeatable, in prompt order\n\
          \x20 --image-raw <WxH:f>   Image input, raw RGB8 file with explicit size; repeatable\n\
-         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in\n\
-         \x20                       16x16 patches (default: the largest --image; larger images\n\
-         \x20                       are resized down to fit)\n\
+         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\
+         \x20                       model's patches (default: the largest --image; Qwen3.5 / 3.8\n\
+         \x20                       resize larger images down to fit, Inkling 2 refuses them)\n\
          \x20 --vision-gelu-bf16    Evaluate the vision tower's GELU in BF16 (default: F32);\n\
          \x20                       slightly faster, slightly less accurate image embeddings\n\
          \x20 --dump-vision-emb <p> Write the image embeddings (tokens x hidden, raw BF16) to a file\n\

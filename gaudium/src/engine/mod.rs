@@ -221,6 +221,21 @@ impl GenEngine for inkling2::Inkling2Engine {
     fn live_profile(&self) -> Option<crate::live_report::ProfileHandle> {
         Some(inkling2::Inkling2Engine::live_profile(self))
     }
+    fn vision_spec(&self) -> Option<&crate::vision::VisionSpec> {
+        inkling2::Inkling2Engine::vision_spec(self)
+    }
+    fn set_request_images(
+        &mut self,
+        images: Vec<crate::vision::PreparedImage>,
+    ) -> Result<(), String> {
+        inkling2::Inkling2Engine::set_request_images(self, images)
+    }
+    fn last_vision_report(&self) -> Option<crate::vision::VisionReport> {
+        inkling2::Inkling2Engine::last_vision_report(self)
+    }
+    fn read_vision_embeddings(&self) -> Result<Vec<u8>, String> {
+        inkling2::Inkling2Engine::read_vision_embeddings(self)
+    }
 }
 
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.

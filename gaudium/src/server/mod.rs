@@ -1182,7 +1182,7 @@ fn served_max_ctx(cfg: &ServerConfig, id: &str, dir: &Path) -> u64 {
 
 /// The vision tower the served model `id` is loaded with: `(largest image in patches, image
 /// tokens per request)`, or `None` for text only. A model has a tower when its checkpoint has
-/// one, its engine runs it (the Qwen3.5 / 3.8 family), its drafter is one that runs with image
+/// one, its engine runs it (the Qwen3.5 / 3.8 and Inkling 2 families), its drafter is one that runs with image
 /// input (the verified `vis_drafter_ok`), and neither `--no-vision` nor the model's own
 /// `--model-vision <id>=off` turned it off. The token count is held to the context.
 fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Option<(u64, u64)> {
@@ -1202,7 +1202,7 @@ fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Opt
     let spec = ModelSpec::from_config_file(dir.join("config.json")).ok()?;
     let runs_tower = matches!(
         spec.family,
-        ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
+        ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe | ModelFamily::Inkling2
     );
     if !(spec.has_vision && runs_tower) {
         return None;
@@ -1482,7 +1482,7 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             .map_err(|e| format!("vision input of '{}': {e}", entry.id))?;
         let runs_tower = matches!(
             spec.family,
-            ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
+            ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe | ModelFamily::Inkling2
         );
         if vision.is_none() && spec.has_vision && runs_tower && cfg.vision {
             if let Some((_, kind, _)) =
