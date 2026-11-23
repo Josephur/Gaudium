@@ -30,7 +30,7 @@ const LAYER_WEIGHTS: [&str; 18] = [
 
 /// What the wavefront did for a request.
 pub(super) struct WaveEnd {
-    /// Tiles it prefilled (the prompt's first `tiles` full tiles).
+    /// Tiles it prefilled (the first `tiles` full tiles from the row the prefill started at).
     pub tiles: usize,
     /// Device rows of the last of them after the last layer.
     pub final_x: u64,
@@ -87,11 +87,13 @@ fn bind_weights(eng: &Qwen3Engine, pool: &mut BTreeMap<String, u64>, l: usize, p
     }
 }
 
-/// Binds the first half of layer `l` of tile `tile` (body prefix `L_`).
+/// Binds the first half of layer `l` of tile `tile` (body prefix `L_`). `start` = whole tiles
+/// of the prompt before the wavefront's first tile.
 fn bind_first(
     eng: &Qwen3Engine,
     bufs: &WaveBufs,
     pool: &mut BTreeMap<String, u64>,
+    start: usize,
     tile: usize,
     l: usize,
     gdn_parity: usize,
@@ -112,16 +114,25 @@ fn bind_first(
         }
     } else {
         // the state alternates between its two buffers from tile to tile, as in the
-        // single-tile loop
+        // single-tile loop; a tile at a kept position reads or writes that position's slot
         let st = eng
             .gdn_state
             .get(&l)
             .ok_or_else(|| format!("prefill wavefront: layer {l} has no recurrent state"))?;
         let p = (gdn_parity + tile) % 2;
-        pool.insert("L_S_in".into(), st.s[p]);
-        pool.insert("L_S_out".into(), st.s[1 - p]);
-        pool.insert("L_cs_in".into(), st.cs[p]);
-        pool.insert("L_cs_out".into(), st.cs[1 - p]);
+        let io = prefix_cache::state_io(
+            st,
+            &eng.prefix_slots,
+            &eng.prefix_plan,
+            eng.prefill_tile,
+            l,
+            (start + tile) as u64,
+            p,
+        )?;
+        pool.insert("L_S_in".into(), io.s_in);
+        pool.insert("L_S_out".into(), io.s_out);
+        pool.insert("L_cs_in".into(), io.cs_in);
+        pool.insert("L_cs_out".into(), io.cs_out);
     }
     Ok(())
 }
@@ -148,13 +159,14 @@ fn begin_tile(
     eng: &mut Qwen3Engine,
     bufs: &WaveBufs,
     prompt_ids: &[i32],
+    start: usize,
     tile: usize,
     vis_layout: Option<&PromptLayout>,
     pf_launch: &mut u64,
 ) -> Result<(), String> {
     let t = eng.prefill_tile as usize;
     let set = set_of(tile);
-    let pos = tile * t;
+    let pos = (start + tile) * t;
     let t_wait = prefill::now();
     unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
         .map_err(|e| format!("sync before prefill tile at pos={pos}: {e}"))?;
@@ -200,9 +212,14 @@ fn begin_tile(
 
 /// Ends tile `tile` (its last half-step is launched): the drafter's context pass over the
 /// tile's tap rows, and the progress record.
-fn end_tile(eng: &mut Qwen3Engine, bufs: &WaveBufs, tile: usize) -> Result<(), String> {
+fn end_tile(
+    eng: &mut Qwen3Engine,
+    bufs: &WaveBufs,
+    start: usize,
+    tile: usize,
+) -> Result<(), String> {
     let t = eng.prefill_tile;
-    let pos = tile as u64 * t;
+    let pos = (start + tile) as u64 * t;
     let n_layers = eng.spec.n_layers;
     if eng.specdec.is_some() {
         if set_of(tile) == 0 {
@@ -261,11 +278,13 @@ fn launch_table(n_wave: usize, n_layers: usize) -> Result<Vec<Launch>, String> {
     Ok(table)
 }
 
-/// Prefills the tiles of `prompt_ids` that the verified schedule runs two in flight, from
-/// position 0. `Ok(None)`: this request uses the single-tile loop from the start.
+/// Prefills the tiles of `prompt_ids` that the verified schedule runs two in flight, from row
+/// `resume` (a whole number of tiles: 0, or the kept position a request resumes from).
+/// `Ok(None)`: this request uses the single-tile loop from there.
 pub(super) fn run(
     eng: &mut Qwen3Engine,
     prompt_ids: &[i32],
+    resume: usize,
     gdn_parity: usize,
     vis_layout: Option<&PromptLayout>,
     is_cancelled: &impl Fn() -> bool,
@@ -278,12 +297,29 @@ pub(super) fn run(
         && eng.calib.is_none()
         && !eng.pf.opts.profile
         && t > 0;
-    let full = (prompt_ids.len() as u64).checked_div(t).unwrap_or(0);
+    let full = ((prompt_ids.len().saturating_sub(resume)) as u64)
+        .checked_div(t)
+        .unwrap_or(0);
     let n_wave = wave_tiles(full, ready) as usize;
     let Some(bufs) = eng.pf.wave_bufs.clone().filter(|_| n_wave > 0) else {
         return Ok(None);
     };
+    let start = (resume as u64).checked_div(t).unwrap_or(0) as usize;
     let table = launch_table(n_wave, n_layers)?;
+    // every state binding of these tiles, checked before the first launch
+    for tile in 0..n_wave {
+        for (&l, st) in &eng.gdn_state {
+            prefix_cache::state_io(
+                st,
+                &eng.prefix_slots,
+                &eng.prefix_plan,
+                t,
+                l,
+                (start + tile) as u64,
+                (gdn_parity + tile) % 2,
+            )?;
+        }
+    }
 
     let mut pools: HashMap<WaveKey, BTreeMap<String, u64>> = HashMap::new();
     let mut done = 0usize;
@@ -299,13 +335,13 @@ pub(super) fn run(
                     cancelled: true,
                 }));
             }
-            begin_tile(eng, &bufs, prompt_ids, tile, vis_layout, pf_launch)?;
+            begin_tile(eng, &bufs, prompt_ids, start, tile, vis_layout, pf_launch)?;
         }
         let t_submit = prefill::now();
         let key = WaveKey {
             first: first.map(|(tile, l)| {
                 if eng.spec.is_full_attention_layer(l) {
-                    let end_pos = (tile as u64 + 1) * t;
+                    let end_pos = ((start + tile) as u64 + 1) * t;
                     FirstHalf::Attn(end_pos.div_ceil(KV_CHUNK).clamp(1, eng.max_chunks))
                 } else {
                     FirstHalf::Lin
@@ -315,7 +351,7 @@ pub(super) fn run(
         };
         let pool = pools.entry(key).or_insert_with(|| base_pool(eng, key));
         if let Some((tile, l)) = first {
-            bind_first(eng, &bufs, pool, tile, l, gdn_parity)?;
+            bind_first(eng, &bufs, pool, start, tile, l, gdn_parity)?;
         }
         if let Some((tile, l)) = second {
             bind_second(eng, &bufs, pool, tile, l);
@@ -334,7 +370,7 @@ pub(super) fn run(
         if let Some((tile, l)) = second {
             if l + 1 == n_layers {
                 let t_end = prefill::now();
-                end_tile(eng, &bufs, tile)?;
+                end_tile(eng, &bufs, start, tile)?;
                 eng.pf.timers.submit_ms += prefill::ms_since(t_end);
                 done += 1;
             }

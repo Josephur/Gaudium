@@ -115,22 +115,21 @@ impl StreamOut {
     pub fn timings(&self) -> Timings {
         match (&self.last, self.feed) {
             (Some(ev), true) if ev.kind != LaunchKind::Prefill => Timings {
-                prompt_n: self.n_prompt,
                 prompt_ms: ev.ttft_ms,
                 predicted_n: ev.gen_tokens,
                 predicted_ms: ev.decode_ms,
                 launches: Some(ev.launches),
                 draft_n: ev.drafted,
                 draft_n_accepted: ev.accepted,
+                ..Timings::of_prompt(self.n_prompt, ev.prompt_cached)
             },
-            (_, true) => Timings {
-                prompt_n: self.n_prompt,
-                ..Timings::default()
-            },
+            (_, true) => Timings::of_prompt(
+                self.n_prompt,
+                self.last.as_ref().map_or(0, |ev| ev.prompt_cached),
+            ),
             // no launch feed: this writer's own clock around the token callback; the prompt
             // time then includes whatever the engine did before its prefill
             (_, false) => Timings {
-                prompt_n: self.n_prompt,
                 prompt_ms: self.first_token_ms().unwrap_or(0.0),
                 predicted_n: self.seen,
                 predicted_ms: match (self.first_token_at, self.last_token_at) {
@@ -140,6 +139,8 @@ impl StreamOut {
                 launches: None,
                 draft_n: 0,
                 draft_n_accepted: 0,
+                // without the engine's feed the reused rows are only known at the end
+                ..Timings::of_prompt(self.n_prompt, 0)
             },
         }
     }
@@ -190,9 +191,10 @@ impl StreamOut {
         self.last_progress = Some(now);
         let chunk = format!(
             "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":null}}],\
-             \"prompt_progress\":{{\"total\":{},\"cache\":0,\"processed\":{},\"time_ms\":{:.1}}}}}\n\n",
+             \"prompt_progress\":{{\"total\":{},\"cache\":{},\"processed\":{},\"time_ms\":{:.1}}}}}\n\n",
             self.chunk_head,
             self.n_prompt,
+            ev.prompt_cached.min(self.n_prompt),
             ev.prefill_pos.min(self.n_prompt),
             ev.request_ms,
         );
@@ -331,6 +333,7 @@ mod tests {
             decode_ms: ms,
             ttft_ms: 80.0,
             prefill_pos: 50,
+            prompt_cached: 0,
             request_ms: 0.0,
         }
     }

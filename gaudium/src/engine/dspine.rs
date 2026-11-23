@@ -1011,6 +1011,8 @@ pub struct DSpine {
     f8_dir: Option<std::path::PathBuf>,
     /// Calibration run: where the table goes, and the running maxima of the GEMM input sites.
     calib: Option<(std::path::PathBuf, crate::engine::fp8_graph::ActCalibrator)>,
+    /// The context bound on the device (`lim[0]` of the ring softmax; -1 = none, as loaded).
+    ctx_floor: i32,
 }
 
 /// Default location of a drafter's FP8 files (activation-scale table, quantised matrices).
@@ -1118,6 +1120,7 @@ impl DSpine {
             act: BTreeMap::new(),
             f8_dir: None,
             calib: None,
+            ctx_floor: -1,
         };
         d.check_checkpoint()?;
         Ok(d)
@@ -1719,6 +1722,39 @@ impl DSpine {
         }
         r.launch_checked(dev, &exact)
             .map_err(|e| format!("launch dspine ctx T={tile_len}: {e}"))
+    }
+
+    /// Sets the first position whose context ring row is valid for the request that follows
+    /// (`gaudium_ds_softr` reads it as `lim[0]`; a position below it is never attended). Only the
+    /// ring form has this bound: with one cache row per position nothing is ever overwritten by
+    /// a later position, and the linear kernels read the same tensor as a tree fix-up pair that
+    /// must stay `(-1, -1)`. The value is uploaded when it changes.
+    pub fn set_context_floor(
+        &mut self,
+        dev: &HpuDevice,
+        stage_io: &mut PinnedBuf,
+        floor: u64,
+    ) -> Result<(), String> {
+        if self.cfg.ring == 0 {
+            return Ok(());
+        }
+        let v = i32::try_from(floor).map_err(|_| format!("dspine context floor {floor}"))?;
+        // 0 and "no bound" are the same to the kernel; keep the load-time value for a cold request
+        let v = if v == 0 { -1 } else { v };
+        if self.ctx_floor == v {
+            return Ok(());
+        }
+        let &addr = self
+            .pool
+            .get("df_nofix")
+            .ok_or("dspine: no context bound tensor")?;
+        let buf = stage_io.as_mut_slice();
+        buf[..4].copy_from_slice(&v.to_le_bytes());
+        buf[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        dev.copy_h2d_pinned_sync(stage_io, 8, addr)
+            .map_err(|e| format!("dspine context floor H2D: {e}"))?;
+        self.ctx_floor = v;
+        Ok(())
     }
 
     /// A calibration run reads the block's site buffers back after every launch.

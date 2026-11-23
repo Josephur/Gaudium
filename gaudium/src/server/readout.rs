@@ -284,6 +284,9 @@ pub(super) fn model_desc_json(
 /// Cumulative timings of a request, as every stream chunk and the final message carry them.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct Timings {
+    /// Prompt tokens taken over from the previous request (prefix reuse), not prefilled.
+    pub cache_n: u64,
+    /// Prompt tokens this request prefilled: with `cache_n` they add up to the prompt.
     pub prompt_n: u64,
     /// The engine's prefill time: its own clock from the start of the prefill to the first token.
     pub prompt_ms: f64,
@@ -298,10 +301,20 @@ pub(super) struct Timings {
 }
 
 impl Timings {
+    /// The prompt side of a request of `prompt` tokens of which `reused` were taken over: the
+    /// verified split (`pc_reused_rows` + `pc_prefill_rows` == the prompt).
+    pub fn of_prompt(prompt: u64, reused: u64) -> Self {
+        Self {
+            cache_n: crate::verified::pc_reused_rows(prompt, reused),
+            prompt_n: crate::verified::pc_prefill_rows(prompt, reused),
+            ..Self::default()
+        }
+    }
+
     pub fn json(&self) -> String {
         let mut out = format!(
-            "{{\"cache_n\":0,\"prompt_n\":{},\"prompt_ms\":{:.2}",
-            self.prompt_n, self.prompt_ms
+            "{{\"cache_n\":{},\"prompt_n\":{},\"prompt_ms\":{:.2}",
+            self.cache_n, self.prompt_n, self.prompt_ms
         );
         if self.prompt_ms > 0.0 && self.prompt_n > 0 {
             out.push_str(&format!(
@@ -402,6 +415,27 @@ pub(super) fn live_record_json(
 /// time before the first token went. `host_ms` is decoding and preparation on the host (before
 /// the request took the card); the tower's times are inside the prefill (`prefill_ms`), and
 /// `text_prefill_ms` is the prefill without them.
+/// The `prefix_cache` object of `/props`: what the engine keeps to resume a prefill from, and
+/// what its requests took over so far.
+pub fn prefix_json(p: &crate::engine::qwen3::prefix_cache::PrefixStats) -> String {
+    format!(
+        "{{\"positions\":{},\"position_bytes\":{},\"held_positions\":{},\"held_tokens\":{},\
+         \"requests\":{},\"hits\":{},\"reused_tokens\":{},\
+         \"last\":{{\"hit\":{},\"prompt_tokens\":{},\"reused_tokens\":{},\"common_tokens\":{}}}}}",
+        p.slots,
+        p.slot_bytes,
+        p.held_positions,
+        p.held_rows,
+        p.requests,
+        p.hits,
+        p.reused_rows,
+        p.last_reused_rows > 0,
+        p.last_prompt_rows,
+        p.last_reused_rows,
+        p.last_lcp,
+    )
+}
+
 pub fn vision_section_json(
     c: &crate::vision::media::MediaCounts,
     host_ms: f64,
@@ -416,13 +450,14 @@ pub fn vision_section_json(
         let in_prefill = v.prep_ms + v.encode_ms + v.compile_ms + v.rope_ms;
         out.push_str(&format!(
             ",\"upload_ms\":{:.1},\"tower_ms\":{:.1},\"compile_ms\":{:.1},\"rope_ms\":{:.1},\"rope_rows\":{},\
-             \"text_prefill_ms\":{:.1}",
+             \"text_prefill_ms\":{:.1},\"reused_images\":{}",
             v.prep_ms,
             v.encode_ms,
             v.compile_ms,
             v.rope_ms,
             v.rope_rows,
             (prefill_ms - in_prefill).max(0.0),
+            v.reused_images,
         ));
     }
     out.push('}');
@@ -603,6 +638,7 @@ mod tests {
     #[test]
     fn timings_and_sections_leave_out_what_was_not_measured() {
         let t = Timings {
+            cache_n: 0,
             prompt_n: 100,
             prompt_ms: 50.0,
             predicted_n: 41,

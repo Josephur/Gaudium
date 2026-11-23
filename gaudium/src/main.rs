@@ -71,6 +71,15 @@ fn print_usage() {
          \x20                       change to kernels, graphs or contexts\n\
          \x20 --build-cache-only <id>  The same for one served model id (repeatable)\n\
          \x20 --idle-park <secs>    Auto-release Gaudi 2 after N seconds idle (0=off, default: 300)\n\
+         \x20 --prefix-cache <N>    Prefix reuse across requests: a request whose prompt starts like\n\
+         \x20                       the one before it prefills only the rest, with the same output\n\
+         \x20                       as a whole prefill. N = positions of the previous prompt whose\n\
+         \x20                       recurrent state is kept on the card to resume from (default: 8;\n\
+         \x20                       0 = off; 0.15 GiB each for a 48-layer DeltaNet model). The\n\
+         \x20                       context is planned first: a load keeps as many as fit beside\n\
+         \x20                       it and says so. A request with cache_prompt: false prefills\n\
+         \x20                       its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a\n\
+         \x20                       drafter or with DSpine\n\
          \x20 --queue-config <file> Card-queue settings, re-read on every turn (or GAUDIUM_QUEUE_CONFIG;\n\
          \x20                       default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock\n\
          \x20                       state dir). Keys: group_max_wait_min (default 45), group_max_skips\n\
@@ -355,6 +364,10 @@ fn print_usage() {
          \x20                       DeltaNet start state; KV rows past the cursor are masked),\n\
          \x20                       dirty (also the KV rows earlier requests wrote) or full\n\
          \x20                       (or GAUDIUM_REQUEST_RESET; same output in every mode)\n\
+         \x20 --prefix-cache <N>    Prefix reuse between the requests of one run (default: 0 = off,\n\
+         \x20                       every request prefills its whole prompt): keep the recurrent\n\
+         \x20                       state at N positions of the previous prompt (see --prefix-cache\n\
+         \x20                       under Server options)\n\
          \x20 --prefill <k=v,..>    Prefill levers of the Qwen engines (default: all on): tile=N rows\n\
          \x20                       per tile (multiple of 64 up to 512; 0 = the widest that fits),\n\
          \x20                       mme=0|1 DeltaNet recurrence as chunked MME GEMMs, rows=0|1|2 its\n\
@@ -463,6 +476,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let mut build_cache_chunks: Vec<u64> = Vec::new();
     let mut prefill_warm = 0u64;
     let mut request_reset: Option<String> = None;
+    let mut prefix_slots = 0u64;
     let mut profile_windows: Vec<gaudium::synapse::profiler::ProfileWindow> = Vec::new();
     let mut draft_vocab_set = false;
     let mut draft_fp8: Option<bool> = None;
@@ -694,6 +708,12 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                 };
             }
             "--request-reset" => request_reset = Some(next_val(&mut i, "--request-reset")?),
+            "--prefix-cache" => {
+                let s = next_val(&mut i, "--prefix-cache")?;
+                prefix_slots = s
+                    .parse()
+                    .map_err(|_| format!("invalid --prefix-cache '{s}'"))?;
+            }
             "--prefill" => {
                 let s = next_val(&mut i, "--prefill")?;
                 gaudium::engine::qwen3::prefill::PrefillOpts::parse(&s)
@@ -801,6 +821,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     cfg.moe_routed = moe_routed;
     cfg.prefill_warm_rows = prefill_warm;
     cfg.request_reset = request_reset;
+    cfg.prefix_slots = prefix_slots;
     if let Some(v) = draft_fp8 {
         cfg.step.draft_fp8 = Some(v);
     }
@@ -1673,6 +1694,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut vision = true;
     let mut vision_max_patches = gaudium::server::DEFAULT_VISION_MAX_PATCHES;
     let mut vision_max_tokens = gaudium::server::DEFAULT_VISION_MAX_TOKENS;
+    let mut prefix_slots = gaudium::engine::qwen3::prefix_cache::DEFAULT_SLOTS;
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -1822,6 +1844,12 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("invalid --idle-park '{s}'"))?;
             }
+            "--prefix-cache" => {
+                let s = next_val(&mut i, "--prefix-cache")?;
+                prefix_slots = s
+                    .parse()
+                    .map_err(|_| format!("invalid --prefix-cache '{s}'"))?;
+            }
             "--queue-config" => {
                 queue_config = Some(PathBuf::from(next_val(&mut i, "--queue-config")?))
             }
@@ -1872,6 +1900,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         vision,
         vision_max_patches,
         vision_max_tokens,
+        prefix_slots,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {

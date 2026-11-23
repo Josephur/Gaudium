@@ -40,6 +40,9 @@ use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{align_up, HbmCat};
 
 pub mod prefill;
+// prefix reuse across requests: kept positions, their device slots
+#[path = "prefix_cache.rs"]
+pub mod prefix_cache;
 #[path = "request_reset.rs"]
 mod request_reset;
 mod vision_hooks;
@@ -100,6 +103,10 @@ pub struct Qwen3Config {
     /// [step] Step-recipe options: DeltaNet verify state, drafter precision / readout width,
     /// device traces (`engine/step_opts.rs`).
     pub step: crate::engine::step_opts::StepOpts,
+    /// Prefix reuse across requests: positions of the previous prompt whose recurrent state is
+    /// kept on the device so that a later request resumes there (`engine/prefix_cache.rs`).
+    /// 0 = off. A load keeps as many as fit beside the rest of its plan.
+    pub prefix_slots: u64,
 }
 
 impl Qwen3Config {
@@ -127,6 +134,7 @@ impl Qwen3Config {
             prefill_warm_rows: 0,
             request_reset: None,
             step: crate::engine::step_opts::StepOpts::from_env(),
+            prefix_slots: 0,
         }
     }
 }
@@ -167,6 +175,9 @@ pub struct Qwen3GenParams {
     /// [step] Run the `K = 0` decode of this request as the plain loop (one host round trip per
     /// token) even where the enqueue-ahead loop applies: the reference of `--compare-k0`.
     pub k0_plain: bool,
+    /// The request may resume its prefill from state the engine holds for a prefix of its prompt
+    /// (`false`: a cold prefill from position 0, the reference a resumed one is identical to).
+    pub cache_prompt: bool,
 }
 
 impl Default for Qwen3GenParams {
@@ -188,6 +199,7 @@ impl Default for Qwen3GenParams {
             spec_k: None,
             force_draft_k: None,
             k0_plain: false,
+            cache_prompt: true,
         }
     }
 }
@@ -222,6 +234,11 @@ pub struct Qwen3GenReport {
     /// Part of `ttft_ms` spent loading or compiling recipes this request used for the first
     /// time in the process (a prefill tile length, a step family).
     pub ttft_recipe_ms: f64,
+    /// Prompt rows taken over from the previous request (not prefilled); 0 = a cold prefill.
+    /// `prefill_tok_s` counts the rows that were prefilled.
+    pub reused_tokens: u64,
+    /// Rows of the prompt that equal the prompt the engine held (0 without prefix reuse).
+    pub prefix_common: u64,
 }
 
 /// One greedy-vs-reference disagreement observed under teacher forcing.
@@ -1006,6 +1023,12 @@ pub struct Qwen3Engine {
     hbm_bytes: [u64; 5],
     /// Per-request reset bookkeeping (mode, KV high-water mark, last reset time).
     reset: request_reset::ResetState,
+    /// Prefix reuse: the table of kept positions, the device buffers of its slots, and what
+    /// the running request does with them.
+    prefix: prefix_cache::PrefixCache,
+    prefix_slots: Vec<prefix_cache::SlotAddrs>,
+    prefix_plan: prefix_cache::Plan,
+    prefix_images: Vec<prefix_cache::ImageId>,
     /// Print recipe / timing diagnostics (`Qwen3Config::verbose`).
     verbose: bool,
     live: LiveReporter,
@@ -1559,12 +1582,66 @@ impl Qwen3Engine {
         let act_bytes: u64 = act_fixed_bytes + pf_scratch_bytes;
         let ws_bytes = align256(max_ws.max(MIN_SHARED_WORKSPACE_BYTES));
 
-        let planned_total = weights_bytes
+        let base_total = weights_bytes
             .saturating_add(kv_bytes)
             .saturating_add(act_bytes)
             .saturating_add(ws_bytes)
             .saturating_add(prof_bytes)
             .saturating_add(spec_bytes.iter().sum());
+        // Prefix reuse: device slots for the recurrent state at kept positions of the previous
+        // prompt. They are planned last: everything above (the context first of all) is
+        // settled, and the slots take what is left, down to none.
+        let pfx_slot_bytes = n_lin * (align256(s_one_bytes) + align256(cs_one_bytes));
+        let pfx_why_not = if !has_gdn {
+            Some("this model has no recurrent layers to keep a state of")
+        } else if spec.is_moe() {
+            Some("not validated for mixture-of-experts models")
+        } else if cfg.fp8_calibrate {
+            Some("a calibration load prefills every row")
+        } else if reset_mode != request_reset::ResetMode::Auto {
+            Some("the request reset mode zeroes the K/V rows of every request")
+        } else if specdec.as_ref().is_some_and(|sd| !sd.prefix_reuse_ok()) {
+            Some("not validated for this drafter")
+        } else {
+            None
+        };
+        let pfx_wanted = if pfx_why_not.is_none() {
+            cfg.prefix_slots
+        } else {
+            0
+        };
+        let pfx_granted = match &dev_opt {
+            Some(_) => {
+                use crate::core::hbm::{grant_prefix_slots, usable_hbm_bytes};
+                let usable =
+                    usable_hbm_bytes(total_hbm, total_hbm.saturating_sub(free_hbm), headroom);
+                let fit = grant_prefix_slots(pfx_wanted, pfx_slot_bytes, base_total, usable);
+                let granted =
+                    crate::verified::pc_grant_checked(fit, pfx_slot_bytes, base_total, usable);
+                if granted < pfx_wanted {
+                    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                    eprintln!(
+                        "[gaudium] prefix reuse: {granted} of {pfx_wanted} kept positions fit beside the context ({:.2} GiB each; the rest of the plan takes {:.2} of the {:.2} GiB the card has usable){}",
+                        gib(pfx_slot_bytes),
+                        gib(base_total),
+                        gib(usable),
+                        if granted == 0 {
+                            ": every request prefills its whole prompt"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                granted
+            }
+            // plan only (the card is not opened): what a load asks for
+            None => pfx_wanted,
+        };
+        if let Some(why) = pfx_why_not.filter(|_| cfg.prefix_slots > 0) {
+            eprintln!("[gaudium] prefix reuse: off ({why})");
+        }
+        let pfx_bytes = pfx_granted.saturating_mul(pfx_slot_bytes);
+        let planned_total = base_total.saturating_add(pfx_bytes);
         // [live] the same plan, buffer by buffer under named parts (the live record's
         // `hbm_detail`, and the lines below the plan total)
         let mem_report = {
@@ -1584,6 +1661,33 @@ impl Qwen3Engine {
                 "DeltaNet conv-state rings",
                 n_lin * 2 * align256(cs_ring_bytes),
             );
+            for _ in 0..pfx_granted {
+                r.add(
+                    HbmCat::CatCheckpoints,
+                    "prefix",
+                    "kept position: DeltaNet state",
+                    n_lin * align256(s_one_bytes),
+                );
+                r.add(
+                    HbmCat::CatCheckpoints,
+                    "prefix",
+                    "kept position: DeltaNet conv state",
+                    n_lin * align256(cs_one_bytes),
+                );
+            }
+            if pfx_granted > 0 {
+                r.set_source(
+                    "prefix",
+                    format!(
+                        "prefix reuse: the recurrent state at {pfx_granted} kept positions of the previous prompt{}",
+                        if plan_only {
+                            " (asked for; a load keeps as many as fit beside the rest)"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
+            }
             // the prefill region, as the buffers of the tile recipe that needs the most of it
             // (every tile recipe lays its scratch out in this one region)
             let arena_items = pf.plan_items(&spec, prefill_tile, max_ctx, max_chunks);
@@ -1683,12 +1787,14 @@ impl Qwen3Engine {
         if cfg.verbose || plan_only {
             let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
             eprintln!(
-                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} + state rings {:.2} ({} slots) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
+                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} + state rings {:.2} ({} slots) + prefix reuse {:.2} ({} kept positions) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
                 gib(planned_total),
                 gib(weights_bytes),
                 gib(kv_bytes.saturating_sub(gdn_state_bytes)),
                 gib(gdn_state_bytes),
                 gdn_slots,
+                gib(pfx_bytes),
+                pfx_granted,
                 gib(act_bytes),
                 gib(spec_bytes[0]),
                 gib(spec_bytes[1]),
@@ -1738,7 +1844,7 @@ impl Qwen3Engine {
             eprintln!(
                 "[gaudium] HBM plan fits: weights={:.2} GiB, kv+state={:.2} GiB, acts={:.2} MiB, ws={:.2} MiB",
                 weights_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                (kv_bytes + pfx_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
                 act_bytes as f64 / (1024.0 * 1024.0),
                 ws_bytes as f64 / (1024.0 * 1024.0),
             );
@@ -1758,7 +1864,7 @@ impl Qwen3Engine {
             .alloc_arena(weights_bytes, HbmCat::CatWeights, "weights_arena")
             .map_err(|e| format!("alloc weights arena: {e}"))?;
         let mut kv_arena = dev
-            .alloc_arena(kv_bytes, HbmCat::CatKv, "kv_state_arena")
+            .alloc_arena(kv_bytes + pfx_bytes, HbmCat::CatKv, "kv_state_arena")
             .map_err(|e| format!("alloc kv/state arena: {e}"))?;
         let mut act_arena = dev
             .alloc_arena(act_bytes, HbmCat::CatScratch, "act_arena")
@@ -1796,6 +1902,20 @@ impl Qwen3Engine {
                     },
                 );
             }
+        }
+
+        // prefix reuse: per kept position, the state buffers of every recurrent layer
+        let mut prefix_slots: Vec<prefix_cache::SlotAddrs> = Vec::new();
+        for _ in 0..pfx_granted {
+            let mut m = prefix_cache::SlotAddrs::new();
+            for l in 0..(spec.n_layers as usize) {
+                if !spec.is_full_attention_layer(l) {
+                    let s = suballoc(&mut kv_arena, s_one_bytes)?;
+                    let cs = suballoc(&mut kv_arena, cs_one_bytes)?;
+                    m.insert(l, (s, cs));
+                }
+            }
+            prefix_slots.push(m);
         }
 
         let pf_x0 = suballoc(&mut act_arena, pf_x_bytes)?;
@@ -1856,7 +1976,7 @@ impl Qwen3Engine {
         // Every K/V cache and state ring starts as zeros (a masked row must be finite): filled
         // on the device while the weights upload, ahead of any launch on the compute stream.
         let t_zero = Instant::now();
-        let mut zero_regions = vec![(kv_arena.base(), kv_bytes)];
+        let mut zero_regions = vec![(kv_arena.base(), kv_bytes + pfx_bytes)];
         if let Some(sd) = &specdec {
             zero_regions.extend(sd.cache_regions());
         }
@@ -1867,7 +1987,7 @@ impl Qwen3Engine {
         let hbm_bytes = [
             weights_bytes + spec_bytes[0],
             kv_only_bytes + spec_bytes[1],
-            gdn_state_bytes,
+            gdn_state_bytes + pfx_bytes,
             act_bytes + spec_bytes[2],
             ws_bytes,
         ];
@@ -2216,6 +2336,16 @@ impl Qwen3Engine {
             step_logits,
             hbm_bytes,
             reset: request_reset::ResetState::new(reset_mode, cfg.verbose),
+            prefix: prefix_cache::PrefixCache::new(
+                prefill_tile,
+                pfx_granted,
+                pfx_slot_bytes,
+                pfx_why_not.is_none(),
+                specdec.as_ref().map_or(0, |sd| sd.context_rows()),
+            ),
+            prefix_slots,
+            prefix_plan: prefix_cache::Plan::default(),
+            prefix_images: Vec::new(),
             verbose: cfg.verbose,
             live,
             vision,
@@ -2288,6 +2418,12 @@ impl Qwen3Engine {
     /// timer starts, so it is not part of `ttft_ms`).
     pub fn last_reset_ms(&self) -> f64 {
         self.reset.last_ms()
+    }
+
+    /// Prefix reuse: the kept positions and what the requests so far took over (`None`: this
+    /// load keeps none).
+    pub fn prefix_stats(&self) -> Option<prefix_cache::PrefixStats> {
+        self.prefix.enabled().then(|| self.prefix.stats())
     }
 
     /// A recipe that was not ready when a request needed it: the request waited for it.
@@ -2506,6 +2642,21 @@ impl Qwen3Engine {
         );
         self.live.end_request();
         request_reset::end_request(self, prompt_ids.len() as u64, &res);
+        // prefix reuse: what the request leaves for the next one (nothing after an error)
+        let written_end = res.as_ref().map_or(0, |r| {
+            request_reset::request_high_water(
+                prompt_ids.len() as u64,
+                r.generated_tokens.len() as u64,
+                self.max_ctx,
+            )
+        });
+        self.prefix.request_end(res.is_ok(), written_end);
+        let (reused, common) = (self.prefix_plan.resume, self.prefix_plan.lcp);
+        let res = res.map(|mut r| {
+            r.reused_tokens = reused;
+            r.prefix_common = common;
+            r
+        });
         // [prefill] measurement of the half-layer recipe forms, once, after the first request
         if res.is_ok() && self.pf.opts.half_probe > 0 {
             let n = std::mem::take(&mut self.pf.opts.half_probe);
@@ -2523,6 +2674,9 @@ impl Qwen3Engine {
         is_cancelled: &impl Fn() -> bool,
         on_token: &mut impl FnMut(i32),
     ) -> Result<Qwen3GenReport, String> {
+        // (before the reset: whether it zeroes K/V rows decides what the request may take over)
+        let rows_zeroed = self.reset.zeroes_rows();
+        self.prefix_plan = prefix_cache::Plan::default();
         request_reset::begin_request(self, prompt_ids.len() as u64, budget.max_new())?;
         spec::begin_request(self, prompt_ids);
         prof_rt::begin_request(self);
@@ -2539,9 +2693,45 @@ impl Qwen3Engine {
         let mut ttft_recipe_ms = 0.0f64;
 
         let t_prefill = Instant::now();
-        // Image input: tower launches + this request's slot-indexed RoPE rows (inside TTFT).
-        // `None` for a text-only request, which launches exactly what it did before.
-        let vis_layout = self.vision_begin_request(prompt_ids, budget.max_new())?;
+        // Image input: the prompt's layout first (the prefix plan compares its image runs).
+        let vis_prepared = self.vision_prepare(prompt_ids)?;
+        // Prefix reuse: where this prefill starts and which kept positions it reads and writes
+        // (`engine/prefix_cache.rs`); a cold plan launches exactly what the engine always did.
+        self.prefix_images = vis_prepared
+            .as_ref()
+            .map(|(images, layout)| prefix_cache::image_ids(images, layout))
+            .unwrap_or_default();
+        let reuse_wanted = params.cache_prompt
+            && self.calib.is_none()
+            && !self.pf.opts.profile
+            && self.pf.opts.half_probe == 0;
+        self.prefix_plan =
+            self.prefix
+                .plan(prompt_ids, &self.prefix_images, reuse_wanted, rows_zeroed);
+        let resume = self.prefix_plan.resume as usize;
+        spec::set_context_floor(self, self.prefix_plan.ring_flo)?;
+        if resume > 0 {
+            self.live.set_cached(resume as u64);
+        }
+        if self.verbose && self.prefix.enabled() {
+            eprintln!(
+                "[gaudium] prefix reuse: {} of {} prompt rows taken over ({} rows equal the held prompt{}); this request keeps {} position(s); held now {:?}",
+                resume,
+                prompt_ids.len(),
+                self.prefix_plan.lcp,
+                if self.prefix_plan.cap < self.prefix_plan.lcp {
+                    format!(", {} before the first image that differs", self.prefix_plan.cap)
+                } else {
+                    String::new()
+                },
+                self.prefix_plan.captures.len(),
+                self.prefix.held_boundaries(),
+            );
+        }
+        // Tower launches + this request's slot-indexed RoPE rows (inside TTFT). `None` for a
+        // text-only request, which launches exactly what it did before.
+        let vis_layout =
+            self.vision_begin_request(vis_prepared, prompt_ids.len(), budget.max_new(), resume)?;
         let mut generated = Vec::with_capacity(budget.max_new() as usize);
         let mut stopped_by_eos = false;
         let mut stopped_by_cancel = false;
@@ -2562,9 +2752,11 @@ impl Qwen3Engine {
             unsafe { self.dev.sync_stream(self.dev.compute_stream()) }
                 .map_err(|e| format!("sync compute (prompt len 1): {e}"))?;
             gdn_parity ^= 1;
+            // a one-row prompt runs as a decode step: nothing of it is a prefill tile's row
+            self.prefix.prefill_end(prompt_ids, &self.prefix_images, 0);
             self.read_row_token(params, self.step_tokens, self.step_logits, 1)?
         } else {
-            let mut pos = 0usize;
+            let mut pos = resume;
             let n_layers = self.spec.n_layers as usize;
             let has_gdn = !self.gdn_state.is_empty();
             let mut last_tile_len = 0u64;
@@ -2579,12 +2771,19 @@ impl Qwen3Engine {
             if let Some(w) = wave_rt::run(
                 self,
                 prompt_ids,
+                resume,
                 gdn_parity,
                 vis_layout.as_ref(),
                 is_cancelled,
                 &mut pf_launch,
             )? {
-                pos = w.tiles * self.prefill_tile as usize;
+                pos = resume + w.tiles * self.prefill_tile as usize;
+                // the wavefront synchronised: the positions its finished tiles wrote are held
+                self.prefix.tiles_done(
+                    prompt_ids,
+                    &self.prefix_images,
+                    pos as u64 / self.prefill_tile.max(1),
+                );
                 if w.cancelled {
                     stopped_by_cancel = true;
                 } else {
@@ -2617,6 +2816,25 @@ impl Qwen3Engine {
                 }
                 moe_rt::ensure(self, tile_len)?; // [moe hook] routed-experts recipe of the tile
                 ttft_recipe_ms += t_recipes.elapsed().as_secs_f64() * 1000.0;
+
+                // the state buffers of this tile's recurrent layers (a tile at a kept position
+                // reads or writes that position's slot), resolved before its first launch
+                let tile_idx = pos as u64 / self.prefill_tile.max(1);
+                let mut tile_state: BTreeMap<usize, prefix_cache::StateIo> = BTreeMap::new();
+                for (&l, st) in &self.gdn_state {
+                    tile_state.insert(
+                        l,
+                        prefix_cache::state_io(
+                            st,
+                            &self.prefix_slots,
+                            &self.prefix_plan,
+                            self.prefill_tile,
+                            l,
+                            tile_idx,
+                            gdn_parity,
+                        )?,
+                    );
+                }
 
                 let t_tile = prefill::now();
                 let tile_bytes = (tile_len as usize) * 4;
@@ -2746,11 +2964,11 @@ impl Qwen3Engine {
                             let real_key = format!("L{l}_{suffix}");
                             lpool.insert(format!("L_{suffix}"), self.weights_addr[&real_key]);
                         }
-                        let st = self.gdn_state[&l];
-                        lpool.insert("L_S_in".to_string(), st.s[gdn_parity]);
-                        lpool.insert("L_S_out".to_string(), st.s[1 - gdn_parity]);
-                        lpool.insert("L_cs_in".to_string(), st.cs[gdn_parity]);
-                        lpool.insert("L_cs_out".to_string(), st.cs[1 - gdn_parity]);
+                        let io = tile_state[&l];
+                        lpool.insert("L_S_in".to_string(), io.s_in);
+                        lpool.insert("L_S_out".to_string(), io.s_out);
+                        lpool.insert("L_cs_in".to_string(), io.cs_in);
+                        lpool.insert("L_cs_out".to_string(), io.cs_out);
                         // [moe/fp8 hook] router, FP8 weight scales, site cast scales of layer l
                         crate::engine::moe::bind_ext_layer_weights(
                             &self.weights_addr,
@@ -2817,6 +3035,14 @@ impl Qwen3Engine {
                     gdn_parity ^= 1;
                 }
                 pos += tile_len as usize;
+                // synchronised: a whole tile's end is a position the next request can resume at
+                if tile_len == self.prefill_tile {
+                    self.prefix.tiles_done(
+                        prompt_ids,
+                        &self.prefix_images,
+                        pos as u64 / self.prefill_tile.max(1),
+                    );
+                }
                 self.live.prefill_tile(
                     pos as u64,
                     n_layers as u64 + 1,
@@ -2840,6 +3066,10 @@ impl Qwen3Engine {
             }
 
             prof_rt::end_prefill(&mut self.prof, &self.dev, pf_launch)?;
+            // rows [0, pos) are this prompt's now (all of it, or the tiles a cancelled prefill
+            // finished); positions whose tile did not finish are dropped
+            self.prefix
+                .prefill_end(prompt_ids, &self.prefix_images, pos as u64);
             if stopped_by_cancel {
                 let ttft_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
                 return Ok(Qwen3GenReport {
@@ -2913,9 +3143,11 @@ impl Qwen3Engine {
         };
 
         let ttft_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-        let prefill_tok_s = (prompt_ids.len() as f64) / (ttft_ms / 1000.0).max(1e-9);
+        // rows this request prefilled (a resumed prefill takes the rest over)
+        let prefilled = prompt_ids.len() - resume.min(prompt_ids.len());
+        let prefill_tok_s = (prefilled as f64) / (ttft_ms / 1000.0).max(1e-9);
         if prompt_ids.len() > 1 {
-            self.pf.report(prompt_ids.len(), ttft_ms); // [prefill] profile / stats runs only
+            self.pf.report(prefilled, ttft_ms); // [prefill] profile / stats runs only
         }
         let first_tok = self.apply_force(params, 0, first_tok, first_logits_hbm, &mut forks)?;
 
@@ -3009,6 +3241,9 @@ impl Qwen3Engine {
                     .enumerate()
                     .map(|(a, n)| a as u64 * n)
                     .sum(),
+                // set by the caller from the request's prefix plan
+                reused_tokens: 0,
+                prefix_common: 0,
             });
         }
 
