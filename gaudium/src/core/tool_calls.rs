@@ -8,10 +8,10 @@ use crate::verified::{
     block_close, block_close_events, block_must_open, call_accepts, call_after_finish,
     call_is_streaming, call_step, finish_reason, gen_end, hold_max, hold_release, slice_bound,
     stop_reason, tool_choice_forces, tool_choice_offers, tool_choice_valid, tool_force_applies,
-    tool_thinking_allowed,
+    tool_force_place, tool_thinking_allowed,
 };
 pub use crate::verified::{
-    BlockKind, CallEvent, CallPhase, FinishReason, GenEnd, StopReason, ToolChoice,
+    BlockKind, CallEvent, CallPhase, FinishReason, ForcePlace, GenEnd, StopReason, ToolChoice,
 };
 
 /// What a request's `tool_choice` and tool list mean for its prompt and its reply.
@@ -35,6 +35,12 @@ impl ToolPolicy {
     /// Whether the model may reason before it answers.
     pub fn thinking(&self, wants_thinking: bool) -> bool {
         tool_thinking_allowed(wants_thinking, self.forces)
+    }
+
+    /// Where a forced call's opening goes: the prompt ends inside the model's reasoning
+    /// (`reasoning_open`), or the model's format can write the opening (`can_place`).
+    pub fn placement(&self, reasoning_open: bool, can_place: bool) -> ForcePlace {
+        tool_force_place(self.forces, reasoning_open, can_place)
     }
 }
 

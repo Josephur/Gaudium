@@ -481,6 +481,7 @@ or reads it to rewrite a file.
 
 | Variable | Read by | Meaning |
 |---|---|---|
+| `GAUDIUM_INKLING2_DIR` | `tokenizer::tests::inkling2_ids_match_the_reference`, `server::chat::tests::inkling2_template_renders_like_jinja2`, `server::chat::tests::inkling2_requests_render_through_the_model_template` (`--ignored`) | An Inkling 2 model directory: its `tokenizer.json` must encode and decode the cases of `gaudium/tests/data/tokenizer/inkling2_cases.json` exactly, and its `chat_template.jinja` must render the contexts of `gaudium/tests/data/chat/inkling2_renders.json` as Jinja2 does (both written by the generator scripts next to them). |
 | `GAUDIUM_IMAGE_REF_DIR` | the decoder tests in `src/vision/decode/` (`--ignored`) | A directory of image files with the raw RGB dump the reference image library wrote for each; every file must decode to the same bytes. |
 | `GAUDIUM_IMAGE_PIPELINE_REF_DIR` | `vision::media::tests::reference_pipeline_records_match_bit_for_bit` (`--ignored`) | A directory written by `gaudium/tests/data/vision/make_pipeline_refs.py`: image files with the patch rows of the checkpoint's own image processor, which must match bit for bit. |
 | `GAUDIUM_VISION_REF_DIR` | `vision::tests::reference_prompt_records_match_bit_for_bit` (`--ignored`) | A directory of reference prompt records (token ids, image grids, positions, patch rows) that the prompt layout and the image preprocessing must reproduce. |

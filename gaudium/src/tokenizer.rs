@@ -5,6 +5,12 @@
 //!   exact hand-written Qwen2 / Qwen3.5 pre-tokenizer state machine, and O(n log n) min-heap BPE.
 //! - **Character-level `byte_fallback` BPE** (Gemma 4): U+2581 space substitution, `<0xNN>`
 //!   byte fallback tokens, and valid-UTF-8 byte-run coalescing on decode.
+//! - **ByteLevel BPE with the letter-case pattern** (Inkling 2): a pre-tokenizer that splits
+//!   words at case runs (an uppercase run may lead a lowercase one), numbers in groups of three,
+//!   punctuation runs with their trailing newlines or slashes, and whitespace runs; its character
+//!   classes come from a table generated from the reference tokenizer itself
+//!   (`tokenizer/char_classes.rs`). With `ignore_merges` a piece that is a whole vocabulary entry
+//!   is that entry, without merging.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -13,6 +19,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::json::parse_json;
+
+mod char_classes;
 
 #[derive(Debug)]
 pub enum TokenizerError {
@@ -218,6 +226,158 @@ fn match_pretok_at(chars: &[char], i: usize, include_marks: bool) -> usize {
     i + 1
 }
 
+/// The `Split` pattern of the letter-case pre-tokenizer, exactly as `tokenizer.json` writes it.
+const LETTER_CASE_PATTERN: &str = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+/// A character's class under the letter-case pattern (the ids of `char_classes.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    /// Not a space, a letter, a mark or a number (punctuation, symbols, unassigned).
+    Other,
+    /// `Lu`, `Lt`: may only lead a word's uppercase run.
+    Upper,
+    /// `Ll`: lowercase only.
+    Lower,
+    /// `Lm`, `Lo`: a letter of both runs.
+    Both,
+    /// `M`: in both runs, but not a letter.
+    Mark,
+    /// `N`.
+    Number,
+    /// `\s`.
+    Space,
+}
+
+fn char_class(c: char) -> CharClass {
+    let key = ((c as u32) << 3) | 7;
+    let runs = &char_classes::CLASS_RUNS;
+    // the last run starting at or before `c`
+    let k = runs.partition_point(|&r| r <= key);
+    match runs[k.saturating_sub(1)] & 7 {
+        1 => CharClass::Upper,
+        2 => CharClass::Lower,
+        3 => CharClass::Both,
+        4 => CharClass::Mark,
+        5 => CharClass::Number,
+        6 => CharClass::Space,
+        _ => CharClass::Other,
+    }
+}
+
+/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)` at `i`: its end, or `i` when there is none.
+fn contraction_end(chars: &[char], i: usize) -> usize {
+    if chars.get(i) != Some(&'\'') {
+        return i;
+    }
+    let fold = |k: usize| -> char {
+        match chars.get(k) {
+            // the one non-ASCII letter that case-folds onto these: U+017F LATIN SMALL LETTER LONG S
+            Some('\u{17F}') => 's',
+            Some(c) => c.to_ascii_lowercase(),
+            None => '\0',
+        }
+    };
+    match (fold(i + 1), fold(i + 2)) {
+        ('s' | 't' | 'm' | 'd', _) => i + 2,
+        ('r' | 'v', 'e') | ('l', 'l') => i + 3,
+        _ => i,
+    }
+}
+
+/// The letter-case pattern at `i`: the end `e > i` of the next isolated piece. The alternatives
+/// are tried in the pattern's order with its backtracking, so the first one that matches wins.
+fn match_letter_case_at(chars: &[char], cls: &[CharClass], i: usize) -> usize {
+    use CharClass::*;
+    let n = chars.len();
+    let at = |k: usize| if k < n { Some(cls[k]) } else { None };
+    // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+    let upper = |k: usize| matches!(at(k), Some(Upper | Both | Mark));
+    let lower = |k: usize| matches!(at(k), Some(Lower | Both | Mark));
+    // [^\r\n\p{L}\p{N}]
+    let prefix = |k: usize| {
+        k < n
+            && !matches!(cls[k], Upper | Lower | Both | Number)
+            && !matches!(chars[k], '\r' | '\n')
+    };
+    // [^\s\p{L}\p{N}]
+    let other = |k: usize| matches!(at(k), Some(Other | Mark));
+    let run = |mut k: usize, f: &dyn Fn(usize) -> bool| {
+        while f(k) {
+            k += 1;
+        }
+        k
+    };
+    // 1. P? U* L+ C?
+    for take in [true, false] {
+        if take && !prefix(i) {
+            continue;
+        }
+        let k0 = i + usize::from(take);
+        let u_end = run(k0, &upper);
+        // L+ starts at the last position the U* run can give back to it
+        let mut p = u_end;
+        loop {
+            if lower(p) {
+                return contraction_end(chars, run(p, &lower));
+            }
+            if p == k0 {
+                break;
+            }
+            p -= 1;
+        }
+    }
+    // 2. P? U+ L* C?
+    for take in [true, false] {
+        if take && !prefix(i) {
+            continue;
+        }
+        let k0 = i + usize::from(take);
+        let u_end = run(k0, &upper);
+        if u_end > k0 {
+            return contraction_end(chars, run(u_end, &lower));
+        }
+    }
+    // 3. \p{N}{1,3}
+    if at(i) == Some(Number) {
+        let mut k = i + 1;
+        while k < n && k < i + 3 && cls[k] == Number {
+            k += 1;
+        }
+        return k;
+    }
+    // 4.  ?[^\s\p{L}\p{N}]+[\r\n/]*
+    let k = if chars[i] == ' ' && other(i + 1) {
+        i + 1
+    } else {
+        i
+    };
+    if other(k) {
+        let mut k = run(k, &other);
+        while k < n && matches!(chars[k], '\r' | '\n' | '/') {
+            k += 1;
+        }
+        return k;
+    }
+    // 5-7. whitespace runs
+    if cls[i] == Space {
+        let j = run(i, &|k: usize| at(k) == Some(Space));
+        // \s*[\r\n]+
+        if let Some(q) = (i..j).rev().find(|&q| matches!(chars[q], '\r' | '\n')) {
+            return q + 1;
+        }
+        // \s+(?!\S)
+        if j == n {
+            return j;
+        }
+        if j - 1 > i {
+            return j - 1;
+        }
+        // \s+
+        return j;
+    }
+    i + 1
+}
+
 /// Parses `<0xNN>` uppercase hex fallback byte tokens (SentencePiece / Gemma 4).
 fn parse_hex_byte_token(s: &str) -> Option<u8> {
     let b = s.as_bytes();
@@ -262,9 +422,22 @@ const FLAG_ADDED: u8 = 1;
 const FLAG_SPECIAL: u8 = 2;
 const FLAG_BYTE_FALLBACK: u8 = 4;
 
+/// The pre-tokenizer a `tokenizer.json` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pretok {
+    /// The Qwen2 / Qwen3.5 pattern (with or without `\p{M}` in the letter runs).
+    Qwen { include_marks: bool },
+    /// The letter-case pattern.
+    LetterCase,
+}
+
 pub struct Tokenizer {
     byte_fallback: bool,
-    include_marks: bool,
+    pretok: Pretok,
+    /// A piece that is a whole vocabulary entry is that entry (the model's `ignore_merges`).
+    ignore_merges: bool,
+    /// ByteLevel: the alphabet character of each byte.
+    byte_char: [char; 256],
     vocab: HashMap<String, i32>,
     id_bytes: Vec<Vec<u8>>,
     id_piece: Vec<String>,
@@ -346,7 +519,11 @@ impl Tokenizer {
             .get("byte_fallback")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let (_b2cp, cp2b) = byte_level_tables();
+        let (b2cp, cp2b) = byte_level_tables();
+        let ignore_merges = model
+            .get("ignore_merges")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         for (piece, v) in vocab_obj {
             let id = v.as_i64().unwrap() as i32;
@@ -449,8 +626,10 @@ impl Tokenizer {
             }
         }
 
-        // Detect whether pre-tokenizer regex includes Unicode marks \p{M} (Qwen3.5 vs Qwen2/Qwen3)
+        // Detect whether pre-tokenizer regex includes Unicode marks \p{M} (Qwen3.5 vs Qwen2/Qwen3),
+        // or is the letter-case pattern
         let mut include_marks = false;
+        let mut letter_case = false;
         if let Some(pt) = root.get("pre_tokenizer") {
             if let Some(list) = pt.get("pretokenizers").and_then(|v| v.as_array()) {
                 for p in list {
@@ -462,6 +641,9 @@ impl Tokenizer {
                         {
                             if re.contains("\\p{M}") {
                                 include_marks = true;
+                            }
+                            if re == LETTER_CASE_PATTERN {
+                                letter_case = true;
                             }
                         }
                     }
@@ -479,9 +661,19 @@ impl Tokenizer {
             }
         }
 
+        let mut byte_char = ['\0'; 256];
+        for (slot, &cp) in byte_char.iter_mut().zip(b2cp.iter()) {
+            *slot = char::from_u32(cp).unwrap_or('\0');
+        }
         Ok(Self {
             byte_fallback,
-            include_marks,
+            pretok: if letter_case {
+                Pretok::LetterCase
+            } else {
+                Pretok::Qwen { include_marks }
+            },
+            ignore_merges,
+            byte_char,
             vocab,
             id_bytes,
             id_piece,
@@ -611,10 +803,22 @@ impl Tokenizer {
         offs.push(seg.len());
 
         let mut i = 0usize;
-        while i < chars.len() {
-            let e = match_pretok_at(&chars, i, self.include_marks);
-            self.bpe_piece(&seg[offs[i]..offs[e]], out);
-            i = e;
+        match self.pretok {
+            Pretok::Qwen { include_marks } => {
+                while i < chars.len() {
+                    let e = match_pretok_at(&chars, i, include_marks);
+                    self.bpe_piece(&seg[offs[i]..offs[e]], out);
+                    i = e;
+                }
+            }
+            Pretok::LetterCase => {
+                let cls: Vec<CharClass> = chars.iter().map(|&c| char_class(c)).collect();
+                while i < chars.len() {
+                    let e = match_letter_case_at(&chars, &cls, i);
+                    self.bpe_piece(&seg[offs[i]..offs[e]], out);
+                    i = e;
+                }
+            }
         }
     }
 
@@ -623,6 +827,15 @@ impl Tokenizer {
         if raw.len() == 1 {
             out.push(self.byte_id[raw[0] as usize]);
             return;
+        }
+        if self.ignore_merges {
+            let word: String = raw.iter().map(|&b| self.byte_char[b as usize]).collect();
+            if let Some(&id) = self.vocab.get(&word) {
+                if !self.is_added(id) {
+                    out.push(id);
+                    return;
+                }
+            }
         }
         let cacheable = raw.len() <= 64;
         if cacheable {
@@ -928,6 +1141,7 @@ pub(crate) fn test_tokenizer(added: &[(&str, bool)]) -> Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json::JsonValue;
 
     fn synthetic_byte_level_tokenizer() -> Tokenizer {
         let (b2cp, _) = byte_level_tables();
@@ -997,6 +1211,120 @@ mod tests {
             "{{- '<|turn>model\\n' -}}{%- if not enable_thinking -%}{{- '<|channel>thought\\n<channel|>' -}}"
         ));
         assert!(!gemma4_template_closes_thought("{{- '<|turn>model\\n' -}}"));
+    }
+
+    /// The letter-case pre-tokenizer's split of `seg`.
+    fn letter_case_split(seg: &str) -> Vec<&str> {
+        let chars: Vec<char> = seg.chars().collect();
+        let offs: Vec<usize> = seg
+            .char_indices()
+            .map(|(b, _)| b)
+            .chain([seg.len()])
+            .collect();
+        let cls: Vec<CharClass> = chars.iter().map(|&c| char_class(c)).collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let e = match_letter_case_at(&chars, &cls, i);
+            assert!(e > i);
+            out.push(&seg[offs[i]..offs[e]]);
+            i = e;
+        }
+        out
+    }
+
+    fn inkling2_cases() -> JsonValue {
+        parse_json(include_str!("../tests/data/tokenizer/inkling2_cases.json")).unwrap()
+    }
+
+    #[test]
+    fn letter_case_pieces_match_the_reference() {
+        // the reference pre-tokenizer's pieces are byte-level text: map them back to bytes
+        let (b2cp, cp2b) = byte_level_tables();
+        let raw = |piece: &str| -> Vec<u8> { piece.chars().map(|c| cp2b[&(c as u32)]).collect() };
+        let level = |bytes: &[u8]| -> String {
+            bytes
+                .iter()
+                .map(|&b| char::from_u32(b2cp[b as usize]).unwrap())
+                .collect()
+        };
+        let cases = inkling2_cases();
+        let mut n = 0;
+        for case in cases.get("encode").unwrap().as_array().unwrap() {
+            for seg in case.get("pieces").unwrap().as_array().unwrap() {
+                let want: Vec<&str> = seg
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p.as_str().unwrap())
+                    .collect();
+                let bytes: Vec<u8> = want.iter().flat_map(|p| raw(p)).collect();
+                let text = String::from_utf8(bytes).unwrap();
+                let got: Vec<String> = letter_case_split(&text)
+                    .iter()
+                    .map(|p| level(p.as_bytes()))
+                    .collect();
+                assert_eq!(got, want, "{text:?}");
+                n += 1;
+            }
+        }
+        assert!(n > 300, "{n} segments");
+        // the classes behind the pattern, spot-checked
+        use CharClass::*;
+        for (c, k) in [
+            ('a', Lower),
+            ('A', Upper),
+            ('\u{1C5}', Upper),
+            ('\u{2B0}', Both),
+            ('\u{4E00}', Both),
+            ('\u{301}', Mark),
+            ('7', Number),
+            ('\u{2160}', Number),
+            (' ', Space),
+            ('\u{3000}', Space),
+            ('\u{200B}', Other),
+            ('!', Other),
+            ('\u{10FFFF}', Other),
+        ] {
+            assert_eq!(char_class(c), k, "{c:?}");
+        }
+    }
+
+    /// Set `GAUDIUM_INKLING2_DIR` to an Inkling 2 model directory (its `tokenizer.json`).
+    #[test]
+    #[ignore = "needs GAUDIUM_INKLING2_DIR with the model's tokenizer.json"]
+    fn inkling2_ids_match_the_reference() {
+        let dir = std::env::var("GAUDIUM_INKLING2_DIR").expect("GAUDIUM_INKLING2_DIR");
+        let tok = Tokenizer::from_model_dir(Path::new(&dir)).unwrap();
+        assert!(tok.ignore_merges && tok.pretok == Pretok::LetterCase);
+        let ids_of = |v: &JsonValue| -> Vec<i32> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect()
+        };
+        let cases = inkling2_cases();
+        for case in cases.get("encode").unwrap().as_array().unwrap() {
+            let text = case.get("text").unwrap().as_str().unwrap();
+            let want = ids_of(case.get("ids").unwrap());
+            assert_eq!(tok.encode(text, true), want, "{text:?}");
+            assert_eq!(tok.decode(&want, false), text);
+            // streaming: the pieces join to the text, never splitting a character
+            let mut sd = StreamDecoder::new(&tok);
+            let mut streamed = String::new();
+            for &id in &want {
+                streamed.push_str(&sd.push(id));
+            }
+            streamed.push_str(&sd.flush());
+            assert_eq!(streamed, text);
+        }
+        for case in cases.get("decode").unwrap().as_array().unwrap() {
+            let ids = ids_of(case.get("ids").unwrap());
+            let skip = case.get("skip_special").unwrap().as_bool().unwrap();
+            let want = case.get("text").unwrap().as_str().unwrap();
+            assert_eq!(tok.decode(&ids, skip), want, "{ids:?}");
+        }
     }
 
     #[test]

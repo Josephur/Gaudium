@@ -1,0 +1,1170 @@
+{
+ "cases": [
+  {
+   "name": "plain",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "system",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "Be brief."
+     },
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "two_systems",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "A"
+     },
+     {
+      "role": "system",
+      "content": "B"
+     },
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>A<|end_message|><|message_system|><|content_text|>B<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "only_system",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "Alone."
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Alone.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+  },
+  {
+   "name": "multi_turn",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello!"
+     },
+     {
+      "role": "user",
+      "content": "How are you?"
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>How are you?<|end_message|>"
+  },
+  {
+   "name": "reasoning_kept",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4",
+      "reasoning_content": "Add them."
+     },
+     {
+      "role": "user",
+      "content": "And 3+3?"
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>2+2?<|end_message|><|message_model|><|content_thinking|>Add them.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And 3+3?<|end_message|>"
+  },
+  {
+   "name": "reasoning_only",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "hmm"
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|><|content_thinking|>hmm<|end_message|><|content_model_end_sampling|>"
+  },
+  {
+   "name": "empty_assistant",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": ""
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|><|content_text|><|end_message|><|content_model_end_sampling|>"
+  },
+  {
+   "name": "tools_declared",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather in Oslo?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City é"
+         },
+         "days": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "name": "lookup",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "now"
+      }
+     }
+    ]
+   },
+   "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City é\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"now\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Oslo?<|end_message|>"
+  },
+  {
+   "name": "tool_call_and_result",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather in Oslo?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Oslo",
+          "days": 2
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "sunny"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City é"
+         },
+         "days": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City é\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Oslo?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\",\"days\":2}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny<|end_message|>"
+  },
+  {
+   "name": "tool_call_reasoning_text",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather?"
+     },
+     {
+      "role": "assistant",
+      "content": "Checking.",
+      "reasoning_content": "Use the tool.",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Oslo",
+          "days": 2
+         }
+        }
+       },
+       {
+        "id": "call_2",
+        "type": "function",
+        "function": {
+         "name": "lookup",
+         "arguments": {
+          "q": "café \"quoted\"",
+          "Z": [
+           1,
+           2.5,
+           null,
+           true,
+           {
+            "b": 1,
+            "a": 2
+           }
+          ],
+          "a": {
+           "y": 1,
+           "x": "\n"
+          }
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "name": "get_weather",
+      "content": "sunny"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_2",
+      "content": "found"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City é"
+         },
+         "days": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "name": "lookup",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City é\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather?<|end_message|><|message_model|><|content_thinking|>Use the tool.<|end_message|><|message_model|><|content_text|>Checking.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\",\"days\":2}}<|end_message|><|message_model|>lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"Z\":[1,2.5,null,true,{\"b\":1,\"a\":2}],\"a\":{\"y\":1,\"x\":\"\\n\"},\"q\":\"café \\\"quoted\\\"\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny<|end_message|><|message_tool|>lookup<|content_text|>found<|end_message|>"
+  },
+  {
+   "name": "tool_result_unnamed",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Oslo",
+          "days": 2
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "content": "no id"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_9",
+      "content": "unknown id"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City é"
+         },
+         "days": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City é\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\",\"days\":2}}<|end_message|><|content_model_end_sampling|><|message_tool|><|content_text|>no id<|end_message|><|message_tool|><|content_text|>unknown id<|end_message|>"
+  },
+  {
+   "name": "tool_call_no_args",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "c",
+        "function": {
+         "name": "now"
+        }
+       },
+       {
+        "id": "d",
+        "function": {
+         "name": "now",
+         "arguments": {}
+        }
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "now"
+      }
+     }
+    ]
+   },
+   "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"now\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>now<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|><|message_model|>now<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|><|content_model_end_sampling|>"
+  },
+  {
+   "name": "assistant_named",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "name": "get_weather",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Oslo",
+          "days": 2
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\",\"days\":2}}<|end_message|><|content_model_end_sampling|>"
+  },
+  {
+   "name": "assistant_name_mismatch",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "name": "other",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Oslo",
+          "days": 2
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "error": "assistant name other does not match its tool call get_weather"
+  },
+  {
+   "name": "args_as_string",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "c",
+        "function": {
+         "name": "f",
+         "arguments": "{\"a\": 1}"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "error": "tool call arguments must be a parsed object, not a JSON string; canonicalize upstream"
+  },
+  {
+   "name": "args_not_object",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "c",
+        "function": {
+         "name": "f",
+         "arguments": [
+          1,
+          2
+         ]
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "error": "tool call arguments must be an object"
+  },
+  {
+   "name": "call_name_not_string",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "c",
+        "function": {
+         "arguments": {}
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "error": "tool call function name must be a string"
+  },
+  {
+   "name": "image_and_text",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "What is this?"
+       },
+       {
+        "type": "image"
+       }
+      ]
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is this?<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>"
+  },
+  {
+   "name": "images_only",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "image"
+       },
+       {
+        "type": "image"
+       }
+      ]
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>"
+  },
+  {
+   "name": "text_parts",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "a"
+       },
+       {
+        "type": "text",
+        "text": "b"
+       }
+      ]
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>a<|end_message|><|message_user|><|content_text|>b<|end_message|>"
+  },
+  {
+   "name": "tool_image",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Oslo",
+          "days": 2
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": [
+       {
+        "type": "text",
+        "text": "chart:"
+       },
+       {
+        "type": "image"
+       }
+      ]
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\",\"days\":2}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>chart:<|end_message|><|message_tool|>get_weather<|content_image|><|unused_200054|><|end_message|>"
+  },
+  {
+   "name": "assistant_image",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "image"
+       }
+      ]
+     }
+    ]
+   },
+   "error": "Image content is only supported for user and tool messages"
+  },
+  {
+   "name": "audio",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "audio"
+       }
+      ]
+     }
+    ]
+   },
+   "error": "Inkling 2 does not accept audio input"
+  },
+  {
+   "name": "video",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "video"
+       }
+      ]
+     }
+    ]
+   },
+   "error": "Unsupported content part type: video"
+  },
+  {
+   "name": "unknown_role",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "narrator",
+      "content": "x"
+     }
+    ]
+   },
+   "error": "Unknown message role: narrator"
+  },
+  {
+   "name": "unicode",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "你好 😀 <|end_message|> é"
+     }
+    ]
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>你好 😀 <|end_message|> é<|end_message|>"
+  },
+  {
+   "name": "effort_none",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "none"
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_minimal",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "minimal"
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_low",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "low"
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_medium",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "medium"
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_high",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "high"
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_xhigh",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "xhigh"
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_max",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "max"
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_high",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": " high "
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_turbo",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "turbo"
+   },
+   "error": "Unknown reasoning_effort: turbo"
+  },
+  {
+   "name": "effort_None",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": null
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_num_0",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 0
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_num_0_0",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 0.0
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_num_0_5",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 0.5
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_num_0_25",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 0.25
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.25<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_num_0_99",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 0.99
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_num_1",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 1
+   },
+   "error": "reasoning_effort must be in [0.0, 0.99]"
+  },
+  {
+   "name": "effort_num_1_0",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 1.0
+   },
+   "error": "reasoning_effort must be in [0.0, 0.99]"
+  },
+  {
+   "name": "effort_num_neg0_1",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": -0.1
+   },
+   "error": "reasoning_effort must be in [0.0, 0.99]"
+  },
+  {
+   "name": "effort_with_system",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "S"
+     },
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "low"
+   },
+   "text": "<|message_system|><|content_text|>S<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort_and_flag",
+   "context": {
+    "add_generation_prompt": true,
+    "eos_token": "<|content_model_end_sampling|>",
+    "pad_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "none",
+    "enable_thinking": false
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  }
+ ]
+}
