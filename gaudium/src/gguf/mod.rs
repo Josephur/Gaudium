@@ -959,4 +959,4 @@ impl Gguf {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -152,6 +152,8 @@ fn print_usage() {
          \x20                       a model whose checkpoint has a vision tower takes images (JPEG,\n\
          \x20                       PNG, GIF, WebP, BMP as data: URLs) and videos (an animated GIF /\n\
          \x20                       WebP, or a list of frames with their rate) in chat requests.\n\
+         \x20                       A GGUF model's tower is a projector file (mmproj*.gguf) beside\n\
+         \x20                       it; with none there it is served text only.\n\
          \x20                       A model drafted by a block or an MTP drafter is served text\n\
          \x20                       only (plain decode and DSpine run with image input)\n\
          \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\

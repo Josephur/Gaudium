@@ -174,11 +174,27 @@ fn obj_f64x3(o: &JsonValue, key: &str) -> Option<[f64; 3]> {
     Some([a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?])
 }
 
+/// The spec of the model at `path` when it has a vision tower: a checkpoint whose `config.json`
+/// has one, or a GGUF model with a projector file beside it (which file, and whether it fits the
+/// model, is decided when its spec is read: [`VisionSpec::from_model_dir`]).
+pub fn model_with_tower(path: &Path) -> Option<crate::model_spec::ModelSpec> {
+    if crate::gguf::looks_like_gguf(path) {
+        return crate::engine::inkling2::vision::gguf_tower::model_spec_with_tower(path);
+    }
+    crate::model_spec::ModelSpec::from_config_file(path.join("config.json"))
+        .ok()
+        .filter(|s| s.has_vision)
+}
+
 impl VisionSpec {
     /// Reads `config.json` (required), `preprocessor_config.json` (optional) and
     /// `video_preprocessor_config.json` (optional: without it, or without a video pad token,
     /// the checkpoint takes no video) of a model dir.
     pub fn from_model_dir(dir: &Path) -> Result<Self, String> {
+        // a GGUF model's tower is its projector file beside it
+        if crate::gguf::looks_like_gguf(dir) {
+            return crate::engine::inkling2::vision::gguf_tower::model_vision_spec(dir);
+        }
         let cfg = std::fs::read_to_string(dir.join("config.json"))
             .map_err(|e| format!("read config.json: {e}"))?;
         let pre = std::fs::read_to_string(dir.join("preprocessor_config.json")).ok();
