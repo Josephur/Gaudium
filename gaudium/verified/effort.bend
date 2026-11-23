@@ -276,19 +276,49 @@ def effort_plan_offered(s, a):
     case EaOther{}:
       effort_other_ok(s, effort_any(s))
 
-# A template without an effort setting is never given a level.
-law effort_no_levels_no_level:
-  for +a: EffortAsk
-  {effort_plan_is_level(effort_plan(EfSet{False{}, False{}, False{}, False{}, False{}, False{}}, a)) == False{} : Bool}
-
-def effort_no_levels_no_level(a):
-  match a:
+# The plan for the empty set is never a level.
+def effort_empty_ask(+q: EffortAsk) -> {effort_plan_is_level(effort_plan(EfSet{False{}, False{}, False{}, False{}, False{}, False{}}, q)) == False{} : Bool}:
+  match q:
     case EaOff{}:
       {==}
     case EaLevel{+r}:
       effort_empty_level(r, effort_has(EfSet{False{}, False{}, False{}, False{}, False{}, False{}}, r), {==})
     case EaOther{}:
       {==}
+
+# A set with a level in it, or a plan that is not a level: flag by flag, down to the empty set.
+def effort_none_no_level(+a: Bool, +b: Bool, +c: Bool, +d: Bool, +e: Bool, +f: Bool, +q: EffortAsk) -> {Bool.or(effort_any(EfSet{a, b, c, d, e, f}), Bool.not(effort_plan_is_level(effort_plan(EfSet{a, b, c, d, e, f}, q)))) == True{} : Bool}:
+  match a:
+    case True{}: {==}
+    case False{}:
+      match b:
+        case True{}: {==}
+        case False{}:
+          match c:
+            case True{}: {==}
+            case False{}:
+              match d:
+                case True{}: {==}
+                case False{}:
+                  match e:
+                    case True{}: {==}
+                    case False{}:
+                      match f:
+                        case True{}: {==}
+                        case False{}:
+                          %Equal.sym(Bool, effort_plan_is_level(effort_plan(EfSet{False{}, False{}, False{}, False{}, False{}, False{}}, q)), False{}, effort_empty_ask(q)) : {Bool.or(effort_any(EfSet{False{}, False{}, False{}, False{}, False{}, False{}}), Bool.not(_)) == True{} : Bool}
+                          {==}
+
+# A template without an effort setting is never given a level.
+law effort_no_levels_no_level:
+  for +s: EffortSet
+  for +q: EffortAsk
+  {Bool.or(effort_any(s), Bool.not(effort_plan_is_level(effort_plan(s, q)))) == True{} : Bool}
+
+def effort_no_levels_no_level(s, q):
+  match s:
+    case EfSet{a, b, c, d, e, f}:
+      effort_none_no_level(a, b, c, d, e, f, q)
 
 # Asking for a level the template accepts gives exactly that level.
 law effort_offered_kept:
