@@ -42,9 +42,9 @@ use crate::cache_ram::{digest128, EngineId, HostCache, SharedCache};
 use crate::synapse::xfer::{Piece, XferRing, XferStats};
 use crate::verified::{
     hc_clean_hi, hc_clean_join_hi, hc_clean_join_lo, hc_clean_lo, hc_copy_wins, hc_layout,
-    hc_loses_unsaved, hc_must_flush, hc_ring_floor, hc_ring_restore, hc_ring_save, hc_rows_added,
-    hc_rows_complete, hc_save_ok, hc_state_wanted, hc_tile_clean, hc_tile_copied, hc_written_hi,
-    hc_written_lo, pc_boundary, pc_request_may_reuse, HcLayout,
+    hc_loses_unsaved, hc_must_flush, hc_new_tiles, hc_ring_floor, hc_ring_restore, hc_ring_save,
+    hc_rows_added, hc_rows_complete, hc_save_ok, hc_state_wanted, hc_tile_clean, hc_tile_copied,
+    hc_written_hi, hc_written_lo, pc_boundary, pc_request_may_reuse, HcLayout,
 };
 
 /// Tiles whose rows one copy call takes (a waiting request is noticed between ring buffers
@@ -696,10 +696,14 @@ impl HostTier {
             e
         };
 
-        // rows, tile by tile
+        // rows, tile by tile: a round of the tiles the entry still lacks (`hc_new_tiles`), until
+        // none is left or a round stops short
         let mut have = target.have_tiles;
-        while have < upto && complete {
-            let n = (upto - have).min(ROUND_TILES);
+        while complete {
+            let n = hc_new_tiles(upto, have).min(ROUND_TILES);
+            if n == 0 {
+                break;
+            }
             let Some(segs) = store.begin_rows(entry, n, tile_bytes) else {
                 complete = false;
                 break;
