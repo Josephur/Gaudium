@@ -1,0 +1,236 @@
+name: CI
+
+# Builds and tests everything on each pull request and on main, and packs the release archive,
+# kept for a few days as a workflow artifact. A pushed tag vX.Y.Z runs the same build and then
+# publishes that archive as a GitHub Release (docs/releasing.md).
+#
+# No job opens a Gaudi card (the runner has none) and nothing here runs on a schedule.
+#
+# The Intel Gaudi SDK is installed on the runner only to check that the kernels compile. Its
+# licence does not allow redistribution, and its compiler puts code of its own into what it
+# compiles: never cache, upload or pack the SDK, and never anything under build/kernels/ either.
+# The archive (packaging/package-release.sh) holds the engine binary, the Web UI and the kernel
+# SOURCES; the script refuses object files, libraries, compiled recipes and SDK files.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Intel Gaudi SDK release the kernels are compile-checked with here, and that INSTALL.md
+  # names as tested: the apt version of habanalabs-tools and habanalabs-graph.
+  SDK_VERSION: "1.24.2-481"
+  RUST_VERSION: "1.99.1"
+  # The Lean release `bend --verdict` of the Bend in gaudium/bend.pin asks for.
+  LEAN_VERSION: "4.34.0"
+  # SHA-256 of bend-<gaudium/bend.pin>-linux-x64.tar.gz, as its installer (bend-lang.com/install.sh) states it.
+  BEND_SHA256: "c9ff8d67bd903fb6ad9a26b43d8a62c01021de82a44d55ce4a3dcd4732113d6b"
+  NODE_VERSION: "20.19.2"
+  # Every proof is rechecked by the Lean kernel; the build fails without Lean.
+  BEND_VERDICT: require
+  BEND_NO_TELEMETRY: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build, test and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      artifact: ${{ steps.version.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Version (a release tag must be "v" + the crate version, on a commit of main)
+        id: version
+        run: |
+          if [[ $GITHUB_REF_TYPE == tag ]]; then
+            version=$(packaging/crate-version.sh --check-tag "$GITHUB_REF_NAME")
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+              echo "::error::tag $GITHUB_REF_NAME is on $GITHUB_SHA, which is not a commit of main"
+              exit 1
+            fi
+          else
+            version=$(packaging/crate-version.sh)
+          fi
+          artifact="gaudium-$version-linux-x86_64"
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "Gaudium $version -> $artifact"
+
+      - name: Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustc --version
+          cargo --version
+
+      - name: Bend 2 (the release in gaudium/bend.pin)
+        run: |
+          pin=$(sed -e 's/#.*//' gaudium/bend.pin | tr -d '[:space:]')
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$RUNNER_TEMP/bend.tar.gz" \
+            "https://github.com/bendlang/bend/releases/download/v$pin/bend-$pin-linux-x64.tar.gz"
+          echo "$BEND_SHA256  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/bend.tar.gz" -C "$RUNNER_TEMP"
+          mkdir -p "$HOME/.bend/bin"
+          mv "$RUNNER_TEMP/bend/bend2" "$RUNNER_TEMP/bend/guide" "$HOME/.bend/"
+          mv "$RUNNER_TEMP/bend/bin/bend" "$HOME/.bend/bin/bend"
+          echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
+          "$HOME/.bend/bin/bend" version
+
+      - name: Lean ${{ env.LEAN_VERSION }} (elan)
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$RUNNER_TEMP/elan-init.sh" \
+            https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain "leanprover/lean4:v$LEAN_VERSION"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/lean" --version
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # A build writes the lock when the file is missing, so a checkout without it would pass.
+      - name: The law lock is in the checkout
+        run: |
+          git ls-files --error-unmatch gaudium/rusty-bends.lock
+          test -s gaudium/rusty-bends.lock
+
+      - name: Check (every Bend law, rechecked by Lean)
+        working-directory: gaudium
+        run: cargo check --locked
+
+      - name: The build left the law lock as committed
+        run: git diff --exit-code -- gaudium/rusty-bends.lock
+
+      - name: Rust tests
+        working-directory: gaudium
+        run: cargo test --locked
+
+      - name: Web UI tests
+        working-directory: ui
+        run: node --test test/
+
+      - name: Release binary
+        working-directory: gaudium
+        run: |
+          GAUDIUM_BUILD_COMMIT=${GITHUB_SHA::12} cargo build --release --locked
+          target/release/gaudium --version
+
+      # The SDK stays on this runner: tpc-clang through apt, and the headers of habanalabs-graph
+      # unpacked beside the checkout (the package itself pulls in the card's user-space stack,
+      # which a build needs nothing of).
+      - name: Intel Gaudi SDK ${{ env.SDK_VERSION }} (tpc-clang and headers; never cached or uploaded)
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://vault.habana.ai/artifactory/api/gpg/key/public \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/habana-artifactory.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/habana-artifactory.gpg] https://vault.habana.ai/artifactory/debian $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/habanalabs.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "habanalabs-tools=$SDK_VERSION"
+          mkdir -p "$RUNNER_TEMP/sdk"
+          cd "$RUNNER_TEMP/sdk"
+          apt-get download "habanalabs-graph=$SDK_VERSION"
+          dpkg-deb --fsys-tarfile habanalabs-graph_*.deb | tar -x --wildcards './usr/include/habanalabs/*'
+          rm habanalabs-graph_*.deb
+          test -f usr/include/habanalabs/tpc_kernel_lib_interface.h
+          tpc-clang --version
+
+      # A compile check: what it writes (build/kernels/) is never packed or uploaded.
+      - name: Kernels and glue libraries compile
+        run: make -C kernels -j"$(nproc)" HABANA_INC="$RUNNER_TEMP/sdk/usr/include/habanalabs"
+
+      - name: Package (binary, Web UI and kernel sources; no compiled kernel)
+        run: |
+          packaging/package-release.sh --sdk-version "$SDK_VERSION" --out dist
+          name="${{ steps.version.outputs.artifact }}"
+          test -f "dist/$name.tar.gz"
+          tar -xzOf "dist/$name.tar.gz" "$name/BUILD-INFO.txt"
+          tar -tzf "dist/$name.tar.gz"
+
+      # INSTALL.md tells users to build the kernels from the archive: do exactly that, outside
+      # the checkout and outside dist/.
+      - name: The kernel sources in the archive build on their own
+        run: |
+          name="${{ steps.version.outputs.artifact }}"
+          mkdir "$RUNNER_TEMP/unpacked"
+          tar -xzf "dist/$name.tar.gz" -C "$RUNNER_TEMP/unpacked"
+          make -C "$RUNNER_TEMP/unpacked/$name/kernels" -j"$(nproc)" \
+            HABANA_INC="$RUNNER_TEMP/sdk/usr/include/habanalabs" > "$RUNNER_TEMP/unpacked/make.log" 2>&1 \
+            || { tail -n 50 "$RUNNER_TEMP/unpacked/make.log"; exit 1; }
+          ls "$RUNNER_TEMP/unpacked/$name/build/kernels" | sed 's/.*\.//' | sort | uniq -c
+          test -f "$RUNNER_TEMP/unpacked/$name/build/kernels/libgaudium_tpc.so"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.artifact }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 3
+
+  # Takes the archive back out of the artifact store, as the release job does, and checks it:
+  # run on every build so that the hand-over to the release is tested before a tag exists.
+  verify:
+    name: Verify the packaged archive
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist
+      - name: Checksum, contents, and the binary runs
+        working-directory: dist
+        run: |
+          name="${{ needs.build.outputs.artifact }}"
+          sha256sum -c "$name.tar.gz.sha256"
+          if tar -tzf "$name.tar.gz" | grep -iE '\.(o|elf|so|a|bc|recipe|habana_recipe)$|\.so\.|libsynapse|libtpc_kernels|tpc-clang'; then
+            echo "::error::the archive holds compiled kernels, libraries, recipes or SDK files"
+            exit 1
+          fi
+          tar -xzf "$name.tar.gz"
+          (cd "$name" && sha256sum -c --quiet SHA256SUMS)
+          test -f "$name/kernels/Makefile"
+          "$name/bin/gaudium" --version
+          "$name/bin/gaudium"
+          cat RELEASE_NOTES.md
+
+  release:
+    name: Publish the GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [build, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist
+      - name: Create the release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="${{ needs.build.outputs.artifact }}"
+          sha256sum -c "$name.tar.gz.sha256"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Gaudium ${GITHUB_REF_NAME#v}" --notes-file RELEASE_NOTES.md --generate-notes \
+            "$name.tar.gz" "$name.tar.gz.sha256"

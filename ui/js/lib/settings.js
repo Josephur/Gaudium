@@ -20,7 +20,7 @@ export const DEFAULTS = {
   maxToolTurns: 12,
   autoCompact: true,          // compact the conversation before a turn that would pass compactAt % of the context (docs/ui.md 10)
   compactAt: 90,              // percent of the context: the conversation + the draft + the reply's reserve
-  a2ui: true,                 // interactive interfaces: declare this page's A2UI renderer in requests (the server must offer it).
+  a2ui: false,                // interactive interfaces: declare this page's A2UI renderer in requests (the server must offer it).
                               // TESTING DEFAULT: on while A2UI is being tried out; set back to false before a release (AGENTS.md 10)
   custom: '',                 // extra request JSON (merged last)
   mcpServers: [],             // [{id, name, url, headers, proxy, enabled, disabledTools: []}]

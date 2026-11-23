@@ -46,6 +46,15 @@ Gaudium follows **"Verified Core, Rust Shell"**, built with
 nothing of Bend reaches the binary). Proved laws are locked in `gaudium/rusty-bends.lock`
 so that a later change cannot quietly weaken one.
 
+## Releases
+
+The [Releases](https://github.com/Josephur/Gaudium/releases) page has archives with the
+`gaudium` binary, the Web UI and the kernel sources. They hold no Intel Gaudi software and no
+compiled kernel: install the Intel Gaudi driver and SDK from Intel, then build the kernels with
+`make -C kernels` in the unpacked archive. `INSTALL.md` in the archive has the steps, and
+`gaudium --version` prints the version. [`docs/releasing.md`](docs/releasing.md) describes how
+a release is cut.
+
 ## Building
 
 You need:
@@ -83,6 +92,7 @@ model needs one.
 
 ```bash
 gaudium --help                      # every flag and environment variable
+gaudium --version                   # the version
 gaudium                             # verified-core self-check
 gaudium --hpu-smoke                 # small live test on the card
 gaudium --serve --model <model_dir> --kernels <kernel_build_dir> --ui-dir ui \
