@@ -272,6 +272,8 @@ Inkling 2 environment variables (debugging; none changes a served stream unless 
                         the head of every K / V state is written there as <name>.bin
   GAUDIUM_IK_VERIFY_CHECK  N (2..64): after a greedy request its tokens are run again in passes
                         of N rows and every row's logits are compared with the one-row step's
+  GAUDIUM_IK_MTP_DUMP   Directory: after the first block of the drafter (--spec mtp), every
+                        drafter activation and the head of its context state as <name>.bin
 
 Generate options:
   --model <dir>         Model directory (or GAUDIUM_MODEL)
@@ -348,6 +350,9 @@ Generate options:
                         A Gemma 4 model reads the drafter kind from the checkpoint:
                         --spec dflash2 --draft-model <dir> runs a DFlashDraftModel
                         block drafter (one --draft-k width, default 7).
+                        An Inkling 2 model: mtp drafts with the checkpoint's block
+                        drafter (mtp.safetensors beside the model; up to 7 drafts per
+                        block, pass --draft-k 7 for all of them).
                         Chain modes are token-identical to K=0 (sampled: same seed)
   --draft-model <dir>   Drafter checkpoint directory (with --spec dspine / dflash2;
                         assistant: default <model_dir>-assistant)

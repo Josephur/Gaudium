@@ -264,6 +264,24 @@ impl SafetensorsStore {
         Ok(store)
     }
 
+    /// Opens one safetensors file that is not part of a checkpoint's index (a drafter's own file
+    /// beside the model's).
+    pub fn open_file(path: impl AsRef<Path>) -> Result<Self, SafetensorsError> {
+        let path = path.as_ref();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| SafetensorsError::Io(format!("not a file name: {}", path.display())))?
+            .to_string();
+        let mut store = Self {
+            dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            shards: Vec::new(),
+            tensors: BTreeMap::new(),
+        };
+        store.load_shard(&name)?;
+        Ok(store)
+    }
+
     /// Creates an empty store for programmatic / GGUF lazy tensor population.
     pub fn empty() -> Self {
         Self {

@@ -198,6 +198,15 @@ const STATIC_ELF_VARS: &[(&str, &str)] = &[
     ("GAUDIUM_IKROUTE_ELF", "ik_route_gaudi2.o"),
     ("GAUDIUM_IKACT_ELF", "ik_moe_act_gaudi2.o"),
     ("GAUDIUM_IKARGMAX_ELF", "ik_argmax_gaudi2.o"),
+    // Inkling 2 block drafter kernels (libgaudium_ik.so)
+    ("GAUDIUM_IKDMIX_ELF", "ik_dmix_gaudi2.o"),
+    ("GAUDIUM_IKDKV_ELF", "ik_dkv_gaudi2.o"),
+    ("GAUDIUM_IKDQPREP_ELF", "ik_dqprep_gaudi2.o"),
+    ("GAUDIUM_IKDSOFT_ELF", "ik_dsoft_gaudi2.o"),
+    ("GAUDIUM_IKDCOMB_ELF", "ik_dcomb_gaudi2.o"),
+    ("GAUDIUM_IKDSWIGLU_ELF", "ik_dswiglu_gaudi2.o"),
+    ("GAUDIUM_IKMSTEP_ELF", "ik_mstep_gaudi2.o"),
+    ("GAUDIUM_IKMARGMAX_ELF", "ik_margmax_gaudi2.o"),
     // Gemma 4 kernels (libgaudium_ga.so)
     ("GAUDIUM_GAPREP_ELF", "ga_prep_gaudi2.o"),
     ("GAUDIUM_GAPREPK_ELF", "ga_prepk_gaudi2.o"),

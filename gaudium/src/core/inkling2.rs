@@ -223,6 +223,16 @@ pub fn wiring(apps: &[IkApp]) -> (Vec<IkWire>, Vec<usize>) {
 /// still read (by a later application or by the final mix). Returns the buffer of each source
 /// (`apps.len() + 1` entries) and the number of buffers.
 pub fn source_buffers(wires: &[IkWire], final_states: &[usize]) -> (Vec<usize>, usize) {
+    source_buffers_keep(wires, final_states, &[])
+}
+
+/// [`source_buffers`] with `keep`: sources that must also stay in their buffers until the tile
+/// ends (a drafter reads them after the last application).
+pub fn source_buffers_keep(
+    wires: &[IkWire],
+    final_states: &[usize],
+    keep: &[usize],
+) -> (Vec<usize>, usize) {
     let n_src = wires.len() + 1;
     // the last application (index) that reads each source; the final mix reads after every layer
     let mut last_use = vec![0usize; n_src];
@@ -236,7 +246,7 @@ pub fn source_buffers(wires: &[IkWire], final_states: &[usize]) -> (Vec<usize>, 
             touch(s);
         }
     }
-    for &s in final_states {
+    for &s in final_states.iter().chain(keep.iter().filter(|&&s| s < n_src)) {
         last_use[s] = wires.len();
     }
     last_use[n_src - 1] = wires.len();
@@ -332,6 +342,23 @@ mod tests {
         let spec = ModelSpec::from_config_json(&bad).unwrap();
         assert!(spec.validate().is_err());
     }
+    #[test]
+    fn kept_sources_survive_the_tile() {
+        let spec = ModelSpec::from_config_json(&mini_json()).unwrap();
+        let ik = spec.inkling2.clone().unwrap();
+        let (w, fin) = wiring(&schedule(&spec, &ik));
+        let keep = [5usize, 23, 41];
+        let (buf, n) = source_buffers_keep(&w, &fin, &keep);
+        assert!(n <= 12, "{n} buffers");
+        for (a, _) in w.iter().enumerate() {
+            for &s in &keep {
+                if s <= a {
+                    assert_ne!(buf[s], buf[a + 1], "application {a} clobbers kept source {s}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn wiring_restarts_each_pass_and_carries_messages() {
         let spec = ModelSpec::from_config_json(&mini_json()).unwrap();

@@ -294,6 +294,8 @@ fn print_usage() {
          \x20                       the head of every K / V state is written there as <name>.bin\n\
          \x20 GAUDIUM_IK_VERIFY_CHECK  N (2..64): after a greedy request its tokens are run again in passes\n\
          \x20                       of N rows and every row's logits are compared with the one-row step's\n\
+         \x20 GAUDIUM_IK_MTP_DUMP   Directory: after the first block of the drafter (--spec mtp), every\n\
+         \x20                       drafter activation and the head of its context state as <name>.bin\n\
          \n\
          Generate options:\n\
          \x20 --model <dir>         Model directory (or GAUDIUM_MODEL)\n\
@@ -370,6 +372,9 @@ fn print_usage() {
          \x20                       A Gemma 4 model reads the drafter kind from the checkpoint:\n\
          \x20                       --spec dflash2 --draft-model <dir> runs a DFlashDraftModel\n\
          \x20                       block drafter (one --draft-k width, default 7).\n\
+         \x20                       An Inkling 2 model: mtp drafts with the checkpoint's block\n\
+         \x20                       drafter (mtp.safetensors beside the model; up to 7 drafts per\n\
+         \x20                       block, pass --draft-k 7 for all of them).\n\
          \x20                       Chain modes are token-identical to K=0 (sampled: same seed)\n\
          \x20 --draft-model <dir>   Drafter checkpoint directory (with --spec dspine / dflash2;\n\
          \x20                       assistant: default <model_dir>-assistant)\n\

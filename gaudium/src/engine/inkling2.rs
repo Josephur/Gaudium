@@ -40,7 +40,7 @@ use std::time::Instant;
 
 use crate::core::budget::SequenceBudget;
 use crate::core::inkling2::{
-    final_states, hist_rows, msg_states, ring_slots, schedule, source_buffers, wiring, IkApp,
+    final_states, hist_rows, msg_states, ring_slots, schedule, source_buffers_keep, wiring, IkApp,
     IkWire, IK_MAX_STATES,
 };
 use crate::engine::qwen3::spec::{chain_accept, SpecConfig, SpecMethod};
@@ -65,6 +65,10 @@ pub mod packer;
 
 #[path = "inkling2_gguf.rs"]
 pub mod gguf_source;
+
+// The block drafter of the checkpoint's `mtp.safetensors` (speculative decoding).
+#[path = "inkling2_mtp.rs"]
+pub mod mtp;
 
 /// Rows of one chunk of a global layer's K / V cache (the softmax kernel stages one chunk).
 pub const IK_CHUNK: u64 = 4096;
@@ -144,6 +148,8 @@ pub struct IkDims {
     pub fg_f32: bool,
     /// Applications a debug run builds (all of them unless cut short).
     pub n_apps: usize,
+    /// Sources a prefill tile keeps in their buffers until it ends (the drafter's taps).
+    pub keep_srcs: Vec<usize>,
 }
 
 impl IkDims {
@@ -194,6 +200,7 @@ impl IkDims {
             log_alpha: ik.log_alpha as f32,
             fg_f32: true,
             n_apps,
+            keep_srcs: Vec::new(),
         })
     }
 
@@ -1048,7 +1055,7 @@ impl IkPlan {
                 *e = (*e).max(bytes);
             }
         }
-        let (_, n) = source_buffers(&d.wires[..d.n_apps], d.fin_states());
+        let (_, n) = source_buffers_keep(&d.wires[..d.n_apps], d.fin_states(), &d.keep_srcs);
         p.pf_bufs = n;
         p.pf_x_bytes = d.hid * tile * 2;
         p.pf_ids_bytes = tile * 4;
@@ -1189,6 +1196,8 @@ pub struct Inkling2Engine {
     app_recipes: HashMap<(IkKind, u64, u64), CompiledRecipe>,      // (kind, T, chunks; 0 sliding)
     /// Per application: the pre-validated prefill launch of its current `(T, chunks)`.
     pf_prepared: Vec<Option<(u64, u64, PreparedLaunch)>>,
+    /// The block drafter of `mtp.safetensors` (its recipes; must drop before `dev`).
+    mtp: Option<mtp::MtpState>,
 
     // Reusable pinned host staging buffer (must drop before `dev`)
     stage_io: PinnedBuf,
@@ -1260,15 +1269,31 @@ impl Inkling2Engine {
         }
         // Speculative decoding: the rows of a verify pass are the last token and its drafts.
         let spec_cfg = cfg.spec.clone();
+        // the checkpoint's own block drafter (`--spec mtp`, `--draft-model <id>=mtp`)
+        let mtp_cfg = match spec_cfg.as_ref().map(|s| &s.method) {
+            Some(SpecMethod::Mtp { tree: None, .. }) => {
+                if gguf.is_some() {
+                    return Err("Inkling 2: the drafter loads from the checkpoint directory's mtp.safetensors; a GGUF model file carries none".into());
+                }
+                let txt = std::fs::read_to_string(cfg.model_dir.join("config.json"))
+                    .map_err(|e| format!("read config.json: {e}"))?;
+                Some(mtp::MtpConfig::from_config_json(&txt)?)
+            }
+            _ => None,
+        };
         let spec_rows = match &spec_cfg {
             Some(sc) => {
-                if !matches!(sc.method, SpecMethod::Oracle { .. }) {
-                    return Err(format!(
-                        "Inkling 2: the '{}' drafter is not wired up for this family yet (the host oracle drafter is)",
-                        sc.method_name()
-                    ));
-                }
                 let k = sc.draft_k.iter().copied().max().unwrap_or(7);
+                let k = match (&sc.method, &mtp_cfg) {
+                    (SpecMethod::Oracle { .. }, _) => k,
+                    (_, Some(c)) => crate::verified::mtp_draft_count(c.block, k),
+                    _ => {
+                        return Err(format!(
+                            "Inkling 2: the '{}' drafter is not wired up for this family (mtp and the host oracle drafter are)",
+                            sc.method_name()
+                        ))
+                    }
+                };
                 if k == 0 || k > 63 {
                     return Err(format!("Inkling 2: --draft-k {k} is outside 1..63"));
                 }
@@ -1318,6 +1343,9 @@ impl Inkling2Engine {
             .filter(|&t| t > 1 && t <= 64)
             .unwrap_or(0);
         let step_rows = verify_check.max(1).max(spec_rows);
+        if mtp_cfg.is_some() && step_prefill {
+            return Err("Inkling 2: the drafter needs the tiled prefill (GAUDIUM_IK_STEP_PREFILL leaves its context unwritten)".into());
+        }
 
         // Configure kernel ELFs and the graph-compiler glue BEFORE SynapseAI is loaded.
         let kenv = KernelEnv::configure_from_dir(&cfg.kernels_dir)?;
@@ -1329,6 +1357,13 @@ impl Inkling2Engine {
         }
         let mut elf_hashes = kenv.fingerprint_hashes(INKLING2_ELFS)?;
         elf_hashes.push(kenv.glue_hash(INKLING2_GLUE)?);
+        let mtp_elf_hashes = if mtp_cfg.is_some() {
+            let mut h = kenv.fingerprint_hashes(mtp::MTP_ELFS)?;
+            h.push(kenv.glue_hash(INKLING2_GLUE)?);
+            h
+        } else {
+            Vec::new()
+        };
 
         let api =
             Arc::new(SynapseApi::load_default().map_err(|e| format!("load libSynapse.so: {e}"))?);
@@ -1349,24 +1384,42 @@ impl Inkling2Engine {
 
         // ---- Plan: the largest prefill tile whose exact plan fits the card ----
         let mut tile = cfg.prefill_tile.clamp(1, IK_MAX_PREFILL_TILE);
-        let (dims, plan) = loop {
+        let (dims, plan, mtp_geo, mtp_plan) = loop {
             // rings hold their window beside the widest pass (a prefill tile or a multi-row step)
             let mut d = IkDims::from_spec(&spec, tile.max(step_rows))?;
             if let Some(n) = apps_cut {
                 d.n_apps = n.clamp(1, d.apps.len());
             }
+            // the drafter: its taps stay in the prefill tile's buffers, its state is planned here
+            let mtp_geo = match &mtp_cfg {
+                Some(c) => {
+                    let taps = c.check_target(&d)?;
+                    d.keep_srcs = taps
+                        .iter()
+                        .filter_map(|t| match t {
+                            mtp::MtpTap::Source(s) => Some(*s),
+                            mtp::MtpTap::Final => None,
+                        })
+                        .collect();
+                    Some((mtp::MtpGeom::new(c.clone(), &d, max_ctx, tile.max(step_rows))?, taps))
+                }
+                None => None,
+            };
             let p = IkPlan::build(&d, max_ctx, max_chunks, tile, step_rows);
-            let total = p.total(MIN_SHARED_WORKSPACE_BYTES);
+            let mp = mtp_geo.as_ref().map(|(g, _)| mtp::MtpPlan::build(g));
+            let mtp_bytes = mp.as_ref().map_or(0, mtp::MtpPlan::total);
+            let total = p.total(MIN_SHARED_WORKSPACE_BYTES) + mtp_bytes;
             match dev.check_plan_fits(total, HBM_HEADROOM_BYTES) {
-                Ok(_) => break (d, p),
+                Ok(_) => break (d, p, mtp_geo, mp),
                 Err(e) if tile <= IK_MIN_PREFILL_TILE => {
                     return Err(format!(
-                        "HBM plan does not fit at max_ctx={max_ctx} even with a {tile}-row prefill tile: planned {:.2} GiB (weights {:.2}, global KV {:.2}, rings {:.2}, activations {:.2}, workspace {:.2}) of {:.2} GiB free: {e}",
+                        "HBM plan does not fit at max_ctx={max_ctx} even with a {tile}-row prefill tile: planned {:.2} GiB (weights {:.2}, global KV {:.2}, rings {:.2}, activations {:.2}, drafter {:.2}, workspace {:.2}) of {:.2} GiB free: {e}",
                         gib(total),
                         gib(p.weights_bytes()),
                         gib(p.kv_bytes()),
                         gib(p.ring_bytes()),
                         gib(p.act_bytes()),
+                        gib(mtp_bytes),
                         gib(MIN_SHARED_WORKSPACE_BYTES),
                         gib(free_hbm),
                     ));
@@ -1446,7 +1499,8 @@ impl Inkling2Engine {
         let kv_bytes = plan.kv_bytes();
         let ring_bytes = plan.ring_bytes();
         let act_bytes = plan.act_bytes();
-        let planned_total = plan.total(ws_bytes);
+        let mtp_bytes = mtp_plan.as_ref().map_or(0, mtp::MtpPlan::total);
+        let planned_total = plan.total(ws_bytes) + mtp_bytes;
         dev.check_plan_fits(planned_total, HBM_HEADROOM_BYTES)
             .map_err(|e| format!("HBM plan check failed: {e}"))?;
         if cfg.verbose {
@@ -1514,12 +1568,55 @@ impl Inkling2Engine {
         let pf_hfin = suballoc(&mut act_arena, plan.pf_x_bytes)?;
         let pf_ids = suballoc(&mut act_arena, plan.pf_ids_bytes)?;
         let pf_cursor = suballoc(&mut act_arena, 256)?;
-        let (buf_of_src, _) = source_buffers(&dims.wires[..dims.n_apps], dims.fin_states());
+        let (buf_of_src, _) =
+            source_buffers_keep(&dims.wires[..dims.n_apps], dims.fin_states(), &dims.keep_srcs);
+
+        // the drafter's weights, context state and activations: arenas of their own
+        let mtp_state = match (mtp_geo, mtp_plan) {
+            (Some((g, taps)), Some(mp)) => {
+                let mut st = mtp::MtpState::new(g, taps, mtp_elf_hashes, mp.clone());
+                let mut arenas = [
+                    dev.alloc_arena(mp.weights_bytes().max(256), HbmCat::CatWeights, "ikd_weights_arena")
+                        .map_err(|e| format!("alloc drafter weights arena: {e}"))?,
+                    dev.alloc_arena(mp.state_bytes().max(256), HbmCat::CatKv, "ikd_state_arena")
+                        .map_err(|e| format!("alloc drafter state arena: {e}"))?,
+                    dev.alloc_arena(mp.act_bytes().max(256), HbmCat::CatScratch, "ikd_act_arena")
+                        .map_err(|e| format!("alloc drafter act arena: {e}"))?,
+                ];
+                for (arena, map) in arenas.iter_mut().zip([&mp.weights, &mp.state, &mp.acts]) {
+                    for (name, &bytes) in map {
+                        st.set_addr(name, suballoc(arena, bytes)?);
+                    }
+                }
+                if cfg.verbose {
+                    eprintln!(
+                        "[gaudium] inkling2 drafter: {} layers, block {}, ring {} slots; HBM weights {:.1} MiB, context state {:.1} MiB, activations {:.1} MiB",
+                        st.g.c.local.len(),
+                        st.g.c.block,
+                        st.g.ring,
+                        mib(mp.weights_bytes()),
+                        mib(mp.state_bytes()),
+                        mib(mp.act_bytes())
+                    );
+                }
+                Some(st)
+            }
+            _ => None,
+        };
+        let (mtp_w, mtp_s, mtp_a) = mtp_state.as_ref().map_or((0, 0, 0), |st| {
+            (st.plan.weights_bytes(), st.plan.state_bytes(), st.plan.act_bytes())
+        });
 
         dev.seal_with_shared_workspace(ws_bytes)
             .map_err(|e| format!("seal HBM allocations: {e}"))?;
 
-        let hbm_bytes = [weights_bytes, kv_bytes, ring_bytes, act_bytes, ws_bytes];
+        let hbm_bytes = [
+            weights_bytes + mtp_w,
+            kv_bytes + mtp_s,
+            ring_bytes,
+            act_bytes + mtp_a,
+            ws_bytes,
+        ];
         live.set_hbm_bytes(
             hbm_bytes[0],
             hbm_bytes[1],
@@ -1597,7 +1694,8 @@ impl Inkling2Engine {
                 t_start.elapsed().as_secs_f64()
             );
         }
-        drop(stage_zero);
+        // kept for the drafter's weights below
+        let mut stage_keep = stage_zero;
 
         let stage_io_bytes = ((dims.vocab_pad as usize) * 2)
             .max((prefill_tile as usize) * 4)
@@ -1630,6 +1728,7 @@ impl Inkling2Engine {
             final_recipes: HashMap::new(),
             app_recipes: HashMap::new(),
             pf_prepared: (0..n_apps).map(|_| None).collect(),
+            mtp: mtp_state,
             stage_io,
             weights_addr,
             kv_addr,
@@ -1647,6 +1746,17 @@ impl Inkling2Engine {
         };
         let prepared = engine.prepare_step(&step1)?;
         engine.step_recipes.insert((1, 1), (step1, prepared));
+        if engine.mtp.is_some() {
+            let t_m = Instant::now();
+            engine.mtp_init(&cfg.model_dir, &mut stage_keep)?;
+            if cfg.verbose {
+                eprintln!(
+                    "[gaudium] inkling2 drafter weights uploaded and folded in {:.2}s",
+                    t_m.elapsed().as_secs_f64()
+                );
+            }
+        }
+        drop(stage_keep);
         engine.live.set_phase("idle", "ready");
         Ok(engine)
     }
@@ -2073,10 +2183,15 @@ impl Inkling2Engine {
         let rows = self.spec_rows as usize;
         let k = rows - 1;
         let req = self.requests;
+        let use_mtp = self.mtp.is_some();
         let oracle = match self.draft.as_ref().map(|s| &s.method) {
             Some(SpecMethod::Oracle { requests }) => requests.get(req).cloned().unwrap_or_default(),
+            _ if use_mtp => Default::default(),
             _ => return Err("Inkling 2: no drafter for this request".into()),
         };
+        if use_mtp {
+            self.mtp_begin_request();
+        }
         let logits = self.step_act_addr["logits"].0;
         let mut out = SpecOutcome::default();
         let mut bucket = 0u64;
@@ -2107,12 +2222,22 @@ impl Inkling2Engine {
                 }
                 continue;
             }
-            // drafts of the host oracle: the known continuation, with the marked ones made wrong
             let mut toks = vec![generated[gi]];
-            for j in 0..k {
-                let Some(&t) = oracle.stream.get(gi + 1 + j) else { break };
-                let wrong = oracle.corrupt.contains(&(gi + 1 + j));
-                toks.push(if wrong { (t + 1) % self.dims.vocab_out as i32 } else { t });
+            if use_mtp {
+                // drafts of the block drafter anchored on the last emitted token (a recipe
+                // compiled on first use is not decode time)
+                compile_ms += self.mtp_prepare_block(cursor)?;
+                let t_d = Instant::now();
+                let d = self.mtp_draft(generated[gi], cursor)?;
+                self.mtp_mut().stats.draft_ms += t_d.elapsed().as_secs_f64() * 1000.0;
+                toks.extend_from_slice(&d[..k.min(d.len())]);
+            } else {
+                // drafts of the host oracle: the known continuation, with the marked ones made wrong
+                for j in 0..k {
+                    let Some(&t) = oracle.stream.get(gi + 1 + j) else { break };
+                    let wrong = oracle.corrupt.contains(&(gi + 1 + j));
+                    toks.push(if wrong { (t + 1) % self.dims.vocab_out as i32 } else { t });
+                }
             }
             let n_drafts = toks.len() - 1;
             toks.resize(rows, 0);
@@ -2123,6 +2248,7 @@ impl Inkling2Engine {
                 compile_ms += tc.elapsed().as_secs_f64() * 1000.0;
                 bucket = need;
             }
+            let t_v = Instant::now();
             let mut got = self.run_rows(&toks, cursor, bucket)?;
             if params.temperature > 0.0 {
                 // a sampled request: each row's token is its position's own sample
@@ -2131,6 +2257,18 @@ impl Inkling2Engine {
                 }
             }
             let accepted = chain_accept(&toks[..=n_drafts], &got[..=n_drafts]);
+            if use_mtp {
+                // the drafter's context of the verify's rows, queued behind it (the rows past the
+                // accepted ones sit at or beyond the next anchor: never read, written again when
+                // those positions are committed); the next block's recurrent context is the row
+                // of the last accepted token
+                self.mtp_mut().stats.verify_ms += t_v.elapsed().as_secs_f64() * 1000.0;
+                let t_c = Instant::now();
+                compile_ms += self.mtp_ctx(rows as u64, true)?;
+                self.mtp_mut().stats.ctx_ms += t_c.elapsed().as_secs_f64() * 1000.0;
+                self.mtp_set_frnn(accepted as u64, rows as u64);
+                self.mtp_record(n_drafts, accepted);
+            }
             out.launches += 1;
             out.drafted += n_drafts as u64;
             out.accepted += accepted as u64;
@@ -2154,6 +2292,9 @@ impl Inkling2Engine {
             }
         }
         out.decode_ms = (t0.elapsed().as_secs_f64() * 1000.0 - compile_ms).max(0.0);
+        if use_mtp && self.verbose {
+            eprintln!("[gaudium] inkling2 drafter: {}", self.mtp_summary());
+        }
         Ok(out)
     }
 
@@ -2277,6 +2418,14 @@ impl Inkling2Engine {
             for a in 0..n_apps {
                 self.launch_prefill_app(a, t, nch)?;
             }
+            if self.mtp.is_some() {
+                // the drafter's context of the tile's rows, while its taps are in the tile's buffers
+                let t_rec = Instant::now();
+                self.ensure_final(t)?;
+                recipe_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
+                self.launch_final_mix(t)?;
+                recipe_ms += self.mtp_ctx(t, false)?;
+            }
             self.sync_compute("prefill tile")?;
             pos += tv as usize;
             self.live.prefill_progress(pos as u64);
@@ -2286,25 +2435,12 @@ impl Inkling2Engine {
         let t_rec = Instant::now();
         self.ensure_final(last_tile)?;
         recipe_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
-        {
-            let fin: Vec<usize> = self.dims.fin_states().to_vec();
-            let mut pool = self.pf_scratch.clone();
-            pool.insert("x_in".into(), self.src_buf(n_apps));
-            for i in 0..IK_MAX_STATES as usize {
-                let addr = match fin.get(i) {
-                    Some(&s) => self.src_buf(s),
-                    None => self.pf_dummy[i],
-                };
-                pool.insert(format!("S{i}"), addr);
-            }
-            for name in ["ctl_fin", "q_fin", "w_final"] {
-                pool.insert(name.to_string(), self.weights_addr[name]);
-            }
-            pool.insert("h_final".into(), self.pf_hfin);
-            let r = &self.final_recipes[&last_tile];
-            let bind = select_exact_bindings(r, &pool)?;
-            r.launch_checked(&self.dev, &bind)
-                .map_err(|e| format!("launch final mix T={last_tile}: {e}"))?;
+        if self.mtp.is_some() {
+            // the last tile's final mix ran with the drafter's context; the next block's
+            // recurrent context is the prompt's last row
+            self.mtp_set_frnn(last_valid - 1, last_tile);
+        } else {
+            self.launch_final_mix(last_tile)?;
         }
         {
             let mut pool = self.pf_scratch.clone();
@@ -2326,6 +2462,30 @@ impl Inkling2Engine {
             self.read_i32_scalar(self.pf_scratch["tokens"])?
         };
         Ok(Some((first_tok, recipe_ms)))
+    }
+
+    /// Launches the final mix and norm over the prefill tile of `t` rows into `pf_hfin` (the
+    /// recipe must be compiled).
+    fn launch_final_mix(&mut self, t: u64) -> Result<(), String> {
+        let n_apps = self.dims.n_apps;
+        let fin: Vec<usize> = self.dims.fin_states().to_vec();
+        let mut pool = self.pf_scratch.clone();
+        pool.insert("x_in".into(), self.src_buf(n_apps));
+        for i in 0..IK_MAX_STATES as usize {
+            let addr = match fin.get(i) {
+                Some(&s) => self.src_buf(s),
+                None => self.pf_dummy[i],
+            };
+            pool.insert(format!("S{i}"), addr);
+        }
+        for name in ["ctl_fin", "q_fin", "w_final"] {
+            pool.insert(name.to_string(), self.weights_addr[name]);
+        }
+        pool.insert("h_final".into(), self.pf_hfin);
+        let r = &self.final_recipes[&t];
+        let bind = select_exact_bindings(r, &pool)?;
+        r.launch_checked(&self.dev, &bind)
+            .map_err(|e| format!("launch final mix T={t}: {e}"))
     }
 
     #[allow(clippy::too_many_arguments)]
