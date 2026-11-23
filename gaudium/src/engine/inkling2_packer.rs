@@ -122,7 +122,10 @@ struct StExperts<'a> {
 impl ExpertRows for StExperts<'_> {
     fn decode(&self, e: usize, r: usize, out: &mut [u8]) -> Result<(), String> {
         let (rb, rs) = match self.factor {
-            Some(_) => (self.cols / 2, self.cols / 16),
+            Some(_) => (
+                ik_nib_row_bytes(self.cols as u64) as usize,
+                ik_nib_row_scales(self.cols as u64) as usize,
+            ),
             None => (self.cols, self.cols / 32),
         };
         let wi = (e * self.rows + r) * rb;
@@ -347,10 +350,8 @@ pub fn split_table(natural: &[f32]) -> Vec<f32> {
     assert_eq!(natural.len() % 128, 0, "a channel table is whole blocks of 128");
     let mut out = vec![0f32; natural.len()];
     for (b, blk) in natural.chunks(128).enumerate() {
-        for h in 0..2 {
-            for j in 0..64 {
-                out[128 * b + 64 * h + j] = blk[2 * j + h];
-            }
+        for (c, &v) in blk.iter().enumerate() {
+            out[128 * b + lane_in_block(c as u64) as usize] = v;
         }
     }
     out

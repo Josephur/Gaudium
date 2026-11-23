@@ -3,12 +3,18 @@
 
 use crate::model_spec::{Inkling2Spec, ModelSpec};
 use crate::verified::{
-    ik_app_layer, ik_app_pass, ik_apps, ik_dims_valid, ik_hist_rows, ik_msg_states,
-    ik_opens_block, ik_ring_slots, ik_schedule_valid, ik_states_attn, ik_states_mlp,
+    ik_app_layer, ik_app_msgs, ik_app_pass, ik_apps, ik_attn_geom_valid, ik_buf_clobbers,
+    ik_buf_reusable, ik_dims_valid, ik_eff_loop_end, ik_eff_loop_start, ik_hist_rows,
+    ik_layer_looped, ik_loop_index, ik_msg_states, ik_opens_block, ik_ring_slots_within,
+    ik_schedule_valid, ik_states_attn, ik_states_mlp, ik_vocab_valid,
 };
 
 /// Block states one residual mix of the family's kernels reads beside the partial state.
 pub const IK_MAX_STATES: u64 = 4;
+
+/// Slots of the largest K / V ring the softmax kernel stages as one chunk
+/// (`kernels/tpc/ik_softmax_gaudi2.c`: a chunk of at most 4096 keys in its local memory).
+pub const IK_MAX_RING_SLOTS: u64 = 4096;
 
 /// One application of a layer's weights to the rows of a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,12 +67,7 @@ pub fn validate_inkling2(spec: &ModelSpec, ik: &Inkling2Spec) -> Result<(), Stri
             ik.conv_taps
         ));
     }
-    // a model without a loop is one pass over an empty span behind the first block
-    let (ls, le) = if ik.passes > 1 {
-        (ik.loop_start, ik.loop_end)
-    } else {
-        (ik.block, ik.block)
-    };
+    let (ls, le) = span_of(ik);
     if !ik_schedule_valid(spec.n_layers, ls, le, ik.passes, ik.block, IK_MAX_STATES) {
         return Err(format!(
             "Inkling 2 schedule outside the kernels' range: {} layers, blocks of {}, layers {}..{} x {} passes (at most {IK_MAX_STATES} block states per mix)",
@@ -76,13 +77,13 @@ pub fn validate_inkling2(spec: &ModelSpec, ik: &Inkling2Spec) -> Result<(), Stri
     if spec.layer_types.len() as u64 != spec.n_layers {
         return Err("Inkling 2 spec: one attention kind per layer is required".into());
     }
-    if ik.window == 0 || ik.rel_extent == 0 || ik.rel_extent > ik.window {
+    if !ik_attn_geom_valid(ik.window, ik.rel_extent) {
         return Err(format!(
             "Inkling 2 spec: sliding window {} and bias extent {} (the extent must be within the window)",
             ik.window, ik.rel_extent
         ));
     }
-    if ik.unpadded_vocab == 0 || ik.unpadded_vocab > spec.vocab {
+    if !ik_vocab_valid(ik.unpadded_vocab, spec.vocab) {
         return Err(format!(
             "Inkling 2 spec: {} emitted tokens of a vocabulary of {}",
             ik.unpadded_vocab, spec.vocab
@@ -93,11 +94,10 @@ pub fn validate_inkling2(spec: &ModelSpec, ik: &Inkling2Spec) -> Result<(), Stri
 
 /// The loop span of a spec (an empty span behind the first block for a model without a loop).
 fn span_of(ik: &Inkling2Spec) -> (u64, u64) {
-    if ik.passes > 1 {
-        (ik.loop_start, ik.loop_end)
-    } else {
-        (ik.block, ik.block)
-    }
+    (
+        ik_eff_loop_start(ik.passes, ik.loop_start, ik.block),
+        ik_eff_loop_end(ik.passes, ik.loop_end, ik.block),
+    )
 }
 
 /// The layer applications of one token, in execution order.
@@ -108,7 +108,7 @@ pub fn schedule(spec: &ModelSpec, ik: &Inkling2Spec) -> Vec<IkApp> {
         .map(|a| {
             let layer = ik_app_layer(a, ls, le, ik.passes);
             let pass = ik_app_pass(a, ls, le, ik.passes);
-            let looped = layer >= ls && layer < le;
+            let looped = ik_layer_looped(layer, ls, le);
             IkApp {
                 index: a as usize,
                 layer: layer as usize,
@@ -117,8 +117,8 @@ pub fn schedule(spec: &ModelSpec, ik: &Inkling2Spec) -> Vec<IkApp> {
                 opens_block: ik_opens_block(layer, ik.block),
                 ns_attn: ik_states_attn(layer, ik.block),
                 ns_mlp: ik_states_mlp(layer, ik.block),
-                msgs: looped && pass > 0,
-                loop_index: if looped { (layer - ls) as usize } else { 0 },
+                msgs: ik_app_msgs(a, ls, le, ik.passes),
+                loop_index: if looped { ik_loop_index(layer, ls) as usize } else { 0 },
                 looped,
             }
         })
@@ -128,11 +128,8 @@ pub fn schedule(spec: &ModelSpec, ik: &Inkling2Spec) -> Vec<IkApp> {
 /// Block states a message is mixed from (beside the previous pass's last output).
 pub fn msg_states(ik: &Inkling2Spec) -> u64 {
     let (ls, le) = span_of(ik);
-    if ik.passes > 1 {
-        ik_msg_states(ls, le, ik.block)
-    } else {
-        0
-    }
+    // a model of one pass has an empty span and no messages (law `ik_one_pass_no_messages`)
+    ik_msg_states(ls, le, ik.block)
 }
 
 /// Block states the final mix reads.
@@ -142,9 +139,9 @@ pub fn final_states(spec: &ModelSpec, ik: &Inkling2Spec) -> u64 {
 
 /// Slots of a sliding layer's K / V ring for passes of at most `rows` rows.
 pub fn ring_slots(ik: &Inkling2Spec, rows: u64) -> Result<u64, String> {
-    match ik_ring_slots(ik.window, rows) {
+    match ik_ring_slots_within(ik.window, rows, IK_MAX_RING_SLOTS) {
         0 => Err(format!(
-            "no K / V ring holds a window of {} beside a pass of {rows} rows",
+            "no K / V ring of at most {IK_MAX_RING_SLOTS} slots (one softmax chunk) holds a window of {} beside a pass of {rows} rows",
             ik.window
         )),
         n => Ok(n),
@@ -248,7 +245,7 @@ pub fn source_buffers(wires: &[IkWire], final_states: &[usize]) -> (Vec<usize>, 
         // application a writes source a + 1: a buffer whose source no application from a on reads
         let free = held
             .iter()
-            .position(|h| h.is_none_or(|s| last_use[s] < a));
+            .position(|h| h.is_none_or(|s| ik_buf_reusable(last_use[s] as u64, a as u64)));
         let b = match free {
             Some(b) => b,
             None => {
@@ -258,6 +255,16 @@ pub fn source_buffers(wires: &[IkWire], final_states: &[usize]) -> (Vec<usize>, 
         };
         held[b] = Some(a + 1);
         buf_of[a + 1] = b;
+    }
+    // no application's output lands on a source that it or a later application still reads
+    for a in 0..wires.len() {
+        for (s, &lu) in last_use.iter().enumerate().take(a + 1) {
+            let (bs, bo) = (buf_of[s] as u64, buf_of[a + 1] as u64);
+            assert!(
+                !ik_buf_clobbers(bs, bo, s as u64, a as u64, lu as u64),
+                "Inkling 2 row buffers: application {a} would overwrite source {s} (last read by {lu})"
+            );
+        }
     }
     (buf_of, held.len())
 }
@@ -387,5 +394,102 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// Today's constants and formulas of `verified/inkling2.bend` that its laws leave open on purpose
+/// (they bound these values but do not fix them).
+#[cfg(test)]
+mod pinned_values {
+    use super::*;
+    use crate::verified::{
+        ik_bias_off, ik_bias_src, ik_bias_width, ik_gate_off, ik_is_pow2, ik_kx_width,
+        ik_nib_row_bytes, ik_nib_row_scales, ik_pow2_rows, ik_qx_width, ik_rel_off,
+        ik_ring_slots, ik_tile_last_row, ik_tile_rows, ik_tile_take,
+    };
+
+    #[test]
+    fn one_pass_runs_an_empty_span_behind_the_first_block() {
+        assert_eq!((ik_eff_loop_start(1, 6, 6), ik_eff_loop_end(1, 18, 6)), (6, 6));
+        assert_eq!((ik_eff_loop_start(0, 6, 6), ik_eff_loop_end(0, 18, 6)), (6, 6));
+        assert_eq!((ik_eff_loop_start(3, 6, 6), ik_eff_loop_end(3, 18, 6)), (6, 18));
+        assert_eq!(ik_msg_states(6, 6, 6), 0);
+        assert_eq!(ik_msg_states(6, 18, 6), 1);
+        assert_eq!(ik_loop_index(17, 6), 11);
+        assert!(ik_layer_looped(6, 6, 18) && !ik_layer_looped(18, 6, 18) && !ik_layer_looped(5, 6, 18));
+    }
+
+    #[test]
+    fn rings_are_the_smallest_power_of_two_of_at_least_128() {
+        assert_eq!(ik_ring_slots(1024, 1), 2048);
+        assert_eq!(ik_ring_slots(1024, 1026), 4096);
+        assert_eq!(ik_ring_slots(32, 1), 128);
+        assert_eq!(ik_pow2_rows(1), 128);
+        assert_eq!(ik_pow2_rows(129), 256);
+        // the search ends at 2^47 rows: beyond it no ring exists (0)
+        assert_eq!(ik_pow2_rows(1 << 47), 1 << 47);
+        assert_eq!(ik_pow2_rows((1 << 47) + 1), 0);
+        for x in [1u64, 2, 128, 4096, 1 << 40, 1 << 63] {
+            assert!(ik_is_pow2(x), "{x}");
+        }
+        for x in [0u64, 3, 96, 4097, (1 << 40) + 1] {
+            assert!(!ik_is_pow2(x), "{x}");
+        }
+        // one softmax chunk holds at most 4096 keys: a wider window has no ring
+        assert_eq!(ik_ring_slots_within(1024, 256, IK_MAX_RING_SLOTS), 2048);
+        assert_eq!(ik_ring_slots_within(4096, 1, IK_MAX_RING_SLOTS), 0);
+        let spec = ModelSpec::from_config_json(&tests::mini_json()).unwrap();
+        let ik = spec.inkling2.as_ref().unwrap();
+        assert_eq!(ring_slots(ik, 256).unwrap(), 2048);
+        assert!(ring_slots(ik, 3100).is_err());
+    }
+
+    #[test]
+    fn bias_table_is_reversed_and_padded_by_one_block() {
+        assert_eq!(ik_bias_off(1024), 1087);
+        assert_eq!(ik_bias_width(1024), 1152);
+        assert_eq!(ik_bias_src(1024, 1087), 0);
+        assert_eq!(ik_bias_src(1024, 64), 1023);
+        assert_eq!(ik_bias_src(1024, 63), 1024);
+        assert_eq!(ik_bias_src(1024, 1100), 1024);
+    }
+
+    #[test]
+    fn projection_layout_and_four_bit_rows() {
+        assert_eq!((ik_gate_off(24), ik_rel_off(24)), (3072, 6144));
+        assert_eq!(ik_qx_width(24, 16), 6528);
+        assert_eq!(ik_kx_width(8, 4), 1152);
+        assert_eq!(ik_kx_width(8, 0), 1024);
+        assert_eq!((ik_nib_row_bytes(2304), ik_nib_row_scales(2304)), (1152, 144));
+        assert_eq!(ik_nib_row_bytes(24), 0);
+        assert_eq!(ik_nib_row_bytes(0), 0);
+    }
+
+    #[test]
+    fn prefill_tiles_pad_to_a_power_of_two_of_at_least_8() {
+        assert_eq!(ik_tile_rows(5, 256, 1000), 8);
+        assert_eq!(ik_tile_rows(200, 256, 1000), 256);
+        assert_eq!(ik_tile_rows(200, 256, 210), 200);
+        assert_eq!(ik_tile_rows(100, 64, 1000), 100);
+        assert_eq!((ik_tile_take(10, 256), ik_tile_take(1000, 256)), (10, 256));
+        assert_eq!(ik_tile_last_row(5), 4);
+    }
+
+    #[test]
+    fn guard_limits_of_todays_kernels() {
+        // hidden, heads q/kv, head dim, relative states, experts, top k, expert width, taps
+        assert!(ik_dims_valid(2304, 24, 8, 128, 16, 128, 8, 1152, 4));
+        assert!(!ik_dims_valid(2304, 24, 8, 64, 16, 128, 8, 1152, 4));
+        assert!(!ik_dims_valid(2304, 24, 8, 128, 8, 128, 8, 1152, 4));
+        assert!(!ik_dims_valid(2304, 20, 4, 128, 16, 128, 8, 1152, 4));
+        assert!(!ik_dims_valid(2304, 24, 8, 128, 16, 640, 8, 1152, 4));
+        assert!(!ik_dims_valid(2304, 24, 8, 128, 16, 128, 13, 1152, 4));
+        assert!(!ik_dims_valid(2304, 24, 8, 128, 16, 128, 8, 1152, 17));
+        assert!(!ik_dims_valid(2300, 24, 8, 128, 16, 128, 8, 1152, 4));
+        assert!(ik_attn_geom_valid(1024, 1024) && !ik_attn_geom_valid(1024, 1025));
+        assert!(!ik_attn_geom_valid(0, 0) && !ik_attn_geom_valid(1024, 0));
+        assert!(ik_vocab_valid(200058, 201024) && !ik_vocab_valid(201025, 201024));
+        assert!(ik_buf_reusable(3, 4) && !ik_buf_reusable(4, 4));
+        assert!(ik_buf_clobbers(2, 2, 3, 4, 4) && !ik_buf_clobbers(2, 1, 3, 4, 4));
     }
 }

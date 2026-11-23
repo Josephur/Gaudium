@@ -56,7 +56,7 @@ use crate::synapse::ops::u32_params;
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
     align_up, ik_bias_off, ik_bias_width, ik_gate_off, ik_kx_width, ik_qx_width, ik_rel_off,
-    ik_tile_rows, HbmCat,
+    ik_tile_last_row, ik_tile_rows, ik_tile_take, HbmCat,
 };
 
 #[path = "inkling2_packer.rs"]
@@ -2086,7 +2086,7 @@ impl Inkling2Engine {
             }
             // `tv` prompt rows run as a tile of `t` rows (a ladder of sizes: the rows past the prompt
             // are computed, written past the cursor and never read; the next pass writes them again)
-            let tv = (prompt_ids.len() - pos).min(self.prefill_tile as usize) as u64;
+            let tv = ik_tile_take((prompt_ids.len() - pos) as u64, self.prefill_tile);
             let t = ik_tile_rows(tv, self.prefill_tile, self.max_ctx - pos as u64);
             let end_pos = pos as u64 + t;
             let nch = step_bucket(end_pos.div_ceil(IK_CHUNK), self.max_chunks);
@@ -2157,7 +2157,7 @@ impl Inkling2Engine {
         }
         {
             let mut pool = self.pf_scratch.clone();
-            pool.insert("h_in".into(), self.pf_hfin + (last_valid - 1) * hid * 2);
+            pool.insert("h_in".into(), self.pf_hfin + ik_tile_last_row(last_valid) * hid * 2);
             pool.insert("W_head".into(), self.weights_addr["W_head"]);
             let bind = select_exact_bindings(&self.head, &pool)?;
             self.head
