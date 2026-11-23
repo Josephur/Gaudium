@@ -248,10 +248,10 @@ mod moe_rt;
 mod build_cache_rt;
 pub use build_cache_rt::build_cache;
 // [step] device-trace windows of the decode loops
-#[path = "qwen3_prof.rs"]
-mod prof_rt;
 #[path = "qwen3_halfprobe.rs"]
 mod halfprobe;
+#[path = "qwen3_prof.rs"]
+mod prof_rt;
 // [prefill] two tiles in flight
 #[path = "qwen3_wave.rs"]
 mod wave_rt;
@@ -1565,6 +1565,120 @@ impl Qwen3Engine {
             .saturating_add(ws_bytes)
             .saturating_add(prof_bytes)
             .saturating_add(spec_bytes.iter().sum());
+        // [live] the same plan, buffer by buffer under named parts (the live record's
+        // `hbm_detail`, and the lines below the plan total)
+        let mem_report = {
+            use crate::engine::mem_report::{trunk_weight_part, MemReport};
+            let mut r = MemReport::new();
+            r.add_map(HbmCat::CatWeights, &weight_specs, trunk_weight_part);
+            r.add_map(HbmCat::CatKv, &kv_specs, |_| "kv-target");
+            r.add(
+                HbmCat::CatCheckpoints,
+                "rings",
+                "DeltaNet state rings",
+                n_lin * 2 * align256(s_ring_bytes),
+            );
+            r.add(
+                HbmCat::CatCheckpoints,
+                "conv-rings",
+                "DeltaNet conv-state rings",
+                n_lin * 2 * align256(cs_ring_bytes),
+            );
+            // the prefill region, as the buffers of the tile recipe that needs the most of it
+            // (every tile recipe lays its scratch out in this one region)
+            let arena_items = pf.plan_items(&spec, prefill_tile, max_ctx, max_chunks);
+            let arena_sum: u64 = arena_items.iter().map(|x| x.1).sum();
+            if arena_sum > 0 && arena_sum <= pf_scratch_bytes {
+                for (name, bytes) in &arena_items {
+                    r.add(HbmCat::CatScratch, "arena", name, *bytes);
+                }
+                r.add(
+                    HbmCat::CatScratch,
+                    "arena",
+                    "unused by the largest recipe",
+                    pf_scratch_bytes - arena_sum,
+                );
+            } else {
+                r.add(HbmCat::CatScratch, "arena", "arena", pf_scratch_bytes);
+            }
+            r.set_source(
+                "arena",
+                format!(
+                    "prefill scratch of a {prefill_tile}-row tile at {max_ctx} tokens, shared by every tile recipe"
+                ),
+            );
+            r.add(HbmCat::CatOther, "prefill", "tile rows x2", pf_x_bytes * 2);
+            r.add(HbmCat::CatOther, "prefill", "tile ids", pf_ids_bytes);
+            r.add(HbmCat::CatOther, "prefill", "tile cursor", pf_cursor_bytes);
+            r.add(HbmCat::CatOther, "prefill", "tile constants", pf_const_bytes);
+            r.add(
+                HbmCat::CatOther,
+                "prefill",
+                "second tile set (two tiles in flight)",
+                pf_wave_bytes,
+            );
+            r.add_map(HbmCat::CatOther, &head_act_specs, |_| "activations");
+            r.add_map(HbmCat::CatOther, &step_act_specs, |_| "activations");
+            r.add(HbmCat::CatOther, "workspace", "shared recipe workspace", ws_bytes);
+            r.add(HbmCat::CatOther, "profile", "profiler trace buffer", prof_bytes);
+            if let Some(v) = vision.as_ref() {
+                // the whole tower under one part, so one number says what vision costs
+                let plan = v.memory_plan();
+                r.add_map(HbmCat::CatOther, &plan.weights, |_| "vision");
+                r.add_map(HbmCat::CatOther, &plan.acts, |_| "vision");
+                let xbuf = align256(plan.xbuf_bytes);
+                r.add(HbmCat::CatOther, "vision", "block rows A", xbuf);
+                r.add(HbmCat::CatOther, "vision", "block rows B", xbuf);
+                r.add(
+                    HbmCat::CatOther,
+                    "vision",
+                    "image embeddings",
+                    align256(plan.emb_bytes),
+                );
+                r.set_source(
+                    "vision",
+                    format!(
+                        "vision tower, up to {} patches ({} image tokens): weights {:.2} GiB + activations {:.2} GiB",
+                        v.max_patches(),
+                        v.max_tokens(),
+                        vis_weights_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        vis_act_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                    ),
+                );
+            }
+            r.set_source(
+                "activations",
+                format!(
+                    "single-row decode step and readout: scores and P of every attention layer at {max_ctx} tokens, state checkpoints"
+                ),
+            );
+            if let Some(sd) = specdec.as_ref() {
+                r.set_source(
+                    "verify",
+                    format!(
+                        "verify rows of the speculative step: scores and P of every attention layer at {max_ctx} tokens"
+                    ),
+                );
+                let [w, kv, acts] = sd.planned_maps();
+                r.add_map(HbmCat::CatWeights, w, |_| "drafter");
+                r.add_map(HbmCat::CatKv, kv, |_| "kv-drafter");
+                r.add_map(
+                    HbmCat::CatOther,
+                    acts,
+                    crate::engine::mem_report::spec_act_part,
+                );
+            }
+            r
+        };
+        // every planned byte is in the report exactly once, or the report is not used
+        let mem_report_ok = mem_report.total_bytes() == planned_total;
+        debug_assert!(mem_report_ok, "the itemised memory report misses the plan");
+        if !mem_report_ok {
+            eprintln!(
+                "[gaudium] the itemised memory report ({} bytes) differs from the plan ({planned_total} bytes): reporting the five categories only",
+                mem_report.total_bytes()
+            );
+        }
         // The whole plan, before the fit check, so a refused configuration shows where it went.
         if cfg.verbose || plan_only {
             let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -1591,6 +1705,11 @@ impl Qwen3Engine {
                     )
                 }
             );
+            if mem_report_ok {
+                for line in mem_report.log_lines() {
+                    eprintln!("[gaudium] {line}");
+                }
+            }
         }
         let Some(mut dev) = dev_opt else {
             if pf.opts.half_probe > 0 {
@@ -1752,13 +1871,35 @@ impl Qwen3Engine {
             act_bytes + spec_bytes[2],
             ws_bytes,
         ];
-        live.set_hbm_bytes(
-            hbm_bytes[0],
-            hbm_bytes[1],
-            hbm_bytes[2],
-            hbm_bytes[3],
-            hbm_bytes[4],
-        );
+        if mem_report_ok {
+            // the live record groups the plan by what a part is for: `scratch` is the prefill
+            // arena only, and the vision tower, the drafter's buffers, the step activations,
+            // the prefill tile buffers and the workspace are named parts of `other`
+            let mut mem_report = mem_report;
+            mem_report.set_source(
+                "target",
+                format!(
+                    "{model_name}, {} weights",
+                    if spec.fp8_weights { "FP8" } else { "BF16" }
+                ),
+            );
+            if let Some(sc) = cfg.spec.as_ref() {
+                mem_report.set_source("drafter", format!("{} drafter", sc.method_name()));
+            }
+            let t = mem_report.totals();
+            live.set_hbm_bytes(t[0], t[1], t[2], t[3], t[4]);
+            live.set_hbm_detail(mem_report.detail_json());
+            live.set_hbm_kinds(mem_report.kinds_json());
+            live.set_sources(mem_report.sources_json());
+        } else {
+            live.set_hbm_bytes(
+                hbm_bytes[0],
+                hbm_bytes[1],
+                hbm_bytes[2],
+                hbm_bytes[3],
+                hbm_bytes[4],
+            );
+        }
         live.set_phase("loading", "uploading weights to HBM");
 
         head_t1

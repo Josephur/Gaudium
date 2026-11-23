@@ -9,6 +9,7 @@ pub mod fp8_pack;
 pub mod gemma4;
 pub mod gemma4_fp8;
 pub mod gemma4_packer;
+pub mod mem_report;
 pub mod moe;
 pub mod packer;
 pub mod qwen3;

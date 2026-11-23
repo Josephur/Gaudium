@@ -202,6 +202,7 @@ struct State {
     notes: String,
     phase: String,
     hbm_detail: String,
+    hbm_kinds: String,
     sources: String,
     profile: String,
     host_parts: BTreeMap<String, (f64, bool)>,
@@ -583,6 +584,14 @@ impl LiveReporter {
     pub fn set_hbm_detail(&self, json_obj: impl Into<String>) {
         if let Some(s) = &self.shared {
             s.state.lock().unwrap().hbm_detail = json_obj.into();
+        }
+    }
+
+    /// Sets an optional JSON object for `"hbm_kinds"`: under each category and named part of
+    /// `hbm_detail`, the part's buffers by kind as `[[kind, GB, buffers], ...]`.
+    pub fn set_hbm_kinds(&self, json_obj: impl Into<String>) {
+        if let Some(s) = &self.shared {
+            s.state.lock().unwrap().hbm_kinds = json_obj.into();
         }
     }
 
@@ -1085,6 +1094,7 @@ impl State {
             notes: String::new(),
             phase: "idle".to_string(),
             hbm_detail: String::new(),
+            hbm_kinds: String::new(),
             sources: String::new(),
             profile: String::new(),
             host_parts: BTreeMap::new(),
@@ -1647,6 +1657,10 @@ fn flush(shared: &Shared, force: bool, heartbeat: bool) {
                 j.push_str(",\"hbm_detail\":");
                 j.push_str(&st.hbm_detail);
             }
+            if !st.hbm_kinds.is_empty() {
+                j.push_str(",\"hbm_kinds\":");
+                j.push_str(&st.hbm_kinds);
+            }
         }
         if !st.sources.is_empty() {
             j.push_str(",\"sources\":");
@@ -1817,6 +1831,8 @@ mod tests {
                 400_000_000,
                 256_000_000,
             );
+            rep.set_hbm_detail("{\"other_gb\":{\"workspace\":0.256}}");
+            rep.set_hbm_kinds("{\"weights_gb\":{\"target\":[[\"W_up\",30.5,64]]}}");
             rep.begin_request(39, "K=0 BF16", "code");
             rep.first_token(Some(35.2), 1);
             thread::sleep(Duration::from_millis(5));
@@ -1834,6 +1850,20 @@ mod tests {
             assert_eq!(v.get("method").and_then(|x| x.as_str()), Some("K=0 BF16"));
             assert_eq!(v.get("phase").and_then(|x| x.as_str()), Some("idle"));
             assert_eq!(v.get("prompt_tokens").and_then(|x| x.as_u64()), Some(39));
+            assert_eq!(
+                v.get("hbm_detail")
+                    .and_then(|d| d.get("other_gb"))
+                    .and_then(|o| o.get("workspace"))
+                    .and_then(|x| x.as_f64()),
+                Some(0.256)
+            );
+            let kinds = v
+                .get("hbm_kinds")
+                .and_then(|d| d.get("weights_gb"))
+                .and_then(|o| o.get("target"))
+                .and_then(|a| a.as_array())
+                .expect("hbm_kinds is written beside hbm_detail");
+            assert_eq!(kinds[0].as_array().unwrap()[0].as_str(), Some("W_up"));
             assert_eq!(v.get("gen_tokens").and_then(|x| x.as_u64()), Some(2));
             assert_eq!(v.get("context_pos").and_then(|x| x.as_u64()), Some(41));
             let hbm = v.get("hbm").expect("hbm object present");

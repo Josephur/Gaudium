@@ -1866,6 +1866,49 @@ impl TileRt {
         build_lin_tile_graph(spec, t, &self.form, elf_base, &self.elf_tile)
     }
 
+    /// The scratch buffers `(name, bytes)` of the tile recipe whose scratch is the largest at
+    /// `tile` rows (the one `plan_bytes` sizes the region for), for the itemised memory report.
+    pub(super) fn plan_items(
+        &self,
+        spec: &ModelSpec,
+        tile: u64,
+        lmax: u64,
+        max_chunks: u64,
+    ) -> Vec<(String, u64)> {
+        let items = |gb: &GraphBuilder, half: bool| -> (u64, Vec<(String, u64)>) {
+            let v: Vec<(String, u64)> = gb
+                .persistent_tensor_specs()
+                .into_iter()
+                .filter(|(name, ..)| !is_loop_bound(name) && !(half && is_half_bound(name)))
+                .map(|(name, _dt, _dims, bytes)| (name, align_up(bytes.max(256), 256)))
+                .collect();
+            (v.iter().map(|x| x.1).sum(), v)
+        };
+        let mut best: (u64, Vec<(String, u64)>) = (0, Vec::new());
+        let mut take = |c: (u64, Vec<(String, u64)>)| {
+            if c.0 > best.0 {
+                best = c;
+            }
+        };
+        if spec.n_full_attention_layers() > 0 {
+            for nch in 1..=max_chunks {
+                take(items(&self.attn_graph(spec, tile, lmax, nch, &[]), false));
+            }
+        }
+        if spec.n_linear_layers() > 0 {
+            take(items(&self.lin_graph(spec, tile, &[]), false));
+        }
+        if self.wave_wanted(spec) {
+            for key in Self::wave_keys(spec, max_chunks) {
+                if let Ok(gb) = build_wave_graph(spec, tile, lmax, key, &self.form, &[], &self.elf_tile)
+                {
+                    take(items(&gb, true));
+                }
+            }
+        }
+        best.1
+    }
+
     /// Scratch bytes of the largest tile recipe at `tile` rows: every chunk count up to
     /// `max_chunks` of the attention layer, and the DeltaNet layer.
     pub(super) fn plan_bytes(

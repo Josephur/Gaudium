@@ -921,6 +921,11 @@ impl SpecRuntime {
         }
     }
 
+    /// The buffers behind `planned_bytes`, by name: `[weights, kv, activations]`.
+    pub fn planned_maps(&self) -> [&BTreeMap<String, u64>; 3] {
+        [&self.weight_specs, &self.kv_specs, &self.act_specs]
+    }
+
     /// `[weights, kv, scratch]` bytes this module adds to the device plan.
     pub fn planned_bytes(&self) -> [u64; 3] {
         let sum = |m: &BTreeMap<String, u64>| m.values().map(|&b| align256(b)).sum::<u64>();
