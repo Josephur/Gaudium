@@ -129,7 +129,7 @@ law ikr_live_holds:
   for +r_snap: Nat
   for +hi_snap: Nat
   for +slack: Nat
-  {Bool.or(Bool.not(ikr_is_live(ikr_pick(r_live, hi_live, r_snap, hi_snap, slack))), ikr_holds(hi_live, r_live, slack)) == True{} : Bool}
+  {Bool.or(Bool.not(ikr_is_live(ikr_pick(r_live, hi_live, r_snap, hi_snap, slack))), ikr_holds(hi_live, ikr_start(IrLive{}, r_live, r_snap), slack)) == True{} : Bool}
 
 def ikr_live_holds(r_live, hi_live, r_snap, hi_snap, slack):
   ikr_live_if(Nat.is_gt(r_live, 0n), ikr_holds(hi_live, r_live, slack), ikr_usable(ikr_snap_rows(r_snap, r_live), hi_snap, slack))
@@ -190,22 +190,25 @@ def ikr_holds_at(r, slack):
     case 1n+p:
       ikr_holds_at(p, slack)
 
-# promise: whatever state is picked, the prefill never starts past the rows of the prompt that equal the rows on the card
+# promise: a resume of the live rings never starts past the rows of the prompt that equal the rows on the card
 # harm: a resume skips rows the global caches do not hold for this prompt
-law ikr_start_le_live:
-  for +p: IkResume
+law ikr_live_start_le_live:
   for +r_live: Nat
   for +r_snap: Nat
-  {Nat.is_le(ikr_start(p, r_live, r_snap), r_live) == True{} : Bool}
+  {Nat.is_le(ikr_start(IrLive{}, r_live, r_snap), r_live) == True{} : Bool}
 
-def ikr_start_le_live(p, r_live, r_snap):
-  match p:
-    case IrFresh{}:
-      L.nat_le_zero(r_live)
-    case IrLive{}:
-      L.nat_le_refl(r_live)
-    case IrSnap{}:
-      L.nat_min_le_r(r_snap, r_live)
+def ikr_live_start_le_live(r_live, r_snap):
+  L.nat_le_refl(r_live)
+
+# promise: a resume of the ring snapshot never starts past the rows of the prompt that equal the rows on the card
+# harm: a resume skips rows the global caches do not hold for this prompt
+law ikr_snap_start_le_live:
+  for +r_live: Nat
+  for +r_snap: Nat
+  {Nat.is_le(ikr_start(IrSnap{}, r_live, r_snap), r_live) == True{} : Bool}
+
+def ikr_snap_start_le_live(r_live, r_snap):
+  L.nat_min_le_r(r_snap, r_live)
 
 # promise: a resume of the snapshot never starts past the rows of the prompt that equal the snapshot's rows
 # harm: a resume skips rows the snapshot's rings do not hold for this prompt

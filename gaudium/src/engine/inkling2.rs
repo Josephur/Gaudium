@@ -2455,6 +2455,9 @@ impl Inkling2Engine {
             &method_label,
         );
         self.live.end_request();
+        // reuse: a drafter's last context launch may still be queued; its rows count as held
+        // only once it is known to be in
+        let res = res.and_then(|rep| self.sync_compute("end of request").map(|()| rep));
         match &res {
             // reuse: the rows of the tokens fed during the decode are held too
             Ok(rep) => self.reuse_request_done(prompt_ids.len(), &rep.generated_tokens),

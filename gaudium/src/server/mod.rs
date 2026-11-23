@@ -1523,7 +1523,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
                 })
             {
                 eprintln!(
-                    "[server] model '{}': served text only: its {kind} drafter is not validated with image input (plain decode and DSpine are)",
+                    "[server] model '{}': served text only: its {kind} drafter is not validated with image input (plain decode, DSpine and Inkling 2's own drafter are)",
                     entry.id
                 );
             }
