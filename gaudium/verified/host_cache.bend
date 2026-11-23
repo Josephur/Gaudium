@@ -219,6 +219,12 @@ def hc_default_budget(+available: Nat) -> Nat:
 def hc_beside_pinned(available: Nat, pinned: Nat) -> Nat:
   Nat.sub(available, pinned)
 
+# Bytes a save may take without evicting: what the budget has free, and never more than the
+# host can give at that moment (the budget was checked when the server started; other
+# processes have taken and given memory since).
+def hc_free_now(+budget_free: Nat, +host_available: Nat) -> Nat:
+  Nat.min(budget_free, host_available)
+
 # Can a budget be honoured? It and the pinned transfer buffers must fit in what is available.
 def hc_budget_fits(budget: Nat, pinned: Nat, available: Nat) -> Bool:
   Nat.is_le(Nat.add(budget, pinned), available)
@@ -1195,3 +1201,22 @@ law hc_ring_cover_never_grows:
 
 def hc_ring_cover_never_grows(i, k):
   hc_min_le_l(i, k)
+
+# LAW HC.54: a save never counts on more free bytes than its budget has left ...
+law hc_free_now_within_budget:
+  for +f: Nat
+  for +a: Nat
+  {Nat.is_le(hc_free_now(f, a), f) == True{} : Bool}
+
+def hc_free_now_within_budget(f, a):
+  hc_min_le_l(f, a)
+
+# LAW HC.55: ... nor on more than the host has available now: the cache gives its own entries
+# back before it takes memory the host does not have.
+law hc_free_now_within_host:
+  for +f: Nat
+  for +a: Nat
+  {Nat.is_le(hc_free_now(f, a), a) == True{} : Bool}
+
+def hc_free_now_within_host(f, a):
+  hc_min_le_r(f, a)

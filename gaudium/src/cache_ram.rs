@@ -33,7 +33,8 @@ use crate::engine::qwen3::prefix_cache::{shared_rows, ImageId};
 use crate::hostmem::AnonMap;
 use crate::verified::{
     hc_abort, hc_begin_read, hc_begin_write, hc_busy, hc_can_evict, hc_continues, hc_end_read,
-    hc_end_write, hc_evict_before, hc_may_restore, hc_pins, hc_readable, hc_resume_valid,
+    hc_end_write, hc_evict_before, hc_free_now, hc_may_restore, hc_pins, hc_readable,
+    hc_resume_valid,
     hc_ring_cover_after_cut, hc_ring_serves, hc_room, hc_shared_tiles, hc_state_leaves_first,
     hc_states_over, hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
 };
@@ -190,6 +191,9 @@ pub struct HostCache {
     tick: u64,
     stats: CacheStats,
     verbose: bool,
+    /// What the host can give this process now, asked with the bytes the store holds (`None`:
+    /// not asked; the budget alone bounds the store). Asked before the store grows.
+    host_available: Option<fn(u64) -> u64>,
 }
 
 // SAFETY: the segments are plain host memory owned by the store; the raw pointers it hands out
@@ -208,6 +212,28 @@ impl HostCache {
                 ..CacheStats::default()
             },
             verbose,
+            host_available: None,
+        }
+    }
+
+    /// A store that also asks the host what it can give before it grows: a save evicts the
+    /// store's own entries first (their memory goes back to the system at once) and is refused
+    /// when even that is not enough, so the store never takes memory the host does not have.
+    pub fn watching_host(mut self) -> Self {
+        self.host_available = Some(|_held| crate::hostmem::HostMemory::read().available());
+        self
+    }
+
+    /// Bytes a save may take now without evicting, with `back` bytes it is about to give back
+    /// itself: the budget's free bytes, and no more than the host has available.
+    fn free_now(&self, back: u64) -> u64 {
+        let budget_free = self.ledger.free().saturating_add(back);
+        match self.host_available {
+            Some(ask) => hc_free_now(
+                budget_free,
+                ask(self.ledger.allocated()).saturating_add(back),
+            ),
+            None => budget_free,
         }
     }
 
@@ -293,7 +319,7 @@ impl HostCache {
     /// that it cannot (and then evicts nothing).
     fn make_room(&mut self, need: u64, target: Option<u64>) -> bool {
         loop {
-            match hc_room(need, self.ledger.free(), self.evictable(target)) {
+            match hc_room(need, self.free_now(0), self.evictable(target)) {
                 HcRoom::HcFits => return true,
                 HcRoom::HcRefuse => return false,
                 HcRoom::HcEvict => {}
@@ -485,21 +511,23 @@ impl HostCache {
             .saturating_mul(Self::charge_of(tile_bytes))
             .saturating_add(extra);
         let target = cont.map(|(id, _)| id);
-        if hc_room(
-            need,
-            self.ledger.free().saturating_add(cut_bytes),
-            self.evictable(target),
-        ) == HcRoom::HcRefuse
-        {
+        if hc_room(need, self.free_now(cut_bytes), self.evictable(target)) == HcRoom::HcRefuse {
             self.stats.refused += 1;
             if self.verbose {
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
                 eprintln!(
-                    "[cache-ram] not saved: a prefix of {} rows needs {:.2} GiB, the budget is {:.2} GiB with {:.2} GiB in entries that cannot leave now",
+                    "[cache-ram] not saved: a prefix of {} rows needs {:.2} GiB; the budget is {:.2} GiB with {:.2} GiB in entries that cannot leave now{}",
                     pc_boundary(upto_tiles, tile),
-                    need as f64 / (1u64 << 30) as f64,
-                    self.ledger.capacity() as f64 / (1u64 << 30) as f64,
-                    (self.ledger.allocated().saturating_sub(self.evictable(target))) as f64
-                        / (1u64 << 30) as f64,
+                    gib(need),
+                    gib(self.ledger.capacity()),
+                    gib(self.ledger.allocated().saturating_sub(self.evictable(target))),
+                    match self.host_available {
+                        Some(ask) => format!(
+                            ", and the host has {:.2} GiB available",
+                            gib(ask(self.ledger.allocated()))
+                        ),
+                        None => String::new(),
+                    },
                 );
             }
             return None;
@@ -724,8 +752,15 @@ pub struct SharedCache {
 }
 
 impl SharedCache {
-    pub fn new(budget_bytes: u64, ring_bytes: u64, verbose: bool) -> Self {
+    /// `watch_host`: the store asks the host what it can give before it grows (a server's
+    /// store does; a test's has no reason to depend on the machine it runs on).
+    pub fn new(budget_bytes: u64, ring_bytes: u64, verbose: bool, watch_host: bool) -> Self {
         let cache = HostCache::new(budget_bytes, verbose);
+        let cache = if watch_host {
+            cache.watching_host()
+        } else {
+            cache
+        };
         let snap = cache.stats();
         Self {
             inner: Mutex::new(cache),
@@ -949,6 +984,37 @@ mod tests {
         assert_eq!(c.stats().refused, 1);
         // the ledger is whole: given out + free = budget
         assert_eq!(c.ledger.allocated() + c.ledger.free(), c.budget_bytes());
+    }
+
+    /// Memory other processes hold on the pretend host of the test below.
+    static OTHERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[test]
+    fn a_host_short_of_memory_bounds_the_store_below_its_budget() {
+        use std::sync::atomic::Ordering;
+        // a host of 20 MiB; the store's budget (64 MiB) is more than it can ever give
+        fn available(held: u64) -> u64 {
+            (20 * MIB).saturating_sub(OTHERS.load(Ordering::Relaxed) + held)
+        }
+        let mut c = HostCache::new(64 * MIB, false);
+        c.host_available = Some(available);
+        let a = save(&mut c, &prompt(512 + 50, 1), 1, &[1]).unwrap();
+        let b = save(&mut c, &prompt(512 + 50, 2), 1, &[1]).unwrap();
+        assert_eq!(c.held_bytes(), 2 * (TB + SB));
+        // 8 MiB are left on the host: a third conversation of 6 MiB fits without evicting
+        let d = save(&mut c, &prompt(512 + 50, 3), 1, &[1]).unwrap();
+        assert_eq!((c.stats().entries, c.stats().evictions), (3, 0));
+        // another process takes what is left: the next save makes its room out of the store's
+        // own entries (the one used least recently), not out of memory the host lacks
+        OTHERS.store(2 * MIB, Ordering::Relaxed);
+        let e = save(&mut c, &prompt(512 + 50, 4), 1, &[1]).unwrap();
+        assert!(!c.contains(a) && c.contains(b) && c.contains(d) && c.contains(e));
+        assert_eq!(c.stats().evictions, 1);
+        assert!(c.held_bytes() + OTHERS.load(Ordering::Relaxed) <= 20 * MIB);
+        // a prefix this host could not hold even with the store empty is refused, and nothing
+        // is evicted for it
+        assert!(save(&mut c, &prompt(5 * 512 + 50, 5), 5, &[5]).is_none());
+        assert_eq!((c.stats().entries, c.stats().evictions, c.stats().refused), (3, 1, 1));
     }
 
     #[test]

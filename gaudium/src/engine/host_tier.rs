@@ -791,18 +791,23 @@ impl HostTier {
 /// a row or of a state (the model's files, the precisions, the context and the tile, the
 /// kernels, the drafter, the vision tower), and of the layout the copies use.
 pub(super) fn engine_identity(cfg: &Qwen3Config, eng: &Qwen3Engine, layout: &str) -> EngineId {
-    /// Names, sizes and modification times of the weight and configuration files of `dir`.
-    fn files_of(dir: &std::path::Path) -> String {
+    /// Names, sizes and modification times of the files of `dir` (`all`), or of its weight and
+    /// configuration files only.
+    fn files_of(dir: &std::path::Path, all: bool) -> String {
         let mut v: Vec<String> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
-                let keep = name.ends_with(".safetensors")
+                let keep = all
+                    || name.ends_with(".safetensors")
                     || name.ends_with(".json")
                     || name.ends_with(".txt");
                 let md = e.metadata().ok()?;
+                if !md.is_file() {
+                    return None;
+                }
                 let mtime = md
                     .modified()
                     .ok()
@@ -831,15 +836,15 @@ pub(super) fn engine_identity(cfg: &Qwen3Config, eng: &Qwen3Engine, layout: &str
         let dir = match &sc.method {
             spec::SpecMethod::DSpine { draft_model }
             | spec::SpecMethod::DFlash2 { draft_model }
-            | spec::SpecMethod::Assistant { draft_model } => files_of(draft_model),
+            | spec::SpecMethod::Assistant { draft_model } => files_of(draft_model, false),
             _ => String::new(),
         };
         format!("{sc:?}|{dir}")
     });
     let text = format!(
-        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8_act={}|fp8_cache={:?}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}|layout={layout}",
+        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8_act={}|fp8_cache={:?}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}|layout={layout}",
         cfg.model_dir.display(),
-        files_of(&cfg.model_dir),
+        files_of(&cfg.model_dir, false),
         eng.spec,
         eng.max_ctx,
         eng.prefill_tile,
@@ -851,6 +856,9 @@ pub(super) fn engine_identity(cfg: &Qwen3Config, eng: &Qwen3Engine, layout: &str
         cfg.request_reset,
         cfg.step,
         eng.elf_hashes,
+        // every kernel and glue file a recipe may be built from (the tower's and the
+        // drafter's too): a rebuilt kernel is another engine
+        files_of(&cfg.kernels_dir, true),
         eng.driver_version,
         drafter,
         eng.prefix.ctx_rows(),
@@ -1221,7 +1229,7 @@ mod tests {
     }
 
     fn rig(budget: u64, n_slots: u64) -> Rig {
-        rig_on(Arc::new(SharedCache::new(budget, 0, false)), n_slots, false, [7, 7])
+        rig_on(Arc::new(SharedCache::new(budget, 0, false, false)), n_slots, false, [7, 7])
     }
 
     impl Rig {
@@ -1312,7 +1320,7 @@ mod tests {
 
     #[test]
     fn a_reloaded_engine_restores_what_its_predecessor_saved_and_another_engine_does_not() {
-        let cache = Arc::new(SharedCache::new(64 << 20, 0, false));
+        let cache = Arc::new(SharedCache::new(64 << 20, 0, false, false));
         let mut r = rig_on(Arc::clone(&cache), 4, true, [7, 7]);
         let a1 = prompt(5 * 512 + 100, 1);
         r.request(&a1, true);
@@ -1362,7 +1370,7 @@ mod tests {
 
     #[test]
     fn the_drafter_rings_are_copied_again_only_when_the_entry_grew() {
-        let cache = Arc::new(SharedCache::new(64 << 20, 0, false));
+        let cache = Arc::new(SharedCache::new(64 << 20, 0, false, false));
         let mut r = rig_on(Arc::clone(&cache), 4, true, [7, 7]);
         let a1 = prompt(4 * 512 + 100, 1);
         r.request(&a1, true);

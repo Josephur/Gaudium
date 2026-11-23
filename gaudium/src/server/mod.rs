@@ -1014,8 +1014,9 @@ impl AppState {
             s.detail = reason.to_string();
             s.since = Instant::now();
             // what the card holds for its conversation goes to host memory first, so the next
-            // turn after the release does not prefill it again
-            if let Some(e) = s.engine.as_mut() {
+            // turn after the release does not prefill it again (not when the server is
+            // stopping: the store goes with the process)
+            if let Some(e) = s.engine.as_mut().filter(|_| !crate::signals::term_requested()) {
                 e.before_release();
             }
             s.engine = None; // drains streams & releases device + unlinks cardlock holder/live/shm
@@ -1065,6 +1066,7 @@ fn host_cache_of(cfg: &ServerConfig) -> Result<Option<Arc<crate::cache_ram::Shar
         budget,
         ring,
         cfg.verbose,
+        true,
     ))))
 }
 

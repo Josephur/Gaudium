@@ -1279,7 +1279,7 @@ fn served_engine_configuration_follows_the_server_options() {
 #[test]
 fn the_host_tier_is_reported_and_given_its_idle_time() {
     use crate::engine::qwen3::host_tier::{Tier, TierReport};
-    let cache = Arc::new(crate::cache_ram::SharedCache::new(8 << 30, 256 << 20, false));
+    let cache = Arc::new(crate::cache_ram::SharedCache::new(8 << 30, 256 << 20, false, false));
     let h = harness_with_cache(Some(Arc::clone(&cache)));
     let u = |v: &JsonValue, path: &[&str]| at(v, path).as_u64().unwrap();
     // a first request: everything prefilled
