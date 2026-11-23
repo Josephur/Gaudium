@@ -43,6 +43,7 @@ use crate::core::inkling2::{
     final_states, hist_rows, msg_states, ring_slots, schedule, source_buffers, wiring, IkApp,
     IkWire, IK_MAX_STATES,
 };
+use crate::engine::qwen3::spec::{chain_accept, SpecConfig, SpecMethod};
 use crate::engine::{EngineConfig, GenParams, GenReport};
 use crate::json::{parse_json, JsonValue};
 use crate::kernels::{KernelEnv, INKLING2_GLUE};
@@ -967,6 +968,17 @@ fn mib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0)
 }
 
+/// What a speculative decode did after the first token.
+#[derive(Debug, Default)]
+struct SpecOutcome {
+    launches: u64,
+    drafted: u64,
+    accepted: u64,
+    decode_ms: f64,
+    stopped_by_eos: bool,
+    stopped_by_cancel: bool,
+}
+
 /// Unused state and message slots of a prefill recipe are bound to buffers of their own (a
 /// launch refuses one address under two tensors).
 const PF_DUMMIES: usize = 8;
@@ -1162,6 +1174,12 @@ pub struct Inkling2Engine {
     dump_dir: Option<std::path::PathBuf>,
     /// Debug: rows of the passes a greedy request is run again with (0: off).
     verify_check: u64,
+    /// Speculative decoding: the drafter and the rows of a verify pass (the last token and its
+    /// drafts); `None`: every request is `K = 0`.
+    draft: Option<SpecConfig>,
+    spec_rows: u64,
+    /// Requests served so far (the host oracle drafter's streams are per request).
+    requests: usize,
 
     // Recipes (must drop before `dev`)
     head: CompiledRecipe,
@@ -1240,9 +1258,24 @@ impl Inkling2Engine {
                     .into(),
             );
         }
-        if cfg.spec.is_some() {
-            return Err("Inkling 2: speculative decoding is not wired up for this family yet".into());
-        }
+        // Speculative decoding: the rows of a verify pass are the last token and its drafts.
+        let spec_cfg = cfg.spec.clone();
+        let spec_rows = match &spec_cfg {
+            Some(sc) => {
+                if !matches!(sc.method, SpecMethod::Oracle { .. }) {
+                    return Err(format!(
+                        "Inkling 2: the '{}' drafter is not wired up for this family yet (the host oracle drafter is)",
+                        sc.method_name()
+                    ));
+                }
+                let k = sc.draft_k.iter().copied().max().unwrap_or(7);
+                if k == 0 || k > 63 {
+                    return Err(format!("Inkling 2: --draft-k {k} is outside 1..63"));
+                }
+                k + 1
+            }
+            None => 1,
+        };
 
         let (max_pos, gen_eos) = match &gguf {
             Some(g) => (
@@ -1284,7 +1317,7 @@ impl Inkling2Engine {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&t| t > 1 && t <= 64)
             .unwrap_or(0);
-        let step_rows = verify_check.max(1);
+        let step_rows = verify_check.max(1).max(spec_rows);
 
         // Configure kernel ELFs and the graph-compiler glue BEFORE SynapseAI is loaded.
         let kenv = KernelEnv::configure_from_dir(&cfg.kernels_dir)?;
@@ -1588,6 +1621,9 @@ impl Inkling2Engine {
             step_prefill,
             dump_dir,
             verify_check,
+            draft: spec_cfg,
+            spec_rows,
+            requests: 0,
             head,
             step_recipes: BTreeMap::new(),
             embed_recipes: HashMap::new(),
@@ -1820,8 +1856,20 @@ impl Inkling2Engine {
         params: &GenParams,
         seq_pos: u32,
     ) -> Result<i32, String> {
+        self.sample_logits_row(logits_hbm, 0, params, seq_pos)
+    }
+
+    /// [`Self::sample_from_logits`] for row `row` of a logits tensor of several rows.
+    fn sample_logits_row(
+        &mut self,
+        logits_hbm: u64,
+        row: usize,
+        params: &GenParams,
+        seq_pos: u32,
+    ) -> Result<i32, String> {
         let vocab = self.dims.vocab_out as usize;
         let bytes = vocab * 2;
+        let logits_hbm = logits_hbm + (row as u64) * self.dims.vocab_pad * 2;
         self.dev
             .copy_d2h_pinned_sync(logits_hbm, &mut self.stage_io, bytes)
             .map_err(|e| format!("read logits D2H: {e}"))?;
@@ -2004,6 +2052,109 @@ impl Inkling2Engine {
             passes * rows as u64
         );
         Ok(())
+    }
+
+    /// Speculative decode after the first token: each launch verifies the last token and its
+    /// drafts in one pass of `spec_rows` rows and emits the tokens the pass itself gives up to and
+    /// including the first one a draft missed. Every emitted token is the pass's own arg-max (or
+    /// its own sample at that position), and a pass of several rows gives each row the logits a
+    /// one-row step gives it, so the stream is the `K = 0` stream.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_spec(
+        &mut self,
+        prompt_len: usize,
+        params: &GenParams,
+        budget: &mut SequenceBudget,
+        is_eos: &impl Fn(i32) -> bool,
+        is_cancelled: &impl Fn() -> bool,
+        on_token: &mut impl FnMut(i32),
+        generated: &mut Vec<i32>,
+    ) -> Result<SpecOutcome, String> {
+        let rows = self.spec_rows as usize;
+        let k = rows - 1;
+        let req = self.requests;
+        let oracle = match self.draft.as_ref().map(|s| &s.method) {
+            Some(SpecMethod::Oracle { requests }) => requests.get(req).cloned().unwrap_or_default(),
+            _ => return Err("Inkling 2: no drafter for this request".into()),
+        };
+        let logits = self.step_act_addr["logits"].0;
+        let mut out = SpecOutcome::default();
+        let mut bucket = 0u64;
+        let t0 = Instant::now();
+        let mut compile_ms = 0.0f64;
+        while budget.remaining() > 0 {
+            if is_cancelled() {
+                out.stopped_by_cancel = true;
+                break;
+            }
+            // the last emitted token is generated[gi]; it sits at position prompt_len + gi
+            let gi = generated.len() - 1;
+            let cursor = (prompt_len + gi) as u64;
+            let room = (self.max_ctx - cursor) as usize;
+            if room < rows {
+                // the pass would write past the context: finish with one-row steps
+                let b1 = step_bucket((cursor + 1).div_ceil(IK_CHUNK), self.max_chunks);
+                self.ensure_step(1, b1)?;
+                let tok = self.run_step(generated[gi], cursor, b1, params)?;
+                out.launches += 1;
+                budget.record_emitted(1);
+                generated.push(tok);
+                self.live.step(1, 0, 0);
+                on_token(tok);
+                if params.stop_on_eos && is_eos(tok) {
+                    out.stopped_by_eos = true;
+                    break;
+                }
+                continue;
+            }
+            // drafts of the host oracle: the known continuation, with the marked ones made wrong
+            let mut toks = vec![generated[gi]];
+            for j in 0..k {
+                let Some(&t) = oracle.stream.get(gi + 1 + j) else { break };
+                let wrong = oracle.corrupt.contains(&(gi + 1 + j));
+                toks.push(if wrong { (t + 1) % self.dims.vocab_out as i32 } else { t });
+            }
+            let n_drafts = toks.len() - 1;
+            toks.resize(rows, 0);
+            let need = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
+            if need != bucket {
+                let tc = Instant::now();
+                self.ensure_step(rows as u64, need)?;
+                compile_ms += tc.elapsed().as_secs_f64() * 1000.0;
+                bucket = need;
+            }
+            let mut got = self.run_rows(&toks, cursor, bucket)?;
+            if params.temperature > 0.0 {
+                // a sampled request: each row's token is its position's own sample
+                for (r, g) in got.iter_mut().enumerate().take(n_drafts + 1) {
+                    *g = self.sample_logits_row(logits, r, params, (cursor + r as u64) as u32)?;
+                }
+            }
+            let accepted = chain_accept(&toks[..=n_drafts], &got[..=n_drafts]);
+            out.launches += 1;
+            out.drafted += n_drafts as u64;
+            out.accepted += accepted as u64;
+            let mut emitted = 0u64;
+            for &tok in &got[..=accepted] {
+                if budget.remaining() == 0 {
+                    break;
+                }
+                budget.record_emitted(1);
+                generated.push(tok);
+                on_token(tok);
+                emitted += 1;
+                if params.stop_on_eos && is_eos(tok) {
+                    out.stopped_by_eos = true;
+                    break;
+                }
+            }
+            self.live.step(emitted, n_drafts as u64, accepted as u64);
+            if out.stopped_by_eos {
+                break;
+            }
+        }
+        out.decode_ms = (t0.elapsed().as_secs_f64() * 1000.0 - compile_ms).max(0.0);
+        Ok(out)
     }
 
     /// Runs prefill + autoregressive decode, calling `on_token` per generated token. `cancel` is
@@ -2247,6 +2398,49 @@ impl Inkling2Engine {
         } else if is_cancelled() {
             stopped_by_cancel = true;
         }
+
+        // ---- DECODE, speculative: an engine loaded with a drafter ----
+        if self.draft.is_some()
+            && !stopped_by_eos
+            && !stopped_by_cancel
+            && !generated.is_empty()
+            && budget.remaining() > 0
+        {
+            let out = self.decode_spec(
+                prompt_ids.len(),
+                params,
+                budget,
+                is_eos,
+                is_cancelled,
+                on_token,
+                &mut generated,
+            )?;
+            self.requests += 1;
+            let decode_tokens = generated.len().saturating_sub(1);
+            let k = self.spec_rows - 1;
+            return Ok(GenReport {
+                prompt_tokens: prompt_ids.len(),
+                generated_tokens: generated,
+                ttft_ms,
+                prefill_tok_s,
+                decode_ms: out.decode_ms,
+                decode_tok_s: decode_tokens as f64 / (out.decode_ms / 1000.0).max(1e-9),
+                ms_per_step: out.decode_ms / (out.launches.max(1) as f64),
+                stopped_by_eos: out.stopped_by_eos,
+                stopped_by_cancel: out.stopped_by_cancel,
+                launches: out.launches,
+                tokens_per_launch: decode_tokens as f64 / (out.launches.max(1) as f64),
+                method: format!(
+                    "{} K={k} BF16 {}",
+                    self.draft.as_ref().map_or("", |s| s.method_name()),
+                    if params.temperature > 0.0 { "sampled" } else { "greedy" }
+                ),
+                drafted: out.drafted,
+                draft_accepted: out.accepted,
+                ..GenReport::default()
+            });
+        }
+        self.requests += 1;
 
         // ---- DECODE: one monolithic launch per token ----
         // a bucket compiled on first use is not decode time: build the first one before the clock
