@@ -521,13 +521,11 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
                     }
                     set(&mut kwargs, "reasoning_effort", n.clone());
                 }
-                NumberEffort::Refuse => {
-                    return Err(format!(
-                        "reasoning_effort must be a level name for this model (its levels: none{}{})",
-                        if t.effort.supported() { ", " } else { "" },
-                        t.effort.advertised().join(", ")
-                    ))
-                }
+                NumberEffort::Refuse => return Err(format!(
+                    "reasoning_effort must be a level name for this model (its levels: none{}{})",
+                    if t.effort.supported() { ", " } else { "" },
+                    t.effort.advertised().join(", ")
+                )),
             }
         }
     }
@@ -604,9 +602,11 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
         set(&mut kwargs, "enable_thinking", JsonValue::Bool(false));
     }
     // reasoning off reaches a template that ignores the flag through its off level
-    let off = effort_off
-        || kwargs.get("enable_thinking").and_then(JsonValue::as_bool) == Some(false);
-    if t.effort_form.off_by_level(off, kwargs.get("reasoning_effort").is_some()) {
+    let off =
+        effort_off || kwargs.get("enable_thinking").and_then(JsonValue::as_bool) == Some(false);
+    if t.effort_form
+        .off_by_level(off, kwargs.get("reasoning_effort").is_some())
+    {
         set(&mut kwargs, "reasoning_effort", JsonValue::Str(OFF.into()));
     }
 
@@ -855,7 +855,10 @@ mod tests {
             effort(",\"reasoning_effort\":\"none\",\"chat_template_kwargs\":{\"enable_thinking\":true}"),
             "0.0"
         );
-        assert_eq!(effort(",\"chat_template_kwargs\":{\"enable_thinking\":false}"), "0.0");
+        assert_eq!(
+            effort(",\"chat_template_kwargs\":{\"enable_thinking\":false}"),
+            "0.0"
+        );
         assert_eq!(effort(",\"reasoning_effort\":0"), "0.0");
         // an effort the request names wins over the off level
         assert_eq!(
@@ -873,12 +876,24 @@ mod tests {
         );
         // a template that takes no numbers refuses one (it would be ignored otherwise)
         let named = ChatTemplate::from_parts(EFFORT_TEMPLATE, None).unwrap().0;
-        assert_eq!(named.effort_form, EffortForm { reads_flag: true, ..EffortForm::default() });
+        assert_eq!(
+            named.effort_form,
+            EffortForm {
+                reads_flag: true,
+                ..EffortForm::default()
+            }
+        );
         assert!(block_prompt(&named, ",\"reasoning_effort\":0.5")
             .unwrap_err()
-            .starts_with("reasoning_effort must be a level name for this model (its levels: none, low"));
+            .starts_with(
+                "reasoning_effort must be a level name for this model (its levels: none, low"
+            ));
         // the flag reaches a template that reads it, without the off level
-        let p = block_prompt(&named, ",\"chat_template_kwargs\":{\"enable_thinking\":false}").unwrap();
+        let p = block_prompt(
+            &named,
+            ",\"chat_template_kwargs\":{\"enable_thinking\":false}",
+        )
+        .unwrap();
         assert!(p.text.starts_with("<|im_start|>user") && !p.reasoning_open);
     }
 
@@ -959,7 +974,9 @@ mod tests {
         );
         // the prompt ends after the last message: the model opens its own block
         let p = block_prompt(&t, "").unwrap();
-        assert!(p.text.ends_with("<|message_user|><|content_text|>w?<|end_message|>"));
+        assert!(p
+            .text
+            .ends_with("<|message_user|><|content_text|>w?<|end_message|>"));
         // a client's tool calls (JSON text arguments) and results, the result named by its call
         let body = parse_json(&format!(
             r#"{{"messages":[{{"role":"user","content":"w?"}},
@@ -988,7 +1005,10 @@ mod tests {
             &parse_json(r#"{"messages":[{"role":"user","content":"x"},{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"data:x"}}]}]}"#).unwrap(),
         )
         .unwrap_err();
-        assert_eq!(err, "chat template: Image content is only supported for user and tool messages");
+        assert_eq!(
+            err,
+            "chat template: Image content is only supported for user and tool messages"
+        );
     }
 
     const TOOLS: &str = r#""tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#;

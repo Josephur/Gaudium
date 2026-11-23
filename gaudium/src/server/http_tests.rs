@@ -236,6 +236,19 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
         ("<|vision_end|>", true),
         ("<|image_pad|>", true),
         ("<|video_pad|>", true),
+        // the message-block family's markers
+        ("<|message_model|>", true),
+        ("<|message_user|>", true),
+        ("<|message_system|>", true),
+        ("<|message_tool|>", true),
+        ("<|content_text|>", true),
+        ("<|content_thinking|>", true),
+        ("<|content_invoke_tool_json|>", true),
+        ("<|content_xml|>", true),
+        ("<|content_image|>", true),
+        ("<|end_message|>", true),
+        ("<|content_model_end_sampling|>", true),
+        ("<|unused_200054|>", true),
     ]));
     let model = |id: &str, template: &str, config: Option<&str>| {
         let config = config.map(|c| json::parse_json(c).unwrap());
@@ -972,6 +985,68 @@ fn special_token_tags_and_the_call_form() {
         ),
         "{\"city\":\"Rome\"}"
     );
+}
+
+#[test]
+fn message_blocks_over_both_endpoints() {
+    let h = model_harness("blocks", chat::BLOCK_TEMPLATE, None, None);
+    let reply = "<|message_model|><|content_thinking|>Need the tool.<|end_message|>\
+                 <|message_model|><|content_text|>On it.<|end_message|>\
+                 <|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\",\"days\":2}}<|end_message|>\
+                 <|content_model_end_sampling|>never shown";
+    h.script(reply);
+    let (status, r) = h.chat(&format!(",{TOOLS}"));
+    assert_eq!(status, 200, "{}", r.dump());
+    // the prompt ends after the last message: the model opens its own blocks
+    assert!(h
+        .last_prompt()
+        .ends_with("<|message_user|><|content_text|>Weather in Oslo?<|end_message|>"));
+    let msg = at(&r, &["choices", "0", "message"]);
+    assert_eq!(s(msg, &["reasoning_content"]), "Need the tool.");
+    assert_eq!(s(msg, &["content"]), "On it.");
+    assert_eq!(s(msg, &["tool_calls", "0", "function", "name"]), "get_weather");
+    assert_eq!(
+        s(msg, &["tool_calls", "0", "function", "arguments"]),
+        "{\"city\":\"Oslo\",\"days\":2}"
+    );
+    assert_eq!(s(&r, &["choices", "0", "finish_reason"]), "tool_calls");
+    // streamed: the same parts, the call whole
+    h.script(reply);
+    let (_, body) = h.post(
+        "/v1/chat/completions",
+        &format!("{{\"messages\":[{{\"role\":\"user\",\"content\":\"Weather in Oslo?\"}}],\"stream\":true,{TOOLS}}}"),
+    );
+    let st = collect_chat_stream(&body);
+    assert_eq!((st.reasoning.as_str(), st.content.as_str()), ("Need the tool.", "On it."));
+    assert_eq!(st.calls.len(), 1);
+    assert_eq!(st.calls[0].2, "{\"city\":\"Oslo\",\"days\":2}");
+    assert!(st.done && st.finish == "tool_calls");
+    // the block-structured endpoint: thinking, text and the call as its blocks
+    h.script(reply);
+    let (status, text) = h.post(
+        "/v1/messages",
+        &format!("{{\"model\":\"any\",\"max_tokens\":512,{MESSAGES_TOOLS},\"messages\":[{{\"role\":\"user\",\"content\":\"Weather in Oslo?\"}}]}}"),
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    let blocks = at(&r, &["content"]).as_array().unwrap();
+    let kinds: Vec<&str> = blocks.iter().map(|b| s(b, &["type"])).collect();
+    assert_eq!(kinds, ["thinking", "text", "tool_use"]);
+    assert_eq!(s(&blocks[1], &["text"]), "On it.");
+    assert_eq!(at(&blocks[2], &["input"]).dump(), "{\"city\":\"Oslo\",\"days\":2}");
+    assert_eq!(s(&r, &["stop_reason"]), "tool_use");
+    // thinking disabled reaches the template as its off level
+    h.script("<|message_model|><|content_text|>Hi.<|end_message|><|content_model_end_sampling|>");
+    let (status, text) = h.post(
+        "/v1/messages",
+        "{\"model\":\"any\",\"max_tokens\":64,\"thinking\":{\"type\":\"disabled\"},\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
+    );
+    assert_eq!(status, 200, "{text}");
+    assert!(h.last_prompt().contains("Effort: 0.0"), "{}", h.last_prompt());
+    // the template's refusal is a clean 400 with its message
+    let (status, r) = h.chat(",\"reasoning_effort\":2");
+    assert_eq!(status, 400, "{}", r.dump());
+    assert!(r.dump().contains("Unknown effort: 2"), "{}", r.dump());
 }
 
 const MESSAGES_TOOLS: &str = r#""tools":[{"name":"get_weather","description":"Weather.","input_schema":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}]"#;

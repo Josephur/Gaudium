@@ -1931,7 +1931,10 @@ mod tests {
         );
         // reasoning stays in the content; without tools a call block is text
         let s = stream_parse(&mut block_parser(false, false), &reply, 3);
-        assert_eq!((s.r.as_str(), s.c.as_str()), ("", "hmm{\"name\":\"x\",\"args\":{}}"));
+        assert_eq!(
+            (s.r.as_str(), s.c.as_str()),
+            ("", "hmm{\"name\":\"x\",\"args\":{}}")
+        );
         assert!(s.calls.is_empty());
         // a call cut off by the end of generation: kept when whole, dropped (never shown) when not
         let whole = format!("{H}<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":{{\"city\":\"Oslo\"}}}}");
@@ -1948,7 +1951,8 @@ mod tests {
         let s = stream_parse(&mut block_parser(true, true), &bad, 4);
         assert_eq!((s.c.as_str(), s.calls.len()), ("not json!", 0));
         // the name before the call marker stands in for a JSON without one
-        let named = format!("{H}get_weather<|content_invoke_tool_json|>{{\"args\":{{\"days\":1}}}}{E}");
+        let named =
+            format!("{H}get_weather<|content_invoke_tool_json|>{{\"args\":{{\"days\":1}}}}{E}");
         let s = stream_parse(&mut block_parser(true, true), &named, 5);
         assert_eq!(s.calls[0].name, "get_weather");
         // another role's header ends the reply
@@ -1965,7 +1969,11 @@ mod tests {
         assert!(p.stopped() && s.calls.len() == 1 && s.calls[0].name == "a");
         // a prompt that ends inside a reasoning block starts there
         let mut p = OutputParser::new(true, true, None, Vec::new(), blocks());
-        let s = stream_parse(&mut p, &format!("still thinking{E}{H}<|content_text|>ok{E}"), 2);
+        let s = stream_parse(
+            &mut p,
+            &format!("still thinking{E}{H}<|content_text|>ok{E}"),
+            2,
+        );
         assert_eq!((s.r.as_str(), s.c.as_str()), ("still thinking", "ok"));
     }
 
@@ -1973,17 +1981,24 @@ mod tests {
     fn message_block_form_is_detected_and_forces_named_calls() {
         let f = blocks();
         assert_eq!(f.style, CallStyle::Blocks);
-        assert_eq!((f.think_open.as_str(), f.think_close.as_str()), ("<|content_thinking|>", E));
+        assert_eq!(
+            (f.think_open.as_str(), f.think_close.as_str()),
+            ("<|content_thinking|>", E)
+        );
         assert!(f.is_marker_piece(E) && f.is_marker_piece("<|content_model_end_sampling|>"));
         assert!(!f.is_marker_piece("<|endoftext|>") && !f.is_marker_piece(""));
         assert!(f.stop_markers().contains(&"<|message_user|>"));
         assert!(OutputFormat::default().stop_markers().is_empty());
         // a call to any tool cannot be opened (its name comes first); a named one can
-        assert!(!f.can_force("") && f.can_force("get_weather") && OutputFormat::default().can_force(""));
+        assert!(
+            !f.can_force("") && f.can_force("get_weather") && OutputFormat::default().can_force("")
+        );
         let prefix = f.forced_prefix("get_weather");
         assert_eq!(
             prefix,
-            format!("{H}get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":")
+            format!(
+                "{H}get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":"
+            )
         );
         let mut p = block_parser(true, true);
         let opened = p.feed(&prefix);

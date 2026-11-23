@@ -201,8 +201,14 @@ mod tests {
         };
         assert!(!flag.off_by_level(true, false));
         assert!(!EffortForm::default().off_by_level(true, false));
-        assert_eq!(levels_only.number(false), NumberEffort::Pass { thinks: true });
-        assert_eq!(levels_only.number(true), NumberEffort::Pass { thinks: false });
+        assert_eq!(
+            levels_only.number(false),
+            NumberEffort::Pass { thinks: true }
+        );
+        assert_eq!(
+            levels_only.number(true),
+            NumberEffort::Pass { thinks: false }
+        );
         assert_eq!(EffortForm::default().number(false), NumberEffort::Refuse);
     }
 }

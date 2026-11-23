@@ -40,7 +40,10 @@ const MARKERS: [(&str, Marker); 13] = [
     (THINK, Marker::Event(MbEvent::MeOpenThink)),
     (TEXT, Marker::Event(MbEvent::MeOpenText)),
     ("<|content_tool_error|>", Marker::Event(MbEvent::MeOpenText)),
-    ("<|content_invoke_tool_text|>", Marker::Event(MbEvent::MeOpenText)),
+    (
+        "<|content_invoke_tool_text|>",
+        Marker::Event(MbEvent::MeOpenText),
+    ),
     ("<|content_xml|>", Marker::Event(MbEvent::MeOpenText)),
     ("<|content_image|>", Marker::Event(MbEvent::MeOpenText)),
     (CALL, Marker::Call),

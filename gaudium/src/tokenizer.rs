@@ -295,7 +295,9 @@ fn match_letter_case_at(chars: &[char], cls: &[CharClass], i: usize) -> usize {
     let lower = |k: usize| matches!(at(k), Some(Lower | Both | Mark));
     // [^\r\n\p{L}\p{N}]
     let prefix = |k: usize| {
-        k < n && !matches!(cls[k], Upper | Lower | Both | Number) && !matches!(chars[k], '\r' | '\n')
+        k < n
+            && !matches!(cls[k], Upper | Lower | Both | Number)
+            && !matches!(chars[k], '\r' | '\n')
     };
     // [^\s\p{L}\p{N}]
     let other = |k: usize| matches!(at(k), Some(Other | Mark));
@@ -344,7 +346,11 @@ fn match_letter_case_at(chars: &[char], cls: &[CharClass], i: usize) -> usize {
         return k;
     }
     // 4.  ?[^\s\p{L}\p{N}]+[\r\n/]*
-    let k = if chars[i] == ' ' && other(i + 1) { i + 1 } else { i };
+    let k = if chars[i] == ' ' && other(i + 1) {
+        i + 1
+    } else {
+        i
+    };
     if other(k) {
         let mut k = run(k, &other);
         while k < n && matches!(chars[k], '\r' | '\n' | '/') {

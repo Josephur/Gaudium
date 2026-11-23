@@ -2518,7 +2518,8 @@ mod tests {
 
     #[test]
     fn features_render_like_jinja2() {
-        let fixture = parse_json(include_str!("../../tests/data/chat/jinja_features.json")).unwrap();
+        let fixture =
+            parse_json(include_str!("../../tests/data/chat/jinja_features.json")).unwrap();
         let source = fixture.get("template").and_then(JsonValue::as_str).unwrap();
         let cases = fixture.get("cases").unwrap();
         assert!(cases.as_array().unwrap().len() >= 10);
