@@ -43,9 +43,9 @@ use crate::verified::{
     hc_copy_whole, hc_end_write, hc_evict_before, hc_may_read, hc_may_restore, hc_pins,
     hc_read_done, hc_readable, hc_resumable, hc_resume_better, hc_resume_valid,
     hc_ring_cover_after_cut, hc_ring_due, hc_ring_serves, hc_room, hc_save_need, hc_shared_tiles,
-    hc_spare_credit, hc_spares_return, hc_state_kept, hc_state_leaves_first, hc_state_may_leave,
-    hc_state_survives_cut, hc_state_wanted, hc_states_over, hc_take_now, hc_tiles, hc_truncate,
-    pc_boundary, HcEntry, HcRoom,
+    hc_spare_credit, hc_spares_return, hc_state_due, hc_state_kept, hc_state_leaves_first,
+    hc_state_may_leave, hc_state_survives_cut, hc_state_wanted, hc_states_over, hc_take_now,
+    hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
 };
 
 /// Identity of the engine an entry was made by: a digest of everything that decides the bytes
@@ -188,6 +188,29 @@ pub struct ReadView {
     pub ring: Option<(*const u8, u64)>,
     pub tokens: Vec<i32>,
     pub images: Vec<ImageId>,
+}
+
+/// Of the kept positions `kept` of a save into an entry that holds the states `have` and rows up
+/// to `entry_tiles` whole tiles and keeps at most `cap` positions: the ones whose state the save
+/// copies and is charged for (the verified `hc_state_due`). The entry lacks them, its rows reach
+/// them, and they are among the `cap` positions furthest into the prompt of everything the entry
+/// would then hold; a state that would leave again at the end of the same save is not copied.
+pub fn states_due(have: &[u64], kept: &[u64], entry_tiles: u64, cap: u64) -> Vec<u64> {
+    // every position the entry would hold if the save copied all it could
+    let mut all: Vec<u64> = have.to_vec();
+    for &k in kept {
+        if hc_state_wanted(all.contains(&k), k, entry_tiles) {
+            all.push(k);
+        }
+    }
+    kept.iter()
+        .copied()
+        .filter(|&k| {
+            // positions that leave after this one (`hc_state_leaves_first`, the order of the trim)
+            let above = all.iter().filter(|&&u| hc_state_leaves_first(k, u)).count() as u64;
+            hc_state_due(have.contains(&k), k, entry_tiles, above, cap)
+        })
+        .collect()
 }
 
 /// The store. One per server; engines reach it through [`SharedCache`].
@@ -544,8 +567,8 @@ impl HostCache {
     /// Chooses the entry a save of the prompt `held` writes into: the entry of this engine that
     /// the prompt continues (`hc_continue_pick`; it is cut to the tiles they share), else a new
     /// one. The save is to reach `upto_tiles` whole tiles and the state at the positions `kept`
-    /// (whole tiles each), with segments of `tile_bytes`, `state_bytes` and `ring_bytes`
-    /// (0: no drafter rings). It is charged for what it adds to the entry and for nothing the
+    /// (whole tiles each; the entry keeps at most `state_cap` positions), with segments of
+    /// `tile_bytes`, `state_bytes` and `ring_bytes` (0: no drafter rings). It is charged for what it adds to the entry and for nothing the
     /// entry keeps (`hc_save_need`). `None`: that has no room even with every other entry
     /// gone, and nothing was changed.
     #[allow(clippy::too_many_arguments)]
@@ -558,6 +581,7 @@ impl HostCache {
         images: &[ImageId],
         upto_tiles: u64,
         kept: &[u64],
+        state_cap: u64,
         state_bytes: u64,
         ring_bytes: u64,
     ) -> Option<SaveTarget> {
@@ -588,17 +612,17 @@ impl HostCache {
                     .map(|(_, s)| s.charged())
                     .sum::<u64>()
         });
-        let keeps = |k: u64| {
-            entry.is_some_and(|e| {
-                e.states
-                    .iter()
-                    .any(|(s, _)| *s == k && hc_state_survives_cut(*s, have))
-            })
-        };
-        let held_states = kept
-            .iter()
-            .filter(|&&k| !hc_state_wanted(keeps(k), k, upto_tiles))
-            .count() as u64;
+        // the states the entry keeps through the cut, and the kept positions the save does
+        // not copy (it holds them, or they would leave again at once: `states_due`)
+        let have_states: Vec<u64> = entry.map_or_else(Vec::new, |e| {
+            e.states
+                .iter()
+                .map(|(k, _)| *k)
+                .filter(|&k| hc_state_survives_cut(k, have))
+                .collect()
+        });
+        let due = states_due(&have_states, kept, upto_tiles, state_cap);
+        let held_states = kept.iter().filter(|k| !due.contains(k)).count() as u64;
         // The tiles the entry's ring image still stands for once the entry is cut: a new image
         // is copied, and charged, when that falls short of the save's last kept position
         // (`hc_ring_due`, the rule the save itself goes by).
@@ -986,7 +1010,7 @@ mod tests {
     /// Saves the first `tiles` tiles of `p` with states after each of `at`, as an engine would:
     /// every copy completes.
     fn save(c: &mut HostCache, p: &[i32], tiles: u64, at: &[u64]) -> Option<u64> {
-        let t = c.open_save(ENG, T, TB, p, &[], tiles, at, SB, 0)?;
+        let t = c.open_save(ENG, T, TB, p, &[], tiles, at, 8, SB, 0)?;
         let n = tiles.saturating_sub(t.have_tiles);
         if n > 0 {
             let segs = c.begin_rows(t.entry, n, TB)?;
@@ -1049,7 +1073,7 @@ mod tests {
             pixels: [px, 1],
         };
         let t = c
-            .open_save(ENG, T, TB, &p, &[img(1)], 6, &[2, 6], SB, 0)
+            .open_save(ENG, T, TB, &p, &[img(1)], 6, &[2, 6], 8, SB, 0)
             .unwrap();
         c.begin_rows(t.entry, 6, TB).unwrap();
         c.end_rows(t.entry, 6);
@@ -1209,7 +1233,7 @@ mod tests {
         const TB2: u64 = 6 * MIB;
         let p = prompt(2 * 512 + 50, 2);
         let t = c
-            .open_save([9, 9], T, TB2, &p, &[], 2, &[2], SB, 0)
+            .open_save([9, 9], T, TB2, &p, &[], 2, &[2], 8, SB, 0)
             .unwrap();
         let segs = c.begin_rows(t.entry, 2, TB2).unwrap();
         assert!(!c.contains(a));
@@ -1248,7 +1272,7 @@ mod tests {
         let b = save(&mut c, &prompt(2 * 512 + 50, 2), 2, &[2]).unwrap();
         // a third conversation: the older entry leaves for its two tiles
         let p = prompt(2 * 512 + 50, 3);
-        let t = c.open_save(ENG, T, TB, &p, &[], 2, &[2], SB, 0).unwrap();
+        let t = c.open_save(ENG, T, TB, &p, &[], 2, &[2], 8, SB, 0).unwrap();
         c.begin_rows(t.entry, 2, TB).unwrap();
         assert!(!c.contains(a) && c.contains(b));
         // its tiles were taken again; its state segment, which the tiles could not use, is
@@ -1282,7 +1306,7 @@ mod tests {
         assert_eq!((c.tiles_of(id), c.states_of(id)), (6, vec![2, 4, 6]));
         // a save that has nothing to add is not refused by a full budget
         let t = c
-            .open_save(ENG, T, TB, &p2, &[], 6, &[2, 4, 6], SB, 0)
+            .open_save(ENG, T, TB, &p2, &[], 6, &[2, 4, 6], 8, SB, 0)
             .unwrap();
         assert_eq!((t.entry, t.have_tiles), (id, 6));
         assert_eq!(c.stats().refused, 0);
@@ -1310,7 +1334,9 @@ mod tests {
         // The first four tiles of a prompt with their position and the rings; then two more
         // tiles and a position, where the save gives way before it takes the rings again.
         let first_turn = |c: &mut HostCache| {
-            let t = c.open_save(ENG, T, TB, &p, &[], 4, &[4], SB, RB).unwrap();
+            let t = c
+                .open_save(ENG, T, TB, &p, &[], 4, &[4], 8, SB, RB)
+                .unwrap();
             c.begin_rows(t.entry, 4, TB).unwrap();
             c.end_rows(t.entry, 4);
             c.begin_piece(t.entry, SB).unwrap();
@@ -1326,7 +1352,7 @@ mod tests {
         let id = first_turn(&mut c);
         assert_eq!(c.ring_tiles(id), Some(4));
         let t = c
-            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], SB, RB)
+            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], 8, SB, RB)
             .unwrap();
         assert_eq!((t.entry, t.have_tiles), (id, 4));
         c.begin_rows(id, 2, TB).unwrap();
@@ -1339,7 +1365,7 @@ mod tests {
         // The save that goes on has no tile and no position left to add. It is charged for the
         // image it still owes, and there is exactly room for that.
         assert!(c
-            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], SB, RB)
+            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], 8, SB, RB)
             .is_some());
         c.begin_piece(id, RB).unwrap();
         assert!(c.end_ring(id, 0, 1, 1));
@@ -1353,16 +1379,45 @@ mod tests {
         // (in this budget the two new tiles and the position fit, a second image beside the
         // first does not: the extension is refused before anything is cut or copied)
         assert!(full
-            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], SB, RB)
+            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], 8, SB, RB)
             .is_none());
         assert_eq!(full.stats().refused, 1);
         assert_eq!((full.tiles_of(fid), full.ring_tiles(fid)), (4, Some(4)));
         // an engine without rings is charged for none
         assert!(full
-            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], SB, 0)
+            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], 8, SB, 0)
             .is_some());
         assert_eq!(full.stats().refused, 1);
         assert_eq!((c.stats().refused, c.stats().evictions), (0, 0));
+    }
+
+    #[test]
+    fn a_save_copies_only_the_states_its_entry_will_keep() {
+        // an entry with eight positions (its cap) and rows up to tile 18; the device keeps the
+        // new last position, one the entry has, and an early one the entry dropped long ago
+        let have: Vec<u64> = (10..=17).collect();
+        assert_eq!(states_due(&have, &[3, 11, 18], 18, 8), vec![18]);
+        // (the early one would leave again at once: eight positions lie above it)
+        // with room for one more position than that, it still would; with room for two, it stays
+        assert_eq!(states_due(&have, &[3, 11, 18], 18, 9), vec![18]);
+        assert_eq!(states_due(&have, &[3, 11, 18], 18, 10), vec![3, 18]);
+        // a position past the entry's rows is never copied, and a new entry takes the last ones
+        assert_eq!(states_due(&have, &[18, 19], 18, 8), vec![18]);
+        assert_eq!(states_due(&[], &[1, 5, 7, 8], 8, 2), vec![7, 8]);
+        assert_eq!(states_due(&[], &[1, 5, 7, 8], 8, 8), vec![1, 5, 7, 8]);
+        // the charge follows: the early position is not paid for
+        let mut c = HostCache::new(256 * MIB, false);
+        let p = prompt(18 * 512 + 100, 0);
+        let id = save(&mut c, &p, 17, &have).unwrap();
+        assert_eq!(c.states_of(id).len(), 8);
+        let held = c.held_bytes();
+        // room for one tile and one state exactly
+        let mut tight = HostCache::new(held + TB + SB, false);
+        let tid = save(&mut tight, &p, 17, &have).unwrap();
+        let t = tight
+            .open_save(ENG, T, TB, &p, &[], 18, &[3, 11, 18], 8, SB, 0)
+            .unwrap();
+        assert_eq!((t.entry, tight.stats().refused), (tid, 0));
     }
 
     #[test]
@@ -1430,7 +1485,7 @@ mod tests {
     fn a_save_cut_short_keeps_the_tiles_that_finished_and_a_failed_one_leaves_nothing() {
         let mut c = HostCache::new(256 * MIB, false);
         let p = prompt(6 * 512 + 100, 0);
-        let t = c.open_save(ENG, T, TB, &p, &[], 6, &[6], SB, 0).unwrap();
+        let t = c.open_save(ENG, T, TB, &p, &[], 6, &[6], 8, SB, 0).unwrap();
         assert!(c.begin_rows(t.entry, 6, TB).is_some());
         // while the rows are written the entry cannot be read, found or evicted
         assert!(c.find(ENG, T, &p, &[], true, true).is_none());
@@ -1442,7 +1497,7 @@ mod tests {
         // without a state nothing can resume from it yet
         assert!(c.find(ENG, T, &p, &[], true, true).is_none());
         // the save goes on later: the same entry, from the tiles it has
-        let t2 = c.open_save(ENG, T, TB, &p, &[], 6, &[6], SB, 0).unwrap();
+        let t2 = c.open_save(ENG, T, TB, &p, &[], 6, &[6], 8, SB, 0).unwrap();
         assert_eq!((t2.entry, t2.have_tiles), (t.entry, 4));
         c.begin_rows(t2.entry, 2, TB).unwrap();
         assert_eq!(c.end_rows(t2.entry, 6), 6);
@@ -1472,7 +1527,7 @@ mod tests {
     fn a_save_cut_short_before_its_first_tile_leaves_no_entry() {
         let mut c = HostCache::new(256 * MIB, false);
         let p = prompt(3 * 512 + 100, 0);
-        let t = c.open_save(ENG, T, TB, &p, &[], 3, &[3], SB, 0).unwrap();
+        let t = c.open_save(ENG, T, TB, &p, &[], 3, &[3], 8, SB, 0).unwrap();
         c.begin_rows(t.entry, 3, TB).unwrap();
         assert_eq!(c.end_rows(t.entry, 0), 0);
         assert!(!c.contains(t.entry));

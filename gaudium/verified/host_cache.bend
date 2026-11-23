@@ -2325,6 +2325,19 @@ def hc_ring_due(ring_bytes: Nat, complete: Bool, has_image: Bool, image_tiles: N
 def hc_saved_whole(complete: Bool, ring_bytes: Nat, has_image: Bool, image_tiles: Nat, last_kept_tiles: Nat) -> Bool:
   Bool.and(complete, Bool.not(Bool.and(Nat.is_gt(ring_bytes, 0n), hc_ring_short(has_image, image_tiles, last_kept_tiles))))
 
+# Does a kept position stay in an entry that keeps at most `cap` of them, with `above` positions
+# (of the entry and of the save together) lying further into the prompt? The positions nearest
+# the start leave first (`hc_state_leaves_first`), so one stays while fewer than `cap` lie above
+# it.
+def hc_state_stays(above: Nat, cap: Nat) -> Bool:
+  Nat.is_lt(above, cap)
+
+# Does a save copy, and is it charged for, the state at a kept position? One the entry lacks at
+# a position its rows reach (`hc_state_wanted`), and that the entry will keep: a state that would
+# leave again at the end of the same save is not copied.
+def hc_state_due(already: Bool, state_tiles: Nat, entry_tiles: Nat, above: Nat, cap: Nat) -> Bool:
+  Bool.and(hc_state_wanted(already, state_tiles, entry_tiles), hc_state_stays(above, cap))
+
 # ============================================================================
 # 16. Where the bytes of a tile lie
 # ============================================================================
@@ -3052,3 +3065,41 @@ law hc_restore_bytes_cover_the_tiles:
 
 def hc_restore_bytes_cover_the_tiles(n, tb, sb, c, rb):
   Equal.sym(Bool, True{}, Nat.is_le(Nat.mul(n, tb), Nat.add(Nat.add(Nat.mul(n, tb), sb), hc_ring_part(c, rb))), hc_le_add_add(Nat.mul(n, tb), sb, hc_ring_part(c, rb)))
+
+# LAW HC.139: the state at a position past the rows the entry holds is never copied.
+law hc_state_due_never_past_rows:
+  for +a: Bool
+  for +k: Nat
+  for +t: Nat
+  for +ab: Nat
+  for +c: Nat
+  {Bool.and(hc_state_due(a, k, t, ab, c), Nat.is_lt(t, k)) == False{} : Bool}
+
+def hc_state_due_never_past_rows(a, k, t, ab, c):
+  hc_tile_below_and(hc_state_wanted(a, k, t), hc_state_stays(ab, c), Nat.is_lt(t, k), hc_state_past_rows_never_wanted(a, k, t))
+
+# LAW HC.140: a state with as many positions above it as the entry may keep is never copied: a
+# save never gives an entry a position beyond its cap.
+law hc_state_due_within_cap:
+  for +a: Bool
+  for +k: Nat
+  for +t: Nat
+  for +ab: Nat
+  for +c: Nat
+  {Bool.and(hc_state_due(a, k, t, ab, c), Nat.is_le(c, ab)) == False{} : Bool}
+
+def hc_state_due_within_cap(a, k, t, ab, c):
+  hc_and3_excl(hc_state_wanted(a, k, t), Nat.is_lt(ab, c), Nat.is_le(c, ab), hc_lt_le_excl(ab, c))
+
+# LAW HC.141: the state at the last kept position is always copied when the entry lacks it, holds
+# its rows and may keep any position at all: the point the next turn resumes from is never left
+# out of a save.
+law hc_last_position_is_due:
+  for +k: Nat
+  for +x: Nat
+  for +c: Nat
+  {hc_state_due(False{}, k, Nat.add(k, x), 0n, 1n+c) == True{} : Bool}
+
+def hc_last_position_is_due(k, x, c):
+  %hc_le_add_r(k, x) : {Bool.and(Bool.and(True{}, _), True{}) == True{} : Bool}
+  {==}

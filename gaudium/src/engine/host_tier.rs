@@ -46,9 +46,8 @@ use crate::verified::{
     hc_new_tiles, hc_piece_dev_off, hc_piece_host_off, hc_piece_inside, hc_piece_len,
     hc_pieces_per_tile, hc_range_end, hc_range_inside, hc_restore_bytes, hc_ring_due,
     hc_ring_floor, hc_ring_restore, hc_rows_added, hc_rows_complete, hc_save_ok, hc_saved_whole,
-    hc_state_wanted, hc_tile_bytes, hc_tile_chunk, hc_tile_clean, hc_tile_copied, hc_tile_slot,
-    hc_tiles_fill_chunk, hc_tiles_per_chunk, hc_written_hi, hc_written_lo, pc_boundary,
-    pc_request_may_reuse, HcLayout,
+    hc_tile_bytes, hc_tile_chunk, hc_tile_clean, hc_tile_copied, hc_tile_slot, hc_tiles_fill_chunk,
+    hc_tiles_per_chunk, hc_written_hi, hc_written_lo, pc_boundary, pc_request_may_reuse, HcLayout,
 };
 
 /// Tiles whose rows one copy call takes (a waiting request is noticed between ring buffers
@@ -767,6 +766,7 @@ impl HostTier {
             images,
             upto,
             &kept_tiles,
+            table.slot_count(),
             self.state_bytes,
             self.ring_bytes,
         ) else {
@@ -844,9 +844,16 @@ impl HostTier {
 
         // the state at every kept position the entry's rows reach
         if complete && store.contains(entry) {
-            let have_states = store.states_of(entry);
+            // the states the entry lacks and will keep (`hc_state_due`); one that would leave
+            // again when the entry is trimmed below is not copied
+            let due = crate::cache_ram::states_due(
+                &store.states_of(entry),
+                &kept_tiles,
+                store.tiles_of(entry),
+                table.slot_count(),
+            );
             for &(k, slot) in &kept {
-                if !hc_state_wanted(have_states.contains(&k), k, store.tiles_of(entry)) {
+                if !due.contains(&k) {
                     continue;
                 }
                 if stop() {
@@ -1729,6 +1736,59 @@ mod tests {
                 .iter()
                 .all(|&b| b == 0xAB));
         }
+    }
+
+    #[test]
+    fn a_save_does_not_copy_a_position_its_entry_would_drop_at_once() {
+        // four slots on the device, so an entry keeps four positions
+        let mut r = rig(64 << 20, 4);
+        let tile_bytes = r.dev.layout.tile_bytes();
+        // three turns of a conversation, each one tile further: the entry keeps the last four
+        // positions
+        let mut p = prompt(8 * 512 + 100, 1);
+        r.request(&p, true);
+        assert!(r.idle().complete);
+        for turn in 0..2 {
+            p.extend(prompt(512, 10 + turn));
+            r.request(&p, true);
+            assert!(r.idle().complete);
+        }
+        // Another conversation takes the card. A cold run of the first one's next turn then
+        // keeps its own ladder on the device, with a position far back that is not among the
+        // entry's last four.
+        r.request(&prompt(3 * 512 + 50, 2), true);
+        r.idle();
+        p.extend(prompt(512, 20));
+        r.request(&p, false);
+        let on_device: Vec<u64> = r.table.held_slots().iter().map(|&(k, _)| k).collect();
+        let entry = {
+            let store = r.cache.inner.lock().unwrap();
+            let id = store.find([7, 7], T, &p, &[], true, true).unwrap().entry;
+            (id, store.states_of(id))
+        };
+        let early: Vec<u64> = on_device
+            .iter()
+            .copied()
+            .filter(|k| k < entry.1.first().unwrap())
+            .collect();
+        assert!(
+            !early.is_empty(),
+            "the device keeps {on_device:?}, the entry {:?}",
+            entry.1
+        );
+        // the save takes the new tile and the new last position, and not the early position
+        // (which would be copied and dropped again by every save from here on)
+        let rep = r.idle();
+        assert!(rep.complete);
+        assert_eq!(rep.bytes, tile_bytes + 4608);
+        let states = r.cache.inner.lock().unwrap().states_of(entry.0);
+        assert_eq!(states.len(), 4);
+        assert!(early.iter().all(|k| !states.contains(k)));
+        // the same turn again, on the device: nothing is left to copy
+        r.request(&p, true);
+        let rep = r.idle();
+        assert!(rep.complete);
+        assert_eq!(rep.bytes, 0);
     }
 
     #[test]
