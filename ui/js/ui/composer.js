@@ -4,10 +4,10 @@ import { html, cx } from './h.js';
 import { useState, useRef, useEffect } from 'preact/hooks';
 import { Icon } from './icons.js';
 import { Attachment } from './message.js';
-import { readAttachment, textAttachment } from '../lib/attachments.js';
+import { readAttachment, textAttachment, VIDEO_TYPES } from '../lib/attachments.js';
 import { methodInfo, greedyOnly, fmtInt } from '../lib/stats.js';
 import { userContent } from '../lib/tree.js';
-import { ringLevel, ringFrac, ringLabel, estimateText, estimateImage } from '../lib/context.js';
+import { ringLevel, ringFrac, ringLabel, estimateText, estimateImage, estimateVideo } from '../lib/context.js';
 import { estimateAudio, fmtDuration, recordUnavailable, startRecording, recordingToClip, AUDIO_MAX_S, SILENT_DB } from '../lib/audio.js';
 
 const FILE_TYPES = 'application/pdf,text/*,.md,.json,.csv,.py,.js,.ts,.c,.cpp,.h,.hpp,.rs,.go,.java,.sh,.yaml,.yml,.toml,.sql,.html,.css,.xml,.log';
@@ -108,11 +108,12 @@ function CtxPanel({ ring, used, draft, onCompact, onSettings, onClose }) {
   </div>`;
 }
 
-export function Composer({ settings, defaultMethodName, setSetting, busy, onSend, onStop, methods, efforts, vision, audio, toolCount, notify, focusKey, draftKey, ring, countDraft, onCompact, openContextSettings, greedyOnlyList, methodPlan, docked, modelName }) {
+export function Composer({ settings, defaultMethodName, setSetting, busy, onSend, onStop, methods, efforts, vision, audio, video, limits, toolCount, notify, focusKey, draftKey, ring, countDraft, onCompact, openContextSettings, greedyOnlyList, methodPlan, docked, modelName }) {
   const [text, setText] = useState(() => { try { return sessionStorage.getItem('gaudium-ui.draft.' + draftKey) || ''; } catch { return ''; } });
   const [atts, setAtts] = useState([]);
   const [drag, setDrag] = useState(false);
   const [reading, setReading] = useState(0);
+  const [progress, setProgress] = useState(null);   // {name, done, total}: the frames of a video being read
   const ta = useRef(null), file = useRef(null);
   const [draftN, setDraftN] = useState(0);
   const [panel, setPanel] = useState(false);
@@ -123,7 +124,7 @@ export function Composer({ settings, defaultMethodName, setSetting, busy, onSend
     const seq = ++draftSeq.current;
     const t = userContent({ content: text, attachments: atts });
     const str = typeof t === 'string' ? t : (t.find((p) => p.type === 'text') || {}).text || '';
-    const imgs = atts.reduce((a, x) => a + (x.kind === 'image' ? estimateImage(x.width, x.height) : x.kind === 'audio' ? estimateAudio(x.duration) : x.kind === 'pdf' && x.pages ? x.pages.length * 1500 : 0), 0);
+    const imgs = atts.reduce((a, x) => a + (x.kind === 'image' ? estimateImage(x.width, x.height) : x.kind === 'video' ? estimateVideo(x) : x.kind === 'audio' ? estimateAudio(x.duration) : x.kind === 'pdf' && x.pages ? x.pages.length * 1500 : 0), 0);
     if (/^\/compact\b/.test(text.trim()) || (!str.trim() && !imgs)) { setDraftN(0); return undefined; }
     if (busy) return undefined;
     const h = setTimeout(async () => {
@@ -146,9 +147,14 @@ export function Composer({ settings, defaultMethodName, setSetting, busy, onSend
   const add = async (files) => {
     for (const f of files) {
       setReading((n) => n + 1);
-      try { const a = await readAttachment(f, { pdfMode: settings.pdfMode, vision, audio }); setAtts((x) => [...x, a]); if (a.warn) notify(`${a.name}: ${a.warn.text}`); }
+      try {
+        const a = await readAttachment(f, { pdfMode: settings.pdfMode, vision, audio, video, limits,
+          videoFps: Number(settings.videoFps) || 2, videoMaxFrames: Number(settings.videoMaxFrames) || 64, videoMaxSide: Number(settings.videoMaxSide) || 0,
+          onProgress: (done, total) => setProgress({ name: f.name, done, total }) });
+        setAtts((x) => [...x, a]); if (a.warn) notify(`${a.name}: ${a.warn.text}`);
+      }
       catch (e) { notify(e.message || String(e)); }
-      finally { setReading((n) => n - 1); }
+      finally { setReading((n) => n - 1); setProgress(null); }
     }
   };
   const send = () => {
@@ -173,13 +179,13 @@ export function Composer({ settings, defaultMethodName, setSetting, busy, onSend
     <div class=${cx('composer', drag && 'drag')}
       onDragOver=${(e) => { e.preventDefault(); setDrag(true); }} onDragLeave=${() => setDrag(false)}
       onDrop=${(e) => { e.preventDefault(); setDrag(false); add([...e.dataTransfer.files]); }}>
-      ${atts.length || reading ? html`<div class="atts">${atts.map((a, i) => html`<${Attachment} a=${a} onRemove=${() => setAtts(atts.filter((_, j) => j !== i))} />`)}${reading ? html`<span class="notice">reading ${reading} file${reading > 1 ? 's' : ''}…</span>` : null}</div>` : null}
+      ${atts.length || reading ? html`<div class="atts">${atts.map((a, i) => html`<${Attachment} a=${a} onRemove=${() => setAtts(atts.filter((_, j) => j !== i))} />`)}${reading ? html`<span class="notice" role="status">${progress ? `reading ${progress.name}: frame ${progress.done} of ${progress.total}…` : `reading ${reading} file${reading > 1 ? 's' : ''}…`}</span>` : null}</div>` : null}
       <textarea ref=${ta} id="composer-input" rows="1" placeholder=${`Message ${modelName || 'the model'} on the Gaudi 2`} aria-label="Message" value=${text}
         onInput=${(e) => { setText(e.target.value); saveDraft(e.target.value); }} onKeyDown=${onKey} onPaste=${onPaste}></textarea>
       <div class="composer-row">
-        <input ref=${file} type="file" multiple hidden id="file-input" accept=${[vision && 'image/*', audio && AUDIO_TYPES, FILE_TYPES].filter(Boolean).join(',')}
+        <input ref=${file} type="file" multiple hidden id="file-input" accept=${[vision && 'image/*', vision && video && VIDEO_TYPES, audio && AUDIO_TYPES, FILE_TYPES].filter(Boolean).join(',')}
           onChange=${(e) => { add([...e.target.files]); e.target.value = ''; }} />
-        <button class="icon-btn" title=${`Attach ${[vision && 'images', audio && 'audio clips', 'text files or PDFs'].filter(Boolean).join(', ')}`} onClick=${() => file.current.click()}><${Icon} name="clip" /></button>
+        <button class="icon-btn" title=${`Attach ${[vision && 'images', vision && video && 'videos or animations', audio && 'audio clips', 'text files or PDFs'].filter(Boolean).join(', ')}`} onClick=${() => file.current.click()}><${Icon} name="clip" /></button>
         ${audio ? html`<${Recorder} onClip=${(a) => setAtts((x) => [...x, a])} notify=${notify} />` : null}
         <button class=${cx('chip', thinkOn && 'on')} title="Thinking: the model reasons before it answers" aria-pressed=${thinkOn} onClick=${() => setSetting('thinking', thinkOn ? 'off' : 'on')}><${Icon} name="brain" />${thinkOn ? 'Thinking' : 'No thinking'}</button>
         ${thinkOn ? html`<label class="select-chip" title="Reasoning effort"><span class="sr">Reasoning effort</span>

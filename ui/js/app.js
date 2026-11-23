@@ -15,7 +15,8 @@ import { newConversation, addChild, update, activePath, pathTo, siblings, switch
   insertAbove, spliceOut, compactableCount, compactionMessages, displayCut, countMessages, isCompaction, nodeSummary, usableSummary, SUMMARY_PREFILL } from './lib/tree.js';
 import { finalStats, methodInfo, greedyOnly, setDfName, fmtInt, contextUsed } from './lib/stats.js';
 import { modelDesc, modelFacts, precisionShort, hasDrafter, dfFamilyName } from './lib/model.js';
-import { reserveTokens, compactPercent, projection, summaryMaxTokens, usedLive, estimateMessages, estimateText, longestText, elideMessage } from './lib/context.js';
+import { reserveTokens, compactPercent, projection, summaryMaxTokens, usedLive, estimateMessages, estimateText, longestText, elideMessage, setVisionLimits } from './lib/context.js';
+import { visionLimits } from './lib/media.js';
 import { newSegment } from './lib/stream.js';
 import { blocksOfPath, syncRuntime, wrapMessage, errorMessage } from './lib/a2ui.js';
 import { loadSettings, saveSettings, applyTheme, effectiveDark, loadDockCollapsed, saveDockCollapsed } from './lib/settings.js';
@@ -728,6 +729,8 @@ export function App() {
   const efforts = (s.props && s.props.chat_template_caps && s.props.chat_template_caps.reasoning_effort_levels) || ['low', 'medium', 'xhigh'];
   const vision = !s.props || !s.props.modalities || s.props.modalities.vision !== false;
   const audio = !!(s.props && s.props.modalities && s.props.modalities.audio);   // only when the server advertises audio support
+  const video = vision && !!(s.props && s.props.modalities && s.props.modalities.video);   // animations and video files as video parts
+  const limits = useMemo(() => { setVisionLimits(s.props); return visionLimits(s.props); }, [s.props]);
   const a2ui = a2uiFor(path, st);
   const view = useMemo(() => ({ settings: s.settings, precision, desc, themeKey: s.themeKey + (s.libs || 0), mock: s.hello && s.hello.backend === 'mock', defaultMethod, nCtx: s.hello ? s.hello.n_ctx : 0, a2ui }), [s.settings, s.hello, s.themeKey, s.libs, precision, desc, a2ui]);
   const liveView = st ? { ...view, engine: s.engine, engineAt: s.engineAt, now: s.now, engineReady: !s.engine || s.engine.state === 'ready', canSkip: !!(s.hello ? s.hello.supports_inject : true) } : view;
@@ -777,17 +780,17 @@ export function App() {
       </div>
       ${st && s.settings.telemetry ? html`<${LiveDock} live=${{ ...st }} m=${s.messages[st.msgId]} view=${liveView} collapsed=${s.dockCollapsed}
         onToggle=${() => { saveDockCollapsed(!s.dockCollapsed); set({ dockCollapsed: !s.dockCollapsed }); }} />` : null}
-      <${Composer} settings=${effSet} defaultMethodName=${defaultMethod(effSet)} setSetting=${setSetting} busy=${busy} onSend=${send} onStop=${stop} methods=${methods} efforts=${efforts} vision=${vision} audio=${audio}
+      <${Composer} settings=${effSet} defaultMethodName=${defaultMethod(effSet)} setSetting=${setSetting} busy=${busy} onSend=${send} onStop=${stop} methods=${methods} efforts=${efforts} vision=${vision} audio=${audio} video=${video} limits=${limits}
         greedyOnlyList=${(s.hello && s.hello.methods && s.hello.methods.greedy_only) || null} methodPlan=${methodPlan(s.settings)} docked=${!!(st && s.settings.telemetry && !s.dockCollapsed)}
         toolCount=${toolCount} notify=${toast} focusKey=${s.focusKey} draftKey=${s.conv.id} modelName=${desc.name}
         ring=${ring} countDraft=${countDraft} onCompact=${() => compactNow()} openContextSettings=${() => set({ dialog: 'settings', settingsTab: 'context' })} />
     </main>
-    ${s.dialog === 'settings' ? html`<${SettingsDialog} tab0=${s.settingsTab} settings=${effSet} vision=${vision} set=${setSetting} onClose=${() => set({ dialog: null, settingsTab: null })} props=${s.props} methods=${methods} efforts=${efforts}
+    ${s.dialog === 'settings' ? html`<${SettingsDialog} tab0=${s.settingsTab} settings=${effSet} vision=${vision} video=${video} set=${setSetting} onClose=${() => set({ dialog: null, settingsTab: null })} props=${s.props} methods=${methods} efforts=${efforts}
         greedyMethod=${ei.greedy} sampledMethod=${ei.sampled}
         greedyOnlyList=${(s.hello && s.hello.methods && s.hello.methods.greedy_only) || null}
         mcp=${s.mcp} proxyEnabled=${!!(s.props && s.props.cors_proxy_enabled)}
         mcpAct=${{ connect: mcpConnect, deleteAll: () => set({ confirm: { title: 'Delete all chats?', body: 'Every chat in this browser is removed. Export them first to keep a copy.', confirm: 'Delete all', danger: true, onConfirm: async () => { await db.deleteAll(); cache.clear(); newChat(); refreshList(); } } }) }} />` : null}
-    ${s.dialog === 'card' ? html`<${CardDialog} engine=${s.engine} hello=${s.hello} live=${s.live} now=${s.now} engineAt=${s.engineAt} desc=${desc} onClose=${() => set({ dialog: null })}
+    ${s.dialog === 'card' ? html`<${CardDialog} engine=${s.engine} hello=${s.hello} live=${s.live} now=${s.now} engineAt=${s.engineAt} desc=${desc} props=${s.props} onClose=${() => set({ dialog: null })}
         onAction=${async (a, m) => { try { const r = await api.engineAction(a, m); toast(r.message || a); } catch (e) { toast(e.message); } }} />` : null}
     ${s.dialog === 'shortcuts' ? html`<${ShortcutsDialog} onClose=${() => set({ dialog: null })} />` : null}
     ${s.confirm ? html`<${ConfirmDialog} ...${s.confirm} onClose=${() => set({ confirm: null })} />` : null}

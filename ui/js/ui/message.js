@@ -48,9 +48,33 @@ export function Attachment({ a, big, onRemove }) {
       ${a.warn ? html`<small class="att-warn" role="note">${a.warn.text}</small>` : null}</div>
     ${onRemove ? html`<button class="icon-btn x" title=${`Remove ${a.name}`} onClick=${onRemove}><${Icon} name="x" /></button>` : null}
   </div>`;
+  if (a.kind === 'video') return html`<${VideoAttachment} a=${a} big=${big} onRemove=${onRemove} />`;
   return html`<div class=${cx('att', big && a.kind === 'image' && 'big')}>
     ${a.kind === 'image' ? html`<img src=${a.dataUrl} alt=${a.name} />` : html`<span class="ficon">${a.kind === 'pdf' ? 'pdf' : ext}</span>`}
     ${!(big && a.kind === 'image') ? html`<div class="meta"><div>${a.name}</div><small>${a.note || fmtBytes(a.size)}</small></div>` : null}
+    ${onRemove ? html`<button class="icon-btn x" title=${`Remove ${a.name}`} onClick=${onRemove}><${Icon} name="x" /></button>` : null}
+  </div>`;
+}
+
+// A video: an animation plays as the image it is; a video file shows the frames that were sent, stepping through them
+// at their own rate while the pointer is over it (or it has the focus), so what the model is shown can be checked.
+function VideoAttachment({ a, big, onRemove }) {
+  const frames = Array.isArray(a.frames) ? a.frames : null;
+  const [i, setI] = useState(0);
+  const [play, setPlay] = useState(false);
+  useEffect(() => {
+    if (!play || !frames || frames.length < 2) return undefined;
+    const h = setInterval(() => setI((k) => (k + 1) % frames.length), Math.max(120, Math.min(600, 1000 / (a.fps || 2))));
+    return () => clearInterval(h);
+  }, [play, frames && frames.length]);
+  const n = frames ? frames.length : a.frames || 0;
+  const src = a.animation ? a.dataUrl : frames && frames.length ? frames[Math.min(i, frames.length - 1)] : null;
+  const label = a.animation ? `Animation ${a.name}, ${n} frames` : `Video ${a.name}, ${n} frames sent`;
+  return html`<div class=${cx('att video', big && 'big')} tabindex=${frames && frames.length > 1 ? 0 : null} aria-label=${label}
+      onMouseEnter=${() => setPlay(true)} onMouseLeave=${() => { setPlay(false); setI(0); }} onFocus=${() => setPlay(true)} onBlur=${() => { setPlay(false); setI(0); }}>
+    <span class="vthumb">${src ? html`<img src=${src} alt=${a.name} />` : html`<span class="ficon">vid</span>`}
+      <span class="vbadge">${a.animation ? 'GIF' : frames && play ? `${i + 1}/${n}` : '▶'}</span></span>
+    <div class="meta"><div title=${a.name}>${a.name}</div><small>${a.note || fmtBytes(a.size)}</small></div>
     ${onRemove ? html`<button class="icon-btn x" title=${`Remove ${a.name}`} onClick=${onRemove}><${Icon} name="x" /></button>` : null}
   </div>`;
 }

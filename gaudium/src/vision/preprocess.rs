@@ -1,7 +1,8 @@
 //! Host image preparation for the vision tower.
 //!
-//! Input is uncompressed RGB8 (binary PPM `P6`, or raw bytes with explicit width / height): the
-//! crate carries no image decoders. The pipeline is the checkpoint's image processor:
+//! Input is uncompressed RGB8 (what `vision::decode` returns for an image file, a binary PPM
+//! `P6`, or raw bytes with explicit width / height). The pipeline is the checkpoint's image
+//! processor:
 //!
 //! 1. `smart_resize`: both sides to multiples of `patch * merge`, pixel count inside
 //!    `[min_pixels, max_pixels]`, aspect ratio kept as closely as the grid allows.
@@ -10,6 +11,11 @@
 //! 3. Normalise `(x - mean * 255) / (std * 255)` in f32 and round to BF16 (nearest even).
 //! 4. Patch rows in merge order (2x2 blocks of patches stay adjacent), each row laid out
 //!    channel, temporal frame, y, x. A still image is `temporal` identical frames.
+//!
+//! A video goes the same way with two differences (the checkpoint's video processor):
+//! `smart_resize_video` shares one pixel budget among all frames, and a patch row holds
+//! `temporal` consecutive frames instead of one frame repeated (`prepare_video`). Each temporal
+//! patch is then one tower input of its own, exactly like an image.
 
 use std::path::Path;
 
@@ -153,6 +159,47 @@ pub fn smart_resize(
         w_bar = f.max((w / beta / f).floor() * f);
     } else if h_bar * w_bar < min_pixels as f64 {
         let beta = (min_pixels as f64 / (h * w)).sqrt();
+        h_bar = (h * beta / f).ceil() * f;
+        w_bar = (w * beta / f).ceil() * f;
+    }
+    Ok((h_bar as usize, w_bar as usize))
+}
+
+/// Target `(height, width)` of every frame of a video of `num_frames` frames: multiples of
+/// `factor`, and `frames x height x width` (frames rounded up to whole temporal patches) within
+/// `[min_pixels, max_pixels]`. The reference video processor's rule, rounding included; like
+/// it, a frame smaller than `factor` on a side is refused.
+pub fn smart_resize_video(
+    num_frames: usize,
+    height: usize,
+    width: usize,
+    temporal: usize,
+    factor: usize,
+    min_pixels: u64,
+    max_pixels: u64,
+) -> Result<(usize, usize), String> {
+    if num_frames == 0 || temporal == 0 || factor == 0 {
+        return Err("video has no frames".into());
+    }
+    if height < factor || width < factor {
+        return Err(format!(
+            "video frames of {width}x{height} pixels are smaller than {factor} pixels on a side"
+        ));
+    }
+    let (h, w, f) = (height as f64, width as f64, factor as f64);
+    if h.max(w) / h.min(w) > 200.0 {
+        return Err("absolute aspect ratio must be smaller than 200".into());
+    }
+    let mut h_bar = (h / f).round_ties_even() * f;
+    let mut w_bar = (w / f).round_ties_even() * f;
+    let t_bar = (num_frames.div_ceil(temporal) * temporal) as f64;
+    let volume = (num_frames as f64) * h * w;
+    if t_bar * h_bar * w_bar > max_pixels as f64 {
+        let beta = (volume / max_pixels as f64).sqrt();
+        h_bar = f.max((h / beta / f).floor() * f);
+        w_bar = f.max((w / beta / f).floor() * f);
+    } else if t_bar * h_bar * w_bar < min_pixels as f64 {
+        let beta = (min_pixels as f64 / volume).sqrt();
         h_bar = (h * beta / f).ceil() * f;
         w_bar = (w * beta / f).ceil() * f;
     }
@@ -312,6 +359,22 @@ pub struct PreparedImage {
 }
 
 impl PreparedImage {
+    /// The sizes of a tower input without its pixels (`pixels` is empty): enough to count
+    /// tokens and lay a prompt out, not to encode.
+    pub fn sized(src: (usize, usize), rw: usize, rh: usize, vs: &VisionSpec) -> Self {
+        let p = vs.patch as usize;
+        Self {
+            src_width: src.0,
+            src_height: src.1,
+            width: rw,
+            height: rh,
+            grid_h: rh / p,
+            grid_w: rw / p,
+            row_len: vs.patch_row() as usize,
+            pixels: Vec::new(),
+        }
+    }
+
     pub fn n_patches(&self) -> usize {
         self.grid_h * self.grid_w
     }
@@ -339,17 +402,19 @@ fn norm_pixel(v: u8, mean255: f32, std255: f32) -> f32 {
     (f32::from(v) - mean255) / std255
 }
 
-/// Walks the resized image in patch-row order, calling `put(channel, byte)` once per value:
+/// Walks one temporal patch in patch-row order, calling `put(channel, byte)` once per value:
 /// 2x2 merge blocks row-major, the block's patches row-major, then channel, frame, y, x.
+/// `frames` holds the temporal patch's resized frames (`VisionSpec::temporal` of them, all
+/// `rw` pixels wide); a still image passes the same frame in every place.
 fn for_each_patch_value(
-    resized: &[u8],
+    frames: &[&[u8]],
     rw: usize,
     grid_h: usize,
     grid_w: usize,
     vs: &VisionSpec,
     mut put: impl FnMut(usize, u8),
 ) {
-    let (p, m, t) = (vs.patch as usize, vs.merge as usize, vs.temporal as usize);
+    let (p, m) = (vs.patch as usize, vs.merge as usize);
     for bh in 0..grid_h / m {
         for bw in 0..grid_w / m {
             for mh in 0..m {
@@ -357,11 +422,11 @@ fn for_each_patch_value(
                     let y0 = (bh * m + mh) * p;
                     let x0 = (bw * m + mw) * p;
                     for c in 0..3 {
-                        for _frame in 0..t {
+                        for frame in frames {
                             for py in 0..p {
                                 let row = ((y0 + py) * rw + x0) * 3 + c;
                                 for px in 0..p {
-                                    put(c, resized[row + px * 3]);
+                                    put(c, frame[row + px * 3]);
                                 }
                             }
                         }
@@ -372,47 +437,80 @@ fn for_each_patch_value(
     }
 }
 
-fn resize_for_tower(img: &RgbImage, vs: &VisionSpec) -> Result<(usize, usize, Vec<u8>), String> {
-    let (rh, rw) = smart_resize(
-        img.height,
-        img.width,
+/// The resized `(height, width)` of a `width x height` image under the model's image settings.
+pub fn image_target_size(
+    width: usize,
+    height: usize,
+    vs: &VisionSpec,
+) -> Result<(usize, usize), String> {
+    smart_resize(
+        height,
+        width,
         vs.resize_factor() as usize,
         vs.min_pixels,
         vs.max_pixels,
-    )?;
+    )
+}
+
+fn resize_for_tower(img: &RgbImage, vs: &VisionSpec) -> Result<(usize, usize, Vec<u8>), String> {
+    let (rh, rw) = image_target_size(img.width, img.height, vs)?;
     let resized = resize_rgb(&img.data, img.width, img.height, rw, rh);
     Ok((rh, rw, resized))
 }
 
-/// Full host pipeline: resize, normalise, patch rows in merge order, BF16.
-pub fn prepare_image(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, String> {
-    let (rh, rw, resized) = resize_for_tower(img, vs)?;
-    let p = vs.patch as usize;
-    let (grid_h, grid_w) = (rh / p, rw / p);
-    let row_len = vs.patch_row() as usize;
+/// BF16 value of every pixel byte per channel: normalised and rounded once.
+fn bf16_lut(vs: &VisionSpec) -> [[u16; 256]; 3] {
     let (mean, std) = mean_std_255(vs);
-    // 256 byte values per channel: normalise and round once
     let mut lut = [[0u16; 256]; 3];
     for c in 0..3 {
         for v in 0..=255u8 {
             lut[c][v as usize] = f32_to_bf16_rne(norm_pixel(v, mean[c], std[c]));
         }
     }
+    lut
+}
+
+/// BF16 patch rows of one temporal patch from its resized frames.
+fn patch_rows_bf16(
+    frames: &[&[u8]],
+    rw: usize,
+    rh: usize,
+    src: (usize, usize),
+    lut: &[[u16; 256]; 3],
+    vs: &VisionSpec,
+) -> PreparedImage {
+    let p = vs.patch as usize;
+    let (grid_h, grid_w) = (rh / p, rw / p);
+    let row_len = vs.patch_row() as usize;
     let mut pixels = Vec::with_capacity(grid_h * grid_w * row_len);
-    for_each_patch_value(&resized, rw, grid_h, grid_w, vs, |c, v| {
+    for_each_patch_value(frames, rw, grid_h, grid_w, vs, |c, v| {
         pixels.push(lut[c][v as usize]);
     });
     debug_assert_eq!(pixels.len(), grid_h * grid_w * row_len);
-    Ok(PreparedImage {
-        src_width: img.width,
-        src_height: img.height,
+    PreparedImage {
+        src_width: src.0,
+        src_height: src.1,
         width: rw,
         height: rh,
         grid_h,
         grid_w,
         row_len,
         pixels,
-    })
+    }
+}
+
+/// Full host pipeline: resize, normalise, patch rows in merge order, BF16.
+pub fn prepare_image(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, String> {
+    let (rh, rw, resized) = resize_for_tower(img, vs)?;
+    let frames = vec![resized.as_slice(); vs.temporal as usize];
+    Ok(patch_rows_bf16(
+        &frames,
+        rw,
+        rh,
+        (img.width, img.height),
+        &bf16_lut(vs),
+        vs,
+    ))
 }
 
 /// The same patch rows as f32 (before BF16 rounding): what the reference processor returns as
@@ -422,11 +520,68 @@ pub fn patch_rows_f32(img: &RgbImage, vs: &VisionSpec) -> Result<(usize, usize, 
     let p = vs.patch as usize;
     let (grid_h, grid_w) = (rh / p, rw / p);
     let (mean, std) = mean_std_255(vs);
+    let frames = vec![resized.as_slice(); vs.temporal as usize];
     let mut out = Vec::with_capacity(grid_h * grid_w * vs.patch_row() as usize);
-    for_each_patch_value(&resized, rw, grid_h, grid_w, vs, |c, v| {
+    for_each_patch_value(&frames, rw, grid_h, grid_w, vs, |c, v| {
         out.push(norm_pixel(v, mean[c], std[c]));
     });
     Ok((grid_h, grid_w, out))
+}
+
+/// The temporal patches of a video from its resized frames (`rw x rh` pixels each): patch `g`
+/// holds the frames `frame_of(g, place)` for `place` in `0..temporal` (the caller repeats the
+/// last frame to fill the last patch). One `PreparedImage` per temporal patch.
+pub fn prepare_video(
+    resized: &[Vec<u8>],
+    rw: usize,
+    rh: usize,
+    src: (usize, usize),
+    groups: usize,
+    frame_of: impl Fn(usize, usize) -> usize,
+    vs: &VisionSpec,
+) -> Result<Vec<PreparedImage>, String> {
+    let lut = bf16_lut(vs);
+    let t = vs.temporal as usize;
+    let mut out = Vec::with_capacity(groups);
+    for g in 0..groups {
+        let mut frames: Vec<&[u8]> = Vec::with_capacity(t);
+        for place in 0..t {
+            let k = frame_of(g, place);
+            let f = resized.get(k).ok_or_else(|| {
+                format!("temporal patch {g} names frame {k} of {}", resized.len())
+            })?;
+            if f.len() != rw * rh * 3 {
+                return Err("a resized video frame has the wrong size".into());
+            }
+            frames.push(f);
+        }
+        out.push(patch_rows_bf16(&frames, rw, rh, src, &lut, vs));
+    }
+    Ok(out)
+}
+
+/// f32 patch rows of a whole video (temporal patch after temporal patch), before BF16
+/// rounding: the reference video processor's `pixel_values_videos`.
+pub fn video_rows_f32(
+    resized: &[Vec<u8>],
+    rw: usize,
+    rh: usize,
+    groups: usize,
+    frame_of: impl Fn(usize, usize) -> usize,
+    vs: &VisionSpec,
+) -> Vec<f32> {
+    let p = vs.patch as usize;
+    let (grid_h, grid_w) = (rh / p, rw / p);
+    let (mean, std) = mean_std_255(vs);
+    let t = vs.temporal as usize;
+    let mut out = Vec::with_capacity(groups * grid_h * grid_w * vs.patch_row() as usize);
+    for g in 0..groups {
+        let frames: Vec<&[u8]> = (0..t).map(|k| resized[frame_of(g, k)].as_slice()).collect();
+        for_each_patch_value(&frames, rw, grid_h, grid_w, vs, |c, v| {
+            out.push(norm_pixel(v, mean[c], std[c]));
+        });
+    }
+    out
 }
 
 /// FNV-1a 64 over the little-endian bytes of f32 values (compact reference fingerprints).

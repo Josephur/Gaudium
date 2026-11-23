@@ -32,7 +32,7 @@ function Seg({ value, options, onChange, label }) {
   return html`<div class="seg-ctl" role="radiogroup" aria-label=${label}>${options.map(([v, t]) => html`<button type="button" role="radio" aria-checked=${value === v} class=${value === v ? 'on' : ''} onClick=${() => onChange(v)}>${t}</button>`)}</div>`;
 }
 
-export function SettingsDialog({ settings, vision = true, set, onClose, props, methods, efforts, mcp, mcpAct, proxyEnabled, tab0, greedyOnlyList, greedyMethod, sampledMethod }) {
+export function SettingsDialog({ settings, vision = true, video = false, set, onClose, props, methods, efforts, mcp, mcpAct, proxyEnabled, tab0, greedyOnlyList, greedyMethod, sampledMethod }) {
   const [tab, setTab] = useState(tab0 || 'general');
   const s = settings;
   const def = (props && props.default_generation_settings && props.default_generation_settings.params) || {};
@@ -53,6 +53,12 @@ export function SettingsDialog({ settings, vision = true, set, onClose, props, m
           : html`<div class="field"><span class="lbl">PDFs</span><div class="help">Sent as text: the loaded model has no vision.</div></div>`}
         ${num('pasteToFile', 'Long paste becomes a file at', 'Characters; 0 keeps every paste in the message.', '1')}
       </div>
+      ${video ? html`<div class="field"><span class="lbl">Video files</span><div class="help">The server decodes no video container: this page draws the frames of an attached video and sends them as images with their rate. An animated GIF or WebP is sent as the file.</div></div>
+      <div class="grid3">
+        ${num('videoFps', 'Frames per second', 'Of video time. The model is shown 2 per second; more are thinned out by the server.', '0.5')}
+        ${num('videoMaxFrames', 'Most frames', 'Of one video; a longer one is sampled more thinly.', '1')}
+        ${num('videoMaxSide', 'Longer side', 'Pixels of a drawn frame; 0 keeps the video\'s own size.', '16')}
+      </div>` : null}
       <label class="check"><input type="checkbox" checked=${s.telemetry} onChange=${(e) => set('telemetry', e.target.checked)} /><span>Show the engine readout while a reply streams (speed, tokens per step, HBM flow, the step split)</span></label>
       <label class=${cx('check', !a2uiOffered && 'off')} title=${a2uiOffered ? '' : 'The server was started without --a2ui'}><input type="checkbox" id="s-a2ui" disabled=${!a2uiOffered} checked=${!!s.a2ui && a2uiOffered} onChange=${(e) => set('a2ui', e.target.checked)} />
         <span>Interactive interfaces (A2UI): the model may answer with forms, pickers, cards and buttons that are drawn in the chat, and it is told what you press. This adds the format's instructions to the system prompt of every request${a2uiOffered ? '.' : ' (the server was started without --a2ui).'}</span></label>
@@ -131,7 +137,16 @@ function McpPanel({ s, set, mcp, act, proxyEnabled }) {
     </div>`;
 }
 
-export function CardDialog({ engine, hello, live, onClose, onAction, now, engineAt, desc }) {
+// "images up to 1.0 MP (4,096 patches) · 16,384 image tokens per request · video at 2 frames/s"
+function visionLine(props) {
+  const v = props && props.vision;
+  if (!v) return 'on';
+  const parts = [`images up to ${(v.max_pixels / 1e6).toFixed(1)} MP (${fmtInt(v.max_patches)} patches)`, `${fmtInt(v.max_tokens)} image tokens per request`];
+  parts.push(v.video ? `video at ${v.video.fps} frames/s (${v.video.min_frames} to ${fmtInt(v.video.max_frames)} frames)` : 'no video');
+  return parts.join(' · ');
+}
+
+export function CardDialog({ engine, hello, live, onClose, onAction, now, engineAt, desc, props }) {
   const pl = desc ? placementOf(desc) : null;
   const e = engine || {};
   const info = e.info || (hello && hello.engine_info) || {};
@@ -167,7 +182,7 @@ export function CardDialog({ engine, hello, live, onClose, onAction, now, engine
       <dt>greedy</dt><dd>${methodInfo(info.greedy || (hello && hello.methods && hello.methods.greedy)).label} (${info.greedy || (hello && hello.methods && hello.methods.greedy) || '–'})</dd>
       <dt>sampled</dt><dd>${methodInfo(info.sampled || (hello && hello.methods && hello.methods.sampled)).label} (${info.sampled || (hello && hello.methods && hello.methods.sampled) || '–'})</dd>
       <dt>loaded</dt><dd>${info.methods || (hello && hello.methods && hello.methods.loaded) || '–'}</dd>
-      <dt>vision</dt><dd>${hello && hello.vision ? `on${info.vision_max_patches ? ` (up to ${fmtInt(info.vision_max_patches)} patches)` : ''}` : 'off'}</dd>
+      <dt>vision</dt><dd>${hello && hello.vision ? visionLine(props) : 'off'}</dd>
       <dt>build</dt><dd>${info.build || (hello && hello.build) || '–'}</dd>
       ${info.startup_s ? html`<dt>engine start</dt><dd>${fmt1(info.startup_s)} s</dd>` : null}
     </dl></div>

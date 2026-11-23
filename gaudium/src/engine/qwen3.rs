@@ -71,6 +71,9 @@ pub struct Qwen3Config {
     pub vision_max_tokens: u64,
     /// Patch counts whose tower recipes are compiled at start-up (others on first use).
     pub vision_precompile: Vec<u64>,
+    /// Further patch counts whose tower recipes `build_cache` compiles into the recipe cache
+    /// (image sizes a load compiles on their first use). A load ignores them.
+    pub vision_cache_sizes: Vec<u64>,
     /// Evaluate the tower's GELU with the BF16 kernel (default: in F32).
     pub vision_gelu_bf16: bool,
     /// Speculative decoding (`--spec`); `None` = the non-speculative `K = 0` engine.
@@ -113,6 +116,7 @@ impl Qwen3Config {
             vision_max_patches: 0,
             vision_max_tokens: 0,
             vision_precompile: Vec::new(),
+            vision_cache_sizes: Vec::new(),
             vision_gelu_bf16: false,
             spec: None,
             precision: crate::engine::fp8_graph::WeightPrecision::Auto,
@@ -1349,6 +1353,22 @@ impl Qwen3Engine {
         let mut vision = vision_hooks::plan_vision(&spec, cfg)?;
         if let Some(v) = vision.as_mut() {
             max_ws = max_ws.max(v.precompile(&api, &cache, &driver_version, cfg.verbose)?);
+            if plan_only && !cfg.vision_cache_sizes.is_empty() {
+                let t0 = Instant::now();
+                let (hit, compiled, ws) =
+                    v.compile_into_cache(&api, &cache, &driver_version, &cfg.vision_cache_sizes)?;
+                eprintln!(
+                    "[gaudium] vision tower recipes of {} further image sizes: {hit} from the cache, {compiled} compiled ({:.2}s); largest workspace {:.2} MiB",
+                    cfg.vision_cache_sizes.len(),
+                    t0.elapsed().as_secs_f64(),
+                    ws as f64 / (1024.0 * 1024.0)
+                );
+                if ws > max_ws {
+                    return Err(format!(
+                        "a vision tower recipe of a smaller image needs a workspace of {ws} bytes, more than the {max_ws} bytes planned from the largest image"
+                    ));
+                }
+            }
         }
         let (vis_weights_bytes, vis_act_bytes) = vision.as_ref().map_or((0, 0), |v| {
             (v.memory_plan().weights_bytes(), v.memory_plan().act_bytes())

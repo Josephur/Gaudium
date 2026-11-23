@@ -2,6 +2,7 @@
 // estimates. Pure (no DOM), unit-tested. docs/ui.md 10.
 import { fmtInt, contextUsed } from './stats.js';
 import { estimateAudio, audioSecondsOfBase64 } from './audio.js';
+import { imageTokens, videoTokens, visionLimits } from './media.js';
 
 // The ring's colour: muted green up to 80 % inclusive, yellow above 80 % up to 90 % inclusive, red above 90 %.
 // Integer maths, so exactly 80 % and exactly 90 % land on the lower band whatever the context size.
@@ -68,17 +69,30 @@ export function estimateText(text) {
   for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) > 0x7f) wide++;
   return Math.ceil((s.length - wide) / 3.4) + wide;
 }
-// at most 2,048 tokens: the engine's vision tower takes up to 2.1 MP images (docs/server.md 0, --vision-max-patches 8192)
-export function estimateImage(width, height) {
-  if (!(width > 0 && height > 0)) return 1024;
-  return Math.min(2048, Math.max(4, Math.round((width * height) / 1024))) + 2;
+// The server's vision tower caps an image (/props `vision`: the largest image in pixels, the image tokens of a request);
+// the page tells this module once it has the props.
+let LIMITS = visionLimits(null);
+export function setVisionLimits(props) { LIMITS = visionLimits(props); }
+export function estimateImage(width, height) { return imageTokens(width, height, LIMITS); }
+// a video attachment ({frames: count or list, fps, duration, width, height}) or a video content part
+export function estimateVideo(a) {
+  const frames = Array.isArray(a.frames) ? a.frames.length : a.frames || 1;
+  return videoTokens({ frames, fps: a.fps, durationMs: a.duration > 0 ? a.duration * 1000 : 0, width: a.width, height: a.height }, LIMITS).tokens;
 }
+// a video part of a request: its frame list with their rate; an animation's frames are not known from the part (taken as
+// a short clip at the model's fewest frames)
+function estimateVideoPart(p) {
+  const v = p.video || p.input_video || p.video_url || {};
+  const frames = Array.isArray(v) ? v : v.frames;
+  return frames ? estimateVideo({ frames, fps: v.fps }) : estimateVideo({ frames: 8, fps: 2 });
+}
+const isVideoPart = (p) => p.type === 'video' || p.type === 'input_video' || p.type === 'video_url';
 export function estimateMessages(msgs, tools) {
   let n = 8 + (tools && tools.length ? estimateText(JSON.stringify(tools)) + 300 : 0);
   for (const m of msgs || []) {
     n += 6;
     if (typeof m.content === 'string') n += estimateText(m.content);
-    else if (Array.isArray(m.content)) for (const p of m.content) n += p.type === 'text' ? estimateText(p.text) : p.type === 'input_audio' ? estimateAudio(audioSecondsOfBase64(p.input_audio && p.input_audio.data)) : estimateImage(p.width, p.height);
+    else if (Array.isArray(m.content)) for (const p of m.content) n += p.type === 'text' ? estimateText(p.text) : p.type === 'input_audio' ? estimateAudio(audioSecondsOfBase64(p.input_audio && p.input_audio.data)) : isVideoPart(p) ? estimateVideoPart(p) : estimateImage(p.width, p.height);
     if (m.reasoning_content) n += estimateText(m.reasoning_content) + 4;
     if (m.tool_calls) n += estimateText(JSON.stringify(m.tool_calls)) + 10;
   }

@@ -398,6 +398,37 @@ pub(super) fn live_record_json(
     out
 }
 
+/// The `vision` section of a request's details: what its images and videos were, and where the
+/// time before the first token went. `host_ms` is decoding and preparation on the host (before
+/// the request took the card); the tower's times are inside the prefill (`prefill_ms`), and
+/// `text_prefill_ms` is the prefill without them.
+pub fn vision_section_json(
+    c: &crate::vision::media::MediaCounts,
+    host_ms: f64,
+    tower: Option<&crate::vision::VisionReport>,
+    prefill_ms: f64,
+) -> String {
+    let mut out = format!(
+        "{{\"images\":{},\"videos\":{},\"frames\":{},\"inputs\":{},\"patches\":{},\"tokens\":{},\"host_ms\":{host_ms:.1}",
+        c.images, c.videos, c.frames, c.inputs, c.patches, c.tokens
+    );
+    if let Some(v) = tower {
+        let in_prefill = v.prep_ms + v.encode_ms + v.compile_ms + v.rope_ms;
+        out.push_str(&format!(
+            ",\"upload_ms\":{:.1},\"tower_ms\":{:.1},\"compile_ms\":{:.1},\"rope_ms\":{:.1},\"rope_rows\":{},\
+             \"text_prefill_ms\":{:.1}",
+            v.prep_ms,
+            v.encode_ms,
+            v.compile_ms,
+            v.rope_ms,
+            v.rope_rows,
+            (prefill_ms - in_prefill).max(0.0),
+        ));
+    }
+    out.push('}');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

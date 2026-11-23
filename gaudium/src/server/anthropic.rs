@@ -234,9 +234,65 @@ fn document_text(b: &JsonValue, path: &str) -> R<String> {
     Ok(text)
 }
 
-/// The text of a `tool_result` block's content.
-fn tool_result_text(b: &JsonValue, path: &str, all_tools: &[JsonValue]) -> R<String> {
-    let mut text = String::new();
+/// Content under construction: text, and image blocks in their place. Without an image it is
+/// one string (as a text-only request was always translated); with one it is a list of parts.
+#[derive(Default)]
+struct Parts {
+    parts: Vec<JsonValue>,
+    has_image: bool,
+}
+
+impl Parts {
+    fn push_str(&mut self, t: &str) {
+        match self.parts.last_mut() {
+            Some(JsonValue::Object(e))
+                if e.iter()
+                    .any(|(k, v)| k == "type" && v.as_str() == Some("text")) =>
+            {
+                if let Some((_, JsonValue::Str(prev))) = e.iter_mut().find(|(k, _)| k == "text") {
+                    prev.push_str(t);
+                }
+            }
+            _ => self
+                .parts
+                .push(obj(vec![("type", s("text")), ("text", s(t))])),
+        }
+    }
+
+    /// An `image` block (`source`: base64 or url), passed on for the chat path to resolve.
+    fn push_image(&mut self, b: &JsonValue, path: &str) -> R<()> {
+        let Some(src) = b.get("source").filter(|x| x.as_object().is_some()) else {
+            return bad(format!(
+                "{path}.source: an image block needs a source object"
+            ));
+        };
+        self.parts
+            .push(obj(vec![("type", s("image")), ("source", src.clone())]));
+        self.has_image = true;
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    fn into_content(self) -> JsonValue {
+        if self.has_image {
+            return JsonValue::Array(self.parts);
+        }
+        let mut text = String::new();
+        for p in &self.parts {
+            if let Some(t) = p.get("text").and_then(JsonValue::as_str) {
+                text.push_str(t);
+            }
+        }
+        JsonValue::Str(text)
+    }
+}
+
+/// The content of a `tool_result` block: its text, with its images in place.
+fn tool_result_content(b: &JsonValue, path: &str, all_tools: &[JsonValue]) -> R<JsonValue> {
+    let mut text = Parts::default();
     if b.get("is_error").and_then(JsonValue::as_bool) == Some(true) {
         text.push_str("Error: ");
     }
@@ -252,11 +308,7 @@ fn tool_result_text(b: &JsonValue, path: &str, all_tools: &[JsonValue]) -> R<Str
                 match kind(x) {
                     "text" => text.push_str(text_of(x, "text", &p)?),
                     "document" => text.push_str(&document_text(x, &p)?),
-                    "image" => {
-                        return bad(format!(
-                            "{p}: this model was started without vision support"
-                        ))
-                    }
+                    "image" => text.push_image(x, &p)?,
                     // a tool search result: the deferred tool's definition, inline
                     "tool_reference" => {
                         let name = text_of(x, "tool_name", &p)?;
@@ -288,7 +340,7 @@ fn tool_result_text(b: &JsonValue, path: &str, all_tools: &[JsonValue]) -> R<Str
             ))
         }
     }
-    Ok(text)
+    Ok(text.into_content())
 }
 
 fn convert_user(
@@ -297,10 +349,10 @@ fn convert_user(
     msgs: &mut Vec<JsonValue>,
     all_tools: &[JsonValue],
 ) -> R<()> {
-    let user = |text: String| obj(vec![("role", s("user")), ("content", JsonValue::Str(text))]);
+    let user = |content: JsonValue| obj(vec![("role", s("user")), ("content", content)]);
     let blocks = match content {
         JsonValue::Str(t) => {
-            msgs.push(user(t.clone()));
+            msgs.push(user(JsonValue::Str(t.clone())));
             return Ok(());
         }
         JsonValue::Array(b) => b,
@@ -310,7 +362,7 @@ fn convert_user(
             ))
         }
     };
-    let mut text: Option<String> = None;
+    let mut text: Option<Parts> = None;
     let mut any = false;
     for (i, b) in blocks.iter().enumerate() {
         let p = at(&format!("{path}.content"), i);
@@ -320,27 +372,20 @@ fn convert_user(
         any = true;
         match kind(b) {
             "text" => text
-                .get_or_insert_with(String::new)
+                .get_or_insert_with(Parts::default)
                 .push_str(text_of(b, "text", &p)?),
             "document" => text
-                .get_or_insert_with(String::new)
+                .get_or_insert_with(Parts::default)
                 .push_str(&document_text(b, &p)?),
-            "image" => {
-                return bad(format!(
-                    "{p}: this model was started without vision support"
-                ))
-            }
+            "image" => text.get_or_insert_with(Parts::default).push_image(b, &p)?,
             "tool_result" => {
                 if let Some(t) = text.take() {
-                    msgs.push(user(t));
+                    msgs.push(user(t.into_content()));
                 }
                 msgs.push(obj(vec![
                     ("role", s("tool")),
                     ("tool_call_id", s(text_of(b, "tool_use_id", &p)?)),
-                    (
-                        "content",
-                        JsonValue::Str(tool_result_text(b, &p, all_tools)?),
-                    ),
+                    ("content", tool_result_content(b, &p, all_tools)?),
                 ]));
             }
             k @ ("thinking" | "redacted_thinking" | "tool_use") => {
@@ -354,9 +399,9 @@ fn convert_user(
         }
     }
     if !any {
-        msgs.push(user(String::new()));
-    } else if let Some(t) = text {
-        msgs.push(user(t));
+        msgs.push(user(JsonValue::Str(String::new())));
+    } else if let Some(t) = text.filter(|t| !t.is_empty()) {
+        msgs.push(user(t.into_content()));
     }
     Ok(())
 }
@@ -1162,8 +1207,8 @@ mod tests {
                 "not in 'tools'",
             ),
             (
-                r#"{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}]}"#,
-                "vision",
+                r#"{"messages":[{"role":"user","content":[{"type":"image"}]}]}"#,
+                "needs a source object",
             ),
             (
                 r#"{"messages":[{"role":"user","content":[{"type":"tool_use","id":"a","name":"f","input":{}}]}]}"#,

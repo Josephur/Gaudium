@@ -11,6 +11,7 @@ use super::jinja::{self, Template, Value};
 use super::outparse::OutputFormat;
 use crate::core::tool_calls::{ToolChoice, ToolPolicy};
 use crate::json::{parse_json, JsonValue};
+use crate::vision::media::MediaRef;
 
 /// A model's chat template with what rendering and parsing its turns needs.
 #[derive(Debug)]
@@ -116,6 +117,8 @@ pub struct ChatPrompt {
     pub continue_final: bool,
     /// Request fields that were accepted but not applied.
     pub ignored: Vec<String>,
+    /// The request's images and videos in the order of their placeholders in `text`.
+    pub media: Vec<MediaRef>,
 }
 
 fn object(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
@@ -135,23 +138,134 @@ fn flag(body: &JsonValue, key: &str) -> Option<bool> {
     body.get(key).and_then(JsonValue::as_bool)
 }
 
-/// A message's content parts as one text. This server takes text only.
-fn parts_text(parts: &[JsonValue]) -> Result<String, String> {
+/// The URL of a media reference: a string, or an object holding it as `url` or `image_url`.
+fn media_url(v: &JsonValue) -> Option<&str> {
+    match v {
+        JsonValue::Str(s) => Some(s.as_str()),
+        JsonValue::Object(_) => v
+            .get("url")
+            .and_then(JsonValue::as_str)
+            .or_else(|| v.get("image_url").and_then(media_url)),
+        _ => None,
+    }
+}
+
+/// An image part's reference: `image_url` (a string or `{url}`), `image` or `url` (a string),
+/// or a `source` block (`{type: "base64", media_type, data}` or `{type: "url", url}`).
+fn image_ref(p: &JsonValue) -> Result<MediaRef, String> {
+    if let Some(src) = p.get("source").filter(|s| s.as_object().is_some()) {
+        return match src.get("type").and_then(JsonValue::as_str) {
+            Some("base64") => {
+                let data = src
+                    .get("data")
+                    .and_then(JsonValue::as_str)
+                    .ok_or("an image source of type base64 needs a string 'data'")?;
+                let mt = src
+                    .get("media_type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("application/octet-stream");
+                Ok(MediaRef::Image(format!("data:{mt};base64,{data}")))
+            }
+            Some("url") => src
+                .get("url")
+                .and_then(JsonValue::as_str)
+                .map(|u| MediaRef::Image(u.to_string()))
+                .ok_or_else(|| "an image source of type url needs a string 'url'".to_string()),
+            _ => Err("an image source must be of type base64 or url".into()),
+        };
+    }
+    ["image_url", "image", "url"]
+        .iter()
+        .find_map(|k| p.get(k).and_then(media_url))
+        .map(|u| MediaRef::Image(u.to_string()))
+        .ok_or_else(|| "an image content part needs image_url.url (a data: URL)".to_string())
+}
+
+/// A video part's reference. A video is its frames (the server decodes no video container):
+/// `{"frames": [<data URL> | {"url": ..} ..], "fps": F | "timestamps": [seconds ..]}` (a bare
+/// list is the frames), or one animated image as a data URL (a string or `{url}`), under the
+/// part's `video`, `input_video` or `video_url` key.
+fn video_ref(p: &JsonValue) -> Result<MediaRef, String> {
+    let v = ["video", "input_video", "video_url"]
+        .iter()
+        .find_map(|k| p.get(k))
+        .ok_or("a video content part needs 'video' (its frames) or 'video_url' (an animated image as a data: URL)")?;
+    let list = match v {
+        JsonValue::Array(a) => Some(a.as_slice()),
+        _ => v.get("frames").and_then(JsonValue::as_array),
+    };
+    let Some(list) = list else {
+        return media_url(v)
+            .map(|u| MediaRef::Animation(u.to_string()))
+            .ok_or_else(|| {
+                "a video must be a list of frames, {\"frames\": [...]}, or a data: URL of an animated image".to_string()
+            });
+    };
+    if list.is_empty() {
+        return Err("a video needs at least one frame".into());
+    }
+    let frames = list
+        .iter()
+        .map(|f| {
+            media_url(f).map(str::to_string).ok_or_else(|| {
+                "a frame must be a data: URL (a string, or an object with 'url')".to_string()
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fps = match v.get("fps") {
+        None | Some(JsonValue::Null) => None,
+        Some(f) => Some(f.as_f64().ok_or("a video's fps must be a number")?),
+    };
+    let times = match v.get("timestamps") {
+        None | Some(JsonValue::Null) => None,
+        Some(JsonValue::Array(ts)) => Some(
+            ts.iter()
+                .map(|t| {
+                    t.as_f64()
+                        .ok_or("a video's timestamps must be numbers (seconds)")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(_) => return Err("a video's timestamps must be a list of seconds".into()),
+    };
+    Ok(MediaRef::Frames { frames, fps, times })
+}
+
+/// A message's content parts as the template gets them. Text-only parts become one string (as
+/// before image input). With an image or a video the parts stay a list, each media part reduced
+/// to its type (the template writes its placeholder; the bytes stay out of the context) and
+/// appended to `media` in order.
+fn convert_parts(parts: &[JsonValue], media: &mut Vec<MediaRef>) -> Result<JsonValue, String> {
+    let mut out: Vec<JsonValue> = Vec::with_capacity(parts.len());
     let mut text = String::new();
+    let mut has_media = false;
     for p in parts {
         if p.as_object().is_none() {
             return Err("content parts must be objects".into());
         }
         let kind = p.get("type").and_then(JsonValue::as_str).unwrap_or("");
         match kind {
-            "text" | "" if p.get("text").is_some() => {
+            "text" | "input_text" | "" if p.get("text").is_some() => {
                 match p.get("text").and_then(JsonValue::as_str) {
-                    Some(t) => text.push_str(t),
+                    Some(t) => {
+                        text.push_str(t);
+                        out.push(object(vec![
+                            ("type", JsonValue::Str("text".into())),
+                            ("text", JsonValue::Str(t.to_string())),
+                        ]));
+                    }
                     None => return Err("a text content part needs a string 'text'".into()),
                 }
             }
-            "image_url" | "image" | "input_video" | "video" | "video_url" => {
-                return Err("this model was started without vision support".into())
+            "image_url" | "image" | "input_image" => {
+                media.push(image_ref(p)?);
+                has_media = true;
+                out.push(object(vec![("type", JsonValue::Str("image".into()))]));
+            }
+            "input_video" | "video" | "video_url" => {
+                media.push(video_ref(p)?);
+                has_media = true;
+                out.push(object(vec![("type", JsonValue::Str("video".into()))]));
             }
             "input_audio" | "audio" | "audio_url" => {
                 return Err("audio input is not supported by this model".into())
@@ -162,7 +276,30 @@ fn parts_text(parts: &[JsonValue]) -> Result<String, String> {
             other => return Err(format!("unknown content part type '{other}'")),
         }
     }
-    Ok(text)
+    Ok(if has_media {
+        JsonValue::Array(out)
+    } else {
+        JsonValue::Str(text)
+    })
+}
+
+/// Whether any message of a request body holds an image or a video part.
+pub fn has_media_parts(body: &JsonValue) -> bool {
+    let media = |p: &JsonValue| {
+        matches!(
+            p.get("type").and_then(JsonValue::as_str),
+            Some("image_url" | "image" | "input_image" | "input_video" | "video" | "video_url")
+        )
+    };
+    body.get("messages")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("content")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|parts| parts.iter().any(media))
+            })
+        })
 }
 
 /// One tool call of an assistant message, its `arguments` as an object (clients send JSON text).
@@ -203,8 +340,8 @@ fn convert_tool_call(call: &JsonValue) -> Result<JsonValue, String> {
     Ok(c)
 }
 
-/// The request's messages as the template gets them.
-fn convert_messages(msgs: &JsonValue) -> Result<Vec<JsonValue>, String> {
+/// The request's messages as the template gets them, and their images and videos in order.
+fn convert_messages(msgs: &JsonValue) -> Result<(Vec<JsonValue>, Vec<MediaRef>), String> {
     let Some(list) = msgs.as_array() else {
         return Err("'messages' must be an array".into());
     };
@@ -212,6 +349,7 @@ fn convert_messages(msgs: &JsonValue) -> Result<Vec<JsonValue>, String> {
         return Err("'messages' must not be empty".into());
     }
     let mut out = Vec::with_capacity(list.len());
+    let mut media = Vec::new();
     for m in list {
         let Some(entries) = m.as_object() else {
             return Err("each message must be an object".into());
@@ -224,7 +362,7 @@ fn convert_messages(msgs: &JsonValue) -> Result<Vec<JsonValue>, String> {
             let v = match (k.as_str(), v) {
                 ("role", JsonValue::Str(r)) if r == "developer" => JsonValue::Str("system".into()),
                 ("content", JsonValue::Str(_) | JsonValue::Null) => v.clone(),
-                ("content", JsonValue::Array(parts)) => JsonValue::Str(parts_text(parts)?),
+                ("content", JsonValue::Array(parts)) => convert_parts(parts, &mut media)?,
                 ("content", _) => {
                     return Err(
                         "message content must be a string, an array of parts, or null".into(),
@@ -244,7 +382,7 @@ fn convert_messages(msgs: &JsonValue) -> Result<Vec<JsonValue>, String> {
         }
         out.push(JsonValue::Object(t));
     }
-    Ok(out)
+    Ok((out, media))
 }
 
 fn tool_name(tool: &JsonValue) -> Option<&str> {
@@ -280,7 +418,7 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
     let Some(raw_msgs) = body.get("messages") else {
         return Err("'messages' is required".into());
     };
-    let msgs = convert_messages(raw_msgs)?;
+    let (msgs, media) = convert_messages(raw_msgs)?;
     let mut ignored = Vec::new();
 
     let mut kwargs = match body.get("chat_template_kwargs") {
@@ -380,11 +518,13 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
 
     if continue_final {
         // cut the rendered text right after the final message's content
-        let final_text = msgs
-            .last()
-            .and_then(|m| m.get("content"))
-            .and_then(JsonValue::as_str)
-            .unwrap_or("");
+        let final_content = msgs.last().and_then(|m| m.get("content"));
+        if matches!(final_content, Some(JsonValue::Array(_))) {
+            return Err(
+                "continue_final_message: the final message must be text (it holds an image or a video)".into(),
+            );
+        }
+        let final_text = final_content.and_then(JsonValue::as_str).unwrap_or("");
         let ws = |c: char| c.is_ascii_whitespace();
         let stripped = final_text.trim_matches(ws);
         let Some(loc) = text.rfind(stripped) else {
@@ -445,6 +585,7 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
         single_call: flag(body, "parallel_tool_calls") == Some(false),
         continue_final,
         ignored,
+        media,
     })
 }
 
@@ -617,8 +758,20 @@ mod tests {
             (r#"{"messages":[]}"#, "must not be empty"),
             (r#"{"messages":[{"content":"x"}]}"#, "string 'role'"),
             (
-                r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:x"}}]}]}"#,
-                "vision",
+                r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{}}]}]}"#,
+                "needs image_url.url",
+            ),
+            (
+                r#"{"messages":[{"role":"user","content":[{"type":"video","video":{"frames":["data:x"],"fps":"fast"}}]}]}"#,
+                "fps must be a number",
+            ),
+            (
+                r#"{"messages":[{"role":"user","content":[{"type":"video","video":{"frames":[7]}}]}]}"#,
+                "a frame must be a data: URL",
+            ),
+            (
+                r#"{"messages":[{"role":"user","content":"x"},{"role":"assistant","content":[{"type":"image","image":"data:x"}]}],"continue_final_message":true}"#,
+                "final message must be text",
             ),
             (
                 r#"{"messages":[{"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"{bad"}}]}]}"#,
@@ -632,6 +785,52 @@ mod tests {
             let err = render_chat(&template(), &parse_json(body).unwrap()).unwrap_err();
             assert!(err.contains(want), "{body}: {err}");
         }
+        // media parts: collected in order, each part reduced to its type for the template
+        let body = parse_json(
+            r#"{"messages":[{"role":"user","content":[
+                {"type":"text","text":"a"},
+                {"type":"image_url","image_url":{"url":"data:1"}},
+                {"type":"input_image","image_url":"data:2"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"QQ=="}},
+                {"type":"video_url","video_url":{"url":"data:3"}},
+                {"type":"input_video","input_video":["data:4",{"url":"data:5"},{"type":"image_url","image_url":{"url":"data:6"}}]},
+                {"type":"video","video":{"frames":["data:7"],"timestamps":[0.5]}}]}]}"#,
+        )
+        .unwrap();
+        let (msgs, media) = convert_messages(body.get("messages").unwrap()).unwrap();
+        assert_eq!(
+            msgs[0].get("content").unwrap().dump(),
+            r#"[{"type":"text","text":"a"},{"type":"image"},{"type":"image"},{"type":"image"},{"type":"video"},{"type":"video"},{"type":"video"}]"#
+        );
+        assert_eq!(
+            media,
+            vec![
+                MediaRef::Image("data:1".into()),
+                MediaRef::Image("data:2".into()),
+                MediaRef::Image("data:image/png;base64,QQ==".into()),
+                MediaRef::Animation("data:3".into()),
+                MediaRef::Frames {
+                    frames: vec!["data:4".into(), "data:5".into(), "data:6".into()],
+                    fps: None,
+                    times: None
+                },
+                MediaRef::Frames {
+                    frames: vec!["data:7".into()],
+                    fps: None,
+                    times: Some(vec![0.5])
+                },
+            ]
+        );
+        assert!(has_media_parts(&body));
+        // text parts alone stay one string, as before image input
+        let body = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#,
+        )
+        .unwrap();
+        let (msgs, media) = convert_messages(body.get("messages").unwrap()).unwrap();
+        assert_eq!(msgs[0].get("content").unwrap().as_str(), Some("ab"));
+        assert!(media.is_empty() && !has_media_parts(&body));
+
         let raising = ChatTemplate::from_parts("{{ raise_exception('No user query.') }}", None)
             .unwrap()
             .0;

@@ -150,6 +150,12 @@ a { color: var(--link); }
 .att .meta { min-width: 0; } .att .meta div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .att .meta small { color: var(--muted); }
 .att.big img { width: 180px; height: auto; max-height: 180px; object-fit: contain; }
 .att .x { margin-left: 2px; width: 22px; height: 22px; }
+.att.video .vthumb { position: relative; flex: none; display: block; line-height: 0; }
+.att.video .vbadge { position: absolute; right: 3px; bottom: 3px; padding: 1px 5px; border-radius: 4px; background: rgba(0, 0, 0, .62); color: #fff; font-family: var(--font-mono); font-size: 10px; line-height: 14px; }
+.att.video.big { flex-direction: column; align-items: stretch; padding: 6px; max-width: 232px; }
+.att.video.big img { width: 220px; height: auto; max-height: 220px; object-fit: contain; }
+.att.video.big .meta { padding: 0 4px 2px; }
+.att.video:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 .att.audio { padding: 6px 6px 6px 10px; max-width: 320px; }
 .att.audio .meta { display: flex; flex-direction: column; gap: 4px; }
 .att.audio audio { width: 240px; max-width: 100%; height: 32px; display: block; }

@@ -593,6 +593,39 @@ impl VisionTower {
         Ok(max_ws)
     }
 
+    /// Compiles the recipes of the patch counts `sizes` into the recipe cache without keeping
+    /// them (off-card cache building). Counts outside the plan are skipped. Returns `(recipes
+    /// found in the cache, recipes compiled, largest workspace)`.
+    pub fn compile_into_cache(
+        &self,
+        api: &Arc<SynapseApi>,
+        cache: &RecipeCache,
+        driver_version: &str,
+        sizes: &[u64],
+    ) -> Result<(usize, usize, u64), String> {
+        let ppt = self.vs.patches_per_token();
+        let (mut hit, mut compiled, mut ws) = (0usize, 0usize, 0u64);
+        for &n in sizes {
+            if n == 0
+                || !n.is_multiple_of(ppt)
+                || n > self.max_patches
+                || self.sets.contains_key(&n)
+            {
+                continue;
+            }
+            let set = Self::compile_set(&self.vs, n, api, cache, driver_version)?;
+            for r in [&set.patch, &set.block, &set.merge] {
+                if r.from_cache {
+                    hit += 1;
+                } else {
+                    compiled += 1;
+                }
+                ws = ws.max(r.ws_size);
+            }
+        }
+        Ok((hit, compiled, ws))
+    }
+
     /// Sub-allocates every weight and buffer of the plan from the engine's arenas (pre-seal).
     pub fn allocate(
         &mut self,

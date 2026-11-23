@@ -1,9 +1,13 @@
-//! Prompt layout and interleaved M-RoPE for image prompts.
+//! Prompt layout and interleaved M-RoPE for image and video prompts.
 //!
 //! Text tokens count positions up by one. An image-pad run starting at position `s` puts its
 //! merged grid at `(t, h, w) = (s, s + row, s + col)`, and the next text token continues at
 //! `s + max(rows, cols)`. So after an image the RoPE position of a token is no longer its KV
 //! slot: inside the prompt it is `pos3[slot]`, after it `slot + delta`.
+//!
+//! A video is its temporal patches, each a run of video-pad tokens between its own vision
+//! start / end markers with the patch's time written as text in front. Time is carried by that
+//! text, not by the `t` position: every temporal patch is laid out exactly like an image.
 //!
 //! The decoder's RoPE tables stay **indexed by KV slot**: for a vision request the rows from the
 //! first image slot on are rewritten with the cos / sin of each slot's M-RoPE position (every
@@ -126,17 +130,31 @@ pub fn expand_image_pads(
     image_tokens: &[usize],
     image_token_id: i32,
 ) -> Result<Vec<i32>, String> {
+    expand_vision_pads(ids, image_tokens, image_token_id, -1)
+}
+
+/// Like `expand_image_pads` for prompts that also hold video: `tokens[k]` is the token count
+/// of the `k`-th pad run in prompt order, a run being image pads (an image) or video pads (one
+/// temporal patch of a video). `video_token_id` < 0: the model has no video pad.
+pub fn expand_vision_pads(
+    ids: &[i32],
+    image_tokens: &[usize],
+    image_token_id: i32,
+    video_token_id: i32,
+) -> Result<Vec<i32>, String> {
+    let is_pad = |t: i32| t == image_token_id || (video_token_id >= 0 && t == video_token_id);
     let mut out = Vec::with_capacity(ids.len() + image_tokens.iter().sum::<usize>());
     let mut k = 0usize;
     let mut i = 0usize;
     while i < ids.len() {
-        if ids[i] != image_token_id {
+        if !is_pad(ids[i]) {
             out.push(ids[i]);
             i += 1;
             continue;
         }
+        let pad = ids[i];
         let mut j = i;
-        while j < ids.len() && ids[j] == image_token_id {
+        while j < ids.len() && ids[j] == pad {
             j += 1;
         }
         let run = j - i;
@@ -153,7 +171,7 @@ pub fn expand_image_pads(
                 "image {k}: a run of {run} image-pad tokens is neither one placeholder nor its {n} tokens"
             ));
         }
-        out.extend(std::iter::repeat_n(image_token_id, n));
+        out.extend(std::iter::repeat_n(pad, n));
         k += 1;
         i = j;
     }
@@ -166,8 +184,9 @@ pub fn expand_image_pads(
     Ok(out)
 }
 
-/// Builds the layout of an (expanded) prompt. `grids` are the images' patch grids
-/// `(rows, columns)` in prompt order; every image-pad run must match its image exactly.
+/// Builds the layout of an (expanded) prompt. `grids` are the patch grids `(rows, columns)` of
+/// the prompt's pad runs in prompt order (an image, or one temporal patch of a video); every
+/// run must match its grid exactly.
 pub fn layout_prompt(
     ids: &[i32],
     grids: &[(usize, usize)],
@@ -180,11 +199,10 @@ pub fn layout_prompt(
     let mut max_pos = -1i64;
     let mut emb_row = 0usize;
     let mut i = 0usize;
+    let is_pad =
+        |t: i32| t == vs.image_token_id || (vs.video_token_id >= 0 && t == vs.video_token_id);
     while i < ids.len() {
-        if ids[i] == vs.video_token_id && vs.video_token_id >= 0 {
-            return Err("video tokens are not supported".into());
-        }
-        if ids[i] != vs.image_token_id {
+        if !is_pad(ids[i]) {
             pos3[i] = [cur as i32; 3];
             max_pos = max_pos.max(cur);
             cur += 1;
@@ -202,8 +220,9 @@ pub fn layout_prompt(
         }
         let (rows, cols) = (gh / m, gw / m);
         let n = rows * cols;
+        let pad = ids[i];
         let mut j = i;
-        while j < ids.len() && ids[j] == vs.image_token_id {
+        while j < ids.len() && ids[j] == pad {
             j += 1;
         }
         if j - i != n {
@@ -436,18 +455,84 @@ mod tests {
     }
 
     #[test]
-    fn layout_refuses_mismatched_runs_and_video() {
+    fn layout_refuses_mismatched_runs() {
         let vs = qwen38_vision_spec();
         let (ids, grids) = two_image_prompt();
         assert!(layout_prompt(&ids, &grids[..1], &vs).is_err());
         assert!(layout_prompt(&ids, &[(16, 16), (20, 30)], &vs).is_err());
         assert!(layout_prompt(&ids, &[(16, 16), (20, 28), (16, 16)], &vs).is_err());
+        // a video pad without a grid is refused like an image pad without one
         assert!(layout_prompt(&[1, 248_057, 2], &[], &vs).is_err());
         // text-only prompt: positions = slots, delta 0
         let l = layout_prompt(&[5, 6, 7], &[], &vs).unwrap();
         assert_eq!(l.delta, 0);
         assert_eq!(l.pos3[2], [2, 2, 2]);
         assert!(l.first_image_slot().is_none());
+    }
+
+    /// A prompt with one video of four temporal patches (7 frames of 96x64 at 2 fps), tokenised
+    /// by the reference processor, and the positions the reference model computes for it.
+    #[test]
+    fn video_layout_matches_reference_positions() {
+        let vs = qwen38_vision_spec();
+        let vp = 248_057;
+        let mut ids = vec![248_045, 846, 198, 10_071, 15_294];
+        // "<0.2 seconds>", "<1.2 seconds>", "<2.2 seconds>", "<3.0 seconds>"
+        for (a, b) in [(15, 17), (16, 17), (17, 17), (18, 15)] {
+            ids.extend([a, 13, b, 6283, 29, 248_053]);
+            ids.extend(std::iter::repeat_n(vp, 6));
+            ids.extend([248_054, 27]);
+        }
+        ids.pop();
+        ids.extend([
+            3710, 8311, 30, 248_046, 198, 248_045, 74_455, 198, 248_068, 271, 248_069, 271,
+        ]);
+        assert_eq!(ids.len(), 72);
+        let l = layout_prompt(&ids, &[(4, 6); 4], &vs).unwrap();
+        let want_t: [i32; 72] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 11, 11, 11, 11, 11, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 22, 22, 22, 22, 22, 25, 26, 27, 28, 29, 30, 31, 32, 33, 33, 33, 33, 33, 33, 36,
+            37, 38, 39, 40, 41, 42, 43, 44, 44, 44, 44, 44, 44, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+            56, 57, 58, 59,
+        ];
+        let want_h: [i32; 72] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 11, 11, 12, 12, 12, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 22, 22, 23, 23, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33, 33, 33, 34, 34, 34, 36,
+            37, 38, 39, 40, 41, 42, 43, 44, 44, 44, 45, 45, 45, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+            56, 57, 58, 59,
+        ];
+        let want_w: [i32; 72] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 33, 34, 35, 36,
+            37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+            56, 57, 58, 59,
+        ];
+        for (slot, p) in l.pos3.iter().enumerate() {
+            assert_eq!(
+                *p,
+                [want_t[slot], want_h[slot], want_w[slot]],
+                "slot {slot}"
+            );
+        }
+        assert_eq!(l.delta, -12);
+        assert_eq!(l.spans.len(), 4);
+        assert_eq!(
+            (l.spans[3].start, l.spans[3].len, l.spans[3].emb_row),
+            (53, 6, 18)
+        );
+        // single placeholders expand to the same prompt
+        let mut collapsed: Vec<i32> = Vec::new();
+        for &t in &ids {
+            if t != vp || collapsed.last() != Some(&t) {
+                collapsed.push(t);
+            }
+        }
+        assert_eq!(
+            expand_vision_pads(&collapsed, &[6; 4], vs.image_token_id, vp).unwrap(),
+            ids
+        );
+        // without a video pad id the tokens are plain text to the layout
+        assert!(expand_image_pads(&collapsed, &[6; 4], vs.image_token_id).is_err());
     }
 
     #[test]

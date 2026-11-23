@@ -10,17 +10,50 @@ use crate::engine::{GenParams, GenReport};
 
 const TOOLS: &str = r#""tools":[{"type":"function","function":{"name":"get_weather","description":"Weather.","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}},{"type":"function","function":{"name":"now","parameters":{"type":"object","properties":{}}}}]"#;
 
+/// The tower inputs of each request a scripted engine ran: `(grid rows, grid columns, values)`.
+type SeenImages = Arc<Mutex<Vec<Vec<(usize, usize, usize)>>>>;
+
 /// Emits the next canned reply token by token and records the prompt it was given.
 struct ScriptedEngine {
     spec: ModelSpec,
     tok: Arc<Tokenizer>,
     replies: Arc<Mutex<VecDeque<String>>>,
     prompts: Arc<Mutex<Vec<String>>>,
+    /// Tower inputs handed over for the next request: `(grid rows, grid columns, values)` each.
+    pending_images: Vec<(usize, usize, usize)>,
+    /// The tower inputs each request ran with.
+    images: SeenImages,
 }
 
 impl GenEngine for ScriptedEngine {
     fn spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    fn set_request_images(
+        &mut self,
+        images: Vec<crate::vision::PreparedImage>,
+    ) -> Result<(), String> {
+        self.pending_images = images
+            .iter()
+            .map(|i| (i.grid_h, i.grid_w, i.pixels.len()))
+            .collect();
+        Ok(())
+    }
+
+    fn last_vision_report(&self) -> Option<crate::vision::VisionReport> {
+        let last = self.images.lock().unwrap().last().cloned()?;
+        (!last.is_empty()).then(|| crate::vision::VisionReport {
+            images: last.len(),
+            patches: last.iter().map(|g| (g.0 * g.1) as u64).sum(),
+            image_tokens: last.iter().map(|g| (g.0 * g.1 / 4) as u64).sum(),
+            prep_ms: 1.0,
+            encode_ms: 20.0,
+            compile_ms: 0.0,
+            rope_ms: 2.0,
+            rope_rows: 100,
+            rope_delta: -3,
+        })
     }
 
     fn max_ctx(&self) -> u64 {
@@ -42,6 +75,10 @@ impl GenEngine for ScriptedEngine {
             .lock()
             .unwrap()
             .push(self.tok.decode(prompt_ids, false));
+        self.images
+            .lock()
+            .unwrap()
+            .push(std::mem::take(&mut self.pending_images));
         let reply = self
             .replies
             .lock()
@@ -80,6 +117,7 @@ struct Harness {
     state: Arc<AppState>,
     replies: Arc<Mutex<VecDeque<String>>>,
     prompts: Arc<Mutex<Vec<String>>>,
+    images: SeenImages,
 }
 
 /// A second model family for the tests: reasoning and tool calls between special tokens, the
@@ -114,6 +152,10 @@ fn harness() -> Harness {
         ("<|tool_response>", true),
         ("<|tool>", true),
         ("<tool|>", true),
+        ("<|vision_start|>", true),
+        ("<|vision_end|>", true),
+        ("<|image_pad|>", true),
+        ("<|video_pad|>", true),
     ]));
     let model = |id: &str, template: &str, config: Option<&str>| {
         let config = config.map(|c| json::parse_json(c).unwrap());
@@ -130,15 +172,19 @@ fn harness() -> Harness {
             max_ctx: 16384,
             gemma_closes_thought: false,
             gen_defaults: SamplerDefaults::FALLBACK,
+            vision: None,
         }
     };
     let replies = Arc::new(Mutex::new(VecDeque::new()));
     let prompts = Arc::new(Mutex::new(Vec::new()));
+    let images = Arc::new(Mutex::new(Vec::new()));
     let engine = ScriptedEngine {
         spec: spec.clone(),
         tok: Arc::clone(&tok),
         replies: Arc::clone(&replies),
         prompts: Arc::clone(&prompts),
+        pending_images: Vec::new(),
+        images: Arc::clone(&images),
     };
     let state = Arc::new(AppState {
         cfg: ServerConfig {
@@ -158,6 +204,9 @@ fn harness() -> Harness {
             verbose: false,
             per_model: Vec::new(),
             draft_k: Vec::new(),
+            vision: true,
+            vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
+            vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
         },
         models: vec![model("tags", chat::TEST_TEMPLATE, None)],
         slot: Mutex::new(EngineSlot {
@@ -191,6 +240,7 @@ fn harness() -> Harness {
         state,
         replies,
         prompts,
+        images,
     }
 }
 
@@ -212,6 +262,7 @@ fn call_form_harness() -> Harness {
         max_ctx: m.max_ctx,
         gemma_closes_thought: false,
         gen_defaults: m.gen_defaults,
+        vision: None,
     };
     let engine = h.state.slot.lock().unwrap().engine.take();
     let state = Arc::new(AppState {
@@ -247,7 +298,146 @@ fn call_form_harness() -> Harness {
         state,
         replies: h.replies,
         prompts: h.prompts,
+        images: h.images,
     }
+}
+
+/// A chat template with the content macro of a vision-language family: a content list writes
+/// one placeholder block per image / video part, numbered when `add_vision_id` is set.
+const VISION_TEMPLATE: &str = r#"{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain images.') }}
+                {%- endif %}
+                {%- set image_count.value = image_count.value + 1 %}
+                {%- if add_vision_id %}
+                    {{- 'Picture ' ~ image_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {%- elif 'video' in item or item.type == 'video' %}
+                {%- set video_count.value = video_count.value + 1 %}
+                {%- if add_vision_id %}
+                    {{- 'Video ' ~ video_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- else %}
+                {{- raise_exception('Unexpected item type in content.') }}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+{%- endmacro %}
+{%- for m in messages %}
+    {%- if m.role == 'tool' %}
+        {{- '<|im_start|>user\n<tool_response>\n' ~ render_content(m.content) ~ '\n</tool_response><|im_end|>\n' }}
+    {%- else %}
+        {{- '<|im_start|>' ~ m.role ~ '\n' ~ render_content(m.content, m.role == 'system') ~ '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}"#;
+
+/// The harness with a vision-language model: the template above, and a tower planned for
+/// images of `max_patches` patches and `max_tokens` image tokens per request.
+fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
+    let h = harness();
+    let m = &h.state.models[0];
+    let (chat, _) = ChatTemplate::from_parts(VISION_TEMPLATE, None).unwrap();
+    let mut vs = crate::vision::test_util::qwen38_vision_spec();
+    let id = |t: &str| m.tokenizer.token_id(t).unwrap();
+    vs.image_token_id = id("<|image_pad|>");
+    vs.video_token_id = id("<|video_pad|>");
+    vs.vision_start_id = id("<|vision_start|>");
+    vs.vision_end_id = id("<|vision_end|>");
+    let model = RegisteredModel {
+        id: "vl".into(),
+        dir: m.dir.clone(),
+        spec: m.spec.clone(),
+        format: chat.format.clone(),
+        chat: Some(chat),
+        tokenizer: Arc::clone(&m.tokenizer),
+        extra_eos_ids: Vec::new(),
+        max_ctx: m.max_ctx,
+        gemma_closes_thought: false,
+        gen_defaults: m.gen_defaults,
+        vision: Some(
+            VisionServe::new(vs, max_patches, max_tokens, MediaLimits::default()).unwrap(),
+        ),
+    };
+    let engine = h.state.slot.lock().unwrap().engine.take();
+    let state = Arc::new(AppState {
+        cfg: h.state.cfg.clone(),
+        models: vec![model],
+        slot: Mutex::new(EngineSlot {
+            engine,
+            resident_idx: Some(0),
+            lifecycle: Lifecycle::Ready(0),
+            detail: String::new(),
+            since: Instant::now(),
+            last_activity: Instant::now(),
+            admin_parked: false,
+            hold: false,
+            active_requests: 0,
+            waiting: vec![0],
+            switches: 0,
+            last_switch_s: None,
+            last_warmup_s: None,
+            last_live_json: None,
+            last_request_json: None,
+            hbm_bytes: None,
+            facts: None,
+        }),
+        card_op: Mutex::new(()),
+        cancels: Mutex::new(HashMap::new()),
+        next_req_id: AtomicU64::new(1),
+        hub: EventHub::new(),
+        dtypes: Mutex::new(HashMap::new()),
+        turns: TurnQueue::default(),
+    });
+    Harness {
+        state,
+        replies: h.replies,
+        prompts: h.prompts,
+        images: h.images,
+    }
+}
+
+/// A `data:` URL of a synthetic image (binary PPM, which needs no codec).
+fn image_url(w: usize, h: usize, k: usize) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut f = format!("P6\n{w} {h}\n255\n").into_bytes();
+    for y in 0..h {
+        for x in 0..w {
+            f.extend([(x * 255 / w) as u8, (y * 255 / h) as u8, (k * 40) as u8]);
+        }
+    }
+    let mut out = String::from("data:image/x-portable-pixmap;base64,");
+    for c in f.chunks(3) {
+        let v = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        out.push(B64[(v >> 18) as usize] as char);
+        out.push(B64[((v >> 12) & 63) as usize] as char);
+        out.push(if c.len() > 1 {
+            B64[((v >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            B64[(v & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 impl Harness {
@@ -895,7 +1085,9 @@ fn a2ui_declaration_adds_the_instructions_to_the_system_turn() {
         r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}],"gaudium_a2ui":true}"#,
     );
     assert_eq!(status, 200, "{text}");
-    assert!(h.last_prompt().contains("# Interactive interfaces (A2UI 1.0)"));
+    assert!(h
+        .last_prompt()
+        .contains("# Interactive interfaces (A2UI 1.0)"));
 
     let props = json::parse_json(&h.state.props_json(0, true)).unwrap();
     assert_eq!(at(&props, &["a2ui", "enabled"]).as_bool(), Some(true));
@@ -929,10 +1121,16 @@ fn served_engine_configuration_follows_the_server_options() {
         verbose: false,
         per_model: vec![("a".into(), opts), ("moe".into(), own)],
         draft_k: Vec::new(),
+        vision: true,
+        vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
+        vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
     };
     // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
     let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
-    assert_eq!(drafter.as_deref(), Some(Path::new("/models/Target-DSpine-b16")));
+    assert_eq!(
+        drafter.as_deref(),
+        Some(Path::new("/models/Target-DSpine-b16"))
+    );
     assert_eq!(q.max_ctx, 131_072);
     assert_eq!(q.cache_dir.as_deref(), Some(Path::new("/cache")));
     assert_eq!(q.precision, crate::engine::fp8_graph::WeightPrecision::Fp8);
@@ -950,4 +1148,397 @@ fn served_engine_configuration_follows_the_server_options() {
     // is compiled
     assert!(build_cache(&cfg, &[]).is_err());
     assert!(build_cache(&cfg, &["nope".to_string()]).is_err());
+}
+
+/// An image in a chat request: decoded, prepared and handed to the engine; its pad run in the
+/// prompt has the image's token count, and the reply's details say what the tower did.
+#[test]
+fn chat_image_reaches_the_engine_with_its_pad_run() {
+    let h = vision_harness(4096, 4096);
+    h.script("A gradient.");
+    let body = format!(
+        r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{}"}}}},{{"type":"text","text":"What is this?"}}]}}]}}"#,
+        image_url(256, 256, 1)
+    );
+    let (status, text) = h.post("/v1/chat/completions", &body);
+    assert_eq!(status, 200, "{text}");
+    let v = json::parse_json(&text).unwrap();
+    assert_eq!(
+        s(&v, &["choices", "0", "message", "content"]),
+        "A gradient."
+    );
+    // 256 x 256 pixels: 16 x 16 patches, 64 tokens
+    let prompt = h.last_prompt();
+    assert_eq!(prompt.matches("<|image_pad|>").count(), 64);
+    assert!(prompt.contains("<|vision_start|><|image_pad|>"));
+    assert!(
+        prompt.ends_with("<|vision_end|>What is this?<|im_end|>\n<|im_start|>assistant\n"),
+        "{prompt}"
+    );
+    assert_eq!(
+        h.images.lock().unwrap().last().unwrap(),
+        &vec![(16, 16, 256 * 1536)]
+    );
+    let vis = at(&v, &["gaudium", "vision"]);
+    assert_eq!(at(vis, &["images"]).as_u64(), Some(1));
+    assert_eq!(at(vis, &["patches"]).as_u64(), Some(256));
+    assert_eq!(at(vis, &["tokens"]).as_u64(), Some(64));
+    assert_eq!(at(vis, &["tower_ms"]).as_f64(), Some(20.0));
+    assert!(at(&v, &["usage", "prompt_tokens"]).as_u64().unwrap() > 64);
+    // a text-only request afterwards hands the engine no image
+    h.script("Hello.");
+    let (status, _) = h.chat("");
+    assert_eq!(status, 200);
+    assert!(h.images.lock().unwrap().last().unwrap().is_empty());
+}
+
+/// Two images and a video in one request, in the order of their parts; the video is written
+/// into the prompt as timed temporal patches.
+#[test]
+fn chat_video_frames_become_timed_patches_between_images() {
+    let h = vision_harness(4096, 4096);
+    h.script("ok");
+    let frames: Vec<String> = (0..7)
+        .map(|k| format!("\"{}\"", image_url(96, 64, k)))
+        .collect();
+    let body = format!(
+        r#"{{"chat_template_kwargs":{{"add_vision_id":true}},"messages":[{{"role":"user","content":[
+            {{"type":"image_url","image_url":{{"url":"{a}"}}}},
+            {{"type":"video","video":{{"frames":[{f}],"fps":2}}}},
+            {{"type":"text","text":"Compare."}},
+            {{"type":"image","image":"{b}"}}]}}]}}"#,
+        a = image_url(256, 256, 0),
+        b = image_url(448, 320, 2),
+        f = frames.join(","),
+    );
+    let (status, text) = h.post("/v1/chat/completions", &body.replace('\n', " "));
+    assert_eq!(status, 200, "{text}");
+    let prompt = h.last_prompt();
+    let pads = "<|video_pad|>".repeat(6);
+    let video: String = ["0.2", "1.2", "2.2", "3.0"]
+        .iter()
+        .map(|t| format!("<{t} seconds><|vision_start|>{pads}<|vision_end|>"))
+        .collect();
+    assert!(
+        prompt.contains(&format!(
+            "Video 1: {video}Compare.Picture 2: <|vision_start|>"
+        )),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Picture 1: <|vision_start|><|image_pad|>"));
+    assert_eq!(prompt.matches("<|image_pad|>").count(), 64 + 140);
+    // the engine gets the inputs in prompt order: image, four temporal patches, image
+    let got = h.images.lock().unwrap().last().unwrap().clone();
+    let grids: Vec<(usize, usize)> = got.iter().map(|g| (g.0, g.1)).collect();
+    assert_eq!(
+        grids,
+        vec![(16, 16), (4, 6), (4, 6), (4, 6), (4, 6), (20, 28)]
+    );
+    let v = json::parse_json(&text).unwrap();
+    let vis = at(&v, &["gaudium", "vision"]);
+    assert_eq!(
+        ["images", "videos", "frames", "inputs", "tokens"].map(|k| at(vis, &[k]).as_u64().unwrap()),
+        [2, 1, 7, 6, 64 + 24 + 140]
+    );
+}
+
+/// The prompt size of a request with images comes from the files' headers, and is the size the
+/// request then runs with.
+#[test]
+fn count_tokens_counts_image_tokens_without_running() {
+    let h = vision_harness(4096, 4096);
+    let body = format!(
+        r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{}"}}}},{{"type":"text","text":"Hi"}}]}}]}}"#,
+        image_url(448, 320, 1)
+    );
+    let (status, text) = h.post("/gaudium/count_tokens", &body);
+    assert_eq!(status, 200, "{text}");
+    let c = json::parse_json(&text).unwrap();
+    assert_eq!(at(&c, &["image_tokens"]).as_u64(), Some(140));
+    assert_eq!(at(&c, &["images"]).as_u64(), Some(1));
+    let counted = at(&c, &["n_prompt_tokens"]).as_u64().unwrap();
+    assert!(c.get("tokens").is_none());
+    h.script("ok");
+    let (status, text) = h.post("/v1/chat/completions", &body);
+    assert_eq!(status, 200, "{text}");
+    let v = json::parse_json(&text).unwrap();
+    assert_eq!(at(&v, &["usage", "prompt_tokens"]).as_u64(), Some(counted));
+    assert!(at(&v, &["gaudium"]).get("tokens").is_none());
+    // on request: the prompt's ids from the count, the generated ids from the chat
+    let with = body.replacen(
+        '{',
+        r#"{"return_tokens":true,"gaudium_return_tokens":true,"#,
+        1,
+    );
+    let (_, text) = h.post("/gaudium/count_tokens", &with);
+    let c = json::parse_json(&text).unwrap();
+    let ids = at(&c, &["tokens"]).as_array().unwrap();
+    assert_eq!(ids.len() as u64, counted);
+    let pad = h.state.models[0]
+        .tokenizer
+        .token_id("<|image_pad|>")
+        .unwrap() as i64;
+    assert_eq!(ids.iter().filter(|t| t.as_i64() == Some(pad)).count(), 140);
+    h.script("ok");
+    let (_, text) = h.post("/v1/chat/completions", &with);
+    let v = json::parse_json(&text).unwrap();
+    assert_eq!(at(&v, &["gaudium", "tokens"]).as_array().unwrap().len(), 2);
+}
+
+/// What a request with media is refused for, before it takes the card.
+#[test]
+fn media_requests_are_refused_with_the_reason() {
+    let h = vision_harness(4096, 100);
+    let part = |p: &str| format!(r#"{{"messages":[{{"role":"user","content":[{p}]}}]}}"#);
+    let cases = [
+        (
+            r#"{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}"#.to_string(),
+            "image 1: only data: URLs are accepted",
+        ),
+        (
+            r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}"#.to_string(),
+            "image 1: not an image this server decodes",
+        ),
+        (
+            r#"{"type":"image_url","image_url":{}}"#.to_string(),
+            "needs image_url.url",
+        ),
+        (
+            r#"{"type":"video","video":{"frames":[]}}"#.to_string(),
+            "at least one frame",
+        ),
+        (
+            r#"{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AAAAIGZ0eXBpc29tAAAAAA=="}}"#.to_string(),
+            "video 1: this is a video file, which the server does not decode",
+        ),
+        (
+            // 448 x 320 gives 140 tokens: more than the 100 this tower takes per request
+            format!(r#"{{"type":"image_url","image_url":{{"url":"{}"}}}}"#, image_url(448, 320, 0)),
+            "need 140 image tokens; this server takes 100",
+        ),
+        (
+            r#"{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}"#.to_string(),
+            "audio input is not supported",
+        ),
+    ];
+    for (p, want) in &cases {
+        let (status, text) = h.post("/v1/chat/completions", &part(p));
+        assert_eq!(status, 400, "{p}: {text}");
+        assert!(text.contains(want), "{p}: expected '{want}' in {text}");
+    }
+    // nothing reached the engine
+    assert!(h.prompts.lock().unwrap().is_empty());
+    // a system message with an image is refused by the template itself
+    let sys = format!(
+        r#"{{"messages":[{{"role":"system","content":[{{"type":"image_url","image_url":{{"url":"{}"}}}}]}},{{"role":"user","content":"x"}}]}}"#,
+        image_url(64, 64, 0)
+    );
+    let (status, text) = h.post("/v1/chat/completions", &sys);
+    assert_eq!(status, 400);
+    assert!(
+        text.contains("System message cannot contain images"),
+        "{text}"
+    );
+    // a model served without a tower says so
+    let text_only = harness();
+    let img = format!(
+        r#"{{"type":"image_url","image_url":{{"url":"{}"}}}}"#,
+        image_url(64, 64, 0)
+    );
+    let (status, text) = text_only.post("/v1/chat/completions", &part(&img));
+    assert_eq!(status, 400);
+    assert!(text.contains("takes no images or videos"), "{text}");
+}
+
+/// `/v1/messages`: image blocks of a user turn and of a tool result reach the tower.
+#[test]
+fn messages_api_images_reach_the_engine() {
+    let h = vision_harness(4096, 4096);
+    h.script("Seen.");
+    let data = image_url(256, 256, 3);
+    let b64 = data.split_once(',').unwrap().1;
+    let body = format!(
+        r#"{{"model":"vl","max_tokens":64,"messages":[
+            {{"role":"user","content":[{{"type":"text","text":"Look: "}},{{"type":"image","source":{{"type":"base64","media_type":"image/x-portable-pixmap","data":"{b64}"}}}}]}},
+            {{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"shot","input":{{}}}}]}},
+            {{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":[{{"type":"text","text":"screen:"}},{{"type":"image","source":{{"type":"base64","media_type":"image/x-portable-pixmap","data":"{b64}"}}}}]}}]}}]}}"#
+    );
+    let (status, text) = h.post("/v1/messages", &body.replace('\n', " "));
+    assert_eq!(status, 200, "{text}");
+    let prompt = h.last_prompt();
+    assert_eq!(prompt.matches("<|image_pad|>").count(), 128);
+    assert!(prompt.contains("Look: <|vision_start|>"), "{prompt}");
+    assert!(
+        prompt.contains("<tool_response>\nscreen:<|vision_start|>"),
+        "{prompt}"
+    );
+    assert_eq!(h.images.lock().unwrap().last().unwrap().len(), 2);
+    // a URL source is a remote image: refused
+    let remote = r#"{"model":"vl","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}]}]}"#;
+    let (status, text) = h.post("/v1/messages", remote);
+    assert_eq!(status, 400);
+    assert!(text.contains("only data: URLs are accepted"), "{text}");
+    // the count endpoint sees the same prompt
+    let (status, text) = h.post("/v1/messages/count_tokens", &body.replace('\n', " "));
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        at(&json::parse_json(&text).unwrap(), &["input_tokens"])
+            .as_u64()
+            .unwrap()
+            > 128
+    );
+}
+
+/// `/props` and the model list say what the model takes.
+#[test]
+fn props_report_the_modalities_truthfully() {
+    let h = vision_harness(4096, 2048);
+    let p = json::parse_json(&h.state.props_json(0, false)).unwrap();
+    assert_eq!(at(&p, &["modalities", "vision"]).as_bool(), Some(true));
+    assert_eq!(at(&p, &["modalities", "video"]).as_bool(), Some(true));
+    assert_eq!(at(&p, &["vision", "max_patches"]).as_u64(), Some(4096));
+    assert_eq!(at(&p, &["vision", "max_tokens"]).as_u64(), Some(2048));
+    assert_eq!(at(&p, &["vision", "max_pixels"]).as_u64(), Some(1_048_576));
+    assert_eq!(
+        at(&p, &["vision", "video", "max_frames"]).as_u64(),
+        Some(768)
+    );
+    assert!(h.state.hello_json().contains("\"vision\":true"));
+    let text_only = harness();
+    let p = json::parse_json(&text_only.state.props_json(0, false)).unwrap();
+    assert_eq!(at(&p, &["modalities", "vision"]).as_bool(), Some(false));
+    assert_eq!(at(&p, &["modalities", "video"]).as_bool(), Some(false));
+    assert!(matches!(at(&p, &["vision"]), JsonValue::Null));
+    assert!(text_only.state.hello_json().contains("\"vision\":false"));
+}
+
+/// Which served models get a vision tower, and what a load of them is configured with.
+#[test]
+fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
+    let dir = std::env::temp_dir().join(format!("gaudium-vis-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        crate::vision::test_util::QWEN38_27B_CONFIG,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("preprocessor_config.json"),
+        crate::vision::test_util::QWEN38_27B_PREPROCESSOR,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("video_preprocessor_config.json"),
+        crate::vision::test_util::QWEN38_27B_VIDEO_PREPROCESSOR,
+    )
+    .unwrap();
+    let opt = |f: &dyn Fn(&mut ModelRunOptions)| {
+        let mut o = ModelRunOptions::default();
+        f(&mut o);
+        o
+    };
+    let mut cfg = ServerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        models: Vec::new(),
+        kernels_dir: PathBuf::from("/kernels"),
+        ui_dir: None,
+        max_ctx: 262_144,
+        cache_dir: None,
+        no_cache: false,
+        lazy: true,
+        idle_park_secs: 0,
+        queue_config: None,
+        api_key: None,
+        a2ui: false,
+        verbose: false,
+        per_model: vec![
+            (
+                "ds".into(),
+                opt(&|o| o.draft_model = Some(PathBuf::from("/m/T-DSpine-b16"))),
+            ),
+            ("mtp".into(), opt(&|o| o.own_mtp = true)),
+            (
+                "block".into(),
+                opt(&|o| o.draft_model = Some(PathBuf::from("/m/T-DFlash2"))),
+            ),
+            ("off".into(), opt(&|o| o.vision_patches = Some(0))),
+            ("big".into(), opt(&|o| o.vision_patches = Some(8192))),
+            ("odd".into(), opt(&|o| o.vision_patches = Some(4098))),
+            ("tiny".into(), opt(&|o| o.vision_patches = Some(64))),
+        ],
+        draft_k: Vec::new(),
+        vision: true,
+        vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
+        vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
+    };
+    // plain decode and a DSpine drafter: the server-wide tower
+    for id in ["plain", "ds"] {
+        assert_eq!(
+            vision_plan_of(&cfg, id, &dir, 262_144),
+            Some((4096, 16_384)),
+            "{id}"
+        );
+    }
+    // drafters that are not validated with image input: text only
+    assert_eq!(vision_plan_of(&cfg, "mtp", &dir, 262_144), None);
+    assert_eq!(vision_plan_of(&cfg, "block", &dir, 262_144), None);
+    // the model's own setting wins over the server's
+    assert_eq!(vision_plan_of(&cfg, "off", &dir, 262_144), None);
+    assert_eq!(
+        vision_plan_of(&cfg, "big", &dir, 262_144),
+        Some((8192, 16_384))
+    );
+    // the image tokens of a request never exceed the served context
+    assert_eq!(
+        vision_plan_of(&cfg, "plain", &dir, 4096),
+        Some((4096, 4096 - 128))
+    );
+    // what a load and the off-card build are configured with
+    let (q, _) = engine_config_of(&cfg, "ds", &dir, 262_144);
+    assert_eq!((q.vision_max_patches, q.vision_max_tokens), (4096, 16_384));
+    assert_eq!(q.vision_precompile, vec![4096]);
+    assert!(
+        q.vision_cache_sizes.contains(&4032) && q.vision_cache_sizes.iter().all(|&n| n <= 4096)
+    );
+    let (q, _) = engine_config_of(&cfg, "mtp", &dir, 262_144);
+    assert_eq!((q.vision_max_patches, q.vision_max_tokens), (0, 0));
+    assert!(q.vision_precompile.is_empty() && q.vision_cache_sizes.is_empty());
+    // what requests may carry
+    let serve = vision_serve_of(&cfg, "ds", &dir, 262_144).unwrap().unwrap();
+    assert_eq!(
+        (serve.max_patches, serve.spec.max_pixels),
+        (4096, 1_048_576)
+    );
+    assert!(serve.spec.video.is_some());
+    assert!(vision_serve_of(&cfg, "off", &dir, 262_144)
+        .unwrap()
+        .is_none());
+    // a tower that cannot be loaded is a configuration error at start-up
+    assert!(vision_serve_of(&cfg, "odd", &dir, 262_144)
+        .unwrap_err()
+        .contains("multiple of 4"));
+    assert!(vision_serve_of(&cfg, "tiny", &dir, 262_144)
+        .unwrap_err()
+        .contains("smallest image"));
+    // --no-vision: no tower unless the model asks for one itself
+    cfg.vision = false;
+    assert_eq!(vision_plan_of(&cfg, "plain", &dir, 262_144), None);
+    assert_eq!(
+        vision_plan_of(&cfg, "big", &dir, 262_144),
+        Some((8192, 16_384))
+    );
+    // a checkpoint without a tower, or a missing one, has none
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"model_type": "qwen3", "hidden_size": 4096}"#,
+    )
+    .unwrap();
+    cfg.vision = true;
+    assert_eq!(vision_plan_of(&cfg, "plain", &dir, 262_144), None);
+    assert_eq!(
+        vision_plan_of(&cfg, "plain", Path::new("/nonexistent"), 262_144),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

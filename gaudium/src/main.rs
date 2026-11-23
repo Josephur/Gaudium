@@ -90,6 +90,20 @@ fn print_usage() {
          \x20                       BF16 checkpoint is quantised at load per output channel; give\n\
          \x20                       its activation-scale table with --fp8-act)\n\
          \x20 --draft-k <N[,N..]>   DSpine drafts verified per launch (default: 7,15 adaptive)\n\
+         \x20 --no-vision           Load no vision tower: every model is served text only. By default\n\
+         \x20                       a model whose checkpoint has a vision tower takes images (JPEG,\n\
+         \x20                       PNG, GIF, WebP, BMP as data: URLs) and videos (an animated GIF /\n\
+         \x20                       WebP, or a list of frames with their rate) in chat requests.\n\
+         \x20                       A model drafted by a block or an MTP drafter is served text\n\
+         \x20                       only (plain decode and DSpine run with image input)\n\
+         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in 16x16\n\
+         \x20                       patches (default: 4096 = 1024x1024 pixels). Larger images are\n\
+         \x20                       resized down to it; the tower's device memory grows with N^2\n\
+         \x20                       (160 bytes x N^2: 2.5 GiB at 4096, 10 GiB at 8192)\n\
+         \x20 --vision-max-tokens <N>  Image tokens one request may hold, all images and video\n\
+         \x20                       frames together (default: 16384; 10 KiB of device memory each)\n\
+         \x20 --model-vision <id=N|off>  The vision tower of model <id> instead of the two options\n\
+         \x20                       above: its largest image in patches, or off for text only\n\
          \x20 --fp8-act <id=file>   FP8 activation-scale table for FP8 model <id> (repeatable)\n\
          \x20 --fp8-cache <id=dir>  Cache directory for model <id>'s quantised FP8 matrices\n\
          \x20 --api-key <key>       Optional Bearer / X-Api-Key auth token\n\
@@ -193,7 +207,9 @@ fn print_usage() {
          \x20                       engine (compiling them on a recipe-cache miss) instead of inside\n\
          \x20                       the first request of each prompt length (default: 0 = first use)\n\
          \x20 --no-eos              Do not stop early on EOS token\n\
-         \x20 --image <file.ppm>    Image input, binary PPM (P6); repeatable, in prompt order\n\
+         \x20 --image <file>        Image input: JPEG, PNG, GIF (first frame), WebP, BMP or binary\n\
+         \x20                       PPM, decoded as the server decodes a request's image;\n\
+         \x20                       repeatable, in prompt order\n\
          \x20 --image-raw <WxH:f>   Image input, raw RGB8 file with explicit size; repeatable\n\
          \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in\n\
          \x20                       16x16 patches (default: the largest --image; larger images\n\
@@ -1608,12 +1624,16 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 .and_then(|d| d.parent().map(|p| p.join("queue.conf")))
         });
     let mut api_key: Option<String> = env::var("GAUDIUM_API_KEY").ok().filter(|s| !s.is_empty());
-    let mut a2ui = env::var("GAUDIUM_A2UI").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
+    let mut a2ui =
+        env::var("GAUDIUM_A2UI").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
     let mut verbose = false;
     let mut per_model: Vec<(String, ModelRunOptions)> = Vec::new();
     let mut draft_k: Vec<u64> = Vec::new();
     let mut build_cache = false;
     let mut build_cache_only: Vec<String> = Vec::new();
+    let mut vision = true;
+    let mut vision_max_patches = gaudium::server::DEFAULT_VISION_MAX_PATCHES;
+    let mut vision_max_tokens = gaudium::server::DEFAULT_VISION_MAX_TOKENS;
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -1686,6 +1706,36 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                             format!("--model-ctx expects <model id>=<tokens>, got '{raw}'")
                         })?,
                 );
+            }
+            "--no-vision" => vision = false,
+            "--vision-max-patches" => {
+                let s = next_val(&mut i, "--vision-max-patches")?;
+                vision_max_patches = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("invalid --vision-max-patches '{s}'"))?;
+            }
+            "--vision-max-tokens" => {
+                let s = next_val(&mut i, "--vision-max-tokens")?;
+                vision_max_tokens = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("invalid --vision-max-tokens '{s}'"))?;
+            }
+            "--model-vision" => {
+                let raw = next_val(&mut i, "--model-vision")?;
+                let (opts, v) = model_opt(&mut per_model, &raw, "--model-vision")?;
+                opts.vision_patches = Some(match v.to_str() {
+                    Some("off") => 0,
+                    other => other
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|&n| n > 0)
+                        .ok_or_else(|| {
+                            format!("--model-vision expects <model id>=<patches>|off, got '{raw}'")
+                        })?,
+                });
             }
             "--fp8-act" => {
                 let raw = next_val(&mut i, "--fp8-act")?;
@@ -1776,6 +1826,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         verbose,
         per_model,
         draft_k,
+        vision,
+        vision_max_patches,
+        vision_max_tokens,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {

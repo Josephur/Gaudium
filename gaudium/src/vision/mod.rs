@@ -1,7 +1,12 @@
-//! Image input for the Qwen3.5/3.8 vision-language family on Intel Gaudi 2.
+//! Image and video input for the Qwen3.5/3.8 vision-language family on Intel Gaudi 2.
 //!
-//! - `preprocess`: host image preparation (PPM / raw RGB8 in, smart resize, antialiased bicubic
-//!   resampling, normalisation, patch rows in 2x2 merge order, BF16).
+//! - `decode`: the crate's own image file decoders (JPEG, PNG, GIF, WebP, BMP), bit-exact with
+//!   the reference image processor's decoder; animations as frames.
+//! - `media`: the media of one request (images, animations, frame lists) from encoded bytes to
+//!   tower inputs: limits, video frame sampling and timing, prompt placeholders.
+//! - `preprocess`: host image preparation (RGB8 in, smart resize, antialiased bicubic
+//!   resampling, normalisation, patch rows in 2x2 merge order, BF16), for stills and for the
+//!   temporal patches of a video.
 //! - `mrope`: prompt layout (image-pad spans, interleaved M-RoPE positions) and the slot-indexed
 //!   RoPE table rows of a vision request. RoPE positions and KV slots diverge after an image.
 //! - `packer`: vision tower weights (BF16 / F32, `rotate_half` folded into extra q / k rows),
@@ -18,6 +23,8 @@ use std::path::Path;
 use crate::json::{parse_json, JsonValue};
 
 pub mod cli;
+pub mod decode;
+pub mod media;
 pub mod mrope;
 pub mod packer;
 pub mod preprocess;
@@ -56,6 +63,86 @@ pub struct VisionSpec {
     pub max_pixels: u64,
     pub image_mean: [f64; 3],
     pub image_std: [f64; 3],
+    /// The checkpoint's video processor settings; `None`: it takes no video.
+    pub video: Option<VideoSpec>,
+}
+
+/// Video processor settings of a checkpoint (`video_preprocessor_config.json`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoSpec {
+    /// Pixel budget of a whole video: frames x height x width of the resized frames.
+    pub min_pixels: u64,
+    pub max_pixels: u64,
+    /// Frames per second of video time the model is shown.
+    pub fps: f64,
+    /// Fewest and most frames kept of one video (never more than it has).
+    pub min_frames: u64,
+    pub max_frames: u64,
+}
+
+impl VideoSpec {
+    /// Reads `video_preprocessor_config.json`; a missing key keeps the processor's own default.
+    pub fn from_json(text: &str, vs: &VisionSpec) -> Result<Self, String> {
+        let p = parse_json(text).map_err(|e| format!("video_preprocessor_config.json: {e}"))?;
+        let mut v = Self {
+            min_pixels: 128 * 32 * 32,
+            max_pixels: 32 * 32 * 768,
+            fps: 2.0,
+            min_frames: 4,
+            max_frames: 768,
+        };
+        if let Some(size) = p.get("size") {
+            if let Some(x) = obj_u64(size, "shortest_edge") {
+                v.min_pixels = x;
+            }
+            if let Some(x) = obj_u64(size, "longest_edge") {
+                v.max_pixels = x;
+            }
+        }
+        if let Some(x) = obj_u64(&p, "min_pixels") {
+            v.min_pixels = x;
+        }
+        if let Some(x) = obj_u64(&p, "max_pixels") {
+            v.max_pixels = x;
+        }
+        if let Some(x) = p.get("fps").and_then(JsonValue::as_f64) {
+            v.fps = x;
+        }
+        if let Some(x) = obj_u64(&p, "min_frames") {
+            v.min_frames = x;
+        }
+        if let Some(x) = obj_u64(&p, "max_frames") {
+            v.max_frames = x;
+        }
+        for (key, model) in [
+            ("patch_size", vs.patch),
+            ("temporal_patch_size", vs.temporal),
+            ("merge_size", vs.merge),
+        ] {
+            if let Some(x) = obj_u64(&p, key) {
+                if x != model {
+                    return Err(format!(
+                        "video_preprocessor_config.json {key}={x} disagrees with vision_config ({model})"
+                    ));
+                }
+            }
+        }
+        for (key, model) in [("image_mean", vs.image_mean), ("image_std", vs.image_std)] {
+            if let Some(x) = obj_f64x3(&p, key) {
+                if x != model {
+                    return Err(format!(
+                        "video_preprocessor_config.json {key} differs from the image processor's"
+                    ));
+                }
+            }
+        }
+        if !(v.fps.is_finite() && v.fps > 0.0) || v.max_frames == 0 || v.max_pixels == 0 {
+            return Err(
+                "video_preprocessor_config.json: fps, max_frames and the pixel budget must be positive".into(),
+            );
+        }
+        Ok(v)
+    }
 }
 
 fn obj_u64(o: &JsonValue, key: &str) -> Option<u64> {
@@ -71,12 +158,20 @@ fn obj_f64x3(o: &JsonValue, key: &str) -> Option<[f64; 3]> {
 }
 
 impl VisionSpec {
-    /// Reads `config.json` (required) and `preprocessor_config.json` (optional) of a model dir.
+    /// Reads `config.json` (required), `preprocessor_config.json` (optional) and
+    /// `video_preprocessor_config.json` (optional: without it, or without a video pad token,
+    /// the checkpoint takes no video) of a model dir.
     pub fn from_model_dir(dir: &Path) -> Result<Self, String> {
         let cfg = std::fs::read_to_string(dir.join("config.json"))
             .map_err(|e| format!("read config.json: {e}"))?;
         let pre = std::fs::read_to_string(dir.join("preprocessor_config.json")).ok();
-        Self::from_json(&cfg, pre.as_deref())
+        let mut s = Self::from_json(&cfg, pre.as_deref())?;
+        if s.video_token_id >= 0 {
+            if let Ok(text) = std::fs::read_to_string(dir.join("video_preprocessor_config.json")) {
+                s.video = Some(VideoSpec::from_json(&text, &s)?);
+            }
+        }
+        Ok(s)
     }
 
     pub fn from_json(config_json: &str, preprocessor_json: Option<&str>) -> Result<Self, String> {
@@ -151,6 +246,7 @@ impl VisionSpec {
             max_pixels: 16_777_216,
             image_mean: [0.5; 3],
             image_std: [0.5; 3],
+            video: None,
         };
         if let Some(text) = preprocessor_json {
             let p = parse_json(text).map_err(|e| format!("preprocessor_config.json: {e}"))?;
@@ -336,8 +432,20 @@ pub(crate) mod test_util {
       "image_std": [0.5, 0.5, 0.5]
     }"#;
 
+    pub const QWEN38_27B_VIDEO_PREPROCESSOR: &str = r#"{
+      "size": {"longest_edge": 25165824, "shortest_edge": 4096},
+      "patch_size": 16,
+      "temporal_patch_size": 2,
+      "merge_size": 2,
+      "image_mean": [0.5, 0.5, 0.5],
+      "image_std": [0.5, 0.5, 0.5]
+    }"#;
+
     pub fn qwen38_vision_spec() -> super::VisionSpec {
-        super::VisionSpec::from_json(QWEN38_27B_CONFIG, Some(QWEN38_27B_PREPROCESSOR)).unwrap()
+        let mut s =
+            super::VisionSpec::from_json(QWEN38_27B_CONFIG, Some(QWEN38_27B_PREPROCESSOR)).unwrap();
+        s.video = Some(super::VideoSpec::from_json(QWEN38_27B_VIDEO_PREPROCESSOR, &s).unwrap());
+        s
     }
 }
 
@@ -369,6 +477,15 @@ mod tests {
         assert_eq!(s.mrope_section, [11, 11, 10]);
         assert_eq!((s.min_pixels, s.max_pixels), (65_536, 16_777_216));
         assert!(s.gelu_tanh);
+        // the video processor: its own pixel budget, the processor's defaults for the rest
+        let v = s.video.unwrap();
+        assert_eq!((v.min_pixels, v.max_pixels), (4_096, 25_165_824));
+        assert_eq!((v.fps, v.min_frames, v.max_frames), (2.0, 4, 768));
+        let bad = QWEN38_27B_VIDEO_PREPROCESSOR.replace("\"patch_size\": 16", "\"patch_size\": 14");
+        assert!(VideoSpec::from_json(&bad, &s).is_err());
+        assert!(VideoSpec::from_json(r#"{"fps": 0}"#, &s).is_err());
+        let d = VideoSpec::from_json("{}", &s).unwrap();
+        assert_eq!((d.min_pixels, d.max_pixels), (131_072, 786_432));
     }
 
     #[test]

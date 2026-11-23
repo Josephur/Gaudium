@@ -2,6 +2,8 @@
 // Pure (no DOM), unit-tested. A conversation is {id, title, root, ...}; messages are a map id -> node:
 //   {id, parent, children: [ids], active: childId|null, role: 'root'|'user'|'assistant', created, ...payload}
 
+import { videoPart } from './media.js';
+
 export function uid(prefix = 'm') {
   const r = (globalThis.crypto && crypto.getRandomValues) ? Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('') : Math.random().toString(16).slice(2);
   return `${prefix}_${Date.now().toString(36)}${r}`;
@@ -241,8 +243,9 @@ export function toolResultText(c) {
   return typeof c.result === 'string' ? c.result : JSON.stringify(c.result);
 }
 
-// user message content: plain text, or OpenAI parts when there are images or audio clips (images and PDF pages first, then the
-// clips as input_audio parts carrying their WAV, then the text, if any); text files and PDFs go in as text blocks
+// user message content: plain text, or OpenAI parts when there are images, videos or audio clips (images and PDF pages
+// first, then the videos, then the clips as input_audio parts carrying their WAV, then the text, if any); text files and
+// PDFs go in as text blocks
 export function userContent(m) {
   const atts = m.attachments || [];
   let text = m.content || '';
@@ -252,9 +255,11 @@ export function userContent(m) {
     text = text ? `${blocks}\n\n${text}` : blocks;
   }
   const imgs = atts.filter((a) => a.kind === 'image' && a.dataUrl).concat(...atts.filter((a) => a.kind === 'pdf' && a.pages).map((a) => a.pages.map((p) => ({ dataUrl: p }))));
+  const vids = atts.filter((a) => a.kind === 'video' && (a.animation ? a.dataUrl : a.frames && a.frames.length));
   const clips = atts.filter((a) => a.kind === 'audio' && a.dataUrl);
-  if (!imgs.length && !clips.length) return text;
+  if (!imgs.length && !vids.length && !clips.length) return text;
   return [...imgs.map((a) => ({ type: 'image_url', image_url: { url: a.dataUrl } })),
+    ...vids.map(videoPart),
     ...clips.map((a) => ({ type: 'input_audio', input_audio: { data: a.dataUrl.slice(a.dataUrl.indexOf(',') + 1), format: 'wav' } })),
     ...(text ? [{ type: 'text', text }] : [])];   // a message of only media is sent as only its media: no empty text part
 }

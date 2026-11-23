@@ -19,8 +19,10 @@ pub struct CliImages {
     pub images: Vec<PreparedImage>,
 }
 
-/// Loads `(is_raw, arg)` images (`--image file.ppm`, `--image-raw WxH:file`) and prepares them.
-/// With a patch cap, larger images are resized down to it. `None` when no image was given.
+/// Loads `(is_raw, arg)` images (`--image <file>`: JPEG, PNG, GIF, WebP, BMP or binary PPM,
+/// decoded by the crate's own decoders and turned by its EXIF orientation, exactly as the
+/// server decodes a request's image; `--image-raw WxH:file`) and prepares them. With a patch
+/// cap, larger images are resized down to it. `None` when no image was given.
 pub fn prepare_cli_images(
     model_dir: &Path,
     args: &[(bool, String)],
@@ -45,7 +47,16 @@ pub fn prepare_cli_images(
         let rgb = if *raw {
             RgbImage::load_raw_rgb(arg)?
         } else {
-            RgbImage::load_ppm(Path::new(arg))?
+            let bytes = std::fs::read(arg).map_err(|e| format!("read {arg}: {e}"))?;
+            let limits = crate::core::vision::MediaLimits::default();
+            limits
+                .check_bytes(bytes.len())
+                .map_err(|e| format!("{arg}: {e}"))?;
+            let decode_limits = crate::vision::decode::DecodeLimits {
+                max_pixels: limits.max_pixels,
+            };
+            crate::vision::decode::decode_image(&bytes, &decode_limits)
+                .map_err(|e| format!("{arg}: {e}"))?
         };
         images.push(prepare_image(&rgb, &spec).map_err(|e| format!("{arg}: {e}"))?);
     }

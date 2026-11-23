@@ -28,12 +28,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::core::budget::SequenceBudget;
 use crate::core::lifecycle::{can_switch_resident_model, RequestGuard};
 use crate::core::tool_calls::{finish_reason_name, generation_end, stop_reason_name, GenEnd};
+use crate::core::vision::{drafter_runs_with_vision, planned_image_tokens, MediaLimits};
 use crate::engine::qwen3::{Qwen3Config, Qwen3GenParams, KV_CHUNK};
 use crate::engine::{load_engine, GenEngine};
 use crate::json::{self, JsonValue};
 use crate::model_spec::{ModelFamily, ModelSpec};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use crate::verified::{BackendState, ReqEvent};
+use crate::vision::media::{MediaCounts, RequestMedia, VisionServe};
+use crate::vision::VisionSpec;
 
 mod a2ui;
 mod anthropic;
@@ -48,7 +51,14 @@ use outparse::{Delta, OutputFormat, OutputParser};
 use readout::{DrafterFacts, RunFacts, Timings};
 use stream_out::StreamOut;
 
-const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Largest request body. Images and video frames travel inside the request as base64.
+const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Server defaults of the vision tower (`--vision-max-patches`, `--vision-max-tokens`): images
+/// of up to 4096 patches (1024 x 1024 pixels; larger ones are resized down to it) and 16384
+/// image tokens per request.
+pub const DEFAULT_VISION_MAX_PATCHES: u64 = 4096;
+pub const DEFAULT_VISION_MAX_TOKENS: u64 = 16_384;
 
 #[derive(Debug, Clone)]
 pub struct ModelSpecEntry {
@@ -79,6 +89,13 @@ pub struct ServerConfig {
     pub per_model: Vec<(String, ModelRunOptions)>,
     /// Draft widths for models with a drafter (one value = fixed, several = adaptive).
     pub draft_k: Vec<u64>,
+    /// Load the vision tower of models that have one (image and video input).
+    pub vision: bool,
+    /// Largest image the vision tower is planned for, in patches (its device buffers grow with
+    /// the square of this); larger images are resized down to it.
+    pub vision_max_patches: u64,
+    /// Image tokens one request may hold (the tower's embedding buffer).
+    pub vision_max_tokens: u64,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -104,6 +121,9 @@ pub struct ModelRunOptions {
     pub fp8_act: Option<PathBuf>,
     /// Directory caching the quantised FP8 matrices.
     pub fp8_cache: Option<PathBuf>,
+    /// The vision tower of this model instead of the server-wide setting: its largest image in
+    /// patches, or 0 for no tower (text only).
+    pub vision_patches: Option<u64>,
 }
 
 struct RegisteredModel {
@@ -122,6 +142,8 @@ struct RegisteredModel {
     format: OutputFormat,
     /// Sampler settings of a request that names none: the model's own `generation_config.json`.
     gen_defaults: SamplerDefaults,
+    /// Image and video input: what the model's vision tower is loaded for. `None`: text only.
+    vision: Option<VisionServe>,
 }
 
 /// Sampler settings a request falls back to (temperature, top-k, top-p).
@@ -376,7 +398,7 @@ impl AppState {
                     checkpoint: dir.as_deref().and_then(dir_name),
                 }
             }),
-            vision: false,
+            vision: m.vision.is_some(),
             hbm_bytes: None,
         }
     }
@@ -461,7 +483,7 @@ impl AppState {
         let desc = self.model_desc_with(res_idx, &facts);
         let (greedy, sampled, loaded, greedy_only) = readout::method_set(facts.drafter.as_ref());
         format!(
-            "{{\"type\":\"hello\",\"backend\":\"engine\",\"model\":{},\"n_ctx\":{},\"vision\":false,\
+            "{{\"type\":\"hello\",\"backend\":\"engine\",\"model\":{},\"n_ctx\":{},\"vision\":{},\
              \"speculative\":{},\"precision\":{},\
              \"methods\":{{\"greedy\":{},\"sampled\":{},\"loaded\":{},\"greedy_only\":[{}]}},\
              \"engine_info\":{info},\"model_desc\":{desc},\
@@ -471,6 +493,7 @@ impl AppState {
              \"count_tokens\":\"/gaudium/count_tokens\",\"version\":1}}}}",
             jq(&m.id),
             m.max_ctx,
+            facts.vision,
             facts.drafter.is_some(),
             jq(readout::precision_word(&facts)),
             jq(&greedy),
@@ -528,13 +551,14 @@ impl AppState {
             };
             let is_res = s.resident_idx == Some(i) && matches!(s.lifecycle, Lifecycle::Ready(_));
             models_arr.push_str(&format!(
-                "{{\"id\":{},\"state\":{},\"resident\":{},\"running\":{},\"waiting\":{},\"n_ctx\":{},\"vision\":false,\"speculative\":{},\"precision\":{},\"greedy\":{},\"sampled\":{}}}",
+                "{{\"id\":{},\"state\":{},\"resident\":{},\"running\":{},\"waiting\":{},\"n_ctx\":{},\"vision\":{},\"speculative\":{},\"precision\":{},\"greedy\":{},\"sampled\":{}}}",
                 jq(&m.id),
                 jq(mstate),
                 is_res,
                 if is_res { active_reqs } else { 0 },
                 s.waiting.get(i).copied().unwrap_or(0),
                 m.max_ctx,
+                m.vision.is_some(),
                 per_model[i].0,
                 jq(per_model[i].1),
                 jq(&per_model[i].2),
@@ -698,13 +722,40 @@ impl AppState {
         let (d_temp, d_top_k, d_top_p) = (gd.temperature, gd.top_k, gd.top_p);
         // tools reach the model through its own chat template
         let tools = m.chat.as_ref().is_some_and(|t| t.supports_tools);
+        // what a request's images and videos must fit (the Web UI sizes its estimates by it)
+        let vision = m.vision.is_some();
+        let video = m.vision.as_ref().is_some_and(|v| v.spec.video.is_some());
+        let vision_limits = match &m.vision {
+            Some(v) => format!(
+                "{{\"max_patches\":{},\"max_tokens\":{},\"patch\":{},\"merge\":{},\"min_pixels\":{},\
+                 \"max_pixels\":{},\"max_file_bytes\":{},\"max_items\":{},\"max_request_bytes\":{},\"video\":{}}}",
+                v.max_patches,
+                v.max_tokens,
+                v.spec.patch,
+                v.spec.merge,
+                v.spec.min_pixels,
+                v.spec.max_pixels,
+                v.limits.max_bytes,
+                v.limits.max_items,
+                MAX_REQUEST_BODY_BYTES,
+                match v.spec.video {
+                    Some(x) => format!(
+                        "{{\"fps\":{},\"min_frames\":{},\"max_frames\":{},\"min_pixels\":{},\"max_pixels\":{}}}",
+                        x.fps, x.min_frames, x.max_frames, x.min_pixels, x.max_pixels
+                    ),
+                    None => "null".into(),
+                },
+            ),
+            None => "null".into(),
+        };
         let mut out = format!(
             "{{\"default_generation_settings\":{{\"n_ctx\":{},\"params\":{{\"seed\":-1,\"temperature\":{d_temp},\
              \"top_k\":{d_top_k},\"top_p\":{d_top_p},\"min_p\":0.0,\"max_tokens\":-1,\"n_predict\":-1,\"stream\":false,\
              \"timings_per_token\":false,\"reasoning_format\":\"auto\",\"speculative\":{speculative},\
              \"samplers\":[\"top_k\",\"top_p\",\"min_p\",\"temperature\"]}}}},\
              \"total_slots\":1,\"model_alias\":{},\"model_path\":{},\
-             \"modalities\":{{\"vision\":false,\"audio\":false,\"video\":false}},\
+             \"modalities\":{{\"vision\":{vision},\"audio\":false,\"video\":{video}}},\
+             \"vision\":{vision_limits},\
              \"endpoint_slots\":true,\"endpoint_props\":false,\"endpoint_metrics\":false,\"ui\":{},\
              \"ui_settings\":{{}},\"chat_template\":\"qwen3\",\
              \"chat_template_caps\":{{\"supports_string_content\":true,\"supports_typed_content\":true,\
@@ -822,6 +873,14 @@ impl AppState {
                 Ok(())
             }
             Err(e) => {
+                // a plan that does not fit says what the tower takes of it
+                let e = match (&m.vision, e.contains("HBM")) {
+                    (Some(v), true) => format!(
+                        "{e} (this model is loaded with a vision tower for images of {} patches: a smaller --model-vision {}=<patches>, or =off, needs less device memory)",
+                        v.max_patches, m.id
+                    ),
+                    _ => e,
+                };
                 let mut s = self.slot.lock().unwrap();
                 s.engine = None;
                 s.facts = None;
@@ -907,9 +966,70 @@ fn served_max_ctx(cfg: &ServerConfig, id: &str, dir: &Path) -> u64 {
             .iter()
             .find(|(k, _)| k == id)
             .and_then(|(_, o)| o.max_ctx)
-            .map_or(max_ctx, |c| crate::verified::align_up(c.max(KV_CHUNK), KV_CHUNK)),
+            .map_or(max_ctx, |c| {
+                crate::verified::align_up(c.max(KV_CHUNK), KV_CHUNK)
+            }),
         dir,
     )
+}
+
+/// The vision tower the served model `id` is loaded with: `(largest image in patches, image
+/// tokens per request)`, or `None` for text only. A model has a tower when its checkpoint has
+/// one, its engine runs it (the Qwen3.5 / 3.8 family), its drafter is one that runs with image
+/// input (the verified `vis_drafter_ok`), and neither `--no-vision` nor the model's own
+/// `--model-vision <id>=off` turned it off. The token count is held to the context.
+fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Option<(u64, u64)> {
+    let own = cfg
+        .per_model
+        .iter()
+        .find(|(k, _)| k == id)
+        .and_then(|(_, o)| o.vision_patches);
+    let patches = match own {
+        Some(p) => p,
+        None if cfg.vision => cfg.vision_max_patches,
+        None => 0,
+    };
+    if patches == 0 {
+        return None;
+    }
+    let spec = ModelSpec::from_config_file(dir.join("config.json")).ok()?;
+    let runs_tower = matches!(
+        spec.family,
+        ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
+    );
+    if !(spec.has_vision && runs_tower) {
+        return None;
+    }
+    let drafter = planned_drafter_of(cfg, id).map(|(_, kind, _)| kind);
+    if !drafter_runs_with_vision(drafter) {
+        return None;
+    }
+    let tokens = planned_image_tokens(
+        cfg.vision_max_tokens,
+        crate::core::budget::advertised_served_ctx(max_ctx),
+    );
+    (tokens > 0).then_some((patches, tokens))
+}
+
+/// What requests to the served model `id` may carry as images and videos (`None`: text only).
+/// An error is a configuration the tower cannot be loaded with.
+fn vision_serve_of(
+    cfg: &ServerConfig,
+    id: &str,
+    dir: &Path,
+    max_ctx: u64,
+) -> Result<Option<VisionServe>, String> {
+    let Some((patches, tokens)) = vision_plan_of(cfg, id, dir, max_ctx) else {
+        return Ok(None);
+    };
+    let spec = VisionSpec::from_model_dir(dir)?;
+    let ppt = spec.patches_per_token();
+    if !patches.is_multiple_of(ppt) {
+        return Err(format!(
+            "the largest image ({patches} patches) must be a multiple of {ppt} patches"
+        ));
+    }
+    VisionServe::new(spec, patches, tokens, MediaLimits::default()).map(Some)
 }
 
 /// The engine configuration the served model `id` is loaded with, and its drafter checkpoint.
@@ -927,6 +1047,18 @@ fn engine_config_of(
     qcfg.cache_dir = cfg.cache_dir.clone();
     qcfg.no_cache = cfg.no_cache;
     qcfg.verbose = cfg.verbose;
+    if let Some((patches, tokens)) = vision_plan_of(cfg, id, dir, max_ctx) {
+        // The tower's buffers are planned for the largest image. Its recipes are compiled at
+        // load for that size (so the shared workspace covers them); other image sizes compile
+        // on their first use and stay in the recipe cache.
+        qcfg.vision_max_patches = patches;
+        qcfg.vision_max_tokens = tokens;
+        qcfg.vision_precompile = vec![patches];
+        // `--build-cache` also compiles the sizes that usual pictures come to
+        if let Ok(Some(serve)) = vision_serve_of(cfg, id, dir, max_ctx) {
+            qcfg.vision_cache_sizes = serve.common_patch_counts();
+        }
+    }
     if let Some((_, opts)) = cfg.per_model.iter().find(|(k, _)| k == id) {
         qcfg.fp8_act = opts.fp8_act.clone();
         qcfg.fp8_cache = opts.fp8_cache.clone();
@@ -964,14 +1096,26 @@ pub fn build_cache(cfg: &ServerConfig, only: &[String]) -> Result<(), String> {
     if cfg.models.is_empty() {
         return Err("at least one --model <dir> is required for --serve --build-cache".into());
     }
-    if let Some(id) = only.iter().find(|o| !cfg.models.iter().any(|m| &m.id == *o)) {
-        return Err(format!("--build-cache-only '{id}': no --model with that id"));
+    if let Some(id) = only
+        .iter()
+        .find(|o| !cfg.models.iter().any(|m| &m.id == *o))
+    {
+        return Err(format!(
+            "--build-cache-only '{id}': no --model with that id"
+        ));
     }
     let mut failed: Vec<String> = Vec::new();
-    for entry in cfg.models.iter().filter(|m| only.is_empty() || only.contains(&m.id)) {
+    for entry in cfg
+        .models
+        .iter()
+        .filter(|m| only.is_empty() || only.contains(&m.id))
+    {
         let max_ctx = served_max_ctx(cfg, &entry.id, &entry.dir);
         let (qcfg, _) = engine_config_of(cfg, &entry.id, &entry.dir, max_ctx);
-        eprintln!("[server] build-cache: model '{}' at context {max_ctx}", entry.id);
+        eprintln!(
+            "[server] build-cache: model '{}' at context {max_ctx}",
+            entry.id
+        );
         let family = ModelSpec::from_config_file(entry.dir.join("config.json"))
             .map(|s| s.family)
             .map_err(|e| format!("load config.json for '{}': {e}", entry.id))?;
@@ -1055,6 +1199,34 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             Some(t) => t.format.clone(),
             None => builtin_format(spec.family),
         };
+        // `--max-ctx` (or the model's own `--model-ctx`), clamped to the model's own limit.
+        let max_ctx = served_max_ctx(&cfg, &entry.id, &entry.dir);
+        let vision = vision_serve_of(&cfg, &entry.id, &entry.dir, max_ctx)
+            .map_err(|e| format!("vision input of '{}': {e}", entry.id))?;
+        let runs_tower = matches!(
+            spec.family,
+            ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
+        );
+        if vision.is_none() && spec.has_vision && runs_tower && cfg.vision {
+            if let Some((_, kind, _)) =
+                planned_drafter_of(&cfg, &entry.id).filter(|d| !drafter_runs_with_vision(Some(d.1)))
+            {
+                eprintln!(
+                    "[server] model '{}': served text only: its {kind} drafter is not validated with image input (plain decode and DSpine are)",
+                    entry.id
+                );
+            }
+        }
+        if let Some(v) = &vision {
+            eprintln!(
+                "[server] model '{}': image{} input, images up to {} patches ({} pixels), {} image tokens per request",
+                entry.id,
+                if v.spec.video.is_some() { " and video" } else { "" },
+                v.max_patches,
+                v.spec.max_pixels,
+                v.max_tokens,
+            );
+        }
         models.push(RegisteredModel {
             id: entry.id.clone(),
             dir: entry.dir.clone(),
@@ -1063,8 +1235,8 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             format,
             tokenizer: Arc::new(tok),
             extra_eos_ids,
-            // `--max-ctx` (or the model's own `--model-ctx`), clamped to the model's own limit.
-            max_ctx: served_max_ctx(&cfg, &entry.id, &entry.dir),
+            max_ctx,
+            vision,
             gen_defaults: std::fs::read_to_string(entry.dir.join("generation_config.json"))
                 .map(|t| SamplerDefaults::from_generation_config(&t))
                 .unwrap_or(SamplerDefaults::FALLBACK),
@@ -1707,19 +1879,34 @@ fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut TcpStre
             return;
         }
     };
-    let ids = m.tokenizer.encode(&prompt.text, true);
+    // image and video sizes come from the files' headers: no pixels are decoded for a count
+    let (ids, media) = match tokenize_prompt(m, &prompt, false) {
+        Ok(x) => x,
+        Err(e) => {
+            write_error(stream, 400, "invalid_request_error", &e);
+            return;
+        }
+    };
     let n_prompt = ids.len() as u64;
     let req_max = val.get("max_tokens").and_then(|v| v.as_u64());
     let (fits, max_tokens) = match SequenceBudget::admit(n_prompt, req_max, m.max_ctx) {
         Ok(b) => (true, b.max_new()),
         Err(_) => (false, 0),
     };
+    let c = media.map(|md| md.counts()).unwrap_or_default();
+    // `return_tokens`: the prompt's token ids too (the ids a chat request with this body runs)
+    let tokens = if val.get("return_tokens").and_then(|v| v.as_bool()) == Some(true) {
+        format!(",\"tokens\":{}", ids_json(&ids))
+    } else {
+        String::new()
+    };
     write_json(
         stream,
         200,
         &format!(
-            "{{\"n_prompt_tokens\":{n_prompt},\"n_ctx\":{},\"max_tokens\":{max_tokens},\"fits\":{fits}}}",
-            m.max_ctx
+            "{{\"n_prompt_tokens\":{n_prompt},\"n_ctx\":{},\"max_tokens\":{max_tokens},\"fits\":{fits},\
+             \"images\":{},\"videos\":{},\"image_tokens\":{}{tokens}}}",
+            m.max_ctx, c.images, c.videos, c.tokens
         ),
     );
 }
@@ -1971,6 +2158,11 @@ fn render_prompt(m: &RegisteredModel, body: &JsonValue) -> Result<ChatPrompt, St
     if let Some(t) = &m.chat {
         return chat::render_chat(t, body);
     }
+    if chat::has_media_parts(body) {
+        return Err(
+            "this model has no chat template, and the built-in text template takes no images or videos".into(),
+        );
+    }
     let text = build_model_chat_prompt(m, body, m.spec.family == ModelFamily::Qwen35Dense)?;
     let reasoning_open = match (
         text.rfind(&m.format.think_open),
@@ -1996,7 +2188,33 @@ fn render_prompt(m: &RegisteredModel, body: &JsonValue) -> Result<ChatPrompt, St
         single_call: false,
         continue_final: false,
         ignored,
+        media: Vec::new(),
     })
+}
+
+/// The token ids of a rendered prompt and its prepared images and videos. Each video is written
+/// into the text as its timed temporal patches first; after tokenising, every image / video pad
+/// is expanded to its tower input's token count. `with_pixels` false computes sizes only (a
+/// token count without decoding pixels).
+fn tokenize_prompt(
+    m: &RegisteredModel,
+    prompt: &ChatPrompt,
+    with_pixels: bool,
+) -> Result<(Vec<i32>, Option<RequestMedia>), String> {
+    if prompt.media.is_empty() {
+        return Ok((m.tokenizer.encode(&prompt.text, true), None));
+    }
+    let Some(serve) = &m.vision else {
+        return Err(if m.spec.has_vision {
+            "this model is served without its vision tower (text only)".to_string()
+        } else {
+            "this model takes no images or videos (text only)".to_string()
+        });
+    };
+    let media = RequestMedia::prepare(&prompt.media, serve, with_pixels)?;
+    let text = media.expand_text(&prompt.text)?;
+    let ids = media.expand_ids(&m.tokenizer.encode(&text, true), &serve.spec)?;
+    Ok((ids, Some(media)))
 }
 
 fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
@@ -2044,7 +2262,8 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut TcpSt
     };
     let rendered = anthropic::translate(&val).and_then(|t| {
         let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
-        prepare_prompt(state.cfg.a2ui, m, &t.chat).map(|p| m.tokenizer.encode(&p.text, true).len())
+        let p = prepare_prompt(state.cfg.a2ui, m, &t.chat)?;
+        tokenize_prompt(m, &p, false).map(|(ids, _)| ids.len())
     });
     match rendered {
         Ok(n) => write_json(stream, 200, &format!("{{\"input_tokens\":{n}}}")),
@@ -2086,7 +2305,18 @@ fn run_chat(
         }
     };
     ignored.extend(prompt.ignored.iter().cloned());
-    let prompt_ids = m.tokenizer.encode(&prompt.text, true);
+    // Images and videos are decoded and prepared here, on the request's own thread, before the
+    // request waits for the card.
+    let (prompt_ids, media) = match tokenize_prompt(m, &prompt, true) {
+        Ok(x) => x,
+        Err(e) => {
+            api.error(stream, 400, "invalid_request_error", &e);
+            return;
+        }
+    };
+    let media_counts: MediaCounts = media.as_ref().map(|md| md.counts()).unwrap_or_default();
+    let media_host_ms = media.as_ref().map_or(0.0, |md| md.host_ms);
+    let n_images = media_counts.images + media_counts.videos;
     let n_prompt = prompt_ids.len() as u64;
     let stream_mode = val.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     // `reasoning_format: "none"` leaves the reasoning in the content
@@ -2188,7 +2418,7 @@ fn run_chat(
     let req_base = |phase: &str, queued_ms: f64| {
         format!(
             "\"type\":\"request\",\"job\":{req_num},\"phase\":{},\"background\":false,\
-             \"method\":{},\"greedy\":{is_greedy},\"prompt_tokens\":{n_prompt},\"images\":0,\
+             \"method\":{},\"greedy\":{is_greedy},\"prompt_tokens\":{n_prompt},\"images\":{n_images},\
              \"max_new\":{max_new},\"queued_ms\":{queued_ms:.1}",
             jq(phase),
             jq(&method),
@@ -2363,7 +2593,12 @@ fn run_chat(
     }
 
     let mut last_live_pub = Instant::now();
-    let report =
+    // The request's tower inputs go to the engine first; it runs the tower inside its prefill.
+    let images_set = match media {
+        Some(md) => engine.set_request_images(md.into_tower_inputs()),
+        None => Ok(()),
+    };
+    let report = images_set.and_then(|()| {
         engine.generate_cancellable(&prompt_ids, &params, Some(&cancel_flag), &mut |tok_id| {
             let piece = if tok_ref.is_special(tok_id) {
                 // a special token is text only when it is part of the family's tags
@@ -2415,10 +2650,13 @@ fn run_chat(
                 ));
                 }
             }
-        });
+        })
+    });
     if let Some(h) = &live {
         h.set_launch_sink(None);
     }
+    // the tower's own timings of this request (kept apart from the decoder's prefill)
+    let vision_report = engine.last_vision_report().filter(|_| n_images > 0);
 
     // Return engine cleanly to slot & decrement active counter!
     {
@@ -2544,6 +2782,21 @@ fn run_chat(
             }
             if has_calls {
                 details.push_str(&format!(",\"tool_calls\":{}", parser.tool_calls().len()));
+            }
+            if n_images > 0 {
+                details.push_str(&format!(
+                    ",\"vision\":{}",
+                    readout::vision_section_json(
+                        &media_counts,
+                        media_host_ms,
+                        vision_report.as_ref(),
+                        rep.ttft_ms,
+                    )
+                ));
+            }
+            // `gaudium_return_tokens`: the generated token ids (exactness checks between runs)
+            if val.get("gaudium_return_tokens").and_then(|v| v.as_bool()) == Some(true) {
+                details.push_str(&format!(",\"tokens\":{}", ids_json(&rep.generated_tokens)));
             }
             if !ignored.is_empty() {
                 details.push_str(&format!(
@@ -2870,6 +3123,12 @@ fn extract_message_text(content: Option<&JsonValue>) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Token ids as a JSON array.
+fn ids_json(ids: &[i32]) -> String {
+    let list: Vec<String> = ids.iter().map(|x| x.to_string()).collect();
+    format!("[{}]", list.join(","))
 }
 
 fn jq(s: &str) -> String {

@@ -10,6 +10,9 @@ export const DEFAULTS = {
   method: 'default',          // gaudium_method: default (greedy -> engine greedy default, sampled -> sampled default) or a loaded run
   sendReasoning: true,        // send earlier turns' reasoning back (the template re-renders it; prefix reuse matches)
   pdfMode: 'text',            // text | images
+  videoFps: 2,                // frames per second of video time drawn from an attached video file (the model's own rate is 2)
+  videoMaxFrames: 64,         // at most this many frames of one video file (a longer video is sampled more thinly)
+  videoMaxSide: 768,          // the longer side of a drawn frame in pixels (0 = the video's own size)
   pasteToFile: 2500,          // pasted text longer than this becomes a text attachment (0 = never)
   telemetry: true,            // the live strip under a streaming reply
   builtinTools: true,         // get_datetime

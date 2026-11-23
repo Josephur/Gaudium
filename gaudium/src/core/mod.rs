@@ -8,3 +8,4 @@ pub mod kv_pool;
 pub mod lifecycle;
 pub mod shapes;
 pub mod tool_calls;
+pub mod vision;

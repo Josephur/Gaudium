@@ -129,7 +129,7 @@ export function finalStats(seg) {
     accept: t.draft_n > 0 ? (t.draft_n_accepted || 0) / t.draft_n : null,
     msPerStep: g.ms_per_step || (t.launches > 0 ? t.predicted_ms / t.launches : null),
     switchStep: g.switch_step != null && g.switch_step >= 0 ? g.switch_step : null,
-    vitMs: g.vit_ms || null, prefixReuse: prefix ? prefix.reuse : null, prefixVitSkipped: prefix ? prefix.vit_skipped : null,
+    vitMs: g.vit_ms || (g.vision && g.vision.tower_ms) || null, vision: g.vision || null, prefixReuse: prefix ? prefix.reuse : null, prefixVitSkipped: prefix ? prefix.vit_skipped : null,
     steps,
   };
 }

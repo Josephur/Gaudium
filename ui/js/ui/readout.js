@@ -187,7 +187,7 @@ export function Readout({ mode, st, info, switchStep, rec, steps, sampling, note
       <span><b>${fmtInt(st.n)}</b> tokens in ${fmtMs(st.ms)}</span>
       ${st.waitMs > 800 ? html`<span title="Time the request waited for the card before the engine took it">waited ${fmtMs(st.waitMs)} for the card</span>` : null}
       <span><b>${fmtInt(st.launches)}</b> launches${st.msPerStep ? ` · ${fmt1(st.msPerStep)} ms each` : ''}</span>
-      ${st.vitMs ? html`<span>vision tower ${fmtMs(st.vitMs)}</span>` : null}
+      ${st.vision ? html`<span title=${visionTitle(st.vision)}>${visionText(st.vision)}</span>` : st.vitMs ? html`<span>vision tower ${fmtMs(st.vitMs)}</span>` : null}
       ${prof && prof.split_basis && mode === 'past' ? html`<span title=${prof.split_basis}>split: modelled from HBM bytes</span>` : null}
     </div>
     ${cover ? html`<div class="ro-cover">${cover}</div>` : null}
@@ -221,3 +221,16 @@ export function WarmUp({ engine, receivedAt, now }) {
 }
 
 export { methodInfo };
+
+// The request's images and videos in the readout's foot: what the tower was given and how long it took.
+function visionText(v) {
+  const what = [v.images ? `${fmtInt(v.images)} image${v.images > 1 ? 's' : ''}` : null, v.videos ? `${fmtInt(v.videos)} video${v.videos > 1 ? 's' : ''} (${fmtInt(v.frames)} frames)` : null].filter(Boolean).join(' + ');
+  return html`${what}: <b>${fmtInt(v.tokens)}</b> tokens${v.tower_ms != null ? html` · tower ${fmtMs(v.tower_ms)}` : null}${v.compile_ms > 1 ? html` · recipes ${fmtMs(v.compile_ms)}` : null}`;
+}
+function visionTitle(v) {
+  const lines = [`${fmtInt(v.inputs)} tower input${v.inputs > 1 ? 's' : ''}, ${fmtInt(v.patches)} patches, ${fmtInt(v.tokens)} image tokens`,
+    `decoded and prepared on the host in ${fmtMs(v.host_ms)} (before the request took the card)`];
+  if (v.tower_ms != null) lines.push(`inside the prefill: upload ${fmtMs(v.upload_ms)}, vision tower ${fmtMs(v.tower_ms)}, position rows ${fmtMs(v.rope_ms)}${v.compile_ms > 1 ? `, recipes for a new image size ${fmtMs(v.compile_ms)}` : ''}`);
+  if (v.text_prefill_ms != null) lines.push(`prefill without the vision part: ${fmtMs(v.text_prefill_ms)}`);
+  return lines.join('\n');
+}
