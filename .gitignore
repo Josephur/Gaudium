@@ -54,6 +54,7 @@ build/
 .benchportal/
 .deep/
 .wt/
+.worktrees/
 habana_logs/
 synapse_log*
 *.log

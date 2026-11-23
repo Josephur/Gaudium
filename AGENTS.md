@@ -182,3 +182,16 @@ When card testing is complete, leave the server running for the user with this c
 - **A2UI:** on (`--a2ui`).
 
 Before ending the session, confirm that the server is up and answers a request from the Web UI. If any of these features cannot be turned on yet, say which one in the hand-off rather than leaving a different configuration silently.
+
+---
+
+## 12. Every Change Lands Through a Pull Request
+
+`main` moves only by merging pull requests. This holds for every change by every author, including one-line fixes and documentation.
+
+- **One task, one branch, one PR.** Start each task on a new branch from the latest `main`, in a git worktree of its own under `.worktrees/` (`git worktree add .worktrees/<name> -b <type>/<name> origin/main`). Never edit files in the main checkout, never commit on `main`, and never put two unrelated tasks on one branch.
+- **Name the issue.** The PR description says which issue the change belongs to: `Closes #N` when it meets everything the issue asks for, `Refs #N` when it is a part. Work without an issue gets one first, or one line in the PR on why none is needed.
+- **Green before it is opened for review.** `BEND_VERDICT=require cargo check`, `cargo test` and the Web UI tests (`node --test test/` in `ui/`) pass on the branch. The description carries the hand-off of section 3a (laws added, the Rust call sites that use them, what stayed in the shell and why), says whether `rusty-bends.lock` changed, and gives card measurements with their configuration when the change claims any (section 7).
+- **Squash merge, then clean up.** A PR merges as one commit once its checks pass and the user has approved it. At merge its branch is deleted and its worktree removed (`git worktree remove`).
+- **Nothing is left uncommitted.** At the end of a session everything it wrote is committed and pushed on its branch; unfinished work is a draft PR that says what is missing. A task that is given up has its PR closed with a note and its worktree removed.
+- **Two tasks, one file.** The task that merges second rebases onto `main` and runs the checks again before it merges.
