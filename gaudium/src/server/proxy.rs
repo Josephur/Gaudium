@@ -885,9 +885,9 @@ impl McpProxy {
     pub fn new(opts: &ProxyOptions, keyed: bool) -> Result<McpProxy, String> {
         let allow = parse_entries("--mcp-proxy-allow", &opts.allow)?;
         let allow_private = parse_entries("--mcp-proxy-allow-private", &opts.allow_private)?;
-        if allow_private.iter().any(|e| e.pat == Pattern::Any) {
+        if allow_private.iter().any(Entry::is_open) {
             return Err(
-                "--mcp-proxy-allow-private '*': name the private targets (hosts, addresses or ranges); every private address at once is not accepted"
+                "--mcp-proxy-allow-private with '*' or a /0 range: name the private targets (hosts, addresses or ranges); every private address at once is not accepted"
                     .into(),
             );
         }

@@ -80,6 +80,17 @@ ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat
 72939e08483e2782  live_write_forced_not_deferred  law live_write_forced_not_deferred : for has_writer : Bool { lw_is_defer ( live_write_route ( has_writer , True { } ) ) == False { } : Bool }
 2e68cb9c0d45b0de  live_write_no_writer_no_defer  law live_write_no_writer_no_defer : for force : Bool { lw_is_defer ( live_write_route ( False { } , force ) ) == False { } : Bool }
 37c4cba4beb87a11  live_write_off_the_caller  law live_write_off_the_caller : for force : Bool { lw_is_inline ( live_write_route ( True { } , force ) ) == False { } : Bool }
+1d7a0b64d1763db8  ls_hello_byte_recognised  law ls_hello_byte_recognised : { ls_is_hello ( 22n ) == True { } : Bool }
+e0bc2b3a6b6233d4  ls_hello_never_plain  law ls_hello_never_plain : for + t : Bool { ls_proto_is_plain ( ls_proto ( True { } , t ) ) == False { } : Bool }
+bc58a58ba0b50f25  ls_no_tls_without_listener  law ls_no_tls_without_listener : for + h : Bool { ls_proto_is_tls ( ls_proto ( h , False { } ) ) == False { } : Bool }
+72cff5c8c40f4989  ls_plain_never_handshakes  law ls_plain_never_handshakes : for t : Bool { ls_proto_is_tls ( ls_proto ( False { } , t ) ) == False { } : Bool }
+4cc1cd7957044300  ls_start_asked_never_silent  law ls_start_asked_never_silent : for + l : Bool for + f : Bool { Bool.or ( ls_start_serves_tls ( ls_start ( True { } , True { } , l , f ) ) , Bool.or ( ls_start_refuses ( ls_start ( True { } , True { } , l , f ) ) , ls_start_warns ( ls_start ( True { } , True { } , l , f ) ) ) ) == True { } : Bool }
+d7ddac32019087d5  ls_start_cert_alone_never_serves  law ls_start_cert_alone_never_serves : for l : Bool for f : Bool { ls_start_serves_tls ( ls_start ( True { } , False { } , l , f ) ) == False { } : Bool }
+0898c9a43b327758  ls_start_key_alone_never_serves  law ls_start_key_alone_never_serves : for l : Bool for f : Bool { ls_start_serves_tls ( ls_start ( False { } , True { } , l , f ) ) == False { } : Bool }
+2ab513c50d0b399c  ls_start_needs_good_files  law ls_start_needs_good_files : for + c : Bool for + k : Bool for + l : Bool { ls_start_serves_tls ( ls_start ( c , k , l , False { } ) ) == False { } : Bool }
+3dab07e66c425e4f  ls_start_needs_library  law ls_start_needs_library : for + c : Bool for + k : Bool for f : Bool { ls_start_serves_tls ( ls_start ( c , k , False { } , f ) ) == False { } : Bool }
+a07804e4088df0fd  ls_start_off_without_files  law ls_start_off_without_files : for l : Bool for f : Bool { ls_start ( False { } , False { } , l , f ) == LsStOff { } : LsStart }
+6342ac690f2c6c42  ls_start_serve_xor_refuse  law ls_start_serve_xor_refuse : for + s : LsStart { Bool.and ( ls_start_serves_tls ( s ) , ls_start_refuses ( s ) ) == False { } : Bool }
 9c50354edb3ef860  media_count_over_refused  law media_count_over_refused : for + m : Nat for + extra : Nat { media_count_ok ( Nat.add ( 1n + m , extra ) , m ) == False { } : Bool }
 b78d879fb880f84b  media_empty_refused  law media_empty_refused : for m : Nat { media_bytes_ok ( 0n , m ) == False { } : Bool }
 1fc661db6e325264  media_inline_always_allowed  law media_inline_always_allowed : for a : Bool { media_source_allowed ( MsInline { } , a ) == True { } : Bool }
@@ -141,6 +152,65 @@ f37e1ea922e84f0b  pool_init_conserved  law pool_init_conserved : for cap : Nat {
 4eccdf8143fa6c1e  pool_oob_block_rejected  law pool_oob_block_rejected : for + cap : Nat for + extra : Nat { pool_block_in_bounds ( Nat.add ( cap , extra ) , cap ) == False { } : Bool }
 59241ade773e071d  pool_oom_alloc_noop  law pool_oom_alloc_noop : for + a : Nat for + f : Nat for + extra : Nat { pool_alloc ( PoolAcct { a , f } , Nat.add ( f , 1n + extra ) ) == PoolAcct { a , f } : PoolAcct }
 e7c4808878bc6e78  pool_pinned_never_evicted  law pool_pinned_never_evicted : for p : Nat for busy : Bool { pool_can_evict ( 1n + p , busy ) == False { } : Bool }
+35e4862c66780f18  px_bound_header_stays_with_origin  law px_bound_header_stays_with_origin : for + p : Bool { px_req_header_goes ( p , PxRhBound { } , False { } ) == False { } : Bool }
+9ea3408d820ceba8  px_cap_zero_refused  law px_cap_zero_refused : for m : Nat { px_cap_ok ( 0n , m ) == False { } : Bool }
+a3addbdf3b41fa93  px_check_within_addr_ok  law px_check_within_addr_ok : for + m : PxMatch for + r : Bool for + c : PxAddrClass for + l : Bool { Bool.or ( px_addr_ok ( c , l ) , Bool.not ( px_addr_passes ( px_addr_check ( m , r , c , l ) ) ) ) == True { } : Bool }
+02b927ba52f907fb  px_framing_never_forwarded  law px_framing_never_forwarded : for + p : Bool for o : Bool { px_req_header_goes ( p , PxRhFraming { } , o ) == False { } : Bool }
+8b49a9f3252e6d02  px_gate_foreign_never_runs  law px_gate_foreign_never_runs : for + k : Bool for + e : Bool for m : Bool { px_gate_runs ( px_gate ( k , e , False { } , m ) ) == False { } : Bool }
+db773639491c5a20  px_gate_method_never_runs  law px_gate_method_never_runs : for + k : Bool for + e : Bool for + s : Bool { px_gate_runs ( px_gate ( k , e , s , False { } ) ) == False { } : Bool }
+0f901cc3c4394291  px_gate_needs_key  law px_gate_needs_key : for e : Bool for s : Bool for m : Bool { px_gate_runs ( px_gate ( False { } , e , s , m ) ) == False { } : Bool }
+495fe892c0fd0a3a  px_gate_off_never_runs  law px_gate_off_never_runs : for + k : Bool for s : Bool for m : Bool { px_gate_runs ( px_gate ( k , False { } , s , m ) ) == False { } : Bool }
+cfc7b72468abb316  px_join_all_must_pass  law px_join_all_must_pass : for + a : PxAddr for + n : PxAddr { px_addr_passes ( px_addr_join ( a , n ) ) == Bool.and ( px_addr_passes ( a ) , px_addr_passes ( n ) ) : Bool }
+477e277c8c489d28  px_keepalive_never_mid_line  law px_keepalive_never_mid_line : for + s : Bool for q : Nat for e : Nat { px_keepalive_due ( s , False { } , q , e ) == False { } : Bool }
+69e3e98a9de7c23b  px_keepalive_only_event_stream  law px_keepalive_only_event_stream : for l : Bool for q : Nat for e : Nat { px_keepalive_due ( False { } , l , q , e ) == False { } : Bool }
+c5b05a6ed036fde3  px_keepalive_wait_within_interval  law px_keepalive_wait_within_interval : for + s : Bool for + l : Bool for + q : Nat for + e : Nat { Nat.is_le ( px_keepalive_wait ( s , l , q , e ) , e ) == True { } : Bool }
+b6e1470d1a9886f4  px_net_bits_run_out  law px_net_bits_run_out : for i : Nat { px_net_bits_at ( 0n , i ) == 0n : Nat }
+fb3c37b3203eb06e  px_net_full_byte_exact  law px_net_full_byte_exact : for a : Nat for b : Nat { px_net_byte_match ( a , b , 8n ) == Nat.is_eq ( a , b ) : Bool }
+dbfee0668cc7f38e  px_net_no_bits_any_byte  law px_net_no_bits_any_byte : for a : Nat for b : Nat { px_net_byte_match ( a , b , 0n ) == True { } : Bool }
+7ebb882938e051b2  px_never_class_refused  law px_never_class_refused : for l : Bool { px_addr_ok ( PxAcNever { } , l ) == False { } : Bool }
+8caf646802ae91de  px_nonpublic_needs_listing  law px_nonpublic_needs_listing : for + c : PxAddrClass { Bool.or ( px_ac_public ( c ) , Bool.not ( px_addr_ok ( c , False { } ) ) ) == True { } : Bool }
+556f62f8ba775642  px_port_zero_refused  law px_port_zero_refused : { px_port_ok ( 0n ) == False { } : Bool }
+6d75ad29d6e33492  px_range_name_resolves_inside  law px_range_name_resolves_inside : for c : PxAddrClass for l : Bool { px_addr_passes ( px_addr_check ( PxMRange { } , False { } , c , l ) ) == False { } : Bool }
+d56786f1518f3c51  px_read_wait_within_limits  law px_read_wait_within_limits : for + i : Nat for + t : Nat for + k : Nat { Nat.is_le ( px_read_wait ( i , t , k ) , Nat.min ( i , t ) ) == True { } : Bool }
+ff210eeedfe24924  px_read_wait_within_tick  law px_read_wait_within_tick : for + i : Nat for + t : Nat for + k : Nat { Nat.is_le ( px_read_wait ( i , t , k ) , k ) == True { } : Bool }
+8525361f13945fdf  px_redirect_budget_never_grows  law px_redirect_budget_never_grows : for + l : Nat { Nat.is_le ( px_redirect_left ( l ) , l ) == True { } : Bool }
+3d2fd8a486e5f0a1  px_redirect_budget_shrinks  law px_redirect_budget_shrinks : for + p : Nat { Nat.is_lt ( px_redirect_left ( 1n + p ) , 1n + p ) == True { } : Bool }
+a37441e26e4e59d8  px_redirect_get_stays_get  law px_redirect_get_stays_get : for + k : PxRedirect { px_redirect_method ( PxGet { } , k ) == PxGet { } : PxMethod }
+55a3c1c86c8419de  px_redirect_needs_location  law px_redirect_needs_location : for s : Nat { px_redirect_follows ( px_redirect_kind ( s , False { } ) ) == False { } : Bool }
+e5713bc504d591b2  px_redirect_same_or_get  law px_redirect_same_or_get : for + m : PxMethod for + k : PxRedirect { Bool.or ( px_method_eq ( px_redirect_method ( m , k ) , m ) , px_method_eq ( px_redirect_method ( m , k ) , PxGet { } ) ) == True { } : Bool }
+49a9f128af3a4ce0  px_redirect_spent_refuses  law px_redirect_spent_refuses : { px_redirect_may ( 0n ) == False { } : Bool }
+bbca9586957ddf0d  px_resp_cors_dropped  law px_resp_cors_dropped : { px_resp_header_passes ( PxRpCors { } ) == False { } : Bool }
+3dc829dedf0d5cd9  px_resp_framing_dropped  law px_resp_framing_dropped : { px_resp_header_passes ( PxRpFraming { } ) == False { } : Bool }
+30513bf551d02ff9  px_resp_state_dropped  law px_resp_state_dropped : { px_resp_header_passes ( PxRpState { } ) == False { } : Bool }
+a9c9d085da87a8e4  px_resp_take_within_cap  law px_resp_take_within_cap : for + s : Nat for + n : Nat for + c : Nat { Nat.is_le ( px_resp_take ( s , n , c ) , Nat.sub ( c , s ) ) == True { } : Bool }
+fee1eaf777a68e60  px_resp_take_within_incoming  law px_resp_take_within_incoming : for + s : Nat for + n : Nat for + c : Nat { Nat.is_le ( px_resp_take ( s , n , c ) , n ) == True { } : Bool }
+e4b132fe494468ce  px_site_foreign_origin_refused  law px_site_foreign_origin_refused : { px_site_ok ( PxSiteAbsent { } , True { } , False { } ) == False { } : Bool }
+d202585e5783ca63  px_site_other_refused  law px_site_other_refused : for o : Bool for h : Bool { px_site_ok ( PxSiteOther { } , o , h ) == False { } : Bool }
+c6f26438418f7b92  px_start_needs_targets  law px_start_needs_targets : for + a : Bool for o : Bool for k : Bool { px_start_serves ( px_start ( a , False { } , o , k ) ) == False { } : Bool }
+651665c1ec6e99ba  px_start_off_unless_asked  law px_start_off_unless_asked : for l : Bool for o : Bool for k : Bool { px_start ( False { } , l , o , k ) == PxStOff { } : PxStart }
+a1d475a0f3765212  px_start_open_needs_key  law px_start_open_needs_key : for + a : Bool for + l : Bool { px_start_serves ( px_start ( a , l , True { } , False { } ) ) == False { } : Bool }
+b5434129c67c7720  px_start_serve_xor_refuse  law px_start_serve_xor_refuse : for + s : PxStart { Bool.and ( px_start_serves ( s ) , px_start_refuses ( s ) ) == False { } : Bool }
+8f0ca4e653e70452  px_unlisted_target_refused  law px_unlisted_target_refused : for r : Bool for c : PxAddrClass for l : Bool { px_addr_passes ( px_addr_check ( PxMNone { } , r , c , l ) ) == False { } : Bool }
+b083430b25528c30  px_unprefixed_never_forwarded  law px_unprefixed_never_forwarded : for k : PxReqHeader for o : Bool { px_req_header_goes ( False { } , k , o ) == False { } : Bool }
+107089354cb6bbb3  px_url_bad_port_refused  law px_url_bad_port_refused : for + s : PxScheme for + u : Bool for + h : Bool for + t : Bool { px_url_ok ( px_url_check ( s , u , h , False { } , t ) ) == False { } : Bool }
+7e24eb45f01ab6ff  px_url_https_needs_tls  law px_url_https_needs_tls : for u : Bool for h : Bool for p : Bool { px_url_ok ( px_url_check ( PxHttps { } , u , h , p , False { } ) ) == False { } : Bool }
+fdad90bfbd9dfb89  px_url_other_scheme_refused  law px_url_other_scheme_refused : for u : Bool for h : Bool for p : Bool for t : Bool { px_url_ok ( px_url_check ( PxSchemeOther { } , u , h , p , t ) ) == False { } : Bool }
+172ded40993cd922  px_url_user_refused  law px_url_user_refused : for + s : PxScheme for h : Bool for p : Bool for + t : Bool { px_url_ok ( px_url_check ( s , True { } , h , p , t ) ) == False { } : Bool }
+f89c7c69db21cf2c  px_v4_172_16_not_public  law px_v4_172_16_not_public : for c : Nat for d : Nat { px_ac_public ( px_v4_class ( 172n , 16n , c , d ) ) == False { } : Bool }
+68fe56b2f5cd6f14  px_v4_172_31_not_public  law px_v4_172_31_not_public : for c : Nat for d : Nat { px_ac_public ( px_v4_class ( 172n , 31n , c , d ) ) == False { } : Bool }
+25e6cec1f052f798  px_v4_192_168_not_public  law px_v4_192_168_not_public : for c : Nat for d : Nat { px_ac_public ( px_v4_class ( 192n , 168n , c , d ) ) == False { } : Bool }
+ec938ee3c47525e8  px_v4_link_local_not_public  law px_v4_link_local_not_public : for c : Nat for d : Nat { px_ac_public ( px_v4_class ( 169n , 254n , c , d ) ) == False { } : Bool }
+909308e4201fe9a4  px_v4_loopback_not_public  law px_v4_loopback_not_public : for b : Nat for c : Nat for d : Nat { px_ac_public ( px_v4_class ( 127n , b , c , d ) ) == False { } : Bool }
+06d5639f6de0468f  px_v4_shared_not_public  law px_v4_shared_not_public : for c : Nat for d : Nat { px_ac_public ( px_v4_class ( 100n , 64n , c , d ) ) == False { } : Bool }
+6c8f000ca1bd48e9  px_v4_ten_not_public  law px_v4_ten_not_public : for b : Nat for c : Nat for d : Nat { px_ac_public ( px_v4_class ( 10n , b , c , d ) ) == False { } : Bool }
+d6371c8f81c526a3  px_v4_zero_never  law px_v4_zero_never : for b : Nat for c : Nat for d : Nat for l : Bool { px_addr_ok ( px_v4_class ( 0n , b , c , d ) , l ) == False { } : Bool }
+75b2db61a622bdb7  px_v6_6to4_no_wider  law px_v6_6to4_no_wider : for + a : Nat for + b : Nat for + c : Nat for + d : Nat for b6 : Nat for b7 : Nat for b8 : Nat for b9 : Nat for b10 : Nat for b11 : Nat for b12 : Nat for b13 : Nat for b14 : Nat for b15 : Nat { Bool.or ( px_ac_public ( px_v4_class ( a , b , c , d ) ) , Bool.not ( px_ac_public ( px_v6_class ( 32n , 2n , a , b , c , d , b6 , b7 , b8 , b9 , b10 , b11 , b12 , b13 , b14 , b15 ) ) ) ) == True { } : Bool }
+c406f4c21575f28f  px_v6_link_local_not_public  law px_v6_link_local_not_public : for b2 : Nat for b3 : Nat for b4 : Nat for b5 : Nat for b6 : Nat for b7 : Nat for b8 : Nat for b9 : Nat for b10 : Nat for b11 : Nat for b12 : Nat for b13 : Nat for b14 : Nat for b15 : Nat { px_ac_public ( px_v6_class ( 254n , 128n , b2 , b3 , b4 , b5 , b6 , b7 , b8 , b9 , b10 , b11 , b12 , b13 , b14 , b15 ) ) == False { } : Bool }
+28fe32ad964029bd  px_v6_loopback_not_public  law px_v6_loopback_not_public : { px_ac_public ( px_v6_class ( 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 1n ) ) == False { } : Bool }
+db71263f424c44a6  px_v6_mapped_no_wider  law px_v6_mapped_no_wider : for + a : Nat for + b : Nat for + c : Nat for + d : Nat { Bool.or ( px_ac_public ( px_v4_class ( a , b , c , d ) ) , Bool.not ( px_ac_public ( px_v6_class ( 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 255n , 255n , a , b , c , d ) ) ) ) == True { } : Bool }
+a684148242cdeb04  px_v6_nat64_no_wider  law px_v6_nat64_no_wider : for + a : Nat for + b : Nat for + c : Nat for + d : Nat { Bool.or ( px_ac_public ( px_v4_class ( a , b , c , d ) ) , Bool.not ( px_ac_public ( px_v6_class ( 0n , 100n , 255n , 155n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , a , b , c , d ) ) ) ) == True { } : Bool }
+d37f393f738d7222  px_v6_unique_local_not_public  law px_v6_unique_local_not_public : for b1 : Nat for b2 : Nat for b3 : Nat for b4 : Nat for b5 : Nat for b6 : Nat for b7 : Nat for b8 : Nat for b9 : Nat for b10 : Nat for b11 : Nat for b12 : Nat for b13 : Nat for b14 : Nat for b15 : Nat { px_ac_public ( px_v6_class ( 253n , b1 , b2 , b3 , b4 , b5 , b6 , b7 , b8 , b9 , b10 , b11 , b12 , b13 , b14 , b15 ) ) == False { } : Bool }
+2586c80b9cf7a4c4  px_v6_unspecified_never  law px_v6_unspecified_never : for l : Bool { px_addr_ok ( px_v6_class ( 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n ) , l ) == False { } : Bool }
 2afc489632120517  qwen36_35b_moe_dims_valid  law qwen36_35b_moe_dims_valid : { Bool.and ( gqa_dims_valid ( 16n , 2n , 256n ) , Bool.and ( gdn_dims_valid ( 16n , 32n , 4n ) , moe_dims_valid ( 256n , 8n , 512n ) ) ) == True { } : Bool }
 b4326499ace96154  qwen38_27b_dims_valid  law qwen38_27b_dims_valid : { Bool.and ( gqa_dims_valid ( 24n , 4n , 256n ) , gdn_dims_valid ( 16n , 48n , 4n ) ) == True { } : Bool }
 f1cbe1206fb49073  recipe_destroy_idempotent  law recipe_destroy_idempotent : for s : RecipeState { recipe_step ( recipe_step ( s , EvRecDestroy { } ) , EvRecDestroy { } ) == recipe_step ( s , EvRecDestroy { } ) : RecipeState }

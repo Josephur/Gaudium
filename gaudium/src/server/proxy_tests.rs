@@ -491,8 +491,10 @@ fn the_proxy_starts_only_with_named_targets_and_a_key_for_an_open_list() {
         assert_eq!(start(&options(&[open], &[]), true), Ok(true));
     }
     // never every private address at once, key or not
-    let e = start(&options(&["*"], &["*"]), true).err().unwrap();
-    assert!(e.contains("--mcp-proxy-allow-private"), "{e}");
+    for every in ["*", "0.0.0.0/0", "::/0"] {
+        let e = start(&options(&["*"], &[every]), true).err().unwrap();
+        assert!(e.contains("--mcp-proxy-allow-private"), "{e}");
+    }
     // a mistyped entry stops the start instead of being skipped
     let e = start(&options(&["example.com, exa mple"], &[]), true)
         .err()
@@ -813,7 +815,7 @@ fn only_listed_targets_are_reached_and_private_ones_only_when_listed_as_private(
     assert!(other.seen().is_empty());
 
     // an address that is never connected to stays refused even when listed
-    let p = Arc::new(proxy(&[], &["0.0.0.0/0", "::/0"]));
+    let p = Arc::new(proxy(&[], &["0.0.0.0/8", "::/127", "224.0.0.0/4"]));
     for url in [
         format!("http://0.0.0.0:{port}/"),
         format!("http://[::]:{port}/"),

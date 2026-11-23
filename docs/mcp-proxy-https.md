@@ -35,7 +35,7 @@ Both list options take comma-separated entries and may be repeated. An entry is 
 - `--mcp-proxy-allow` names targets whose addresses must be public.
 - `--mcp-proxy-allow-private` names targets that may be reached although their address is
   loopback, private or link-local. An entry here also allows the target, so a local MCP server
-  needs this option only.
+  needs this option only. `*` and a `/0` range are not accepted here: private targets are named.
 
 In the Web UI, tick "Use the server proxy" for an MCP server (Settings, Tools). `/props` reports
 `cors_proxy_enabled`, and the page offers the checkbox only when it is true.
