@@ -61,7 +61,7 @@ You need:
 
 ```bash
 # Kernels and glue plugins (on the Gaudi host, needs the Intel Gaudi SDK)
-make -C kernels -j16
+make -C kernels -j"$(nproc)"
 
 # Engine: checks every Bend law (needs Lean with BEND_VERDICT=require), then builds
 cd gaudium
