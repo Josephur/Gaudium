@@ -55,10 +55,13 @@ def cancel_order(s: OrderState) -> OrderState:
       Cancelled{}
 
 # 4. LAWS & PROOFS:
+#    - Promise  = '# promise: <one-sentence English statement>' directly above every law (required for new laws; '# harm:' optional)
 #    - Theorem  = 'law <name>: for <var>: <Type> {<lhs> == <rhs> : <Type>}'
 #    - Proof    = 'def <name>(<var>):' with the SAME name (erased automatically by rusty-bends-build!)
 #    - Refl     = '{==}'
 #    - Rewrite  = '%<lemma>(<args>) : {<goal_with_underscore>}'
+# promise: depositing zero leaves any existing balance unchanged
+# harm: zero-value deposits could corrupt account balances
 law deposit_zero:
   for bal: Nat
   {deposit(bal, 0n) == bal : Nat}
@@ -71,6 +74,7 @@ def deposit_zero(bal):
       %deposit_zero(p) : {1n+Nat.add(p, 0n) == 1n+_ : Nat}
       {==}
 
+# promise: cancelling an order twice produces the same state as cancelling it once
 law cancel_idempotent:
   for s: OrderState
   {cancel_order(cancel_order(s)) == cancel_order(s) : OrderState}
@@ -87,25 +91,53 @@ def cancel_idempotent(s):
 
 `rusty-bends-build/src/emit.rs` lowers Bend 2 `Base` stdlib calls directly to zero-overhead Rust:
 
-- **`Nat` arithmetic (saturating `u64`, total division — never panics):**
-  - `Nat.add`, `Nat.sub`, `Nat.mul` -> `saturating_add`, `saturating_sub`, `saturating_mul`
+- **`Nat` arithmetic (checked `u64` on growth, saturating subtraction, total division):**
+  - `Nat.add`, `Nat.mul`, `Nat.succ` -> `checked_add` / `checked_mul` (panics with `"rusty-bends: Nat overflow"` on `u64` overflow, so emitted Rust agrees with mathematical `Nat` wherever it returns and never silently saturates past `u64::MAX` into a law-violating state).
+  - **List the panic sites:** `RUSTY_BENDS_LIST_PANICS=1 cargo check` prints every checked-growth op as `RustyBends panic [function]: Nat.mul at verified/file.bend:12`, so you can review which functions take untrusted input.
+  - **Refuse instead of panicking (`# rusty-bends: total`):** put `# rusty-bends: total` in the comment block directly above a `def` and it emits as `Option<T>`, returning `None` on overflow anywhere in its call tree (callees get private `Option` variants; their public versions are unchanged). Callers in other `def`s keep panicking semantics (listed as `call <f>`). Its generated per-law tests still run.
+  - **Write limit checks that cannot overflow.** Compare against a quotient instead of building a product from untrusted input:
+    ```bend
+    # Panics (checked_mul) when w * h overflows u64:
+    def fits_area_limit(+w: Nat, +h: Nat, max_area: Nat) -> Bool:
+      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(Nat.mul(w, h), max_area))
+
+    # Never overflows: w > 0, so w * h <= max  <=>  h <= max / w
+    def fits_area_limit(+w: Nat, +h: Nat, max_area: Nat) -> Bool:
+      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(h, Nat.div(max_area, w)))
+    ```
+  - `Nat.sub`, `Nat.pred` -> `saturating_sub` (exact match for Peano `0n - x == 0n`).
   - `Nat.div(a, b)` / `Nat.mod(a, b)` / `Nat.divmod(a, b)` -> total div/mod matching Bend 2 (`Nat.div(a, 0n) == 0n`, `Nat.mod(a, 0n) == a`)
-  - `Nat.min`, `Nat.max`, `Nat.succ`, `Nat.pred`, `Nat.is_zero`
+  - `Nat.min`, `Nat.max`, `Nat.is_zero`
   - `Nat.is_le`, `Nat.is_lt`, `Nat.is_ge`, `Nat.is_gt`, `Nat.is_eq`, `Nat.is_ne`
 - **`Bool` & `Pair` helpers:**
   - `Bool.and`, `Bool.or`, `Bool.not`, `Bool.xor`, `Bool.is_eq`, `Bool.is_ne`, `Bool.pick`
   - `A & B` pair types -> `(A, B)`, `Pair.fst`, `Pair.snd`
 - **Fixed-width integers vs `Nat`:**
-  - `(a + b : Nat)` / `(a - b : Nat)` / `(a * b : Nat)` emit **saturating** `u64` ops (exact match for Peano `Nat` non-underflow proofs).
+  - `(a + b : Nat)` / `(a * b : Nat)` emit **checked** `u64` ops (panicking on `u64` overflow), while `(a - b : Nat)` emits `saturating_sub`.
   - `(a + b : U32)` / `U64` / `I32` / `I64` emit **wrapping** ops (`wrapping_add`, `wrapping_sub`, `wrapping_mul`) matching Bend 2's fixed-width integer semantics.
-- **Control flow & patterns:** nested `match`, multi-scrutinee `match a b:`, `case 1n+p:` successor patterns, and multi-line `let` bindings are all supported.
+- **Control flow & patterns:** nested `match`, multi-scrutinee `match a b:`, `case 1n+p:` and nested `case 1n+1n+q:` successor patterns, and multi-line `let` bindings are all supported.
+- **Recursive ADTs & built-in `List`:** direct or mutually recursive `type` definitions automatically box cycle-forming fields (`Box<T>`), omit `Copy` (`#[derive(Debug, Clone, PartialEq, Eq)]`) across recursive types and any wrappers containing them, unbox patterns (`*__rb_box` + nested guards), and insert `.clone()` on multi-use non-`Copy` values. Built-in `Base` `List<T>` / `List<&2, T>`, `Nil{}` / `Con{head, tail}`, and list literals `[]` / `[a, b]` emit `pub enum List<T> { Nil, Con(T, Box<List<T>>) }`.
+- **Cross-file sibling imports (`import sibling.bend as X`):** files under `verified/` can import sibling `.bend` files (`import base_rules.bend as B`) to share functions, types, laws, and helper lemmas (`B.fn_name(...)`, `B.TypeName`, `B.Ctor{}`). Keep top-level names unique across `verified/*.bend`; the emitter resolves each file's import aliases into the single emitted `verified.rs` module, and `rusty-bends.lock` normalizes aliases so renaming `as B` does not trip `E_LAW_LOCK_TAMPERED`.
+- **Bundled `Nat` arithmetic lemma library (`nat_lemmas.bend`):** `rusty-bends-build` ships `rusty_bends_build::lemmas/nat_lemmas.bend` via `rusty_bends_build::NAT_LEMMAS_BEND` and `rusty_bends_build::write_nat_lemmas("verified")` (called in `build.rs` before `verify_and_emit("verified")`, or copied into `verified/`). Import it with `import nat_lemmas.bend as L`. All definitions in `nat_lemmas.bend` are `q=0` proof/type helpers and are erased completely before Rust codegen, covering:
+  - **Ex falso / Bool refutation:** `bool_pick_type`, `bool_false_ne_true`, `bool_true_ne_false`, `bool_absurd`, `bool_absurd_tf`.
+  - **Order & min/max:** `nat_le_refl`, `nat_le_zero`, `nat_le_succ_r`, `nat_lt_succ_self`, `nat_lt_succ_eq_le`, `nat_lt_imp_le`, `nat_not_lt_imp_le`, `nat_le_subst_r`, `nat_lt_subst_r`, `nat_le_trans`, `nat_lt_trans`, `nat_lt_le_trans`, `nat_le_lt_trans`, `nat_lt_not_le`, `nat_lt_le_false`, `nat_le_lt_false`, `nat_le_antisym`, `nat_min_le_l`, `nat_min_le_r`, `nat_max_ge_l`, `nat_max_ge_r`, `nat_min_comm`, `nat_max_comm`.
+  - **Addition & subtraction:** `nat_add_zero_r`, `nat_add_succ_r`, `nat_add_comm`, `nat_add_assoc`, `nat_add_le_l`, `nat_add_le_r`, `nat_add_le_mono`, `nat_add_lt_le_mono`, `nat_sub_zero_r`, `nat_sub_self`, `nat_add_sub_cancel_l`, `nat_add_sub_cancel_r`, `nat_sub_add_cancel`.
+  - **Multiplication:** `nat_mul_zero_r`, `nat_mul_one_r`, `nat_mul_succ_r`, `nat_mul_comm`, `nat_mul_add_dist_r`, `nat_mul_add_dist_l`, `nat_mul_assoc`, `nat_mul_le_mono_r`, `nat_mul_le_mono_l`, `nat_mul_le_mono`.
+  - **Division & modulo (`b = 1n+bp > 0`):** `nat_mod_lt(a, bp)` (`a % (1n+bp) < 1n+bp`), `nat_div_mod(a, bp)` (`a % (1n+bp) + (a / (1n+bp)) * (1n+bp) == a`), `nat_div_mod_r(a, bp)` (`(a / (1n+bp)) * (1n+bp) + a % (1n+bp) == a`), `nat_div_lt_of_lt_mul(a, n, bp, h)` (`a < n * (1n+bp) -> a / (1n+bp) < n`), and `nat_div_lt_of_lt_mul_l(a, n, bp, h)` (`a < (1n+bp) * n -> a / (1n+bp) < n`).
+- **Generated per-law Rust tests:** every `law` also emits a `#[cfg(test)]` Rust test into `OUT_DIR/verified.rs` (run automatically by `cargo test`) that checks the emitted functions across small values, `u64::MAX - 1`, `u64::MAX`, ADT constructors, and deterministic PRNG samples (skipping only checked `Nat` overflow panics).
+- **Counterexample vs proof-failure diagnosis:** when `bend --check-only` fails on a law, `rusty-bends-build` evaluates the emitted Rust on concrete inputs first and reports `[E_LAW_FALSE]` with aligned `lhs`/`rhs` values if the law is false, or notes `"no counterexample up to ...: the law may be true; the proof is what failed"` if no counterexample exists.
+- **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Bound and safety laws are covered too: `NatBound` pushes a `Nat` result past a bound (`+ 1n`, `- 1n`, `0n`), `SiblingCtor` replaces a returned constructor with its sibling constructors, `BoolConst` replaces a `Bool` variable with `True{}` / `False{}`, and `FlipCmp` loosens comparisons (`Nat.is_le` <-> `Nat.is_ge`, `Nat.is_lt` <-> `Nat.is_gt`). `ReturnCtor` replaces a returned variable or function call (e.g. a fallthrough `case st _: st`) with each constructor of the return type, and `NatLit` changes `Nat` literals (`k` -> `0n`, `k + 1`, `k - 1`, at most 8 sites per function). Each reported mutant ends with its operator, e.g. `caught by f: result -> Nat.add(result, 1n) [NatBound]`. Run `RUSTY_BENDS_MUTATE=all cargo check` to report caught/survived status for already-locked laws without failing.
+- **Unevaluable new laws (`E_LAW_UNCHECKED`):** a new law the checker cannot evaluate (`exs`, a `where` refinement, an unparsable clause, or a goal without `==`) fails the build, naming the reason and the supported forms. If it truly cannot be sampled, add `# unchecked: <why>` in the comment block directly above `law <name>:`; the marker is stored in `rusty-bends.lock` and shown as `[unchecked: <why>]` by the law listing. Locked laws only warn.
+- **Mutants that do not compile (`E_MUTANT_BUILD`):** a mutant the generated Rust cannot build was never tested, so it never counts as a survivor. The build stops with `[E_MUTANT_BUILD]`, naming the mutant and the first rustc error; that is a RustyBends bug to report, not a weak law.
+- **Names that are Rust keywords:** any Bend name may be used, including ones Rust reserves (`as`, `in`, `fn`, `ref`, `mut`, `dyn`, `loop`, `move`, `self`, `crate`, `super`, ...). The emitted Rust spells them `r#as`, `r#in`, ... and, where Rust allows no raw form, `__rb_self`, `__rb_crate`, `__rb_super`, `__rb_Self`. Call them from Rust by those names, e.g. `verified::r#loop(2, 3)`.
 
 ## 5. Mandatory Rules for AI Agents
 
-1. **Always type-annotate operators (Bend 2.0.17+).** Write `(a + b : U32)` (wrapping) or `Nat.add(a, b)` / `(a + b : Nat)` (saturating) — never bare `a + b`.
+1. **Always type-annotate operators (Bend 2.0.17+).** Write `(a + b : U32)` (wrapping) or `Nat.add(a, b)` / `(a + b : Nat)` (checked `Nat` add) — never bare `a + b`.
 2. **Use real Bend 2 `law` + proof `def` syntax.** Never invent `proof foo: refl`; write `law foo: for x: T {lhs == rhs : T}` paired with `def foo(x): ... {==}`. Helper lemmas returning `{lhs == rhs : T}` are also erased automatically.
 3. **Run `cargo check` after every edit.** Cargo runs `build.rs` -> `rusty_bends_build::verify_and_emit("verified")`.
 4. **NEVER delete, comment out, or weaken laws in `verified/`.**
    `rusty-bends.lock` uses an AST/token canonicalizer (safe across whitespace/comment edits, strict on law changes) and fails with `E_LAW_LOCK_TAMPERED`.
-5. **Lean `--verdict` kernel cross-check**: `rusty-bends-build` always runs `bend <file> --check-only` (which checks all laws and proofs). By default (`BEND_VERDICT=auto`), it also runs `--verdict` whenever Lean (`~/.elan/bin/lean`) or `$BENDTT` is installed, and skips `--verdict` with a warning otherwise. Set `BEND_VERDICT=require` in CI to enforce Lean cross-checking, or `BEND_VERDICT=off` to disable it.
-6. **Pin Bend 2 if upstream drifts**: uncomment the version prefix (e.g. `2.0.`) in `bend.pin` or set `BEND_PIN_VERSION`.
+5. **Every new law MUST have a plain-English `# promise:` comment directly above `law <name>:`** (`# harm:` is optional). Missing promises on new laws fail with `E_LAW_NO_PROMISE` (locked laws warn if missing). Promises are stored in `rusty-bends.lock` outside the law hash, so improving `# promise:` wording is reported in build output without tripping `E_LAW_LOCK_TAMPERED`. Run `RUSTY_BENDS_LIST_LAWS=1 cargo check` or `cargo run -p rusty-bends-build --bin rusty-bends-laws -- verified` to print every law as `name: promise`.
+6. **Lean `--verdict` kernel cross-check**: `rusty-bends-build` always runs `bend <file> --check-only` (which checks all laws and proofs). By default (`BEND_VERDICT=auto`), it also runs `--verdict` whenever Lean (`~/.elan/bin/lean`) or `$BENDTT` is installed, and skips `--verdict` with a warning otherwise. Set `BEND_VERDICT=require` in CI to enforce Lean cross-checking, or `BEND_VERDICT=off` to disable it.
+7. **Pin Bend 2 if upstream drifts**: uncomment the version prefix (e.g. `2.0.`) in `bend.pin` or set `BEND_PIN_VERSION`.

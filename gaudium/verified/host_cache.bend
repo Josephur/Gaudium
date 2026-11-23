@@ -226,8 +226,41 @@ def hc_free_now(+budget_free: Nat, +host_available: Nat) -> Nat:
   Nat.min(budget_free, host_available)
 
 # Can a budget be honoured? It and the pinned transfer buffers must fit in what is available.
-def hc_budget_fits(budget: Nat, pinned: Nat, available: Nat) -> Bool:
-  Nat.is_le(Nat.add(budget, pinned), available)
+# Written as pinned <= available and budget <= available - pinned, which is budget + pinned <=
+# available (`hc_fits_split`) without the sum, so no budget an operator names can overflow it.
+def hc_budget_fits(+budget: Nat, +pinned: Nat, +available: Nat) -> Bool:
+  Bool.and(Nat.is_le(pinned, available), Nat.is_le(budget, Nat.sub(available, pinned)))
+
+# n + 0 == n, and 1 + (a + b) == a + (1 + b): rewrites for the overflow-free forms below.
+def hc_fit_add_zero(+n: Nat) -> {Nat.add(n, 0n) == n : Nat}:
+  match n:
+    case 0n: {==}
+    case 1n+p:
+      %hc_fit_add_zero(p) : {1n+Nat.add(p, 0n) == 1n+_ : Nat}
+      {==}
+
+def hc_fit_add_succ(+a: Nat, +b: Nat) -> {1n+Nat.add(a, b) == Nat.add(a, 1n+b) : Nat}:
+  match a:
+    case 0n: {==}
+    case 1n+p:
+      %hc_fit_add_succ(p, b) : {1n+1n+Nat.add(p, b) == 1n+_ : Nat}
+      {==}
+
+# b + p <= a  is  p <= a and b <= a - p.
+def hc_fits_split(+b: Nat, +p: Nat, +a: Nat) -> {Nat.is_le(Nat.add(b, p), a) == Bool.and(Nat.is_le(p, a), Nat.is_le(b, Nat.sub(a, p))) : Bool}:
+  match p a:
+    case 0n 0n:
+      %hc_fit_add_zero(b) : {Nat.is_le(Nat.add(b, 0n), 0n) == Nat.is_le(_, 0n) : Bool}
+      {==}
+    case 0n 1n+ap:
+      %hc_fit_add_zero(b) : {Nat.is_le(Nat.add(b, 0n), 1n+ap) == Nat.is_le(_, 1n+ap) : Bool}
+      {==}
+    case 1n+pp 0n:
+      %hc_fit_add_succ(b, pp) : {Nat.is_le(_, 0n) == False{} : Bool}
+      {==}
+    case 1n+pp 1n+ap:
+      %hc_fit_add_succ(b, pp) : {Nat.is_le(_, 1n+ap) == Bool.and(Nat.is_le(pp, ap), Nat.is_le(b, Nat.sub(ap, pp))) : Bool}
+      hc_fits_split(b, pp, ap)
 
 # ============================================================================
 # 3. May a request restore from an entry at all?
@@ -630,6 +663,7 @@ law hc_budget_over_refused:
   {Bool.and(hc_budget_fits(b, p, a), Nat.is_lt(a, Nat.add(b, p))) == False{} : Bool}
 
 def hc_budget_over_refused(b, p, a):
+  %hc_fits_split(b, p, a) : {Bool.and(_, Nat.is_lt(a, Nat.add(b, p))) == False{} : Bool}
   hc_le_lt_excl(Nat.add(b, p), a)
 
 # LAW HC.5: a request that asked for a cold prefill never restores from host memory.
@@ -1546,13 +1580,51 @@ def hc_spare_credit(+spare_segments: Nat, +wanted_segments: Nat, seg_charge: Nat
 
 # Bytes a save may take now without evicting: the budget's free bytes, and no more than the
 # host has available plus what the save gave back and takes again.
-def hc_take_now(+budget_free: Nat, +host_available: Nat, reusable: Nat) -> Nat:
-  hc_free_now(budget_free, Nat.add(host_available, reusable))
+# The smaller of the budget's free bytes and host_available + reusable, computed as
+# min(free, reusable) + min(free - reusable, host_available) (`hc_take_split`): never above the
+# free bytes, so it cannot overflow, also when the host figure is the largest value (not read).
+def hc_take_now(+budget_free: Nat, +host_available: Nat, +reusable: Nat) -> Nat:
+  Nat.add(Nat.min(budget_free, reusable), Nat.min(Nat.sub(budget_free, reusable), host_available))
+
+# min(f, a + r)  is  min(f, r) + min(f - r, a).
+def hc_take_split(+f: Nat, +r: Nat, +a: Nat) -> {Nat.min(f, Nat.add(a, r)) == Nat.add(Nat.min(f, r), Nat.min(Nat.sub(f, r), a)) : Nat}:
+  match f r:
+    case 0n _:
+      {==}
+    case 1n+fp 0n:
+      %hc_fit_add_zero(a) : {Nat.min(1n+fp, Nat.add(a, 0n)) == Nat.min(1n+fp, _) : Nat}
+      {==}
+    case 1n+fp 1n+rp:
+      %hc_fit_add_succ(a, rp) : {Nat.min(1n+fp, _) == 1n+Nat.add(Nat.min(fp, rp), Nat.min(Nat.sub(fp, rp), a)) : Nat}
+      %hc_take_split(fp, rp, a) : {1n+Nat.min(fp, Nat.add(a, rp)) == 1n+_ : Nat}
+      {==}
+
+def hc_add_zero_not_lt_zero(a: Nat) -> {Nat.is_lt(Nat.add(a, 0n), 0n) == False{} : Bool}:
+  match a:
+    case 0n: {==}
+    case 1n+_: {==}
+
+# a + r < n  is  r < n and a < n - r.
+def hc_lt_split(+a: Nat, +r: Nat, +n: Nat) -> {Nat.is_lt(Nat.add(a, r), n) == Bool.and(Nat.is_lt(r, n), Nat.is_lt(a, Nat.sub(n, r))) : Bool}:
+  match r n:
+    case 0n 0n:
+      hc_add_zero_not_lt_zero(a)
+    case 0n 1n+np:
+      %hc_fit_add_zero(a) : {Nat.is_lt(Nat.add(a, 0n), 1n+np) == Nat.is_lt(_, 1n+np) : Bool}
+      {==}
+    case 1n+rp 0n:
+      %hc_fit_add_succ(a, rp) : {Nat.is_lt(_, 0n) == False{} : Bool}
+      {==}
+    case 1n+rp 1n+np:
+      %hc_fit_add_succ(a, rp) : {Nat.is_lt(_, 1n+np) == Bool.and(Nat.is_lt(rp, np), Nat.is_lt(a, Nat.sub(np, rp))) : Bool}
+      hc_lt_split(a, rp, np)
 
 # Do the spare segments an allocation cannot take again go back to the system first? When the
 # host cannot give what the allocation needs beyond what it takes again, and there are some.
-def hc_spares_return(need: Nat, host_available: Nat, reusable: Nat, unusable: Nat) -> Bool:
-  Bool.and(Nat.is_gt(unusable, 0n), Nat.is_lt(Nat.add(host_available, reusable), need))
+# host_available + reusable < need is asked as reusable < need and host_available < need -
+# reusable (`hc_lt_split`), so the largest host figure (not read) cannot overflow it.
+def hc_spares_return(+need: Nat, +host_available: Nat, +reusable: Nat, unusable: Nat) -> Bool:
+  Bool.and(Nat.is_gt(unusable, 0n), Bool.and(Nat.is_lt(reusable, need), Nat.is_lt(host_available, Nat.sub(need, reusable))))
 
 # ---- 12.7 laws ----
 
@@ -2047,6 +2119,7 @@ law hc_take_now_within_budget:
   {Nat.is_le(hc_take_now(f, a, r), f) == True{} : Bool}
 
 def hc_take_now_within_budget(f, a, r):
+  %hc_take_split(f, r, a) : {Nat.is_le(_, f) == True{} : Bool}
   hc_min_le_l(f, Nat.add(a, r))
 
 # LAW HC.97: ... nor what the host has available plus what the save itself gave back and
@@ -2058,6 +2131,7 @@ law hc_take_now_within_host_and_reuse:
   {Nat.is_le(hc_take_now(f, a, r), Nat.add(a, r)) == True{} : Bool}
 
 def hc_take_now_within_host_and_reuse(f, a, r):
+  %hc_take_split(f, r, a) : {Nat.is_le(_, Nat.add(a, r)) == True{} : Bool}
   hc_min_le_r(f, Nat.add(a, r))
 
 # LAW HC.98: when the host cannot give what an allocation needs, the spare segments the
@@ -2071,6 +2145,7 @@ law hc_unusable_spares_go_first:
   {hc_spares_return(Nat.add(Nat.add(a, r), 1n+x), a, r, 1n+u) == True{} : Bool}
 
 def hc_unusable_spares_go_first(a, r, x, u):
+  %hc_lt_split(a, r, Nat.add(Nat.add(a, r), 1n+x)) : {Bool.and(True{}, _) == True{} : Bool}
   %hc_lt_add_succ(Nat.add(a, r), x) : {Bool.and(True{}, _) == True{} : Bool}
   {==}
 

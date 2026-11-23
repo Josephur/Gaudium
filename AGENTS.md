@@ -74,7 +74,8 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 3. **No `if/else` in Bend 2** — match on `Bool`'s `True{}` / `False{}` constructors, or use `Bool.pick(T, cond, then_val, else_val)`.
 4. **Match scrutinees & def headers:** Bend 2 only matches on parameters or bound variables (never computed expressions like `match f(x):`); bind or pass intermediate values to a helper `def`. Both single-line and multi-line `def` headers, nested `match`, multi-scrutinee `match a b:`, and `case 1n+p:` successor patterns are supported.
 5. **Exact integer arithmetic semantics (`Nat` vs fixed-width ints):**
-   - Use **`Nat`** (emits saturating `u64` + total division) for all conservation, budget, alignment, and bounds math so Peano `Nat` proofs (`Nat.sub(0n, x) == 0n`, `Nat.div(a, 0n) == 0n`, `Nat.mod(a, 0n) == a`) match emitted Rust **exactly**.
+   - Use **`Nat`** for all conservation, budget, alignment, and bounds math. It emits `u64` with checked growth (`Nat.add`, `Nat.mul`, `Nat.succ` panic with `rusty-bends: Nat overflow` past `u64::MAX`), saturating `Nat.sub` / `Nat.pred`, and total division, so the emitted Rust agrees with the Peano `Nat` proofs (`Nat.sub(0n, x) == 0n`, `Nat.div(a, 0n) == 0n`, `Nat.mod(a, 0n) == a`) wherever it returns.
+   - A growth op on a value a client or a file controls can now panic. Write limit checks in a form that cannot overflow (compare `h` with `Nat.div(max, w)` rather than `w * h` with `max`). `RUSTY_BENDS_LIST_PANICS=1 cargo check` lists every growth op that can panic. A `def` with `# rusty-bends: total` in the comment block above it emits as `Option<T>` and returns `None` instead of panicking.
    - Note: `Nat.is_zero` is not in Bend 2.0.40 `Base`; use `Nat.is_eq(x, 0n)`.
    - Supported `Base` stdlib calls lowered directly to zero-overhead Rust: `Nat.add`, `Nat.sub`, `Nat.mul`, `Nat.div`, `Nat.mod`, `Nat.divmod`, `Nat.min`, `Nat.max`, `Nat.succ`, `Nat.pred`, `Nat.is_le`, `Nat.is_lt`, `Nat.is_ge`, `Nat.is_gt`, `Nat.is_eq`, `Nat.is_ne`, `Bool.and`, `Bool.or`, `Bool.not`, `Bool.xor`, `Bool.is_eq`, `Bool.is_ne`, `Bool.pick`, `A & B` pairs, `Pair.fst`, `Pair.snd`.
    - Always type-annotate infix operators: `(a + b : Nat)` vs `(a + b : U32)` / `U64` / `I32` / `I64`.
@@ -82,6 +83,7 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
    - Theorem: `law <name>: for x: T {lhs == rhs : T}`
    - Proof: `def <name>(x): ... {==}` (same name as the `law`), using `%lemma(args) : {goal_with_underscore}` for rewrites.
    - Standalone helper lemmas returning an equality type (`def lemma(...) -> {lhs == rhs : T}:`) are automatically erased before Rust codegen alongside `law`s and proof `def`s.
+   - Every new law has a one-sentence `# promise:` comment directly above it (`# harm:` optional), or the build fails with `E_LAW_NO_PROMISE`. A new law must also be shown false for at least one small mutant of the code it depends on, or the build fails with `E_LAW_VACUOUS`. Each law also runs as a generated Rust test on the emitted code under `cargo test`. When a proof fails, `E_LAW_FALSE` with a concrete input means the code breaks the law; "no counterexample" means only the proof is incomplete.
 7. **Multiple `.bend` files in `gaudium/verified/`:**
    - `rusty-bends-build` checks every `.bend` file individually with `bend` and concatenates all `.bend` files into one `OUT_DIR/verified.rs`. Keep top-level type, constructor, function, and law names unique across all files in `gaudium/verified/`.
 
@@ -115,8 +117,9 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 ## 6. RustyBends Issues — Do Not Patch Locally, File via `gh`
 
 - **NEVER silently modify `rusty-bends-build/`.**
+- **RustyBends is a general tool, and Gaudium is one of its users.** Ask it only for what any project could use. Gaudium's own rules belong in Gaudium (this file, `gaudium/verified/`, Rust tests), never in RustyBends. An issue states the need in general Bend/Rust terms with a standalone reproducer whose names are neutral (`fits_area_limit`, `Ledger`), never Gaudium code or vocabulary pasted in: RustyBends declines requests that only one project needs.
 - If you hit a bug, missing Bend 2 primitive, emitter limitation, or CLI mismatch in RustyBends:
-  1. Document the minimal `.bend` reproducer and exact error output.
+  1. Write a minimal standalone `.bend` reproducer, with neutral names, and the exact error output.
   2. File an issue directly on the RustyBends repository using `gh`:
      ```bash
      gh issue create -R Josephur/RustyBends --title "<concise title>" --body "<minimal reproducer + expected vs actual>"

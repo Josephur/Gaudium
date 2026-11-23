@@ -1660,6 +1660,42 @@ mod tests {
     }
 
     #[test]
+    fn room_arithmetic_matches_exact_sums_at_every_size() {
+        // the overflow-free forms agree with the exact (128-bit) sums, the host figure of a
+        // host that was not read (u64::MAX) and budgets of any size included
+        let v = [
+            0u64,
+            1,
+            2,
+            7,
+            MIB,
+            64 * MIB,
+            1 << 40,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let w = |x: u64| x as u128;
+        for &x in &v {
+            for &y in &v {
+                for &z in &v {
+                    let take = w(x).min(w(y) + w(z)) as u64;
+                    assert_eq!(hc_take_now(x, y, z), take, "take_now({x}, {y}, {z})");
+                    let ret = w(y) + w(z) < w(x);
+                    assert_eq!(
+                        hc_spares_return(x, y, z, 1),
+                        ret,
+                        "spares_return({x}, {y}, {z})"
+                    );
+                    let fits = w(x) + w(y) <= w(z);
+                    let fit = crate::verified::hc_budget_fits(x, y, z);
+                    assert_eq!(fit, fits, "budget_fits({x}, {y}, {z})");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_save_cut_short_keeps_the_tiles_that_finished_and_a_failed_one_leaves_nothing() {
         let mut c = HostCache::new(256 * MIB, false);
         let p = prompt(6 * 512 + 100, 0);

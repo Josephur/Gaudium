@@ -225,6 +225,21 @@ mod tests {
     }
 
     #[test]
+    fn canvas_check_matches_exact_area() {
+        // the division form agrees with the exact (128-bit) area test, overflowing sizes included
+        let sides = [0u64, 1, 2, 3, 7, 100, 4096, 65_535, 1 << 31, u64::MAX / 2, u64::MAX];
+        let limits = [0u64, 1, 99, 100, 101, 1 << 24, 1 << 62, u64::MAX - 1, u64::MAX];
+        for &w in &sides {
+            for &h in &sides {
+                for &m in &limits {
+                    let exact = w > 0 && h > 0 && (w as u128) * (h as u128) <= m as u128;
+                    assert_eq!(media_canvas_ok(w, h, m), exact, "w={w} h={h} m={m}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn only_validated_drafters_run_with_the_tower() {
         // today's validated set: plain decode and the DSpine drafter
         assert!(drafter_runs_with_vision(None));
