@@ -2,8 +2,8 @@
 //!
 //! Configures `GC_KERNEL_PATH` and every `GAUDIUM_*_ELF` environment variable consumed by
 //! `libgaudium_tpc.so` and `libgaudium_ga.so` from a single kernel build directory (`--kernels` or
-//! `GAUDIUM_KERNELS`), and computes normalized ELF64 SHA-256 hashes (via
-//! [`crate::synapse::recipe_cache::hash_elf_normalized`]) for recipe cache fingerprinting.
+//! `GAUDIUM_KERNELS`), and computes build-path-independent kernel ELF hashes (via
+//! [`crate::synapse::recipe_cache::hash_tpc_elf_normalized`]) for recipe cache fingerprinting.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
