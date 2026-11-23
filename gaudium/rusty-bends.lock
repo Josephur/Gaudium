@@ -241,6 +241,8 @@ d7ddac32019087d5  ls_start_cert_alone_never_serves  law ls_start_cert_alone_neve
 3dab07e66c425e4f  ls_start_needs_library  law ls_start_needs_library : for + c : Bool for + k : Bool for f : Bool { ls_start_serves_tls ( ls_start ( c , k , False { } , f ) ) == False { } : Bool }
 a07804e4088df0fd  ls_start_off_without_files  law ls_start_off_without_files : for l : Bool for f : Bool { ls_start ( False { } , False { } , l , f ) == LsStOff { } : LsStart }
 6342ac690f2c6c42  ls_start_serve_xor_refuse  law ls_start_serve_xor_refuse : for + s : LsStart { Bool.and ( ls_start_serves_tls ( s ) , ls_start_refuses ( s ) ) == False { } : Bool }
+52451ba3c6d0be64  media_canvas_within_limit  law media_canvas_within_limit : for + w : Nat for + h : Nat for + m : Nat { Bool.and ( media_canvas_ok ( w , h , m ) , Nat.is_lt ( m , Nat.mul ( w , h ) ) ) == False { } : Bool }
+# promise media_canvas_within_limit: a canvas the media check accepts never has more pixels (width times height) than the limit.
 9c50354edb3ef860  media_count_over_refused  law media_count_over_refused : for + m : Nat for + extra : Nat { media_count_ok ( Nat.add ( 1n + m , extra ) , m ) == False { } : Bool }
 b78d879fb880f84b  media_empty_refused  law media_empty_refused : for m : Nat { media_bytes_ok ( 0n , m ) == False { } : Bool }
 1fc661db6e325264  media_inline_always_allowed  law media_inline_always_allowed : for a : Bool { media_source_allowed ( MsInline { } , a ) == True { } : Bool }
