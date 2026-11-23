@@ -26,7 +26,10 @@ Gaudium — Intel Gaudi 2 Inference Engine (RustyBends v1)
 
 Usage:
   gaudium                                   Run verified-core self-check
-  gaudium --inspect-model <dir>             Validate config.json & Safetensors
+  gaudium --inspect-model <dir|file.gguf>   Validate config.json & Safetensors, or a GGUF
+                                            model (a .gguf file, any shard of a split one,
+                                            or a directory of them without config.json):
+                                            metadata, tensors and weights per type
   gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json
   gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test
   gaudium --probe-copy [GiB]                Measure copies between the card and host memory
@@ -473,6 +476,7 @@ or reads it to rewrite a file.
 | `GAUDIUM_IMAGE_REF_DIR` | the decoder tests in `src/vision/decode/` (`--ignored`) | A directory of image files with the raw RGB dump the reference image library wrote for each; every file must decode to the same bytes. |
 | `GAUDIUM_IMAGE_PIPELINE_REF_DIR` | `vision::media::tests::reference_pipeline_records_match_bit_for_bit` (`--ignored`) | A directory written by `gaudium/tests/data/vision/make_pipeline_refs.py`: image files with the patch rows of the checkpoint's own image processor, which must match bit for bit. |
 | `GAUDIUM_VISION_REF_DIR` | `vision::tests::reference_prompt_records_match_bit_for_bit` (`--ignored`) | A directory of reference prompt records (token ids, image grids, positions, patch rows) that the prompt layout and the image preprocessing must reproduce. |
+| `GAUDIUM_GGUF_REF_DIR` | `gguf::tests::reference_gguf_files_open_and_decode` (`--ignored`) | A directory of published GGUF files (and its `dspark/` subdirectory): every file must open, the Inkling 2 Mini model must have its 744 tensors with architecture `inkling2_loop` and NVFP4 weights, every NVFP4 tensor its per-expert `.scale`, and one row of every type must decode to finite numbers. |
 | `GAUDIUM_UPDATE_REFERENCE` | `tests/reference_docs.rs` | `1` = rewrite the copy of the help text on this page from the binary instead of failing when it differs. |
 
 <!-- test-variables:end -->

@@ -27,6 +27,7 @@
 
 pub mod adapter;
 pub mod dequant;
+pub mod inspect;
 pub mod types;
 
 use std::collections::BTreeMap;

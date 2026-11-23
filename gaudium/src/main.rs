@@ -48,7 +48,10 @@ fn print_usage() {
          \n\
          Usage:\n\
          \x20 gaudium                                   Run verified-core self-check\n\
-         \x20 gaudium --inspect-model <dir>             Validate config.json & Safetensors\n\
+         \x20 gaudium --inspect-model <dir|file.gguf>   Validate config.json & Safetensors, or a GGUF\n\
+         \x20                                           model (a .gguf file, any shard of a split one,\n\
+         \x20                                           or a directory of them without config.json):\n\
+         \x20                                           metadata, tensors and weights per type\n\
          \x20 gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json\n\
          \x20 gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test\n\
          \x20 gaudium --probe-copy [GiB]                Measure copies between the card and host memory\n\
@@ -484,6 +487,10 @@ fn print_usage() {
 }
 
 fn inspect_model(dir: &Path) -> Result<(), String> {
+    if gaudium::gguf::looks_like_gguf(dir) {
+        println!("{}", gaudium::gguf::inspect::inspect(dir).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
     let cfg_path = dir.join("config.json");
     let spec = ModelSpec::from_config_file(&cfg_path).map_err(|e| e.to_string())?;
     spec.validate().map_err(|e| e.to_string())?;

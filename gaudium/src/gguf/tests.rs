@@ -721,3 +721,88 @@ fn verified_padding_lands_on_the_alignment() {
         vec![0, 4, 8, 10]
     );
 }
+
+/// The published Inkling 2 Mini GGUF build, when present (`GAUDIUM_GGUF_REF_DIR` = its
+/// directory; run with `--ignored`): every file there opens, the main model has the expected
+/// tensor table, every NVFP4 tensor has its per-expert scale, and the first row of one tensor
+/// of every type decodes to finite numbers.
+#[test]
+#[ignore]
+fn reference_gguf_files_open_and_decode() {
+    let Some(dir) = std::env::var_os("GAUDIUM_GGUF_REF_DIR").map(PathBuf::from) else {
+        eprintln!("GAUDIUM_GGUF_REF_DIR is not set: nothing to check");
+        return;
+    };
+    let mut files = list_gguf(&dir).unwrap();
+    if dir.join("dspark").is_dir() {
+        files.extend(list_gguf(&dir.join("dspark")).unwrap());
+    }
+    assert!(!files.is_empty(), "no .gguf file in {}", dir.display());
+    for p in files {
+        let g = Gguf::open(&p).unwrap_or_else(|e| panic!("{e}"));
+        let counts = super::inspect::type_counts(&g);
+        eprintln!(
+            "{}: arch {:?}, {} tensors, {counts:?}",
+            p.display(),
+            g.arch(),
+            g.tensor_count()
+        );
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("Inkling-2-Mini-") && !name.starts_with("mmproj") {
+            assert_eq!(g.arch(), "inkling2_loop");
+            assert_eq!(g.tensor_count(), 744);
+            assert!(counts.get("NVFP4").is_some_and(|c| c.params > 0));
+        }
+        let mut done = std::collections::BTreeSet::new();
+        for t in g.tensors() {
+            if t.ty == GgmlType::NVFP4 {
+                let s = adapter::companion_scale(&g, &t.name).unwrap();
+                let s = s.unwrap_or_else(|| panic!("{}: no .scale", t.name));
+                assert_eq!(s.len() as u64, *t.dims.last().unwrap(), "{}", t.name);
+                assert!(s.iter().all(|x| x.is_finite() && *x > 0.0), "{}", t.name);
+                if t.name.starts_with("blk.0.") {
+                    let mut row = vec![0f32; t.row_len() as usize];
+                    dequant::rows_f32(&g, t, 0, 1, &mut row).unwrap();
+                    let amax = row.iter().fold(0f32, |m, x| m.max(x.abs()));
+                    eprintln!(
+                        "  {} dims {:?}: scale[0..3] {:?}, row 0 |max| {amax} before the scale",
+                        t.name,
+                        t.dims,
+                        &s[..3]
+                    );
+                }
+            }
+            if t.ty.info().decodable && done.insert(t.ty) {
+                let mut row = vec![0f32; t.row_len() as usize];
+                dequant::rows_f32(&g, t, 0, 1, &mut row).unwrap();
+                assert!(
+                    row.iter().all(|x| x.is_finite()),
+                    "{} ({})",
+                    t.name,
+                    t.ty.name()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn inspect_reports_and_refuses() {
+    let dir = temp_dir("inspect");
+    let p = dir.join("toy.gguf");
+    fs::write(&p, sample().build()).unwrap();
+    let r = super::inspect::inspect(&p).unwrap();
+    assert!(r.contains("architecture: \"toy\""), "{r}");
+    assert!(r.contains("toy.block_count = 2"), "{r}");
+    assert!(r.contains("tokenizer: ? (4 tokens)"), "{r}");
+    assert!(
+        r.contains("Q8_0") && r.contains("total         3 tensors"),
+        "{r}"
+    );
+    let mut bad = sample().build();
+    bad.truncate(bad.len() - 40);
+    fs::write(&p, &bad).unwrap();
+    let e = super::inspect::inspect(&p).unwrap_err().to_string();
+    assert!(e.contains("w.q8") || e.contains("w.bf16"), "{e}");
+    fs::remove_dir_all(&dir).unwrap();
+}
