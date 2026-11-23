@@ -32,6 +32,12 @@
 //! (full fingerprint coverage, recipe cache), device memory is summed up front, allocated exactly
 //! and sealed, prefill runs generic single-application recipes bound per application at launch,
 //! and decode is one monolithic `synLaunch` per token with a pre-validated binding list.
+//!
+//! Speculative decoding verifies the last token and its drafts in one pass of several rows (a row
+//! of a wider pass has the logits of a one-row step, so the stream is the `K = 0` stream). The
+//! drafts come from the checkpoint's block drafter (`mtp.safetensors`, child module `mtp`: its
+//! context is computed from taps of the prefill tiles and of every verify pass, a block costs one
+//! more launch) or from a known stream on the host (tests).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2251,9 +2257,14 @@ impl Inkling2Engine {
             let t_v = Instant::now();
             let mut got = self.run_rows(&toks, cursor, bucket)?;
             if params.temperature > 0.0 {
-                // a sampled request: each row's token is its position's own sample
-                for (r, g) in got.iter_mut().enumerate().take(n_drafts + 1) {
-                    *g = self.sample_logits_row(logits, r, params, (cursor + r as u64) as u32)?;
+                // a sampled request: each row's token is its position's own sample. Rows after the
+                // first one whose sample is not the next draft are never emitted: they are not
+                // sampled (a row's sample depends only on its own logits and position)
+                for r in 0..=n_drafts {
+                    got[r] = self.sample_logits_row(logits, r, params, (cursor + r as u64) as u32)?;
+                    if r == n_drafts || got[r] != toks[r + 1] {
+                        break;
+                    }
                 }
             }
             let accepted = chain_accept(&toks[..=n_drafts], &got[..=n_drafts]);

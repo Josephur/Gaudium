@@ -1200,19 +1200,28 @@ impl Inkling2Engine {
         Ok(drafts)
     }
 
-    /// Debug (`GAUDIUM_IK_MTP_DUMP`): writes every drafter activation of the last block and the
-    /// first rows of every context state to `dir`.
+    /// Debug (`GAUDIUM_IK_MTP_DUMP`): writes every drafter activation of the last block, the
+    /// first rows of every context state and the last prefill tile's taps to `dir`.
     fn mtp_dump(&mut self, dir: &std::path::Path) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let cap = self.stage_io.as_slice().len();
         let st = self.mtp_ref();
-        let list: Vec<(String, u64, u64)> = st
+        let mut list: Vec<(String, u64, u64)> = st
             .plan
             .acts
             .iter()
             .chain(st.plan.state.iter())
             .map(|(n, &b)| (n.clone(), st.addr[n], b.min(64 << 20)))
             .collect();
+        // the main model's taps of the last prefill tile, as the context recipe read them
+        let tile_bytes = self.dims.hid * self.prefill_tile * 2;
+        for (j, tap) in st.taps.iter().enumerate() {
+            let addr = match *tap {
+                MtpTap::Source(s) => self.src_buf(s),
+                MtpTap::Final => self.pf_hfin,
+            };
+            list.push((format!("mti_tap{j}"), addr, tile_bytes));
+        }
         for (name, addr, bytes) in list {
             let mut out = Vec::with_capacity(bytes as usize);
             let mut off = 0u64;
