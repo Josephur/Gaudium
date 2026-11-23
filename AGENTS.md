@@ -102,7 +102,12 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
   - Once a `law` is locked in `gaudium/rusty-bends.lock`, **NEVER weaken, edit, comment out, or delete it** to make `cargo check` pass.
   - If `E_BEND_CHECK_FAILED` or `E_LAW_LOCK_TAMPERED` fires, fix the implementation or proof — NOT the law.
   - If a locked law itself contradicts the real hardware or protocol specification, **STOP and ask the user** before touching any locked law.
-  - Adding brand-new laws for new slices is allowed; always run `cargo check` *without* `RUSTY_BENDS_UPDATE_LAWS=1` first to confirm zero locked laws changed, and only seal new laws into `rusty-bends.lock` with user approval.
+  - Adding brand-new laws for new slices is allowed; always run `cargo check` *without* `RUSTY_BENDS_UPDATE_LAWS=1` first to confirm zero locked laws changed.
+- **New laws are sealed after an independent review, not by asking the user:**
+  - **Who reviews.** A second agent, never the session that wrote the laws, running on the most capable model available to it at high reasoning effort or above. It works from the `.bend` sources and the Rust call sites, not from the author's summary.
+  - **What it checks, law by law.** The law states a bound or a safety property as section 3a requires, and fixes no default, tuning constant, threshold or exact formula. It is not vacuous: it constrains the function it names, and that function is the one the Rust shell calls (no Rust condition restates it). Its proof is checked by `BEND_VERDICT=require cargo check`. The reviewer names the legitimate future change the law would forbid, or says that there is none.
+  - **What happens next.** The reviewer writes its verdict for each law in the pull request. Laws that pass are sealed on that pull request's branch with `RUSTY_BENDS_UPDATE_LAWS=1`, and the lock's diff must only add lines. A law the reviewer doubts is corrected and reviewed again, or left out of the lock with the reason stated; it is never sealed to get the change merged.
+  - The user is still asked before any law that is already locked is touched (the rule above), and still approves the merge (section 12).
 - **Incremental vertical slices:** Keep `cargo check` and `cargo test` green after every slice.
 
 ---
@@ -192,7 +197,7 @@ Before ending the session, confirm that the server is up and answers a request f
 
 - **One task, one branch, one PR.** Start each task on a new branch from the latest `main`, in a git worktree of its own under `.worktrees/` (`git worktree add .worktrees/<name> -b <type>/<name> origin/main`). Never edit files in the main checkout, never commit on `main`, and never put two unrelated tasks on one branch.
 - **Name the issue.** The PR description says which issue the change belongs to: `Closes #N` when it meets everything the issue asks for, `Refs #N` when it is a part. Work without an issue gets one first, or one line in the PR on why none is needed.
-- **Green before it is opened for review.** `BEND_VERDICT=require cargo check`, `cargo test` and the Web UI tests (`node --test test/` in `ui/`) pass on the branch. The description carries the hand-off of section 3a (laws added, the Rust call sites that use them, what stayed in the shell and why), says whether `rusty-bends.lock` changed, and gives card measurements with their configuration when the change claims any (section 7).
+- **Green before it is opened for review.** `BEND_VERDICT=require cargo check`, `cargo test` and the Web UI tests (`node --test test/` in `ui/`) pass on the branch. The description carries the hand-off of section 3a (laws added, the Rust call sites that use them, what stayed in the shell and why), says whether `rusty-bends.lock` changed (with the review verdict for every law it seals, section 5), and gives card measurements with their configuration when the change claims any (section 7).
 - **Squash merge, then clean up.** A PR merges as one commit once its checks pass and the user has approved it. At merge its branch is deleted and its worktree removed (`git worktree remove`).
 - **Nothing is left uncommitted.** At the end of a session everything it wrote is committed and pushed on its branch; unfinished work is a draft PR that says what is missing. A task that is given up has its PR closed with a note and its worktree removed.
 - **Two tasks, one file.** The task that merges second rebases onto `main` and runs the checks again before it merges.
