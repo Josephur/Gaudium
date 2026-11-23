@@ -4,6 +4,7 @@
 //! validates every JSON header and `[begin, end]` byte range strictly, and exposes zero-copy
 //! `&[u8]` tensor views.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt;
@@ -19,6 +20,29 @@ use crate::json::{parse_json_bytes, JsonError, JsonValue};
 pub trait LazyRows: Send + Sync {
     /// Materialises rows `[r0, r1)` of the `[shape[0], rest]` matrix as row-major BF16.
     fn rows_bf16(&self, r0: u64, r1: u64, out: &mut [u16]);
+
+    /// [`Self::rows_bf16`] that reports a bad row range or output length instead of panicking.
+    fn try_rows_bf16(&self, r0: u64, r1: u64, out: &mut [u16]) -> Result<(), String> {
+        self.rows_bf16(r0, r1, out);
+        Ok(())
+    }
+
+    /// The same rows as `f32` (a producer that decodes to `f32` gives its values before any
+    /// rounding to BF16; the default widens the BF16 rows).
+    fn try_rows_f32(&self, r0: u64, r1: u64, out: &mut [f32]) -> Result<(), String> {
+        let mut b = vec![0u16; out.len()];
+        self.try_rows_bf16(r0, r1, &mut b)?;
+        out.iter_mut()
+            .zip(&b)
+            .for_each(|(o, &x)| *o = f32::from_bits((x as u32) << 16));
+        Ok(())
+    }
+
+    /// The tensor's bytes in its registered dtype when they already sit in memory as they are
+    /// (e.g. a BF16 tensor in a mapped file); `None` when they have to be produced.
+    fn mapped_bytes(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,6 +390,37 @@ impl SafetensorsStore {
     pub fn get(&self, name: &str) -> Result<&TensorMeta, SafetensorsError> {
         self.find(name)
             .ok_or_else(|| SafetensorsError::NotFound(name.to_owned()))
+    }
+
+    /// The tensor's bytes in its dtype: borrowed from the mapping for a mapped tensor or a lazy
+    /// one whose bytes are in memory as they are, else produced by its [`LazyRows`] (BF16 or
+    /// F32 lazy tensors) into an owned buffer.
+    pub fn tensor_data(&self, name: &str) -> Result<Cow<'_, [u8]>, SafetensorsError> {
+        let meta = self.get(name)?;
+        let Some(lazy) = &meta.lazy else {
+            return Ok(Cow::Borrowed(self.tensor_bytes(name)?.unwrap_or(&[])));
+        };
+        if let Some(b) = lazy.mapped_bytes() {
+            return Ok(Cow::Borrowed(b));
+        }
+        let rows = meta.shape.first().copied().unwrap_or(1);
+        let n: u64 = meta.shape.iter().product();
+        let fail = |e: String| SafetensorsError::Malformed(format!("{name}: {e}"));
+        match meta.dtype.as_str() {
+            "BF16" => {
+                let mut v = vec![0u16; n as usize];
+                lazy.try_rows_bf16(0, rows, &mut v).map_err(fail)?;
+                Ok(Cow::Owned(v.iter().flat_map(|x| x.to_le_bytes()).collect()))
+            }
+            "F32" => {
+                let mut v = vec![0f32; n as usize];
+                lazy.try_rows_f32(0, rows, &mut v).map_err(fail)?;
+                Ok(Cow::Owned(v.iter().flat_map(|x| x.to_le_bytes()).collect()))
+            }
+            other => Err(SafetensorsError::Malformed(format!(
+                "{name}: lazy tensor of dtype {other} cannot be produced"
+            ))),
+        }
     }
 
     /// Returns the zero-copy byte slice of a mapped tensor (`None` for lazy tensors).
