@@ -43,6 +43,11 @@ e5ac6739516742cc  ds_ring_holds_window_and_pass  law ds_ring_holds_window_and_pa
 a0a0a67e1d6ae93a  ds_ring_needs_its_kernels  law ds_ring_needs_its_kernels : for w : Nat for + l : Nat for + r : Nat { ds_ring_pick ( False { } , w , l , r ) == 0n : Nat }
 d64aa69324dcf18f  ds_window_rows_split  law ds_window_rows_split : for + nv : Nat for + hi : Nat { Nat.add ( ds_win_low ( nv , hi ) , ds_win_wrap ( nv , hi ) ) == nv : Nat }
 a09474b00bc19d2b  effective_max_new_le_room  law effective_max_new_le_room : for unb : Bool for + req : Nat for + p : Nat for + lmax : Nat { Nat.is_le ( effective_max_new ( unb , req , p , lmax ) , prompt_room ( p , lmax ) ) == True { } : Bool }
+c5c794aed8b5d9a9  effort_level_ask_thinks  law effort_level_ask_thinks : for + s : EffortSet for + r : Nat { effort_plan_is_off ( effort_plan ( s , EaLevel { r } ) ) == False { } : Bool }
+e793ca3caadd0e8e  effort_no_levels_no_level  law effort_no_levels_no_level : for + s : EffortSet for + q : EffortAsk { Bool.or ( effort_any ( s ) , Bool.not ( effort_plan_is_level ( effort_plan ( s , q ) ) ) ) == True { } : Bool }
+fa1947f576425c2e  effort_offered_advertised  law effort_offered_advertised : for + s : EffortSet for + r : Nat { Bool.or ( Bool.not ( effort_has ( s , r ) ) , effort_advertised ( s , r ) ) == True { } : Bool }
+32771468a14c3e13  effort_offered_kept  law effort_offered_kept : for + s : EffortSet for + r : Nat { Bool.or ( Bool.not ( effort_has ( s , r ) ) , effort_plan_is ( effort_plan ( s , EaLevel { r } ) , r ) ) == True { } : Bool }
+cec5eb19c9afc9c6  effort_plan_offered  law effort_plan_offered : for + s : EffortSet for + a : EffortAsk { effort_plan_ok ( s , effort_plan ( s , a ) ) == True { } : Bool }
 b8a418606825f53b  empty_prompt_rejected  law empty_prompt_rejected : for lmax : Nat { prompt_admitted ( 0n , lmax ) == False { } : Bool }
 0a0dc9c6c90582ef  finish_calls_reported_unless_cancelled  law finish_calls_reported_unless_cancelled : for + e : GenEnd { Bool.xor ( fr_is_tool_calls ( finish_reason ( e , True { } ) ) , ge_is_cancelled ( e ) ) == True { } : Bool }
 67a57dc6c58cd39b  finish_cancel_absorbs  law finish_cancel_absorbs : for c : Bool { finish_reason ( GeCancelled { } , c ) == FrCancelled { } : FinishReason }

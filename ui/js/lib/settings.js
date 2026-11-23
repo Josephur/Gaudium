@@ -4,7 +4,7 @@ export const DEFAULTS = {
   system: '',
   theme: 'system',            // system | light | dark
   thinking: 'on',             // on | off
-  effort: 'default',          // default | low | medium | xhigh (the template's levels, /props)
+  effort: 'default',          // default | a level of the model's template (/props chat_template_caps.reasoning_effort_levels)
   showReasoning: 'stream',    // stream: open while it streams, then folds | always | never
   temperature: '', top_k: '', top_p: '', min_p: '', seed: '', max_tokens: '',
   method: 'default',          // gaudium_method: default (greedy -> engine greedy default, sampled -> sampled default) or a loaded run

@@ -114,6 +114,11 @@ Serve options:
   --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster
                         decode, more device memory, its own token stream)
   --model-ctx <id=N>    Context size for model <id> instead of --max-ctx
+  --effort-levels <id=l,..>  Reasoning-effort levels of model <id> instead of the ones
+                        read from its chat template (each one the template renders
+                        without raising): levels of minimal, low, medium, high,
+                        xhigh, max, or none for no effort setting. /props advertises
+                        them; a request's reasoning_effort goes to the nearest one
   --precision <id=p>    Weight precision of model <id>: auto (default), bf16 or fp8 (a
                         BF16 checkpoint is quantised at load per output channel; give
                         its activation-scale table with --fp8-act)

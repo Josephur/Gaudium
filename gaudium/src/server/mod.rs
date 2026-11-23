@@ -31,6 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::budget::SequenceBudget;
+use crate::core::effort::EffortLevels;
 use crate::core::lifecycle::{can_switch_resident_model, RequestGuard};
 use crate::core::tool_calls::{finish_reason_name, generation_end, stop_reason_name, GenEnd};
 use crate::core::vision::{drafter_runs_with_vision, planned_image_tokens, MediaLimits};
@@ -148,6 +149,8 @@ pub struct ModelRunOptions {
     /// The vision tower of this model instead of the server-wide setting: its largest image in
     /// patches, or 0 for no tower (text only).
     pub vision_patches: Option<u64>,
+    /// The reasoning-effort levels instead of the ones read from the model's chat template.
+    pub effort_levels: Option<EffortLevels>,
 }
 
 struct RegisteredModel {
@@ -762,6 +765,14 @@ impl AppState {
         let (d_temp, d_top_k, d_top_p) = (gd.temperature, gd.top_k, gd.top_p);
         // tools reach the model through its own chat template
         let tools = m.chat.as_ref().is_some_and(|t| t.supports_tools);
+        // the reasoning-effort levels of the template (the verified plan keeps each of them)
+        let effort = m.chat.as_ref().map_or(EffortLevels::NONE, |t| t.effort);
+        let effort_on = effort.supported();
+        let effort_levels = format!(
+            "[{}]",
+            effort.advertised().into_iter().map(jq).collect::<Vec<_>>().join(",")
+        );
+        let family = jq(template_family(m.spec.family));
         // what a request's images and videos must fit (the Web UI sizes its estimates by it)
         let vision = m.vision.is_some();
         let video = m.vision.as_ref().is_some_and(|v| v.spec.video.is_some());
@@ -797,11 +808,11 @@ impl AppState {
              \"modalities\":{{\"vision\":{vision},\"audio\":false,\"video\":{video}}},\
              \"vision\":{vision_limits},\
              \"endpoint_slots\":true,\"endpoint_props\":false,\"endpoint_metrics\":false,\"ui\":{},\
-             \"ui_settings\":{{}},\"chat_template\":\"qwen3\",\
+             \"ui_settings\":{{}},\"chat_template\":{family},\
              \"chat_template_caps\":{{\"supports_string_content\":true,\"supports_typed_content\":true,\
              \"supports_tools\":{tools},\"supports_tool_calls\":{tools},\"supports_parallel_tool_calls\":{tools},\
-             \"supports_system_role\":true,\"supports_preserve_reasoning\":true,\"supports_reasoning_effort\":false,\
-             \"supports_object_arguments\":false,\"reasoning_effort_levels\":[]}},\
+             \"supports_system_role\":true,\"supports_preserve_reasoning\":true,\"supports_reasoning_effort\":{effort_on},\
+             \"supports_object_arguments\":false,\"reasoning_effort_levels\":{effort_levels}}},\
              \"bos_token\":{},\"eos_token\":{},\"build_info\":{},\"is_sleeping\":false,\
              \"cors_proxy_enabled\":{},\"a2ui\":{}",
             m.max_ctx,
@@ -1118,6 +1129,40 @@ fn planned_drafter_of(
     Some((Some(dir.clone()), kind, draft_k))
 }
 
+/// `--effort-levels`: the model's reasoning-effort levels instead of the ones read from its chat
+/// template. A level the template raises on is refused.
+fn effort_override(
+    chat: Option<&mut ChatTemplate>,
+    levels: EffortLevels,
+) -> Result<(), String> {
+    let Some(t) = chat else {
+        return match levels.supported() {
+            true => Err("the model has no chat template".into()),
+            false => Ok(()),
+        };
+    };
+    if let Some(bad) = levels
+        .advertised()
+        .into_iter()
+        .find(|l| !t.effort_renders(l))
+    {
+        return Err(format!(
+            "the model's chat template raises on reasoning_effort '{bad}'"
+        ));
+    }
+    t.effort = levels;
+    Ok(())
+}
+
+/// The `chat_template` family name `/props` reports.
+fn template_family(family: ModelFamily) -> &'static str {
+    match family {
+        ModelFamily::Qwen3 => "qwen3",
+        ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe => "qwen3.5",
+        ModelFamily::Gemma4 | ModelFamily::Gemma4Assistant => "gemma4",
+    }
+}
+
 /// The context the served model `id` runs at: `--max-ctx` (or the model's own `--model-ctx`) in
 /// whole KV chunks, clamped to the model's own limit.
 fn served_max_ctx(cfg: &ServerConfig, id: &str, dir: &Path) -> u64 {
@@ -1378,7 +1423,7 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
                 extra_eos_ids.push(id);
             }
         }
-        let chat = match ChatTemplate::load(&entry.dir) {
+        let mut chat = match ChatTemplate::load(&entry.dir) {
             Ok(Some((t, note))) => {
                 if let Some(note) = note {
                     eprintln!(
@@ -1403,6 +1448,22 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
                 None
             }
         };
+        if let Some(levels) = cfg
+            .per_model
+            .iter()
+            .find(|(k, _)| k == &entry.id)
+            .and_then(|(_, o)| o.effort_levels)
+        {
+            effort_override(chat.as_mut(), levels)
+                .map_err(|e| format!("--effort-levels {}: {e}", entry.id))?;
+        }
+        if let Some(t) = chat.as_ref().filter(|t| t.effort.supported()) {
+            eprintln!(
+                "[server] model '{}': reasoning effort levels {}",
+                entry.id,
+                t.effort.advertised().join(", ")
+            );
+        }
         let format = match &chat {
             Some(t) => t.format.clone(),
             None => builtin_format(spec.family),
@@ -3699,5 +3760,26 @@ mod tests {
         assert_eq!(safe_join(root, "../etc/passwd"), None);
         assert_eq!(safe_join(root, "js/../../secret"), None);
         assert_eq!(safe_join(root, "/etc/passwd"), None);
+    }
+
+    #[test]
+    fn effort_levels_override_only_levels_the_template_renders() {
+        let template = || ChatTemplate::from_parts(chat::EFFORT_TEMPLATE, None).unwrap().0;
+        let levels = |l: &str| EffortLevels::parse(l).unwrap();
+        let mut t = template();
+        effort_override(Some(&mut t), levels("low,xhigh")).unwrap();
+        assert_eq!(t.effort.advertised(), ["low", "xhigh"]);
+        effort_override(Some(&mut t), levels("none")).unwrap();
+        assert!(!t.effort.supported());
+        // the template raises on high: refused, the detected levels stay
+        let mut t = template();
+        assert!(effort_override(Some(&mut t), levels("low,high"))
+            .unwrap_err()
+            .contains("'high'"));
+        assert_eq!(t.effort.advertised(), ["low", "medium", "xhigh"]);
+        // no chat template: no levels to give
+        assert!(effort_override(None, levels("low")).is_err());
+        assert!(effort_override(None, levels("none")).is_ok());
+        assert_eq!(template_family(ModelFamily::Gemma4Assistant), "gemma4");
     }
 }
