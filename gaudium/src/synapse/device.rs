@@ -5,6 +5,7 @@
 //! all streams before releasing the device (`AGENTS.md` §8).
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -87,6 +88,10 @@ pub struct HpuDevice {
     allocs: Vec<HbmAllocRecord>,
     shared_ws_addr: u64,
     shared_ws_size: u64,
+    /// True from the open until the streams have been drained for the last time in `Drop`.
+    /// What holds host memory mapped for this device reads it before it unmaps
+    /// (`synapse/xfer.rs`).
+    open: Arc<AtomicBool>,
 }
 
 impl HpuDevice {
@@ -169,7 +174,14 @@ impl HpuDevice {
             allocs: Vec::new(),
             shared_ws_addr: 0,
             shared_ws_size: 0,
+            open: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// Whether this device is still open, for a holder of host memory that is mapped for it
+    /// and may be dropped before or after it.
+    pub fn open_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.open)
     }
 
     pub fn api(&self) -> &Arc<SynapseApi> {
@@ -752,6 +764,8 @@ impl Drop for HpuDevice {
     fn drop(&mut self) {
         // CRITICAL: Drain EVERY stream before freeing HBM or destroying streams/device!
         self.drain_all();
+        // from here on nothing is queued and the streams are about to go
+        self.open.store(false, Ordering::Release);
         for alloc in self.allocs.drain(..) {
             unsafe {
                 (self.api.syn_device_free)(self.dev_id, alloc.addr, 0);

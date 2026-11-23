@@ -41,10 +41,14 @@ use super::*;
 use crate::cache_ram::{digest128, EngineId, HostCache, SharedCache};
 use crate::synapse::xfer::{Piece, XferRing, XferStats};
 use crate::verified::{
-    hc_clean_hi, hc_clean_join_hi, hc_clean_join_lo, hc_clean_lo, hc_copy_wins, hc_layout,
-    hc_loses_unsaved, hc_must_flush, hc_new_tiles, hc_ring_floor, hc_ring_restore, hc_ring_save,
-    hc_rows_added, hc_rows_complete, hc_save_ok, hc_state_wanted, hc_tile_clean, hc_tile_copied,
-    hc_written_hi, hc_written_lo, pc_boundary, pc_request_may_reuse, HcLayout,
+    hc_cache_span, hc_cache_tiles, hc_calibrate_bytes, hc_clean_hi, hc_clean_join_hi,
+    hc_clean_join_lo, hc_clean_lo, hc_copy_wins, hc_layout, hc_loses_unsaved, hc_must_flush,
+    hc_new_tiles, hc_piece_dev_off, hc_piece_host_off, hc_piece_inside, hc_piece_len,
+    hc_pieces_per_tile, hc_range_end, hc_range_inside, hc_restore_bytes, hc_ring_due,
+    hc_ring_floor, hc_ring_restore, hc_rows_added, hc_rows_complete, hc_save_ok, hc_saved_whole,
+    hc_state_wanted, hc_tile_bytes, hc_tile_chunk, hc_tile_clean, hc_tile_copied, hc_tile_slot,
+    hc_tiles_fill_chunk, hc_tiles_per_chunk, hc_written_hi, hc_written_lo, pc_boundary,
+    pc_request_may_reuse, HcLayout,
 };
 
 /// Tiles whose rows one copy call takes (a waiting request is noticed between ring buffers
@@ -185,13 +189,17 @@ impl Copier for RingCopier<'_> {
 
 /// Where the K/V rows of a prompt lie on the device: every attention layer's key and value
 /// cache is `chunks` chunks of `chunk_rows` rows, and inside a chunk each of `heads` heads
-/// holds its rows one after the other (`row_bytes` each).
+/// holds its rows one after the other (`row_bytes` each). Every size and offset of it is the
+/// verified core's (`verified/host_cache.bend`, section 16); this type holds the numbers and
+/// adds the offsets to addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowLayout {
     /// Device address of each cache, in name order.
     pub caches: Vec<u64>,
     pub chunks: u64,
     pub chunk_rows: u64,
+    /// Tiles of one chunk (`hc_tiles_per_chunk`); they fill it exactly.
+    pub tiles_per_chunk: u64,
     pub heads: u64,
     pub row_bytes: u64,
     pub tile: u64,
@@ -220,80 +228,164 @@ impl RowLayout {
             KV_BLOCK_ROWS,
             cache_bytes,
         ) {
-            HcLayout::HcLayoutOk => Ok(Self {
-                caches,
-                chunks,
-                chunk_rows,
-                heads,
-                row_bytes,
-                tile,
-            }),
-            HcLayout::HcLayoutEmpty => Err("no K/V caches to copy".into()),
-            HcLayout::HcLayoutTile => Err(format!(
-                "a prefill tile of {tile} rows does not divide a K/V chunk of {chunk_rows} rows into whole {KV_BLOCK_ROWS}-row blocks"
-            )),
-            HcLayout::HcLayoutSize => Err(format!(
-                "a K/V cache of {cache_bytes} bytes is not {chunks} chunks x {heads} heads x {chunk_rows} rows x {row_bytes} bytes"
-            )),
+            HcLayout::HcLayoutOk => {}
+            HcLayout::HcLayoutEmpty => return Err("no K/V caches to copy".into()),
+            HcLayout::HcLayoutTile => {
+                return Err(format!(
+                    "a prefill tile of {tile} rows does not divide a K/V chunk of {chunk_rows} rows into whole {KV_BLOCK_ROWS}-row blocks"
+                ))
+            }
+            HcLayout::HcLayoutSize => {
+                return Err(format!(
+                    "a K/V cache of {cache_bytes} bytes is not {chunks} chunks x {heads} heads x {chunk_rows} rows x {row_bytes} bytes"
+                ))
+            }
         }
+        // The offsets of a piece count whole tiles of a chunk, so the tiles must fill a chunk
+        // exactly (a tile that divides the chunk does); the laws that keep every piece inside
+        // its cache are stated for such chunks.
+        let tiles_per_chunk = hc_tiles_per_chunk(chunk_rows, tile);
+        if !hc_tiles_fill_chunk(tiles_per_chunk, tile, chunk_rows) {
+            return Err(format!(
+                "{tiles_per_chunk} tiles of {tile} rows do not fill a K/V chunk of {chunk_rows} rows"
+            ));
+        }
+        Ok(Self {
+            caches,
+            chunks,
+            chunk_rows,
+            tiles_per_chunk,
+            heads,
+            row_bytes,
+            tile,
+        })
     }
 
     /// Host bytes of one tile's rows.
     pub fn tile_bytes(&self) -> u64 {
-        self.caches.len() as u64 * self.heads * self.tile * self.row_bytes
+        hc_tile_bytes(
+            self.caches.len() as u64,
+            self.heads,
+            self.tile,
+            self.row_bytes,
+        )
     }
 
     /// Device ranges of one tile: one per cache and head.
     pub fn pieces_per_tile(&self) -> usize {
-        self.caches.len() * self.heads as usize
+        hc_pieces_per_tile(self.caches.len() as u64, self.heads) as usize
     }
 
     /// Tiles the caches hold.
     pub fn tiles(&self) -> u64 {
-        self.chunks * self.chunk_rows / self.tile
+        hc_cache_tiles(self.chunks, self.tiles_per_chunk)
+    }
+
+    /// Bytes of one cache.
+    pub fn cache_bytes(&self) -> u64 {
+        hc_cache_span(
+            self.chunks,
+            self.heads,
+            self.tiles_per_chunk,
+            self.tile,
+            self.row_bytes,
+        )
     }
 
     /// Appends the pieces of tile `t`, whose rows live at `host`: per cache, per head, the
-    /// tile's rows of that head. The host bytes follow each other in that order.
-    pub(crate) fn tile_pieces(&self, t: u64, host: *mut u8, out: &mut Vec<Piece>) {
-        let row = t * self.tile;
-        let (chunk, in_chunk) = (row / self.chunk_rows, row % self.chunk_rows);
-        let len = (self.tile * self.row_bytes) as usize;
-        let chunk_bytes = self.heads * self.chunk_rows * self.row_bytes;
-        let mut off = 0usize;
-        for &addr in &self.caches {
-            for h in 0..self.heads {
-                out.push(Piece {
-                    dev: addr
-                        + chunk * chunk_bytes
-                        + (h * self.chunk_rows + in_chunk) * self.row_bytes,
-                    // SAFETY: `off + len <= tile_bytes()`, the size of the tile's segment.
-                    host: unsafe { host.add(off) },
+    /// tile's rows of that head. Where a piece starts in its cache and in the tile's segment,
+    /// and how long it is, are `hc_piece_dev_off`, `hc_piece_host_off` and `hc_piece_len`;
+    /// a piece is used only when `hc_piece_inside` says that the place is the tile's and one
+    /// the layout has (its laws then keep the piece inside the cache and inside the segment).
+    /// An error names a tile the caches have no place for; nothing was appended for it.
+    pub(crate) fn tile_pieces(
+        &self,
+        t: u64,
+        host: *mut u8,
+        out: &mut Vec<Piece>,
+    ) -> Result<(), String> {
+        let (chunk, slot) = (
+            hc_tile_chunk(t, self.tiles_per_chunk),
+            hc_tile_slot(t, self.tiles_per_chunk),
+        );
+        let caches = self.caches.len() as u64;
+        let len = hc_piece_len(self.tile, self.row_bytes) as usize;
+        let mut pieces = Vec::with_capacity(self.pieces_per_tile());
+        for (cache, &addr) in self.caches.iter().enumerate() {
+            for head in 0..self.heads {
+                if !hc_piece_inside(
+                    t,
+                    chunk,
+                    self.chunks,
+                    slot,
+                    self.tiles_per_chunk,
+                    head,
+                    self.heads,
+                    cache as u64,
+                    caches,
+                ) {
+                    return Err(format!(
+                        "host tier: the K/V caches have no place for tile {t} ({} chunks of {} tiles)",
+                        self.chunks, self.tiles_per_chunk
+                    ));
+                }
+                let dev_off = hc_piece_dev_off(
+                    chunk,
+                    slot,
+                    head,
+                    self.heads,
+                    self.tiles_per_chunk,
+                    self.tile,
+                    self.row_bytes,
+                );
+                let host_off =
+                    hc_piece_host_off(cache as u64, head, self.heads, self.tile, self.row_bytes);
+                pieces.push(Piece {
+                    dev: addr + dev_off,
+                    // SAFETY: `host_off + len <= tile_bytes()`, the size of the tile's segment
+                    // (`hc_piece_within_segment`).
+                    host: unsafe { host.add(host_off as usize) },
                     len,
                 });
-                off += len;
             }
         }
+        out.extend(pieces);
+        Ok(())
     }
 }
 
-/// The pieces of device ranges `ranges` (`(address, bytes)`), whose bytes follow each other at
-/// `host`.
-fn range_pieces(ranges: &[(u64, u64)], host: *mut u8) -> Vec<Piece> {
-    let mut off = 0usize;
+/// Bytes of device ranges `ranges` (`(address, bytes)`) laid one after the other.
+fn ranges_bytes(ranges: &[(u64, u64)]) -> u64 {
     ranges
         .iter()
-        .map(|&(dev, bytes)| {
-            let p = Piece {
-                dev,
-                // SAFETY: the segment at `host` has the size of the sum of the ranges.
-                host: unsafe { host.add(off) },
-                len: bytes as usize,
-            };
-            off += bytes as usize;
-            p
-        })
-        .collect()
+        .fold(0, |end, &(_, bytes)| hc_range_end(end, bytes))
+}
+
+/// The pieces of device ranges `ranges` (`(address, bytes)`), whose bytes follow each other at
+/// `host` in a segment of `seg_bytes` (`hc_range_end`). A range that would end past the
+/// segment is an error (`hc_range_inside`), and no piece is returned.
+fn range_pieces(
+    ranges: &[(u64, u64)],
+    host: *mut u8,
+    seg_bytes: u64,
+) -> Result<Vec<Piece>, String> {
+    let mut off = 0u64;
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(dev, bytes) in ranges {
+        if !hc_range_inside(off, bytes, seg_bytes) {
+            return Err(format!(
+                "host tier: a device range of {bytes} bytes at offset {off} ends past its segment of {seg_bytes} bytes"
+            ));
+        }
+        out.push(Piece {
+            dev,
+            // SAFETY: `off + bytes <= seg_bytes`, checked above.
+            host: unsafe { host.add(off as usize) },
+            len: bytes as usize,
+        });
+        off = hc_range_end(off, bytes);
+    }
+    Ok(out)
 }
 
 /// The tier of one loaded engine.
@@ -334,8 +426,8 @@ impl HostTier {
         ring: Vec<(u64, u64)>,
         verbose: bool,
     ) -> Self {
-        let state_bytes = slots.first().map_or(0, |s| s.iter().map(|&(_, b)| b).sum());
-        let ring_bytes = ring.iter().map(|&(_, b)| b).sum();
+        let state_bytes = slots.first().map_or(0, |s| ranges_bytes(s));
+        let ring_bytes = ranges_bytes(&ring);
         Self {
             cache,
             id,
@@ -402,8 +494,7 @@ impl HostTier {
     /// Measures the two copy rates through `copier` with the first bytes of the first K/V
     /// cache, which are read and written back unchanged.
     pub fn calibrate(&mut self, copier: &mut dyn Copier) -> Result<(), String> {
-        let bytes = CALIBRATE_BYTES
-            .min(self.rows.chunks * self.rows.heads * self.rows.chunk_rows * self.rows.row_bytes);
+        let bytes = hc_calibrate_bytes(CALIBRATE_BYTES, self.rows.cache_bytes());
         let mut map = crate::hostmem::AnonMap::new(bytes)?;
         let pieces = [Piece {
             dev: self.rows.caches[0],
@@ -483,9 +574,13 @@ impl HostTier {
             store.ring_serves(found.entry, found.tiles),
             self.ring_owner == Some(found.entry),
         );
-        let bytes = copy_tiles.len() as u64 * self.rows.tile_bytes()
-            + self.state_bytes
-            + if ring_copy { self.ring_bytes } else { 0 };
+        let bytes = hc_restore_bytes(
+            copy_tiles.len() as u64,
+            self.rows.tile_bytes(),
+            self.state_bytes,
+            ring_copy,
+            self.ring_bytes,
+        );
         let gained = found.pos.saturating_sub(peek.resume);
         if !hc_copy_wins(bytes, self.rates.to_device, gained, self.rates.prefill_rows) {
             return Ok(None);
@@ -503,18 +598,25 @@ impl HostTier {
             found.pos,
         );
         let slot = table.adopt_restored(&view.tokens, &view.images, found.tiles, ring_from);
-        let mut pieces: Vec<Piece> = Vec::new();
-        for &t in &copy_tiles {
-            self.rows
-                .tile_pieces(t, view.rows[t as usize] as *mut u8, &mut pieces);
-        }
-        if let Some(s) = slot {
-            pieces.extend(range_pieces(&self.slots[s], view.state as *mut u8));
-        }
-        if let (true, Some((ptr, _))) = (ring_copy, view.ring) {
-            pieces.extend(range_pieces(&self.ring, ptr as *mut u8));
-        }
-        let res = copier.to_device(&pieces);
+        let pieces = (|| -> Result<Vec<Piece>, String> {
+            let mut pieces: Vec<Piece> = Vec::new();
+            for &t in &copy_tiles {
+                self.rows
+                    .tile_pieces(t, view.rows[t as usize] as *mut u8, &mut pieces)?;
+            }
+            if let Some(s) = slot {
+                pieces.extend(range_pieces(
+                    &self.slots[s],
+                    view.state as *mut u8,
+                    self.state_bytes,
+                )?);
+            }
+            if let (true, Some((ptr, _))) = (ring_copy, view.ring) {
+                pieces.extend(range_pieces(&self.ring, ptr as *mut u8, self.ring_bytes)?);
+            }
+            Ok(pieces)
+        })();
+        let res = pieces.and_then(|pieces| copier.to_device(&pieces));
         match res {
             Err(e) => {
                 // nothing of a copy that failed may be read later: not the entry, not the
@@ -683,8 +785,6 @@ impl HostTier {
             );
         }
         let mut complete = true;
-        // the entry gained rows or positions in this save (its ring image is then stale)
-        let mut grew = false;
         let fail = |store: &mut HostCache, this: &mut Self, e: String| -> String {
             store.fail(entry);
             this.clean.remove(&entry);
@@ -710,7 +810,9 @@ impl HostTier {
             };
             let mut pieces: Vec<Piece> = Vec::with_capacity(n as usize * per_tile);
             for (i, &seg) in segs.iter().enumerate() {
-                self.rows.tile_pieces(have + i as u64, seg, &mut pieces);
+                if let Err(e) = self.rows.tile_pieces(have + i as u64, seg, &mut pieces) {
+                    return Err(fail(&mut store, self, e));
+                }
             }
             let (done, st) = match copier.to_host(&pieces, stop) {
                 Ok(x) => x,
@@ -724,7 +826,6 @@ impl HostTier {
             rep.bytes += st.bytes;
             Self::note_rate(&mut self.rates.to_host, &st);
             if hc_rows_added(have, now) {
-                grew = true;
                 let (lo, hi) = self.clean.get(&entry).copied().unwrap_or((have, have));
                 self.clean.insert(
                     entry,
@@ -757,14 +858,16 @@ impl HostTier {
                     complete = false;
                     break;
                 };
-                let pieces = range_pieces(&self.slots[slot], ptr);
+                let pieces = match range_pieces(&self.slots[slot], ptr, self.state_bytes) {
+                    Ok(p) => p,
+                    Err(e) => return Err(fail(&mut store, self, e)),
+                };
                 let (done, st) = match copier.to_host(&pieces, stop) {
                     Ok(x) => x,
                     Err(e) => return Err(fail(&mut store, self, e)),
                 };
                 let whole = store.end_state(entry, k, done as u64, pieces.len() as u64);
                 rep.bytes += st.bytes;
-                grew |= whole;
                 if !whole {
                     complete = false;
                     rep.yielded = true;
@@ -774,15 +877,28 @@ impl HostTier {
             store.trim_states(entry, table.slot_count(), upto);
         }
 
-        // the drafter rings, whole, when the entry has no image or outgrew the one it has
+        // The drafter rings, whole, when the entry's image falls short of what the entry keeps
+        // (`hc_ring_due`). That is read from the entry, not from what this call added: a save
+        // that gave way before or during this copy takes the image at the next call, although
+        // that call finds no tile and no position left to copy.
+        let image = store.ring_tiles(entry);
         if store.contains(entry)
-            && hc_ring_save(self.ring_bytes, complete, store.has_ring(entry), grew)
+            && hc_ring_due(
+                self.ring_bytes,
+                complete,
+                image.is_some(),
+                image.unwrap_or(0),
+                store.last_state_of(entry),
+            )
         {
             if stop() {
                 complete = false;
                 rep.yielded = true;
             } else if let Some(ptr) = store.begin_piece(entry, self.ring_bytes) {
-                let pieces = range_pieces(&self.ring, ptr);
+                let pieces = match range_pieces(&self.ring, ptr, self.ring_bytes) {
+                    Ok(p) => p,
+                    Err(e) => return Err(fail(&mut store, self, e)),
+                };
                 let (done, st) = match copier.to_host(&pieces, stop) {
                     Ok(x) => x,
                     Err(e) => return Err(fail(&mut store, self, e)),
@@ -801,7 +917,17 @@ impl HostTier {
             }
         }
 
-        rep.complete = complete && store.contains(entry);
+        // complete: nothing was cut short, and the image covers the entry's last kept position
+        // (`hc_saved_whole`)
+        let image = store.ring_tiles(entry);
+        rep.complete = store.contains(entry)
+            && hc_saved_whole(
+                complete,
+                self.ring_bytes,
+                image.is_some(),
+                image.unwrap_or(0),
+                store.last_state_of(entry),
+            );
         rep.ms = t0.elapsed().as_secs_f64() * 1e3;
         // a save cut short goes on at the next call; one that found no room does not ask again
         self.unsaved = rep.yielded;
@@ -1234,7 +1360,7 @@ mod tests {
             let mut out = Vec::new();
             for t in from / T..to / T {
                 let mut p = Vec::new();
-                l.tile_pieces(t, std::ptr::null_mut(), &mut p);
+                l.tile_pieces(t, std::ptr::null_mut(), &mut p).unwrap();
                 for piece in p {
                     out.extend_from_slice(self.at(piece.dev, piece.len));
                 }
@@ -1516,6 +1642,188 @@ mod tests {
             assert!(store.ring_serves(id, 6));
             assert!(!store.ring_serves(id, 8));
         }
+    }
+
+    #[test]
+    fn a_save_cut_short_at_the_rings_takes_them_at_the_next_idle_time() {
+        // A conversation whose first turn is saved (rows, positions, rings), after its second
+        // turn: two new tiles, two new positions, and an image that covers the first turn only.
+        let scene = || {
+            let cache = Arc::new(SharedCache::new(64 << 20, 0, false, false));
+            let mut r = rig_on(Arc::clone(&cache), 4, true, [7, 7]);
+            let a1 = prompt(4 * 512 + 100, 1);
+            r.request(&a1, true);
+            assert!(r.idle().complete);
+            let mut a2 = a1.clone();
+            a2.extend(prompt(1100, 5));
+            r.request(&a2, true);
+            // what the drafter's rings hold now
+            let (ring_at, ring_len) = r.dev.ring[0];
+            r.dev.at(ring_at, ring_len as usize).fill(0xAB);
+            (r, a2)
+        };
+        let tile_bytes = FakeDev::new(1, false).layout.tile_bytes();
+        // how often a whole save of that turn asks whether a request waits: the last time but
+        // one is the question before the ring copy, the last one is asked inside it
+        let asks = {
+            let (mut r, _) = scene();
+            let mut n = 0usize;
+            let rep = r
+                .tier
+                .save(&r.table, &mut r.dev, &mut || {
+                    n += 1;
+                    false
+                })
+                .unwrap();
+            assert!(rep.complete);
+            assert_eq!(rep.bytes, 2 * tile_bytes + 2 * 4608 + 8192);
+            n
+        };
+        for cut_at in [asks - 1, asks] {
+            let (mut r, a2) = scene();
+            // a request arrives exactly before the ring copy, or during it
+            let mut n = 0usize;
+            let rep = r
+                .tier
+                .save(&r.table, &mut r.dev, &mut || {
+                    n += 1;
+                    n >= cut_at
+                })
+                .unwrap();
+            assert!(rep.yielded && !rep.complete, "cut at ask {cut_at}");
+            assert_eq!(rep.bytes, 2 * tile_bytes + 2 * 4608);
+            assert!(r.tier.has_unsaved());
+            {
+                // the entry holds the new rows and positions, and the old image
+                let store = r.cache.inner.lock().unwrap();
+                let id = store.find([7, 7], T, &a2, &[], true, true).unwrap().entry;
+                assert_eq!((store.tiles_of(id), store.ring_tiles(id)), (6, Some(4)));
+                assert!(!store.ring_serves(id, 6));
+            }
+            // The next idle time finds no tile and no position left to copy. It takes the
+            // image all the same, because the one the entry has does not reach its last kept
+            // position; only then is the save complete.
+            let rep = r.idle();
+            assert!(rep.complete, "cut at ask {cut_at}");
+            assert_eq!(rep.bytes, 8192);
+            assert!(!r.tier.has_unsaved());
+            // one more idle time copies nothing
+            assert_eq!(r.idle().bytes, 0);
+            // the conversation comes back on an engine loaded again: rows, state and rings,
+            // and its drafter has the context of the whole restored prefix
+            let mut r2 = rig_on(Arc::clone(&r.cache), 4, true, [7, 7]);
+            let mut a3 = a2.clone();
+            a3.extend(prompt(300, 6));
+            let restored = r2
+                .tier
+                .begin_request(&mut r2.table, &mut r2.dev, &a3, &[], true, false)
+                .unwrap();
+            assert!(restored.is_some());
+            assert_eq!(r2.tier.last().restore_bytes, 6 * tile_bytes + 4608 + 8192);
+            let plan = r2.table.plan_from(&a3, &[], true, false, restored);
+            assert_eq!((plan.resume, plan.ring_flo), (6 * 512, 0));
+            let (ring_at, ring_len) = r2.dev.ring[0];
+            assert!(r2
+                .dev
+                .at(ring_at, ring_len as usize)
+                .iter()
+                .all(|&b| b == 0xAB));
+        }
+    }
+
+    #[test]
+    fn the_pieces_of_every_tile_lie_where_the_layout_says_inside_cache_and_segment() {
+        // (caches, chunks, rows of a chunk, heads, row bytes, tile)
+        for (n_caches, chunks, chunk_rows, heads, row_bytes, tile) in [
+            (2u64, 2u64, 4096u64, 2u64, 16u64, 512u64),
+            (3, 3, 1024, 4, 8, 256),
+            (1, 1, 512, 1, 32, 128),
+            (2, 5, 2048, 3, 24, 1024),
+        ] {
+            let cache_bytes = chunks * heads * chunk_rows * row_bytes;
+            let at: Vec<u64> = (0..n_caches)
+                .map(|c| 0x1000_0000 + c * 3 * cache_bytes)
+                .collect();
+            let l = RowLayout::new(
+                at.clone(),
+                cache_bytes,
+                chunks,
+                chunk_rows,
+                heads,
+                row_bytes,
+                tile,
+            )
+            .unwrap();
+            assert_eq!(l.cache_bytes(), cache_bytes);
+            assert_eq!(l.tiles(), chunks * chunk_rows / tile);
+            assert_eq!(l.tile_bytes(), n_caches * heads * tile * row_bytes);
+            assert_eq!(l.pieces_per_tile() as u64, n_caches * heads);
+            let len = tile * row_bytes;
+            let mut seg = vec![0u8; l.tile_bytes() as usize];
+            let seg_at = seg.as_mut_ptr();
+            let mut dev_ranges: Vec<u64> = Vec::new();
+            for t in 0..l.tiles() {
+                let mut p = Vec::new();
+                l.tile_pieces(t, seg_at, &mut p).unwrap();
+                assert_eq!(p.len(), l.pieces_per_tile());
+                // the arithmetic this replaced, written out
+                let row = t * tile;
+                let (chunk, in_chunk) = (row / chunk_rows, row % chunk_rows);
+                let chunk_bytes = heads * chunk_rows * row_bytes;
+                let mut off = 0u64;
+                for (c, &addr) in at.iter().enumerate() {
+                    for h in 0..heads {
+                        let piece = p[c * heads as usize + h as usize];
+                        assert_eq!(
+                            piece.dev,
+                            addr + chunk * chunk_bytes + (h * chunk_rows + in_chunk) * row_bytes
+                        );
+                        assert_eq!(piece.host as u64 - seg_at as u64, off);
+                        assert_eq!(piece.len as u64, len);
+                        // inside its cache, and inside the tile's segment
+                        assert!(piece.dev >= addr && piece.dev + len <= addr + cache_bytes);
+                        assert!(off + len <= l.tile_bytes());
+                        dev_ranges.push(piece.dev);
+                        off += len;
+                    }
+                }
+                // the pieces of the tile fill its segment without a gap or an overlap
+                assert_eq!(off, l.tile_bytes());
+            }
+            // over all tiles, the pieces cover every cache exactly once
+            dev_ranges.sort_unstable();
+            let mut expect = Vec::new();
+            for &addr in &at {
+                expect.extend((0..cache_bytes / len).map(|i| addr + i * len));
+            }
+            assert!(dev_ranges == expect);
+            // a tile the caches have no place for is refused, and nothing is appended for it
+            let mut p = Vec::new();
+            assert!(l.tile_pieces(l.tiles(), seg_at, &mut p).is_err());
+            assert!(l.tile_pieces(l.tiles() + 7, seg_at, &mut p).is_err());
+            assert!(p.is_empty());
+        }
+    }
+
+    #[test]
+    fn ranges_of_a_state_follow_each_other_and_never_leave_their_segment() {
+        let ranges = [(0x9000u64, 4096u64), (0x100u64, 512), (0x7000, 100)];
+        assert_eq!(ranges_bytes(&ranges), 4708);
+        let mut seg = vec![0u8; 4708];
+        let at = seg.as_mut_ptr();
+        let p = range_pieces(&ranges, at, 4708).unwrap();
+        let got: Vec<(u64, u64, usize)> = p
+            .iter()
+            .map(|x| (x.dev, x.host as u64 - at as u64, x.len))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0x9000, 0, 4096), (0x100, 4096, 512), (0x7000, 4608, 100)]
+        );
+        // a segment one byte short is refused, with no piece to copy
+        assert!(range_pieces(&ranges, at, 4707).is_err());
+        assert!(range_pieces(&ranges[..2], at, 4607).is_err());
+        assert!(range_pieces(&[], at, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -1878,9 +2186,13 @@ mod tests {
         // a request pays for a save only of a conversation whose last request took rows over
         use crate::verified::hc_must_flush;
         assert!(hc_must_flush(true, 512, 0, 2048) && !hc_must_flush(true, 0, 0, 2048));
-        // the rings are copied again when the entry has no image or grew
-        use crate::verified::hc_ring_stale;
-        assert!(hc_ring_stale(false, false) && hc_ring_stale(true, true));
+        // the rings are copied when the entry has no image, or one that does not reach its
+        // last kept position; a save is whole only when neither is the case
+        use crate::verified::hc_ring_short;
+        assert!(hc_ring_short(false, 6, 6) && hc_ring_short(true, 4, 6));
+        assert!(!hc_ring_short(true, 6, 6) && !hc_ring_short(true, 8, 6));
+        assert!(hc_saved_whole(true, 8192, true, 6, 6) && hc_saved_whole(true, 0, false, 0, 6));
+        assert!(!hc_saved_whole(true, 8192, true, 4, 6) && !hc_saved_whole(false, 0, false, 0, 6));
         // ... and copied back unless the device's rings are that image already
         assert!(hc_ring_restore(8192, true, false) && !hc_ring_restore(8192, true, true));
         // a restore with an image takes the image's first valid position, one without takes
@@ -1908,7 +2220,7 @@ mod tests {
         assert_eq!((l.pieces_per_tile(), l.tiles()), (4, 16));
         let mut p = Vec::new();
         // tile 9: chunk 1, rows 512..1024 of it
-        l.tile_pieces(9, std::ptr::null_mut(), &mut p);
+        l.tile_pieces(9, std::ptr::null_mut(), &mut p).unwrap();
         let chunk = 2 * 4096 * 16u64;
         assert_eq!(
             p.iter().map(|x| (x.dev, x.len)).collect::<Vec<_>>(),

@@ -40,12 +40,12 @@ use crate::engine::qwen3::prefix_cache::{shared_rows, ImageId};
 use crate::hostmem::AnonMap;
 use crate::verified::{
     hc_abort, hc_begin_read, hc_begin_write, hc_busy, hc_can_evict, hc_continue_pick,
-    hc_copy_whole, hc_end_write, hc_evict_before, hc_may_read, hc_may_restore, hc_new_tiles,
-    hc_pins, hc_read_done, hc_readable, hc_resumable, hc_resume_better, hc_resume_valid,
-    hc_ring_cover_after_cut, hc_ring_save, hc_ring_serves, hc_room, hc_save_grows, hc_save_need,
-    hc_shared_tiles, hc_spare_credit, hc_spares_return, hc_state_kept, hc_state_leaves_first,
-    hc_state_may_leave, hc_state_survives_cut, hc_state_wanted, hc_states_over, hc_take_now,
-    hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
+    hc_copy_whole, hc_end_write, hc_evict_before, hc_may_read, hc_may_restore, hc_pins,
+    hc_read_done, hc_readable, hc_resumable, hc_resume_better, hc_resume_valid,
+    hc_ring_cover_after_cut, hc_ring_due, hc_ring_serves, hc_room, hc_save_need, hc_shared_tiles,
+    hc_spare_credit, hc_spares_return, hc_state_kept, hc_state_leaves_first, hc_state_may_leave,
+    hc_state_survives_cut, hc_state_wanted, hc_states_over, hc_take_now, hc_tiles, hc_truncate,
+    pc_boundary, HcEntry, HcRoom,
 };
 
 /// Identity of the engine an entry was made by: a digest of everything that decides the bytes
@@ -469,6 +469,22 @@ impl HostCache {
         self.entries.get(&id).is_some_and(|e| e.ring.is_some())
     }
 
+    /// Whole tiles the ring image of entry `id` stands for (`None`: it has no image).
+    pub fn ring_tiles(&self, id: u64) -> Option<u64> {
+        self.entries
+            .get(&id)
+            .and_then(|e| e.ring.as_ref())
+            .map(|r| r.tiles)
+    }
+
+    /// Whole tiles of the last kept position of entry `id` (0: it keeps none).
+    pub fn last_state_of(&self, id: u64) -> u64 {
+        self.entries
+            .get(&id)
+            .and_then(|e| e.states.last())
+            .map_or(0, |(k, _)| *k)
+    }
+
     /// Does entry `id` hold a ring image that serves a resume after `tiles` whole tiles?
     pub fn ring_serves(&self, id: u64, tiles: u64) -> bool {
         self.entries
@@ -583,9 +599,13 @@ impl HostCache {
             .iter()
             .filter(|&&k| !hc_state_wanted(keeps(k), k, upto_tiles))
             .count() as u64;
-        let has_image = entry.is_some_and(|e| e.ring.is_some());
+        // The tiles the entry's ring image still stands for once the entry is cut: a new image
+        // is copied, and charged, when that falls short of the save's last kept position
+        // (`hc_ring_due`, the rule the save itself goes by).
+        let image_tiles = entry
+            .and_then(|e| e.ring.as_ref())
+            .map(|r| hc_ring_cover_after_cut(r.tiles, have));
         let n_kept = kept.len() as u64;
-        let grows = hc_save_grows(hc_new_tiles(upto_tiles, have), n_kept, held_states);
         let need = hc_save_need(
             upto_tiles,
             have,
@@ -593,7 +613,13 @@ impl HostCache {
             n_kept,
             held_states,
             Self::charge_of(state_bytes),
-            hc_ring_save(ring_bytes, true, has_image, grows),
+            hc_ring_due(
+                ring_bytes,
+                true,
+                image_tiles.is_some(),
+                image_tiles.unwrap_or(0),
+                upto_tiles,
+            ),
             Self::charge_of(ring_bytes),
         );
         let target = cont;
@@ -1278,6 +1304,68 @@ mod tests {
     }
 
     #[test]
+    fn a_ring_image_is_charged_while_it_does_not_reach_the_last_kept_position() {
+        const RB: u64 = 2 * MIB;
+        let p = prompt(6 * 512 + 100, 0);
+        // The first four tiles of a prompt with their position and the rings; then two more
+        // tiles and a position, where the save gives way before it takes the rings again.
+        let first_turn = |c: &mut HostCache| {
+            let t = c.open_save(ENG, T, TB, &p, &[], 4, &[4], SB, RB).unwrap();
+            c.begin_rows(t.entry, 4, TB).unwrap();
+            c.end_rows(t.entry, 4);
+            c.begin_piece(t.entry, SB).unwrap();
+            assert!(c.end_state(t.entry, 4, 1, 1));
+            c.begin_piece(t.entry, RB).unwrap();
+            assert!(c.end_ring(t.entry, 0, 1, 1));
+            c.settle();
+            t.entry
+        };
+        // room for six tiles, two states, an image, and a second image while the first is
+        // replaced
+        let mut c = HostCache::new(6 * TB + 2 * SB + 2 * RB, false);
+        let id = first_turn(&mut c);
+        assert_eq!(c.ring_tiles(id), Some(4));
+        let t = c
+            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], SB, RB)
+            .unwrap();
+        assert_eq!((t.entry, t.have_tiles), (id, 4));
+        c.begin_rows(id, 2, TB).unwrap();
+        c.end_rows(id, 6);
+        c.begin_piece(id, SB).unwrap();
+        assert!(c.end_state(id, 6, 1, 1));
+        c.settle();
+        assert_eq!((c.last_state_of(id), c.ring_tiles(id)), (6, Some(4)));
+        assert_eq!(c.budget_bytes() - c.held_bytes(), RB);
+        // The save that goes on has no tile and no position left to add. It is charged for the
+        // image it still owes, and there is exactly room for that.
+        assert!(c
+            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], SB, RB)
+            .is_some());
+        c.begin_piece(id, RB).unwrap();
+        assert!(c.end_ring(id, 0, 1, 1));
+        c.settle();
+        assert_eq!(c.ring_tiles(id), Some(6));
+        assert_eq!(c.held_bytes(), 6 * TB + 2 * SB + RB);
+        // With an image that reaches the last kept position the same save asks for nothing:
+        // a budget with nothing free does not refuse it.
+        let mut full = HostCache::new(6 * TB + 2 * SB + RB, false);
+        let fid = first_turn(&mut full);
+        // (in this budget the two new tiles and the position fit, a second image beside the
+        // first does not: the extension is refused before anything is cut or copied)
+        assert!(full
+            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], SB, RB)
+            .is_none());
+        assert_eq!(full.stats().refused, 1);
+        assert_eq!((full.tiles_of(fid), full.ring_tiles(fid)), (4, Some(4)));
+        // an engine without rings is charged for none
+        assert!(full
+            .open_save(ENG, T, TB, &p, &[], 6, &[4, 6], SB, 0)
+            .is_some());
+        assert_eq!(full.stats().refused, 1);
+        assert_eq!((c.stats().refused, c.stats().evictions), (0, 0));
+    }
+
+    #[test]
     fn among_equal_resume_points_the_entry_used_last_is_chosen() {
         let mut c = HostCache::new(256 * MIB, false);
         // two conversations with the same first tile (a system prompt), each with a kept
@@ -1322,11 +1410,11 @@ mod tests {
         // what a save adds: two new tiles, one new state of three, a ring image
         assert_eq!(hc_save_need(6, 4, TB, 3, 2, SB, true, SB), 2 * TB + 2 * SB);
         assert_eq!(hc_save_need(6, 6, TB, 3, 3, SB, false, SB), 0);
-        // the rings are copied (and charged) for an entry without an image and for one that
-        // grows, on an engine that has rings
-        assert!(hc_ring_save(SB, true, false, false) && hc_ring_save(SB, true, true, true));
-        assert!(!hc_ring_save(SB, true, true, false) && !hc_ring_save(0, true, false, true));
-        assert!(hc_save_grows(1, 3, 3) && hc_save_grows(0, 3, 2) && !hc_save_grows(0, 3, 3));
+        // the rings are copied (and charged) for an entry without an image and for one whose
+        // image does not reach its last kept position, on an engine that has rings
+        assert!(hc_ring_due(SB, true, false, 0, 6) && hc_ring_due(SB, true, true, 4, 6));
+        assert!(!hc_ring_due(SB, true, true, 6, 6) && !hc_ring_due(0, true, false, 0, 6));
+        assert!(!hc_ring_due(SB, false, true, 4, 6));
         // spare segments count for the allocations that take them again
         assert_eq!(hc_spare_credit(3, 2, TB), 2 * TB);
         assert_eq!(hc_spare_credit(1, 2, TB), TB);
@@ -1428,11 +1516,7 @@ mod tests {
     #[test]
     fn the_budget_is_checked_against_what_the_host_can_give() {
         let gib = 1u64 << 30;
-        let mem = crate::hostmem::HostMemory {
-            host_available: 40 * gib,
-            cgroup_limit: None,
-            cgroup_in_use: None,
-        };
+        let mem = crate::hostmem::HostMemory::of_host(40 * gib);
         let ring = 256 * MIB;
         // asked for and fits
         assert_eq!(

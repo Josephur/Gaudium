@@ -126,73 +126,123 @@ impl Drop for AnonMap {
     }
 }
 
-/// What the host can still give this process, in bytes.
+/// One control group of this process's chain: its own group, or a group above it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Group {
+    /// Limit of the group (`None`: no limit, or its files cannot be read).
+    pub limit: Option<u64>,
+    /// Memory the group has in use that it cannot give back by dropping file pages (its own
+    /// and that of every group below it).
+    pub in_use: Option<u64>,
+}
+
+/// What the host can still give this process, in bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostMemory {
     /// `MemAvailable` of the host (or of the container's view of it).
     pub host_available: u64,
-    /// Limit of this process's control group (`None`: no limit).
-    pub cgroup_limit: Option<u64>,
-    /// Memory the control group has in use that it cannot give back by dropping file pages.
-    pub cgroup_in_use: Option<u64>,
+    /// The control groups this process is in, its own first, then each group above it up to
+    /// the top of what it can see. A limit on any of them bounds the process.
+    pub groups: Vec<Group>,
 }
 
 impl HostMemory {
-    /// Reads `/proc/meminfo` and the control group v2 files of this process. A file that is
-    /// missing or unreadable leaves its part unknown (no limit).
+    /// Reads `/proc/meminfo` and the control group v2 files of this process and of every
+    /// group above its own. A file that is missing or unreadable leaves its part unknown (no
+    /// limit).
     pub fn read() -> Self {
         let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-        let (limit, in_use) = match cgroup_dir() {
-            Some(dir) => {
-                let max = std::fs::read_to_string(dir.join("memory.max")).unwrap_or_default();
-                let cur = std::fs::read_to_string(dir.join("memory.current")).unwrap_or_default();
-                let stat = std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
-                parse_cgroup(&max, &cur, &stat)
-            }
-            None => (None, None),
-        };
+        let groups = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
+            })
+            .map(|rel| read_groups(std::path::Path::new("/sys/fs/cgroup"), &rel))
+            .unwrap_or_default();
         Self {
             host_available: parse_meminfo_available(&meminfo).unwrap_or(u64::MAX),
-            cgroup_limit: limit,
-            cgroup_in_use: in_use,
+            groups,
         }
     }
 
-    /// Bytes this process can still take: the smaller of what the host has available and what
-    /// its control group has left (the verified `hc_available`).
-    pub fn available(&self) -> u64 {
-        crate::verified::hc_available(
-            self.host_available,
-            self.cgroup_limit.is_some(),
-            self.cgroup_limit.unwrap_or(0),
-            self.cgroup_in_use.unwrap_or(0),
-        )
+    /// A host with no control group limit (tests, and messages about a plain host).
+    pub fn of_host(host_available: u64) -> Self {
+        Self {
+            host_available,
+            groups: Vec::new(),
+        }
     }
 
-    /// The numbers behind [`Self::available`], for a message.
+    /// Bytes this process can still take: what the host has available, and no more than any
+    /// group of its chain has left. Each group is taken into account by the verified
+    /// `hc_chain_step`; the walk over the chain is all that happens here.
+    pub fn available(&self) -> u64 {
+        self.groups.iter().fold(self.host_available, |left, g| {
+            crate::verified::hc_chain_step(
+                left,
+                g.limit.is_some(),
+                g.limit.unwrap_or(0),
+                g.in_use.unwrap_or(0),
+            )
+        })
+    }
+
+    /// The numbers behind [`Self::available`], for a message: every group that has a limit,
+    /// with how far above the process's own group it is.
     pub fn describe(&self) -> String {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        match (self.cgroup_limit, self.cgroup_in_use) {
-            (Some(l), Some(u)) => format!(
-                "host available {:.2} GiB; control group limit {:.2} GiB with {:.2} GiB in use",
-                gib(self.host_available),
-                gib(l),
-                gib(u)
-            ),
-            _ => format!(
+        let limits: Vec<String> = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter_map(|(up, g)| {
+                let limit = g.limit?;
+                Some(format!(
+                    "{:.2} GiB with {:.2} GiB in use ({})",
+                    gib(limit),
+                    gib(g.in_use.unwrap_or(0)),
+                    match up {
+                        0 => "its own group".to_string(),
+                        1 => "the group above".to_string(),
+                        n => format!("{n} groups above"),
+                    }
+                ))
+            })
+            .collect();
+        if limits.is_empty() {
+            format!(
                 "host available {:.2} GiB; no control group limit",
                 gib(self.host_available)
-            ),
+            )
+        } else {
+            format!(
+                "host available {:.2} GiB; control group limit {}",
+                gib(self.host_available),
+                limits.join(", ")
+            )
         }
     }
 }
 
-/// The control group v2 directory of this process (`None`: not found, or not version 2).
-fn cgroup_dir() -> Option<std::path::PathBuf> {
-    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let dir = std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
-    dir.join("memory.max").exists().then_some(dir)
+/// The control groups of a process whose group is `rel` (the path after `0::` in its
+/// `/proc/<pid>/cgroup`) below the control group mount `root`: that group first, then each
+/// group above it, the mount's own directory last. A directory without readable memory files
+/// is a group without a limit.
+pub fn read_groups(root: &std::path::Path, rel: &str) -> Vec<Group> {
+    let rel = std::path::Path::new(rel.trim().trim_start_matches('/'));
+    rel.ancestors()
+        .map(|up| {
+            let dir = root.join(up);
+            let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+            let (limit, in_use) = parse_cgroup(
+                &read("memory.max"),
+                &read("memory.current"),
+                &read("memory.stat"),
+            );
+            Group { limit, in_use }
+        })
+        .collect()
 }
 
 /// `MemAvailable` of a `/proc/meminfo` text, in bytes.
@@ -298,29 +348,138 @@ mod tests {
     #[test]
     fn available_is_the_smaller_of_host_and_control_group() {
         let gib = 1u64 << 30;
-        let m = HostMemory {
-            host_available: 80 * gib,
-            cgroup_limit: Some(86 * gib),
-            cgroup_in_use: Some(40 * gib),
+        let own = |limit: Option<u64>, in_use: Option<u64>, host: u64| HostMemory {
+            host_available: host * gib,
+            groups: vec![Group {
+                limit: limit.map(|l| l * gib),
+                in_use: in_use.map(|u| u * gib),
+            }],
         };
-        assert_eq!(m.available(), 46 * gib);
-        let m = HostMemory {
-            host_available: 20 * gib,
-            ..m
-        };
-        assert_eq!(m.available(), 20 * gib);
-        let m = HostMemory {
-            host_available: 20 * gib,
-            cgroup_limit: None,
-            cgroup_in_use: None,
-        };
-        assert_eq!(m.available(), 20 * gib);
+        assert_eq!(own(Some(86), Some(40), 80).available(), 46 * gib);
+        assert_eq!(own(Some(86), Some(40), 20).available(), 20 * gib);
+        assert_eq!(own(None, None, 20).available(), 20 * gib);
+        assert_eq!(HostMemory::of_host(20 * gib).available(), 20 * gib);
         // a group over its limit has nothing left
-        let m = HostMemory {
-            host_available: 20 * gib,
-            cgroup_limit: Some(10 * gib),
-            cgroup_in_use: Some(12 * gib),
+        assert_eq!(own(Some(10), Some(12), 20).available(), 0);
+    }
+
+    /// A made-up control group tree under a directory of its own: `groups` are `(path below
+    /// the mount, memory.max, memory.current)`, each with a `memory.stat` of 1 GiB of file
+    /// pages that can be dropped.
+    fn cgroup_tree(name: &str, groups: &[(&str, &str, u64)]) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("gaudium-cgroup-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, max, current) in groups {
+            let dir = root.join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("memory.max"), format!("{max}\n")).unwrap();
+            std::fs::write(dir.join("memory.current"), format!("{current}\n")).unwrap();
+            std::fs::write(
+                dir.join("memory.stat"),
+                format!("anon 0\ninactive_file {}\nactive_file 0\n", 1u64 << 30),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_limit_on_any_group_above_bounds_what_is_available() {
+        let gib = 1u64 << 30;
+        let g = |n: u64| (n * gib).to_string();
+        // the process is in a/b/c; 64 GiB are available on the host; every group has 11 GiB
+        // charged, 1 GiB of it file pages
+        let available = |name: &str, a: &str, b: &str, c: &str| {
+            let root = cgroup_tree(
+                name,
+                &[
+                    ("", "max", 11 * gib),
+                    ("a", a, 11 * gib),
+                    ("a/b", b, 11 * gib),
+                    ("a/b/c", c, 11 * gib),
+                ],
+            );
+            let mem = HostMemory {
+                host_available: 64 * gib,
+                groups: read_groups(&root, "/a/b/c"),
+            };
+            let _ = std::fs::remove_dir_all(&root);
+            (mem.available(), mem.groups.len(), mem.describe())
         };
-        assert_eq!(m.available(), 0);
+        // no limit anywhere: the host's figure
+        let (left, n, text) = available("none", "max", "max", "max");
+        assert_eq!((left, n), (64 * gib, 4));
+        assert!(text.ends_with("no control group limit"), "{text}");
+        // only on the process's own group
+        assert_eq!(available("own", "max", "max", &g(30)).0, 20 * gib);
+        // only on the parent: the group itself says `max`, and is bounded all the same
+        let (left, _, text) = available("parent", "max", &g(30), "max");
+        assert_eq!(left, 20 * gib);
+        assert!(
+            text.contains("30.00 GiB with 10.00 GiB in use (the group above)"),
+            "{text}"
+        );
+        // only on the grandparent
+        let (left, _, text) = available("grandparent", &g(26), "max", "max");
+        assert_eq!(left, 16 * gib);
+        assert!(text.contains("(2 groups above)"), "{text}");
+        // on both, the parent tighter
+        assert_eq!(
+            available("parent-tighter", &g(50), &g(22), "max").0,
+            12 * gib
+        );
+        // on both, the parent looser: the grandparent's is the one that counts
+        assert_eq!(available("parent-looser", &g(18), &g(50), "max").0, 8 * gib);
+        // a limit above what the host has available changes nothing
+        assert_eq!(available("loose", &g(500), &g(400), &g(300)).0, 64 * gib);
+        // a group that is already over its limit leaves nothing, whatever the others say
+        assert_eq!(available("over", &g(9), &g(50), &g(40)).0, 0);
+    }
+
+    #[test]
+    fn groups_are_read_from_the_process_s_own_up_to_the_mount() {
+        let gib = 1u64 << 30;
+        let root = cgroup_tree(
+            "walk",
+            &[
+                ("", "max", gib),
+                ("svc", &(8 * gib).to_string(), 3 * gib),
+                ("svc/unit", "max", 2 * gib),
+            ],
+        );
+        let groups = read_groups(&root, "/svc/unit\n");
+        assert_eq!(
+            groups,
+            vec![
+                Group {
+                    limit: None,
+                    in_use: Some(gib)
+                },
+                Group {
+                    limit: Some(8 * gib),
+                    in_use: Some(2 * gib)
+                },
+                Group {
+                    limit: None,
+                    in_use: Some(0)
+                },
+            ]
+        );
+        // a process in the mount's own group has that one group
+        assert_eq!(read_groups(&root, "/").len(), 1);
+        // a group whose files cannot be read has no limit
+        assert_eq!(
+            read_groups(&root, "/svc/gone"),
+            vec![
+                Group {
+                    limit: None,
+                    in_use: None
+                },
+                groups[1],
+                groups[2],
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

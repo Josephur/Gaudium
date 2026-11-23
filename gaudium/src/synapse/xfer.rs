@@ -20,14 +20,29 @@
 //! The ring is used between requests only (the engine takes part in no launch then). A copy to
 //! the host is synchronised before its bytes are read; a copy to the device is synchronised
 //! before this module returns, so a launch enqueued afterwards reads the copied rows.
+//!
+//! Nothing is ever in flight against a ring buffer that is being unmapped: every function here
+//! drains what it queued before it returns, on an error too ([`then_drained`]), and the ring
+//! drains both transfer streams once more when it is dropped, whenever that is.
+//!
+//! How a copy is packed is the verified core's (`verified/host_cache.bend`, section 17): the
+//! bytes placed next (`xf_take`), when a buffer is handed over (`xf_buf_full`), which buffer
+//! follows (`xf_next_buf`), which bytes join the command before them (`xf_cmd_joins`), and
+//! how one buffer's host copy is cut among the threads (`xf_part_take`, `xf_part_full`). This
+//! file adds the offsets it is given to addresses and calls the DMA.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use crate::hostmem::AnonMap;
 use crate::synapse::device::{DeviceEvent, HpuDevice, PinnedBuf};
-use crate::synapse::ffi::{SynDeviceId, SynapseApi, SynapseError};
+use crate::synapse::ffi::{SynDeviceId, SynStreamHandle, SynapseApi, SynapseError};
+use crate::verified::{
+    xf_buf_full, xf_cmd_joins, xf_next_buf, xf_part_full, xf_part_take, xf_probe_dev_off,
+    xf_probe_span, xf_probe_span_fits, xf_slice_fits, xf_slice_off, xf_take,
+};
 
 /// Buffers and bytes per buffer of the ring an engine keeps.
 pub const RING_BUFS: usize = 4;
@@ -57,8 +72,12 @@ enum RingMem {
         map: AnonMap,
         api: Arc<SynapseApi>,
         dev_id: SynDeviceId,
+        dev_open: Arc<AtomicBool>,
     },
     Pinned(PinnedBuf),
+    /// Host memory that is mapped for no device (a ring driven by a made-up link in tests).
+    #[cfg(test)]
+    Plain(AnonMap),
 }
 
 impl RingMem {
@@ -66,18 +85,29 @@ impl RingMem {
         match self {
             Self::Mapped { map, .. } => map.as_ptr() as *mut u8,
             Self::Pinned(p) => p.as_slice().as_ptr() as *mut u8,
+            #[cfg(test)]
+            Self::Plain(map) => map.as_ptr() as *mut u8,
         }
     }
 }
 
 impl Drop for RingMem {
     fn drop(&mut self) {
-        if let Self::Mapped { map, api, dev_id } = self {
-            // SAFETY: the pointer was mapped by `synHostMap` in `XferRing::new`; no transfer
-            // reads or writes it now (every copy of this module is synchronised before it
-            // returns, error paths included).
-            unsafe {
-                (api.syn_host_unmap)(*dev_id, map.as_ptr() as *const std::ffi::c_void);
+        if let Self::Mapped {
+            map,
+            api,
+            dev_id,
+            dev_open,
+        } = self
+        {
+            // A device that is closed took its mappings with it.
+            if dev_open.load(Ordering::Acquire) {
+                // SAFETY: the pointer was mapped by `synHostMap` in `XferRing::new`; no
+                // transfer reads or writes it now (`XferRing::drop` drained both transfer
+                // streams before its buffers are dropped).
+                unsafe {
+                    (api.syn_host_unmap)(*dev_id, map.as_ptr() as *const std::ffi::c_void);
+                }
             }
         }
     }
@@ -136,18 +166,145 @@ struct Job {
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
-/// The pinned ring of one open device. Must be dropped before the device (declare it before the
-/// `HpuDevice` in a struct that holds both).
+/// The pinned ring of one open device. It may be dropped before the device or after it: while
+/// the device is open the ring drains the two transfer streams before its buffers are
+/// unmapped, and a device that closes first drains every stream itself with the buffers still
+/// mapped. (Declare it before the `HpuDevice` in a struct that holds both all the same: its
+/// events and pinned allocations are the device's.)
 pub struct XferRing {
     bufs: Vec<RingMem>,
     events: Vec<DeviceEvent>,
     buf_bytes: usize,
     threads: usize,
     kind: RingKind,
+    /// The device's two transfer streams, drained before the buffers are unmapped (`None`: a
+    /// ring no device reads).
+    drain: Option<RingDrain>,
+}
+
+struct RingDrain {
+    api: Arc<SynapseApi>,
+    d2h: SynStreamHandle,
+    h2d: SynStreamHandle,
+    dev_open: Arc<AtomicBool>,
 }
 
 // SAFETY: the ring owns its buffers and events; they are used by one thread at a time.
 unsafe impl Send for XferRing {}
+
+impl Drop for XferRing {
+    fn drop(&mut self) {
+        // Runs before the buffers (fields) are dropped and unmapped. Every copy drains what it
+        // queued before it returns; this is for the path that did not.
+        if let Some(d) = self.drain.as_ref() {
+            if d.dev_open.load(Ordering::Acquire) {
+                for stream in [d.d2h, d.h2d] {
+                    // SAFETY: the device is open, so its streams are live.
+                    unsafe {
+                        (d.api.syn_stream_synchronize)(stream);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What the ring asks of a device: the two directions of the DMA, a mark behind what was
+/// queued for one ring buffer, and the two ways to wait. The engine's ring talks to the card
+/// ([`DevLink`]); host tests drive the same copy loops with a link made of host memory.
+pub(crate) trait Link {
+    /// Queues a copy of device memory into a ring buffer.
+    ///
+    /// # Safety
+    /// `host` must be valid for writes of `bytes` until the copy has been waited for.
+    unsafe fn enqueue_d2h(
+        &self,
+        dev_addr: u64,
+        bytes: u64,
+        host: *mut u8,
+    ) -> Result<(), SynapseError>;
+    /// Queues a copy of a ring buffer into device memory.
+    ///
+    /// # Safety
+    /// `host` must be valid for reads of `bytes` until the copy has been waited for.
+    unsafe fn enqueue_h2d(
+        &self,
+        host: *const u8,
+        bytes: u64,
+        dev_addr: u64,
+    ) -> Result<(), SynapseError>;
+    /// Marks the end of what was queued for ring buffer `buf` in that direction.
+    fn mark(&self, buf: usize, to_host: bool) -> Result<(), SynapseError>;
+    /// Waits for everything queued before the mark of ring buffer `buf`.
+    fn wait(&self, buf: usize) -> Result<(), SynapseError>;
+    /// Waits for everything queued in that direction.
+    fn drain(&self, to_host: bool) -> Result<(), SynapseError>;
+}
+
+/// The card as a [`Link`]: its two transfer streams and the ring's events on them.
+struct DevLink<'a> {
+    dev: &'a HpuDevice,
+    events: &'a [DeviceEvent],
+}
+
+impl DevLink<'_> {
+    fn stream(&self, to_host: bool) -> SynStreamHandle {
+        if to_host {
+            self.dev.d2h_stream()
+        } else {
+            self.dev.h2d_stream()
+        }
+    }
+}
+
+impl Link for DevLink<'_> {
+    unsafe fn enqueue_d2h(
+        &self,
+        dev_addr: u64,
+        bytes: u64,
+        host: *mut u8,
+    ) -> Result<(), SynapseError> {
+        // SAFETY: the caller's contract; the ring buffer is mapped for `dev`.
+        unsafe { self.dev.enqueue_d2h_raw(dev_addr, bytes, host) }
+    }
+
+    unsafe fn enqueue_h2d(
+        &self,
+        host: *const u8,
+        bytes: u64,
+        dev_addr: u64,
+    ) -> Result<(), SynapseError> {
+        // SAFETY: the caller's contract; the ring buffer is mapped for `dev`.
+        unsafe { self.dev.enqueue_h2d_raw(host, bytes, dev_addr) }
+    }
+
+    fn mark(&self, buf: usize, to_host: bool) -> Result<(), SynapseError> {
+        // SAFETY: the stream belongs to `dev`.
+        unsafe { self.events[buf].record(self.stream(to_host)) }
+    }
+
+    fn wait(&self, buf: usize) -> Result<(), SynapseError> {
+        self.events[buf].synchronize()
+    }
+
+    fn drain(&self, to_host: bool) -> Result<(), SynapseError> {
+        // SAFETY: the stream belongs to `dev`.
+        unsafe { self.dev.sync_stream(self.stream(to_host)) }
+    }
+}
+
+/// Runs `enqueue`, then `sync` whatever `enqueue` returned, and gives back the first error. A
+/// command that was queued before a later one failed is complete on the device, or has failed,
+/// before the caller sees the error and lets go of the host memory it names.
+fn then_drained<T, E>(
+    enqueue: impl FnOnce() -> Result<T, E>,
+    sync: impl FnOnce() -> Result<(), E>,
+) -> Result<T, E> {
+    let queued = enqueue();
+    let synced = sync();
+    let value = queued?;
+    synced.map(|()| value)
+}
 
 impl XferRing {
     /// Allocates and maps the ring: `bufs` buffers of `buf_bytes`, each its own mapping, none
@@ -175,6 +332,7 @@ impl XferRing {
                         map,
                         api: Arc::clone(dev.api()),
                         dev_id: dev.device_id(),
+                        dev_open: dev.open_flag(),
                     }
                 }
             };
@@ -187,7 +345,29 @@ impl XferRing {
             buf_bytes,
             threads: threads.clamp(1, 16),
             kind,
+            drain: Some(RingDrain {
+                api: Arc::clone(dev.api()),
+                d2h: dev.d2h_stream(),
+                h2d: dev.h2d_stream(),
+                dev_open: dev.open_flag(),
+            }),
         })
+    }
+
+    /// A ring of plain host memory that no device reads, for a made-up [`Link`].
+    #[cfg(test)]
+    fn on_host_memory(bufs: usize, buf_bytes: usize, threads: usize) -> Self {
+        let buf_bytes = AnonMap::mapped_len(buf_bytes as u64) as usize;
+        Self {
+            bufs: (0..bufs.max(2))
+                .map(|_| RingMem::Plain(AnonMap::new(buf_bytes as u64).unwrap()))
+                .collect(),
+            events: Vec::new(),
+            buf_bytes,
+            threads: threads.clamp(1, 16),
+            kind: RingKind::MappedHuge,
+            drain: None,
+        }
     }
 
     /// Host copy threads for a machine with the given parallelism: the copy is bound by memory
@@ -237,6 +417,24 @@ impl XferRing {
         pieces: &[Piece],
         stop: &mut dyn FnMut() -> bool,
     ) -> Result<(usize, XferStats), SynapseError> {
+        let link = DevLink {
+            dev,
+            events: &self.events,
+        };
+        // SAFETY: the caller's contract.
+        unsafe { self.d2h_on(&link, pieces, stop) }
+    }
+
+    /// [`Self::d2h`] over any [`Link`].
+    ///
+    /// # Safety
+    /// As [`Self::d2h`].
+    unsafe fn d2h_on<L: Link>(
+        &self,
+        link: &L,
+        pieces: &[Piece],
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<(usize, XferStats), SynapseError> {
         let t0 = Instant::now();
         let n = self.bufs.len();
         let cap = self.buf_bytes;
@@ -258,17 +456,17 @@ impl XferRing {
             }
             let mut off = 0usize;
             while off < piece.len {
-                if fill == cap {
+                if xf_buf_full(fill as u64, cap as u64) {
                     // the buffer is full: hand it to the link and take the next one
                     ends[cur] = placed;
-                    if let Err(e) = self.close_d2h(dev, cur, &mut cmds, &mut busy, &mut stats) {
+                    if let Err(e) = self.close_d2h(link, cur, &mut cmds, &mut busy, &mut stats) {
                         res = Err(e);
                         break 'pieces;
                     }
-                    cur = (cur + 1) % n;
+                    cur = xf_next_buf(cur as u64, n as u64) as usize;
                     fill = 0;
                     if busy[cur] {
-                        match self.drain_d2h(cur, &mut jobs[cur], &mut stats, stop) {
+                        match self.drain_d2h(link, cur, &mut jobs[cur], &mut stats, stop) {
                             Ok(true) => {
                                 busy[cur] = false;
                                 done = ends[cur];
@@ -288,16 +486,23 @@ impl XferRing {
                         break 'pieces;
                     }
                 }
-                let take = (piece.len - off).min(cap - fill);
+                // what is left of the piece, and no more than the buffer has room for
+                let take = xf_take(piece.len as u64, off as u64, cap as u64, fill as u64) as usize;
                 let dev_addr = piece.dev + off as u64;
                 match cmds.last_mut() {
-                    Some((d, r, l)) if *d + *l as u64 == dev_addr && *r + *l == fill => *l += take,
+                    Some((d, r, l))
+                        if xf_cmd_joins(*d, *l as u64, dev_addr, *r as u64, fill as u64) =>
+                    {
+                        *l += take
+                    }
                     _ => cmds.push((dev_addr, fill, take)),
                 }
                 jobs[cur].push(Job {
-                    // SAFETY: `fill + take <= cap`, inside the ring buffer.
+                    // SAFETY: `fill + take <= cap`, inside the ring buffer
+                    // (`xf_take_within_buffer`).
                     ring: unsafe { self.bufs[cur].ptr().add(fill) },
-                    // SAFETY: `off + take <= piece.len`, inside the piece's host range.
+                    // SAFETY: `off + take <= piece.len`, inside the piece's host range
+                    // (`xf_take_within_piece`).
                     host: unsafe { piece.host.add(off) },
                     len: take,
                 });
@@ -310,11 +515,12 @@ impl XferRing {
         if res.is_ok() && !stopped {
             // hand over what is left, then copy out every buffer in the order they were queued
             ends[cur] = placed;
-            res = self.close_d2h(dev, cur, &mut cmds, &mut busy, &mut stats);
-            for k in 1..=n {
-                let b = (cur + k) % n;
+            res = self.close_d2h(link, cur, &mut cmds, &mut busy, &mut stats);
+            let mut b = cur;
+            for _ in 0..n {
+                b = xf_next_buf(b as u64, n as u64) as usize;
                 if busy[b] {
-                    match self.drain_d2h(b, &mut jobs[b], &mut stats, stop) {
+                    match self.drain_d2h(link, b, &mut jobs[b], &mut stats, stop) {
                         Ok(true) => {
                             busy[b] = false;
                             done = ends[b];
@@ -335,8 +541,7 @@ impl XferRing {
             // whatever was enqueued must not be in flight when the caller frees host memory or
             // the ring is used again; its bytes stay in the ring and count for nothing
             let t1 = Instant::now();
-            // SAFETY: the stream belongs to `dev`.
-            let synced = unsafe { dev.sync_stream(dev.d2h_stream()) };
+            let synced = link.drain(true);
             stats.wait_s += t1.elapsed().as_secs_f64();
             if res.is_ok() {
                 res = synced;
@@ -347,9 +552,9 @@ impl XferRing {
     }
 
     /// Enqueues the commands of buffer `b` and marks its end on the stream.
-    fn close_d2h(
+    fn close_d2h<L: Link>(
         &self,
-        dev: &HpuDevice,
+        link: &L,
         b: usize,
         cmds: &mut Vec<(u64, usize, usize)>,
         busy: &mut [bool],
@@ -360,28 +565,29 @@ impl XferRing {
         }
         let base = self.bufs[b].ptr();
         for &(dev_addr, ring_off, len) in cmds.iter() {
-            // SAFETY: `ring_off + len` lies inside ring buffer `b`, which is mapped for `dev`.
-            unsafe { dev.enqueue_d2h_raw(dev_addr, len as u64, base.add(ring_off))? };
+            // SAFETY: `ring_off + len` lies inside ring buffer `b`, which stays live until the
+            // copy has been waited for.
+            unsafe { link.enqueue_d2h(dev_addr, len as u64, base.add(ring_off))? };
             stats.commands += 1;
         }
         cmds.clear();
-        // SAFETY: the stream belongs to `dev`.
-        unsafe { self.events[b].record(dev.d2h_stream())? };
+        link.mark(b, true)?;
         busy[b] = true;
         Ok(())
     }
 
     /// Waits for buffer `b`'s transfers and copies its bytes out to host memory, asking `stop`
     /// between slices of the copy. `Ok(false)`: it said yes and the rest was left in the ring.
-    fn drain_d2h(
+    fn drain_d2h<L: Link>(
         &self,
+        link: &L,
         b: usize,
         jobs: &mut Vec<Job>,
         stats: &mut XferStats,
         stop: &mut dyn FnMut() -> bool,
     ) -> Result<bool, SynapseError> {
         let t0 = Instant::now();
-        let res = self.events[b].synchronize();
+        let res = link.wait(b);
         stats.wait_s += t0.elapsed().as_secs_f64();
         let mut whole = true;
         if res.is_ok() {
@@ -419,6 +625,23 @@ impl XferRing {
         dev: &HpuDevice,
         pieces: &[Piece],
     ) -> Result<XferStats, SynapseError> {
+        let link = DevLink {
+            dev,
+            events: &self.events,
+        };
+        // SAFETY: the caller's contract.
+        unsafe { self.h2d_on(&link, pieces) }
+    }
+
+    /// [`Self::h2d`] over any [`Link`].
+    ///
+    /// # Safety
+    /// As [`Self::h2d`].
+    unsafe fn h2d_on<L: Link>(
+        &self,
+        link: &L,
+        pieces: &[Piece],
+    ) -> Result<XferStats, SynapseError> {
         let t0 = Instant::now();
         let n = self.bufs.len();
         let cap = self.buf_bytes;
@@ -432,18 +655,18 @@ impl XferRing {
         'pieces: for piece in pieces {
             let mut off = 0usize;
             while off < piece.len {
-                if fill == cap {
+                if xf_buf_full(fill as u64, cap as u64) {
                     if let Err(e) =
-                        self.close_h2d(dev, cur, &mut jobs, &mut cmds, &mut busy, &mut stats)
+                        self.close_h2d(link, cur, &mut jobs, &mut cmds, &mut busy, &mut stats)
                     {
                         res = Err(e);
                         break 'pieces;
                     }
-                    cur = (cur + 1) % n;
+                    cur = xf_next_buf(cur as u64, n as u64) as usize;
                     fill = 0;
                     if busy[cur] {
                         let t1 = Instant::now();
-                        let r = self.events[cur].synchronize();
+                        let r = link.wait(cur);
                         stats.wait_s += t1.elapsed().as_secs_f64();
                         busy[cur] = false;
                         if let Err(e) = r {
@@ -452,10 +675,14 @@ impl XferRing {
                         }
                     }
                 }
-                let take = (piece.len - off).min(cap - fill);
+                let take = xf_take(piece.len as u64, off as u64, cap as u64, fill as u64) as usize;
                 let dev_addr = piece.dev + off as u64;
                 match cmds.last_mut() {
-                    Some((d, r, l)) if *d + *l as u64 == dev_addr && *r + *l == fill => *l += take,
+                    Some((d, r, l))
+                        if xf_cmd_joins(*d, *l as u64, dev_addr, *r as u64, fill as u64) =>
+                    {
+                        *l += take
+                    }
                     _ => cmds.push((dev_addr, fill, take)),
                 }
                 jobs.push(Job {
@@ -470,22 +697,21 @@ impl XferRing {
             }
         }
         if res.is_ok() {
-            res = self.close_h2d(dev, cur, &mut jobs, &mut cmds, &mut busy, &mut stats);
+            res = self.close_h2d(link, cur, &mut jobs, &mut cmds, &mut busy, &mut stats);
         }
         // Everything queued must be on the device before a launch reads it (and before the
         // ring is reused or freed).
         let t1 = Instant::now();
-        // SAFETY: the stream belongs to `dev`.
-        let synced = unsafe { dev.sync_stream(dev.h2d_stream()) };
+        let synced = link.drain(false);
         stats.wait_s += t1.elapsed().as_secs_f64();
         stats.wall_s = t0.elapsed().as_secs_f64();
         res.and(synced).map(|()| stats)
     }
 
     /// Fills buffer `b` from host memory, enqueues its commands and marks its end.
-    fn close_h2d(
+    fn close_h2d<L: Link>(
         &self,
-        dev: &HpuDevice,
+        link: &L,
         b: usize,
         jobs: &mut Vec<Job>,
         cmds: &mut Vec<(u64, usize, usize)>,
@@ -503,59 +729,87 @@ impl XferRing {
         jobs.clear();
         let base = self.bufs[b].ptr();
         for &(dev_addr, ring_off, len) in cmds.iter() {
-            // SAFETY: `ring_off + len` lies inside ring buffer `b`, which is mapped for `dev`.
-            unsafe { dev.enqueue_h2d_raw(base.add(ring_off), len as u64, dev_addr)? };
+            // SAFETY: `ring_off + len` lies inside ring buffer `b`, which is not refilled before
+            // the copy has been waited for.
+            unsafe { link.enqueue_h2d(base.add(ring_off), len as u64, dev_addr)? };
             stats.commands += 1;
         }
         cmds.clear();
-        // SAFETY: the stream belongs to `dev`.
-        unsafe { self.events[b].record(dev.h2d_stream())? };
+        link.mark(b, false)?;
         busy[b] = true;
         Ok(())
     }
 
     /// Raw link rates without a host copy: `(device to host, host to device)` bytes per second
-    /// for `bytes` moved in commands of `cmd_bytes` between `[dev_addr, dev_addr + ring size)`
-    /// and the ring. What the device range holds is read and written back unchanged.
+    /// for `bytes` moved in commands of `cmd_bytes` between the ring and the first bytes of
+    /// the device range `[dev_addr, dev_addr + dev_bytes)`, whose content is read and written
+    /// back unchanged. A round that would reach past that range is refused. Every command
+    /// this queues is complete, or has failed, when it returns, also on an error.
     pub fn link_rates(
         &mut self,
         dev: &HpuDevice,
         dev_addr: u64,
+        dev_bytes: u64,
         bytes: u64,
         cmd_bytes: usize,
     ) -> Result<(u64, u64), SynapseError> {
-        let cmd = cmd_bytes.clamp(4096, self.buf_bytes);
-        let per_buf = (self.buf_bytes / cmd).max(1);
-        let n = self.bufs.len();
-        let span = (n * per_buf * cmd) as u64;
-        let rounds = bytes.div_ceil(span).max(1);
+        let link = DevLink {
+            dev,
+            events: &self.events,
+        };
+        self.link_rates_on(&link, dev_addr, dev_bytes, bytes, cmd_bytes)
+    }
+
+    /// [`Self::link_rates`] over any [`Link`].
+    fn link_rates_on<L: Link>(
+        &self,
+        link: &L,
+        dev_addr: u64,
+        dev_bytes: u64,
+        bytes: u64,
+        cmd_bytes: usize,
+    ) -> Result<(u64, u64), SynapseError> {
+        let cmd = cmd_bytes.clamp(4096, self.buf_bytes) as u64;
+        let buf = self.buf_bytes as u64;
+        // the commands of this size that lie inside one ring buffer (`xf_slice_fits`)
+        let per_buf = (0u64..).take_while(|&k| xf_slice_fits(k, cmd, buf)).count() as u64;
+        let n = self.bufs.len() as u64;
+        let span = xf_probe_span(n, per_buf, cmd);
+        if !xf_probe_span_fits(n, per_buf, cmd, dev_bytes) {
+            return Err(SynapseError::Guard(format!(
+                "link probe: a round of {span} bytes reaches past the {dev_bytes} device bytes it was given"
+            )));
+        }
+        let rounds = bytes.div_ceil(span.max(1)).max(1);
         let mut rates = [0u64; 2];
         for (dir, rate) in rates.iter_mut().enumerate() {
+            let to_host = dir == 0;
             let t0 = Instant::now();
             for _ in 0..rounds {
-                for b in 0..n {
-                    let base = self.bufs[b].ptr();
-                    for k in 0..per_buf {
-                        let at = dev_addr + ((b * per_buf + k) * cmd) as u64;
-                        // SAFETY: inside ring buffer `b` and inside the caller's device range.
-                        unsafe {
-                            let host = base.add(k * cmd);
-                            if dir == 0 {
-                                dev.enqueue_d2h_raw(at, cmd as u64, host)?;
-                            } else {
-                                dev.enqueue_h2d_raw(host, cmd as u64, at)?;
+                then_drained(
+                    || {
+                        for b in 0..n {
+                            let base = self.bufs[b as usize].ptr();
+                            for k in 0..per_buf {
+                                let at = dev_addr + xf_probe_dev_off(b, per_buf, k, cmd);
+                                // SAFETY: slice `k` lies inside ring buffer `b`
+                                // (`xf_slice_fits`), and the command inside the round's span
+                                // on the device (`xf_probe_cmd_within_span`), which lies
+                                // inside the caller's range (checked above).
+                                unsafe {
+                                    let host = base.add(xf_slice_off(k, cmd) as usize);
+                                    if to_host {
+                                        link.enqueue_d2h(at, cmd, host)?;
+                                    } else {
+                                        link.enqueue_h2d(host, cmd, at)?;
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-                // SAFETY: the streams belong to `dev`.
-                unsafe {
-                    dev.sync_stream(if dir == 0 {
-                        dev.d2h_stream()
-                    } else {
-                        dev.h2d_stream()
-                    })?
-                };
+                        Ok(())
+                    },
+                    || link.drain(to_host),
+                )?;
             }
             let s = t0.elapsed().as_secs_f64().max(1e-9);
             *rate = ((rounds * span) as f64 / s) as u64;
@@ -586,25 +840,27 @@ unsafe fn run_jobs(jobs: &[Job], threads: usize, to_host: bool) {
         jobs.iter().for_each(copy);
         return;
     }
-    // shares of whole pages; a job larger than a share is cut
+    // Shares of whole pages (any share is correct: it only spreads the work); a job larger
+    // than what is left of a share is cut, and the last thread takes whatever is left.
     let share = total.div_ceil(threads).next_multiple_of(4096);
     let mut parts: Vec<Vec<Job>> = vec![Vec::new(); threads];
     let (mut t, mut used) = (0usize, 0usize);
     for j in jobs {
         let mut off = 0usize;
         while off < j.len {
-            if used == share && t + 1 < threads {
+            if xf_part_full(used as u64, share as u64, t + 1 == threads) {
                 t += 1;
                 used = 0;
             }
-            let room = if t + 1 < threads {
-                share - used
-            } else {
-                usize::MAX
-            };
-            let take = (j.len - off).min(room);
+            let take = xf_part_take(
+                j.len as u64,
+                off as u64,
+                share as u64,
+                used as u64,
+                t + 1 == threads,
+            ) as usize;
             parts[t].push(Job {
-                // SAFETY: `off + take <= j.len`.
+                // SAFETY: `off + take <= j.len` (`xf_part_take_within_job`).
                 ring: unsafe { j.ring.add(off) },
                 host: unsafe { j.host.add(off) },
                 len: take,
@@ -710,7 +966,7 @@ pub fn probe(gib: u64) -> Result<(), String> {
         );
         for cmd in [256usize << 10, 2 << 20, 8 << 20, 64 << 20] {
             let (d2h, h2d) = ring
-                .link_rates(&dev, addr, bytes.min(2 << 30), cmd)
+                .link_rates(&dev, addr, bytes, bytes.min(2 << 30), cmd)
                 .map_err(|e| format!("link rates: {e}"))?;
             println!(
                 "  link, commands of {:>6} KiB: device to host {:.2} GiB/s, host to device {:.2} GiB/s",
@@ -724,13 +980,18 @@ pub fn probe(gib: u64) -> Result<(), String> {
         for threads in [1usize, 2, 4, 6, 8] {
             ring.set_threads(threads);
             let mut host = AnonMap::new(bytes)?;
-            for piece_bytes in [256usize << 10, 32 << 20] {
-                let pieces: Vec<Piece> = (0..bytes as usize / piece_bytes)
-                    .map(|i| Piece {
-                        dev: addr + (i * piece_bytes) as u64,
-                        // SAFETY: inside `host`.
-                        host: unsafe { host.as_mut_ptr().add(i * piece_bytes) },
-                        len: piece_bytes,
+            for piece_bytes in [256u64 << 10, 32 << 20] {
+                // the pieces of this size that lie inside the device bytes and inside `host`
+                let pieces: Vec<Piece> = (0u64..)
+                    .take_while(|&i| xf_slice_fits(i, piece_bytes, bytes))
+                    .map(|i| {
+                        let off = xf_slice_off(i, piece_bytes);
+                        Piece {
+                            dev: addr + off,
+                            // SAFETY: inside `host`, a mapping of `bytes` (`xf_slice_fits`).
+                            host: unsafe { host.as_mut_ptr().add(off as usize) },
+                            len: piece_bytes as usize,
+                        }
                     })
                     .collect();
                 // SAFETY: the pieces tile `host` and the probe's device allocation.
@@ -784,6 +1045,407 @@ pub fn probe(gib: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+
+    const MIB: usize = 1 << 20;
+    const BASE: u64 = 0x4000_0000;
+
+    /// `bytes` bytes that differ from place to place (built once, copied for each test).
+    fn pattern(bytes: usize) -> Vec<u8> {
+        static PATTERN: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let p = PATTERN.get_or_init(|| {
+            (0..16 * MIB)
+                .map(|i| ((i * 2654435761) >> 7) as u8)
+                .collect()
+        });
+        p[..bytes].to_vec()
+    }
+
+    /// One queued command of the made-up link.
+    struct Cmd {
+        serial: usize,
+        to_host: bool,
+        dev: u64,
+        host: *mut u8,
+        len: usize,
+    }
+
+    /// A device made of host memory behind a [`Link`]. As on the card, a command only moves
+    /// its bytes once it is waited for (by the mark of its ring buffer, or by a drain): a copy
+    /// loop that read a ring buffer before waiting for it, or filled one again before its
+    /// transfers ran, moves the wrong bytes here too. `fail_at`: the enqueue with this serial
+    /// number fails.
+    struct FakeLink {
+        mem: RefCell<Vec<u8>>,
+        queue: RefCell<Vec<Cmd>>,
+        marks: RefCell<Vec<(usize, bool)>>,
+        serial: Cell<usize>,
+        fail_at: Cell<Option<usize>>,
+        ran: Cell<usize>,
+    }
+
+    impl FakeLink {
+        fn new(bytes: usize, bufs: usize) -> Self {
+            Self {
+                mem: RefCell::new(pattern(bytes)),
+                queue: RefCell::new(Vec::new()),
+                marks: RefCell::new(vec![(0, true); bufs]),
+                serial: Cell::new(0),
+                fail_at: Cell::new(None),
+                ran: Cell::new(0),
+            }
+        }
+
+        fn enqueue(
+            &self,
+            to_host: bool,
+            dev: u64,
+            host: *mut u8,
+            len: usize,
+        ) -> Result<(), SynapseError> {
+            let serial = self.serial.get();
+            self.serial.set(serial + 1);
+            if self.fail_at.get() == Some(serial) {
+                return Err(SynapseError::Guard(format!(
+                    "made-up failure of command {serial}"
+                )));
+            }
+            self.queue.borrow_mut().push(Cmd {
+                serial,
+                to_host,
+                dev,
+                host,
+                len,
+            });
+            Ok(())
+        }
+
+        /// Runs the queued commands of one direction that `keep` does not hold back.
+        fn run(&self, to_host: bool, before: usize) {
+            let mut queue = self.queue.borrow_mut();
+            let mut mem = self.mem.borrow_mut();
+            queue.retain(|c| {
+                if c.to_host != to_host || c.serial >= before {
+                    return true;
+                }
+                let at = (c.dev - BASE) as usize;
+                // SAFETY: the ring and the tests keep `host` valid for `len` bytes.
+                unsafe {
+                    if c.to_host {
+                        std::ptr::copy_nonoverlapping(mem[at..at + c.len].as_ptr(), c.host, c.len);
+                    } else {
+                        std::ptr::copy_nonoverlapping(
+                            c.host,
+                            mem[at..at + c.len].as_mut_ptr(),
+                            c.len,
+                        );
+                    }
+                }
+                self.ran.set(self.ran.get() + 1);
+                false
+            });
+        }
+
+        fn queued(&self) -> usize {
+            self.queue.borrow().len()
+        }
+    }
+
+    impl Link for FakeLink {
+        unsafe fn enqueue_d2h(
+            &self,
+            dev_addr: u64,
+            bytes: u64,
+            host: *mut u8,
+        ) -> Result<(), SynapseError> {
+            self.enqueue(true, dev_addr, host, bytes as usize)
+        }
+
+        unsafe fn enqueue_h2d(
+            &self,
+            host: *const u8,
+            bytes: u64,
+            dev_addr: u64,
+        ) -> Result<(), SynapseError> {
+            self.enqueue(false, dev_addr, host as *mut u8, bytes as usize)
+        }
+
+        fn mark(&self, buf: usize, to_host: bool) -> Result<(), SynapseError> {
+            self.marks.borrow_mut()[buf] = (self.serial.get(), to_host);
+            Ok(())
+        }
+
+        fn wait(&self, buf: usize) -> Result<(), SynapseError> {
+            let (before, to_host) = self.marks.borrow()[buf];
+            self.run(to_host, before);
+            Ok(())
+        }
+
+        fn drain(&self, to_host: bool) -> Result<(), SynapseError> {
+            self.run(to_host, usize::MAX);
+            Ok(())
+        }
+    }
+
+    /// Pieces of uneven sizes over 15 MiB of device memory, some following each other on the
+    /// device (they become one command), some not, one larger than two ring buffers; their host
+    /// places are in another order, with gaps.
+    fn pieces(host: &mut [u8]) -> Vec<Piece> {
+        let lens = [
+            3 * MIB + 17,
+            4096,
+            1,
+            2 * MIB,
+            5 * MIB + 3,
+            123_456,
+            2 * MIB - 4097,
+            700_000,
+        ];
+        // device: the first four follow each other; then a gap before each of the others
+        let mut dev = Vec::new();
+        let mut at = 0usize;
+        for (i, &len) in lens.iter().enumerate() {
+            if i >= 4 {
+                at += 8192 + i;
+            }
+            dev.push(at);
+            at += len;
+        }
+        assert!(at <= 15 * MIB);
+        // host: back to front, 64 bytes apart
+        let mut out = Vec::new();
+        let mut end = host.len();
+        for (i, &len) in lens.iter().enumerate() {
+            end -= len + 64;
+            out.push(Piece {
+                dev: BASE + dev[i] as u64,
+                // SAFETY: inside `host`.
+                host: unsafe { host.as_mut_ptr().add(end) },
+                len,
+            });
+        }
+        out
+    }
+
+    fn host_of(p: &Piece) -> &[u8] {
+        // SAFETY: the piece's host range is live for the test.
+        unsafe { std::slice::from_raw_parts(p.host, p.len) }
+    }
+
+    fn dev_of(link: &FakeLink, p: &Piece) -> Vec<u8> {
+        let at = (p.dev - BASE) as usize;
+        link.mem.borrow()[at..at + p.len].to_vec()
+    }
+
+    #[test]
+    fn a_copy_to_the_host_brings_every_piece_through_a_ring_smaller_than_the_copy() {
+        for threads in [1usize, 2, 3] {
+            // three buffers of 2 MiB for 13 MiB of pieces: the ring goes round twice
+            let ring = XferRing::on_host_memory(3, 2 * MIB, threads);
+            let link = FakeLink::new(15 * MIB, 3);
+            let mut host = vec![0u8; 16 * MIB];
+            let ps = pieces(&mut host);
+            let (done, st) = unsafe { ring.d2h_on(&link, &ps, &mut || false) }.unwrap();
+            assert_eq!(done, ps.len());
+            for (i, p) in ps.iter().enumerate() {
+                assert!(
+                    host_of(p) == dev_of(&link, p),
+                    "piece {i}, {threads} thread(s)"
+                );
+            }
+            let total: usize = ps.iter().map(|p| p.len).sum();
+            assert_eq!(st.bytes, total as u64);
+            // nothing is left queued, and pieces that follow each other on the device and in
+            // the ring went as one command
+            assert_eq!(link.queued(), 0);
+            assert_eq!(st.commands as usize, link.ran.get());
+            let slices = total.div_ceil(2 * MIB) + ps.len();
+            assert!(
+                (st.commands as usize) < slices - 3,
+                "{} commands",
+                st.commands
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_to_the_device_brings_every_piece_through_a_ring_smaller_than_the_copy() {
+        for threads in [1usize, 2] {
+            let ring = XferRing::on_host_memory(3, 2 * MIB, threads);
+            let link = FakeLink::new(15 * MIB, 3);
+            let mut host: Vec<u8> = (0..16 * MIB).map(|i| ((i * 40503) >> 5) as u8).collect();
+            let ps = pieces(&mut host);
+            let before = link.mem.borrow().clone();
+            let st = unsafe { ring.h2d_on(&link, &ps) }.unwrap();
+            for (i, p) in ps.iter().enumerate() {
+                assert!(
+                    host_of(p) == dev_of(&link, p),
+                    "piece {i}, {threads} thread(s)"
+                );
+            }
+            assert_eq!(link.queued(), 0);
+            assert_eq!(st.bytes, ps.iter().map(|p| p.len as u64).sum::<u64>());
+            // device bytes outside the pieces are as they were
+            let mut expect = before;
+            for p in &ps {
+                let at = (p.dev - BASE) as usize;
+                expect[at..at + p.len].copy_from_slice(host_of(p));
+            }
+            assert!(*link.mem.borrow() == expect);
+        }
+    }
+
+    #[test]
+    fn a_copy_that_is_stopped_reports_only_whole_pieces_and_leaves_nothing_queued() {
+        // how often an unstopped copy asks
+        let asks = {
+            let ring = XferRing::on_host_memory(3, 2 * MIB, 2);
+            let link = FakeLink::new(15 * MIB, 3);
+            let mut host = vec![0u8; 16 * MIB];
+            let ps = pieces(&mut host);
+            let mut n = 0usize;
+            unsafe {
+                ring.d2h_on(&link, &ps, &mut || {
+                    n += 1;
+                    false
+                })
+            }
+            .unwrap();
+            n
+        };
+        assert!(asks > 8);
+        let mut seen = std::collections::BTreeSet::new();
+        for stop_at in 0..=asks {
+            let ring = XferRing::on_host_memory(3, 2 * MIB, 2);
+            let link = FakeLink::new(15 * MIB, 3);
+            let mut host = vec![0xEEu8; 16 * MIB];
+            let ps = pieces(&mut host);
+            let mut n = 0usize;
+            let (done, _) = unsafe {
+                ring.d2h_on(&link, &ps, &mut || {
+                    n += 1;
+                    n > stop_at
+                })
+            }
+            .unwrap();
+            // every piece counted as done is whole in host memory
+            for (i, p) in ps.iter().take(done).enumerate() {
+                assert!(
+                    host_of(p) == dev_of(&link, p),
+                    "stop at {stop_at}: piece {i}"
+                );
+            }
+            // whatever was queued when it stopped was waited for before it returned
+            assert_eq!(link.queued(), 0, "stop at {stop_at}");
+            seen.insert(done);
+        }
+        // it stopped at the start, in the middle and not at all
+        assert!(
+            seen.contains(&0) && seen.contains(&8) && seen.len() > 3,
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_command_leaves_nothing_queued_in_either_direction_or_in_the_probe() {
+        // which commands an unfailed run queues
+        let count = |run: &dyn Fn(&XferRing, &FakeLink, &[Piece]) -> bool| {
+            let ring = XferRing::on_host_memory(3, 2 * MIB, 2);
+            let link = FakeLink::new(15 * MIB, 3);
+            let mut host = vec![0u8; 16 * MIB];
+            let ps = pieces(&mut host);
+            assert!(run(&ring, &link, &ps));
+            link.serial.get()
+        };
+        let to_host: &dyn Fn(&XferRing, &FakeLink, &[Piece]) -> bool =
+            &|ring, link, ps| unsafe { ring.d2h_on(link, ps, &mut || false) }.is_ok();
+        let to_dev: &dyn Fn(&XferRing, &FakeLink, &[Piece]) -> bool =
+            &|ring, link, ps| unsafe { ring.h2d_on(link, ps) }.is_ok();
+        let probe: &dyn Fn(&XferRing, &FakeLink, &[Piece]) -> bool = &|ring, link, _| {
+            ring.link_rates_on(link, BASE, 15 * MIB as u64, 12 * MIB as u64, MIB)
+                .is_ok()
+        };
+        for (name, run) in [
+            ("to host", to_host),
+            ("to device", to_dev),
+            ("probe", probe),
+        ] {
+            let n = count(run);
+            assert!(n >= 6, "{name}: {n} commands");
+            for fail_at in 0..n {
+                let ring = XferRing::on_host_memory(3, 2 * MIB, 2);
+                let link = FakeLink::new(15 * MIB, 3);
+                let mut host = vec![0u8; 16 * MIB];
+                let ps = pieces(&mut host);
+                link.fail_at.set(Some(fail_at));
+                assert!(
+                    !run(&ring, &link, &ps),
+                    "{name}: command {fail_at} failed unnoticed"
+                );
+                // every command queued before the one that failed has run: none can touch
+                // the ring or the caller's memory after the error is returned
+                assert_eq!(link.queued(), 0, "{name}: failure of command {fail_at}");
+                assert_eq!(
+                    link.ran.get(),
+                    fail_at,
+                    "{name}: failure of command {fail_at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_link_probe_stays_inside_the_device_bytes_it_is_given() {
+        let ring = XferRing::on_host_memory(3, 2 * MIB, 1);
+        let link = FakeLink::new(15 * MIB, 3);
+        let before = link.mem.borrow().clone();
+        // a round of three buffers of 2 MiB in commands of 512 KiB: 12 commands a round
+        let (down, up) = ring
+            .link_rates_on(&link, BASE, 15 * MIB as u64, 12 * MIB as u64, 512 * 1024)
+            .unwrap();
+        assert!(down > 0 && up > 0);
+        assert_eq!(link.ran.get(), 2 * 2 * 12);
+        // what the device holds was read and written back unchanged
+        assert!(*link.mem.borrow() == before);
+        // a device range smaller than one round is refused before anything is queued
+        let small = FakeLink::new(15 * MIB, 3);
+        assert!(ring
+            .link_rates_on(
+                &small,
+                BASE,
+                6 * MIB as u64 - 1,
+                12 * MIB as u64,
+                512 * 1024
+            )
+            .is_err());
+        assert_eq!(small.serial.get(), 0);
+    }
+
+    #[test]
+    fn the_drain_runs_whatever_the_enqueue_returned_and_the_first_error_wins() {
+        let drained = Cell::new(0);
+        let sync = |r: Result<(), &'static str>| {
+            let d = &drained;
+            move || {
+                d.set(d.get() + 1);
+                r
+            }
+        };
+        assert_eq!(then_drained(|| Ok::<_, &str>(7), sync(Ok(()))), Ok(7));
+        assert_eq!(
+            then_drained(|| Err::<u8, _>("enqueue"), sync(Ok(()))),
+            Err("enqueue")
+        );
+        assert_eq!(
+            then_drained(|| Err::<u8, _>("enqueue"), sync(Err("sync"))),
+            Err("enqueue")
+        );
+        assert_eq!(
+            then_drained(|| Ok::<_, &str>(7), sync(Err("sync"))),
+            Err("sync")
+        );
+        assert_eq!(drained.get(), 4);
+    }
 
     #[test]
     fn host_copies_are_exact_for_every_thread_count_and_cut() {

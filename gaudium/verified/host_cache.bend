@@ -1521,11 +1521,6 @@ def hc_layout_ok(l: HcLayout) -> Bool:
 def hc_new_tiles(upto: Nat, have: Nat) -> Nat:
   Nat.sub(upto, have)
 
-# Does an entry gain rows or positions in a save that adds `new_tiles` tiles and the state at
-# all but `held_states` of the `kept` positions?
-def hc_save_grows(new_tiles: Nat, kept: Nat, held_states: Nat) -> Bool:
-  Bool.or(Nat.is_gt(new_tiles, 0n), Nat.is_gt(Nat.sub(kept, held_states), 0n))
-
 def hc_ring_part(ring_copy: Bool, ring_charge: Nat) -> Nat:
   match ring_copy:
     case True{}:
@@ -2169,3 +2164,891 @@ law hc_layout_no_caches_never_ok:
 
 def hc_layout_no_caches_never_ok(ch, cr, h, rb, t, b, cb):
   {==}
+
+# ============================================================================
+# 13. More helper lemmas (erased before Rust codegen)
+# ============================================================================
+
+def hc_add_zero_r(n: Nat) -> {Nat.add(n, 0n) == n : Nat}:
+  match n:
+    case 0n: {==}
+    case 1n+p:
+      %Equal.sym(Nat, Nat.add(p, 0n), p, hc_add_zero_r(p)) : {1n+_ == 1n+p : Nat}
+      {==}
+
+def hc_add_succ_r(+a: Nat, +b: Nat) -> {Nat.add(a, 1n+b) == 1n+Nat.add(a, b) : Nat}:
+  match a:
+    case 0n: {==}
+    case 1n+p:
+      %Equal.sym(Nat, Nat.add(p, 1n+b), 1n+Nat.add(p, b), hc_add_succ_r(p, b)) : {1n+_ == 1n+(1n+Nat.add(p, b)) : Nat}
+      {==}
+
+def hc_add_comm(+a: Nat, +b: Nat) -> {Nat.add(a, b) == Nat.add(b, a) : Nat}:
+  match a:
+    case 0n:
+      Equal.sym(Nat, Nat.add(b, 0n), b, hc_add_zero_r(b))
+    case 1n+p:
+      %Equal.sym(Nat, Nat.add(b, 1n+p), 1n+Nat.add(b, p), hc_add_succ_r(b, p)) : {1n+Nat.add(p, b) == _ : Nat}
+      %hc_add_comm(p, b) : {1n+Nat.add(p, b) == 1n+_ : Nat}
+      {==}
+
+# a + (b + c) == (a + b) + c
+def hc_add_assoc_r(+a: Nat, +b: Nat, +c: Nat) -> {Nat.add(a, Nat.add(b, c)) == Nat.add(Nat.add(a, b), c) : Nat}:
+  match a:
+    case 0n: {==}
+    case 1n+p:
+      %hc_add_assoc_r(p, b, c) : {1n+Nat.add(p, Nat.add(b, c)) == 1n+_ : Nat}
+      {==}
+
+# ((a + b) + c) + p == ((p + a) + b) + c
+def hc_add_shuffle3(+a: Nat, +b: Nat, +c: Nat, +p: Nat) -> {Nat.add(Nat.add(Nat.add(a, b), c), p) == Nat.add(Nat.add(Nat.add(p, a), b), c) : Nat}:
+  %hc_add_assoc_r(p, a, b) : {Nat.add(Nat.add(Nat.add(a, b), c), p) == Nat.add(_, c) : Nat}
+  %hc_add_assoc_r(p, Nat.add(a, b), c) : {Nat.add(Nat.add(Nat.add(a, b), c), p) == _ : Nat}
+  hc_add_comm(Nat.add(Nat.add(a, b), c), p)
+
+# (a + b) + p == (p + a) + b
+def hc_add_shuffle2(+a: Nat, +b: Nat, +p: Nat) -> {Nat.add(Nat.add(a, b), p) == Nat.add(Nat.add(p, a), b) : Nat}:
+  %hc_add_assoc_r(p, a, b) : {Nat.add(Nat.add(a, b), p) == _ : Nat}
+  hc_add_comm(Nat.add(a, b), p)
+
+# (a + b) - a == b
+def hc_add_sub_cancel(a: Nat, b: Nat) -> {Nat.sub(Nat.add(a, b), a) == b : Nat}:
+  match a:
+    case 0n:
+      match b:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+p:
+      hc_add_sub_cancel(p, b)
+
+def hc_le_trans(+a: Nat, +b: Nat, +c: Nat, +h1: {Nat.is_le(a, b) == True{} : Bool}, +h2: {Nat.is_le(b, c) == True{} : Bool}) -> {Nat.is_le(a, c) == True{} : Bool}:
+  match a b c:
+    case 0n 0n 0n: {==}
+    case 0n 0n 1n+_: {==}
+    case 0n 1n+_ 0n: {==}
+    case 0n 1n+_ 1n+_: {==}
+    case 1n+ap 0n 0n:
+      h1
+    case 1n+ap 0n 1n+cp:
+      hc_absurd(Nat.is_le(1n+ap, 1n+cp), h1)
+    case 1n+ap 1n+bp 0n:
+      h2
+    case 1n+ap 1n+bp 1n+cp:
+      hc_le_trans(ap, bp, cp, h1, h2)
+
+# 1 + i <= i + (1 + e)
+def hc_succ_le_add(i: Nat, e: Nat) -> {Nat.is_le(1n+i, Nat.add(i, 1n+e)) == True{} : Bool}:
+  match i:
+    case 0n:
+      hc_zero_le(e)
+    case 1n+p:
+      hc_succ_le_add(p, e)
+
+# An extent x that fits one unit of size s, placed in unit i of i + 1 + e units, ends inside
+# them: x <= s  ->  x + i * s <= (i + 1 + e) * s
+def hc_nest(+x: Nat, +s: Nat, +i: Nat, +e: Nat, +h: {Nat.is_le(x, s) == True{} : Bool}) -> {Nat.is_le(Nat.add(x, Nat.mul(i, s)), Nat.mul(Nat.add(i, 1n+e), s)) == True{} : Bool}:
+  hc_le_trans(
+    Nat.add(x, Nat.mul(i, s)),
+    Nat.mul(1n+i, s),
+    Nat.mul(Nat.add(i, 1n+e), s),
+    hc_le_add_mono(x, s, Nat.mul(i, s), Nat.mul(i, s), h, hc_le_refl(Nat.mul(i, s))),
+    hc_le_mul_mono(1n+i, Nat.add(i, 1n+e), s, hc_succ_le_add(i, e))
+  )
+
+# (a + b) * c == a * c + b * c
+def hc_mul_add_distrib(+a: Nat, +b: Nat, +c: Nat) -> {Nat.mul(Nat.add(a, b), c) == Nat.add(Nat.mul(a, c), Nat.mul(b, c)) : Nat}:
+  match a:
+    case 0n: {==}
+    case 1n+p:
+      %Equal.sym(Nat, Nat.mul(Nat.add(p, b), c), Nat.add(Nat.mul(p, c), Nat.mul(b, c)), hc_mul_add_distrib(p, b, c)) : {Nat.add(c, _) == Nat.add(Nat.add(c, Nat.mul(p, c)), Nat.mul(b, c)) : Nat}
+      hc_add_assoc_r(c, Nat.mul(p, c), Nat.mul(b, c))
+
+# a * (b * c) == (a * b) * c
+def hc_mul_assoc_r(+a: Nat, +b: Nat, +c: Nat) -> {Nat.mul(a, Nat.mul(b, c)) == Nat.mul(Nat.mul(a, b), c) : Nat}:
+  match a:
+    case 0n: {==}
+    case 1n+p:
+      %Equal.sym(Nat, Nat.mul(p, Nat.mul(b, c)), Nat.mul(Nat.mul(p, b), c), hc_mul_assoc_r(p, b, c)) : {Nat.add(Nat.mul(b, c), _) == Nat.mul(Nat.add(b, Nat.mul(p, b)), c) : Nat}
+      Equal.sym(Nat, Nat.mul(Nat.add(b, Nat.mul(p, b)), c), Nat.add(Nat.mul(b, c), Nat.mul(Nat.mul(p, b), c)), hc_mul_add_distrib(b, Nat.mul(p, b), c))
+
+def hc_and_not_l(x: Bool, y: Bool) -> {Bool.and(Bool.and(x, y), Bool.not(x)) == False{} : Bool}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      hc_and_false_r(y)
+
+def hc_and_not_r(x: Bool, y: Bool) -> {Bool.and(Bool.and(x, y), Bool.not(y)) == False{} : Bool}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      match y:
+        case False{}: {==}
+        case True{}: {==}
+
+# ============================================================================
+# 14. The control groups a process is in
+# ============================================================================
+#
+# A limit on any group above the process's own bounds it too. The shell reads the groups it can
+# see, its own first and then each ancestor, and takes them into account one at a time with
+# this step, starting from what the host has available.
+
+# What is still available after one more group of the chain: no more than before it, and no
+# more than that group has left when it has a limit.
+def hc_chain_step(+so_far: Nat, has_limit: Bool, limit: Nat, in_use: Nat) -> Nat:
+  hc_available(so_far, has_limit, limit, in_use)
+
+# ============================================================================
+# 15. Does the ring image cover what the entry keeps?
+# ============================================================================
+#
+# A ring image serves a resume point up to the tiles its entry held when it was taken
+# (`hc_ring_serves`). Whether a save has to take a new one is read from what the entry keeps,
+# so a save that was cut short before the image is taken again at the next save.
+
+# Does the image fall short of the entry's last kept position (`last_kept_tiles`: the whole
+# tiles of it, 0 for an entry with none)? An entry without an image is always short.
+def hc_ring_short(has_image: Bool, image_tiles: Nat, last_kept_tiles: Nat) -> Bool:
+  Bool.or(Bool.not(has_image), Nat.is_lt(image_tiles, last_kept_tiles))
+
+# Does a save copy the drafter's rings now? On an engine that has rings, when everything before
+# them was copied whole (a save that was cut short gives the card up at once), and the entry's
+# image is short of what the entry keeps.
+def hc_ring_due(ring_bytes: Nat, complete: Bool, has_image: Bool, image_tiles: Nat, last_kept_tiles: Nat) -> Bool:
+  Bool.and(Nat.is_gt(ring_bytes, 0n), Bool.and(complete, hc_ring_short(has_image, image_tiles, last_kept_tiles)))
+
+# Is everything the device holds for its prompt in host memory after a save? Only when no copy
+# of it was cut short, and (on an engine with rings) the entry's image covers its last kept
+# position.
+def hc_saved_whole(complete: Bool, ring_bytes: Nat, has_image: Bool, image_tiles: Nat, last_kept_tiles: Nat) -> Bool:
+  Bool.and(complete, Bool.not(Bool.and(Nat.is_gt(ring_bytes, 0n), hc_ring_short(has_image, image_tiles, last_kept_tiles))))
+
+# ============================================================================
+# 16. Where the bytes of a tile lie
+# ============================================================================
+#
+# A K/V cache is `chunks` chunks; a chunk holds, for each of `heads` heads, `tiles_per_chunk`
+# tiles of `tile` rows of `row_bytes`. A tile's rows of one head in one cache are one piece. On
+# the host the pieces of a tile follow each other, cache by cache and head by head, in the
+# tile's segment. Every offset below is a count of bytes from the start of its cache or of its
+# segment; the shell adds it to an address and does nothing else with it.
+
+# Bytes of one piece.
+def hc_piece_len(tile: Nat, row_bytes: Nat) -> Nat:
+  Nat.mul(tile, row_bytes)
+
+# Bytes of one head's rows in one chunk.
+def hc_head_bytes(tiles_per_chunk: Nat, tile: Nat, row_bytes: Nat) -> Nat:
+  Nat.mul(tiles_per_chunk, hc_piece_len(tile, row_bytes))
+
+# Bytes of one chunk.
+def hc_chunk_bytes(heads: Nat, tiles_per_chunk: Nat, tile: Nat, row_bytes: Nat) -> Nat:
+  Nat.mul(heads, hc_head_bytes(tiles_per_chunk, tile, row_bytes))
+
+# Bytes of one cache.
+def hc_cache_span(chunks: Nat, heads: Nat, tiles_per_chunk: Nat, tile: Nat, row_bytes: Nat) -> Nat:
+  Nat.mul(chunks, hc_chunk_bytes(heads, tiles_per_chunk, tile, row_bytes))
+
+# Tiles of one chunk, and whether they fill it exactly (a tile then never straddles two chunks).
+def hc_tiles_per_chunk(chunk_rows: Nat, tile: Nat) -> Nat:
+  Nat.div(chunk_rows, tile)
+
+def hc_tiles_fill_chunk(tiles_per_chunk: Nat, tile: Nat, chunk_rows: Nat) -> Bool:
+  Nat.is_eq(Nat.mul(tiles_per_chunk, tile), chunk_rows)
+
+# Tiles the caches hold.
+def hc_cache_tiles(chunks: Nat, tiles_per_chunk: Nat) -> Nat:
+  Nat.mul(chunks, tiles_per_chunk)
+
+# The chunk a tile lies in, its place among the tiles of that chunk, and the tile that lies at
+# a place.
+def hc_tile_chunk(t: Nat, tiles_per_chunk: Nat) -> Nat:
+  Nat.div(t, tiles_per_chunk)
+
+def hc_tile_slot(t: Nat, tiles_per_chunk: Nat) -> Nat:
+  Nat.mod(t, tiles_per_chunk)
+
+def hc_tile_at(chunk: Nat, slot: Nat, tiles_per_chunk: Nat) -> Nat:
+  Nat.add(slot, Nat.mul(chunk, tiles_per_chunk))
+
+# Is this the piece of tile `t` for this cache and head, at a place the caches have? The shell
+# asks before it uses the offsets below: the place must be the tile's (`hc_tile_at`), and the
+# chunk, the place in it, the head and the cache must each be one the layout has.
+def hc_piece_inside(t: Nat, +chunk: Nat, chunks: Nat, +slot: Nat, +tiles_per_chunk: Nat, head: Nat, heads: Nat, cache: Nat, caches: Nat) -> Bool:
+  Bool.and(Bool.and(Bool.and(Bool.and(Nat.is_eq(hc_tile_at(chunk, slot, tiles_per_chunk), t), Nat.is_lt(chunk, chunks)), Nat.is_lt(slot, tiles_per_chunk)), Nat.is_lt(head, heads)), Nat.is_lt(cache, caches))
+
+# Where a piece starts in its cache.
+def hc_piece_dev_off(chunk: Nat, slot: Nat, head: Nat, heads: Nat, +tiles_per_chunk: Nat, +tile: Nat, +row_bytes: Nat) -> Nat:
+  Nat.add(Nat.add(Nat.mul(slot, hc_piece_len(tile, row_bytes)), Nat.mul(head, hc_head_bytes(tiles_per_chunk, tile, row_bytes))), Nat.mul(chunk, hc_chunk_bytes(heads, tiles_per_chunk, tile, row_bytes)))
+
+# Bytes of a tile's segment, and where a piece starts in it.
+def hc_tile_bytes(caches: Nat, heads: Nat, tile: Nat, row_bytes: Nat) -> Nat:
+  Nat.mul(caches, Nat.mul(heads, hc_piece_len(tile, row_bytes)))
+
+def hc_piece_host_off(cache: Nat, head: Nat, heads: Nat, +tile: Nat, +row_bytes: Nat) -> Nat:
+  Nat.add(Nat.mul(head, hc_piece_len(tile, row_bytes)), Nat.mul(cache, Nat.mul(heads, hc_piece_len(tile, row_bytes))))
+
+# Device pieces of one tile.
+def hc_pieces_per_tile(caches: Nat, heads: Nat) -> Nat:
+  Nat.mul(caches, heads)
+
+# Bytes the first copies through the ring are measured with: no more than a cache holds.
+def hc_calibrate_bytes(wanted: Nat, cache_bytes: Nat) -> Nat:
+  Nat.min(wanted, cache_bytes)
+
+# Bytes a restore copies to the device, as the copy is weighed against the prefill it replaces
+# (`hc_copy_wins`): the tiles the device no longer holds, the state at the resume point, and the
+# rings when they are copied.
+def hc_restore_bytes(tiles: Nat, tile_bytes: Nat, state_bytes: Nat, ring_copy: Bool, ring_bytes: Nat) -> Nat:
+  Nat.add(Nat.add(Nat.mul(tiles, tile_bytes), state_bytes), hc_ring_part(ring_copy, ring_bytes))
+
+# Device ranges of other sizes (a kept position's state, the drafter's rings) follow each other
+# in a segment: where the next one starts, and whether one lies inside the segment.
+def hc_range_end(off: Nat, bytes: Nat) -> Nat:
+  Nat.add(off, bytes)
+
+def hc_range_inside(off: Nat, bytes: Nat, seg_bytes: Nat) -> Bool:
+  Nat.is_le(Nat.add(off, bytes), seg_bytes)
+
+# ============================================================================
+# 17. Packing a copy into the transfer ring
+# ============================================================================
+#
+# A copy walks its pieces and the ring's buffers together: `off` bytes of a piece of `len` are
+# placed, `fill` bytes of a buffer of `cap` are taken.
+
+# Bytes placed next: what is left of the piece, and no more than the buffer has room for.
+def xf_take(len: Nat, off: Nat, cap: Nat, fill: Nat) -> Nat:
+  Nat.min(Nat.sub(len, off), Nat.sub(cap, fill))
+
+# Is the buffer handed to the link before more is placed? When it has no room left.
+def xf_buf_full(fill: Nat, cap: Nat) -> Bool:
+  Nat.is_le(cap, fill)
+
+def xf_next_if(inside: Bool, next: Nat) -> Nat:
+  match inside:
+    case True{}:
+      next
+    case False{}:
+      0n
+
+# The buffer after buffer `cur` of `bufs`, around the ring.
+def xf_next_buf(+cur: Nat, bufs: Nat) -> Nat:
+  xf_next_if(Nat.is_lt(1n+cur, bufs), 1n+cur)
+
+# Do the bytes placed now go into the command before them? Only when they follow it both on
+# the device and in the ring buffer.
+def xf_cmd_joins(prev_dev: Nat, +prev_len: Nat, dev_addr: Nat, prev_ring: Nat, fill: Nat) -> Bool:
+  Bool.and(Nat.is_eq(Nat.add(prev_dev, prev_len), dev_addr), Nat.is_eq(Nat.add(prev_ring, prev_len), fill))
+
+# The host copy of one buffer is cut into a share for each copy thread. Bytes of a job given to
+# the thread now: what is left of the job, and for every thread but the last no more than its
+# share has room for. Any share is correct; it only spreads the work.
+def xf_part_take(len: Nat, off: Nat, share: Nat, used: Nat, last: Bool) -> Nat:
+  match last:
+    case True{}:
+      Nat.sub(len, off)
+    case False{}:
+      xf_take(len, off, share, used)
+
+# Does the work go on with the next thread? When this one has its share, and is not the last.
+def xf_part_full(used: Nat, share: Nat, last: Bool) -> Bool:
+  Bool.and(Nat.is_le(share, used), Bool.not(last))
+
+# The probe moves slices of one size: where slice `index` starts, and whether it lies inside
+# `total` bytes.
+def xf_slice_off(index: Nat, size: Nat) -> Nat:
+  Nat.mul(index, size)
+
+def xf_slice_fits(index: Nat, +size: Nat, total: Nat) -> Bool:
+  Nat.is_le(Nat.add(size, xf_slice_off(index, size)), total)
+
+# Where the probe's command `k` of buffer `b` reads or writes the device (`per_buf` commands to
+# a buffer), and whether the whole round lies inside the device bytes it was given.
+def xf_probe_dev_off(b: Nat, per_buf: Nat, k: Nat, cmd: Nat) -> Nat:
+  xf_slice_off(Nat.add(k, Nat.mul(b, per_buf)), cmd)
+
+def xf_probe_span(bufs: Nat, per_buf: Nat, cmd: Nat) -> Nat:
+  Nat.mul(Nat.mul(bufs, per_buf), cmd)
+
+def xf_probe_span_fits(bufs: Nat, per_buf: Nat, cmd: Nat, dev_bytes: Nat) -> Bool:
+  Nat.is_le(xf_probe_span(bufs, per_buf, cmd), dev_bytes)
+
+# ============================================================================
+# 18. Laws of sections 14 to 17
+# ============================================================================
+
+# LAW HC.103: taking one more control group into account never makes more available.
+law hc_chain_step_never_grows:
+  for +a: Nat
+  for +l: Bool
+  for +lim: Nat
+  for +u: Nat
+  {Nat.is_le(hc_chain_step(a, l, lim, u), a) == True{} : Bool}
+
+def hc_chain_step_never_grows(a, l, lim, u):
+  hc_available_within_host(a, l, lim, u)
+
+# LAW HC.104: what is available never exceeds what a group with a limit has left.
+law hc_chain_step_within_group:
+  for +a: Nat
+  for +lim: Nat
+  for +u: Nat
+  {Nat.is_le(hc_chain_step(a, True{}, lim, u), Nat.sub(lim, u)) == True{} : Bool}
+
+def hc_chain_step_within_group(a, lim, u):
+  hc_available_within_group(a, lim, u)
+
+# LAW HC.105: a bound that held before a group is taken into account holds after it: no group
+# further up the chain gives back what a group before it took.
+law hc_chain_step_keeps_earlier_bound:
+  for +a: Nat
+  for +b: Nat
+  for +l: Bool
+  for +lim: Nat
+  for +u: Nat
+  {Nat.is_le(hc_chain_step(Nat.min(a, b), l, lim, u), b) == True{} : Bool}
+
+def hc_chain_step_keeps_earlier_bound(a, b, l, lim, u):
+  hc_le_trans(
+    hc_chain_step(Nat.min(a, b), l, lim, u),
+    Nat.min(a, b),
+    b,
+    hc_available_within_host(Nat.min(a, b), l, lim, u),
+    hc_min_le_r(a, b)
+  )
+
+# LAW HC.106: a group without a limit changes nothing.
+law hc_chain_step_no_limit_changes_nothing:
+  for +a: Nat
+  for +lim: Nat
+  for +u: Nat
+  {hc_chain_step(a, False{}, lim, u) == a : Nat}
+
+def hc_chain_step_no_limit_changes_nothing(a, lim, u):
+  {==}
+
+# LAW HC.107: on an engine with rings, an entry whose image does not cover its last kept
+# position is never reported as completely saved.
+law hc_short_image_never_whole:
+  for +c: Bool
+  for +b: Nat
+  for +i: Nat
+  for +x: Nat
+  {hc_saved_whole(c, 1n+b, True{}, i, Nat.add(i, 1n+x)) == False{} : Bool}
+
+def hc_short_image_never_whole(c, b, i, x):
+  %hc_lt_add_succ(i, x) : {Bool.and(c, Bool.not(Bool.and(True{}, Bool.or(False{}, _)))) == False{} : Bool}
+  hc_and_false_r(c)
+
+# LAW HC.108: nor one that has no image at all.
+law hc_no_image_never_whole:
+  for +c: Bool
+  for +b: Nat
+  for +i: Nat
+  for +k: Nat
+  {hc_saved_whole(c, 1n+b, False{}, i, k) == False{} : Bool}
+
+def hc_no_image_never_whole(c, b, i, k):
+  hc_and_false_r(c)
+
+# LAW HC.109: a save of which a copy was cut short is never reported as complete.
+law hc_cut_short_never_whole:
+  for +b: Nat
+  for +h: Bool
+  for +i: Nat
+  for +k: Nat
+  {hc_saved_whole(False{}, b, h, i, k) == False{} : Bool}
+
+def hc_cut_short_never_whole(b, h, i, k):
+  {==}
+
+def hc_due_whole_aux(g: Bool, c: Bool, s: Bool) -> {Bool.and(Bool.and(g, Bool.and(c, s)), Bool.and(c, Bool.not(Bool.and(g, s)))) == False{} : Bool}:
+  match g:
+    case False{}:
+      {==}
+    case True{}:
+      match c:
+        case False{}:
+          {==}
+        case True{}:
+          match s:
+            case False{}: {==}
+            case True{}: {==}
+
+# LAW HC.110: a save that still owes a ring image is never complete.
+law hc_ring_due_never_whole:
+  for +b: Nat
+  for +c: Bool
+  for +h: Bool
+  for +i: Nat
+  for +k: Nat
+  {Bool.and(hc_ring_due(b, c, h, i, k), hc_saved_whole(c, b, h, i, k)) == False{} : Bool}
+
+def hc_ring_due_never_whole(b, c, h, i, k):
+  hc_due_whole_aux(Nat.is_gt(b, 0n), c, hc_ring_short(h, i, k))
+
+# LAW HC.111: an engine without rings never copies a ring image out.
+law hc_ring_due_needs_rings:
+  for +c: Bool
+  for +h: Bool
+  for +i: Nat
+  for +k: Nat
+  {hc_ring_due(0n, c, h, i, k) == False{} : Bool}
+
+def hc_ring_due_needs_rings(c, h, i, k):
+  {==}
+
+# LAW HC.112: a save that was cut short never goes on to copy the rings: it gives the card up.
+law hc_ring_due_not_after_a_cut:
+  for +b: Nat
+  for +h: Bool
+  for +i: Nat
+  for +k: Nat
+  {hc_ring_due(b, False{}, h, i, k) == False{} : Bool}
+
+def hc_ring_due_not_after_a_cut(b, h, i, k):
+  hc_and_false_r(Nat.is_gt(b, 0n))
+
+def hc_piece_end_in_cache(+c: Nat, +e: Nat, +k: Nat, +f: Nat, +h: Nat, +g: Nat, +t: Nat, +rb: Nat) -> {Nat.is_le(Nat.add(Nat.add(Nat.add(hc_piece_len(t, rb), Nat.mul(k, hc_piece_len(t, rb))), Nat.mul(h, hc_head_bytes(Nat.add(k, 1n+f), t, rb))), Nat.mul(c, hc_chunk_bytes(Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb))), hc_cache_span(Nat.add(c, 1n+e), Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb)) == True{} : Bool}:
+  hc_nest(
+    Nat.add(Nat.add(hc_piece_len(t, rb), Nat.mul(k, hc_piece_len(t, rb))), Nat.mul(h, hc_head_bytes(Nat.add(k, 1n+f), t, rb))),
+    hc_chunk_bytes(Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb),
+    c,
+    e,
+    hc_nest(
+      Nat.add(hc_piece_len(t, rb), Nat.mul(k, hc_piece_len(t, rb))),
+      hc_head_bytes(Nat.add(k, 1n+f), t, rb),
+      h,
+      g,
+      hc_nest(hc_piece_len(t, rb), hc_piece_len(t, rb), k, f, hc_le_refl(hc_piece_len(t, rb)))
+    )
+  )
+
+# LAW HC.113: a piece of a chunk, a place and a head the layout has ends inside its cache: the
+# device offset plus the piece's length never exceeds the cache's bytes.
+law hc_piece_within_cache:
+  for +c: Nat
+  for +e: Nat
+  for +k: Nat
+  for +f: Nat
+  for +h: Nat
+  for +g: Nat
+  for +t: Nat
+  for +rb: Nat
+  {Nat.is_le(Nat.add(hc_piece_dev_off(c, k, h, Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb), hc_piece_len(t, rb)), hc_cache_span(Nat.add(c, 1n+e), Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb)) == True{} : Bool}
+
+def hc_piece_within_cache(c, e, k, f, h, g, t, rb):
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.add(Nat.mul(k, hc_piece_len(t, rb)), Nat.mul(h, hc_head_bytes(Nat.add(k, 1n+f), t, rb))), Nat.mul(c, hc_chunk_bytes(Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb))), hc_piece_len(t, rb)), Nat.add(Nat.add(Nat.add(hc_piece_len(t, rb), Nat.mul(k, hc_piece_len(t, rb))), Nat.mul(h, hc_head_bytes(Nat.add(k, 1n+f), t, rb))), Nat.mul(c, hc_chunk_bytes(Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb))), hc_add_shuffle3(Nat.mul(k, hc_piece_len(t, rb)), Nat.mul(h, hc_head_bytes(Nat.add(k, 1n+f), t, rb)), Nat.mul(c, hc_chunk_bytes(Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb)), hc_piece_len(t, rb))) : {Nat.is_le(_, hc_cache_span(Nat.add(c, 1n+e), Nat.add(h, 1n+g), Nat.add(k, 1n+f), t, rb)) == True{} : Bool}
+  hc_piece_end_in_cache(c, e, k, f, h, g, t, rb)
+
+# LAW HC.114: the bytes of a cache as the pieces count them are the bytes `hc_layout` checks a
+# cache against, for chunks whose tiles fill them: a layout it accepted has room for every
+# piece.
+law hc_cache_span_is_the_checked_size:
+  for +n: Nat
+  for +h: Nat
+  for +k: Nat
+  for +t: Nat
+  for +rb: Nat
+  {hc_cache_span(n, h, k, t, rb) == Nat.mul(Nat.mul(Nat.mul(n, h), Nat.mul(k, t)), rb) : Nat}
+
+def hc_cache_span_is_the_checked_size(n, h, k, t, rb):
+  %hc_mul_assoc_r(Nat.mul(n, h), Nat.mul(k, t), rb) : {Nat.mul(n, Nat.mul(h, Nat.mul(k, Nat.mul(t, rb)))) == _ : Nat}
+  %hc_mul_assoc_r(k, t, rb) : {Nat.mul(n, Nat.mul(h, Nat.mul(k, Nat.mul(t, rb)))) == Nat.mul(Nat.mul(n, h), _) : Nat}
+  %hc_mul_assoc_r(n, h, Nat.mul(k, Nat.mul(t, rb))) : {Nat.mul(n, Nat.mul(h, Nat.mul(k, Nat.mul(t, rb)))) == _ : Nat}
+  {==}
+
+def hc_piece_end_in_segment(+c: Nat, +e: Nat, +h: Nat, +g: Nat, +t: Nat, +rb: Nat) -> {Nat.is_le(Nat.add(Nat.add(hc_piece_len(t, rb), Nat.mul(h, hc_piece_len(t, rb))), Nat.mul(c, Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb)))), Nat.mul(Nat.add(c, 1n+e), Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb)))) == True{} : Bool}:
+  hc_nest(
+    Nat.add(hc_piece_len(t, rb), Nat.mul(h, hc_piece_len(t, rb))),
+    Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb)),
+    c,
+    e,
+    hc_nest(hc_piece_len(t, rb), hc_piece_len(t, rb), h, g, hc_le_refl(hc_piece_len(t, rb)))
+  )
+
+# LAW HC.115: a piece of a cache and a head the layout has ends inside the tile's segment: the
+# host offset plus the piece's length never exceeds the tile's bytes.
+law hc_piece_within_segment:
+  for +c: Nat
+  for +e: Nat
+  for +h: Nat
+  for +g: Nat
+  for +t: Nat
+  for +rb: Nat
+  {Nat.is_le(Nat.add(hc_piece_host_off(c, h, Nat.add(h, 1n+g), t, rb), hc_piece_len(t, rb)), hc_tile_bytes(Nat.add(c, 1n+e), Nat.add(h, 1n+g), t, rb)) == True{} : Bool}
+
+def hc_piece_within_segment(c, e, h, g, t, rb):
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.mul(h, hc_piece_len(t, rb)), Nat.mul(c, Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb)))), hc_piece_len(t, rb)), Nat.add(Nat.add(hc_piece_len(t, rb), Nat.mul(h, hc_piece_len(t, rb))), Nat.mul(c, Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb)))), hc_add_shuffle2(Nat.mul(h, hc_piece_len(t, rb)), Nat.mul(c, Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb))), hc_piece_len(t, rb))) : {Nat.is_le(_, Nat.mul(Nat.add(c, 1n+e), Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb)))) == True{} : Bool}
+  hc_piece_end_in_segment(c, e, h, g, t, rb)
+
+# LAW HC.116: two pieces of one tile in one cache never overlap in host memory: the piece of a
+# later head starts at or after the end of the piece of an earlier one.
+law hc_pieces_apart_in_a_cache:
+  for +c: Nat
+  for +h: Nat
+  for +d: Nat
+  for +hs: Nat
+  for +t: Nat
+  for +rb: Nat
+  {Nat.is_le(Nat.add(hc_piece_host_off(c, h, hs, t, rb), hc_piece_len(t, rb)), hc_piece_host_off(c, Nat.add(h, 1n+d), hs, t, rb)) == True{} : Bool}
+
+def hc_pieces_apart_in_a_cache(c, h, d, hs, t, rb):
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.mul(h, hc_piece_len(t, rb)), Nat.mul(c, Nat.mul(hs, hc_piece_len(t, rb)))), hc_piece_len(t, rb)), Nat.add(Nat.add(hc_piece_len(t, rb), Nat.mul(h, hc_piece_len(t, rb))), Nat.mul(c, Nat.mul(hs, hc_piece_len(t, rb)))), hc_add_shuffle2(Nat.mul(h, hc_piece_len(t, rb)), Nat.mul(c, Nat.mul(hs, hc_piece_len(t, rb))), hc_piece_len(t, rb))) : {Nat.is_le(_, Nat.add(Nat.mul(Nat.add(h, 1n+d), hc_piece_len(t, rb)), Nat.mul(c, Nat.mul(hs, hc_piece_len(t, rb))))) == True{} : Bool}
+  hc_le_add_mono(
+    Nat.mul(1n+h, hc_piece_len(t, rb)),
+    Nat.mul(Nat.add(h, 1n+d), hc_piece_len(t, rb)),
+    Nat.mul(c, Nat.mul(hs, hc_piece_len(t, rb))),
+    Nat.mul(c, Nat.mul(hs, hc_piece_len(t, rb))),
+    hc_le_mul_mono(1n+h, Nat.add(h, 1n+d), hc_piece_len(t, rb), hc_succ_le_add(h, d)),
+    hc_le_refl(Nat.mul(c, Nat.mul(hs, hc_piece_len(t, rb))))
+  )
+
+# LAW HC.117: nor two pieces of one tile in two caches: every piece of a later cache starts at
+# or after the end of every piece of an earlier one.
+law hc_pieces_apart_across_caches:
+  for +c: Nat
+  for +d: Nat
+  for +h: Nat
+  for +g: Nat
+  for +h2: Nat
+  for +t: Nat
+  for +rb: Nat
+  {Nat.is_le(Nat.add(hc_piece_host_off(c, h, Nat.add(h, 1n+g), t, rb), hc_piece_len(t, rb)), hc_piece_host_off(Nat.add(c, 1n+d), h2, Nat.add(h, 1n+g), t, rb)) == True{} : Bool}
+
+def hc_pieces_apart_across_caches(c, d, h, g, h2, t, rb):
+  hc_le_trans(
+    Nat.add(hc_piece_host_off(c, h, Nat.add(h, 1n+g), t, rb), hc_piece_len(t, rb)),
+    Nat.mul(Nat.add(c, 1n+d), Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb))),
+    hc_piece_host_off(Nat.add(c, 1n+d), h2, Nat.add(h, 1n+g), t, rb),
+    hc_piece_within_segment(c, d, h, g, t, rb),
+    hc_le_add_l(
+      Nat.mul(Nat.add(c, 1n+d), Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb))),
+      Nat.mul(Nat.add(c, 1n+d), Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb))),
+      Nat.mul(h2, hc_piece_len(t, rb)),
+      hc_le_refl(Nat.mul(Nat.add(c, 1n+d), Nat.mul(Nat.add(h, 1n+g), hc_piece_len(t, rb))))
+    )
+  )
+
+# LAW HC.118: every place the layout has is a tile the caches count: its tile index lies below
+# `hc_cache_tiles`.
+law hc_tile_at_within_cache_tiles:
+  for +c: Nat
+  for +e: Nat
+  for +k: Nat
+  for +f: Nat
+  {Nat.is_le(1n+hc_tile_at(c, k, Nat.add(k, 1n+f)), hc_cache_tiles(Nat.add(c, 1n+e), Nat.add(k, 1n+f))) == True{} : Bool}
+
+def hc_tile_at_within_cache_tiles(c, e, k, f):
+  hc_nest(1n+k, Nat.add(k, 1n+f), c, e, hc_succ_le_add(k, f))
+
+# LAW HC.119: a piece is never taken for a tile's when the place is not that tile's ...
+law hc_piece_inside_is_the_tile:
+  for +t: Nat
+  for +c: Nat
+  for +cs: Nat
+  for +k: Nat
+  for +tp: Nat
+  for +h: Nat
+  for +hs: Nat
+  for +a: Nat
+  for +as: Nat
+  {Bool.and(hc_piece_inside(t, c, cs, k, tp, h, hs, a, as), Bool.not(Nat.is_eq(hc_tile_at(c, k, tp), t))) == False{} : Bool}
+
+def hc_piece_inside_is_the_tile(t, c, cs, k, tp, h, hs, a, as):
+  hc_tile_below_and(
+    Bool.and(Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)), Nat.is_lt(h, hs)),
+    Nat.is_lt(a, as),
+    Bool.not(Nat.is_eq(hc_tile_at(c, k, tp), t)),
+    hc_tile_below_and(
+      Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)),
+      Nat.is_lt(h, hs),
+      Bool.not(Nat.is_eq(hc_tile_at(c, k, tp), t)),
+      hc_tile_below_and(
+        Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)),
+        Nat.is_lt(k, tp),
+        Bool.not(Nat.is_eq(hc_tile_at(c, k, tp), t)),
+        hc_and_not_l(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs))
+      )
+    )
+  )
+
+# LAW HC.120: ... nor in a chunk the caches do not have ...
+law hc_piece_inside_a_chunk:
+  for +t: Nat
+  for +c: Nat
+  for +cs: Nat
+  for +k: Nat
+  for +tp: Nat
+  for +h: Nat
+  for +hs: Nat
+  for +a: Nat
+  for +as: Nat
+  {Bool.and(hc_piece_inside(t, c, cs, k, tp, h, hs, a, as), Nat.is_le(cs, c)) == False{} : Bool}
+
+def hc_piece_inside_a_chunk(t, c, cs, k, tp, h, hs, a, as):
+  hc_tile_below_and(
+    Bool.and(Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)), Nat.is_lt(h, hs)),
+    Nat.is_lt(a, as),
+    Nat.is_le(cs, c),
+    hc_tile_below_and(
+      Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)),
+      Nat.is_lt(h, hs),
+      Nat.is_le(cs, c),
+      hc_tile_below_and(
+        Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)),
+        Nat.is_lt(k, tp),
+        Nat.is_le(cs, c),
+        hc_and3_excl(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs), Nat.is_le(cs, c), hc_lt_le_excl(c, cs))
+      )
+    )
+  )
+
+# LAW HC.121: ... at a place past the tiles of a chunk ...
+law hc_piece_inside_a_place:
+  for +t: Nat
+  for +c: Nat
+  for +cs: Nat
+  for +k: Nat
+  for +tp: Nat
+  for +h: Nat
+  for +hs: Nat
+  for +a: Nat
+  for +as: Nat
+  {Bool.and(hc_piece_inside(t, c, cs, k, tp, h, hs, a, as), Nat.is_le(tp, k)) == False{} : Bool}
+
+def hc_piece_inside_a_place(t, c, cs, k, tp, h, hs, a, as):
+  hc_tile_below_and(
+    Bool.and(Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)), Nat.is_lt(h, hs)),
+    Nat.is_lt(a, as),
+    Nat.is_le(tp, k),
+    hc_tile_below_and(
+      Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)),
+      Nat.is_lt(h, hs),
+      Nat.is_le(tp, k),
+      hc_and3_excl(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp), Nat.is_le(tp, k), hc_lt_le_excl(k, tp))
+    )
+  )
+
+# LAW HC.122: ... for a head the caches do not have ...
+law hc_piece_inside_a_head:
+  for +t: Nat
+  for +c: Nat
+  for +cs: Nat
+  for +k: Nat
+  for +tp: Nat
+  for +h: Nat
+  for +hs: Nat
+  for +a: Nat
+  for +as: Nat
+  {Bool.and(hc_piece_inside(t, c, cs, k, tp, h, hs, a, as), Nat.is_le(hs, h)) == False{} : Bool}
+
+def hc_piece_inside_a_head(t, c, cs, k, tp, h, hs, a, as):
+  hc_tile_below_and(
+    Bool.and(Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)), Nat.is_lt(h, hs)),
+    Nat.is_lt(a, as),
+    Nat.is_le(hs, h),
+    hc_and3_excl(Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)), Nat.is_lt(h, hs), Nat.is_le(hs, h), hc_lt_le_excl(h, hs))
+  )
+
+# LAW HC.123: ... or for a cache the engine does not have.
+law hc_piece_inside_a_cache:
+  for +t: Nat
+  for +c: Nat
+  for +cs: Nat
+  for +k: Nat
+  for +tp: Nat
+  for +h: Nat
+  for +hs: Nat
+  for +a: Nat
+  for +as: Nat
+  {Bool.and(hc_piece_inside(t, c, cs, k, tp, h, hs, a, as), Nat.is_le(as, a)) == False{} : Bool}
+
+def hc_piece_inside_a_cache(t, c, cs, k, tp, h, hs, a, as):
+  hc_and3_excl(Bool.and(Bool.and(Bool.and(Nat.is_eq(hc_tile_at(c, k, tp), t), Nat.is_lt(c, cs)), Nat.is_lt(k, tp)), Nat.is_lt(h, hs)), Nat.is_lt(a, as), Nat.is_le(as, a), hc_lt_le_excl(a, as))
+
+# LAW HC.124: the first copies are never measured with more bytes than a cache holds.
+law hc_calibrate_within_cache:
+  for +w: Nat
+  for +c: Nat
+  {Nat.is_le(hc_calibrate_bytes(w, c), c) == True{} : Bool}
+
+def hc_calibrate_within_cache(w, c):
+  hc_min_le_r(w, c)
+
+# LAW HC.125: the range after a range never starts before that range ends: two ranges of one
+# segment never overlap in host memory.
+law hc_range_end_after_the_range:
+  for +o: Nat
+  for +b: Nat
+  {Nat.is_le(Nat.add(o, b), hc_range_end(o, b)) == True{} : Bool}
+
+def hc_range_end_after_the_range(o, b):
+  hc_le_refl(Nat.add(o, b))
+
+# LAW HC.126: a range that ends past its segment is never taken for one inside it.
+law hc_range_past_segment_never_inside:
+  for +o: Nat
+  for +b: Nat
+  for +s: Nat
+  {Bool.and(hc_range_inside(o, b, s), Nat.is_lt(s, Nat.add(o, b))) == False{} : Bool}
+
+def hc_range_past_segment_never_inside(o, b, s):
+  hc_le_lt_excl(Nat.add(o, b), s)
+
+# LAW HC.127: the bytes placed next never reach past the end of the piece ...
+law xf_take_within_piece:
+  for +off: Nat
+  for +left: Nat
+  for +cap: Nat
+  for +fill: Nat
+  {Nat.is_le(Nat.add(off, xf_take(Nat.add(off, left), off, cap, fill)), Nat.add(off, left)) == True{} : Bool}
+
+def xf_take_within_piece(off, left, cap, fill):
+  %Equal.sym(Nat, Nat.sub(Nat.add(off, left), off), left, hc_add_sub_cancel(off, left)) : {Nat.is_le(Nat.add(off, Nat.min(_, Nat.sub(cap, fill))), Nat.add(off, left)) == True{} : Bool}
+  hc_le_add_mono(off, off, Nat.min(left, Nat.sub(cap, fill)), left, hc_le_refl(off), hc_min_le_l(left, Nat.sub(cap, fill)))
+
+# LAW HC.128: ... nor past the end of the ring buffer.
+law xf_take_within_buffer:
+  for +len: Nat
+  for +off: Nat
+  for +fill: Nat
+  for +room: Nat
+  {Nat.is_le(Nat.add(fill, xf_take(len, off, Nat.add(fill, room), fill)), Nat.add(fill, room)) == True{} : Bool}
+
+def xf_take_within_buffer(len, off, fill, room):
+  %Equal.sym(Nat, Nat.sub(Nat.add(fill, room), fill), room, hc_add_sub_cancel(fill, room)) : {Nat.is_le(Nat.add(fill, Nat.min(Nat.sub(len, off), _)), Nat.add(fill, room)) == True{} : Bool}
+  hc_le_add_mono(fill, fill, Nat.min(Nat.sub(len, off), room), room, hc_le_refl(fill), hc_min_le_r(Nat.sub(len, off), room))
+
+# LAW HC.129: a buffer with no room left is always handed to the link: nothing is ever placed
+# past its end, and a copy never stands still on a full buffer.
+law xf_full_buffer_is_handed_over:
+  for +c: Nat
+  for +x: Nat
+  {xf_buf_full(Nat.add(c, x), c) == True{} : Bool}
+
+def xf_full_buffer_is_handed_over(c, x):
+  Equal.sym(Bool, True{}, Nat.is_le(c, Nat.add(c, x)), hc_le_add_r(c, x))
+
+def xf_next_aux(b: Bool, nx: Nat, m: Nat, h: {Nat.is_lt(nx, 1n+m) == b : Bool}) -> {Nat.is_lt(xf_next_if(b, nx), 1n+m) == True{} : Bool}:
+  match b:
+    case True{}:
+      h
+    case False{}:
+      {==}
+
+# LAW HC.130: the next buffer is always one the ring has.
+law xf_next_buf_is_in_the_ring:
+  for +c: Nat
+  for +m: Nat
+  {Nat.is_lt(xf_next_buf(c, 1n+m), 1n+m) == True{} : Bool}
+
+def xf_next_buf_is_in_the_ring(c, m):
+  xf_next_aux(Nat.is_lt(1n+c, 1n+m), 1n+c, m, {==})
+
+# LAW HC.131: bytes are never added to a command they do not follow on the device ...
+law xf_cmd_joins_on_the_device:
+  for +pd: Nat
+  for +pl: Nat
+  for +da: Nat
+  for +pr: Nat
+  for +f: Nat
+  {Bool.and(xf_cmd_joins(pd, pl, da, pr, f), Bool.not(Nat.is_eq(Nat.add(pd, pl), da))) == False{} : Bool}
+
+def xf_cmd_joins_on_the_device(pd, pl, da, pr, f):
+  hc_and_not_l(Nat.is_eq(Nat.add(pd, pl), da), Nat.is_eq(Nat.add(pr, pl), f))
+
+# LAW HC.132: ... or in the ring buffer.
+law xf_cmd_joins_in_the_ring:
+  for +pd: Nat
+  for +pl: Nat
+  for +da: Nat
+  for +pr: Nat
+  for +f: Nat
+  {Bool.and(xf_cmd_joins(pd, pl, da, pr, f), Bool.not(Nat.is_eq(Nat.add(pr, pl), f))) == False{} : Bool}
+
+def xf_cmd_joins_in_the_ring(pd, pl, da, pr, f):
+  hc_and_not_r(Nat.is_eq(Nat.add(pd, pl), da), Nat.is_eq(Nat.add(pr, pl), f))
+
+def xf_part_take_aux(l: Bool, +off: Nat, +left: Nat, +s: Nat, +u: Nat) -> {Nat.is_le(Nat.add(off, xf_part_take(Nat.add(off, left), off, s, u, l)), Nat.add(off, left)) == True{} : Bool}:
+  match l:
+    case True{}:
+      %Equal.sym(Nat, Nat.sub(Nat.add(off, left), off), left, hc_add_sub_cancel(off, left)) : {Nat.is_le(Nat.add(off, _), Nat.add(off, left)) == True{} : Bool}
+      hc_le_refl(Nat.add(off, left))
+    case False{}:
+      xf_take_within_piece(off, left, s, u)
+
+# LAW HC.133: a copy thread is never given bytes past the end of a job.
+law xf_part_take_within_job:
+  for +l: Bool
+  for +off: Nat
+  for +left: Nat
+  for +s: Nat
+  for +u: Nat
+  {Nat.is_le(Nat.add(off, xf_part_take(Nat.add(off, left), off, s, u, l)), Nat.add(off, left)) == True{} : Bool}
+
+def xf_part_take_within_job(l, off, left, s, u):
+  xf_part_take_aux(l, off, left, s, u)
+
+# LAW HC.134: the work never goes on past the last copy thread.
+law xf_last_thread_takes_the_rest:
+  for +u: Nat
+  for +s: Nat
+  {xf_part_full(u, s, True{}) == False{} : Bool}
+
+def xf_last_thread_takes_the_rest(u, s):
+  hc_and_false_r(Nat.is_le(s, u))
+
+# LAW HC.135: a slice that ends past the bytes it is cut from is never taken for one inside.
+law xf_slice_past_end_never_fits:
+  for +i: Nat
+  for +z: Nat
+  for +t: Nat
+  {Bool.and(xf_slice_fits(i, z, t), Nat.is_lt(t, Nat.add(z, xf_slice_off(i, z)))) == False{} : Bool}
+
+def xf_slice_past_end_never_fits(i, z, t):
+  hc_le_lt_excl(Nat.add(z, xf_slice_off(i, z)), t)
+
+# LAW HC.136: every command of a probe round ends inside the round's span on the device.
+law xf_probe_cmd_within_span:
+  for +b: Nat
+  for +e: Nat
+  for +k: Nat
+  for +f: Nat
+  for +cmd: Nat
+  {Nat.is_le(Nat.add(cmd, xf_probe_dev_off(b, Nat.add(k, 1n+f), k, cmd)), xf_probe_span(Nat.add(b, 1n+e), Nat.add(k, 1n+f), cmd)) == True{} : Bool}
+
+def xf_probe_cmd_within_span(b, e, k, f, cmd):
+  hc_le_mul_mono(
+    1n+Nat.add(k, Nat.mul(b, Nat.add(k, 1n+f))),
+    Nat.mul(Nat.add(b, 1n+e), Nat.add(k, 1n+f)),
+    cmd,
+    hc_nest(1n+k, Nat.add(k, 1n+f), b, e, hc_succ_le_add(k, f))
+  )
+
+# LAW HC.137: a probe round whose span exceeds the device bytes it was given never runs.
+law xf_probe_span_over_refused:
+  for +n: Nat
+  for +p: Nat
+  for +c: Nat
+  for +d: Nat
+  {Bool.and(xf_probe_span_fits(n, p, c, d), Nat.is_lt(d, xf_probe_span(n, p, c))) == False{} : Bool}
+
+def xf_probe_span_over_refused(n, p, c, d):
+  hc_le_lt_excl(xf_probe_span(n, p, c), d)
+
+# LAW HC.138: a restore is never weighed with fewer bytes than the rows it copies: a copy never
+# wins against a prefill by leaving its tiles out of the count.
+law hc_restore_bytes_cover_the_tiles:
+  for +n: Nat
+  for +tb: Nat
+  for +sb: Nat
+  for +c: Bool
+  for +rb: Nat
+  {Nat.is_le(Nat.mul(n, tb), hc_restore_bytes(n, tb, sb, c, rb)) == True{} : Bool}
+
+def hc_restore_bytes_cover_the_tiles(n, tb, sb, c, rb):
+  Equal.sym(Bool, True{}, Nat.is_le(Nat.mul(n, tb), Nat.add(Nat.add(Nat.mul(n, tb), sb), hc_ring_part(c, rb))), hc_le_add_add(Nat.mul(n, tb), sb, hc_ring_part(c, rb)))
