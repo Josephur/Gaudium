@@ -1111,7 +1111,8 @@ fn planned_drafter_of(
 ) -> Option<(Option<PathBuf>, &'static str, Vec<u64>)> {
     let (_, opts) = cfg.per_model.iter().find(|(k, _)| k == id)?;
     if opts.own_mtp {
-        return Some((None, "mtp", vec![if opts.moe_routed { 3 } else { 4 }]));
+        let dir = cfg.models.iter().find(|m| m.id == id).map(|m| m.dir.as_path());
+        return Some((None, "mtp", vec![own_mtp_width(dir, opts.moe_routed)]));
     }
     let dir = opts.draft_model.as_ref()?;
     let name = dir
@@ -1129,6 +1130,29 @@ fn planned_drafter_of(
         ("dspine", vec![7, 15])
     };
     Some((Some(dir.clone()), kind, draft_k))
+}
+
+/// Drafts per launch of a model's own MTP drafter (`--draft-model <id>=mtp`): the widths that
+/// measured best on the card. Inkling 2's block drafter fills a block of 7 drafts in one launch
+/// that costs about 3% of a verify pass, so it runs at the full block.
+fn own_mtp_width(dir: Option<&Path>, moe_routed: bool) -> u64 {
+    static INKLING: std::sync::OnceLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
+    let inkling = dir.is_some_and(|d| {
+        let mut seen = INKLING
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *seen.entry(d.to_path_buf()).or_insert_with(|| {
+            ModelText::open(d)
+                .and_then(|t| t.spec())
+                .is_ok_and(|s| s.family == ModelFamily::Inkling2)
+        })
+    });
+    match (inkling, moe_routed) {
+        (true, _) => 7,
+        (false, true) => 3,
+        (false, false) => 4,
+    }
 }
 
 /// `--effort-levels`: the model's reasoning-effort levels instead of the ones read from its chat
@@ -1211,7 +1235,7 @@ fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Opt
         return None;
     }
     let drafter = planned_drafter_of(cfg, id).map(|(_, kind, _)| kind);
-    if !drafter_runs_with_vision(drafter) {
+    if !drafter_runs_with_vision(drafter, spec.family == ModelFamily::Inkling2) {
         return None;
     }
     let tokens = planned_image_tokens(
@@ -1494,7 +1518,9 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         );
         if vision.is_none() && spec.has_vision && runs_tower && cfg.vision {
             if let Some((_, kind, _)) =
-                planned_drafter_of(&cfg, &entry.id).filter(|d| !drafter_runs_with_vision(Some(d.1)))
+planned_drafter_of(&cfg, &entry.id).filter(|d| {
+                    !drafter_runs_with_vision(Some(d.1), spec.family == ModelFamily::Inkling2)
+                })
             {
                 eprintln!(
                     "[server] model '{}': served text only: its {kind} drafter is not validated with image input (plain decode and DSpine are)",

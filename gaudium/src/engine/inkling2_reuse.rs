@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 
 use super::Inkling2Engine;
 use crate::engine::qwen3::prefix_cache::PrefixStats;
-use crate::verified::{ikr_cap, ikr_pick, ikr_slack, ikr_start, IkResume};
+use crate::verified::{ikr_cap, ikr_pick, ikr_slack, ikr_slack_with, ikr_start, IkResume};
 
 /// What the card holds for the next request, and the copy of the rings taken at the end of
 /// the last prompt.
@@ -27,10 +27,12 @@ use crate::verified::{ikr_cap, ikr_pick, ikr_slack, ikr_start, IkResume};
 pub(super) struct IkReuse {
     enabled: bool,
     slack: u64,
-    /// The ring arena `[ring_lo, ring_lo + ring_bytes)` and its copy.
-    ring_lo: u64,
-    ring_bytes: u64,
-    snap_addr: u64,
+    /// What a copy of the rings is made of: `(rings, bytes, their copy)` (the main model's
+    /// ring arena, and each context ring of a drafter).
+    copies: Vec<(u64, u64, u64)>,
+    /// Position from which the rows of the request's own tokens do not count as held (a part
+    /// of the state was not written for them); `None`: all of them count.
+    held_cap: Option<usize>,
     /// Identity of the rows at positions `0..keys.len()` of the caches.
     keys: Vec<u64>,
     /// End (exclusive) of the highest position written since the last prefill from 0, rows
@@ -59,11 +61,21 @@ impl IkReuse {
         }
     }
 
-    /// The device buffers: the ring arena and its copy (both `bytes` long).
-    pub(super) fn bind(&mut self, ring_lo: u64, bytes: u64, snap_addr: u64) {
-        self.ring_lo = ring_lo;
-        self.ring_bytes = bytes;
-        self.snap_addr = snap_addr;
+    /// A part of the bounded state and its copy (both `bytes` long): the main model's ring
+    /// arena, a drafter's context ring.
+    pub(super) fn bind(&mut self, rings: u64, bytes: u64, copy: u64) {
+        self.copies.push((rings, bytes, copy));
+    }
+
+    /// A drafter keeps context rings of `ring` slots for a window of `window` positions.
+    pub(super) fn with_drafter(&mut self, ring: u64, window: u64) {
+        self.slack = ikr_slack_with(self.slack, ring, window);
+    }
+
+    /// The rows of this request's tokens from position `pos` on are not held (the engine
+    /// wrote only a part of its state for them).
+    pub(super) fn hold_before(&mut self, pos: usize) {
+        self.held_cap = Some(self.held_cap.map_or(pos, |c| c.min(pos)));
     }
 
     /// A pass is about to write the rows up to position `end` (exclusive).
@@ -164,6 +176,7 @@ impl Inkling2Engine {
         let pick = ikr_pick(r_live, ru.hi, r_snap, ru.snap_hi, ru.slack);
         let start = ikr_start(pick, r_live, r_snap) as usize;
         ru.pending = keys;
+        ru.held_cap = None;
         ru.stats.requests += 1;
         ru.stats.last_prompt_rows = rows;
         ru.stats.last_lcp = lcp as u64;
@@ -180,12 +193,14 @@ impl Inkling2Engine {
             IkResume::IrLive => ru.keys.truncate(start),
             IkResume::IrSnap => {
                 // the rings as they were when the last prompt was in
-                let (src, bytes, dst, hi) = (ru.snap_addr, ru.ring_bytes, ru.ring_lo, ru.snap_hi);
+                let (copies, hi) = (ru.copies.clone(), ru.snap_hi);
                 // the live rings are neither state until the copy is known to be in
                 ru.keys.clear();
-                self.dev
-                    .copy_d2d_compute(src, bytes, dst)
-                    .map_err(|e| format!("give the ring copy back: {e}"))?;
+                for (rings, bytes, copy) in copies {
+                    self.dev
+                        .copy_d2d_compute(copy, bytes, rings)
+                        .map_err(|e| format!("give the ring copy back: {e}"))?;
+                }
                 self.sync_compute("ring copy back")?;
                 let ru = &mut self.reuse;
                 ru.hi = hi;
@@ -213,10 +228,11 @@ impl Inkling2Engine {
             return Ok(());
         }
         ru.snap_valid = false;
-        let (src, bytes, dst) = (ru.ring_lo, ru.ring_bytes, ru.snap_addr);
-        self.dev
-            .copy_d2d_compute(src, bytes, dst)
-            .map_err(|e| format!("copy the rings: {e}"))?;
+        for (rings, bytes, copy) in ru.copies.clone() {
+            self.dev
+                .copy_d2d_compute(rings, bytes, copy)
+                .map_err(|e| format!("copy the rings: {e}"))?;
+        }
         self.sync_compute("ring copy")?;
         let ru = &mut self.reuse;
         ru.snap_keys.clone_from(&ru.keys);
@@ -232,7 +248,10 @@ impl Inkling2Engine {
         if !ru.enabled || ru.keys.len() != prompt_rows {
             return;
         }
-        let fed = generated.len().saturating_sub(1);
+        let mut fed = generated.len().saturating_sub(1);
+        if let Some(cap) = ru.held_cap {
+            fed = fed.min(cap.saturating_sub(prompt_rows));
+        }
         ru.keys
             .extend(generated[..fed].iter().map(|&t| text_key(t)));
     }

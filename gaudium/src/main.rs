@@ -163,7 +163,8 @@ fn print_usage() {
          \x20                       A GGUF model's tower is a projector file (mmproj*.gguf) beside\n\
          \x20                       it; with none there it is served text only.\n\
          \x20                       A model drafted by a block or an MTP drafter is served text\n\
-         \x20                       only (plain decode and DSpine run with image input)\n\
+         \x20                       only (plain decode, DSpine and Inkling 2's own drafter run\n\
+         \x20                       with image input)\n\
          \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\
          \x20                       model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:\n\
          \x20                       1024x1024 pixels, larger images are resized down to it; 20x20\n\
@@ -309,6 +310,8 @@ fn print_usage() {
          \x20 GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first image\n\
          \x20                       request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence rows x 1024)\n\
          \x20                       and img<k>_feat (tokens x 2304) as raw BF16 (it syncs after each one)\n\
+         \x20 GAUDIUM_IK_MTP_DUMP   Directory: after the first block of the drafter (--spec mtp), every\n\
+         \x20                       drafter activation and the head of its context state as <name>.bin\n\
          \n\
          Generate options:\n\
          \x20 --model <dir>         Model directory (or GAUDIUM_MODEL); or a GGUF file (Inkling 2)\n\
@@ -386,6 +389,9 @@ fn print_usage() {
          \x20                       A Gemma 4 model reads the drafter kind from the checkpoint:\n\
          \x20                       --spec dflash2 --draft-model <dir> runs a DFlashDraftModel\n\
          \x20                       block drafter (one --draft-k width, default 7).\n\
+         \x20                       An Inkling 2 model: mtp drafts with the checkpoint's block\n\
+         \x20                       drafter (mtp.safetensors beside the model; up to 7 drafts per\n\
+         \x20                       block, pass --draft-k 7 for all of them).\n\
          \x20                       Chain modes are token-identical to K=0 (sampled: same seed)\n\
          \x20 --draft-model <dir>   Drafter checkpoint directory (with --spec dspine / dflash2;\n\
          \x20                       assistant: default <model_dir>-assistant)\n\

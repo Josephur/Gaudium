@@ -590,5 +590,15 @@ $$(KDIR)/$(1)_gaudi2.o: $$(TPC_SRC)/$(2) $$(TPC_SRC)/ik_common.h | $$(KDIR)
 KERNEL_OBJS += $$(KDIR)/$(1)_gaudi2.o
 endef
 $(foreach k,$(IK_KERNELS),$(eval $(call IK_RULE,$(word 1,$(subst :, ,$(k))),$(word 2,$(subst :, ,$(k))),$(word 3,$(subst :, ,$(k))))))
+# The Inkling 2 block drafter (mtp.safetensors): context mixes, context / block heads with rotary positions, a two-set softmax over the
+# context state and the block, the merge, a plain SwiGLU, the recurrent head's step and its arg-max. Same glue library.
+IKD_KERNELS := ik_dmix:ik_dmix_gaudi2.c: ik_dkv:ik_dkv_gaudi2.c: ik_dqprep:ik_dqprep_gaudi2.c: ik_dsoft:ik_dsoft_gaudi2.c: \
+  ik_dcomb:ik_dcomb_gaudi2.c: ik_dswiglu:ik_dswiglu_gaudi2.c: ik_mstep:ik_mstep_gaudi2.c: ik_margmax:ik_margmax_gaudi2.c:
+define IKD_RULE
+$$(KDIR)/$(1)_gaudi2.o: $$(TPC_SRC)/$(2) $$(TPC_SRC)/ik_common.h $$(TPC_SRC)/ik_mtp.h | $$(KDIR)
+	cd $$(TPC_SRC) && $$(TPC_CC) -march=gaudi2 -O2 $(3) -x c++ -c $(2) -o $$@
+KERNEL_OBJS += $$(KDIR)/$(1)_gaudi2.o
+endef
+$(foreach k,$(IKD_KERNELS),$(eval $(call IKD_RULE,$(word 1,$(subst :, ,$(k))),$(word 2,$(subst :, ,$(k))),$(word 3,$(subst :, ,$(k))))))
 $(KDIR)/libgaudium_ik.so: $(GLUE_SRC)/ik_glue.cpp $(GLUE_SRC)/elf_record.inc | $(KDIR)
 	$(CXX) -O2 -std=c++17 -fPIC -shared -I$(HABANA_INC) $< -o $@

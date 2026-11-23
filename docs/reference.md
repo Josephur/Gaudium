@@ -141,7 +141,8 @@ Serve options:
                         A GGUF model's tower is a projector file (mmproj*.gguf) beside
                         it; with none there it is served text only.
                         A model drafted by a block or an MTP drafter is served text
-                        only (plain decode and DSpine run with image input)
+                        only (plain decode, DSpine and Inkling 2's own drafter run
+                        with image input)
   --vision-max-patches <N>  Largest image the vision tower is planned for, in the
                         model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:
                         1024x1024 pixels, larger images are resized down to it; 20x20
@@ -287,6 +288,8 @@ Inkling 2 environment variables (debugging; none changes a served stream unless 
   GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first image
                         request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence rows x 1024)
                         and img<k>_feat (tokens x 2304) as raw BF16 (it syncs after each one)
+  GAUDIUM_IK_MTP_DUMP   Directory: after the first block of the drafter (--spec mtp), every
+                        drafter activation and the head of its context state as <name>.bin
 
 Generate options:
   --model <dir>         Model directory (or GAUDIUM_MODEL); or a GGUF file (Inkling 2)
@@ -364,6 +367,9 @@ Generate options:
                         A Gemma 4 model reads the drafter kind from the checkpoint:
                         --spec dflash2 --draft-model <dir> runs a DFlashDraftModel
                         block drafter (one --draft-k width, default 7).
+                        An Inkling 2 model: mtp drafts with the checkpoint's block
+                        drafter (mtp.safetensors beside the model; up to 7 drafts per
+                        block, pass --draft-k 7 for all of them).
                         Chain modes are token-identical to K=0 (sampled: same seed)
   --draft-model <dir>   Drafter checkpoint directory (with --spec dspine / dflash2;
                         assistant: default <model_dir>-assistant)

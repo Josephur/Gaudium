@@ -287,3 +287,31 @@ law ikr_slack_le_hist:
 
 def ikr_slack_le_hist(ring, window, hist, taps):
   L.nat_min_le_r(Nat.sub(ring, window), Nat.sub(hist, taps))
+
+# The slack of an engine whose drafter keeps context rings of its own (the keys and values of a
+# window of positions per windowed layer): no more than the main model's slack, and no more
+# than the drafter's rings have beyond their window.
+def ikr_slack_with(slack: Nat, ring: Nat, window: Nat) -> Nat:
+  Nat.min(slack, Nat.sub(ring, window))
+
+# promise: a drafter never widens the slack of the main model's rings
+# harm: a resume is allowed after the main model's rings overwrote rows a pass reads
+law ikr_slack_with_le_main:
+  for +slack: Nat
+  for +ring: Nat
+  for +window: Nat
+  {Nat.is_le(ikr_slack_with(slack, ring, window), slack) == True{} : Bool}
+
+def ikr_slack_with_le_main(slack, ring, window):
+  L.nat_min_le_l(slack, Nat.sub(ring, window))
+
+# promise: with a drafter the slack never exceeds the slots of its context rings beyond their window
+# harm: a resume is allowed after the drafter's rings overwrote context a block reads
+law ikr_slack_with_le_ring:
+  for +slack: Nat
+  for +ring: Nat
+  for +window: Nat
+  {Nat.is_le(ikr_slack_with(slack, ring, window), Nat.sub(ring, window)) == True{} : Bool}
+
+def ikr_slack_with_le_ring(slack, ring, window):
+  L.nat_min_le_r(slack, Nat.sub(ring, window))

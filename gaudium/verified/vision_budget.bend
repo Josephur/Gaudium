@@ -103,11 +103,14 @@ type VisDrafter is Data:
   VdDSpine{}
   VdBlock{}
   VdMtp{}
+  VdStates{}
 
 # Whether a model with this drafter may be loaded with its vision tower. Plain decode is the
 # exactness reference and always may. A drafter may once it reads vision embeddings (never
 # image-pad embeddings) at image positions AND has passed the vision regression on the card:
-# today that is the DSpine drafter. The others are served text only until they have.
+# today that is the DSpine drafter, and the block drafter whose context is the target model's own
+# hidden states (`VdStates`: it embeds no prompt row itself, an image reaches it as what the target
+# made of it). The others are served text only until they have.
 def vis_drafter_ok(d: VisDrafter) -> Bool:
   match d:
     case VdNone{}:
@@ -118,6 +121,8 @@ def vis_drafter_ok(d: VisDrafter) -> Bool:
       False{}
     case VdMtp{}:
       False{}
+    case VdStates{}:
+      True{}
 
 # ============================================================================
 # 3. Limits checked before decoding
