@@ -31,6 +31,7 @@ Usage:
                                             or a directory of them without config.json):
                                             metadata, tensors and weights per type
   gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json
+                                            (or a GGUF model's tokenizer metadata)
   gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test
   gaudium --probe-copy [GiB]                Measure copies between the card and host memory
                                             (both directions, through the pinned transfer ring
@@ -38,7 +39,8 @@ Usage:
                                             default: 2 GiB of device memory)
   gaudium --apply-template <model_dir> <request.json|->
                                             Print the prompt a chat request renders to with
-                                            the model's own chat template (host only)
+                                            the model's own chat template (host only; a GGUF
+                                            model: its tokenizer.chat_template)
   gaudium --generate [options]              Run live Gaudi 2 LLM generation
   gaudium --build-cache [generate options]  Compile every recipe of that configuration into
                                             the recipe cache and print its exact HBM plan,
@@ -54,7 +56,9 @@ Usage:
 Serve options:
   --host <addr>         Bind address (or GAUDIUM_SERVE_HOST; default: 0.0.0.0)
   --port <N>            Bind port (or GAUDIUM_SERVE_PORT; default: 8090)
-  --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap)
+  --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap); a GGUF
+                        file (or a directory of one GGUF model) serves its own tokenizer,
+                        chat template, context limit and sampling defaults from its metadata
   --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)
   --ui-dir <dir>        Gaudium Web UI bundle directory (or GAUDIUM_UI_DIR)
   --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)
@@ -274,7 +278,7 @@ Inkling 2 environment variables (debugging; none changes a served stream unless 
                         of N rows and every row's logits are compared with the one-row step's
 
 Generate options:
-  --model <dir>         Model directory (or GAUDIUM_MODEL)
+  --model <dir>         Model directory (or GAUDIUM_MODEL); or a GGUF file (Inkling 2)
   --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)
   --prompt <text>       Input prompt text
   --prompt-ids <csv>    Raw comma-separated prompt token IDs (skips tokenizer)
@@ -284,7 +288,8 @@ Generate options:
   --also-prompt-ids-file <p>  Same as a further --prompt-ids-file
   --also-prompt-file <p>  One more text request on the same loaded engine (repeatable;
                         formatted like --prompt, after the token-ID requests)
-  --chat                Wrap --prompt in the model's chat template (Qwen3 ChatML / Gemma 4 turns)
+  --chat                Wrap --prompt in the model's chat template (Qwen3 ChatML / Gemma 4 turns;
+                        other families: the model's own template, reasoning off with --no-think)
   --no-think            Disable thinking block (with --chat)
   --system <text>       System prompt (with --chat)
   --max-new <N>         Maximum tokens to generate (default: 64)
@@ -489,7 +494,7 @@ or reads it to rewrite a file.
 | `GAUDIUM_IMAGE_PIPELINE_REF_DIR` | `vision::media::tests::reference_pipeline_records_match_bit_for_bit` (`--ignored`) | A directory written by `gaudium/tests/data/vision/make_pipeline_refs.py`: image files with the patch rows of the checkpoint's own image processor, which must match bit for bit. |
 | `GAUDIUM_VISION_REF_DIR` | `vision::tests::reference_prompt_records_match_bit_for_bit` (`--ignored`) | A directory of reference prompt records (token ids, image grids, positions, patch rows) that the prompt layout and the image preprocessing must reproduce. |
 | `GAUDIUM_GGUF_REF_DIR` | `gguf::tests::reference_gguf_files_open_and_decode` (`--ignored`) | A directory of published GGUF files (and its `dspark/` subdirectory): every file must open, the Inkling 2 Mini model must have its 744 tensors with architecture `inkling2_loop` and NVFP4 weights, every NVFP4 tensor its per-expert `.scale`, and one row of every type must decode to finite numbers. |
-| `GAUDIUM_INKLING2_GGUF` | `engine::inkling2::gguf_source::tests::gguf_and_checkpoint_pack_the_same_device_tensors` (`--ignored`, with `GAUDIUM_INKLING2_DIR`) | A GGUF file of the same Inkling 2 model as the checkpoint directory `GAUDIUM_INKLING2_DIR`: both must pack byte-identical device tensors. |
+| `GAUDIUM_INKLING2_GGUF` | `engine::inkling2::gguf_source::tests::gguf_and_checkpoint_pack_the_same_device_tensors`, `tokenizer::gguf::tests::inkling2_gguf_tokenizer_matches_the_checkpoint`, `server::chat::tests::inkling2_gguf_renders_like_the_checkpoint` (`--ignored`, with `GAUDIUM_INKLING2_DIR`) | A GGUF file of the same Inkling 2 model as the checkpoint directory `GAUDIUM_INKLING2_DIR`: both must pack byte-identical device tensors, the tokenizer built from the file's metadata must equal the one of `tokenizer.json` (every token, every merge, the fixture cases), and the file's chat template must render the Jinja2 fixture contexts and a set of chat requests to the same prompts and ids as the checkpoint's. |
 | `GAUDIUM_UPDATE_REFERENCE` | `tests/reference_docs.rs` | `1` = rewrite the copy of the help text on this page from the binary instead of failing when it differs. |
 
 <!-- test-variables:end -->

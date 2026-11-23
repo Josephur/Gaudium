@@ -39,6 +39,7 @@ use crate::engine::qwen3::{Qwen3Config, Qwen3GenParams, KV_CHUNK};
 use crate::engine::{load_engine, GenEngine};
 use crate::json::{self, JsonValue};
 use crate::model_spec::{ModelFamily, ModelSpec};
+use crate::model_text::ModelText;
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use crate::verified::{BackendState, ReqEvent};
 use crate::vision::media::{MediaCounts, RequestMedia, VisionServe};
@@ -171,6 +172,8 @@ struct RegisteredModel {
     gen_defaults: SamplerDefaults,
     /// Image and video input: what the model's vision tower is loaded for. `None`: text only.
     vision: Option<VisionServe>,
+    /// The model's own context limit (`ModelText::max_positions`), read once at registration.
+    n_ctx_train: Option<u64>,
 }
 
 /// Sampler settings a request falls back to (temperature, top-k, top-p).
@@ -726,8 +729,7 @@ impl AppState {
         };
         drop(s);
 
-        let n_ctx_train = crate::engine::model_max_positions(&m.dir)
-            .map_or("null".to_string(), |n| n.to_string());
+        let n_ctx_train = m.n_ctx_train.map_or("null".to_string(), |n| n.to_string());
         let mut out = format!(
             "{{\"id\":{},\"object\":\"model\",\"owned_by\":\"gaudium\",\"created\":0,\
              \"context_length\":{},\"architecture\":{{\"input_modalities\":[\"text\"]}},\
@@ -1324,9 +1326,10 @@ pub fn build_cache(cfg: &ServerConfig, only: &[String]) -> Result<(), String> {
             "[server] build-cache: model '{}' at context {max_ctx}",
             entry.id
         );
-        let family = ModelSpec::from_config_file(entry.dir.join("config.json"))
+        let family = ModelText::open(&entry.dir)
+            .and_then(|t| t.spec())
             .map(|s| s.family)
-            .map_err(|e| format!("load config.json for '{}': {e}", entry.id))?;
+            .map_err(|e| format!("model description of '{}': {e}", entry.id))?;
         if !matches!(
             family,
             ModelFamily::Qwen3 | ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
@@ -1411,12 +1414,16 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
 
     let mut models = Vec::with_capacity(cfg.models.len());
     for entry in &cfg.models {
-        let spec = ModelSpec::from_config_file(entry.dir.join("config.json"))
-            .map_err(|e| format!("load config.json for '{}': {e}", entry.id))?;
+        // a checkpoint directory or a GGUF file: its text resources from one place
+        let text = ModelText::open(&entry.dir).map_err(|e| format!("model '{}': {e}", entry.id))?;
+        let spec = text
+            .spec()
+            .map_err(|e| format!("model description of '{}': {e}", entry.id))?;
         spec.validate()
             .map_err(|e| format!("invalid ModelSpec for '{}': {e}", entry.id))?;
-        let tok = Tokenizer::from_model_dir(&entry.dir)
-            .map_err(|e| format!("load tokenizer.json for '{}': {e}", entry.id))?;
+        let tok = text
+            .tokenizer()
+            .map_err(|e| format!("load tokenizer for '{}': {e}", entry.id))?;
         let mut extra_eos_ids = Vec::new();
         // `<|tool_response>`: where a Gemma 4 reply hands over to the tool results of its calls
         for special in ["<|im_end|>", "<|endoftext|>", "<turn|>", "<|tool_response>"] {
@@ -1424,7 +1431,7 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
                 extra_eos_ids.push(id);
             }
         }
-        let mut chat = match ChatTemplate::load(&entry.dir) {
+        let mut chat = match ChatTemplate::load_model(&text) {
             Ok(Some((t, note))) => {
                 if let Some(note) = note {
                     eprintln!(
@@ -1514,12 +1521,15 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             extra_eos_ids,
             max_ctx,
             vision,
-            gen_defaults: std::fs::read_to_string(entry.dir.join("generation_config.json"))
+            gen_defaults: text
+                .generation_config()
                 .map(|t| SamplerDefaults::from_generation_config(&t))
                 .unwrap_or(SamplerDefaults::FALLBACK),
-            gemma_closes_thought: std::fs::read_to_string(entry.dir.join("chat_template.jinja"))
+            gemma_closes_thought: text
+                .chat_template_source()
                 .map(|t| crate::tokenizer::gemma4_template_closes_thought(&t))
                 .unwrap_or(false),
+            n_ctx_train: text.max_positions(),
         });
     }
 
@@ -3525,8 +3535,32 @@ fn parse_query(q: &str) -> HashMap<String, String> {
     map
 }
 
+/// A model's own chat template, for the one-turn prompts of `gaudium --generate --chat` with a
+/// model whose family has no built-in chat form.
+pub struct OneTurnTemplate(chat::ChatTemplate);
+
+impl OneTurnTemplate {
+    /// The model's template; `None`: it has none.
+    pub fn load(text: &ModelText) -> Result<Option<Self>, String> {
+        Ok(chat::ChatTemplate::load_model(text)?.map(|(t, _)| Self(t)))
+    }
+
+    /// The prompt of one user turn (after an optional system turn), with reasoning on or off.
+    pub fn render(&self, user: &str, system: Option<&str>, think: bool) -> Result<String, String> {
+        let mut msgs = Vec::new();
+        if let Some(sys) = system.filter(|s| !s.is_empty()) {
+            msgs.push(format!("{{\"role\":\"system\",\"content\":{}}}", jq(sys)));
+        }
+        msgs.push(format!("{{\"role\":\"user\",\"content\":{}}}", jq(user)));
+        let effort = if think { "" } else { ",\"reasoning_effort\":\"none\"" };
+        let body = json::parse_json(&format!("{{\"messages\":[{}]{effort}}}", msgs.join(",")))
+            .map_err(|e| e.to_string())?;
+        chat::render_chat(&self.0, &body).map(|p| p.text)
+    }
+}
+
 /// The prompt text a chat-completions request body renders to with the chat template of the
-/// model in `model_dir` (`gaudium --apply-template`).
+/// model at `model_dir`, a checkpoint directory or a GGUF file (`gaudium --apply-template`).
 pub fn apply_chat_template(model_dir: &Path, body_json: &str) -> Result<String, String> {
     let Some((template, note)) = chat::ChatTemplate::load(model_dir)? else {
         return Err(format!("{} has no chat template", model_dir.display()));
@@ -3568,6 +3602,26 @@ mod http_tests;
 mod tests {
     use super::{next_turn, TurnLimits, TurnWaiter};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn one_turn_prompts_render_through_the_model_template() {
+        let d = std::env::temp_dir().join(format!("gaudium-oneturn-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let text = crate::model_text::ModelText::open(&d).unwrap();
+        assert!(super::OneTurnTemplate::load(&text).unwrap().is_none());
+        std::fs::write(
+            d.join("chat_template.jinja"),
+            "{% for m in messages %}[{{ m.role }}:{{ m.content }}]{% endfor %}think={{ enable_thinking | default('unset') }}",
+        )
+        .unwrap();
+        let t = super::OneTurnTemplate::load(&text).unwrap().unwrap();
+        assert_eq!(t.render("Hi \"x\"", None, true).unwrap(), "[user:Hi \"x\"]think=unset");
+        assert_eq!(
+            t.render("Hi", Some("Be brief."), false).unwrap(),
+            "[system:Be brief.][user:Hi]think=False"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn waiters(models: &[usize], now: Instant) -> Vec<TurnWaiter> {
         models

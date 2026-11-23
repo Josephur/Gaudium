@@ -21,6 +21,7 @@ use std::sync::Mutex;
 use crate::json::parse_json;
 
 mod char_classes;
+pub(crate) mod gguf;
 
 #[derive(Debug)]
 pub enum TokenizerError {

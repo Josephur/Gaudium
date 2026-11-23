@@ -28,7 +28,7 @@ use gaudium::synapse::ffi::{SynDataType, SynapseApi};
 use gaudium::synapse::graph::GraphBuilder;
 use gaudium::synapse::recipe_cache::RecipeCache;
 use gaudium::tokenizer::{
-    format_gemma4_chat, format_qwen3_chat, gemma4_template_closes_thought, StreamDecoder, Tokenizer,
+    format_gemma4_chat, format_qwen3_chat, gemma4_template_closes_thought, StreamDecoder,
 };
 use gaudium::verified::{DevEvent, HbmCat, ReqEvent};
 
@@ -53,6 +53,7 @@ fn print_usage() {
          \x20                                           or a directory of them without config.json):\n\
          \x20                                           metadata, tensors and weights per type\n\
          \x20 gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json\n\
+         \x20                                           (or a GGUF model's tokenizer metadata)\n\
          \x20 gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test\n\
          \x20 gaudium --probe-copy [GiB]                Measure copies between the card and host memory\n\
          \x20                                           (both directions, through the pinned transfer ring\n\
@@ -60,7 +61,8 @@ fn print_usage() {
          \x20                                           default: 2 GiB of device memory)\n\
          \x20 gaudium --apply-template <model_dir> <request.json|->\n\
          \x20                                           Print the prompt a chat request renders to with\n\
-         \x20                                           the model's own chat template (host only)\n\
+         \x20                                           the model's own chat template (host only; a GGUF\n\
+         \x20                                           model: its tokenizer.chat_template)\n\
          \x20 gaudium --generate [options]              Run live Gaudi 2 LLM generation\n\
          \x20 gaudium --build-cache [generate options]  Compile every recipe of that configuration into\n\
          \x20                                           the recipe cache and print its exact HBM plan,\n\
@@ -76,7 +78,9 @@ fn print_usage() {
          Serve options:\n\
          \x20 --host <addr>         Bind address (or GAUDIUM_SERVE_HOST; default: 0.0.0.0)\n\
          \x20 --port <N>            Bind port (or GAUDIUM_SERVE_PORT; default: 8090)\n\
-         \x20 --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap)\n\
+         \x20 --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap); a GGUF\n\
+         \x20                       file (or a directory of one GGUF model) serves its own tokenizer,\n\
+         \x20                       chat template, context limit and sampling defaults from its metadata\n\
          \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
          \x20 --ui-dir <dir>        Gaudium Web UI bundle directory (or GAUDIUM_UI_DIR)\n\
          \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)\n\
@@ -296,7 +300,7 @@ fn print_usage() {
          \x20                       of N rows and every row's logits are compared with the one-row step's\n\
          \n\
          Generate options:\n\
-         \x20 --model <dir>         Model directory (or GAUDIUM_MODEL)\n\
+         \x20 --model <dir>         Model directory (or GAUDIUM_MODEL); or a GGUF file (Inkling 2)\n\
          \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
          \x20 --prompt <text>       Input prompt text\n\
          \x20 --prompt-ids <csv>    Raw comma-separated prompt token IDs (skips tokenizer)\n\
@@ -306,7 +310,8 @@ fn print_usage() {
          \x20 --also-prompt-ids-file <p>  Same as a further --prompt-ids-file\n\
          \x20 --also-prompt-file <p>  One more text request on the same loaded engine (repeatable;\n\
          \x20                       formatted like --prompt, after the token-ID requests)\n\
-         \x20 --chat                Wrap --prompt in the model's chat template (Qwen3 ChatML / Gemma 4 turns)\n\
+         \x20 --chat                Wrap --prompt in the model's chat template (Qwen3 ChatML / Gemma 4 turns;\n\
+         \x20                       other families: the model's own template, reasoning off with --no-think)\n\
          \x20 --no-think            Disable thinking block (with --chat)\n\
          \x20 --system <text>       System prompt (with --chat)\n\
          \x20 --max-new <N>         Maximum tokens to generate (default: 64)\n\
@@ -524,8 +529,18 @@ fn inspect_model(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The families whose `--generate --chat` prompt has a built-in form (the others render the
+/// model's own chat template).
+fn has_builtin_chat_form(family: gaudium::model_spec::ModelFamily) -> bool {
+    use gaudium::model_spec::ModelFamily as F;
+    match family {
+        F::Qwen3 | F::Qwen35Dense | F::Qwen35Moe | F::Gemma4 | F::Gemma4Assistant => true,
+        F::Inkling2 => false,
+    }
+}
+
 fn run_tokenize(dir: &Path, text: &str) -> Result<(), String> {
-    let tok = Tokenizer::from_model_dir(dir).map_err(|e| e.to_string())?;
+    let tok = gaudium::model_text::ModelText::open(dir)?.tokenizer()?;
     let ids = tok.encode(text, true);
     let decoded = tok.decode(&ids, false);
     println!("vocab={} tokens={}", tok.vocab_size(), ids.len());
@@ -846,18 +861,25 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let kernels_dir = kernels_dir
         .ok_or_else(|| "missing --kernels <dir> (or GAUDIUM_KERNELS env var)".to_string())?;
 
-    // a model given as one file (a GGUF build) keeps its tokenizer files beside it
-    let text_dir = if model_dir.is_file() {
-        model_dir.parent().map(Path::to_path_buf).unwrap_or_default()
+    // the model's text resources: a checkpoint directory or a GGUF file
+    let text = gaudium::model_text::ModelText::open(&model_dir)?;
+    let tok = text.tokenizer()?;
+    // `--chat`: the family's built-in chat form, or the model's own template (`mt_cli_chat`)
+    let builtin_chat = text.spec().map_or(true, |s| has_builtin_chat_form(s.family));
+    let one_turn = if chat && !builtin_chat {
+        gaudium::server::OneTurnTemplate::load(&text)?
     } else {
-        model_dir.clone()
+        None
     };
-    let tok = Tokenizer::from_model_dir(&text_dir).map_err(|e| {
-        format!(
-            "tokenizer files in {}: {e}",
-            text_dir.display()
-        )
-    })?;
+    let chat_form = gaudium::verified::mt_cli_chat(
+        tok.token_id("<|turn>").is_some(),
+        builtin_chat,
+        one_turn.is_some(),
+    );
+    let gemma_closes = text
+        .chat_template_source()
+        .is_some_and(|t| gemma4_template_closes_thought(&t));
+    drop(text);
     if let Some(im_end) = tok.token_id("<|im_end|>") {
         params.extra_eos_ids.push(im_end);
     }
@@ -880,31 +902,36 @@ fn run_generate(args: &[String]) -> Result<(), String> {
             })
             .collect::<Result<Vec<_>, _>>()
     };
-    // a text prompt as token ids, through the chat template when `--chat` is given
-    let encode_text = |raw_prompt: String| -> Vec<i32> {
-        let formatted = if chat && tok.token_id("<|turn>").is_some() {
-            let template =
-                std::fs::read_to_string(model_dir.join("chat_template.jinja")).unwrap_or_default();
-            format_gemma4_chat(
-                &raw_prompt,
-                system_prompt.as_deref(),
-                !no_think,
-                gemma4_template_closes_thought(&template),
-            )
-        } else if chat {
-            format_qwen3_chat(&raw_prompt, system_prompt.as_deref(), !no_think)
-        } else {
-            raw_prompt
+    // a text prompt as token ids, through the chat form when `--chat` is given
+    let encode_text = |raw_prompt: String| -> Result<Vec<i32>, String> {
+        use gaudium::verified::MtChatForm;
+        let sys = system_prompt.as_deref();
+        let formatted = match (chat, chat_form) {
+            (false, _) => raw_prompt,
+            (true, MtChatForm::MtChatGemma) => {
+                format_gemma4_chat(&raw_prompt, sys, !no_think, gemma_closes)
+            }
+            (true, MtChatForm::MtChatChatml) => format_qwen3_chat(&raw_prompt, sys, !no_think),
+            (true, MtChatForm::MtChatTemplate) => one_turn
+                .as_ref()
+                .ok_or("--chat: the model's chat template was not loaded")?
+                .render(&raw_prompt, sys, !no_think)?,
+            (true, MtChatForm::MtChatNone) => {
+                return Err("--chat: the model has no chat template".into())
+            }
         };
-        tok.encode(&formatted, true)
+        Ok(tok.encode(&formatted, true))
     };
     let prompt_ids: Vec<i32> = if let Some(csv) = prompt_ids_raw {
         parse_ids_csv(&csv)?
     } else {
-        encode_text(prompt.unwrap_or_else(|| "The capital of France is".to_string()))
+        encode_text(prompt.unwrap_or_else(|| "The capital of France is".to_string()))?
     };
     // `--also-prompt-file`: more text requests for the same loaded engine
-    let extra_text_ids: Vec<Vec<i32>> = extra_prompt_texts.into_iter().map(encode_text).collect();
+    let extra_text_ids: Vec<Vec<i32>> = extra_prompt_texts
+        .into_iter()
+        .map(encode_text)
+        .collect::<Result<_, _>>()?;
     let prompt_ids = match &vision_in {
         Some(v) => v.expand_prompt(&prompt_ids)?,
         None => prompt_ids,
@@ -1547,7 +1574,7 @@ fn run_fp8_calibrate(args: &[String]) -> Result<(), String> {
         prompts.push((path.clone(), ids));
     }
     if !text_files.is_empty() {
-        let tok = Tokenizer::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+        let tok = gaudium::model_text::ModelText::open(&model_dir)?.tokenizer()?;
         for path in &text_files {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("read --prompt-file {path}: {e}"))?;

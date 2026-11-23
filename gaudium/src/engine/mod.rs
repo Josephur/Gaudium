@@ -267,14 +267,12 @@ pub fn build_cache(cfg: &EngineConfig) -> Result<(), String> {
 }
 
 /// The model's own context limit (`max_position_embeddings` in `config.json`, looked up in
-/// `text_config` for multimodal checkpoints); `None` when the config does not state one.
+/// `text_config` for multimodal checkpoints, or a GGUF file's `<arch>.context_length`); `None`
+/// when the model does not state one (`ModelText::max_positions`).
 pub fn model_max_positions(model_dir: &std::path::Path) -> Option<u64> {
-    let txt = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
-    let root = crate::json::parse_json(&txt).ok()?;
-    let tc = root.get("text_config").unwrap_or(&root);
-    tc.get("max_position_embeddings")
-        .and_then(crate::json::JsonValue::as_u64)
-        .filter(|&n| n > 0)
+    crate::model_text::ModelText::open(model_dir)
+        .ok()?
+        .max_positions()
 }
 
 /// Clamps a requested context capacity to what the model supports, in whole KV chunks

@@ -266,6 +266,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             gemma_closes_thought: false,
             gen_defaults: SamplerDefaults::FALLBACK,
             vision: None,
+            n_ctx_train: None,
         }
     };
     let replies = Arc::new(Mutex::new(VecDeque::new()));
@@ -382,6 +383,7 @@ fn model_harness(id: &str, template: &str, config: Option<&str>, spec: Option<&s
         gemma_closes_thought: false,
         gen_defaults: m.gen_defaults,
         vision: None,
+        n_ctx_train: None,
     };
     let engine = h.state.slot.lock().unwrap().engine.take();
     let state = Arc::new(AppState {
@@ -497,6 +499,7 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
         vision: Some(
             VisionServe::new(vs, max_patches, max_tokens, MediaLimits::default()).unwrap(),
         ),
+        n_ctx_train: None,
     };
     let engine = h.state.slot.lock().unwrap().engine.take();
     let state = Arc::new(AppState {

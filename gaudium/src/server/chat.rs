@@ -12,6 +12,7 @@ use super::outparse::{CallStyle, OutputFormat};
 use crate::core::effort::{Effort, EffortForm, EffortLevels, NumberEffort, OFF};
 use crate::core::tool_calls::{ForcePlace, ToolChoice, ToolPolicy};
 use crate::json::{parse_json, JsonValue};
+use crate::model_text::ModelText;
 use crate::vision::media::MediaRef;
 
 /// A model's chat template with what rendering and parsing its turns needs.
@@ -133,29 +134,18 @@ impl ChatTemplate {
         })
     }
 
-    /// Reads a model directory: `chat_template.jinja`, else the `chat_template` of its
-    /// `tokenizer_config.json`. `Ok(None)`: the model has no template.
-    pub fn load(dir: &Path) -> Result<Option<(Self, Option<String>)>, String> {
-        let config = std::fs::read_to_string(dir.join("tokenizer_config.json"))
-            .ok()
-            .and_then(|t| parse_json(&t).ok());
-        let source = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
-            Ok(s) => Some(s),
-            Err(_) => config.as_ref().and_then(|c| match c.get("chat_template") {
-                Some(JsonValue::Str(s)) => Some(s.clone()),
-                // a list of named templates: the default one
-                Some(JsonValue::Array(list)) => list
-                    .iter()
-                    .find(|t| t.get("name").and_then(JsonValue::as_str) == Some("default"))
-                    .and_then(|t| t.get("template"))
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string),
-                _ => None,
-            }),
-        };
-        match source {
-            Some(s) => Self::from_parts(&s, config.as_ref()).map(Some),
-            None => Ok(None),
+    /// Reads a model path (a checkpoint directory: `chat_template.jinja`, else the
+    /// `chat_template` of its `tokenizer_config.json`; a GGUF file: its `tokenizer.chat_template`).
+    /// `Ok(None)`: the model has no template.
+    pub fn load(path: &Path) -> Result<Option<(Self, Option<String>)>, String> {
+        Self::load_model(&ModelText::open(path)?)
+    }
+
+    /// The template of a model's text resources (`ModelText::chat_template`).
+    pub fn load_model(text: &ModelText) -> Result<Option<(Self, Option<String>)>, String> {
+        match text.chat_template() {
+            (Some(s), config) => Self::from_parts(&s, config.as_ref()).map(Some),
+            (None, _) => Ok(None),
         }
     }
 
@@ -1284,6 +1274,46 @@ mod tests {
             parse_json(include_str!("../../tests/data/chat/inkling2_renders.json")).unwrap();
         let bad = jinja::fixture_mismatches(&source, fixture.get("cases").unwrap());
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// Set `GAUDIUM_INKLING2_GGUF` to an Inkling 2 GGUF file and `GAUDIUM_INKLING2_DIR` to the
+    /// publisher's checkpoint directory of the same model.
+    #[test]
+    #[ignore = "needs GAUDIUM_INKLING2_GGUF and GAUDIUM_INKLING2_DIR"]
+    fn inkling2_gguf_renders_like_the_checkpoint() {
+        let gguf = std::env::var("GAUDIUM_INKLING2_GGUF").expect("GAUDIUM_INKLING2_GGUF");
+        let dir = std::env::var("GAUDIUM_INKLING2_DIR").expect("GAUDIUM_INKLING2_DIR");
+        let file = ModelText::open(Path::new(&gguf)).unwrap();
+        let ckpt = ModelText::open(Path::new(&dir)).unwrap();
+        assert!(file.gguf().is_some() && ckpt.gguf().is_none());
+        // the file's own template renders the fixture contexts as Jinja2 does
+        let source = file.chat_template_source().unwrap();
+        let fixture =
+            parse_json(include_str!("../../tests/data/chat/inkling2_renders.json")).unwrap();
+        let bad = jinja::fixture_mismatches(&source, fixture.get("cases").unwrap());
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+        let (tf, nf) = ChatTemplate::load_model(&file).unwrap().unwrap();
+        let (tc, nc) = ChatTemplate::load_model(&ckpt).unwrap().unwrap();
+        assert_eq!((nf, nc), (None, None));
+        assert_eq!(tf.format, tc.format);
+        assert_eq!(tf.effort, tc.effort);
+        assert_eq!(tf.effort_form, tc.effort_form);
+        assert_eq!(tf.supports_tools, tc.supports_tools);
+        for name in ["bos_token", "eos_token", "pad_token"] {
+            assert_eq!(tf.token(name), tc.token(name), "{name}");
+        }
+        let (tok_f, tok_c) = (file.tokenizer().unwrap(), ckpt.tokenizer().unwrap());
+        for body in [
+            r#"{"messages":[{"role":"user","content":"What is the capital of France, and why is it famous?"}]}"#,
+            r#"{"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}],"reasoning_effort":"none"}"#,
+            r#"{"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello!","reasoning_content":"greet"},{"role":"user","content":"Und jetzt? 東京"}],"reasoning_effort":"low"}"#,
+            r#"{"messages":[{"role":"user","content":"weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"w","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"tool_choice":"required"}"#,
+        ] {
+            let b = parse_json(body).unwrap();
+            let (pf, pc) = (render_chat(&tf, &b).unwrap(), render_chat(&tc, &b).unwrap());
+            assert_eq!(pf, pc, "{body}");
+            assert_eq!(tok_f.encode(&pf.text, true), tok_c.encode(&pc.text, true), "{body}");
+        }
     }
 
     #[test]
