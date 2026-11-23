@@ -1183,14 +1183,9 @@ law hc_tier_no_restore_is_never_host:
 def hc_tier_no_restore_is_never_host(n):
   {==}
 
-# LAW HC.49: the drafter's rings are never copied again for an entry that has an image and
-# gained nothing: a save that has nothing new to keep copies nothing.
-law hc_ring_unchanged_not_copied:
-  for u: Unit
-  {hc_ring_stale(True{}, False{}) == False{} : Bool}
-
-def hc_ring_unchanged_not_copied(u):
-  {==}
+# (That the drafter's rings are not copied again for an entry that has an image and gained
+# nothing is today's saving, pinned by a Rust test and by no law: a later version may copy them
+# more often, never less safely.)
 
 # LAW HC.50: a ring image never serves a resume point past the tiles its entry held when it was
 # taken: rows written since are never passed off as that prompt's.
