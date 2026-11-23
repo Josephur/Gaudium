@@ -19,37 +19,40 @@ A release is a git tag `vX.Y.Z` on a commit of `main`. Pushing the tag makes the
 3. **The workflow does the rest.** It fails, and publishes nothing, when the tag is not `v`
    followed by the version in `gaudium/Cargo.toml`
    (`packaging/crate-version.sh --check-tag <tag>`), or when the tagged commit is not on
-   `main`. Otherwise it runs the same checks as for a pull request, builds the release binary
-   and the kernels, and creates the release with two files:
+   `main`. Otherwise it runs the same checks as for a pull request, builds the release binary,
+   and creates the release with two files:
 
-   - `gaudium-<version>-linux-x86_64-synapse<sdk>.tar.gz`: the archive;
-   - `gaudium-<version>-linux-x86_64-synapse<sdk>.tar.gz.sha256`: its SHA-256.
+   - `gaudium-<version>-linux-x86_64.tar.gz`: the archive;
+   - `gaudium-<version>-linux-x86_64.tar.gz.sha256`: its SHA-256.
 
 If the run fails, fix the cause on `main` through a pull request, delete the tag
 (`git push origin :refs/tags/v0.0.2`, `git tag -d v0.0.2`) and tag the new commit.
 
 ## What the archive holds
 
-`packaging/package-release.sh` builds it from the built tree: `bin/gaudium`, `kernels/` (the
-TPC kernel ELFs and the glue libraries that `make -C kernels` wrote), `ui/` without its tests,
-`docs/`, `README.md`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, `INSTALL.md` (from
-`packaging/INSTALL.md.in`), `BUILD-INFO.txt` (commit and tool versions) and `SHA256SUMS`.
+`packaging/package-release.sh` builds it: `bin/gaudium`, `ui/` without its tests, the
+**sources** of the kernels (`kernels/`: `Makefile`, `tpc/`, `glue/`), `docs/`, `README.md`,
+`LICENSE`, `THIRD_PARTY_NOTICES.md`, `INSTALL.md` (from `packaging/INSTALL.md.in`),
+`BUILD-INFO.txt` (commit and tool versions) and `SHA256SUMS`. Only files tracked by git go in,
+plus the binary.
 
-Every pull request and every push to `main` builds the same archive and keeps it for 14 days
-as a workflow artifact of the run, so a release can be inspected before its tag exists.
+Every pull request and every push to `main` builds the same archive and keeps it for 3 days as
+a workflow artifact of the run, so a release can be inspected before its tag exists.
 
-## The Intel Gaudi SDK is never shipped
+## No compiled kernel and no Intel Gaudi SDK file is shipped
 
-The runner installs the Intel Gaudi SDK from Intel's package repository to compile the
-kernels. Its licence does not allow redistribution:
+The kernels (`*.o`) and the glue libraries (`libgaudium_*.so`) are compiled by the Intel Gaudi
+SDK: `tpc-clang` puts its own code for built-in functions into a kernel, and the glue is
+compiled against an SDK header. The SDK's licence does not allow redistribution. So:
 
-- no SDK file (`libSynapse`, `tpc-clang`, Intel's kernel library, headers, firmware) and no
-  compiled recipe goes into the archive, an artifact, a cache or this repository. The packaging
-  script copies the kernels directory by an allow-list (`*.o`, `libgaudium_*.so`) and refuses a
-  staged tree that holds anything else of that kind;
-- the SDK is not cached between runs;
-- `INSTALL.md` and the release text tell users to install the driver, the firmware and the SDK
-  from Intel, in the release the archive is named after.
+- a release has the kernel sources, and `INSTALL.md` tells users to install the driver, the
+  firmware and the SDK from Intel and to run `make -C kernels` in the unpacked archive;
+- the workflow installs the SDK on the runner and compiles the kernels twice, from the
+  checkout and from the unpacked archive, only to check that they build. Nothing under
+  `build/kernels/` goes into the archive, an artifact, a cache or this repository, and the SDK
+  is not cached between runs;
+- the packaging script refuses a staged tree that holds an object file, a library, a compiled
+  recipe, an SDK file, or any ELF file other than `bin/gaudium`.
 
 ## Pinned tool versions
 
@@ -57,12 +60,12 @@ They are the `env` block at the top of `.github/workflows/ci.yml`:
 
 | Variable | What |
 |---|---|
-| `SDK_VERSION` | The Intel Gaudi SDK packages the kernels are compiled with. The archive name carries its release (`synapse1.24.2`). Change it in a pull request of its own, and test the kernels of that SDK release on a card before tagging. |
+| `SDK_VERSION` | The Intel Gaudi SDK packages the workflow compiles the kernels with as a check; `INSTALL.md` and `BUILD-INFO.txt` name it as the release the build was tested with. Change it in a pull request of its own, and test that SDK release on a card before tagging. |
 | `RUST_VERSION` | The Rust toolchain. |
 | `LEAN_VERSION` | The Lean release that `bend --verdict` asks for. It belongs to the Bend release in `gaudium/bend.pin`. |
 | `BEND_SHA256` | The SHA-256 of the Bend archive for the release in `gaudium/bend.pin`; update both together. |
 | `NODE_VERSION` | Node.js for the Web UI tests. |
 
-The workflow builds on a GitHub-hosted Ubuntu 24.04 runner; the binaries need that glibc
-release's symbol versions or later (`BUILD-INFO.txt` in the archive states the floor). No job
+The workflow builds on a GitHub-hosted Ubuntu 24.04 runner; `BUILD-INFO.txt` in the archive
+states the oldest glibc the binary runs on. No job
 opens a Gaudi card, and nothing runs on a schedule.

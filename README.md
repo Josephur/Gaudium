@@ -49,9 +49,9 @@ so that a later change cannot quietly weaken one.
 ## Releases
 
 The [Releases](https://github.com/Josephur/Gaudium/releases) page has archives with the
-`gaudium` binary, the compiled kernels and the Web UI, each built against one release of the
-Intel Gaudi SDK (named in the file name). The Intel Gaudi driver and SDK are not in them:
-install those from Intel first. `INSTALL.md` in the archive has the steps, and
+`gaudium` binary, the Web UI and the kernel sources. They hold no Intel Gaudi software and no
+compiled kernel: install the Intel Gaudi driver and SDK from Intel, then build the kernels with
+`make -C kernels` in the unpacked archive. `INSTALL.md` in the archive has the steps, and
 `gaudium --version` prints the version. [`docs/releasing.md`](docs/releasing.md) describes how
 a release is cut.
 

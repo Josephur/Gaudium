@@ -1,15 +1,16 @@
 name: CI
 
-# Builds and tests everything on each pull request and on main, and packs the result into the
-# release archive, kept as a workflow artifact. A pushed tag vX.Y.Z runs the same build and
-# then publishes that archive as a GitHub Release (docs/releasing.md).
+# Builds and tests everything on each pull request and on main, and packs the release archive,
+# kept for a few days as a workflow artifact. A pushed tag vX.Y.Z runs the same build and then
+# publishes that archive as a GitHub Release (docs/releasing.md).
 #
 # No job opens a Gaudi card (the runner has none) and nothing here runs on a schedule.
 #
-# The Intel Gaudi SDK is installed on the runner only to compile the kernels. Its licence does
-# not allow redistribution: never cache it, never upload it, never pack it. The archive is
-# built by packaging/package-release.sh, which copies our own build outputs by an allow-list
-# and refuses SDK files and compiled recipes.
+# The Intel Gaudi SDK is installed on the runner only to check that the kernels compile. Its
+# licence does not allow redistribution, and its compiler puts code of its own into what it
+# compiles: never cache, upload or pack the SDK, and never anything under build/kernels/ either.
+# The archive (packaging/package-release.sh) holds the engine binary, the Web UI and the kernel
+# SOURCES; the script refuses object files, libraries, compiled recipes and SDK files.
 
 on:
   pull_request:
@@ -25,8 +26,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Intel Gaudi SDK release the kernels are compiled with: the apt version of habanalabs-tools
-  # and habanalabs-graph. The archive is named after it (synapse<release>).
+  # Intel Gaudi SDK release the kernels are compile-checked with here, and that INSTALL.md
+  # names as tested: the apt version of habanalabs-tools and habanalabs-graph.
   SDK_VERSION: "1.24.2-481"
   RUST_VERSION: "1.99.1"
   # The Lean release `bend --verdict` of the Bend in gaudium/bend.pin asks for.
@@ -64,7 +65,7 @@ jobs:
           else
             version=$(packaging/crate-version.sh)
           fi
-          artifact="gaudium-$version-linux-x86_64-synapse${SDK_VERSION%%-*}"
+          artifact="gaudium-$version-linux-x86_64"
           echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
           echo "Gaudium $version -> $artifact"
 
@@ -147,16 +148,30 @@ jobs:
           test -f usr/include/habanalabs/tpc_kernel_lib_interface.h
           tpc-clang --version
 
-      - name: Kernels and glue libraries
+      # A compile check: what it writes (build/kernels/) is never packed or uploaded.
+      - name: Kernels and glue libraries compile
         run: make -C kernels -j"$(nproc)" HABANA_INC="$RUNNER_TEMP/sdk/usr/include/habanalabs"
 
-      - name: Package
+      - name: Package (binary, Web UI and kernel sources; no compiled kernel)
         run: |
           packaging/package-release.sh --sdk-version "$SDK_VERSION" --out dist
           name="${{ steps.version.outputs.artifact }}"
           test -f "dist/$name.tar.gz"
           tar -xzOf "dist/$name.tar.gz" "$name/BUILD-INFO.txt"
           tar -tzf "dist/$name.tar.gz"
+
+      # INSTALL.md tells users to build the kernels from the archive: do exactly that, outside
+      # the checkout and outside dist/.
+      - name: The kernel sources in the archive build on their own
+        run: |
+          name="${{ steps.version.outputs.artifact }}"
+          mkdir "$RUNNER_TEMP/unpacked"
+          tar -xzf "dist/$name.tar.gz" -C "$RUNNER_TEMP/unpacked"
+          make -C "$RUNNER_TEMP/unpacked/$name/kernels" -j"$(nproc)" \
+            HABANA_INC="$RUNNER_TEMP/sdk/usr/include/habanalabs" > "$RUNNER_TEMP/unpacked/make.log" 2>&1 \
+            || { tail -n 50 "$RUNNER_TEMP/unpacked/make.log"; exit 1; }
+          ls "$RUNNER_TEMP/unpacked/$name/build/kernels" | sed 's/.*\.//' | sort | uniq -c
+          test -f "$RUNNER_TEMP/unpacked/$name/build/kernels/libgaudium_tpc.so"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -166,7 +181,7 @@ jobs:
             dist/*.tar.gz.sha256
             dist/RELEASE_NOTES.md
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
   # Takes the archive back out of the artifact store, as the release job does, and checks it:
   # run on every build so that the hand-over to the release is tested before a tag exists.
@@ -185,8 +200,13 @@ jobs:
         run: |
           name="${{ needs.build.outputs.artifact }}"
           sha256sum -c "$name.tar.gz.sha256"
+          if tar -tzf "$name.tar.gz" | grep -iE '\.(o|elf|so|a|bc|recipe|habana_recipe)$|\.so\.|libsynapse|libtpc_kernels|tpc-clang'; then
+            echo "::error::the archive holds compiled kernels, libraries, recipes or SDK files"
+            exit 1
+          fi
           tar -xzf "$name.tar.gz"
           (cd "$name" && sha256sum -c --quiet SHA256SUMS)
+          test -f "$name/kernels/Makefile"
           "$name/bin/gaudium" --version
           "$name/bin/gaudium"
           cat RELEASE_NOTES.md
