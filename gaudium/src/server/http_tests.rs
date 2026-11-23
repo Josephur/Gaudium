@@ -347,15 +347,20 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
 
 /// The same harness with the call-form family as its model.
 fn call_form_harness() -> Harness {
+    model_harness("callform", CALL_FORM_TEMPLATE, Some(CALL_FORM_CONFIG), None)
+}
+
+/// The same harness with another template (and model family) as its model.
+fn model_harness(id: &str, template: &str, config: Option<&str>, spec: Option<&str>) -> Harness {
     let h = harness();
     let m = &h.state.models[0];
-    let config = json::parse_json(CALL_FORM_CONFIG).unwrap();
-    let (chat, note) = ChatTemplate::from_parts(CALL_FORM_TEMPLATE, Some(&config)).unwrap();
+    let config = config.map(|c| json::parse_json(c).unwrap());
+    let (chat, note) = ChatTemplate::from_parts(template, config.as_ref()).unwrap();
     assert!(note.is_none(), "{note:?}");
     let model = RegisteredModel {
-        id: "callform".into(),
+        id: id.into(),
         dir: m.dir.clone(),
-        spec: m.spec.clone(),
+        spec: spec.map_or_else(|| m.spec.clone(), |s| ModelSpec::from_config_json(s).unwrap()),
         format: chat.format.clone(),
         chat: Some(chat),
         tokenizer: Arc::clone(&m.tokenizer),
@@ -572,6 +577,14 @@ impl Harness {
     /// One HTTP exchange with the server's connection handler: `(status, body)`, the body with
     /// its transfer chunks joined.
     fn post(&self, path: &str, body: &str) -> (u16, String) {
+        self.exchange("POST", path, body)
+    }
+
+    fn get(&self, path: &str) -> (u16, String) {
+        self.exchange("GET", path, "")
+    }
+
+    fn exchange(&self, method: &str, path: &str, body: &str) -> (u16, String) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let state = Arc::clone(&self.state);
@@ -582,7 +595,7 @@ impl Harness {
         let mut c = TcpStream::connect(addr).unwrap();
         write!(
             c,
-            "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
@@ -1146,6 +1159,80 @@ fn template_and_token_count_endpoints_and_props() {
             "{key}"
         );
     }
+}
+
+/// A Gemma 4 model's configuration (the family's template has no effort setting).
+const GEMMA4_SPEC: &str = r#"{"architectures": ["Gemma4ForConditionalGeneration"], "model_type": "gemma4",
+    "text_config": {"model_type": "gemma4_text", "hidden_size": 5376, "intermediate_size": 21504, "vocab_size": 262144,
+        "num_hidden_layers": 60, "num_attention_heads": 32, "num_key_value_heads": 16,
+        "head_dim": 256, "global_head_dim": 512, "num_global_key_value_heads": 4,
+        "sliding_window": 1024, "attention_k_eq_v": true,
+        "rope_parameters": {"sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+            "full_attention": {"rope_theta": 1000000.0, "rope_type": "proportional", "partial_rotary_factor": 0.25}}}}"#;
+
+#[test]
+fn props_advertise_the_template_family_and_its_effort_levels() {
+    let props = |h: &Harness| {
+        let (status, text) = h.get("/props");
+        assert_eq!(status, 200, "{text}");
+        json::parse_json(&text).unwrap()
+    };
+    let levels = |p: &JsonValue| -> Vec<String> {
+        at(p, &["chat_template_caps", "reasoning_effort_levels"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect()
+    };
+    let supported =
+        |p: &JsonValue| at(p, &["chat_template_caps", "supports_reasoning_effort"]).as_bool();
+
+    // a Qwen3.5-family model whose template has three effort levels
+    let h = model_harness("effort", chat::EFFORT_TEMPLATE, None, None);
+    let p = props(&h);
+    assert_eq!(s(&p, &["chat_template"]), "qwen3.5");
+    assert_eq!(supported(&p), Some(true));
+    assert_eq!(levels(&p), ["low", "medium", "xhigh"]);
+    // each advertised level reaches the prompt as the template defines it
+    for (level, system) in [("low", true), ("medium", false), ("xhigh", true)] {
+        let (status, text) = h.post(
+            "/apply-template",
+            &format!("{{\"messages\":[{{\"role\":\"user\",\"content\":\"Hi\"}}],\"reasoning_effort\":\"{level}\"}}"),
+        );
+        assert_eq!(status, 200, "{text}");
+        let prompt = json::parse_json(&text).unwrap();
+        assert_eq!(
+            s(&prompt, &["prompt"]).starts_with(&format!("<|im_start|>system\nThink at {level}.")),
+            system,
+            "{level}"
+        );
+    }
+    // a level the model does not have goes to the nearest one, a name off the scale is refused
+    h.script("Fine.");
+    let (status, _) = h.chat(",\"reasoning_effort\":\"high\"");
+    assert_eq!(status, 200);
+    assert!(h.last_prompt().starts_with("<|im_start|>system\nThink at xhigh."));
+    let (status, reply) = h.chat(",\"reasoning_effort\":\"turbo\"");
+    assert_eq!(status, 400, "{reply:?}");
+
+    // a Gemma 4 model: its template has no effort setting
+    let h = model_harness(
+        "gemma",
+        CALL_FORM_TEMPLATE,
+        Some(CALL_FORM_CONFIG),
+        Some(GEMMA4_SPEC),
+    );
+    let p = props(&h);
+    assert_eq!(s(&p, &["chat_template"]), "gemma4");
+    assert_eq!(supported(&p), Some(false));
+    assert!(levels(&p).is_empty());
+    // an effort there only asks for reasoning
+    let (status, text) = h.post(
+        "/apply-template",
+        r#"{"messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"turbo"}"#,
+    );
+    assert_eq!(status, 200, "{text}");
 }
 
 #[test]

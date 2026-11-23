@@ -9,6 +9,7 @@ use std::path::Path;
 
 use super::jinja::{self, Template, Value};
 use super::outparse::OutputFormat;
+use crate::core::effort::{Effort, EffortLevels};
 use crate::core::tool_calls::{ToolChoice, ToolPolicy};
 use crate::json::{parse_json, JsonValue};
 use crate::vision::media::MediaRef;
@@ -23,6 +24,8 @@ pub struct ChatTemplate {
     pub format: OutputFormat,
     /// The template renders a tool list.
     pub supports_tools: bool,
+    /// The levels of the effort scale the template accepts for `reasoning_effort`.
+    pub effort: EffortLevels,
 }
 
 impl ChatTemplate {
@@ -54,15 +57,52 @@ impl ChatTemplate {
             tokens.push(("pad_token".into(), "<|endoftext|>".into()));
         }
         let (format, note) = OutputFormat::detect(tokenizer_config, source);
-        Ok((
-            Self {
-                template,
-                tokens,
-                format,
-                supports_tools: source.contains("tools"),
-            },
-            note,
-        ))
+        let mut t = Self {
+            template,
+            tokens,
+            format,
+            supports_tools: source.contains("tools"),
+            effort: EffortLevels::NONE,
+        };
+        if source.contains("reasoning_effort") {
+            t.effort = t.detect_effort();
+        }
+        Ok((t, note))
+    }
+
+    /// A one-message chat rendered with reasoning on and `reasoning_effort` set to `level`.
+    fn probe_effort(&self, level: &str) -> Result<String, jinja::Error> {
+        let mut ctx: Vec<(String, Value)> = vec![
+            (
+                "messages".into(),
+                Value::from_json(&parse_json(r#"[{"role":"user","content":"Hi"}]"#).unwrap()),
+            ),
+            ("add_generation_prompt".into(), Value::Bool(true)),
+        ];
+        for (k, v) in &self.tokens {
+            ctx.push((k.clone(), Value::str(v)));
+        }
+        ctx.push(("enable_thinking".into(), Value::Bool(true)));
+        ctx.push(("reasoning_effort".into(), Value::str(level)));
+        self.template.render(ctx)
+    }
+
+    /// The template renders with this level (it does not raise).
+    pub fn effort_renders(&self, level: &str) -> bool {
+        self.probe_effort(level).is_ok()
+    }
+
+    /// The levels the template accepts, found by rendering it with each level of the scale: a
+    /// level is accepted when the render succeeds and the template tells it apart from a value
+    /// it cannot know (that value raises, or renders differently). A level is never reported
+    /// unless the template rendered with it.
+    fn detect_effort(&self) -> EffortLevels {
+        let unknown = self.probe_effort("gaudium-unknown-effort").ok();
+        EffortLevels::from_fn(|level| match (self.probe_effort(level), &unknown) {
+            (Ok(text), Some(u)) => text != *u,
+            (Ok(_), None) => true,
+            (Err(_), _) => false,
+        })
     }
 
     /// Reads a model directory: `chat_template.jinja`, else the `chat_template` of its
@@ -428,17 +468,22 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
     };
     if let Some(effort) = body.get("reasoning_effort").and_then(JsonValue::as_str) {
         if kwargs.get("reasoning_effort").is_none() {
-            // an effort asks for reasoning ("none": for none); templates know low / medium / xhigh
-            let thinks = effort != "none";
+            // the verified plan: reasoning off, on at one of the template's levels, or on alone
+            let (thinks, level) = match t.effort.plan(effort) {
+                Effort::Off => (false, None),
+                Effort::Level(l) => (true, Some(l)),
+                Effort::ThinkOnly => (true, None),
+                Effort::Refuse => {
+                    return Err(format!(
+                        "reasoning_effort '{effort}' is not a level of this model (its levels: none, {})",
+                        t.effort.advertised().join(", ")
+                    ))
+                }
+            };
             if kwargs.get("enable_thinking").is_none() {
                 set(&mut kwargs, "enable_thinking", JsonValue::Bool(thinks));
             }
-            if thinks {
-                let level = match effort {
-                    "high" | "max" => "xhigh",
-                    "minimal" => "low",
-                    other => other,
-                };
+            if let Some(level) = level {
                 set(
                     &mut kwargs,
                     "reasoning_effort",
@@ -647,6 +692,26 @@ pub(super) const TEST_TEMPLATE: &str = r#"{%- if tools %}
     {%- endif %}
 {%- endif %}"#;
 
+/// A small template with an effort setting: three levels, the highest by default, anything
+/// else raises (the tests' own).
+#[cfg(test)]
+pub(super) const EFFORT_TEMPLATE: &str = r#"{%- set thinking = enable_thinking is undefined or enable_thinking %}
+{%- if thinking %}
+    {%- set level = reasoning_effort | default('xhigh') %}
+    {%- if level not in ('low', 'medium', 'xhigh') %}
+        {{- raise_exception('No effort ' ~ level ~ ' here.') }}
+    {%- endif %}
+    {%- if level != 'medium' %}
+        {{- '<|im_start|>system\nThink at ' ~ level ~ '.<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- for m in messages %}
+    {{- '<|im_start|>' ~ m.role ~ '\n' ~ m.content ~ '<|im_end|>\n' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' ~ ('<think>\n' if thinking else '<think>\n\n</think>\n\n') }}
+{%- endif %}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,6 +907,78 @@ mod tests {
             .unwrap_err(),
             "chat template: No user query."
         );
+    }
+
+    #[test]
+    fn effort_levels_come_from_the_template_and_requests_map_onto_them() {
+        let t = ChatTemplate::from_parts(EFFORT_TEMPLATE, None).unwrap().0;
+        assert_eq!(t.effort.advertised(), ["low", "medium", "xhigh"]);
+        let prompt = |extra: &str| {
+            let body =
+                format!("{{\"messages\":[{{\"role\":\"user\",\"content\":\"w?\"}}]{extra}}}");
+            render_chat(&t, &parse_json(&body).unwrap())
+        };
+        // no effort: the template's own default, as before
+        assert!(prompt("")
+            .unwrap()
+            .text
+            .starts_with("<|im_start|>system\nThink at xhigh."));
+        for (asked, system) in [
+            ("low", Some("low")),
+            ("minimal", Some("low")),
+            ("medium", None),
+            ("high", Some("xhigh")),
+            ("max", Some("xhigh")),
+        ] {
+            let p = prompt(&format!(",\"reasoning_effort\":\"{asked}\"")).unwrap();
+            match system {
+                Some(l) => assert!(
+                    p.text
+                        .starts_with(&format!("<|im_start|>system\nThink at {l}.")),
+                    "{asked}"
+                ),
+                None => assert!(p.text.starts_with("<|im_start|>user"), "{asked}"),
+            }
+            assert!(p.reasoning_open, "{asked}");
+        }
+        let off = prompt(",\"reasoning_effort\":\"none\"").unwrap();
+        assert!(off.text.starts_with("<|im_start|>user") && !off.reasoning_open);
+        // a name off the scale is refused with the model's levels
+        assert_eq!(
+            prompt(",\"reasoning_effort\":\"turbo\"").unwrap_err(),
+            "reasoning_effort 'turbo' is not a level of this model (its levels: none, low, medium, xhigh)"
+        );
+        // a level set in the template's own arguments reaches it unchanged
+        assert!(
+            prompt(",\"chat_template_kwargs\":{\"reasoning_effort\":\"high\"}")
+                .unwrap_err()
+                .contains("No effort high here.")
+        );
+
+        // a template that reads no effort has none, and an effort only turns reasoning on
+        assert_eq!(template().effort, EffortLevels::NONE);
+        assert!(
+            render(",\"reasoning_effort\":\"turbo\"")
+                .unwrap()
+                .reasoning_open
+        );
+        // a template that reads the effort but never tells two values apart has no levels either
+        let blind = ChatTemplate::from_parts(
+            "{{ reasoning_effort | default('x') | length > 0 }}{{ messages[0].content }}",
+            None,
+        )
+        .unwrap()
+        .0;
+        assert!(!blind.effort.supported());
+        // one that accepts any value: the levels it renders differently from an unknown one
+        let open = ChatTemplate::from_parts(
+            "{% if reasoning_effort == 'high' %}H{% elif reasoning_effort == 'low' %}L{% endif %}{{ messages[0].content }}",
+            None,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(open.effort.advertised(), ["low", "high"]);
+        assert!(open.effort_renders("max"));
     }
 
     #[test]

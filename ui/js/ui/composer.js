@@ -188,7 +188,7 @@ export function Composer({ settings, defaultMethodName, setSetting, busy, onSend
         <button class="icon-btn" title=${`Attach ${[vision && 'images', vision && video && 'videos or animations', audio && 'audio clips', 'text files or PDFs'].filter(Boolean).join(', ')}`} onClick=${() => file.current.click()}><${Icon} name="clip" /></button>
         ${audio ? html`<${Recorder} onClip=${(a) => setAtts((x) => [...x, a])} notify=${notify} />` : null}
         <button class=${cx('chip', thinkOn && 'on')} title="Thinking: the model reasons before it answers" aria-pressed=${thinkOn} onClick=${() => setSetting('thinking', thinkOn ? 'off' : 'on')}><${Icon} name="brain" />${thinkOn ? 'Thinking' : 'No thinking'}</button>
-        ${thinkOn ? html`<label class="select-chip" title="Reasoning effort"><span class="sr">Reasoning effort</span>
+        ${thinkOn && efforts.length ? html`<label class="select-chip" title="Reasoning effort"><span class="sr">Reasoning effort</span>
           <select value=${settings.effort} onChange=${(e) => setSetting('effort', e.target.value)}>
             <option value="default">effort: default</option>${efforts.map((l) => html`<option value=${l}>effort: ${l}</option>`)}
           </select></label>` : null}

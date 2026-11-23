@@ -14,7 +14,7 @@ import { McpClient, toOpenAiTools, BUILTIN, isNetworkError, connectFailureText }
 import { newConversation, addChild, update, activePath, pathTo, siblings, switchSibling, removeSubtree, titleFrom, toApiMessages, uid,
   insertAbove, spliceOut, compactableCount, compactionMessages, displayCut, countMessages, isCompaction, nodeSummary, usableSummary, SUMMARY_PREFILL } from './lib/tree.js';
 import { finalStats, methodInfo, greedyOnly, setDfName, fmtInt, contextUsed } from './lib/stats.js';
-import { modelDesc, modelFacts, precisionShort, hasDrafter, dfFamilyName } from './lib/model.js';
+import { modelDesc, modelFacts, precisionShort, hasDrafter, dfFamilyName, effortLevels, effortFor } from './lib/model.js';
 import { reserveTokens, compactPercent, projection, summaryMaxTokens, usedLive, estimateMessages, estimateText, longestText, elideMessage, setVisionLimits } from './lib/context.js';
 import { visionLimits } from './lib/media.js';
 import { newSegment } from './lib/stream.js';
@@ -173,7 +173,10 @@ function loadedMethods() {
   return l ? [...new Set(String(l).replace(/\(.*?\)/g, '').split(/[\s,/]+/).filter(Boolean))] : null;
 }
 function effSettings(s) {
-  if (!s || !s.method || s.method === 'default') return s;
+  if (!s) return s;
+  const effort = effortFor(s.effort, effortLevels(S().props));   // only a level the model's template has
+  if (effort !== s.effort) s = { ...s, effort };
+  if (!s.method || s.method === 'default') return s;
   const l = loadedMethods();
   return l && !l.includes(s.method) ? { ...s, method: 'default' } : s;
 }
@@ -731,8 +734,8 @@ export function App() {
     if (l) return l;
     return s.settings.method && s.settings.method !== 'default' ? [s.settings.method] : [];
   }, [ei.loaded, s.settings.method]);
-  const effSet = useMemo(() => effSettings(s.settings), [s.settings, ei.loaded]);
-  const efforts = (s.props && s.props.chat_template_caps && s.props.chat_template_caps.reasoning_effort_levels) || ['low', 'medium', 'xhigh'];
+  const effSet = useMemo(() => effSettings(s.settings), [s.settings, ei.loaded, s.props]);
+  const efforts = useMemo(() => effortLevels(s.props), [s.props]);
   const vision = !s.props || !s.props.modalities || s.props.modalities.vision !== false;
   const audio = !!(s.props && s.props.modalities && s.props.modalities.audio);   // only when the server advertises audio support
   const video = vision && !!(s.props && s.props.modalities && s.props.modalities.video);   // animations and video files as video parts

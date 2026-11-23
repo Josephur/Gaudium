@@ -136,6 +136,11 @@ fn print_usage() {
          \x20 --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster\n\
          \x20                       decode, more device memory, its own token stream)\n\
          \x20 --model-ctx <id=N>    Context size for model <id> instead of --max-ctx\n\
+         \x20 --effort-levels <id=l,..>  Reasoning-effort levels of model <id> instead of the ones\n\
+         \x20                       read from its chat template (each one the template renders\n\
+         \x20                       without raising): levels of minimal, low, medium, high,\n\
+         \x20                       xhigh, max, or none for no effort setting. /props advertises\n\
+         \x20                       them; a request's reasoning_effort goes to the nearest one\n\
          \x20 --precision <id=p>    Weight precision of model <id>: auto (default), bf16 or fp8 (a\n\
          \x20                       BF16 checkpoint is quantised at load per output channel; give\n\
          \x20                       its activation-scale table with --fp8-act)\n\
@@ -1847,6 +1852,14 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                         .ok_or_else(|| {
                             format!("--model-ctx expects <model id>=<tokens>, got '{raw}'")
                         })?,
+                );
+            }
+            "--effort-levels" => {
+                let raw = next_val(&mut i, "--effort-levels")?;
+                let (opts, list) = model_opt(&mut per_model, &raw, "--effort-levels")?;
+                opts.effort_levels = Some(
+                    gaudium::core::effort::EffortLevels::parse(list.to_str().unwrap_or(""))
+                        .map_err(|e| format!("--effort-levels: {e}"))?,
                 );
             }
             "--no-vision" => vision = false,

@@ -153,3 +153,14 @@ export function isSpeculative(info, st, sections) {
   if (st && st.accept != null) return true;
   return !(info && info.maxTok === 1);
 }
+
+// The reasoning-effort levels the model's chat template accepts, low to high (/props chat_template_caps). Empty: the template has no
+// effort setting, or the server does not say; the effort picker is then hidden.
+export function effortLevels(props) {
+  const c = props && props.chat_template_caps;
+  if (!c || c.supports_reasoning_effort !== true || !Array.isArray(c.reasoning_effort_levels)) return [];
+  return c.reasoning_effort_levels.filter((l) => typeof l === 'string' && l);
+}
+// The effort a request is built with: a saved level this model does not offer is the template's default (the saved setting stays,
+// for a model that has it).
+export function effortFor(effort, levels) { return effort && effort !== 'default' && levels.includes(effort) ? effort : 'default'; }
