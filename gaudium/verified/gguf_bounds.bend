@@ -150,6 +150,28 @@ def gg_split_complete(+present: Nat, +count: Nat) -> Bool:
   Bool.and(Nat.is_gt(count, 0n), Nat.is_eq(present, count))
 
 # ============================================================================
+# 5b. Value-head order of a gated DeltaNet layer
+# ============================================================================
+
+# A converter may store the value heads of a linear-attention layer tiled, (r, k), where the
+# checkpoint groups them, (k, r): `hk` key heads, `r` value heads per key head, `d` values per
+# head, after `base` leading entries that keep their place. Checkpoint index `i` reads stored
+# index base + rr * (hk * d) + k * d + dd, with i - base = k * (r * d) + rr * d + dd.
+def gg_vhead_tail(+j: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat) -> Nat:
+  Nat.add(base, Nat.add(Nat.add(Nat.mul(Nat.div(Nat.mod(j, Nat.mul(r, d)), d), Nat.mul(hk, d)), Nat.mul(Nat.div(j, Nat.mul(r, d)), d)), Nat.mod(Nat.mod(j, Nat.mul(r, d)), d)))
+
+def gg_vhead_pick(+i: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, lead: Bool) -> Nat:
+  match lead:
+    case True{}:
+      i
+    case False{}:
+      gg_vhead_tail(Nat.sub(i, base), base, hk, r, d)
+
+# rusty-bends: total
+def gg_vhead_src(+i: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat) -> Nat:
+  gg_vhead_pick(i, base, hk, r, d, Nat.is_lt(i, base))
+
+# ============================================================================
 # 6. Laws
 # ============================================================================
 
@@ -319,3 +341,23 @@ def gg_split_empty_refused(c):
       {==}
     case 1n+cp:
       {==}
+
+def gg_lt_add_succ(i: Nat, p: Nat) -> {True{} == Nat.is_lt(i, Nat.add(i, 1n+p)) : Bool}:
+  match i:
+    case 0n:
+      {==}
+    case 1n+q:
+      gg_lt_add_succ(q, p)
+
+# promise: the leading entries before the value heads keep their place in any head reordering.
+law gg_vhead_lead_fixed:
+  for +i: Nat
+  for +p: Nat
+  for +hk: Nat
+  for +r: Nat
+  for +d: Nat
+  {gg_vhead_src(i, Nat.add(i, 1n+p), hk, r, d) == i : Nat}
+
+def gg_vhead_lead_fixed(i, p, hk, r, d):
+  %gg_lt_add_succ(i, p) : {gg_vhead_pick(i, Nat.add(i, 1n+p), hk, r, d, _) == i : Nat}
+  {==}

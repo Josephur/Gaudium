@@ -391,7 +391,7 @@ pub fn decode_blocks(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), St
         return Err(format!("no host decoder for ggml type {} yet", ti.name));
     }
     let (bw, bb) = (ti.block_weights as usize, ti.block_bytes as usize);
-    if src.len() % bb != 0 || dst.len() != src.len() / bb * bw {
+    if !src.len().is_multiple_of(bb) || dst.len() != src.len() / bb * bw {
         return Err(format!(
             "{}: {} source bytes and {} values are not whole blocks",
             ti.name,

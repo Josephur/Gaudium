@@ -40,7 +40,7 @@ Gaudium follows **"Verified Core, Rust Shell"**, built with
 | Part | Where | What |
 |---|---|---|
 | Verified core | `gaudium/verified/*.bend` | Decision logic written in [Bend 2](https://github.com/bendlang/bend) with proved `law`s: device and recipe lifecycles, KV-cache and HBM accounting, token / context budgets, tensor bounds, request routing. Proofs are checked at `cargo build` time and erased; the functions are emitted as plain Rust. |
-| Rust shell | `gaudium/src/` | SynapseAI FFI, tensor buffers, Safetensors loading, tokenizer, chat templates, sampling, the HTTP server and CLI. No crates beyond the Rust standard library at run time. |
+| Rust shell | `gaudium/src/` | SynapseAI FFI, tensor buffers, Safetensors and GGUF loading (host dequantisation of the GGUF block types), tokenizer, chat templates, sampling, the HTTP server and CLI. No crates beyond the Rust standard library at run time. |
 | Device kernels | `kernels/` | TPC-C kernels (compiled with `tpc-clang`) and the Synapse Graph Compiler glue plugins. |
 | Web UI | `ui/` | A self-contained browser UI served by `gaudium --serve`. |
 

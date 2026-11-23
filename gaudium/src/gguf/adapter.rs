@@ -350,7 +350,7 @@ impl GgufView {
     pub fn try_bf16(&self, r0: u64, r1: u64, out: &mut [u16]) -> Result<(), String> {
         self.check(r0, r1, out.len())?;
         let cols = self.t.row_len();
-        if !self.spec.transpose && self.plain() && self.rest % cols == 0 {
+        if !self.spec.transpose && self.plain() && self.rest.is_multiple_of(cols) {
             // straight from the decoder: one run of whole GGUF rows per registered row
             let per = self.rest / cols;
             for (i, o) in out.chunks_exact_mut(self.rest as usize).enumerate() {

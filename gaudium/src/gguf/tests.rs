@@ -806,3 +806,172 @@ fn inspect_reports_and_refuses() {
     assert!(e.contains("w.q8") || e.contains("w.bf16"), "{e}");
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A tiny synthetic `qwen35` GGUF maps to every name the Qwen BF16 packer reads, with the
+/// converter's transforms undone.
+#[test]
+fn qwen35_map_gives_the_packer_names() {
+    use super::qwen35;
+    let dir = temp_dir("qwen35");
+    let p = dir.join("q.gguf");
+    // H = 4, 2 key heads, 4 value heads (r = 2) of dim 1, key dim 1: qk = 4, qkv rows = 8
+    let (h, hk, hv) = (4u64, 2u64, 4u64);
+    let seq = |n: u64, k: f32| f32_bytes(&(0..n).map(|i| i as f32 + k).collect::<Vec<_>>());
+    let mut b = Builder::new();
+    b.kv_str("general.architecture", "qwen35")
+        .kv_u32("qwen35.block_count", 3)
+        .kv_u32("qwen35.nextn_predict_layers", 1)
+        .kv_u32("qwen35.embedding_length", h as u32)
+        .kv_u32("qwen35.ssm.group_count", hk as u32)
+        .kv_u32("qwen35.ssm.time_step_rank", hv as u32)
+        .kv_u32("qwen35.ssm.state_size", 1)
+        .kv_u32("qwen35.ssm.inner_size", hv as u32);
+    let m = |b: &mut Builder, name: &str, cols: u64, rows: u64| {
+        b.tensor(name, &[cols, rows], GgmlType::F32, seq(cols * rows, 0.0));
+    };
+    let v = |b: &mut Builder, name: &str, n: u64| {
+        b.tensor(name, &[n], GgmlType::F32, seq(n, 1.0));
+    };
+    m(&mut b, "token_embd.weight", h, 16);
+    m(&mut b, "output.weight", h, 16);
+    v(&mut b, "output_norm.weight", h);
+    for l in 0..3 {
+        let x = |r: &str| format!("blk.{l}.{r}");
+        v(&mut b, &x("attn_norm.weight"), h);
+        v(&mut b, &x("post_attention_norm.weight"), h);
+        m(&mut b, &x("ffn_gate.weight"), h, 8);
+        m(&mut b, &x("ffn_up.weight"), h, 8);
+        m(&mut b, &x("ffn_down.weight"), 8, h);
+        if l == 0 {
+            m(&mut b, &x("attn_qkv.weight"), h, 8);
+            m(&mut b, &x("attn_gate.weight"), h, hv);
+            m(&mut b, &x("ssm_beta.weight"), h, hv);
+            m(&mut b, &x("ssm_alpha.weight"), h, hv);
+            m(&mut b, &x("ssm_out.weight"), hv, h);
+            m(&mut b, &x("ssm_conv1d.weight"), 4, 8);
+            // A_log stored as -exp(A_log)
+            let a: Vec<f32> = (0..hv).map(|i| -((i as f32 * 0.5).exp())).collect();
+            b.tensor(&x("ssm_a"), &[hv], GgmlType::F32, f32_bytes(&a));
+            v(&mut b, &x("ssm_dt.bias"), hv);
+            v(&mut b, &x("ssm_norm.weight"), 1);
+        } else {
+            m(&mut b, &x("attn_q.weight"), h, 8);
+            m(&mut b, &x("attn_k.weight"), h, 4);
+            m(&mut b, &x("attn_v.weight"), h, 4);
+            m(&mut b, &x("attn_output.weight"), 4, h);
+            v(&mut b, &x("attn_q_norm.weight"), 4);
+            v(&mut b, &x("attn_k_norm.weight"), 4);
+        }
+        if l == 2 {
+            m(&mut b, &x("nextn.eh_proj.weight"), 2 * h, h);
+            v(&mut b, &x("nextn.enorm.weight"), h);
+            v(&mut b, &x("nextn.hnorm.weight"), h);
+            v(&mut b, &x("nextn.shared_head_norm.weight"), h);
+        }
+    }
+    fs::write(&p, b.build()).unwrap();
+    let g = Arc::new(Gguf::open(&p).unwrap());
+    let mut store = SafetensorsStore::empty();
+    let done = qwen35::register_qwen35(&mut store, &g).unwrap();
+    assert!(done.skipped.is_empty(), "{:?}", done.skipped);
+    let lp = "model.language_model.";
+    let mut want = vec![
+        format!("{lp}embed_tokens.weight"),
+        "lm_head.weight".into(),
+        format!("{lp}norm.weight"),
+        "mtp.fc.weight".into(),
+        "mtp.pre_fc_norm_embedding.weight".into(),
+        "mtp.pre_fc_norm_hidden.weight".into(),
+        "mtp.norm.weight".into(),
+    ];
+    for (pre, lin) in [
+        (format!("{lp}layers.0."), true),
+        (format!("{lp}layers.1."), false),
+        ("mtp.layers.0.".to_owned(), false),
+    ] {
+        for r in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ] {
+            want.push(format!("{pre}{r}"));
+        }
+        let roles: &[&str] = if lin {
+            &[
+                "linear_attn.in_proj_qkv.weight",
+                "linear_attn.in_proj_z.weight",
+                "linear_attn.in_proj_b.weight",
+                "linear_attn.in_proj_a.weight",
+                "linear_attn.conv1d.weight",
+                "linear_attn.A_log",
+                "linear_attn.dt_bias",
+                "linear_attn.norm.weight",
+                "linear_attn.out_proj.weight",
+            ]
+        } else {
+            &[
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.o_proj.weight",
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
+            ]
+        };
+        want.extend(roles.iter().map(|r| format!("{pre}{r}")));
+    }
+    for n in &want {
+        let t = store.get(n).unwrap_or_else(|_| panic!("missing {n}"));
+        assert_eq!(t.dtype, "BF16", "{n}");
+    }
+    assert_eq!(store.len(), want.len());
+    let vals = |n: &str| -> Vec<f32> {
+        store
+            .tensor_data(n)
+            .unwrap()
+            .chunks_exact(2)
+            .map(|c| crate::fp8::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect()
+    };
+    // norms come back as w (stored 1 + w = 1, 2, 3, 4)
+    assert_eq!(vals(&format!("{lp}norm.weight")), vec![0.0, 1.0, 2.0, 3.0]);
+    assert_eq!(
+        vals(&format!("{lp}layers.0.linear_attn.norm.weight")),
+        vec![1.0]
+    );
+    // A_log = ln(-x)
+    let a = vals(&format!("{lp}layers.0.linear_attn.A_log"));
+    let want_a: Vec<f32> = [0.0f32, 2.0, 1.0, 3.0]
+        .iter()
+        .map(|i| crate::fp8::bf16_to_f32(crate::fp8::f32_to_bf16_rne(i * 0.5)))
+        .collect();
+    assert_eq!(a, want_a);
+    // value heads: checkpoint (k, r) -> stored (r, k): with 2 x 2 heads of dim 1, entries 1 and 2 swap
+    assert_eq!(
+        vals(&format!("{lp}layers.0.linear_attn.dt_bias")),
+        vec![1.0, 3.0, 2.0, 4.0]
+    );
+    let qkv = vals(&format!("{lp}layers.0.linear_attn.in_proj_qkv.weight"));
+    let row = |k: usize| qkv[4 * k];
+    assert_eq!(
+        (0..8).map(row).collect::<Vec<_>>(),
+        vec![0.0, 4.0, 8.0, 12.0, 16.0, 24.0, 20.0, 28.0]
+    );
+    let out = vals(&format!("{lp}layers.0.linear_attn.out_proj.weight"));
+    assert_eq!(&out[..4], &[0.0, 2.0, 1.0, 3.0]);
+    assert_eq!(
+        store
+            .get(&format!("{lp}layers.0.linear_attn.conv1d.weight"))
+            .unwrap()
+            .shape,
+        vec![8, 1, 4]
+    );
+    // a model of another family, or inconsistent metadata, is refused
+    let mut o = Builder::new();
+    o.kv_str("general.architecture", "llama");
+    fs::write(&p, o.build()).unwrap();
+    assert!(qwen35::dims(&Gguf::open(&p).unwrap()).is_err());
+    fs::remove_dir_all(&dir).unwrap();
+}
