@@ -1,6 +1,7 @@
 //! The Inkling 2 block drafter (the checkpoint's `mtp.safetensors`) on the card: the speculative
 //! drafter of [`Inkling2Engine`]. A child module of `engine::inkling2` (declared there with
-//! `#[path]`).
+//! `#[path]`). A GGUF model reads the same weights from its drafter GGUF file beside it (child
+//! module [`gguf`]); the packer reads either through [`MtpSource`].
 //!
 //! The drafter is a small bidirectional decoder over one block of rows (the anchor, the last
 //! committed token, and `block - 1` mask rows at the positions after it), followed by a recurrent
@@ -29,6 +30,11 @@
 
 use super::*;
 use crate::safetensors::SafetensorsStore;
+use std::borrow::Cow;
+
+// The drafter of a GGUF model: its own GGUF file beside the model (`mtp::gguf`).
+#[path = "inkling2_mtp_gguf.rs"]
+pub mod gguf;
 use crate::verified::{
     mtp_ctx_chunks, mtp_ctx_seen, mtp_draft_count, mtp_frnn_row, mtp_ring_ok, mtp_ring_slots,
 };
@@ -56,7 +62,17 @@ const ROPE_LO: u64 = 256;
 /// Main-model tensors a drafter graph reads by their own names.
 const MAIN_SHARED: &[&str] = &["W_head", "embed", "w_embed"];
 
-/// The drafter's contract, read from `mtp_config` of the checkpoint's `config.json`.
+/// Where the drafter's weights are read from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MtpWeights {
+    /// `mtp.safetensors` in the checkpoint directory.
+    Checkpoint,
+    /// A drafter GGUF file beside a GGUF model ([`gguf`]).
+    Gguf(std::path::PathBuf),
+}
+
+/// The drafter's contract, read from `mtp_config` of the checkpoint's `config.json` (or from a
+/// drafter GGUF file's metadata, [`gguf::drafter_config`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MtpConfig {
     pub hid: u64,
@@ -74,6 +90,7 @@ pub struct MtpConfig {
     /// Main-model layer applications whose input feeds the context; the application count itself
     /// names the final norm output.
     pub taps: Vec<u64>,
+    pub weights: MtpWeights,
 }
 
 impl MtpConfig {
@@ -112,7 +129,10 @@ impl MtpConfig {
                 )));
             }
         }
-        let c = Self {
+        if num("head_dim") != Some(DH) {
+            return Err(bad("head_dim must be 128 (fixed in the drafter kernels)"));
+        }
+        Self {
             hid: need("hidden_size")?,
             nh: need("num_attention_heads")?,
             nkv: need("num_key_value_heads")?,
@@ -130,10 +150,16 @@ impl MtpConfig {
                 .and_then(JsonValue::as_f64)
                 .unwrap_or(1e-6) as f32,
             taps: list("target_layer_ids")?,
-        };
-        if num("head_dim") != Some(DH) {
-            return Err(bad("head_dim must be 128 (fixed in the drafter kernels)"));
+            weights: MtpWeights::Checkpoint,
         }
+        .validate()
+        .map_err(|e| bad(&e))
+    }
+
+    /// The limits of the drafter kernels, whichever file the contract was read from.
+    pub fn validate(self) -> Result<Self, String> {
+        let c = self;
+        let bad = |what: &str| what.to_string();
         if c.hid == 0 || c.hid % 128 != 0 || c.ff == 0 || c.ff % 128 != 0 {
             return Err(bad(
                 "hidden_size / intermediate_size must be whole blocks of 128",
@@ -640,9 +666,14 @@ fn role(name: &str) -> Role {
     }
 }
 
-/// Weights the card computes at load instead of the host.
+/// Weights the card computes at load instead of the host (unless the source stores them).
 fn computed(name: &str) -> bool {
     matches!(name, "mtw_fold" | "mtw_bf")
+}
+
+/// The inputs of the on-card fold (unused when the source stores the fold).
+fn fold_input(name: &str) -> bool {
+    matches!(name, "mtw_howT" | "mtw_hob")
 }
 
 /// The drafter's share of the up-front device-memory plan, in bytes per tensor.
@@ -762,20 +793,33 @@ pub fn rope_table(theta: f64, step: u64, n: u64) -> Vec<f32> {
     out
 }
 
-/// Packs the drafter's weights from `mtp.safetensors`.
-pub(super) struct MtpPacker<'a> {
-    st: &'a SafetensorsStore,
-    g: &'a MtpGeom,
-}
+/// Where the drafter packer reads its tensors: the checkpoint's `mtp.safetensors`, or a drafter
+/// GGUF file presented under the checkpoint's names, shapes and element order ([`gguf::GgufMtp`]).
+pub trait MtpSource {
+    /// Checkpoint tensor `name` (its name in `mtp.safetensors`) as BF16 bytes of the checkpoint's
+    /// row-major `shape`.
+    fn bf16(&self, name: &str, shape: &[u64]) -> Result<Cow<'_, [u8]>, String>;
 
-impl<'a> MtpPacker<'a> {
-    pub fn new(st: &'a SafetensorsStore, g: &'a MtpGeom) -> Self {
-        Self { st, g }
+    /// The device image of drafter weight `name` when the source stores it ready (a file that
+    /// keeps a pre-computed form of it); `None`: packed from the checkpoint's tensors.
+    fn stored(&self, _name: &str, _g: &MtpGeom) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
     }
 
-    fn raw(&self, name: &str, shape: &[u64]) -> Result<&'a [u8], String> {
+    /// Whether the card folds the recurrent head through the unembedding at load (`false`: the
+    /// source stores the fold, [`MtpSource::stored`] gives `mtw_fold` and `mtw_bf`).
+    fn folds_on_card(&self) -> bool {
+        true
+    }
+}
+
+/// `mtp.safetensors` as a [`MtpSource`].
+pub struct StMtp<'a>(pub &'a SafetensorsStore);
+
+impl MtpSource for StMtp<'_> {
+    fn bf16(&self, name: &str, shape: &[u64]) -> Result<Cow<'_, [u8]>, String> {
         let t = self
-            .st
+            .0
             .get(name)
             .map_err(|e| format!("drafter tensor '{name}': {e}"))?;
         if t.dtype != "BF16" || t.shape != shape {
@@ -784,10 +828,27 @@ impl<'a> MtpPacker<'a> {
                 t.dtype, t.shape
             ));
         }
-        self.st
+        self.0
             .tensor_bytes(name)
             .map_err(|e| format!("read '{name}': {e}"))?
+            .map(Cow::Borrowed)
             .ok_or_else(|| format!("drafter tensor '{name}' is not mapped"))
+    }
+}
+
+/// Packs the drafter's weights from a [`MtpSource`].
+pub(super) struct MtpPacker<'a> {
+    src: &'a dyn MtpSource,
+    g: &'a MtpGeom,
+}
+
+impl<'a> MtpPacker<'a> {
+    pub fn new(src: &'a dyn MtpSource, g: &'a MtpGeom) -> Self {
+        Self { src, g }
+    }
+
+    fn raw(&self, name: &str, shape: &[u64]) -> Result<Cow<'a, [u8]>, String> {
+        self.src.bf16(name, shape)
     }
 
     fn f32s(&self, name: &str, shape: &[u64]) -> Result<Vec<f32>, String> {
@@ -814,25 +875,30 @@ impl<'a> MtpPacker<'a> {
         Ok(out)
     }
 
-    /// The device image of weight `name` (`None`: computed on the card at load).
+    /// The device image of weight `name` (`None`: computed on the card at load, or an input of
+    /// that computation the source makes unnecessary).
     pub fn pack(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
-        if computed(name) {
+        if let Some(v) = self.src.stored(name, self.g)? {
+            return Ok(Some(v));
+        }
+        // computed on the card at load, or (the source stores the fold) never read
+        if computed(name) || (fold_input(name) && !self.src.folds_on_card()) {
             return Ok(None);
         }
         let c = &self.g.c;
         let (h, rk) = (c.hid, c.rank);
         let kvh = DH * c.nkv;
-        let v = |x: &[u8]| Ok(Some(x.to_vec()));
+        let v = |x: Cow<'_, [u8]>| Ok(Some(x.into_owned()));
         match name {
             "mtw_alpha" => return Ok(Some(f32_bytes(&self.alpha()?))),
             "mtw_wmix" => {
                 let mut out = Vec::new();
                 for l in 0..3 {
                     out.extend_from_slice(
-                        self.raw(&format!("layers.{l}.dflare_norm.weight"), &[h])?,
+                        &self.raw(&format!("layers.{l}.dflare_norm.weight"), &[h])?,
                     );
                 }
-                out.extend_from_slice(self.raw("markov_head.dflare_norm.weight", &[h])?);
+                out.extend_from_slice(&self.raw("markov_head.dflare_norm.weight", &[h])?);
                 return Ok(Some(out));
             }
             "mtw_rope_hi" => {
@@ -866,7 +932,7 @@ impl<'a> MtpPacker<'a> {
             "mtw_Wzf" | "mtw_Wsw" => {
                 let cols = 2 * rk + 2 * h;
                 let w = self.raw("markov_head.rnn_proj.weight", &[3 * rk, cols])?;
-                let rows = split_rows(w, (3 * rk) as usize, cols as usize);
+                let rows = split_rows(&w, (3 * rk) as usize, cols as usize);
                 let (lo, hi) = if name == "mtw_Wsw" {
                     (0, 2 * rk)
                 } else {
@@ -900,9 +966,9 @@ impl<'a> MtpPacker<'a> {
         let a = format!("{p}self_attn.");
         // keys as stored, values with their channels in the split order of each head
         let kv = |k: &str, vn: &str| -> Result<Option<Vec<u8>>, String> {
-            let mut out = self.raw(&format!("{a}{k}"), &[kvh, h])?.to_vec();
+            let mut out = self.raw(&format!("{a}{k}"), &[kvh, h])?.into_owned();
             out.extend(split_rows(
-                self.raw(&format!("{a}{vn}"), &[kvh, h])?,
+                &self.raw(&format!("{a}{vn}"), &[kvh, h])?,
                 kvh as usize,
                 h as usize,
             ));
@@ -921,8 +987,8 @@ impl<'a> MtpPacker<'a> {
             "Wgu" => {
                 let mut out = self
                     .raw(&format!("{p}mlp.gate_proj.weight"), &[c.ff, h])?
-                    .to_vec();
-                out.extend_from_slice(self.raw(&format!("{p}mlp.up_proj.weight"), &[c.ff, h])?);
+                    .into_owned();
+                out.extend_from_slice(&self.raw(&format!("{p}mlp.up_proj.weight"), &[c.ff, h])?);
                 Ok(Some(out))
             }
             "Wd" => v(self.raw(&format!("{p}mlp.down_proj.weight"), &[h, c.ff])?),
@@ -1032,11 +1098,40 @@ impl Inkling2Engine {
         model_dir: &std::path::Path,
         stage: &mut PinnedBuf,
     ) -> Result<(), String> {
-        let path = model_dir.join(MTP_FILE);
-        let store = SafetensorsStore::open_file(&path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        let store;
+        let st_src;
+        let gg_src;
+        let src: &dyn MtpSource = match &self.mtp_ref().g.c.weights {
+            MtpWeights::Checkpoint => {
+                let path = model_dir.join(MTP_FILE);
+                store = SafetensorsStore::open_file(&path)
+                    .map_err(|e| format!("open {}: {e}", path.display()))?;
+                st_src = StMtp(&store);
+                &st_src
+            }
+            MtpWeights::Gguf(path) => {
+                gg_src = gguf::GgufMtp::open(path)?;
+                &gg_src
+            }
+        };
+        let folds = src.folds_on_card();
+        if self.verbose {
+            let file = match &self.mtp_ref().g.c.weights {
+                MtpWeights::Checkpoint => model_dir.join(MTP_FILE),
+                MtpWeights::Gguf(p) => p.clone(),
+            };
+            eprintln!(
+                "[gaudium] inkling2 drafter weights from {} ({})",
+                file.display(),
+                if folds {
+                    "head folded through the unembedding on the card"
+                } else {
+                    "folded head as stored in the file"
+                }
+            );
+        }
         let st = self.mtp_ref();
-        let packer = MtpPacker::new(&store, &st.g);
+        let packer = MtpPacker::new(src, &st.g);
         let mut uploads = Vec::new();
         for (name, &bytes) in &st.plan.weights {
             if let Some(data) = packer.pack(name)? {
@@ -1059,6 +1154,10 @@ impl Inkling2Engine {
             self.dev
                 .zero_hbm_chunked(addr, bytes, stage)
                 .map_err(|e| format!("zero drafter state: {e}"))?;
+        }
+        if !folds {
+            // the drafter file stores the fold (uploaded above)
+            return Ok(());
         }
         let gb = build_fold_graph(&self.mtp_ref().g, &self.mtp_ref().elf_hashes);
         let r = self.compile(&gb, "drafter fold")?;
@@ -1386,7 +1485,8 @@ mod tests {
         let d = mini_dims(256);
         let g = MtpGeom::new(c, &d, 8192, 256).unwrap();
         let st = SafetensorsStore::open_file(dir.join(MTP_FILE)).unwrap();
-        let pk = MtpPacker::new(&st, &g);
+        let src = StMtp(&st);
+        let pk = MtpPacker::new(&src, &g);
         let p = MtpPlan::build(&g);
         for (name, &bytes) in &p.weights {
             match pk.pack(name).unwrap() {
