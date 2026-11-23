@@ -48,8 +48,8 @@ use crate::engine::qwen3::prefix_cache::{shared_rows, ImageId};
 use crate::hostmem::{Admitted, AnonMap};
 use crate::verified::{
     hc_abort, hc_begin_read, hc_begin_write, hc_busy, hc_can_evict, hc_continue_pick,
-    hc_copy_whole, hc_end_write, hc_evict_before, hc_may_read, hc_may_restore, hc_pins,
-    hc_read_done, hc_readable, hc_resumable, hc_resume_better, hc_resume_valid,
+    hc_copy_whole, hc_end_write, hc_evict_before, hc_host_counted, hc_may_read, hc_may_restore,
+    hc_pins, hc_read_done, hc_readable, hc_resumable, hc_resume_better, hc_resume_valid,
     hc_ring_cover_after_cut, hc_ring_due, hc_ring_serves, hc_room, hc_save_need, hc_shared_tiles,
     hc_spare_credit, hc_spares_return, hc_state_due, hc_state_kept, hc_state_leaves_first,
     hc_state_may_leave, hc_state_survives_cut, hc_state_wanted, hc_states_over, hc_take_now,
@@ -221,6 +221,22 @@ pub fn states_due(have: &[u64], kept: &[u64], entry_tiles: u64, cap: u64) -> Vec
         .collect()
 }
 
+/// Where a store reads what the host can give.
+#[derive(Debug, Clone, Copy)]
+enum HostSource {
+    /// Nowhere: the budget alone bounds the store (tests of other things).
+    Unasked,
+    /// The system, read at every asking (`hostmem::HostMemory::read`).
+    Live { budget_named: bool },
+    /// A made-up host: asked with the bytes the store has mapped.
+    #[cfg(test)]
+    Made {
+        available: fn(u64) -> u64,
+        limits_known: bool,
+        budget_named: bool,
+    },
+}
+
 /// The store. One per server; engines reach it through [`SharedCache`].
 #[derive(Debug)]
 pub struct HostCache {
@@ -231,9 +247,9 @@ pub struct HostCache {
     tick: u64,
     stats: CacheStats,
     verbose: bool,
-    /// What the host can give this process now, asked with the bytes the store holds (`None`:
-    /// not asked; the budget alone bounds the store). Asked before the store grows.
-    host_available: Option<fn(u64) -> u64>,
+    /// Where the store reads what the host can give this process now. Read before the store
+    /// grows, and before an engine takes memory beside it.
+    host: HostSource,
     /// Segments of entries that left during the copy in progress, free for it to take; emptied
     /// by [`Self::settle`]. Not charged to the budget, still the store's memory.
     spare: Vec<Seg>,
@@ -255,7 +271,7 @@ impl HostCache {
                 ..CacheStats::default()
             },
             verbose,
-            host_available: None,
+            host: HostSource::Unasked,
             spare: Vec::new(),
         }
     }
@@ -264,17 +280,55 @@ impl HostCache {
     /// store's own entries first (their memory goes back to the system at once) and is refused
     /// when even that is not enough, so the store never takes memory the host does not have.
     pub fn watching_host(mut self) -> Self {
-        self.host_available = Some(|_held| crate::hostmem::HostMemory::read().available());
+        self.host = HostSource::Live {
+            budget_named: false,
+        };
         self
     }
 
-    /// What the host can give this process now (`u64::MAX`: not asked; the budget alone bounds
-    /// the store). The spare segments are still mapped, so they count as held.
-    fn host_now(&self) -> u64 {
-        match self.host_available {
-            Some(ask) => ask(self.mapped_bytes()),
-            None => u64::MAX,
+    /// The operator named this store's budget (`--cache-ram <GB>`), or did not. It matters
+    /// when a limit of the process cannot be read (`hc_host_counted`).
+    pub fn set_budget_named(&mut self, named: bool) {
+        if let HostSource::Live { budget_named } = &mut self.host {
+            *budget_named = named;
         }
+    }
+
+    /// A made-up host for tests: `available` is asked with the bytes the store has mapped.
+    #[cfg(test)]
+    fn set_host(&mut self, available: fn(u64) -> u64) {
+        self.host = HostSource::Made {
+            available,
+            limits_known: true,
+            budget_named: false,
+        };
+    }
+
+    /// One reading of the host: the bytes it has available for this process now, whether the
+    /// limits of the process are established, and whether the operator named the budget. The
+    /// spare segments are still mapped, so a made-up host is told of them as held.
+    fn host_reading(&self) -> (u64, bool, bool) {
+        match self.host {
+            HostSource::Unasked => (u64::MAX, true, true),
+            HostSource::Live { budget_named } => {
+                let mem = crate::hostmem::HostMemory::read();
+                (mem.available(), mem.limits_known(), budget_named)
+            }
+            #[cfg(test)]
+            HostSource::Made {
+                available,
+                limits_known,
+                budget_named,
+            } => (available(self.mapped_bytes()), limits_known, budget_named),
+        }
+    }
+
+    /// What the host can give this process now, as the store may count it (`hc_host_counted`:
+    /// nothing under a limit that could not be read, unless the budget was named).
+    /// `u64::MAX`: not asked; the budget alone bounds the store.
+    fn host_now(&self) -> u64 {
+        let (available, known, named) = self.host_reading();
+        hc_host_counted(known, named, available)
     }
 
     /// Bytes the store has mapped: what its entries hold, and the spare segments of the copy
@@ -489,8 +543,11 @@ impl HostCache {
     pub fn admit_beside(&mut self, what: &str, need: u64) -> Result<Admitted, String> {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         loop {
-            let host = self.host_now();
-            let evictable = self.evictable(None);
+            // one reading for both figures: what is available, and what the entries would
+            // give back, which counts only where the reading itself does
+            let (available, known, named) = self.host_reading();
+            let host = hc_host_counted(known, named, available);
+            let evictable = hc_host_counted(known, named, self.evictable(None));
             let refused = |host: u64| {
                 format!(
                     "{what} needs {:.2} GiB of host memory, and {:.2} GiB are available now{}",
@@ -738,12 +795,12 @@ impl HostCache {
                     gib(need),
                     gib(self.ledger.capacity()),
                     gib(self.ledger.allocated().saturating_sub(self.evictable(target))),
-                    match self.host_available {
-                        Some(_) => format!(
+                    match self.host {
+                        HostSource::Unasked => String::new(),
+                        _ => format!(
                             ", and the host has {:.2} GiB available",
                             gib(self.host_now())
                         ),
-                        None => String::new(),
                     },
                 );
             }
@@ -1028,13 +1085,22 @@ impl SharedCache {
     #[cfg(test)]
     pub fn on_host(budget_bytes: u64, ring_bytes: u64, available: fn(u64) -> u64) -> Self {
         let mut cache = HostCache::new(budget_bytes, false);
-        cache.host_available = Some(available);
+        cache.set_host(available);
         let snap = cache.stats();
         Self {
             inner: Mutex::new(cache),
             snap: Mutex::new(snap),
             ring_bytes,
         }
+    }
+
+    /// [`HostCache::set_budget_named`] for a store that is being set up.
+    pub fn budget_named(self, named: bool) -> Self {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_budget_named(named);
+        self
     }
 
     /// The counters as of the last finished save or restore.
@@ -1304,7 +1370,7 @@ mod tests {
             (20 * MIB).saturating_sub(OTHERS.load(Ordering::Relaxed) + held)
         }
         let mut c = HostCache::new(64 * MIB, false);
-        c.host_available = Some(available);
+        c.set_host(available);
         let a = save(&mut c, &prompt(512 + 50, 1), 1, &[1]).unwrap();
         let b = save(&mut c, &prompt(512 + 50, 2), 1, &[1]).unwrap();
         assert_eq!(c.held_bytes(), 2 * (TB + SB));
@@ -1335,7 +1401,7 @@ mod tests {
         }
         const HOST: u64 = 20 * MIB;
         let mut c = HostCache::new(64 * MIB, false);
-        c.host_available = Some(available);
+        c.set_host(available);
         // an entry of one engine: three tiles of 4 MiB and a state (14 MiB)
         let a = save(&mut c, &prompt(3 * 512 + 50, 1), 3, &[3]).unwrap();
         assert_eq!(c.mapped_bytes(), 3 * TB + SB);
@@ -1379,7 +1445,7 @@ mod tests {
             (256 * MIB).saturating_sub(held)
         }
         let mut c = HostCache::new(5 * TB + 2 * SB, false);
-        c.host_available = Some(available);
+        c.set_host(available);
         let a = save(&mut c, &prompt(2 * 512 + 50, 1), 2, &[2]).unwrap();
         let b = save(&mut c, &prompt(2 * 512 + 50, 2), 2, &[2]).unwrap();
         // a third conversation: the older entry leaves for its two tiles
@@ -1740,7 +1806,7 @@ mod tests {
             (20 * MIB).saturating_sub(held)
         }
         let mut c = HostCache::new(64 * MIB, false);
-        c.host_available = Some(available);
+        c.set_host(available);
         // an empty store: what the host has is what can be had
         assert_eq!(c.admit_beside("a ring", 20 * MIB).unwrap().left(), 20 * MIB);
         assert!(c.admit_beside("a ring", 20 * MIB + 1).is_err());
@@ -1784,12 +1850,60 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_that_stops_being_readable_stops_the_growth_of_an_unnamed_budget() {
+        // a host with room to spare; the budget (64 MiB) is not what bounds the store
+        fn available(held: u64) -> u64 {
+            (256 * MIB).saturating_sub(held)
+        }
+        let unread = |named: bool| HostSource::Made {
+            available,
+            limits_known: false,
+            budget_named: named,
+        };
+        let mut c = HostCache::new(64 * MIB, false);
+        c.set_host(available);
+        let a = save(&mut c, &prompt(2 * 512 + 50, 1), 2, &[2]).unwrap();
+        c.settle();
+        let mapped = c.mapped_bytes();
+        assert_eq!(mapped, 2 * TB + SB);
+        // The limit of the process can no longer be read, and nobody named the budget: the
+        // store takes no fresh memory. Nothing is asked for beside it, and no entry leaves
+        // for that (what it would give back does not count either).
+        c.host = unread(false);
+        let e = c
+            .admit_beside("its pinned transfer ring", 2 * MIB)
+            .unwrap_err();
+        assert!(e.contains("0.00 GiB are available now"), "{e}");
+        assert!(c.contains(a));
+        assert_eq!(c.stats().evictions, 0);
+        // A save goes on with the memory the store has: the older entry leaves for it and
+        // its segments are taken again; nothing more is mapped.
+        let b = save(&mut c, &prompt(2 * 512 + 50, 2), 2, &[2]).unwrap();
+        assert!(!c.contains(a) && c.contains(b));
+        c.settle();
+        assert_eq!(c.mapped_bytes(), mapped);
+        // a larger one does not fit in what the store has, and is refused
+        assert!(save(&mut c, &prompt(3 * 512 + 50, 3), 3, &[3]).is_none());
+        assert!(c.contains(b));
+        // A budget the operator named is the operator's word: the store goes on counting what
+        // could be read.
+        c.host = unread(true);
+        assert!(c.admit_beside("its pinned transfer ring", 2 * MIB).is_ok());
+        assert!(save(&mut c, &prompt(3 * 512 + 50, 3), 3, &[3]).is_some());
+        assert_eq!(c.stats().entries, 2);
+        // today's rule in one place
+        use crate::verified::hc_host_counted as counted;
+        assert_eq!((counted(true, false, 7), counted(false, true, 7)), (7, 7));
+        assert_eq!(counted(false, false, 7), 0);
+    }
+
+    #[test]
     fn a_segment_a_copy_did_not_finish_goes_back_to_the_system_at_once() {
         fn available(held: u64) -> u64 {
             (20 * MIB).saturating_sub(held)
         }
         let mut c = HostCache::new(64 * MIB, false);
-        c.host_available = Some(available);
+        c.set_host(available);
         let p = prompt(4 * 512 + 50, 1);
         let t = c.open_save(ENG, T, TB, &p, &[], 4, &[4], 8, SB, 0).unwrap();
         // four tiles are mapped for the copy (16 of the host's 20 MiB); a fifth would not be

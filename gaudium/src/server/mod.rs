@@ -1077,12 +1077,11 @@ fn host_cache_of(cfg: &ServerConfig) -> Result<Option<Arc<crate::cache_ram::Shar
         ring >> 20,
         first_copies >> 20,
     );
-    Ok(Some(Arc::new(crate::cache_ram::SharedCache::new(
-        budget,
-        ring,
-        cfg.verbose,
-        true,
-    ))))
+    // a budget the operator named stays theirs when a limit stops being readable later
+    Ok(Some(Arc::new(
+        crate::cache_ram::SharedCache::new(budget, ring, cfg.verbose, true)
+            .budget_named(cfg.cache_ram_bytes.is_some()),
+    )))
 }
 
 /// Starts the Gaudium HTTP/SSE + Web UI server (blocks until terminated).

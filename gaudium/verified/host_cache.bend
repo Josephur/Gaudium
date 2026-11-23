@@ -3228,6 +3228,23 @@ def hm_left(left: Nat, bytes: Nat) -> Nat:
 def hc_default_allowed(limits_known: Bool) -> Bool:
   limits_known
 
+# Host memory the store may count on at a reading: the bytes read as available, or the bytes
+# its entries would give back to the host. All of them when the limits of the process are
+# established, or when the operator named the budget (it bounds the store then, and what
+# could be read still does). None otherwise: a limit can stop being readable while the server
+# runs, and a figure that leaves a limit out is no ground to take memory on. The store then
+# goes on with the memory it has (a save takes the segments of the entries that leave for it).
+def hc_host_counted(limits_known: Bool, budget_named: Bool, +bytes: Nat) -> Nat:
+  match limits_known:
+    case True{}:
+      bytes
+    case False{}:
+      match budget_named:
+        case True{}:
+          bytes
+        case False{}:
+          0n
+
 # LAW HC.149: nothing is admitted beyond what is available at the moment it is asked for.
 law hm_never_admits_beyond_available:
   for +n: Nat
@@ -3275,9 +3292,57 @@ law hm_fresh_within_need:
 def hm_fresh_within_need(n, r):
   hc_sub_le_self(n, r)
 
-# LAW HC.154: a server whose limits could not be read never takes a default budget.
+# n <= (n - r) + r
+def hm_le_sub_add(+n: Nat, +r: Nat) -> {Nat.is_le(n, Nat.add(Nat.sub(n, r), r)) == True{} : Bool}:
+  match n r:
+    case 0n _:
+      hc_zero_le(r)
+    case 1n+np 0n:
+      Equal.sym(Bool, True{}, Nat.is_le(np, Nat.add(np, 0n)), hc_le_add_r(np, 0n))
+    case 1n+np 1n+rp:
+      %Equal.sym(Nat, Nat.add(Nat.sub(np, rp), 1n+rp), 1n+Nat.add(Nat.sub(np, rp), rp), hc_add_succ_r(Nat.sub(np, rp), rp)) : {Nat.is_le(1n+np, _) == True{} : Bool}
+      hm_le_sub_add(np, rp)
+
+# LAW HC.154: ... nor below what it maps beyond the segments it takes again: the leave an
+# allocation is given covers every fresh mapping it makes.
+law hm_fresh_and_reused_cover_the_need:
+  for +n: Nat
+  for +r: Nat
+  {Nat.is_le(n, Nat.add(hm_fresh(n, r), r)) == True{} : Bool}
+
+def hm_fresh_and_reused_cover_the_need(n, r):
+  hm_le_sub_add(n, r)
+
+# LAW HC.155: a server whose limits could not be read never takes a default budget.
 law hc_unread_limit_allows_no_default:
   {hc_default_allowed(False{}) == False{} : Bool}
 
 def hc_unread_limit_allows_no_default():
+  {==}
+
+# LAW HC.156: the store never counts more host memory than was read ...
+law hc_host_counted_within_read:
+  for +k: Bool
+  for +n: Bool
+  for +b: Nat
+  {Nat.is_le(hc_host_counted(k, n, b), b) == True{} : Bool}
+
+def hc_host_counted_within_read(k, n, b):
+  match k:
+    case True{}:
+      hc_le_refl(b)
+    case False{}:
+      match n:
+        case True{}:
+          hc_le_refl(b)
+        case False{}:
+          hc_zero_le(b)
+
+# LAW HC.157: ... and none at all under a limit that could not be read, unless the operator
+# named the budget.
+law hc_unread_limit_counts_nothing_unnamed:
+  for +b: Nat
+  {hc_host_counted(False{}, False{}, b) == 0n : Nat}
+
+def hc_unread_limit_counts_nothing_unnamed(b):
   {==}
