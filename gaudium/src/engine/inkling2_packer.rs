@@ -141,6 +141,9 @@ pub struct IkPacker<'a> {
     prefix: &'static str,
     max_ctx: u64,
     f8: [f32; 256],
+    /// The 4-bit experts' per-expert factor from scale terms rounded to BF16 first (what the
+    /// publisher's reference loader ends up computing), instead of the stored f32 values.
+    amax_bf16: bool,
 }
 
 fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -221,7 +224,14 @@ impl<'a> IkPacker<'a> {
             prefix: "model.llm.",
             max_ctx,
             f8: e4m3_table(),
+            amax_bf16: false,
         }
+    }
+
+    /// Decode the 4-bit experts with their scale terms rounded to BF16 first (see the field).
+    pub fn with_amax_bf16(mut self, on: bool) -> Self {
+        self.amax_bf16 = on;
+        self
     }
 
     fn meta(&self, suffix: &str) -> Result<(String, &'a TensorMeta), String> {
@@ -295,7 +305,14 @@ impl<'a> IkPacker<'a> {
                 }
                 let amax = self.f32s(&format!("{base}_amax"), ne)?;
                 let den = self.f32s(&format!("{base}_outer_scale_denominator"), 1)?[0];
-                let f: Vec<f32> = amax.iter().map(|&a| a / den).collect();
+                let rf = |x: f32| {
+                    if self.amax_bf16 {
+                        bf16_to_f32(f32_to_bf16_rne(x))
+                    } else {
+                        x
+                    }
+                };
+                let f: Vec<f32> = amax.iter().map(|&a| rf(a) / rf(den)).collect();
                 ("F8_E4M3", Some(f), rb, ik_nib_row_scales(cols))
             }
             "F8_E4M3" => {
@@ -462,11 +479,7 @@ impl<'a> IkPacker<'a> {
                 ))))
             }
             "ctl_fin" => {
-                let ns = if d.n_apps == d.apps.len() {
-                    d.final_states.len()
-                } else {
-                    d.wires[d.n_apps - 1].mlp_states.len()
-                };
+                let ns = d.fin_states().len();
                 return Ok(Cow::Owned(i32s_to_bytes(&[ns as i32, 0, 0, 0, 0, 0, 0, 0])));
             }
             "ctl_msg" => {

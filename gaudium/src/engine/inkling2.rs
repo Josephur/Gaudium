@@ -208,6 +208,16 @@ impl IkDims {
         self.apps.iter().any(|a| a.layer == l && a.looped) && self.apps.iter().any(|a| a.msgs)
     }
 
+    /// The block states the final mix reads: those behind the last layer, or, for a debug run cut
+    /// short, the ones its last application's MLP mix saw.
+    pub fn fin_states(&self) -> &[usize] {
+        if self.n_apps == self.apps.len() {
+            &self.final_states
+        } else {
+            &self.wires[self.n_apps - 1].mlp_states
+        }
+    }
+
     /// The applications this configuration runs.
     pub fn run_apps(&self) -> &[IkApp] {
         &self.apps[..self.n_apps]
@@ -806,12 +816,7 @@ pub fn build_step_graph(
         src.push(out);
     }
     let last = *src.last().expect("at least the embedding");
-    let fin: Vec<TensorId> = if d.n_apps == d.apps.len() {
-        d.final_states.iter().map(|&s| src[s]).collect()
-    } else {
-        // a debug run cut short mixes the states its last application's MLP mix saw
-        d.wires[d.n_apps - 1].mlp_states.iter().map(|&s| src[s]).collect()
-    };
+    let fin: Vec<TensorId> = d.fin_states().iter().map(|&s| src[s]).collect();
     let h_final = append_ik_final(&mut gb, d, four(&fin, last), last, t);
     let _ = append_ik_head(&mut gb, d, h_final, t);
     gb
@@ -1016,7 +1021,7 @@ impl IkPlan {
                 *e = (*e).max(bytes);
             }
         }
-        let (_, n) = source_buffers(&d.wires[..d.n_apps], &d.final_states);
+        let (_, n) = source_buffers(&d.wires[..d.n_apps], d.fin_states());
         p.pf_bufs = n;
         p.pf_x_bytes = d.hid * tile * 2;
         p.pf_ids_bytes = tile * 4;
@@ -1430,7 +1435,7 @@ impl Inkling2Engine {
         let pf_hfin = suballoc(&mut act_arena, plan.pf_x_bytes)?;
         let pf_ids = suballoc(&mut act_arena, plan.pf_ids_bytes)?;
         let pf_cursor = suballoc(&mut act_arena, 256)?;
-        let (buf_of_src, _) = source_buffers(&dims.wires[..dims.n_apps], &dims.final_states);
+        let (buf_of_src, _) = source_buffers(&dims.wires[..dims.n_apps], dims.fin_states());
 
         dev.seal_with_shared_workspace(ws_bytes)
             .map_err(|e| format!("seal HBM allocations: {e}"))?;
@@ -1455,7 +1460,8 @@ impl Inkling2Engine {
         let t_up = Instant::now();
         let store = crate::safetensors::SafetensorsStore::open(&cfg.model_dir)
             .map_err(|e| format!("open safetensors: {e}"))?;
-        let packer = packer::IkPacker::new(&store, &dims, max_ctx);
+        let packer = packer::IkPacker::new(&store, &dims, max_ctx)
+            .with_amax_bf16(std::env::var("GAUDIUM_IK_AMAX_BF16").is_ok_and(|v| v == "1"));
         let mut stage_upload = dev
             .alloc_pinned(STAGE_BUF_BYTES)
             .map_err(|e| format!("alloc pinned upload stage: {e}"))?;
@@ -1794,10 +1800,16 @@ impl Inkling2Engine {
     fn dump_step(&mut self, dir: &std::path::Path) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let cap = self.stage_io.as_slice().len();
+        // the activations, and the head of every K / V state and history ring
         let list: Vec<(String, u64, u64)> = self
             .step_act_addr
             .iter()
             .map(|(n, &(a, b))| (n.clone(), a, b))
+            .chain(
+                self.kv_addr
+                    .iter()
+                    .map(|(n, &(a, b))| (n.clone(), a, b.min(64 << 20))),
+            )
             .collect();
         for (name, addr, bytes) in list {
             let mut out = Vec::with_capacity(bytes as usize);
@@ -1974,11 +1986,7 @@ impl Inkling2Engine {
         self.ensure_final(last_tile)?;
         recipe_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
         {
-            let fin: Vec<usize> = if n_apps == self.dims.apps.len() {
-                self.dims.final_states.clone()
-            } else {
-                self.dims.wires[n_apps - 1].mlp_states.clone()
-            };
+            let fin: Vec<usize> = self.dims.fin_states().to_vec();
             let mut pool = self.pf_scratch.clone();
             pool.insert("x_in".into(), self.src_buf(n_apps));
             for i in 0..IK_MAX_STATES as usize {
