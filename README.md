@@ -50,8 +50,12 @@ so that a later change cannot quietly weaken one.
 
 You need:
 
-- A Linux host with an Intel Gaudi 2 card and the Intel Gaudi software stack (SynapseAI,
+- A Linux host with an Intel Gaudi 2 card and the
+  [Intel Gaudi SDK](https://docs.habana.ai/en/latest/Installation_Guide/index.html) (SynapseAI,
   `tpc-clang`, headers under `/usr/include/habanalabs`) to build the kernels and run on the card.
+  Install it from [Intel's package repository](https://vault.habana.ai/) (`habanalabs-dkms`,
+  `habanalabs-firmware`, `habanalabs-graph`, `habanalabs-tools`; tested with 1.24). Its license
+  does not allow redistribution, so Gaudium does not include any of it.
 - Rust (stable) and [Bend 2](https://github.com/bendlang/bend) at the version in
   `gaudium/bend.pin` (looked up at `~/.bend/bin/bend`, or set `BEND_BIN`).
 - Lean (via `~/.elan/bin` or `PATH`), so the build also kernel-checks every proof. The
