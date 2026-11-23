@@ -117,8 +117,9 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 ## 6. RustyBends Issues — Do Not Patch Locally, File via `gh`
 
 - **NEVER silently modify `rusty-bends-build/`.**
+- **RustyBends is a general tool, and Gaudium is one of its users.** Ask it only for what any project could use. Gaudium's own rules belong in Gaudium (this file, `gaudium/verified/`, Rust tests), never in RustyBends. An issue states the need in general Bend/Rust terms with a standalone reproducer whose names are neutral (`fits_area_limit`, `Ledger`), never Gaudium code or vocabulary pasted in: RustyBends declines requests that only one project needs.
 - If you hit a bug, missing Bend 2 primitive, emitter limitation, or CLI mismatch in RustyBends:
-  1. Document the minimal `.bend` reproducer and exact error output.
+  1. Write a minimal standalone `.bend` reproducer, with neutral names, and the exact error output.
   2. File an issue directly on the RustyBends repository using `gh`:
      ```bash
      gh issue create -R Josephur/RustyBends --title "<concise title>" --body "<minimal reproducer + expected vs actual>"
