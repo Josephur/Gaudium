@@ -240,9 +240,49 @@ mod tests {
         assert_eq!((m.as_slice()[0], m.as_slice()[n - 1]), (9, 7));
     }
 
+    /// What mapping, writing and unmapping segments costs on this machine (`cargo test --release
+    /// -- --ignored segment_costs --nocapture`).
+    #[test]
+    #[ignore]
+    fn segment_costs() {
+        use std::time::Instant;
+        for (n, bytes) in [(96usize, 32u64 << 20), (20, 150 << 20)] {
+            let t0 = Instant::now();
+            let mut maps: Vec<AnonMap> = (0..n).map(|_| AnonMap::new(bytes).unwrap()).collect();
+            let t_map = t0.elapsed();
+            let t1 = Instant::now();
+            for m in &mut maps {
+                m.as_mut_slice().fill(7);
+            }
+            let t_fill = t1.elapsed();
+            let t2 = Instant::now();
+            for m in &mut maps {
+                m.as_mut_slice().fill(9);
+            }
+            let t_again = t2.elapsed();
+            let total = n as u64 * bytes;
+            let t3 = Instant::now();
+            drop(maps);
+            let t_unmap = t3.elapsed();
+            let gib = total as f64 / (1u64 << 30) as f64;
+            println!(
+                "{n} segments of {} MiB ({gib:.2} GiB): map {:.1} ms, first write {:.0} ms ({:.1} GiB/s), second write {:.0} ms ({:.1} GiB/s), unmap {:.1} ms ({:.1} GiB/s)",
+                bytes >> 20,
+                t_map.as_secs_f64() * 1e3,
+                t_fill.as_secs_f64() * 1e3,
+                gib / t_fill.as_secs_f64(),
+                t_again.as_secs_f64() * 1e3,
+                gib / t_again.as_secs_f64(),
+                t_unmap.as_secs_f64() * 1e3,
+                gib / t_unmap.as_secs_f64(),
+            );
+        }
+    }
+
     #[test]
     fn meminfo_and_cgroup_texts_are_read_in_bytes() {
-        let mi = "MemTotal:       115000000 kB\nMemFree:        1000 kB\nMemAvailable:   90000000 kB\n";
+        let mi =
+            "MemTotal:       115000000 kB\nMemFree:        1000 kB\nMemAvailable:   90000000 kB\n";
         assert_eq!(parse_meminfo_available(mi), Some(90_000_000 * 1024));
         assert_eq!(parse_meminfo_available("MemTotal: 1 kB\n"), None);
         let stat = "anon 100\nfile 5000\ninactive_file 3000\nactive_file 1000\n";

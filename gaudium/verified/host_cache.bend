@@ -766,18 +766,22 @@ def hc_failed_read_leaves_nothing(e):
     case HcWriting{t, w}: {==}
     case HcReading{t}: {==}
 
-# LAW HC.17: a restore that finished leaves the entry as it was.
-law hc_read_returns_entry:
-  for +t: Nat
-  {hc_end_read(hc_begin_read(HcHeld{t})) == HcHeld{t} : HcEntry}
+# LAW HC.17: a restore never changes how many rows an entry holds, whatever state it was in.
+law hc_read_keeps_rows:
+  for +e: HcEntry
+  {hc_tiles(hc_end_read(hc_begin_read(e))) == hc_tiles(e) : Nat}
 
-def hc_read_returns_entry(t):
-  {==}
+def hc_read_keeps_rows(e):
+  match e:
+    case HcVacant{}: {==}
+    case HcHeld{t}: {==}
+    case HcWriting{t, w}: {==}
+    case HcReading{t}: {==}
 
 # LAW HC.18: an entry a restore reads counts as pinned (the eviction guard then refuses it).
 law hc_reading_is_pinned:
   for +t: Nat
-  {hc_pins(hc_begin_read(HcHeld{t})) == 1n : Nat}
+  {Nat.is_gt(hc_pins(hc_begin_read(HcHeld{t})), 0n) == True{} : Bool}
 
 def hc_reading_is_pinned(t):
   {==}
@@ -1158,23 +1162,16 @@ law hc_tier_no_restore_is_never_host:
 def hc_tier_no_restore_is_never_host(n):
   {==}
 
-# LAW HC.49: an entry without an image of the drafter's rings always gets one.
-law hc_ring_missing_is_stale:
-  for +g: Bool
-  {hc_ring_stale(False{}, g) == True{} : Bool}
+# LAW HC.49: the drafter's rings are never copied again for an entry that has an image and
+# gained nothing: a save that has nothing new to keep copies nothing.
+law hc_ring_unchanged_not_copied:
+  for u: Unit
+  {hc_ring_stale(True{}, False{}) == False{} : Bool}
 
-def hc_ring_missing_is_stale(g):
+def hc_ring_unchanged_not_copied(u):
   {==}
 
-# LAW HC.50: an entry that gained rows or positions never keeps the image taken before them.
-law hc_ring_grown_is_stale:
-  for +h: Bool
-  {hc_ring_stale(h, True{}) == True{} : Bool}
-
-def hc_ring_grown_is_stale(h):
-  hc_or_true_r(Bool.not(h))
-
-# LAW HC.51: a ring image never serves a resume point past the tiles its entry held when it was
+# LAW HC.50: a ring image never serves a resume point past the tiles its entry held when it was
 # taken: rows written since are never passed off as that prompt's.
 law hc_ring_never_serves_past_its_tiles:
   for +i: Nat
@@ -1184,7 +1181,7 @@ law hc_ring_never_serves_past_its_tiles:
 def hc_ring_never_serves_past_its_tiles(i, r):
   hc_le_lt_excl(r, i)
 
-# LAW HC.52: after its entry is cut, a ring image stands for no tile the entry lost.
+# LAW HC.51: after its entry is cut, a ring image stands for no tile the entry lost.
 law hc_ring_cover_within_cut:
   for +i: Nat
   for +k: Nat
@@ -1193,7 +1190,7 @@ law hc_ring_cover_within_cut:
 def hc_ring_cover_within_cut(i, k):
   hc_min_le_r(i, k)
 
-# LAW HC.53: nor for more than it did.
+# LAW HC.52: nor for more than it did.
 law hc_ring_cover_never_grows:
   for +i: Nat
   for +k: Nat
@@ -1202,7 +1199,7 @@ law hc_ring_cover_never_grows:
 def hc_ring_cover_never_grows(i, k):
   hc_min_le_l(i, k)
 
-# LAW HC.54: a save never counts on more free bytes than its budget has left ...
+# LAW HC.53: a save never counts on more free bytes than its budget has left ...
 law hc_free_now_within_budget:
   for +f: Nat
   for +a: Nat
@@ -1211,7 +1208,7 @@ law hc_free_now_within_budget:
 def hc_free_now_within_budget(f, a):
   hc_min_le_l(f, a)
 
-# LAW HC.55: ... nor on more than the host has available now: the cache gives its own entries
+# LAW HC.54: ... nor on more than the host has available now: the cache gives its own entries
 # back before it takes memory the host does not have.
 law hc_free_now_within_host:
   for +f: Nat

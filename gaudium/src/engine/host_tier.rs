@@ -323,9 +323,7 @@ impl HostTier {
         ring: Vec<(u64, u64)>,
         verbose: bool,
     ) -> Self {
-        let state_bytes = slots
-            .first()
-            .map_or(0, |s| s.iter().map(|&(_, b)| b).sum());
+        let state_bytes = slots.first().map_or(0, |s| s.iter().map(|&(_, b)| b).sum());
         let ring_bytes = ring.iter().map(|&(_, b)| b).sum();
         Self {
             cache,
@@ -391,7 +389,8 @@ impl HostTier {
     /// Measures the two copy rates through `copier` with the first bytes of the first K/V
     /// cache, which are read and written back unchanged.
     pub fn calibrate(&mut self, copier: &mut dyn Copier) -> Result<(), String> {
-        let bytes = CALIBRATE_BYTES.min(self.rows.chunks * self.rows.heads * self.rows.chunk_rows * self.rows.row_bytes);
+        let bytes = CALIBRATE_BYTES
+            .min(self.rows.chunks * self.rows.heads * self.rows.chunk_rows * self.rows.row_bytes);
         let mut map = crate::hostmem::AnonMap::new(bytes)?;
         let pieces = [Piece {
             dev: self.rows.caches[0],
@@ -438,8 +437,7 @@ impl HostTier {
         let cache = Arc::clone(&self.cache);
         let mut store = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.clean.retain(|id, _| store.contains(*id));
-        let Some(found) = store.find(self.id, tile, prompt, images, wanted, table.enabled())
-        else {
+        let Some(found) = store.find(self.id, tile, prompt, images, wanted, table.enabled()) else {
             return Ok(None);
         };
         // what the restore would copy: the entry's tiles the device no longer holds, the state
@@ -487,6 +485,7 @@ impl HostTier {
                 // nothing of a copy that failed may be read later: not the entry, not the
                 // device rows it was to fill
                 store.end_read(found.entry, false);
+                store.settle();
                 cache.publish(&store);
                 table.restore_done(0);
                 table.clear();
@@ -524,6 +523,7 @@ impl HostTier {
                 s.restores += 1;
                 s.restore_bytes += st.bytes;
                 s.restore_s += ms / 1e3;
+                store.settle();
                 cache.publish(&store);
                 self.restored = true;
                 self.last.restore_ms = ms;
@@ -567,9 +567,15 @@ impl HostTier {
         }
         self.last.tier = Tier::of(self.restored, resume);
         let tile = self.rows.tile;
-        let (w0, w1) = (hc_written_lo(resume, tile), hc_written_hi(written_end, tile));
+        let (w0, w1) = (
+            hc_written_lo(resume, tile),
+            hc_written_hi(written_end, tile),
+        );
         for iv in self.clean.values_mut() {
-            *iv = (hc_clean_lo(iv.0, iv.1, w0, w1), hc_clean_hi(iv.0, iv.1, w0, w1));
+            *iv = (
+                hc_clean_lo(iv.0, iv.1, w0, w1),
+                hc_clean_hi(iv.0, iv.1, w0, w1),
+            );
         }
         self.ring_owner = None;
         self.unsaved = true;
@@ -618,11 +624,11 @@ impl HostTier {
             } else {
                 0
             };
-        let Some(target) =
-            store.open_save(self.id, tile, tile_bytes, held, images, upto, extra)
+        let Some(target) = store.open_save(self.id, tile, tile_bytes, held, images, upto, extra)
         else {
             // no room for this prefix at all: not asked again until the device holds another
             self.unsaved = false;
+            store.settle();
             cache.publish(&store);
             return Ok(rep);
         };
@@ -643,6 +649,7 @@ impl HostTier {
             if this.ring_owner == Some(entry) {
                 this.ring_owner = None;
             }
+            store.settle();
             cache.publish(store);
             e
         };
@@ -782,6 +789,7 @@ impl HostTier {
                 if store.stats().entries == 1 { "y" } else { "ies" },
             );
         }
+        store.settle();
         cache.publish(&store);
         Ok(rep)
     }
@@ -923,7 +931,9 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
     let layout = format!(
         "{rows:?}|slots={}|state={:?}|ring={:?}",
         slots.len(),
-        slots.first().map(|s| s.iter().map(|&(_, b)| b).collect::<Vec<_>>()),
+        slots
+            .first()
+            .map(|s| s.iter().map(|&(_, b)| b).collect::<Vec<_>>()),
         ring.iter().map(|&(_, b)| b).collect::<Vec<_>>()
     );
     let id = engine_identity(cfg, eng, &layout);
@@ -1095,7 +1105,9 @@ mod tests {
         fn mark(tokens: &[i32], pos: usize) -> u64 {
             let mut h = 0x9E37_79B9_7F4A_7C15u64;
             for &t in &tokens[..=pos.min(tokens.len() - 1)] {
-                h = (h ^ t as u32 as u64).wrapping_mul(0x100_0000_01B3).rotate_left(23);
+                h = (h ^ t as u32 as u64)
+                    .wrapping_mul(0x100_0000_01B3)
+                    .rotate_left(23);
             }
             h ^ pos as u64
         }
@@ -1123,7 +1135,9 @@ mod tests {
         fn write_state(&mut self, tokens: &[i32], tiles: u64, slot: usize) {
             let v = Self::mark(tokens, (tiles * T) as usize - 1) ^ 0x5555;
             for (dev, bytes) in self.slots[slot].clone() {
-                let fill: Vec<u8> = (0..bytes).map(|i| (v >> (8 * (i % 8))) as u8 ^ i as u8).collect();
+                let fill: Vec<u8> = (0..bytes)
+                    .map(|i| (v >> (8 * (i % 8))) as u8 ^ i as u8)
+                    .collect();
                 self.at(dev, bytes as usize).copy_from_slice(&fill);
             }
         }
@@ -1229,7 +1243,12 @@ mod tests {
     }
 
     fn rig(budget: u64, n_slots: u64) -> Rig {
-        rig_on(Arc::new(SharedCache::new(budget, 0, false, false)), n_slots, false, [7, 7])
+        rig_on(
+            Arc::new(SharedCache::new(budget, 0, false, false)),
+            n_slots,
+            false,
+            [7, 7],
+        )
     }
 
     impl Rig {
@@ -1356,7 +1375,10 @@ mod tests {
         let mut a2 = a1.clone();
         a2.extend(prompt(1100, 5));
         let (resume, rep) = r.request(&a2, true);
-        assert_eq!((resume, rep.tier, rep.restore_bytes), (4 * 512, Tier::Device, 0));
+        assert_eq!(
+            (resume, rep.tier, rep.restore_bytes),
+            (4 * 512, Tier::Device, 0)
+        );
         assert_eq!(r.dev.up, 0);
         // its save copies the two new tiles and the new positions only
         let rep = r.idle();
@@ -1469,10 +1491,7 @@ mod tests {
         let a1 = prompt(4 * 512 + 100, 1);
         r.request(&a1, true);
         r.dev.fail_next = true;
-        assert!(r
-            .tier
-            .save(&r.table, &mut r.dev, &mut || false)
-            .is_err());
+        assert!(r.tier.save(&r.table, &mut r.dev, &mut || false).is_err());
         assert_eq!(r.cache.stats().entries, 0);
         assert_eq!(r.cache.stats().held_bytes, 0);
         // a restore that fails drops the entry and everything the table held
@@ -1543,8 +1562,32 @@ mod tests {
     }
 
     #[test]
+    fn today_s_tuning_values() {
+        // pinned here, not in a law: each may change with measurements
+        use crate::synapse::xfer::{COPY_THREADS, RING_BUFS, RING_BUF_BYTES};
+        assert_eq!(IDLE_GRACE, std::time::Duration::from_millis(30));
+        assert_eq!((RING_BUFS, RING_BUF_BYTES, COPY_THREADS), (4, 64 << 20, 2));
+        assert_eq!(
+            (ROUND_TILES, RATE_MIN_BYTES, CALIBRATE_BYTES),
+            (64, 32 << 20, 128 << 20)
+        );
+        assert_eq!(crate::verified::hc_default_share(), 4);
+        // a prompt continues an entry when it shares at least as many tiles as it drops
+        use crate::verified::hc_continues;
+        assert!(hc_continues(5, 6) && hc_continues(3, 6) && !hc_continues(2, 6));
+        // the rings are copied again when the entry has no image or grew
+        use crate::verified::hc_ring_stale;
+        assert!(hc_ring_stale(false, false) && hc_ring_stale(true, true));
+        // a copy wins when it takes less time than the prefill it replaces: 2 GiB at
+        // 14 GiB/s against 32,256 rows at 6,500 rows per second
+        assert!(hc_copy_wins(2 << 30, 14 << 30, 32_256, 6_500));
+        assert!(!hc_copy_wins(2 << 30, 100 << 20, 512, 6_500));
+    }
+
+    #[test]
     fn row_layout_follows_the_caches_chunk_by_chunk_and_head_by_head() {
-        let l = RowLayout::new(vec![1000, 900_000], 2 * 2 * 4096 * 16, 2, 4096, 2, 16, 512).unwrap();
+        let l =
+            RowLayout::new(vec![1000, 900_000], 2 * 2 * 4096 * 16, 2, 4096, 2, 16, 512).unwrap();
         assert_eq!(l.tile_bytes(), 2 * 2 * 512 * 16);
         assert_eq!((l.pieces_per_tile(), l.tiles()), (4, 16));
         let mut p = Vec::new();

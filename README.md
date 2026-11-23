@@ -26,7 +26,9 @@ What the Rust engine does today:
 - Image input for vision-language checkpoints.
 - Long contexts (up to 256K on the models that support it), planned against HBM at load
   time: a context that does not fit is refused at start with the exact shortfall.
-- Prefix reuse between consecutive requests.
+- Prefix reuse between consecutive requests, and from host memory when the card no longer
+  holds a conversation (another conversation or model in between, the idle release of the
+  card): `--cache-ram`.
 - An OpenAI-compatible (and Anthropic-style) chat API with streaming, tool calls, an
   optional MCP proxy for the Web UI, optional HTTPS on the same port, and A2UI interfaces.
 

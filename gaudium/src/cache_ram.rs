@@ -22,8 +22,12 @@
 //! (`allocated + free == budget`, the locked rules of the block pool counted in bytes).
 //!
 //! Memory: a segment is an anonymous mapping of its own (`hostmem::AnonMap`). The budget is
-//! charged for what is mapped, pages exist only once written, and a segment that leaves goes
-//! back to the system at once. Nothing here is pinned.
+//! charged for what is mapped, and pages exist only once written. Segments of entries that
+//! leave during a save are handed to that save first (a cache that is full evicts on every
+//! save, and a segment that is reused costs neither an unmap nor fresh pages: measured on the
+//! Gaudi 2 host, memory that was written before takes a copy at about twice the rate of fresh
+//! memory); what the save does not take goes back to the system when it ends
+//! ([`HostCache::settle`]). Nothing here is pinned.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -34,9 +38,8 @@ use crate::hostmem::AnonMap;
 use crate::verified::{
     hc_abort, hc_begin_read, hc_begin_write, hc_busy, hc_can_evict, hc_continues, hc_end_read,
     hc_end_write, hc_evict_before, hc_free_now, hc_may_restore, hc_pins, hc_readable,
-    hc_resume_valid,
-    hc_ring_cover_after_cut, hc_ring_serves, hc_room, hc_shared_tiles, hc_state_leaves_first,
-    hc_states_over, hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
+    hc_resume_valid, hc_ring_cover_after_cut, hc_ring_serves, hc_room, hc_shared_tiles,
+    hc_state_leaves_first, hc_states_over, hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
 };
 
 /// Identity of the engine an entry was made by: a digest of everything that decides the bytes
@@ -194,6 +197,9 @@ pub struct HostCache {
     /// What the host can give this process now, asked with the bytes the store holds (`None`:
     /// not asked; the budget alone bounds the store). Asked before the store grows.
     host_available: Option<fn(u64) -> u64>,
+    /// Segments of entries that left during the copy in progress, free for it to take; emptied
+    /// by [`Self::settle`]. Not charged to the budget, still the store's memory.
+    spare: Vec<Seg>,
 }
 
 // SAFETY: the segments are plain host memory owned by the store; the raw pointers it hands out
@@ -213,6 +219,7 @@ impl HostCache {
             },
             verbose,
             host_available: None,
+            spare: Vec::new(),
         }
     }
 
@@ -229,12 +236,25 @@ impl HostCache {
     fn free_now(&self, back: u64) -> u64 {
         let budget_free = self.ledger.free().saturating_add(back);
         match self.host_available {
+            // the spare segments are memory the store already has
             Some(ask) => hc_free_now(
                 budget_free,
-                ask(self.ledger.allocated()).saturating_add(back),
+                ask(self.ledger.allocated().saturating_add(self.spare_bytes()))
+                    .saturating_add(back)
+                    .saturating_add(self.spare_bytes()),
             ),
             None => budget_free,
         }
+    }
+
+    fn spare_bytes(&self) -> u64 {
+        self.spare.iter().map(Seg::charged).sum()
+    }
+
+    /// A copy has ended: the segments it did not take go back to the system. Between copies
+    /// the store's memory is what its entries hold.
+    pub fn settle(&mut self) {
+        self.spare.clear();
     }
 
     pub fn budget_bytes(&self) -> u64 {
@@ -280,6 +300,10 @@ impl HostCache {
     fn alloc(&mut self, bytes: u64) -> Option<Seg> {
         let charge = Self::charge_of(bytes);
         self.ledger.alloc(charge).ok()?;
+        // a spare segment of this size first: every byte a copy reads later is written by it
+        if let Some(i) = self.spare.iter().position(|s| s.charged() == charge) {
+            return Some(self.spare.swap_remove(i));
+        }
         match AnonMap::new(bytes) {
             Ok(map) => Some(Seg { map }),
             Err(e) => {
@@ -290,8 +314,11 @@ impl HostCache {
         }
     }
 
+    /// The budget gets the segment's bytes back; the segment itself stays for the copy in
+    /// progress to take ([`Self::settle`] unmaps what is left).
     fn release(&mut self, seg: Seg) {
         let _ = self.ledger.free_blocks(seg.charged());
+        self.spare.push(seg);
     }
 
     fn remove(&mut self, id: u64) {
@@ -539,7 +566,8 @@ impl HostCache {
                 let e = self.entries.get_mut(&id).expect("entry");
                 e.life = hc_truncate(e.life, common);
                 let keep = hc_tiles(e.life);
-                let mut gone: Vec<Seg> = e.rows.drain((keep as usize).min(e.rows.len())..).collect();
+                let mut gone: Vec<Seg> =
+                    e.rows.drain((keep as usize).min(e.rows.len())..).collect();
                 let (kept, cut): (Vec<_>, Vec<_>) =
                     e.states.drain(..).partition(|(k, _)| *k <= keep);
                 e.states = kept;
@@ -684,7 +712,11 @@ impl HostCache {
         if let Some(seg) = e.pending.take() {
             if complete {
                 let tiles = hc_tiles(e.life);
-                gone.extend(e.ring.replace(RingImage { seg, from, tiles }).map(|r| r.seg));
+                gone.extend(
+                    e.ring
+                        .replace(RingImage { seg, from, tiles })
+                        .map(|r| r.seg),
+                );
             } else {
                 gone.push(seg);
             }
@@ -878,7 +910,10 @@ mod tests {
         p3.extend(prompt(900, 5));
         assert_eq!(c.find(ENG, T, &p3, &[], true, true).unwrap().pos, 3 * 512);
         // a prompt that ends at a kept position cannot resume there (its last rows are prefilled)
-        assert_eq!(c.find(ENG, T, &p[..6 * 512], &[], true, true).unwrap().pos, 3 * 512);
+        assert_eq!(
+            c.find(ENG, T, &p[..6 * 512], &[], true, true).unwrap().pos,
+            3 * 512
+        );
         // nothing shared, a cold request, another engine, another tile width: no entry
         assert!(c.find(ENG, T, &prompt(4000, 77), &[], true, true).is_none());
         assert!(c.find(ENG, T, &p2, &[], false, true).is_none());
@@ -908,7 +943,10 @@ mod tests {
         let mut p2 = p.clone();
         p2.extend(prompt(300, 9));
         // the same picture: resume past it; another one, or none: before its run
-        assert_eq!(c.find(ENG, T, &p2, &[img(1)], true, true).unwrap().pos, 6 * 512);
+        assert_eq!(
+            c.find(ENG, T, &p2, &[img(1)], true, true).unwrap().pos,
+            6 * 512
+        );
         let f = c.find(ENG, T, &p2, &[img(2)], true, true).unwrap();
         assert_eq!((f.pos, f.cap), (2 * 512, 2 * 512 + 40));
         assert_eq!(c.find(ENG, T, &p2, &[], true, true).unwrap().pos, 2 * 512);
@@ -952,13 +990,16 @@ mod tests {
         assert_ne!(ia, ib);
         assert_eq!(c.stats().entries, 2);
         // each comes back to its own rows
-        assert_eq!(c.find(ENG, T, &a, &[], true, true).unwrap(), Found {
-            entry: ia,
-            tiles: 5,
-            pos: 5 * 512,
-            lcp: a.len() as u64,
-            cap: a.len() as u64
-        });
+        assert_eq!(
+            c.find(ENG, T, &a, &[], true, true).unwrap(),
+            Found {
+                entry: ia,
+                tiles: 5,
+                pos: 5 * 512,
+                lcp: a.len() as u64,
+                cap: a.len() as u64
+            }
+        );
         assert_eq!(c.find(ENG, T, &b, &[], true, true).unwrap().entry, ib);
     }
 
@@ -978,6 +1019,19 @@ mod tests {
         assert!(c.contains(a) && !c.contains(b) && c.contains(d));
         assert_eq!(c.stats().evictions, 1);
         assert!(c.held_bytes() <= c.budget_bytes());
+        // the entry that left gave its segments to the save that needed the room: all three
+        // were taken (two tiles, one state), none is left over
+        assert_eq!(c.spare_bytes(), 0);
+        c.settle();
+        // an entry that is cut gives its tail back when the copy has ended
+        let p = prompt(2 * 512 + 50, 3);
+        let mut branch = p[..512 + 9].to_vec();
+        branch.extend(prompt(300, 8));
+        assert_eq!(save(&mut c, &branch, 1, &[1]), Some(d));
+        assert_eq!(c.spare_bytes(), TB);
+        c.settle();
+        assert_eq!(c.spare_bytes(), 0);
+        assert_eq!(c.held_bytes(), 3 * TB + 2 * SB);
         // a prefix larger than the whole budget is refused and evicts nothing for it
         assert!(save(&mut c, &prompt(9 * 512 + 50, 4), 9, &[9]).is_none());
         assert!(c.contains(a) && c.contains(d));
@@ -1014,7 +1068,10 @@ mod tests {
         // a prefix this host could not hold even with the store empty is refused, and nothing
         // is evicted for it
         assert!(save(&mut c, &prompt(5 * 512 + 50, 5), 5, &[5]).is_none());
-        assert_eq!((c.stats().entries, c.stats().evictions, c.stats().refused), (3, 1, 1));
+        assert_eq!(
+            (c.stats().entries, c.stats().evictions, c.stats().refused),
+            (3, 1, 1)
+        );
     }
 
     #[test]
@@ -1113,7 +1170,10 @@ mod tests {
         };
         let ring = 256 * MIB;
         // asked for and fits
-        assert_eq!(resolve_budget(Some(16 * gib), ring, &mem).unwrap().0, 16 * gib);
+        assert_eq!(
+            resolve_budget(Some(16 * gib), ring, &mem).unwrap().0,
+            16 * gib
+        );
         // asked for and does not fit: an error with both numbers
         let e = resolve_budget(Some(40 * gib), ring, &mem).unwrap_err();
         assert!(e.contains("40.00 GiB") && e.contains("40.25 GiB"), "{e}");
@@ -1128,8 +1188,14 @@ mod tests {
 
     #[test]
     fn digests_tell_configurations_apart() {
-        assert_eq!(digest128(b"model a, ctx 4096"), digest128(b"model a, ctx 4096"));
-        assert_ne!(digest128(b"model a, ctx 4096"), digest128(b"model a, ctx 8192"));
+        assert_eq!(
+            digest128(b"model a, ctx 4096"),
+            digest128(b"model a, ctx 4096")
+        );
+        assert_ne!(
+            digest128(b"model a, ctx 4096"),
+            digest128(b"model a, ctx 8192")
+        );
         assert_ne!(digest128(b""), digest128(b"\0"));
         assert_ne!(digest128(b"abcdefgh"), digest128(b"abcdefgi"));
     }

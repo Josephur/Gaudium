@@ -35,6 +35,9 @@ pub const RING_BUF_BYTES: usize = 64 * 1024 * 1024;
 /// copy is bound by memory traffic, two threads carry what the machine gives and more only
 /// take from each other (14.9 GiB/s to host with two, 10.4 with six).
 pub const COPY_THREADS: usize = 2;
+/// A copy to the host asks whether a request waits after each this many bytes it has copied out
+/// of the ring (and whenever a ring buffer is full).
+const STOP_CHECK_BYTES: usize = 8 * 1024 * 1024;
 /// Host copies below this stay on the calling thread.
 const PAR_MIN_BYTES: usize = 2 * 1024 * 1024;
 
@@ -264,12 +267,20 @@ impl XferRing {
                     cur = (cur + 1) % n;
                     fill = 0;
                     if busy[cur] {
-                        if let Err(e) = self.drain_d2h(cur, &mut jobs[cur], &mut stats) {
-                            res = Err(e);
-                            break 'pieces;
+                        match self.drain_d2h(cur, &mut jobs[cur], &mut stats, stop) {
+                            Ok(true) => {
+                                busy[cur] = false;
+                                done = ends[cur];
+                            }
+                            Ok(false) => {
+                                stopped = true;
+                                break 'pieces;
+                            }
+                            Err(e) => {
+                                res = Err(e);
+                                break 'pieces;
+                            }
                         }
-                        busy[cur] = false;
-                        done = ends[cur];
                     }
                     if stop() {
                         stopped = true;
@@ -302,10 +313,15 @@ impl XferRing {
             for k in 1..=n {
                 let b = (cur + k) % n;
                 if busy[b] {
-                    let r = self.drain_d2h(b, &mut jobs[b], &mut stats);
-                    busy[b] = false;
-                    match r {
-                        Ok(()) => done = ends[b],
+                    match self.drain_d2h(b, &mut jobs[b], &mut stats, stop) {
+                        Ok(true) => {
+                            busy[b] = false;
+                            done = ends[b];
+                        }
+                        Ok(false) => {
+                            stopped = true;
+                            break;
+                        }
                         Err(e) => {
                             res = Err(e);
                             break;
@@ -354,25 +370,41 @@ impl XferRing {
         Ok(())
     }
 
-    /// Waits for buffer `b`'s transfers and copies its bytes out to host memory.
+    /// Waits for buffer `b`'s transfers and copies its bytes out to host memory, asking `stop`
+    /// between slices of the copy. `Ok(false)`: it said yes and the rest was left in the ring.
     fn drain_d2h(
         &self,
         b: usize,
         jobs: &mut Vec<Job>,
         stats: &mut XferStats,
-    ) -> Result<(), SynapseError> {
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, SynapseError> {
         let t0 = Instant::now();
         let res = self.events[b].synchronize();
         stats.wait_s += t0.elapsed().as_secs_f64();
+        let mut whole = true;
         if res.is_ok() {
             let t1 = Instant::now();
-            // SAFETY: the transfers into the ring buffer are complete; the host ranges are the
-            // caller's (`d2h`'s contract).
-            unsafe { run_jobs(jobs, self.threads, true) };
+            let mut from = 0usize;
+            while from < jobs.len() {
+                if stop() {
+                    whole = false;
+                    break;
+                }
+                let (mut to, mut bytes) = (from, 0usize);
+                while to < jobs.len() && (bytes == 0 || bytes + jobs[to].len <= STOP_CHECK_BYTES) {
+                    bytes += jobs[to].len;
+                    to += 1;
+                }
+                // SAFETY: the transfers into the ring buffer are complete; the host ranges are
+                // the caller's (`d2h`'s contract).
+                unsafe { run_jobs(&jobs[from..to], self.threads, true) };
+                from = to;
+            }
             stats.copy_s += t1.elapsed().as_secs_f64();
         }
         jobs.clear();
-        res
+        res.map(|()| whole)
     }
 
     /// Copies host memory to device memory. Every transfer is complete when this returns.
@@ -564,7 +596,11 @@ unsafe fn run_jobs(jobs: &[Job], threads: usize, to_host: bool) {
                 t += 1;
                 used = 0;
             }
-            let room = if t + 1 < threads { share - used } else { usize::MAX };
+            let room = if t + 1 < threads {
+                share - used
+            } else {
+                usize::MAX
+            };
             let take = (j.len - off).min(room);
             parts[t].push(Job {
                 // SAFETY: `off + take <= j.len`.
@@ -601,8 +637,7 @@ pub unsafe fn stream_copy(src: *const u8, dst: *mut u8, len: usize) {
     {
         if len >= STREAM_MIN_BYTES {
             use std::arch::x86_64::{
-                __m128i, _mm_loadu_si128, _mm_prefetch, _mm_sfence, _mm_stream_si128,
-                _MM_HINT_NTA,
+                __m128i, _mm_loadu_si128, _mm_prefetch, _mm_sfence, _mm_stream_si128, _MM_HINT_NTA,
             };
             // SAFETY: the caller's contract; every access below stays inside `len` bytes.
             unsafe {
@@ -642,8 +677,7 @@ pub fn probe(gib: u64) -> Result<(), String> {
     use crate::verified::HbmCat;
     let gib = gib.clamp(1, 16);
     let bytes = gib << 30;
-    let api =
-        Arc::new(SynapseApi::load_default().map_err(|e| format!("load libSynapse.so: {e}"))?);
+    let api = Arc::new(SynapseApi::load_default().map_err(|e| format!("load libSynapse.so: {e}"))?);
     let mut dev =
         HpuDevice::open_gaudi2(Arc::clone(&api)).map_err(|e| format!("open Gaudi 2: {e}"))?;
     let addr = dev
@@ -790,7 +824,10 @@ mod tests {
         ] {
             let mut dst = vec![0xEEu8; n + 200];
             unsafe { stream_copy(src.as_ptr().add(so), dst.as_mut_ptr().add(d_off), len) };
-            assert!(dst[d_off..d_off + len] == src[so..so + len], "{so} {d_off} {len}");
+            assert!(
+                dst[d_off..d_off + len] == src[so..so + len],
+                "{so} {d_off} {len}"
+            );
             // nothing outside the range is written
             assert!(dst[..d_off].iter().all(|&b| b == 0xEE));
             assert!(dst[d_off + len..].iter().all(|&b| b == 0xEE));
@@ -830,7 +867,11 @@ mod tests {
                 let t1 = Instant::now();
                 for i in 0..n / piece {
                     unsafe {
-                        stream_copy(a.as_ptr().add(i * piece), c.as_mut_ptr().add(i * piece), piece)
+                        stream_copy(
+                            a.as_ptr().add(i * piece),
+                            c.as_mut_ptr().add(i * piece),
+                            piece,
+                        )
                     };
                 }
                 let streamed = t1.elapsed().as_secs_f64();
