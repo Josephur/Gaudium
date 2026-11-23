@@ -167,3 +167,18 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 ## 10. Temporary Testing Defaults (revert before a release)
 
 - **A2UI is on by default in the Web UI while it is being tested.** `DEFAULTS.a2ui` in `ui/js/lib/settings.js` is `true` so that "Interactive interfaces (A2UI)" is ticked without visiting the settings (it still only takes effect on a server started with `--a2ui`, and a browser that has saved the setting keeps its own value). The intended shipping default is `false`: A2UI adds about 2,100 tokens of instructions to every request's system turn. Set it back to `false` when testing ends, and remove this entry.
+
+---
+
+## 11. Leave the Card Serving When Testing Is Done
+
+When card testing is complete, leave the server running for the user with this configuration (site-specific service names, model paths and run helpers are in `AGENTS.local.md`):
+
+- **Model:** Qwen 3.8 27B (FP8 weights, the resident default).
+- **Speculative decoding:** DSpine with adaptive draft widths (`--draft-model <id=dir>` with a DSpine drafter; keep the adaptive `--draft-k` default).
+- **Vision:** on (the vision-language checkpoint, with its vision tower loaded).
+- **Context:** 256K (`--max-ctx 262144`, or `--model-ctx <id>=262144`).
+- **MCP proxy:** on.
+- **A2UI:** on (`--a2ui`).
+
+Before ending the session, confirm that the server is up and answers a request from the Web UI. If any of these features cannot be turned on yet, say which one in the hand-off rather than leaving a different configuration silently.
