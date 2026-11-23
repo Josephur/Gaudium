@@ -70,6 +70,10 @@ pub mod gguf_source;
 #[path = "inkling2_vision.rs"]
 pub mod vision;
 
+// Prefix reuse: taking over the rows the card holds from the request before.
+#[path = "inkling2_reuse.rs"]
+mod reuse;
+
 /// Rows of one chunk of a global layer's K / V cache (the softmax kernel stages one chunk).
 pub const IK_CHUNK: u64 = 4096;
 /// Largest prefill tile planned into the activation scratch.
@@ -1184,6 +1188,8 @@ pub struct Inkling2Engine {
     spec_rows: u64,
     /// Requests served so far (the host oracle drafter's streams are per request).
     requests: usize,
+    // reuse: the rows the card holds for the next request, and the copy of the rings
+    reuse: reuse::IkReuse,
 
     // Recipes (must drop before `dev`)
     head: CompiledRecipe,
@@ -1361,6 +1367,10 @@ impl Inkling2Engine {
         };
         let vis_bytes = vision.as_ref().map_or(0, |v| v.plan_bytes().0 + v.plan_bytes().1);
 
+        // reuse: on with `--prefix-cache` > 0 (the debug modes that write rows out of order
+        // keep it off)
+        let reuse_on = cfg.prefix_slots > 0 && !step_prefill && verify_check == 0;
+
         // ---- Plan: the largest prefill tile whose exact plan fits the card ----
         let mut tile = cfg.prefill_tile.clamp(1, IK_MAX_PREFILL_TILE);
         let (dims, plan) = loop {
@@ -1370,7 +1380,10 @@ impl Inkling2Engine {
                 d.n_apps = n.clamp(1, d.apps.len());
             }
             let p = IkPlan::build(&d, max_ctx, max_chunks, tile, step_rows);
-            let total = p.total(MIN_SHARED_WORKSPACE_BYTES) + vis_bytes;
+            // reuse: the copy of the rings is as large as the rings
+            let total = p.total(MIN_SHARED_WORKSPACE_BYTES)
+                + vis_bytes
+                + if reuse_on { p.ring_bytes() } else { 0 };
             match dev.check_plan_fits(total, HBM_HEADROOM_BYTES) {
                 Ok(_) => break (d, p),
                 Err(e) if tile <= IK_MIN_PREFILL_TILE => {
@@ -1464,8 +1477,9 @@ impl Inkling2Engine {
         let weights_bytes = plan.weights_bytes();
         let kv_bytes = plan.kv_bytes();
         let ring_bytes = plan.ring_bytes();
+        let snap_bytes = if reuse_on { ring_bytes } else { 0 };
         let act_bytes = plan.act_bytes();
-        let planned_total = plan.total(ws_bytes) + vis_bytes;
+        let planned_total = plan.total(ws_bytes) + vis_bytes + snap_bytes;
         dev.check_plan_fits(planned_total, HBM_HEADROOM_BYTES)
             .map_err(|e| format!("HBM plan check failed: {e}"))?;
         if cfg.verbose {
@@ -1490,7 +1504,7 @@ impl Inkling2Engine {
             .alloc_arena(kv_bytes.max(256), HbmCat::CatKv, "ik_global_kv_arena")
             .map_err(|e| format!("alloc global KV arena: {e}"))?;
         let mut ring_arena = dev
-            .alloc_arena(ring_bytes.max(256), HbmCat::CatKv, "ik_ring_arena")
+            .alloc_arena((ring_bytes + snap_bytes).max(256), HbmCat::CatKv, "ik_ring_arena")
             .map_err(|e| format!("alloc ring arena: {e}"))?;
         let mut act_arena = dev
             .alloc_arena(act_bytes, HbmCat::CatScratch, "ik_act_arena")
@@ -1513,6 +1527,23 @@ impl Inkling2Engine {
         }
         for (name, &bytes) in &plan.rings {
             kv_addr.insert(name.clone(), (suballoc(&mut ring_arena, bytes)?, bytes));
+        }
+        // reuse: the copy of the rings lies behind them
+        let mut reuse = reuse::IkReuse::new(
+            reuse_on,
+            dims.ring,
+            dims.window,
+            dims.hist,
+            dims.taps,
+        );
+        if reuse_on {
+            let (lo, used) = (ring_arena.base(), ring_arena.used());
+            if used != ring_bytes {
+                return Err(format!(
+                    "ring arena holds {used} bytes where the plan has {ring_bytes}"
+                ));
+            }
+            reuse.bind(lo, ring_bytes, suballoc(&mut ring_arena, ring_bytes)?);
         }
         let mut step_act_addr = BTreeMap::new();
         for (name, &bytes) in &plan.step_acts {
@@ -1542,7 +1573,13 @@ impl Inkling2Engine {
             .map_err(|e| format!("seal HBM allocations: {e}"))?;
 
         let (vis_w, vis_a) = vision.as_ref().map_or((0, 0), |v| v.plan_bytes());
-        let hbm_bytes = [weights_bytes + vis_w, kv_bytes, ring_bytes, act_bytes + vis_a, ws_bytes];
+        let hbm_bytes = [
+            weights_bytes + vis_w,
+            kv_bytes,
+            ring_bytes + snap_bytes,
+            act_bytes + vis_a,
+            ws_bytes,
+        ];
         live.set_hbm_bytes(
             hbm_bytes[0],
             hbm_bytes[1],
@@ -1653,6 +1690,7 @@ impl Inkling2Engine {
             draft: spec_cfg,
             spec_rows,
             requests: 0,
+            reuse,
             head,
             step_recipes: BTreeMap::new(),
             embed_recipes: HashMap::new(),
@@ -1968,6 +2006,8 @@ impl Inkling2Engine {
     /// `toks.len()` rows must be compiled) and returns each row's arg-max token.
     fn run_rows(&mut self, toks: &[i32], cursor: u64, bucket: u64) -> Result<Vec<i32>, String> {
         let rows = toks.len();
+        // reuse: every row of the pass is written, accepted or not
+        self.reuse.will_write(cursor + rows as u64);
         let (ids, cur, tokens) = (
             self.step_act_addr["ids"].0,
             self.step_act_addr["cursor"].0,
@@ -2244,9 +2284,13 @@ impl Inkling2Engine {
             &method_label,
         );
         self.live.end_request();
-        if res.is_err() {
+        match &res {
+            // reuse: the rows of the tokens fed during the decode are held too
+            Ok(rep) => self.reuse_request_done(prompt_ids.len(), &rep.generated_tokens),
             // never leave a launch queued behind an error return
-            let _ = self.dev.sync_all();
+            Err(_) => {
+                let _ = self.dev.sync_all();
+            }
         }
         res
     }
@@ -2256,13 +2300,15 @@ impl Inkling2Engine {
     fn prefill_tiles(
         &mut self,
         prompt_ids: &[i32],
+        start: usize,
         params: &GenParams,
         is_cancelled: &impl Fn() -> bool,
     ) -> Result<Option<(i32, f64)>, String> {
         let n_apps = self.dims.n_apps;
         let hid = self.dims.hid;
         let kinds = self.dims.kinds();
-        let mut pos = 0usize;
+        // reuse: the rows before `start` are taken over from the card
+        let mut pos = start;
         let mut last_tile = 0u64;
         let mut last_valid = 0u64;
         let mut recipe_ms = 0.0f64;
@@ -2278,6 +2324,7 @@ impl Inkling2Engine {
             let t = ik_tile_rows(tv, self.prefill_tile, self.max_ctx - pos as u64);
             let end_pos = pos as u64 + t;
             let nch = step_bucket(end_pos.div_ceil(IK_CHUNK), self.max_chunks);
+            self.reuse.will_write(end_pos);
             last_tile = t;
             last_valid = tv;
 
@@ -2317,6 +2364,7 @@ impl Inkling2Engine {
             }
             self.sync_compute("prefill tile")?;
             pos += tv as usize;
+            self.reuse.rows_in(pos);
             self.live.prefill_progress(pos as u64);
         }
 
@@ -2388,6 +2436,9 @@ impl Inkling2Engine {
             ..GenReport::default()
         };
 
+        // reuse: where the prefill starts (0: nothing is taken over)
+        let (start, prefix_common) = self.reuse_begin(prompt_ids, params.cache_prompt)?;
+
         // ---- PREFILL ----
         let (first_tok, recipe_ms) = if self.step_prefill {
             // debug: the prompt one row at a time through the decode step
@@ -2403,7 +2454,7 @@ impl Inkling2Engine {
             }
             (tok, 0.0)
         } else {
-            match self.prefill_tiles(prompt_ids, params, is_cancelled)? {
+            match self.prefill_tiles(prompt_ids, start, params, is_cancelled)? {
                 Some(v) => v,
                 None => return Ok(cancelled_report(t_prefill.elapsed().as_secs_f64() * 1000.0)),
             }
@@ -2413,11 +2464,12 @@ impl Inkling2Engine {
         }
 
         let ttft_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-        let prefill_tok_s = (prompt_ids.len() as f64) / ((ttft_ms - recipe_ms).max(1e-6) / 1000.0);
+        let prefilled = prompt_ids.len() - start;
+        let prefill_tok_s = (prefilled as f64) / ((ttft_ms - recipe_ms).max(1e-6) / 1000.0);
         if self.verbose {
             eprintln!(
-                "[gaudium] inkling2 prefill: {} tok, tiles of <= {} rows, {:.1} ms to first token of which {:.1} ms first-use recipe compile/load (excluded from the prefill rate: {:.1} tok/s)",
-                prompt_ids.len(),
+                "[gaudium] inkling2 prefill: {} tok ({start} taken over), tiles of <= {} rows, {:.1} ms to first token of which {:.1} ms first-use recipe compile/load (excluded from the prefill rate: {:.1} tok/s)",
+                prefilled,
                 self.prefill_tile,
                 ttft_ms,
                 recipe_ms,
@@ -2436,6 +2488,8 @@ impl Inkling2Engine {
         } else if is_cancelled() {
             stopped_by_cancel = true;
         }
+        // reuse: the prompt is in (after the first token left, so the copy is not in its time)
+        self.reuse_prompt_in()?;
 
         // ---- DECODE, speculative: an engine loaded with a drafter ----
         if self.draft.is_some()
@@ -2458,6 +2512,8 @@ impl Inkling2Engine {
             let k = self.spec_rows - 1;
             return Ok(GenReport {
                 prompt_tokens: prompt_ids.len(),
+                reused_tokens: start as u64,
+                prefix_common: prefix_common as u64,
                 generated_tokens: generated,
                 ttft_ms,
                 prefill_tok_s,
@@ -2537,6 +2593,8 @@ impl Inkling2Engine {
         };
         Ok(GenReport {
             prompt_tokens: prompt_ids.len(),
+            reused_tokens: start as u64,
+            prefix_common: prefix_common as u64,
             generated_tokens: generated,
             ttft_ms,
             prefill_tok_s,

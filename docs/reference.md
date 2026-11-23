@@ -78,6 +78,10 @@ Serve options:
                         it and says so. A request with cache_prompt: false prefills
                         its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a
                         drafter or with DSpine
+                        (N positions), and Inkling 2 (any N > 0: the rows on the card
+                        are resumed while the bounded rings still hold what the rest
+                        of the prompt reads, and a copy of the rings taken when each
+                        prompt is in, 0.6 GiB, covers a long generation after it)
   --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a
                         conversation: after another conversation, another model, or
                         the idle release (--idle-park). What a request could resume

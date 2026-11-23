@@ -100,6 +100,10 @@ fn print_usage() {
          \x20                       it and says so. A request with cache_prompt: false prefills\n\
          \x20                       its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a\n\
          \x20                       drafter or with DSpine\n\
+         \x20                       (N positions), and Inkling 2 (any N > 0: the rows on the card\n\
+         \x20                       are resumed while the bounded rings still hold what the rest\n\
+         \x20                       of the prompt reads, and a copy of the rings taken when each\n\
+         \x20                       prompt is in, 0.6 GiB, covers a long generation after it)\n\
          \x20 --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a\n\
          \x20                       conversation: after another conversation, another model, or\n\
          \x20                       the idle release (--idle-park). What a request could resume\n\

@@ -1574,6 +1574,30 @@ impl Inkling2Engine {
         }
     }
 
+    /// The placeholder token and, for each image of the current request in prompt order, a
+    /// fingerprint of its tower input and its number of rows (prefix reuse compares image rows
+    /// by these; a text request, or an engine without a tower: no images, and a token no
+    /// prompt holds).
+    pub(super) fn ikv_request_keys(&self) -> (i32, Vec<(u64, u64)>) {
+        use std::hash::{Hash, Hasher};
+        let Some(vis) = self.vision.as_ref() else {
+            return (-1, Vec::new());
+        };
+        let m = vis.plan.d.merge as usize;
+        let images = vis.active.as_ref().map_or_else(Vec::new, |req| {
+            req.images
+                .iter()
+                .map(|im| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (im.grid_h, im.grid_w).hash(&mut h);
+                    im.pixels.hash(&mut h);
+                    (h.finish(), ((im.grid_h / m) * (im.grid_w / m)) as u64)
+                })
+                .collect()
+        });
+        (vis.image_token_id, images)
+    }
+
     /// Runs the tower over the current request's images, writing their features into the
     /// feature buffer in prompt order (prefill time: it counts in the time to first token).
     pub(super) fn ikv_run_tower(&mut self) -> Result<(), String> {
