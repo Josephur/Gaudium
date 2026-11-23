@@ -1661,17 +1661,17 @@ impl Qwen3Engine {
                 "DeltaNet conv-state rings",
                 n_lin * 2 * align256(cs_ring_bytes),
             );
-            for slot in 0..pfx_granted {
+            for _ in 0..pfx_granted {
                 r.add(
                     HbmCat::CatCheckpoints,
                     "prefix",
-                    &format!("kept position {slot}: DeltaNet state"),
+                    "kept position: DeltaNet state",
                     n_lin * align256(s_one_bytes),
                 );
                 r.add(
                     HbmCat::CatCheckpoints,
                     "prefix",
-                    &format!("kept position {slot}: DeltaNet conv state"),
+                    "kept position: DeltaNet conv state",
                     n_lin * align256(cs_one_bytes),
                 );
             }
@@ -1844,7 +1844,7 @@ impl Qwen3Engine {
             eprintln!(
                 "[gaudium] HBM plan fits: weights={:.2} GiB, kv+state={:.2} GiB, acts={:.2} MiB, ws={:.2} MiB",
                 weights_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                (kv_bytes + pfx_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
                 act_bytes as f64 / (1024.0 * 1024.0),
                 ws_bytes as f64 / (1024.0 * 1024.0),
             );

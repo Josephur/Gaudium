@@ -802,9 +802,10 @@ mod tests {
     #[test]
     fn today_s_tuning_values() {
         // pinned here, not in a law: the guard and the ladder may change with measurements
-        assert_eq!(crate::verified::pc_tail_guard(), 32);
+        assert_eq!(crate::verified::pc_tail_guard(), 8);
         assert_eq!(pc_anchor_tiles(8 * 512 + 100, 512), 8);
-        assert_eq!(pc_anchor_tiles(8 * 512 + 20, 512), 7);
+        assert_eq!(pc_anchor_tiles(8 * 512 + 9, 512), 8);
+        assert_eq!(pc_anchor_tiles(8 * 512 + 8, 512), 7);
         let back: Vec<u64> = (0..5).map(crate::verified::pc_ladder_back).collect();
         assert_eq!(back, vec![0, 1, 3, 7, 15]);
         assert_eq!(DEFAULT_SLOTS, 8);

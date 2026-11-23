@@ -1248,8 +1248,7 @@ fn prefix_reuse_is_reported_to_the_client() {
     let last = text
         .lines()
         .filter_map(|l| l.strip_prefix("data: "))
-        .filter(|l| l.contains("\"usage\""))
-        .last()
+        .rfind(|l| l.contains("\"usage\""))
         .expect("a final chunk with usage");
     let fin = json::parse_json(last).unwrap();
     assert_eq!(u(&fin, &["timings", "cache_n"]), cached);

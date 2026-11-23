@@ -315,9 +315,11 @@ def pc_capture_ok(+tiles: Nat, resume_tiles: Nat, prompt_len: Nat, tile: Nat) ->
   Bool.and(Nat.is_lt(resume_tiles, tiles), Nat.is_lt(pc_boundary(tiles, tile), prompt_len))
 
 # Rows at the end of a prompt that the next turn's prompt may render differently (the opening
-# of the answer): the position a request keeps first lies before them.
+# of the answer): the position a request keeps first lies before them. Measured with the chat
+# template of the served model: the next turn shares the whole prompt, or all but its last row
+# when the client does not send the reasoning back.
 def pc_tail_guard() -> Nat:
-  32n
+  8n
 
 # Tiles of the first position a request wants to keep: the last tile boundary an appended
 # turn can still share.
@@ -526,7 +528,21 @@ def pc_zeroed_rows_never_reused(w, s):
     case False{}: {==}
     case True{}: {==}
 
-# LAW PC.9: a slot that is being written is never one a request may resume from.
+# LAW PC.9: an engine that cannot resume a prefill never does.
+law pc_unsupported_never_reuses:
+  for +w: Bool
+  for +z: Bool
+  {pc_request_may_reuse(w, z, False{}) == False{} : Bool}
+
+def pc_unsupported_never_reuses(w, z):
+  match w:
+    case False{}: {==}
+    case True{}:
+      match z:
+        case False{}: {==}
+        case True{}: {==}
+
+# LAW PC.10: a slot that is being written is never one a request may resume from.
 law pc_writing_not_readable:
   for +s: PcSlot
   for +t: Nat
@@ -535,7 +551,7 @@ law pc_writing_not_readable:
 def pc_writing_not_readable(s, t):
   {==}
 
-# LAW PC.10: a write that did not finish leaves the slot empty, whatever it held before.
+# LAW PC.11: a write that did not finish leaves the slot empty, whatever it held before.
 law pc_abort_leaves_nothing:
   for +s: PcSlot
   for +t: Nat
@@ -544,7 +560,7 @@ law pc_abort_leaves_nothing:
 def pc_abort_leaves_nothing(s, t):
   {==}
 
-# LAW PC.11: a finished write holds the position that was written, and no other.
+# LAW PC.12: a finished write holds the position that was written, and no other.
 law pc_commit_holds_what_was_written:
   for +s: PcSlot
   for +t: Nat
@@ -553,7 +569,7 @@ law pc_commit_holds_what_was_written:
 def pc_commit_holds_what_was_written(s, t):
   {==}
 
-# LAW PC.12: committing never makes an empty slot readable.
+# LAW PC.13: committing never makes an empty slot readable.
 law pc_commit_empty_stays_empty:
   for u: Unit
   {pc_readable(pc_commit(PcEmpty{})) == False{} : Bool}
@@ -568,7 +584,7 @@ def pc_retain_aux(t: Nat, tile: Nat, cap: Nat, b: Bool, h: {Bool.and(b, Nat.is_l
     case False{}:
       {==}
 
-# LAW PC.13: for a new prompt, no slot stays readable whose position lies past the rows the
+# LAW PC.14: for a new prompt, no slot stays readable whose position lies past the rows the
 # prompt shares with the held one.
 law pc_retain_within_cap:
   for +s: PcSlot
@@ -585,7 +601,7 @@ def pc_retain_within_cap(s, cap, tile):
     case PcHeld{t}:
       pc_retain_aux(t, tile, cap, Nat.is_le(pc_boundary(t, tile), cap), pc_le_lt_excl(pc_boundary(t, tile), cap))
 
-# LAW PC.14: a slot left in the middle of a write is never kept for a new prompt.
+# LAW PC.15: a slot left in the middle of a write is never kept for a new prompt.
 law pc_retain_drops_unfinished:
   for +t: Nat
   for +cap: Nat
@@ -595,7 +611,7 @@ law pc_retain_drops_unfinished:
 def pc_retain_drops_unfinished(t, cap, tile):
   {==}
 
-# LAW PC.15: a request never keeps a state at or past the end of its prompt.
+# LAW PC.16: a request never keeps a state at or past the end of its prompt.
 law pc_capture_before_prompt_end:
   for +k: Nat
   for +r: Nat
@@ -606,7 +622,7 @@ law pc_capture_before_prompt_end:
 def pc_capture_before_prompt_end(k, r, p, tile):
   pc_and3_excl(Nat.is_lt(r, k), Nat.is_lt(pc_boundary(k, tile), p), Nat.is_le(p, pc_boundary(k, tile)), pc_lt_le_excl(pc_boundary(k, tile), p))
 
-# LAW PC.16: a request never keeps a state at or before its resume point: every state it
+# LAW PC.17: a request never keeps a state at or before its resume point: every state it
 # writes into a slot is one its own tiles computed.
 law pc_capture_past_resume:
   for +k: Nat
@@ -618,7 +634,7 @@ law pc_capture_past_resume:
 def pc_capture_past_resume(k, r, p, tile):
   pc_and3_excl_l(Nat.is_lt(r, k), Nat.is_lt(pc_boundary(k, tile), p), Nat.is_le(k, r), pc_lt_le_excl(r, k))
 
-# LAW PC.17: a wanted position never lies past the anchor.
+# LAW PC.18: a wanted position never lies past the anchor.
 law pc_ladder_within_anchor:
   for +a: Nat
   for +rank: Nat
@@ -627,7 +643,7 @@ law pc_ladder_within_anchor:
 def pc_ladder_within_anchor(a, rank):
   pc_sub_le_self(a, pc_ladder_back(rank))
 
-# LAW PC.18: a slot that is being written is never given to another position.
+# LAW PC.19: a slot that is being written is never given to another position.
 law pc_writing_slot_not_usable:
   for +t: Nat
   for +r: Bool
@@ -637,7 +653,7 @@ law pc_writing_slot_not_usable:
 def pc_writing_slot_not_usable(t, r, m):
   {==}
 
-# LAW PC.19: the slot a request resumes from is never written by the tile that reads it.
+# LAW PC.20: the slot a request resumes from is never written by the tile that reads it.
 law pc_resume_slot_not_same_tile:
   for +t: Nat
   {pc_class_usable(pc_victim_class(PcHeld{t}, True{}, True{})) == False{} : Bool}
@@ -645,18 +661,30 @@ law pc_resume_slot_not_same_tile:
 def pc_resume_slot_not_same_tile(t):
   {==}
 
-# LAW PC.20: a slot that holds a position is never preferred to a free one: nothing is dropped
-# while a slot is free.
+def pc_held_not_before_free(+r: Bool, +m: Bool, +ca: Nat, +cb: Nat) -> {pc_victim_better(pc_victim_class_held(r, m), ca, 0n, cb) == False{} : Bool}:
+  match r:
+    case False{}: {==}
+    case True{}:
+      match m:
+        case True{}: {==}
+        case False{}: {==}
+
+# LAW PC.21: a slot that holds a position is never preferred to an empty one: nothing is
+# dropped while a slot is free.
 law pc_free_slot_first:
-  for +c: Nat
+  for +t: Nat
+  for +r: Bool
+  for +m: Bool
   for +ca: Nat
+  for +r2: Bool
+  for +m2: Bool
   for +cb: Nat
-  {pc_victim_better(1n+c, ca, 0n, cb) == False{} : Bool}
+  {pc_victim_better(pc_victim_class(PcHeld{t}, r, m), ca, pc_victim_class(PcEmpty{}, r2, m2), cb) == False{} : Bool}
 
-def pc_free_slot_first(c, ca, cb):
-  {==}
+def pc_free_slot_first(t, r, m, ca, r2, m2, cb):
+  pc_held_not_before_free(r, m, ca, cb)
 
-# LAW PC.21: no slot is better than itself, so the choice among slots is stable.
+# LAW PC.22: no slot is better than itself, so the choice among slots is stable.
 law pc_victim_better_irreflexive:
   for +c: Nat
   for +k: Nat
@@ -667,27 +695,29 @@ def pc_victim_better_irreflexive(c, k):
   %Equal.sym(Bool, Nat.is_gt(k, k), False{}, pc_gt_refl(k)) : {Bool.and(Nat.is_eq(c, c), _) == False{} : Bool}
   pc_and_false_r(Nat.is_eq(c, c))
 
-# LAW PC.22: a slot that is not usable is never taken, whatever the costs.
-law pc_unusable_never_taken:
+# LAW PC.23: a slot that is being written is never taken for another position, whatever the
+# positions are worth.
+law pc_writing_slot_never_taken:
   for +n: Nat
-  for +c: Nat
+  for +t: Nat
+  for +r: Bool
+  for +m: Bool
   for +k: Nat
-  {pc_may_take(n, 1n+1n+1n+c, k) == False{} : Bool}
+  {pc_may_take(n, pc_victim_class(PcWriting{t}, r, m), k) == False{} : Bool}
 
-def pc_unusable_never_taken(n, c, k):
-  match c:
-    case 0n: {==}
-    case 1n+_: {==}
+def pc_writing_slot_never_taken(n, t, r, m, k):
+  {==}
 
-# LAW PC.23: a held position is never replaced by one worth the same.
-law pc_equal_cost_never_replaces:
-  for +c: Nat
+# LAW PC.24: the slot a request resumes from is never taken by the tile that reads it,
+# whatever the positions are worth.
+law pc_resume_slot_never_taken_by_its_reader:
+  for +n: Nat
+  for +t: Nat
   for +k: Nat
-  {pc_may_take(k, 1n+c, k) == False{} : Bool}
+  {pc_may_take(n, pc_victim_class(PcHeld{t}, True{}, True{}), k) == False{} : Bool}
 
-def pc_equal_cost_never_replaces(c, k):
-  %Equal.sym(Bool, Nat.is_lt(k, k), False{}, pc_lt_refl(k)) : {Bool.and(pc_class_usable(1n+c), _) == False{} : Bool}
-  pc_and_false_r(pc_class_usable(1n+c))
+def pc_resume_slot_never_taken_by_its_reader(n, t, k):
+  {==}
 
 def pc_grant_none_aux(g: Nat, b: Bool) -> {Bool.or(b, Nat.is_eq(pc_grant_pick(g, b), 0n)) == True{} : Bool}:
   match b:
@@ -696,7 +726,7 @@ def pc_grant_none_aux(g: Nat, b: Bool) -> {Bool.or(b, Nat.is_eq(pc_grant_pick(g,
     case False{}:
       {==}
 
-# LAW PC.24: zero slots are granted whenever the granted count does not fit beside the plan.
+# LAW PC.25: zero slots are granted whenever the granted count does not fit beside the plan.
 law pc_grant_none_when_over:
   for +g: Nat
   for +sb: Nat
@@ -714,7 +744,7 @@ def pc_grant_le_aux(g: Nat, b: Bool) -> {Nat.is_le(pc_grant_pick(g, b), g) == Tr
     case False{}:
       pc_zero_le(g)
 
-# LAW PC.25: the granted slots never exceed the count asked for.
+# LAW PC.26: the granted slots never exceed the count asked for.
 law pc_grant_within_request:
   for +g: Nat
   for +sb: Nat
@@ -725,7 +755,7 @@ law pc_grant_within_request:
 def pc_grant_within_request(g, sb, bp, u):
   pc_grant_le_aux(g, pc_plan_fits(g, sb, bp, u))
 
-# LAW PC.26: a resumed request's drafter never reads a ring row below both the rows that were
+# LAW PC.27: a resumed request's drafter never reads a ring row below both the rows that were
 # valid before it and the rows its own prefill writes again.
 law pc_ring_flo_bound:
   for +f: Nat
@@ -735,7 +765,7 @@ law pc_ring_flo_bound:
 def pc_ring_flo_bound(f, r):
   pc_le_refl(Nat.min(f, r))
 
-# LAW PC.27: the rows a request's own prefill writes are always readable by its drafter.
+# LAW PC.28: the rows a request's own prefill writes are always readable by its drafter.
 law pc_ring_flo_within_resume:
   for +f: Nat
   for +r: Nat
@@ -744,7 +774,7 @@ law pc_ring_flo_within_resume:
 def pc_ring_flo_within_resume(f, r):
   pc_min_le_r(f, r)
 
-# LAW PC.28: after a request, no position that its writes overwrote in the ring counts as valid.
+# LAW PC.29: after a request, no position that its writes overwrote in the ring counts as valid.
 law pc_ring_from_past_wrap:
   for +f: Nat
   for +r: Nat
@@ -755,7 +785,7 @@ law pc_ring_from_past_wrap:
 def pc_ring_from_past_wrap(f, r, e, g):
   pc_le_max_r(pc_ring_flo(f, r), Nat.sub(e, g))
 
-# LAW PC.29: nor any position that was not valid for the request itself.
+# LAW PC.30: nor any position that was not valid for the request itself.
 law pc_ring_from_past_flo:
   for +f: Nat
   for +r: Nat
@@ -766,7 +796,7 @@ law pc_ring_from_past_flo:
 def pc_ring_from_past_flo(f, r, e, g):
   pc_le_max_l(pc_ring_flo(f, r), Nat.sub(e, g))
 
-# LAW PC.30: reused rows and prefilled rows of a prompt add up to the prompt.
+# LAW PC.31: reused rows and prefilled rows of a prompt add up to the prompt.
 law pc_rows_conserved:
   for +p: Nat
   for +r: Nat
@@ -775,7 +805,7 @@ law pc_rows_conserved:
 def pc_rows_conserved(p, r):
   pc_split_sum(p, r)
 
-# LAW PC.31: the reused rows never exceed the prompt.
+# LAW PC.32: the reused rows never exceed the prompt.
 law pc_reused_within_prompt:
   for +p: Nat
   for +r: Nat
