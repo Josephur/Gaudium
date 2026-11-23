@@ -255,7 +255,7 @@ fn pos_rows_match_the_reference() {
         &std::fs::read_to_string(std::path::Path::new(&dir).join("config.json")).unwrap(),
     )
     .unwrap();
-    let (table, cls) = host_tables(&store, &d).unwrap();
+    let (table, cls) = host_tables(&StTower(&store), &d).unwrap();
     let fx = fixture();
     let s = spec();
     for (name, img) in fixture_images() {
@@ -351,6 +351,7 @@ fn requests_are_checked_against_the_plan() {
     let d = IkvDims::from_config_json(CONFIG).unwrap();
     let mut v = IkVision {
         spec: spec(),
+        from: TowerFile::Checkpoint,
         plan: IkvPlan::new(d, &text, 4 * 144, 200, 256).unwrap(),
         text_hid: 2304,
         image_token_id: 200_054,

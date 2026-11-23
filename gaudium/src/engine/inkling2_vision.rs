@@ -136,7 +136,7 @@ impl IkvDims {
             .and_then(|r| r.get("rope_theta"))
             .and_then(JsonValue::as_f64)
             .or_else(|| vc.get("rope_theta").and_then(JsonValue::as_f64))
-            .unwrap_or(10_000.0);
+            .unwrap_or(FAMILY.rope_theta);
         let d = Self {
             hid,
             layers: u("num_hidden_layers", 23),
@@ -156,7 +156,7 @@ impl IkvDims {
             grid: u("posemb_grid_size", 32),
             proj: u("projection_hidden_dim", 4096),
             out: u("text_hidden_size", 4608),
-            channels: u("num_channels", 3),
+            channels: u("num_channels", FAMILY.channels),
             eps: vc
                 .get("layer_norm_eps")
                 .and_then(JsonValue::as_f64)
@@ -179,7 +179,7 @@ impl IkvDims {
         Ok(d)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.hid == 0 || self.layers == 0 || self.nh == 0 || self.inter == 0 || self.proj == 0 {
             return Err("vision_config: sizes must be positive".into());
         }
@@ -236,7 +236,7 @@ pub fn vision_spec(config_json: &str, processor_json: Option<&str>) -> Result<Vi
         .map_or(DEFAULT_IMAGE_TOKEN_ID, |v| v as i32);
     let mut mean = [0.5f64; 3];
     let mut std = [0.5f64; 3];
-    let mut token = DEFAULT_IMAGE_TOKEN.to_string();
+    let mut token = FAMILY.image_token.to_string();
     if let Some(text) = processor_json {
         let p = parse_json(text).map_err(|e| format!("processor_config.json: {e}"))?;
         if let Some(t) = p.get("image_token").and_then(JsonValue::as_str) {
@@ -269,12 +269,45 @@ pub fn vision_spec(config_json: &str, processor_json: Option<&str>) -> Result<Vi
             }
         }
     }
+    tiled_spec(&d, image_token_id, &token, mean, std)
+}
+
+/// What the family fixes that a model's files need not carry: the tower's own configuration
+/// gives everything else (`config.json` `vision_config`, or a projector file's metadata).
+pub struct FamilyFixed {
+    /// The placeholder token of one image and the template's marker in front of it.
+    pub image_token: &'static str,
+    pub content_image: &'static str,
+    /// The rotary code of the tower: axial, on interleaved pairs, with this base.
+    pub rope_theta: f64,
+    /// Colour channels of a patch.
+    pub channels: u64,
+    /// The projector type a projector file of this family names (`clip.vision.projector_type`).
+    pub projector_type: &'static str,
+}
+
+pub const FAMILY: FamilyFixed = FamilyFixed {
+    image_token: DEFAULT_IMAGE_TOKEN,
+    content_image: CONTENT_IMAGE,
+    rope_theta: 10_000.0,
+    channels: 3,
+    projector_type: "inkling2v",
+};
+
+/// The tiled processor's `VisionSpec` of a tower of geometry `d`.
+pub fn tiled_spec(
+    d: &IkvDims,
+    image_token_id: i32,
+    token: &str,
+    mean: [f64; 3],
+    std: [f64; 3],
+) -> Result<VisionSpec, String> {
     if std.contains(&0.0) {
         return Err("image_std holds a zero".into());
     }
     let s = VisionSpec {
         processor: ImageProcessor::Tiles,
-        image_block: format!("{CONTENT_IMAGE}{token}"),
+        image_block: format!("{}{token}", FAMILY.content_image),
         depth: d.layers,
         hidden: d.hid,
         n_heads: d.nh,
@@ -991,6 +1024,31 @@ impl IkvPlan {
 // Weights
 // ============================================================================
 
+/// Where the tower's weights are read from: the tensors of the publisher's tower under their
+/// names below `model.visual.`, in the publisher's shape and element order, whatever file holds
+/// them (the checkpoint, [`StTower`]; a GGUF projector file, [`gguf_tower::ProjectorSource`]).
+pub trait TowerSource {
+    /// Tensor `name` as BF16 bytes of shape `shape`.
+    fn bf16(&self, name: &str, shape: &[u64]) -> Result<std::borrow::Cow<'_, [u8]>, String>;
+    /// Tensor `name` of `len` values (a norm's weight or bias) as f32.
+    fn f32s(&self, name: &str, len: u64) -> Result<Vec<f32>, String>;
+}
+
+/// The checkpoint's safetensors as a tower source (every tower tensor is BF16).
+pub struct StTower<'a>(pub &'a SafetensorsStore);
+
+impl TowerSource for StTower<'_> {
+    fn bf16(&self, name: &str, shape: &[u64]) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+        ckpt(self.0, name, shape).map(std::borrow::Cow::Borrowed)
+    }
+    fn f32s(&self, name: &str, len: u64) -> Result<Vec<f32>, String> {
+        Ok(bf16s(ckpt(self.0, name, &[len])?)
+            .iter()
+            .map(|&x| bf16_to_f32(x))
+            .collect())
+    }
+}
+
 fn ckpt<'a>(store: &'a SafetensorsStore, name: &str, shape: &[u64]) -> Result<&'a [u8], String> {
     let full = format!("model.visual.{name}");
     let t = store
@@ -1047,27 +1105,19 @@ fn rotate_pairs(v: &[u16], width: usize) -> Vec<u16> {
 }
 
 /// The device bytes of tower weight `name`.
-pub fn pack_weight(store: &SafetensorsStore, d: &IkvDims, name: &str) -> Result<Vec<u8>, String> {
+pub fn pack_weight(src: &dyn TowerSource, d: &IkvDims, name: &str) -> Result<Vec<u8>, String> {
     let (h, inter) = (d.hid, d.inter);
-    let f32_of = |n: &str, len: u64| -> Result<Vec<u8>, String> {
-        let v = bf16s(ckpt(store, n, &[len])?);
-        Ok(f32_bytes(
-            &v.iter().map(|&x| bf16_to_f32(x)).collect::<Vec<_>>(),
-        ))
-    };
+    let f32_of = |n: &str, len: u64| -> Result<Vec<u8>, String> { Ok(f32_bytes(&src.f32s(n, len)?)) };
     match name {
         "VW_patch_W" => {
-            return Ok(ckpt(
-                store,
-                "backbone.embeddings.patch_embedding.weight",
-                &[h, d.row_len()],
-            )?
-            .to_vec())
+            return Ok(src
+                .bf16("backbone.embeddings.patch_embedding.weight", &[h, d.row_len()])?
+                .into_owned())
         }
         "VW_pre_w" => return f32_of("backbone.ln_pre.weight", h),
         "VW_pre_b" => return f32_of("backbone.ln_pre.bias", h),
-        "VM_in_W" => return Ok(ckpt(store, "proj_in.weight", &[d.proj, d.merged()])?.to_vec()),
-        "VM_out_W" => return Ok(ckpt(store, "proj_out.weight", &[d.out, d.proj])?.to_vec()),
+        "VM_in_W" => return Ok(src.bf16("proj_in.weight", &[d.proj, d.merged()])?.into_owned()),
+        "VM_out_W" => return Ok(src.bf16("proj_out.weight", &[d.out, d.proj])?.into_owned()),
         _ => {}
     }
     let (l, kind) = name
@@ -1076,7 +1126,7 @@ pub fn pack_weight(store: &SafetensorsStore, d: &IkvDims, name: &str) -> Result<
         .and_then(|(i, k)| i.parse::<u64>().ok().map(|i| (i, k)))
         .ok_or_else(|| format!("no packer for tower tensor '{name}'"))?;
     let p = format!("backbone.layers.{l}.");
-    let raw = |s: &str, shape: &[u64]| ckpt(store, &format!("{p}{s}"), shape);
+    let raw = |s: &str, shape: &[u64]| src.bf16(&format!("{p}{s}"), shape);
     let scale = 1.0 / (d.dh as f32).sqrt();
     if scale.log2().fract() != 0.0 {
         return Err(format!(
@@ -1090,63 +1140,54 @@ pub fn pack_weight(store: &SafetensorsStore, d: &IkvDims, name: &str) -> Result<
         "n2_w" => f32_of(&format!("{p}ln_2.weight"), h)?,
         "n2_b" => f32_of(&format!("{p}ln_2.bias"), h)?,
         "q_W" => u16_bytes(&scale_pow2(
-            &bf16s(raw("self_attn.q_proj.weight", &[h, h])?),
+            &bf16s(&raw("self_attn.q_proj.weight", &[h, h])?),
             scale,
         )),
         "q_b" => u16_bytes(&scale_pow2(
-            &bf16s(raw("self_attn.q_proj.bias", &[h])?),
+            &bf16s(&raw("self_attn.q_proj.bias", &[h])?),
             scale,
         )),
         "qr_W" => u16_bytes(&rotate_pairs(
-            &scale_pow2(&bf16s(raw("self_attn.q_proj.weight", &[h, h])?), scale),
+            &scale_pow2(&bf16s(&raw("self_attn.q_proj.weight", &[h, h])?), scale),
             h as usize,
         )),
         "qr_b" => u16_bytes(&rotate_pairs(
-            &scale_pow2(&bf16s(raw("self_attn.q_proj.bias", &[h])?), scale),
+            &scale_pow2(&bf16s(&raw("self_attn.q_proj.bias", &[h])?), scale),
             1,
         )),
-        "k_W" => raw("self_attn.k_proj.weight", &[h, h])?.to_vec(),
-        "k_b" => raw("self_attn.k_proj.bias", &[h])?.to_vec(),
+        "k_W" => raw("self_attn.k_proj.weight", &[h, h])?.into_owned(),
+        "k_b" => raw("self_attn.k_proj.bias", &[h])?.into_owned(),
         "kr_W" => u16_bytes(&rotate_pairs(
-            &bf16s(raw("self_attn.k_proj.weight", &[h, h])?),
+            &bf16s(&raw("self_attn.k_proj.weight", &[h, h])?),
             h as usize,
         )),
         "kr_b" => u16_bytes(&rotate_pairs(
-            &bf16s(raw("self_attn.k_proj.bias", &[h])?),
+            &bf16s(&raw("self_attn.k_proj.bias", &[h])?),
             1,
         )),
-        "v_W" => raw("self_attn.v_proj.weight", &[h, h])?.to_vec(),
-        "v_b" => raw("self_attn.v_proj.bias", &[h])?.to_vec(),
-        "o_W" => raw("self_attn.out_proj.weight", &[h, h])?.to_vec(),
-        "o_b" => raw("self_attn.out_proj.bias", &[h])?.to_vec(),
-        "ls1" => raw("ls_1.gamma", &[h])?.to_vec(),
-        "ls2" => raw("ls_2.gamma", &[h])?.to_vec(),
-        "fc1_W" => raw("mlp.c_fc.weight", &[inter, h])?.to_vec(),
-        "fc1_b" => raw("mlp.c_fc.bias", &[inter])?.to_vec(),
-        "fc2_W" => raw("mlp.c_proj.weight", &[h, inter])?.to_vec(),
-        "fc2_b" => raw("mlp.c_proj.bias", &[h])?.to_vec(),
+        "v_W" => raw("self_attn.v_proj.weight", &[h, h])?.into_owned(),
+        "v_b" => raw("self_attn.v_proj.bias", &[h])?.into_owned(),
+        "o_W" => raw("self_attn.out_proj.weight", &[h, h])?.into_owned(),
+        "o_b" => raw("self_attn.out_proj.bias", &[h])?.into_owned(),
+        "ls1" => raw("ls_1.gamma", &[h])?.into_owned(),
+        "ls2" => raw("ls_2.gamma", &[h])?.into_owned(),
+        "fc1_W" => raw("mlp.c_fc.weight", &[inter, h])?.into_owned(),
+        "fc1_b" => raw("mlp.c_fc.bias", &[inter])?.into_owned(),
+        "fc2_W" => raw("mlp.c_proj.weight", &[h, inter])?.into_owned(),
+        "fc2_b" => raw("mlp.c_proj.bias", &[h])?.into_owned(),
         other => return Err(format!("no packer for tower tensor kind '{other}'")),
     })
 }
 
 /// The learned position table `[grid^2][hid]` and the class row `class + class position`
 /// (BF16, rounded once from the f32 sum).
-pub fn host_tables(store: &SafetensorsStore, d: &IkvDims) -> Result<(Vec<u16>, Vec<u16>), String> {
-    let table = bf16s(ckpt(
-        store,
+pub fn host_tables(src: &dyn TowerSource, d: &IkvDims) -> Result<(Vec<u16>, Vec<u16>), String> {
+    let table = bf16s(&src.bf16(
         "backbone.embeddings.position_embedding",
         &[d.grid * d.grid, d.hid],
     )?);
-    let ce = bf16s(ckpt(
-        store,
-        "backbone.embeddings.class_embedding",
-        &[d.hid],
-    )?);
-    let cp = bf16s(ckpt(
-        store,
-        "backbone.embeddings.cls_position_embedding",
-        &[d.hid],
-    )?);
+    let ce = bf16s(&src.bf16("backbone.embeddings.class_embedding", &[d.hid])?);
+    let cp = bf16s(&src.bf16("backbone.embeddings.cls_position_embedding", &[d.hid])?);
     let cls = ce
         .iter()
         .zip(&cp)
@@ -1173,9 +1214,19 @@ struct ActiveRequest {
     tokens: u64,
 }
 
+/// The file the tower's weights are read from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TowerFile {
+    /// The checkpoint directory's safetensors.
+    Checkpoint,
+    /// A GGUF model's projector file.
+    Projector(std::path::PathBuf),
+}
+
 /// The tower of one engine: plan, device buffers, recipes per bucket, request state.
 pub struct IkVision {
     spec: VisionSpec,
+    from: TowerFile,
     plan: IkvPlan,
     text_hid: u64,
     image_token_id: i32,
@@ -1201,20 +1252,38 @@ pub struct IkVision {
 }
 
 impl IkVision {
-    /// Plans the tower when the configuration asks for image input and the checkpoint has a
-    /// tower (`None`: text only). Nothing is compiled or allocated here.
-    pub fn plan(cfg: &crate::engine::EngineConfig, text: &IkDims) -> Result<Option<Self>, String> {
+    /// Plans the tower when the configuration asks for image input and the model has a tower
+    /// (`None`: text only): a checkpoint's `vision_config`, or for a GGUF model (`main`, opened
+    /// from `cfg.model_dir`) the projector file beside it. Nothing is compiled or allocated here.
+    pub fn plan(
+        cfg: &crate::engine::EngineConfig,
+        text: &IkDims,
+        main: Option<&crate::gguf::Gguf>,
+    ) -> Result<Option<Self>, String> {
         if cfg.vision_max_patches == 0 {
             return Ok(None);
         }
-        let config = std::fs::read_to_string(cfg.model_dir.join("config.json"))
-            .map_err(|e| format!("read config.json: {e}"))?;
-        if !is_inkling2_vision(&config) {
-            return Ok(None);
-        }
-        let proc = std::fs::read_to_string(cfg.model_dir.join("processor_config.json")).ok();
-        let spec = vision_spec(&config, proc.as_deref())?;
-        let d = IkvDims::from_config_json(&config)?;
+        let (spec, d, from) = if let Some(g) = main {
+            let Some(t) = gguf_tower::model_tower(&cfg.model_dir, g)? else {
+                return Ok(None);
+            };
+            if cfg.verbose {
+                eprintln!(
+                    "[gaudium] vision tower from projector file {}",
+                    t.projector.display()
+                );
+            }
+            (t.spec, t.dims, TowerFile::Projector(t.projector))
+        } else {
+            let config = std::fs::read_to_string(cfg.model_dir.join("config.json"))
+                .map_err(|e| format!("read config.json: {e}"))?;
+            if !is_inkling2_vision(&config) {
+                return Ok(None);
+            }
+            let proc = std::fs::read_to_string(cfg.model_dir.join("processor_config.json")).ok();
+            let spec = vision_spec(&config, proc.as_deref())?;
+            (spec, IkvDims::from_config_json(&config)?, TowerFile::Checkpoint)
+        };
         let plan = IkvPlan::new(
             d,
             text,
@@ -1234,6 +1303,7 @@ impl IkVision {
         Ok(Some(Self {
             image_token_id: spec.image_token_id,
             spec,
+            from,
             plan,
             text_hid: text.hid,
             precompile: pre,
@@ -1361,12 +1431,37 @@ impl IkVision {
         Ok(())
     }
 
+    /// The file the weights come from.
+    pub fn tower_file(&self) -> &TowerFile {
+        &self.from
+    }
+
+    /// [`Self::upload`] from the planned file: the checkpoint in `model_dir`, or the projector file.
+    pub fn upload_weights(
+        &mut self,
+        dev: &HpuDevice,
+        model_dir: &std::path::Path,
+        stage: &mut PinnedBuf,
+    ) -> Result<u64, String> {
+        match self.from.clone() {
+            TowerFile::Checkpoint => {
+                let store = SafetensorsStore::open(model_dir)
+                    .map_err(|e| format!("open safetensors (vision tower): {e}"))?;
+                self.upload(dev, &StTower(&store), stage)
+            }
+            TowerFile::Projector(p) => {
+                let src = gguf_tower::ProjectorSource::open(&p)?;
+                self.upload(dev, &src, stage)
+            }
+        }
+    }
+
     /// Binds the recipes to the shared workspace, uploads the weights, zeroes the feature buffer
     /// (its column 0 is what text rows read) and keeps the host tables.
     pub fn upload(
         &mut self,
         dev: &HpuDevice,
-        store: &SafetensorsStore,
+        src: &dyn TowerSource,
         stage: &mut PinnedBuf,
     ) -> Result<u64, String> {
         for set in self.sets.values_mut() {
@@ -1377,7 +1472,7 @@ impl IkVision {
         }
         let mut bytes = 0u64;
         for (name, &addr) in &self.weights_addr {
-            let data = pack_weight(store, &self.plan.d, name)?;
+            let data = pack_weight(src, &self.plan.d, name)?;
             if data.len() as u64 != self.plan.weights[name] {
                 return Err(format!(
                     "tower weight '{name}' packed size {} != graph tensor size {}",
@@ -1389,7 +1484,7 @@ impl IkVision {
                 .map_err(|e| format!("upload tower weight '{name}': {e}"))?;
             bytes += data.len() as u64;
         }
-        let (table, cls) = host_tables(store, &self.plan.d)?;
+        let (table, cls) = host_tables(src, &self.plan.d)?;
         self.pos_table = table;
         self.cls_row = cls;
         dev.zero_hbm_compute(self.feat, align_up(self.plan.feat_bytes, 4))
@@ -1906,3 +2001,7 @@ fn ikv_dump(
 #[cfg(test)]
 #[path = "inkling2_vision_tests.rs"]
 mod tests;
+
+// The tower of a GGUF model: its projector file.
+#[path = "inkling2_vision_gguf.rs"]
+pub mod gguf_tower;

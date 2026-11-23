@@ -1359,12 +1359,13 @@ impl Inkling2Engine {
             RecipeCache::from_env()
         };
 
-        // vision: the image tower's share of the plan (none without image input)
-        // (a GGUF file carries no tower: text only)
-        let mut vision = match gguf {
-            Some(_) => None,
-            None => vision::IkVision::plan(cfg, &IkDims::from_spec(&spec, IK_MAX_PREFILL_TILE)?)?,
-        };
+        // vision: the image tower's share of the plan (none without image input; a GGUF
+        // model's tower is the projector file beside it, none there: text only)
+        let mut vision = vision::IkVision::plan(
+            cfg,
+            &IkDims::from_spec(&spec, IK_MAX_PREFILL_TILE)?,
+            gguf.as_deref(),
+        )?;
         let vis_bytes = vision.as_ref().map_or(0, |v| v.plan_bytes().0 + v.plan_bytes().1);
 
         // reuse: on with `--prefix-cache` > 0 (the debug modes that write rows out of order
@@ -1489,7 +1490,7 @@ impl Inkling2Engine {
                 gib(free_hbm),
                 gib(weights_bytes),
                 gib(kv_bytes),
-                gib(ring_bytes),
+                gib(ring_bytes + snap_bytes),
                 gib(act_bytes),
                 mib(IkPlan::sum(&plan.step_acts)),
                 mib(IkPlan::sum(&plan.pf_scratch)),
@@ -1631,11 +1632,9 @@ impl Inkling2Engine {
                 .map_err(|e| format!("upload weight '{name}': {e}"))?;
             uploaded_bytes += expected;
         }
-        // vision: the tower's weights come from the checkpoint's safetensors file
+        // vision: the tower's weights (the checkpoint's safetensors, or the projector file)
         if let Some(v) = vision.as_mut() {
-            let vstore = crate::safetensors::SafetensorsStore::open(&cfg.model_dir)
-                .map_err(|e| format!("open safetensors (vision tower): {e}"))?;
-            uploaded_bytes += v.upload(&dev, &vstore, &mut stage_upload)?;
+            uploaded_bytes += v.upload_weights(&dev, &cfg.model_dir, &mut stage_upload)?;
         }
         if cfg.verbose {
             let dt = t_up.elapsed().as_secs_f64();

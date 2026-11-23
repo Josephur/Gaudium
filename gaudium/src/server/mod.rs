@@ -1201,12 +1201,13 @@ fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Opt
     if patches == 0 {
         return None;
     }
-    let spec = ModelSpec::from_config_file(dir.join("config.json")).ok()?;
+    // vision: a checkpoint with a tower, or a GGUF model with a projector file beside it
+    let spec = crate::vision::model_with_tower(dir)?;
     let runs_tower = matches!(
         spec.family,
         ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe | ModelFamily::Inkling2
     );
-    if !(spec.has_vision && runs_tower) {
+    if !runs_tower {
         return None;
     }
     let drafter = planned_drafter_of(cfg, id).map(|(_, kind, _)| kind);
