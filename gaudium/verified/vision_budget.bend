@@ -127,8 +127,10 @@ def media_bytes_ok(+bytes: Nat, max_bytes: Nat) -> Bool:
   Bool.and(Nat.is_gt(bytes, 0n), Nat.is_le(bytes, max_bytes))
 
 # A canvas read from a file header: both sides positive, the area within the pixel limit.
+# The area test is h <= max_pixels / w (w > 0 here), the same as w * h <= max_pixels for whole
+# numbers, written so that no header size can overflow it.
 def media_canvas_ok(+w: Nat, +h: Nat, max_pixels: Nat) -> Bool:
-  Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(Nat.mul(w, h), max_pixels))
+  Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(h, Nat.div(max_pixels, w)))
 
 # Media items (images + videos) of one request against the request limit.
 def media_count_ok(count: Nat, max_items: Nat) -> Bool:
