@@ -9,6 +9,7 @@
 #   - Which speculative drafters a model may run beside its vision tower
 
 import Base
+import nat_lemmas.bend as L
 
 # ============================================================================
 # 1. Helper Nat / Bool lemmas (erased before Rust codegen)
@@ -276,6 +277,33 @@ def media_zero_height_refused(w, m):
   match w:
     case 0n: {==}
     case 1n+_: {==}
+
+# An accepted height h <= m / (1 + wp) keeps h * (1 + wp) within m: it is at most
+# (m / (1 + wp)) * (1 + wp), which with the remainder added is m itself.
+def media_fit_within(+wp: Nat, +h: Nat, +m: Nat, b: Bool, e: {Nat.is_le(h, Nat.div(m, 1n+wp)) == b : Bool}) -> {Bool.and(b, Nat.is_lt(m, Nat.mul(1n+wp, h))) == False{} : Bool}:
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      %L.nat_mul_comm(h, 1n+wp) : {Bool.and(True{}, Nat.is_lt(m, _)) == False{} : Bool}
+      L.nat_le_lt_false(m, Nat.mul(h, 1n+wp), L.nat_le_trans(Nat.mul(h, 1n+wp), Nat.mul(Nat.div(m, 1n+wp), 1n+wp), m, L.nat_mul_le_mono_r(h, Nat.div(m, 1n+wp), 1n+wp, e), L.nat_le_subst_r(Nat.mul(Nat.div(m, 1n+wp), 1n+wp), Nat.add(Nat.mul(Nat.div(m, 1n+wp), 1n+wp), Nat.mod(m, 1n+wp)), m, L.nat_div_mod_r(m, wp), L.nat_add_le_r(Nat.mul(Nat.div(m, 1n+wp), 1n+wp), Nat.mod(m, 1n+wp)))))
+
+# LAW VB.6a: an accepted canvas never has more pixels than the limit.
+# promise: a canvas the media check accepts never has more pixels (width times height) than the limit.
+law media_canvas_within_limit:
+  for +w: Nat
+  for +h: Nat
+  for +m: Nat
+  {Bool.and(media_canvas_ok(w, h, m), Nat.is_lt(m, Nat.mul(w, h))) == False{} : Bool}
+
+def media_canvas_within_limit(w, h, m):
+  match w h:
+    case 0n _:
+      {==}
+    case 1n+wp 0n:
+      {==}
+    case 1n+wp 1n+hp:
+      media_fit_within(wp, 1n+hp, m, Nat.is_le(1n+hp, Nat.div(m, 1n+wp)), {==})
 
 # LAW VB.7: more items than the limit are refused.
 law media_count_over_refused:
