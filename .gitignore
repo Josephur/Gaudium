@@ -37,6 +37,7 @@ target/
 
 # --- Gaudi 2 / SynapseAI / TPC-C native build outputs & recipe caches ---
 build/
+dist/
 *.o
 *.a
 *.so

@@ -32,6 +32,16 @@ use gaudium::tokenizer::{
 };
 use gaudium::verified::{DevEvent, HbmCat, ReqEvent};
 
+/// The line `gaudium --version` prints: the crate version, then the commit the binary was built
+/// from when the build was given one in `GAUDIUM_BUILD_COMMIT`.
+fn version_line() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match option_env!("GAUDIUM_BUILD_COMMIT") {
+        Some(commit) if !commit.trim().is_empty() => format!("gaudium {version} ({})", commit.trim()),
+        _ => format!("gaudium {version}"),
+    }
+}
+
 fn print_usage() {
     println!(
         "Gaudium — Intel Gaudi 2 Inference Engine (RustyBends v1)\n\
@@ -54,6 +64,7 @@ fn print_usage() {
          \x20                                           Quantise a Gemma 4 BF16 checkpoint's matrices into an\n\
          \x20                                           FP8 cache directory (host only, no card)\n\
          \x20 gaudium --help | -h                       Print this text\n\
+         \x20 gaudium --version | -V                    Print the version (and the commit of a release build)\n\
          \n\
          Serve options:\n\
          \x20 --host <addr>         Bind address (or GAUDIUM_SERVE_HOST; default: 0.0.0.0)\n\
@@ -196,6 +207,9 @@ fn print_usage() {
          \x20                       directory\n\
          \x20 GAUDIUM_W4_GLUE_DEBUG Set (any value) = the graph-compiler glue of the MoE W4 kernels\n\
          \x20                       prints the tensor shapes of a node it refuses\n\
+         Read when the engine is built, not when it runs:\n\
+         \x20 GAUDIUM_BUILD_COMMIT  The commit `gaudium --version` prints after the version (release\n\
+         \x20                       builds set it; unset = the version alone)\n\
          SDK environment variables the engine reads and completes:\n\
          \x20 GC_KERNEL_PATH        The engine puts its glue libraries first, keeps the entries\n\
          \x20                       already there and adds the SDK's TPC kernel library\n\
@@ -1978,6 +1992,10 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
+        return;
+    }
+    if args.len() == 2 && (args[1] == "--version" || args[1] == "-V") {
+        println!("{}", version_line());
         return;
     }
     if args.len() == 3 && args[1] == "--inspect-model" {

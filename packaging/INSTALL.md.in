@@ -1,0 +1,64 @@
+# Gaudium @VERSION@: install notes
+
+This archive is Gaudium @VERSION@ for the Intel Gaudi 2 (HL-225), built for Linux x86_64
+against release @SDK_RELEASE@ of the Intel Gaudi SDK.
+
+Gaudium is in the middle of a port to Rust (see `README.md`): interfaces and flags still
+change, and this is not a stable release.
+
+## What is in the archive
+
+| Path | What |
+|---|---|
+| `bin/gaudium` | The engine and its HTTP server (one binary). |
+| `kernels/` | Gaudium's TPC kernels (`*.o`) and its graph-compiler glue libraries (`libgaudium_*.so`), compiled with the `tpc-clang` of SDK @SDK_VERSION@. |
+| `ui/` | The Web UI the server serves. |
+| `docs/` | The command-line and environment reference, and the notes on the MCP proxy and HTTPS. |
+| `BUILD-INFO.txt` | The commit and the tool versions of this build. |
+| `SHA256SUMS` | The SHA-256 of every file above (`sha256sum -c SHA256SUMS`). |
+| `LICENSE`, `THIRD_PARTY_NOTICES.md` | Gaudium's licence (MIT) and the notices of the third-party code that is included. |
+
+## What is not in it: the Intel Gaudi software
+
+Gaudium runs on top of Intel's driver, firmware and SDK (SynapseAI). Their licence does not
+allow redistribution, so **no file of them is in this archive: you install them yourself,
+from Intel.**
+
+- Install release **@SDK_RELEASE@** (package version `@SDK_VERSION@`): the kernels here were
+  compiled for it. The packages are `habanalabs-dkms` (driver), `habanalabs-firmware` and
+  `habanalabs-graph` (SynapseAI and the graph compiler); `habanalabs-tools` (`tpc-clang`) is
+  only needed to compile the kernels yourself.
+- Follow the [Intel Gaudi installation guide](https://docs.habana.ai/en/latest/Installation_Guide/index.html);
+  the packages come from [Intel's package repository](https://vault.habana.ai/).
+- With another SDK release, build Gaudium from source against that release (the "Building"
+  section of `README.md`).
+
+## Requirements
+
+- A host with an Intel Gaudi 2 card and the Intel Gaudi software above.
+- Linux x86_64 with glibc @GLIBC_MIN@ or later (this build was made on @OS_NAME@).
+- A model checkpoint directory (see "Status" in `README.md` for the supported models).
+
+## Install and run
+
+```bash
+sha256sum -c @NAME@.tar.gz.sha256        # next to the downloaded archive
+tar -xzf @NAME@.tar.gz
+cd @NAME@
+
+bin/gaudium --version
+bin/gaudium --help                       # every flag and environment variable
+bin/gaudium                              # verified-core self-check (no card needed)
+bin/gaudium --hpu-smoke                  # small live test on the card
+
+bin/gaudium --serve --model <model_dir> --kernels "$PWD/kernels" --ui-dir "$PWD/ui" \
+            --cache-dir <cache_dir> --max-ctx 32768    # API + Web UI on port 8090
+```
+
+`--cache-dir` keeps the compiled recipes between starts; without it every start compiles them
+again. Use a new cache directory after installing another SDK release.
+
+The engine loads `libSynapse.so` from `/usr/lib/habanalabs/` or the loader's search path
+(set `GAUDIUM_SYNAPSE_LIB` to use another file). Only one process may open the card at a time.
+
+The archive can be unpacked anywhere. `docs/reference.md` is the full `--help` text.

@@ -1,6 +1,6 @@
 [package]
 name = "gaudium"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "Intel Gaudi 2 inference engine built with RustyBends v1 (Verified Core, Rust Shell)"
 license = "MIT"

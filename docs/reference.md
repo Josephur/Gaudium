@@ -42,6 +42,7 @@ Usage:
                                             Quantise a Gemma 4 BF16 checkpoint's matrices into an
                                             FP8 cache directory (host only, no card)
   gaudium --help | -h                       Print this text
+  gaudium --version | -V                    Print the version (and the commit of a release build)
 
 Serve options:
   --host <addr>         Bind address (or GAUDIUM_SERVE_HOST; default: 0.0.0.0)
@@ -184,6 +185,9 @@ Engine environment variables:
                         directory
   GAUDIUM_W4_GLUE_DEBUG Set (any value) = the graph-compiler glue of the MoE W4 kernels
                         prints the tensor shapes of a node it refuses
+Read when the engine is built, not when it runs:
+  GAUDIUM_BUILD_COMMIT  The commit `gaudium --version` prints after the version (release
+                        builds set it; unset = the version alone)
 SDK environment variables the engine reads and completes:
   GC_KERNEL_PATH        The engine puts its glue libraries first, keeps the entries
                         already there and adds the SDK's TPC kernel library
