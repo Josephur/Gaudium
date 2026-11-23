@@ -397,10 +397,13 @@ impl ModelSpec {
             .get("vision_config")
             .and_then(JsonValue::as_object)
             .is_some();
-        let fp8_quantized = root
-            .get("quantization_config")
-            .and_then(JsonValue::as_object)
-            .is_some();
+        // (an Inkling 2 checkpoint declares its 4-bit / 8-bit expert matrices here; the engine
+        // decodes them to BF16, so it is not a block-FP8 checkpoint in this sense)
+        let fp8_quantized = family != ModelFamily::Inkling2
+            && root
+                .get("quantization_config")
+                .and_then(JsonValue::as_object)
+                .is_some();
 
         let gemma4 = if matches!(family, ModelFamily::Gemma4 | ModelFamily::Gemma4Assistant) {
             let rp = tc.get("rope_parameters");

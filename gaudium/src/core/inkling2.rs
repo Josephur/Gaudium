@@ -289,6 +289,12 @@ mod tests {
     fn mini_schedule_runs_the_span_three_times() {
         let spec = ModelSpec::from_config_json(&mini_json()).unwrap();
         spec.validate().unwrap();
+        // the checkpoint's quantisation note does not make it a block-FP8 model
+        let noted = mini_json().replace(
+            r#""vision_config""#,
+            r#""quantization_config":{"quant_method":"modelopt"},"vision_config""#,
+        );
+        assert!(!ModelSpec::from_config_json(&noted).unwrap().fp8_quantized);
         let ik = spec.inkling2.as_ref().unwrap();
         let apps = schedule(&spec, ik);
         assert_eq!(apps.len(), 48);

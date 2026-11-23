@@ -23,9 +23,11 @@ use crate::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use crate::safetensors::{SafetensorsStore, TensorMeta};
 use crate::verified::{ik_bias_src, ik_nib_row_bytes, ik_nib_row_scales};
 
-/// Values of the sixteen 4-bit codes (sign, two exponent bits, one mantissa bit).
+/// Values of the sixteen 4-bit codes (sign, two exponent bits, one mantissa bit). Code 8 is a
+/// negative zero in the format; it is stored as the same weight, a positive zero, so that every
+/// source of one model gives one byte image.
 const E2M1: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 /// Value of an 8-bit float with 4 exponent and 3 mantissa bits (bias 7, no infinities).
@@ -81,69 +83,246 @@ pub fn decode_f8_row(vals: &[u8], scales: &[u8], f8: &[f32; 256], out: &mut [u8]
     }
 }
 
-/// A stacked expert tensor of the checkpoint: `ne` experts of `rows` rows of `cols` values.
-struct ExpertSrc<'a> {
-    name: String,
+/// Rows of a stacked expert tensor in the publisher's row order, decoded to BF16.
+pub trait ExpertRows: Sync {
+    /// Decodes row `r` of expert `e` into `out` (the row's values as little-endian BF16).
+    fn decode(&self, e: usize, r: usize, out: &mut [u8]) -> Result<(), String>;
+}
+
+/// Where the packer reads a checkpoint: its tensors under the publisher's names (the part after
+/// `model.llm.`) and in the publisher's shapes and element order, whatever the file format.
+pub trait IkSource: Sync {
+    /// A BF16 tensor of exactly `shape`, as bytes.
+    fn bf16(&self, suffix: &str, shape: &[u64]) -> Result<Cow<'_, [u8]>, String>;
+    /// A small tensor of `elems` values as f32.
+    fn f32s(&self, suffix: &str, elems: u64) -> Result<Vec<f32>, String>;
+    /// The stacked expert tensor `layers.<l>.mlp.experts.<key>_weight` (`key`: `w13`, whose even
+    /// rows are gate rows and odd rows up rows, or `w2`) of `ne` experts x `rows` x `cols`.
+    fn experts(
+        &self,
+        l: usize,
+        key: &str,
+        ne: u64,
+        rows: u64,
+        cols: u64,
+    ) -> Result<Box<dyn ExpertRows + '_>, String>;
+}
+
+/// A stacked expert tensor of the publisher's checkpoint in its stored form.
+struct StExperts<'a> {
     w: &'a [u8],
     scale: &'a [u8],
     /// Per-expert factor of the 4-bit form; `None`: the 8-bit float form.
     factor: Option<Vec<f32>>,
-    ne: usize,
     rows: usize,
     cols: usize,
+    f8: [f32; 256],
 }
 
-impl ExpertSrc<'_> {
-    fn row_bytes(&self) -> usize {
-        if self.factor.is_some() {
-            self.cols / 2
-        } else {
-            self.cols
-        }
-    }
-
-    fn row_scales(&self) -> usize {
-        if self.factor.is_some() {
-            self.cols / 16
-        } else {
-            self.cols / 32
-        }
-    }
-
-    /// Decodes row `r` of expert `e` into `out` (`cols` BF16 values).
-    fn decode(&self, e: usize, r: usize, f8: &[f32; 256], out: &mut [u8]) {
-        let (rb, rs) = (self.row_bytes(), self.row_scales());
+impl ExpertRows for StExperts<'_> {
+    fn decode(&self, e: usize, r: usize, out: &mut [u8]) -> Result<(), String> {
+        let (rb, rs) = match self.factor {
+            Some(_) => (self.cols / 2, self.cols / 16),
+            None => (self.cols, self.cols / 32),
+        };
         let wi = (e * self.rows + r) * rb;
         let si = (e * self.rows + r) * rs;
         match &self.factor {
-            Some(f) => decode_nib_row(&self.w[wi..wi + rb], &self.scale[si..si + rs], f[e], f8, out),
-            None => decode_f8_row(&self.w[wi..wi + rb], &self.scale[si..si + rs], f8, out),
+            Some(f) => decode_nib_row(
+                &self.w[wi..wi + rb],
+                &self.scale[si..si + rs],
+                f[e],
+                &self.f8,
+                out,
+            ),
+            None => decode_f8_row(&self.w[wi..wi + rb], &self.scale[si..si + rs], &self.f8, out),
         }
+        Ok(())
     }
 }
 
+/// The publisher's safetensors checkpoint as a packer source.
+pub struct StSource<'a> {
+    store: &'a SafetensorsStore,
+    prefix: &'static str,
+    /// The 4-bit experts' per-expert factor from scale terms rounded to BF16 first (what the
+    /// publisher's reference loader ends up computing), instead of the stored f32 values.
+    amax_bf16: bool,
+}
+
+impl<'a> StSource<'a> {
+    pub fn new(store: &'a SafetensorsStore) -> Self {
+        Self {
+            store,
+            prefix: "model.llm.",
+            amax_bf16: false,
+        }
+    }
+
+    /// Decode the 4-bit experts with their scale terms rounded to BF16 first (see the field).
+    pub fn with_amax_bf16(mut self, on: bool) -> Self {
+        self.amax_bf16 = on;
+        self
+    }
+
+    fn meta(&self, suffix: &str) -> Result<(String, &'a TensorMeta), String> {
+        let full = format!("{}{}", self.prefix, suffix);
+        let meta = self
+            .store
+            .get(&full)
+            .map_err(|e| format!("missing checkpoint tensor '{full}': {e}"))?;
+        Ok((full, meta))
+    }
+
+    fn mapped(&self, full: &str) -> Result<&'a [u8], String> {
+        self.store
+            .tensor_bytes(full)
+            .map_err(|e| format!("read '{full}': {e}"))?
+            .ok_or_else(|| format!("checkpoint tensor '{full}' is not mapped"))
+    }
+
+    fn raw(&self, suffix: &str, dtype: &str, shape: &[u64]) -> Result<&'a [u8], String> {
+        let (full, t) = self.meta(suffix)?;
+        if t.dtype != dtype || t.shape != shape {
+            return Err(format!(
+                "checkpoint tensor '{full}' is {} {:?}, expected {dtype} {shape:?}",
+                t.dtype, t.shape
+            ));
+        }
+        self.mapped(&full)
+    }
+}
+
+impl IkSource for StSource<'_> {
+    fn bf16(&self, suffix: &str, shape: &[u64]) -> Result<Cow<'_, [u8]>, String> {
+        Ok(Cow::Borrowed(self.raw(suffix, "BF16", shape)?))
+    }
+
+    fn f32s(&self, suffix: &str, elems: u64) -> Result<Vec<f32>, String> {
+        let (full, t) = self.meta(suffix)?;
+        let bytes = self.mapped(&full)?;
+        let n: u64 = t.shape.iter().product();
+        if n != elems {
+            return Err(format!(
+                "checkpoint tensor '{full}' has {n} values ({:?}), expected {elems}",
+                t.shape
+            ));
+        }
+        match t.dtype.as_str() {
+            "BF16" => Ok(bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
+                .collect()),
+            "F32" => Ok(bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect()),
+            other => Err(format!(
+                "checkpoint tensor '{full}' has dtype {other}, expected BF16 or F32"
+            )),
+        }
+    }
+
+    fn experts(
+        &self,
+        l: usize,
+        key: &str,
+        ne: u64,
+        rows: u64,
+        cols: u64,
+    ) -> Result<Box<dyn ExpertRows + '_>, String> {
+        let base = format!("layers.{l}.mlp.experts.{key}_weight");
+        let (full, t) = self.meta(&base)?;
+        let w = self.mapped(&full)?;
+        let (scale_dtype, factor, row_bytes, row_scales) = match t.dtype.as_str() {
+            "U8" => {
+                let rb = ik_nib_row_bytes(cols);
+                if rb == 0 {
+                    return Err(format!(
+                        "expert tensor '{full}': {cols} columns are not whole blocks of 16 codes"
+                    ));
+                }
+                let amax = self.f32s(&format!("{base}_amax"), ne)?;
+                let den = self.f32s(&format!("{base}_outer_scale_denominator"), 1)?[0];
+                let rf = |x: f32| {
+                    if self.amax_bf16 {
+                        bf16_to_f32(f32_to_bf16_rne(x))
+                    } else {
+                        x
+                    }
+                };
+                let f: Vec<f32> = amax.iter().map(|&a| rf(a) / rf(den)).collect();
+                ("F8_E4M3", Some(f), rb, ik_nib_row_scales(cols))
+            }
+            "F8_E4M3" => {
+                if !cols.is_multiple_of(32) {
+                    return Err(format!(
+                        "expert tensor '{full}': {cols} columns are not whole blocks of 32 values"
+                    ));
+                }
+                ("U8", None, cols, cols / 32)
+            }
+            other => {
+                return Err(format!(
+                    "expert tensor '{full}' has dtype {other}: expected 4-bit codes (U8) or 8-bit floats (F8_E4M3)"
+                ))
+            }
+        };
+        if t.shape != [ne, rows, row_bytes] {
+            return Err(format!(
+                "expert tensor '{full}' has shape {:?}, expected {:?}",
+                t.shape,
+                [ne, rows, row_bytes]
+            ));
+        }
+        let scale = self.raw(&format!("{base}_scale"), scale_dtype, &[ne, rows, row_scales])?;
+        Ok(Box::new(StExperts {
+            w,
+            scale,
+            factor,
+            rows: rows as usize,
+            cols: cols as usize,
+            f8: e4m3_table(),
+        }))
+    }
+}
+
+/// A job over a range of output rows: `(first row, the rows' bytes)`.
+type RowJob<'a> = dyn Fn(usize, &mut [u8]) -> Result<(), String> + Sync + 'a;
+
 /// Runs `job(first_row, rows_slice)` over `out` split into row ranges on the host's threads.
-fn par_rows(out: &mut [u8], row_bytes: usize, job: &(dyn Fn(usize, &mut [u8]) + Sync)) {
+fn par_rows(out: &mut [u8], row_bytes: usize, job: &RowJob<'_>) -> Result<(), String> {
     let rows = out.len() / row_bytes;
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 32);
     let per = rows.div_ceil(threads).max(1);
     std::thread::scope(|sc| {
-        for (i, chunk) in out.chunks_mut(per * row_bytes).enumerate() {
-            sc.spawn(move || job(i * per, chunk));
+        let handles: Vec<_> = out
+            .chunks_mut(per * row_bytes)
+            .enumerate()
+            .map(|(i, chunk)| sc.spawn(move || job(i * per, chunk)))
+            .collect();
+        let mut res = Ok(());
+        for h in handles {
+            let r = h
+                .join()
+                .unwrap_or_else(|_| Err("a weight decode thread panicked".into()));
+            if res.is_ok() {
+                res = r;
+            }
         }
-    });
+        res
+    })
 }
 
 /// Weight packer for the Inkling 2 family.
 pub struct IkPacker<'a> {
-    store: &'a SafetensorsStore,
+    src: &'a dyn IkSource,
     d: &'a IkDims,
-    prefix: &'static str,
     max_ctx: u64,
-    f8: [f32; 256],
-    /// The 4-bit experts' per-expert factor from scale terms rounded to BF16 first (what the
-    /// publisher's reference loader ends up computing), instead of the stored f32 values.
-    amax_bf16: bool,
 }
 
 fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -217,152 +396,32 @@ pub fn tau_table(floor: u64, alpha: f32, lmax: u64) -> Vec<f32> {
 }
 
 impl<'a> IkPacker<'a> {
-    pub fn new(store: &'a SafetensorsStore, d: &'a IkDims, max_ctx: u64) -> Self {
-        Self {
-            store,
-            d,
-            prefix: "model.llm.",
-            max_ctx,
-            f8: e4m3_table(),
-            amax_bf16: false,
-        }
+    pub fn new(src: &'a dyn IkSource, d: &'a IkDims, max_ctx: u64) -> Self {
+        Self { src, d, max_ctx }
     }
 
-    /// Decode the 4-bit experts with their scale terms rounded to BF16 first (see the field).
-    pub fn with_amax_bf16(mut self, on: bool) -> Self {
-        self.amax_bf16 = on;
-        self
+    fn raw(&self, suffix: &str, _dtype: &str, shape: &[u64]) -> Result<Cow<'a, [u8]>, String> {
+        self.src.bf16(suffix, shape)
     }
 
-    fn meta(&self, suffix: &str) -> Result<(String, &'a TensorMeta), String> {
-        let full = format!("{}{}", self.prefix, suffix);
-        let meta = self
-            .store
-            .get(&full)
-            .map_err(|e| format!("missing checkpoint tensor '{full}': {e}"))?;
-        Ok((full, meta))
-    }
-
-    fn raw(&self, suffix: &str, dtype: &str, shape: &[u64]) -> Result<&'a [u8], String> {
-        let (full, t) = self.meta(suffix)?;
-        if t.dtype != dtype || t.shape != shape {
-            return Err(format!(
-                "checkpoint tensor '{full}' is {} {:?}, expected {dtype} {shape:?}",
-                t.dtype, t.shape
-            ));
-        }
-        self.store
-            .tensor_bytes(&full)
-            .map_err(|e| format!("read '{full}': {e}"))?
-            .ok_or_else(|| format!("checkpoint tensor '{full}' is not mapped"))
-    }
-
-    /// A small BF16 or F32 tensor of `elems` values as f32.
     fn f32s(&self, suffix: &str, elems: u64) -> Result<Vec<f32>, String> {
-        let (full, t) = self.meta(suffix)?;
-        let bytes = self
-            .store
-            .tensor_bytes(&full)
-            .map_err(|e| format!("read '{full}': {e}"))?
-            .ok_or_else(|| format!("checkpoint tensor '{full}' is not mapped"))?;
-        let n: u64 = t.shape.iter().product();
-        if n != elems {
-            return Err(format!(
-                "checkpoint tensor '{full}' has {n} values ({:?}), expected {elems}",
-                t.shape
-            ));
-        }
-        match t.dtype.as_str() {
-            "BF16" => Ok(bytes
-                .chunks_exact(2)
-                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect()),
-            "F32" => Ok(bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()),
-            other => Err(format!("checkpoint tensor '{full}' has dtype {other}, expected BF16 or F32")),
-        }
-    }
-
-    /// The stacked expert tensor `layers.<l>.mlp.experts.<key>_weight` in its stored form.
-    fn experts(&self, l: usize, key: &str, rows: u64, cols: u64) -> Result<ExpertSrc<'a>, String> {
-        let base = format!("layers.{l}.mlp.experts.{key}_weight");
-        let (full, t) = self.meta(&base)?;
-        let ne = self.d.ne;
-        let w = self
-            .store
-            .tensor_bytes(&full)
-            .map_err(|e| format!("read '{full}': {e}"))?
-            .ok_or_else(|| format!("checkpoint tensor '{full}' is not mapped"))?;
-        let (scale_dtype, factor, row_bytes, row_scales) = match t.dtype.as_str() {
-            "U8" => {
-                let rb = ik_nib_row_bytes(cols);
-                if rb == 0 {
-                    return Err(format!(
-                        "expert tensor '{full}': {cols} columns are not whole blocks of 16 codes"
-                    ));
-                }
-                let amax = self.f32s(&format!("{base}_amax"), ne)?;
-                let den = self.f32s(&format!("{base}_outer_scale_denominator"), 1)?[0];
-                let rf = |x: f32| {
-                    if self.amax_bf16 {
-                        bf16_to_f32(f32_to_bf16_rne(x))
-                    } else {
-                        x
-                    }
-                };
-                let f: Vec<f32> = amax.iter().map(|&a| rf(a) / rf(den)).collect();
-                ("F8_E4M3", Some(f), rb, ik_nib_row_scales(cols))
-            }
-            "F8_E4M3" => {
-                if !cols.is_multiple_of(32) {
-                    return Err(format!(
-                        "expert tensor '{full}': {cols} columns are not whole blocks of 32 values"
-                    ));
-                }
-                ("U8", None, cols, cols / 32)
-            }
-            other => {
-                return Err(format!(
-                    "expert tensor '{full}' has dtype {other}: expected 4-bit codes (U8) or 8-bit floats (F8_E4M3)"
-                ))
-            }
-        };
-        if t.shape != [ne, rows, row_bytes] {
-            return Err(format!(
-                "expert tensor '{full}' has shape {:?}, expected {:?}",
-                t.shape,
-                [ne, rows, row_bytes]
-            ));
-        }
-        let scale = self.raw(&format!("{base}_scale"), scale_dtype, &[ne, rows, row_scales])?;
-        Ok(ExpertSrc {
-            name: full,
-            w,
-            scale,
-            factor,
-            ne: ne as usize,
-            rows: rows as usize,
-            cols: cols as usize,
-        })
+        self.src.f32s(suffix, elems)
     }
 
     /// The wide gate (`up == false`) or up matrix `{hid, ne ef}`: expert `e`'s channel `i` is
     /// row `2 i` (gate) or `2 i + 1` (up) of its stored gate-up matrix.
     fn pack_gate_up(&self, l: usize, up: bool) -> Result<Vec<u8>, String> {
         let d = self.d;
-        let src = self.experts(l, "w13", 2 * d.ef, d.hid)?;
+        let src = self.src.experts(l, "w13", d.ne, 2 * d.ef, d.hid)?;
         let (ef, row) = (d.ef as usize, d.hid as usize * 2);
-        let mut out = vec![0u8; src.ne * ef * row];
-        let f8 = &self.f8;
+        let mut out = vec![0u8; d.ne as usize * ef * row];
         par_rows(&mut out, row, &|first, chunk| {
             for (k, o) in chunk.chunks_mut(row).enumerate() {
                 let n = first + k;
-                src.decode(n / ef, 2 * (n % ef) + usize::from(up), f8, o);
+                src.decode(n / ef, 2 * (n % ef) + usize::from(up), o)?;
             }
-        });
-        let _ = &src.name;
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -370,18 +429,18 @@ impl<'a> IkPacker<'a> {
     /// `ef` values of the experts' row `n`.
     fn pack_down(&self, l: usize) -> Result<Vec<u8>, String> {
         let d = self.d;
-        let src = self.experts(l, "w2", d.hid, d.ef)?;
-        let (ef2, ne) = (d.ef as usize * 2, src.ne);
+        let src = self.src.experts(l, "w2", d.ne, d.hid, d.ef)?;
+        let (ef2, ne) = (d.ef as usize * 2, d.ne as usize);
         let row = ne * ef2;
         let mut out = vec![0u8; d.hid as usize * row];
-        let f8 = &self.f8;
         par_rows(&mut out, row, &|first, chunk| {
             for (k, o) in chunk.chunks_mut(row).enumerate() {
                 for e in 0..ne {
-                    src.decode(e, first + k, f8, &mut o[e * ef2..(e + 1) * ef2]);
+                    src.decode(e, first + k, &mut o[e * ef2..(e + 1) * ef2])?;
                 }
             }
-        });
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -459,9 +518,9 @@ impl<'a> IkPacker<'a> {
         let hid = d.hid;
         let bf = "BF16";
         match name {
-            "embed" => return Ok(Cow::Borrowed(self.raw("embed.weight", bf, &[d.vocab_in, hid])?)),
-            "w_embed" => return Ok(Cow::Borrowed(self.raw("embed_norm.weight", bf, &[hid])?)),
-            "w_final" => return Ok(Cow::Borrowed(self.raw("norm.weight", bf, &[hid])?)),
+            "embed" => return self.raw("embed.weight", bf, &[d.vocab_in, hid]),
+            "w_embed" => return self.raw("embed_norm.weight", bf, &[hid]),
+            "w_final" => return self.raw("norm.weight", bf, &[hid]),
             "W_head" => {
                 let w = self.raw("unembed.weight", bf, &[d.vocab_in, hid])?;
                 let keep = (d.vocab_out * hid * 2) as usize;
@@ -529,37 +588,34 @@ impl<'a> IkPacker<'a> {
                 } else {
                     format!("{lp}{}_input_norm.weight", &what[2..])
                 };
-                Cow::Borrowed(self.raw(&src, bf, &[hid])?)
+                self.raw(&src, bf, &[hid])?
             }
-            "w_mlp" => Cow::Borrowed(self.raw(&format!("{lp}mlp_norm.weight"), bf, &[hid])?),
+            "w_mlp" => self.raw(&format!("{lp}mlp_norm.weight"), bf, &[hid])?,
             "W_qx" => {
                 let q = self.raw(&format!("{at}wq_du.weight"), bf, &[128 * nh, hid])?;
                 let g = self.raw(&format!("{at}gate_attn.weight"), bf, &[128 * nh, hid])?;
                 let r = self.raw(&format!("{at}wr_du.weight"), bf, &[d.d_rel * nh, hid])?;
-                Cow::Owned(self.concat_rows(&[q, g, r], d.qw, hid * 2))
+                Cow::Owned(self.concat_rows(&[&q, &g, &r], d.qw, hid * 2))
             }
-            "W_sink" => Cow::Borrowed(self.raw(&format!("{at}attn_sink_proj.weight"), bf, &[nh, hid])?),
+            "W_sink" => self.raw(&format!("{at}attn_sink_proj.weight"), bf, &[nh, hid])?,
             "W_kx" | "W_vx" => {
                 let is_v = what == "W_vx";
                 let kv = if is_v { "v" } else { "k" };
                 let w = self.raw(&format!("{at}w{kv}_dv.weight"), bf, &[kvw, hid])?;
-                let main: Cow<'_, [u8]> = if is_v {
-                    Cow::Owned(lane_rows(w, (hid * 2) as usize))
+                let main: Cow<'a, [u8]> = if is_v {
+                    Cow::Owned(lane_rows(&w, (hid * 2) as usize))
                 } else {
-                    Cow::Borrowed(w)
+                    w
                 };
                 if sliding {
-                    match main {
-                        Cow::Borrowed(b) => Cow::Borrowed(b),
-                        Cow::Owned(v) => Cow::Owned(v),
-                    }
+                    main
                 } else {
                     let taps = self.raw(
                         &format!("{at}{kv}_sconv.weight_proj"),
                         bf,
                         &[d.taps * nkv, hid],
                     )?;
-                    Cow::Owned(self.concat_rows(&[&main, taps], d.kxw(false), hid * 2))
+                    Cow::Owned(self.concat_rows(&[&main, &taps], d.kxw(false), hid * 2))
                 }
             }
             "qsc" => {
@@ -580,7 +636,7 @@ impl<'a> IkPacker<'a> {
                     Cow::Owned(self.conv_table(&format!("{at}{kv}_sconv.static_w"), kvw, true, is_v)?)
                 }
             }
-            "W_o" => Cow::Borrowed(self.raw(&format!("{at}wo_ud.weight"), bf, &[hid, 128 * nh])?),
+            "W_o" => self.raw(&format!("{at}wo_ud.weight"), bf, &[hid, 128 * nh])?,
             "acw" => Cow::Owned(self.conv_table(&format!("{lp}attn_sconv.weight"), hid, false, false)?),
             "mcw" => Cow::Owned(self.conv_table(&format!("{lp}mlp_sconv.weight"), hid, false, false)?),
             "q_attn" => {
@@ -618,7 +674,7 @@ impl<'a> IkPacker<'a> {
                     row(&qm, 2 * li + 1),
                 ]))
             }
-            "W_router" => Cow::Borrowed(self.raw(&format!("{lp}mlp.gate.weight"), bf, &[d.ne, hid])?),
+            "W_router" => self.raw(&format!("{lp}mlp.gate.weight"), bf, &[d.ne, hid])?,
             "rb" => {
                 let b = self.f32s(&format!("{lp}mlp.gate.bias"), d.ne)?;
                 Cow::Owned(f32s_to_bytes(&split_table(&b)))
@@ -635,22 +691,22 @@ impl<'a> IkPacker<'a> {
                     _ => None,
                 };
                 if let Some(c) = what.strip_prefix("W_gd_").and_then(ctrl) {
-                    Cow::Borrowed(self.raw(
+                    self.raw(
                         &format!("{lp}controllers.{c}.down_weight"),
                         bf,
                         &[d.rank, 2 * hid],
-                    )?)
+                    )?
                 } else if let Some(c) = what.strip_prefix("W_gf_").and_then(ctrl) {
                     let f = self.raw(&format!("{lp}controllers.{c}.forget_weight"), bf, &[hid, d.rank])?;
                     let g = self.raw(&format!("{lp}controllers.{c}.gain_weight"), bf, &[hid, d.rank])?;
                     let rb = (d.rank * 2) as usize;
                     if d.fg_f32 {
                         // an f32 result in the split layout: the rows in lane order
-                        let mut out = lane_rows(f, rb);
-                        out.extend(lane_rows(g, rb));
+                        let mut out = lane_rows(&f, rb);
+                        out.extend(lane_rows(&g, rb));
                         Cow::Owned(out)
                     } else {
-                        Cow::Owned(self.concat_rows(&[f, g], 2 * hid, d.rank * 2))
+                        Cow::Owned(self.concat_rows(&[&f, &g], 2 * hid, d.rank * 2))
                     }
                 } else {
                     return Err(format!("no packer for device tensor '{name}'"));

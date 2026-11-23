@@ -43,6 +43,7 @@ use crate::core::inkling2::{
     final_states, hist_rows, msg_states, ring_slots, schedule, source_buffers, wiring, IkApp,
     IkWire, IK_MAX_STATES,
 };
+use crate::engine::qwen3::spec::{chain_accept, SpecConfig, SpecMethod};
 use crate::engine::{EngineConfig, GenParams, GenReport};
 use crate::json::{parse_json, JsonValue};
 use crate::kernels::{KernelEnv, INKLING2_GLUE};
@@ -54,10 +55,16 @@ use crate::synapse::ffi::{SynDataType, SynapseApi};
 use crate::synapse::graph::{CompiledRecipe, GraphBuilder, PreparedLaunch, TensorId};
 use crate::synapse::ops::u32_params;
 use crate::synapse::recipe_cache::RecipeCache;
-use crate::verified::{align_up, ik_bias_off, ik_bias_width, ik_gate_off, ik_kx_width, ik_qx_width, ik_rel_off, HbmCat};
+use crate::verified::{
+    align_up, ik_bias_off, ik_bias_width, ik_gate_off, ik_kx_width, ik_qx_width, ik_rel_off,
+    ik_tile_rows, HbmCat,
+};
 
 #[path = "inkling2_packer.rs"]
 pub mod packer;
+
+#[path = "inkling2_gguf.rs"]
+pub mod gguf_source;
 
 // Image input (vision tower, preprocessing, hand-over to the prefill).
 #[path = "inkling2_vision.rs"]
@@ -965,6 +972,17 @@ fn mib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0)
 }
 
+/// What a speculative decode did after the first token.
+#[derive(Debug, Default)]
+struct SpecOutcome {
+    launches: u64,
+    drafted: u64,
+    accepted: u64,
+    decode_ms: f64,
+    stopped_by_eos: bool,
+    stopped_by_cancel: bool,
+}
+
 /// Unused state and message slots of a prefill recipe are bound to buffers of their own (a
 /// launch refuses one address under two tensors).
 const PF_DUMMIES: usize = 8;
@@ -986,22 +1004,31 @@ struct IkPlan {
 }
 
 impl IkPlan {
-    fn build(d: &IkDims, max_ctx: u64, max_chunks: u64, tile: u64) -> Self {
+    /// `step_rows`: the widest decode-step pass (1: the one-row step only).
+    fn build(d: &IkDims, max_ctx: u64, max_chunks: u64, tile: u64, step_rows: u64) -> Self {
         let mut p = Self::default();
-        let step = build_step_graph(d, max_ctx, max_chunks, 1, &[]);
-        for (name, _dt, _dims, bytes) in step.persistent_tensor_specs() {
-            if is_weight_name(&name) {
-                p.weights.insert(name, bytes);
-            } else if is_kv_name(&name) {
-                if name.ends_with("ring") {
-                    p.rings.insert(name, bytes);
+        let mut widths = vec![1u64];
+        if step_rows > 1 {
+            widths.push(step_rows);
+        }
+        for t in widths {
+            let step = build_step_graph(d, max_ctx, max_chunks, t, &[]);
+            for (name, _dt, _dims, bytes) in step.persistent_tensor_specs() {
+                let map = if is_weight_name(&name) {
+                    &mut p.weights
+                } else if is_kv_name(&name) {
+                    if name.ends_with("ring") {
+                        &mut p.rings
+                    } else {
+                        &mut p.kv
+                    }
+                } else if is_hist_name(&name) {
+                    &mut p.rings
                 } else {
-                    p.kv.insert(name, bytes);
-                }
-            } else if is_hist_name(&name) {
-                p.rings.insert(name, bytes);
-            } else {
-                p.step_acts.insert(name, bytes);
+                    &mut p.step_acts
+                };
+                let e = map.entry(name).or_insert(0);
+                *e = (*e).max(bytes);
             }
         }
         let mut graphs = vec![
@@ -1072,7 +1099,7 @@ pub fn hbm_plan_bytes(spec: &ModelSpec, max_ctx: u64, prefill_tile: u64) -> Resu
     let max_ctx = align_up(max_ctx.max(IK_CHUNK), IK_CHUNK);
     let tile = prefill_tile.clamp(1, IK_MAX_PREFILL_TILE);
     let d = IkDims::from_spec(spec, tile)?;
-    let p = IkPlan::build(&d, max_ctx, max_ctx / IK_CHUNK, tile);
+    let p = IkPlan::build(&d, max_ctx, max_ctx / IK_CHUNK, tile, 1);
     Ok([p.weights_bytes(), p.kv_bytes(), p.ring_bytes(), p.act_bytes()])
 }
 
@@ -1149,10 +1176,18 @@ pub struct Inkling2Engine {
     step_prefill: bool,
     /// Debug: directory the step's tensors are written to after the prompt.
     dump_dir: Option<std::path::PathBuf>,
+    /// Debug: rows of the passes a greedy request is run again with (0: off).
+    verify_check: u64,
+    /// Speculative decoding: the drafter and the rows of a verify pass (the last token and its
+    /// drafts); `None`: every request is `K = 0`.
+    draft: Option<SpecConfig>,
+    spec_rows: u64,
+    /// Requests served so far (the host oracle drafter's streams are per request).
+    requests: usize,
 
     // Recipes (must drop before `dev`)
     head: CompiledRecipe,
-    step_recipes: BTreeMap<u64, (CompiledRecipe, PreparedLaunch)>, // bucket (chunks)
+    step_recipes: BTreeMap<(u64, u64), (CompiledRecipe, PreparedLaunch)>, // (rows, bucket)
     embed_recipes: HashMap<u64, CompiledRecipe>,                   // T
     final_recipes: HashMap<u64, CompiledRecipe>,                   // T
     app_recipes: HashMap<(IkKind, u64, u64), CompiledRecipe>,      // (kind, T, chunks; 0 sliding)
@@ -1204,10 +1239,22 @@ impl Inkling2Engine {
         live.set_model(&model_name);
         live.set_phase("loading", "opening device and compiling recipes");
 
-        let spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
-            .map_err(|e| format!("load config.json: {e}"))?;
+        // A GGUF file (or a directory of its shards) carries the geometry in its metadata.
+        let gguf = if crate::gguf::looks_like_gguf(&cfg.model_dir) {
+            Some(Arc::new(
+                crate::gguf::Gguf::open(&cfg.model_dir).map_err(|e| format!("open GGUF: {e}"))?,
+            ))
+        } else {
+            None
+        };
+        let spec = match &gguf {
+            Some(g) => ModelSpec::from_config_json(&gguf_source::config_json(g)?)
+                .map_err(|e| format!("GGUF metadata: {e}"))?,
+            None => ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
+                .map_err(|e| format!("load config.json: {e}"))?,
+        };
         if spec.family != ModelFamily::Inkling2 {
-            return Err("Inkling2Engine: config.json is not an Inkling 2 model".into());
+            return Err("Inkling2Engine: the model is not an Inkling 2 model".into());
         }
         spec.validate()
             .map_err(|e| format!("verified ModelSpec validation failed: {e}"))?;
@@ -1217,11 +1264,34 @@ impl Inkling2Engine {
                     .into(),
             );
         }
-        if cfg.spec.is_some() {
-            return Err("Inkling 2: speculative decoding is not wired up for this family yet".into());
-        }
+        // Speculative decoding: the rows of a verify pass are the last token and its drafts.
+        let spec_cfg = cfg.spec.clone();
+        let spec_rows = match &spec_cfg {
+            Some(sc) => {
+                if !matches!(sc.method, SpecMethod::Oracle { .. }) {
+                    return Err(format!(
+                        "Inkling 2: the '{}' drafter is not wired up for this family yet (the host oracle drafter is)",
+                        sc.method_name()
+                    ));
+                }
+                let k = sc.draft_k.iter().copied().max().unwrap_or(7);
+                if k == 0 || k > 63 {
+                    return Err(format!("Inkling 2: --draft-k {k} is outside 1..63"));
+                }
+                k + 1
+            }
+            None => 1,
+        };
 
-        let (max_pos, gen_eos) = read_model_limits(cfg);
+        let (max_pos, gen_eos) = match &gguf {
+            Some(g) => (
+                g.arch_kv("context_length").and_then(|v| v.as_u64()).unwrap_or(0),
+                g.get_u64("tokenizer.ggml.eos_token_id")
+                    .map(|e| vec![e as i32])
+                    .unwrap_or_default(),
+            ),
+            None => read_model_limits(cfg),
+        };
         let max_ctx = align_up(cfg.max_ctx.max(IK_CHUNK), IK_CHUNK);
         if max_pos > 0 && max_ctx > max_pos {
             return Err(format!(
@@ -1246,6 +1316,14 @@ impl Inkling2Engine {
             .and_then(|v| v.parse::<usize>().ok());
         let step_prefill = std::env::var("GAUDIUM_IK_STEP_PREFILL").is_ok_and(|v| v == "1");
         let dump_dir = std::env::var_os("GAUDIUM_IK_DUMP").map(std::path::PathBuf::from);
+        // Debug: after a greedy request, its tokens are run again in passes of this many rows and
+        // every row's logits are compared with the one-row step's, bit for bit.
+        let verify_check = std::env::var("GAUDIUM_IK_VERIFY_CHECK")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&t| t > 1 && t <= 64)
+            .unwrap_or(0);
+        let step_rows = verify_check.max(1).max(spec_rows);
 
         // Configure kernel ELFs and the graph-compiler glue BEFORE SynapseAI is loaded.
         let kenv = KernelEnv::configure_from_dir(&cfg.kernels_dir)?;
@@ -1276,17 +1354,22 @@ impl Inkling2Engine {
         };
 
         // vision: the image tower's share of the plan (none without image input)
-        let mut vision = vision::IkVision::plan(cfg, &IkDims::from_spec(&spec, IK_MAX_PREFILL_TILE)?)?;
+        // (a GGUF file carries no tower: text only)
+        let mut vision = match gguf {
+            Some(_) => None,
+            None => vision::IkVision::plan(cfg, &IkDims::from_spec(&spec, IK_MAX_PREFILL_TILE)?)?,
+        };
         let vis_bytes = vision.as_ref().map_or(0, |v| v.plan_bytes().0 + v.plan_bytes().1);
 
         // ---- Plan: the largest prefill tile whose exact plan fits the card ----
         let mut tile = cfg.prefill_tile.clamp(1, IK_MAX_PREFILL_TILE);
         let (dims, plan) = loop {
-            let mut d = IkDims::from_spec(&spec, tile)?;
+            // rings hold their window beside the widest pass (a prefill tile or a multi-row step)
+            let mut d = IkDims::from_spec(&spec, tile.max(step_rows))?;
             if let Some(n) = apps_cut {
                 d.n_apps = n.clamp(1, d.apps.len());
             }
-            let p = IkPlan::build(&d, max_ctx, max_chunks, tile);
+            let p = IkPlan::build(&d, max_ctx, max_chunks, tile, step_rows);
             let total = p.total(MIN_SHARED_WORKSPACE_BYTES) + vis_bytes;
             match dev.check_plan_fits(total, HBM_HEADROOM_BYTES) {
                 Ok(_) => break (d, p),
@@ -1477,10 +1560,23 @@ impl Inkling2Engine {
 
         // ---- Upload weights and tables from the mmap'd checkpoint ----
         let t_up = Instant::now();
-        let store = crate::safetensors::SafetensorsStore::open(&cfg.model_dir)
-            .map_err(|e| format!("open safetensors: {e}"))?;
-        let packer = packer::IkPacker::new(&store, &dims, max_ctx)
-            .with_amax_bf16(std::env::var("GAUDIUM_IK_AMAX_BF16").is_ok_and(|v| v == "1"));
+        let store;
+        let st_source;
+        let gg_source;
+        let source: &dyn packer::IkSource = match &gguf {
+            Some(g) => {
+                gg_source = gguf_source::GgufSource::new(Arc::clone(g))?;
+                &gg_source
+            }
+            None => {
+                store = crate::safetensors::SafetensorsStore::open(&cfg.model_dir)
+                    .map_err(|e| format!("open safetensors: {e}"))?;
+                st_source = packer::StSource::new(&store)
+                    .with_amax_bf16(std::env::var("GAUDIUM_IK_AMAX_BF16").is_ok_and(|v| v == "1"));
+                &st_source
+            }
+        };
+        let packer = packer::IkPacker::new(source, &dims, max_ctx);
         let mut stage_upload = dev
             .alloc_pinned(STAGE_BUF_BYTES)
             .map_err(|e| format!("alloc pinned upload stage: {e}"))?;
@@ -1498,11 +1594,12 @@ impl Inkling2Engine {
                 .map_err(|e| format!("upload weight '{name}': {e}"))?;
             uploaded_bytes += expected;
         }
-        drop(packer);
+        // vision: the tower's weights come from the checkpoint's safetensors file
         if let Some(v) = vision.as_mut() {
-            uploaded_bytes += v.upload(&dev, &store, &mut stage_upload)?;
+            let vstore = crate::safetensors::SafetensorsStore::open(&cfg.model_dir)
+                .map_err(|e| format!("open safetensors (vision tower): {e}"))?;
+            uploaded_bytes += v.upload(&dev, &vstore, &mut stage_upload)?;
         }
-        drop(store);
         if cfg.verbose {
             let dt = t_up.elapsed().as_secs_f64();
             eprintln!(
@@ -1552,6 +1649,10 @@ impl Inkling2Engine {
             elf_hashes,
             step_prefill,
             dump_dir,
+            verify_check,
+            draft: spec_cfg,
+            spec_rows,
+            requests: 0,
             head,
             step_recipes: BTreeMap::new(),
             embed_recipes: HashMap::new(),
@@ -1575,7 +1676,7 @@ impl Inkling2Engine {
             dev,
         };
         let prepared = engine.prepare_step(&step1)?;
-        engine.step_recipes.insert(1, (step1, prepared));
+        engine.step_recipes.insert((1, 1), (step1, prepared));
         engine.live.set_phase("idle", "ready");
         Ok(engine)
     }
@@ -1642,14 +1743,14 @@ impl Inkling2Engine {
             .map_err(|e| format!("prepare decode step launch: {e}"))
     }
 
-    fn ensure_step(&mut self, bucket: u64) -> Result<(), String> {
-        if self.step_recipes.contains_key(&bucket) {
+    fn ensure_step(&mut self, rows: u64, bucket: u64) -> Result<(), String> {
+        if self.step_recipes.contains_key(&(rows, bucket)) {
             return Ok(());
         }
-        let gb = build_step_graph(&self.dims, self.max_ctx, bucket, 1, &self.elf_hashes);
-        let r = self.compile(&gb, &format!("decode step ({bucket} chunks)"))?;
+        let gb = build_step_graph(&self.dims, self.max_ctx, bucket, rows, &self.elf_hashes);
+        let r = self.compile(&gb, &format!("decode step ({rows} rows, {bucket} chunks)"))?;
         let prepared = self.prepare_step(&r)?;
-        self.step_recipes.insert(bucket, (r, prepared));
+        self.step_recipes.insert((rows, bucket), (r, prepared));
         Ok(())
     }
 
@@ -1785,8 +1886,20 @@ impl Inkling2Engine {
         params: &GenParams,
         seq_pos: u32,
     ) -> Result<i32, String> {
+        self.sample_logits_row(logits_hbm, 0, params, seq_pos)
+    }
+
+    /// [`Self::sample_from_logits`] for row `row` of a logits tensor of several rows.
+    fn sample_logits_row(
+        &mut self,
+        logits_hbm: u64,
+        row: usize,
+        params: &GenParams,
+        seq_pos: u32,
+    ) -> Result<i32, String> {
         let vocab = self.dims.vocab_out as usize;
         let bytes = vocab * 2;
+        let logits_hbm = logits_hbm + (row as u64) * self.dims.vocab_pad * 2;
         self.dev
             .copy_d2h_pinned_sync(logits_hbm, &mut self.stage_io, bytes)
             .map_err(|e| format!("read logits D2H: {e}"))?;
@@ -1851,6 +1964,42 @@ impl Inkling2Engine {
         Ok(())
     }
 
+    /// Runs one pass of the decode step over `toks` at positions `cursor ..` (the recipe of
+    /// `toks.len()` rows must be compiled) and returns each row's arg-max token.
+    fn run_rows(&mut self, toks: &[i32], cursor: u64, bucket: u64) -> Result<Vec<i32>, String> {
+        let rows = toks.len();
+        let (ids, cur, tokens) = (
+            self.step_act_addr["ids"].0,
+            self.step_act_addr["cursor"].0,
+            self.step_act_addr["tokens"].0,
+        );
+        let buf = self.stage_io.as_mut_slice();
+        for (k, &t) in toks.iter().enumerate() {
+            buf[k * 4..k * 4 + 4].copy_from_slice(&t.to_le_bytes());
+        }
+        let coff = (rows * 4).next_multiple_of(64);
+        buf[coff..coff + 4].copy_from_slice(&(cursor as i32).to_le_bytes());
+        self.dev
+            .copy_h2d_pinned_batch_sync(&self.stage_io, &[(0, rows * 4, ids), (coff, 4, cur)])
+            .map_err(|e| format!("write step inputs H2D: {e}"))?;
+        let (recipe, prepared) = &self.step_recipes[&(rows as u64, bucket)];
+        self.live.launch_begin();
+        recipe
+            .launch_prepared(&self.dev, prepared)
+            .map_err(|e| format!("launch decode step (cursor={cursor}, {rows} rows): {e}"))?;
+        self.live.launch_submitted();
+        self.sync_compute("decode step")?;
+        self.dev
+            .copy_d2h_pinned_sync(tokens, &mut self.stage_io, rows * 4)
+            .map_err(|e| format!("read step tokens D2H: {e}"))?;
+        Ok(self.stage_io.as_slice()[..rows * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
+            .collect())
+    }
+
     /// Runs one decode step for `tok` at position `cursor` and returns the next token.
     fn run_step(
         &mut self,
@@ -1859,30 +2008,183 @@ impl Inkling2Engine {
         bucket: u64,
         params: &GenParams,
     ) -> Result<i32, String> {
-        let (ids, cur, tokens, logits) = (
-            self.step_act_addr["ids"].0,
-            self.step_act_addr["cursor"].0,
-            self.step_act_addr["tokens"].0,
-            self.step_act_addr["logits"].0,
-        );
-        let buf = self.stage_io.as_mut_slice();
-        buf[0..4].copy_from_slice(&tok.to_le_bytes());
-        buf[64..68].copy_from_slice(&(cursor as i32).to_le_bytes());
-        self.dev
-            .copy_h2d_pinned_batch_sync(&self.stage_io, &[(0, 4, ids), (64, 4, cur)])
-            .map_err(|e| format!("write step inputs H2D: {e}"))?;
-        let (recipe, prepared) = &self.step_recipes[&bucket];
-        self.live.launch_begin();
-        recipe
-            .launch_prepared(&self.dev, prepared)
-            .map_err(|e| format!("launch decode step (cursor={cursor}): {e}"))?;
-        self.live.launch_submitted();
-        self.sync_compute("decode step")?;
+        let greedy = self.run_rows(&[tok], cursor, bucket)?[0];
         if params.temperature > 0.0 {
+            let logits = self.step_act_addr["logits"].0;
             self.sample_from_logits(logits, params, cursor as u32)
         } else {
-            self.read_i32_scalar(tokens)
+            Ok(greedy)
         }
+    }
+
+    /// Reads back the raw logits of the first `rows` rows of the last step pass.
+    fn read_step_logits(&mut self, rows: usize) -> Result<Vec<u8>, String> {
+        let row_bytes = self.dims.vocab_pad as usize * 2;
+        let addr = self.step_act_addr["logits"].0;
+        let cap = self.stage_io.as_slice().len() / row_bytes * row_bytes;
+        let total = rows * row_bytes;
+        let mut out = Vec::with_capacity(total);
+        while out.len() < total {
+            let n = (total - out.len()).min(cap);
+            self.dev
+                .copy_d2h_pinned_sync(addr + out.len() as u64, &mut self.stage_io, n)
+                .map_err(|e| format!("read logits D2H: {e}"))?;
+            out.extend_from_slice(&self.stage_io.as_slice()[..n]);
+        }
+        Ok(out)
+    }
+
+    /// Debug check behind `GAUDIUM_IK_VERIFY_CHECK`: runs the tokens of a finished greedy request
+    /// again in passes of `rows` rows and compares every row's logits with the one-row step's.
+    fn verify_check_run(
+        &mut self,
+        prompt_len: usize,
+        generated: &[i32],
+        step_logits: &[Vec<u8>],
+    ) -> Result<(), String> {
+        let rows = self.verify_check as usize;
+        let row_bytes = self.dims.vocab_pad as usize * 2;
+        let (mut passes, mut bad_tokens, mut bad_rows, mut bad_values) = (0u64, 0u64, 0u64, 0u64);
+        let mut pass_ms = 0.0f64;
+        let mut b = 0usize;
+        // step i reads generated[i] at position prompt_len + i and gives generated[i + 1]
+        while b + rows < generated.len() && b + rows <= step_logits.len() {
+            let cursor = (prompt_len + b) as u64;
+            let bucket = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
+            self.ensure_step(rows as u64, bucket)?;
+            let t0 = Instant::now();
+            let got = self.run_rows(&generated[b..b + rows], cursor, bucket)?;
+            pass_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            let logits = self.read_step_logits(rows)?;
+            for k in 0..rows {
+                if got[k] != generated[b + k + 1] {
+                    bad_tokens += 1;
+                }
+                let a = &logits[k * row_bytes..(k + 1) * row_bytes];
+                let diff = a
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(step_logits[b + k].as_chunks::<2>().0)
+                    .filter(|(x, y)| x != y)
+                    .count() as u64;
+                if diff > 0 {
+                    bad_rows += 1;
+                    bad_values += diff;
+                }
+            }
+            passes += 1;
+            b += rows;
+        }
+        eprintln!(
+            "[gaudium] VERIFY-CHECK rows={rows}: {passes} passes ({:.2} ms per pass), {} rows; tokens differing from the one-row stream: {bad_tokens}; rows with any differing logit: {bad_rows} ({bad_values} values)",
+            pass_ms / (passes.max(1) as f64),
+            passes * rows as u64
+        );
+        Ok(())
+    }
+
+    /// Speculative decode after the first token: each launch verifies the last token and its
+    /// drafts in one pass of `spec_rows` rows and emits the tokens the pass itself gives up to and
+    /// including the first one a draft missed. Every emitted token is the pass's own arg-max (or
+    /// its own sample at that position), and a pass of several rows gives each row the logits a
+    /// one-row step gives it, so the stream is the `K = 0` stream.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_spec(
+        &mut self,
+        prompt_len: usize,
+        params: &GenParams,
+        budget: &mut SequenceBudget,
+        is_eos: &impl Fn(i32) -> bool,
+        is_cancelled: &impl Fn() -> bool,
+        on_token: &mut impl FnMut(i32),
+        generated: &mut Vec<i32>,
+    ) -> Result<SpecOutcome, String> {
+        let rows = self.spec_rows as usize;
+        let k = rows - 1;
+        let req = self.requests;
+        let oracle = match self.draft.as_ref().map(|s| &s.method) {
+            Some(SpecMethod::Oracle { requests }) => requests.get(req).cloned().unwrap_or_default(),
+            _ => return Err("Inkling 2: no drafter for this request".into()),
+        };
+        let logits = self.step_act_addr["logits"].0;
+        let mut out = SpecOutcome::default();
+        let mut bucket = 0u64;
+        let t0 = Instant::now();
+        let mut compile_ms = 0.0f64;
+        while budget.remaining() > 0 {
+            if is_cancelled() {
+                out.stopped_by_cancel = true;
+                break;
+            }
+            // the last emitted token is generated[gi]; it sits at position prompt_len + gi
+            let gi = generated.len() - 1;
+            let cursor = (prompt_len + gi) as u64;
+            let room = (self.max_ctx - cursor) as usize;
+            if room < rows {
+                // the pass would write past the context: finish with one-row steps
+                let b1 = step_bucket((cursor + 1).div_ceil(IK_CHUNK), self.max_chunks);
+                self.ensure_step(1, b1)?;
+                let tok = self.run_step(generated[gi], cursor, b1, params)?;
+                out.launches += 1;
+                budget.record_emitted(1);
+                generated.push(tok);
+                self.live.step(1, 0, 0);
+                on_token(tok);
+                if params.stop_on_eos && is_eos(tok) {
+                    out.stopped_by_eos = true;
+                    break;
+                }
+                continue;
+            }
+            // drafts of the host oracle: the known continuation, with the marked ones made wrong
+            let mut toks = vec![generated[gi]];
+            for j in 0..k {
+                let Some(&t) = oracle.stream.get(gi + 1 + j) else { break };
+                let wrong = oracle.corrupt.contains(&(gi + 1 + j));
+                toks.push(if wrong { (t + 1) % self.dims.vocab_out as i32 } else { t });
+            }
+            let n_drafts = toks.len() - 1;
+            toks.resize(rows, 0);
+            let need = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
+            if need != bucket {
+                let tc = Instant::now();
+                self.ensure_step(rows as u64, need)?;
+                compile_ms += tc.elapsed().as_secs_f64() * 1000.0;
+                bucket = need;
+            }
+            let mut got = self.run_rows(&toks, cursor, bucket)?;
+            if params.temperature > 0.0 {
+                // a sampled request: each row's token is its position's own sample
+                for (r, g) in got.iter_mut().enumerate().take(n_drafts + 1) {
+                    *g = self.sample_logits_row(logits, r, params, (cursor + r as u64) as u32)?;
+                }
+            }
+            let accepted = chain_accept(&toks[..=n_drafts], &got[..=n_drafts]);
+            out.launches += 1;
+            out.drafted += n_drafts as u64;
+            out.accepted += accepted as u64;
+            let mut emitted = 0u64;
+            for &tok in &got[..=accepted] {
+                if budget.remaining() == 0 {
+                    break;
+                }
+                budget.record_emitted(1);
+                generated.push(tok);
+                on_token(tok);
+                emitted += 1;
+                if params.stop_on_eos && is_eos(tok) {
+                    out.stopped_by_eos = true;
+                    break;
+                }
+            }
+            self.live.step(emitted, n_drafts as u64, accepted as u64);
+            if out.stopped_by_eos {
+                break;
+            }
+        }
+        out.decode_ms = (t0.elapsed().as_secs_f64() * 1000.0 - compile_ms).max(0.0);
+        Ok(out)
     }
 
     /// Runs prefill + autoregressive decode, calling `on_token` per generated token. `cancel` is
@@ -1962,6 +2264,7 @@ impl Inkling2Engine {
         let kinds = self.dims.kinds();
         let mut pos = 0usize;
         let mut last_tile = 0u64;
+        let mut last_valid = 0u64;
         let mut recipe_ms = 0.0f64;
         // vision: the tower runs first, its features land in the feature buffer
         self.ikv_run_tower()?;
@@ -1969,10 +2272,14 @@ impl Inkling2Engine {
             if is_cancelled() {
                 return Ok(None);
             }
-            let t = (prompt_ids.len() - pos).min(self.prefill_tile as usize) as u64;
+            // `tv` prompt rows run as a tile of `t` rows (a ladder of sizes: the rows past the prompt
+            // are computed, written past the cursor and never read; the next pass writes them again)
+            let tv = (prompt_ids.len() - pos).min(self.prefill_tile as usize) as u64;
+            let t = ik_tile_rows(tv, self.prefill_tile, self.max_ctx - pos as u64);
             let end_pos = pos as u64 + t;
-            let nch = end_pos.div_ceil(IK_CHUNK).clamp(1, self.max_chunks);
+            let nch = step_bucket(end_pos.div_ceil(IK_CHUNK), self.max_chunks);
             last_tile = t;
+            last_valid = tv;
 
             let t_rec = Instant::now();
             self.ensure_embed(t)?;
@@ -1982,7 +2289,8 @@ impl Inkling2Engine {
             recipe_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
 
             let tile_bytes = (t as usize) * 4;
-            for (k, &id) in prompt_ids[pos..pos + t as usize].iter().enumerate() {
+            self.stage_io.as_mut_slice()[..tile_bytes].fill(0);
+            for (k, &id) in prompt_ids[pos..pos + tv as usize].iter().enumerate() {
                 self.stage_io.as_mut_slice()[k * 4..k * 4 + 4].copy_from_slice(&id.to_le_bytes());
             }
             self.dev
@@ -2008,7 +2316,7 @@ impl Inkling2Engine {
                 self.launch_prefill_app(a, t, nch)?;
             }
             self.sync_compute("prefill tile")?;
-            pos += t as usize;
+            pos += tv as usize;
             self.live.prefill_progress(pos as u64);
         }
 
@@ -2038,7 +2346,7 @@ impl Inkling2Engine {
         }
         {
             let mut pool = self.pf_scratch.clone();
-            pool.insert("h_in".into(), self.pf_hfin + (last_tile - 1) * hid * 2);
+            pool.insert("h_in".into(), self.pf_hfin + (last_valid - 1) * hid * 2);
             pool.insert("W_head".into(), self.weights_addr["W_head"]);
             let bind = select_exact_bindings(&self.head, &pool)?;
             self.head
@@ -2089,7 +2397,7 @@ impl Inkling2Engine {
                     return Ok(cancelled_report(t_prefill.elapsed().as_secs_f64() * 1000.0));
                 }
                 let bucket = step_bucket((i as u64 + 1).div_ceil(IK_CHUNK), self.max_chunks);
-                self.ensure_step(bucket)?;
+                self.ensure_step(1, bucket)?;
                 tok = self.run_step(id, i as u64, bucket, params)?;
                 self.live.prefill_progress(i as u64 + 1);
             }
@@ -2129,6 +2437,49 @@ impl Inkling2Engine {
             stopped_by_cancel = true;
         }
 
+        // ---- DECODE, speculative: an engine loaded with a drafter ----
+        if self.draft.is_some()
+            && !stopped_by_eos
+            && !stopped_by_cancel
+            && !generated.is_empty()
+            && budget.remaining() > 0
+        {
+            let out = self.decode_spec(
+                prompt_ids.len(),
+                params,
+                budget,
+                is_eos,
+                is_cancelled,
+                on_token,
+                &mut generated,
+            )?;
+            self.requests += 1;
+            let decode_tokens = generated.len().saturating_sub(1);
+            let k = self.spec_rows - 1;
+            return Ok(GenReport {
+                prompt_tokens: prompt_ids.len(),
+                generated_tokens: generated,
+                ttft_ms,
+                prefill_tok_s,
+                decode_ms: out.decode_ms,
+                decode_tok_s: decode_tokens as f64 / (out.decode_ms / 1000.0).max(1e-9),
+                ms_per_step: out.decode_ms / (out.launches.max(1) as f64),
+                stopped_by_eos: out.stopped_by_eos,
+                stopped_by_cancel: out.stopped_by_cancel,
+                launches: out.launches,
+                tokens_per_launch: decode_tokens as f64 / (out.launches.max(1) as f64),
+                method: format!(
+                    "{} K={k} BF16 {}",
+                    self.draft.as_ref().map_or("", |s| s.method_name()),
+                    if params.temperature > 0.0 { "sampled" } else { "greedy" }
+                ),
+                drafted: out.drafted,
+                draft_accepted: out.accepted,
+                ..GenReport::default()
+            });
+        }
+        self.requests += 1;
+
         // ---- DECODE: one monolithic launch per token ----
         // a bucket compiled on first use is not decode time: build the first one before the clock
         let mut bucket = step_bucket(
@@ -2136,8 +2487,10 @@ impl Inkling2Engine {
             self.max_chunks,
         );
         if !stopped_by_eos && !stopped_by_cancel && budget.remaining() > 0 {
-            self.ensure_step(bucket)?;
+            self.ensure_step(1, bucket)?;
         }
+        let keep_logits = self.verify_check > 0 && params.temperature <= 0.0;
+        let mut step_logits: Vec<Vec<u8>> = Vec::new();
         let t_decode = Instant::now();
         let mut compile_ms = 0.0f64;
         let mut cur_tok = first_tok;
@@ -2151,11 +2504,14 @@ impl Inkling2Engine {
             let need = step_bucket((cursor_val + 1).div_ceil(IK_CHUNK), self.max_chunks);
             if need != bucket {
                 let t0 = Instant::now();
-                self.ensure_step(need)?;
+                self.ensure_step(1, need)?;
                 compile_ms += t0.elapsed().as_secs_f64() * 1000.0;
                 bucket = need;
             }
             let next_tok = self.run_step(cur_tok, cursor_val, bucket, params)?;
+            if keep_logits {
+                step_logits.push(self.read_step_logits(1)?);
+            }
             decode_steps += 1;
             budget.record_emitted(1);
             generated.push(next_tok);
@@ -2168,6 +2524,9 @@ impl Inkling2Engine {
         }
 
         let decode_ms = (t_decode.elapsed().as_secs_f64() * 1000.0 - compile_ms).max(0.0);
+        if keep_logits && !stopped_by_cancel {
+            self.verify_check_run(prompt_ids.len(), &generated, &step_logits)?;
+        }
         let (decode_tok_s, ms_per_step) = if decode_steps > 0 {
             (
                 (decode_steps as f64) / (decode_ms / 1000.0).max(1e-9),
@@ -2276,7 +2635,7 @@ mod tests {
         assert!(acts > 0);
         // every name the plan sorted is one the roles know
         let d = IkDims::from_spec(&spec, 64).unwrap();
-        let p = IkPlan::build(&d, 262144, 64, 64);
+        let p = IkPlan::build(&d, 262144, 64, 64, 1);
         assert!(p.weights.keys().all(|n| is_weight_name(n)));
         assert!(p.kv.keys().all(|n| is_kv_name(n) && n.ends_with("cache")));
         assert!(p.pf_scratch.keys().all(|n| !is_weight_name(n) && !is_kv_name(n) && !is_hist_name(n)));

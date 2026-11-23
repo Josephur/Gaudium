@@ -250,3 +250,28 @@ def ik_dims_valid(+hidden: Nat, +n_heads: Nat, +n_kv: Nat, head_dim: Nat, d_rel:
       )
     )
   )
+
+# ============================================================================
+# 7. Prefill tiles
+# ============================================================================
+
+def ik_tile_rows_fit(+rows: Nat, +padded: Nat, fits: Bool) -> Nat:
+  match fits:
+    case True{}:
+      padded
+    case False{}:
+      rows
+
+# Rows a prefill tile of `rows` prompt rows runs with: a power of two of at least 8, capped at the
+# planned tile, so that a new prompt length compiles no new recipe (the rows past the prompt are
+# computed and never read); the rows themselves when the padded tile would not fit the `room`
+# of positions left in the context or when no such count holds them.
+def ik_tile_rows(+rows: Nat, +tile: Nat, +room: Nat) -> Nat:
+  ik_tile_rows_fit(
+    rows,
+    Nat.min(ik_pow2_from(40n, Nat.is_ge(8n, rows), 8n, rows), tile),
+    Bool.and(
+      Nat.is_ge(Nat.min(ik_pow2_from(40n, Nat.is_ge(8n, rows), 8n, rows), tile), rows),
+      Nat.is_le(Nat.min(ik_pow2_from(40n, Nat.is_ge(8n, rows), 8n, rows), tile), room)
+    )
+  )

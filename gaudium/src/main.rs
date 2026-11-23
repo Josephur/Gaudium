@@ -48,7 +48,10 @@ fn print_usage() {
          \n\
          Usage:\n\
          \x20 gaudium                                   Run verified-core self-check\n\
-         \x20 gaudium --inspect-model <dir>             Validate config.json & Safetensors\n\
+         \x20 gaudium --inspect-model <dir|file.gguf>   Validate config.json & Safetensors, or a GGUF\n\
+         \x20                                           model (a .gguf file, any shard of a split one,\n\
+         \x20                                           or a directory of them without config.json):\n\
+         \x20                                           metadata, tensors and weights per type\n\
          \x20 gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json\n\
          \x20 gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test\n\
          \x20 gaudium --probe-copy [GiB]                Measure copies between the card and host memory\n\
@@ -278,24 +281,24 @@ fn print_usage() {
          \x20                       BF16 weights streams may differ between settings at exact BF16\n\
          \x20                       logit ties, s16 > 0 is not token-identical to s16=0.\n\
          \n\
-         Inkling 2 environment variables (debug):\n\
-         \x20 GAUDIUM_IK_AMAX_BF16  1 = decode the 4-bit experts with their per-expert scale rounded\n\
-         \x20                       to BF16 first, as the reference loader does (default: f32)\n\
-         \x20 GAUDIUM_IK_APPS       Load only the first <n> layer applications (quick kernel checks;\n\
-         \x20                       the output is not the model's)\n\
-         \x20 GAUDIUM_IK_STEP_PREFILL  1 = prefill the prompt one row at a time through the decode\n\
-         \x20                       step (takes no image)\n\
-         \x20 GAUDIUM_IK_DUMP       Directory: every tensor of the decode step after the prompt is\n\
-         \x20                       written there\n\
-         \x20 GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first\n\
-         \x20                       image request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence\n\
-         \x20                       rows x 1024) and img<k>_feat (tokens x 2304) as raw BF16 (it\n\
-         \x20                       syncs after each one; debug)\n\
-         \n\
          Gemma 4 environment variables:\n\
          \x20 GAUDIUM_G4_NORM       Layer RMS-norm node: row | tile | vendor (default: tile for sizes with\n\
          \x20                       per-layer inputs, else vendor). Changes compiled graphs; streams may\n\
          \x20                       differ between settings at exact BF16 logit ties.\n\
+         \n\
+         Inkling 2 environment variables (debugging; none changes a served stream unless noted):\n\
+         \x20 GAUDIUM_IK_AMAX_BF16  1: decode the 4-bit expert matrices with their per-expert scale terms\n\
+         \x20                       rounded to BF16 first, as the publisher's reference loader ends up\n\
+         \x20                       doing (for comparisons with it; changes the weights slightly)\n\
+         \x20 GAUDIUM_IK_APPS       Load and run only the first N layer applications (kernel checks)\n\
+         \x20 GAUDIUM_IK_STEP_PREFILL  1: prefill the prompt one row at a time with the decode step\n\
+         \x20 GAUDIUM_IK_DUMP       Directory: after the prompt, every tensor of the one-row decode step and\n\
+         \x20                       the head of every K / V state is written there as <name>.bin\n\
+         \x20 GAUDIUM_IK_VERIFY_CHECK  N (2..64): after a greedy request its tokens are run again in passes\n\
+         \x20                       of N rows and every row's logits are compared with the one-row step's\n\
+         \x20 GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first image\n\
+         \x20                       request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence rows x 1024)\n\
+         \x20                       and img<k>_feat (tokens x 2304) as raw BF16 (it syncs after each one)\n\
          \n\
          Generate options:\n\
          \x20 --model <dir>         Model directory (or GAUDIUM_MODEL)\n\
@@ -500,6 +503,10 @@ fn print_usage() {
 }
 
 fn inspect_model(dir: &Path) -> Result<(), String> {
+    if gaudium::gguf::looks_like_gguf(dir) {
+        println!("{}", gaudium::gguf::inspect::inspect(dir).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
     let cfg_path = dir.join("config.json");
     let spec = ModelSpec::from_config_file(&cfg_path).map_err(|e| e.to_string())?;
     spec.validate().map_err(|e| e.to_string())?;
@@ -844,7 +851,18 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let kernels_dir = kernels_dir
         .ok_or_else(|| "missing --kernels <dir> (or GAUDIUM_KERNELS env var)".to_string())?;
 
-    let tok = Tokenizer::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+    // a model given as one file (a GGUF build) keeps its tokenizer files beside it
+    let text_dir = if model_dir.is_file() {
+        model_dir.parent().map(Path::to_path_buf).unwrap_or_default()
+    } else {
+        model_dir.clone()
+    };
+    let tok = Tokenizer::from_model_dir(&text_dir).map_err(|e| {
+        format!(
+            "tokenizer files in {}: {e}",
+            text_dir.display()
+        )
+    })?;
     if let Some(im_end) = tok.token_id("<|im_end|>") {
         params.extra_eos_ids.push(im_end);
     }

@@ -26,7 +26,10 @@ Gaudium — Intel Gaudi 2 Inference Engine (RustyBends v1)
 
 Usage:
   gaudium                                   Run verified-core self-check
-  gaudium --inspect-model <dir>             Validate config.json & Safetensors
+  gaudium --inspect-model <dir|file.gguf>   Validate config.json & Safetensors, or a GGUF
+                                            model (a .gguf file, any shard of a split one,
+                                            or a directory of them without config.json):
+                                            metadata, tensors and weights per type
   gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json
   gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test
   gaudium --probe-copy [GiB]                Measure copies between the card and host memory
@@ -256,24 +259,24 @@ Qwen prefill environment variables:
                         BF16 weights streams may differ between settings at exact BF16
                         logit ties, s16 > 0 is not token-identical to s16=0.
 
-Inkling 2 environment variables (debug):
-  GAUDIUM_IK_AMAX_BF16  1 = decode the 4-bit experts with their per-expert scale rounded
-                        to BF16 first, as the reference loader does (default: f32)
-  GAUDIUM_IK_APPS       Load only the first <n> layer applications (quick kernel checks;
-                        the output is not the model's)
-  GAUDIUM_IK_STEP_PREFILL  1 = prefill the prompt one row at a time through the decode
-                        step (takes no image)
-  GAUDIUM_IK_DUMP       Directory: every tensor of the decode step after the prompt is
-                        written there
-  GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first
-                        image request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence
-                        rows x 1024) and img<k>_feat (tokens x 2304) as raw BF16 (it
-                        syncs after each one; debug)
-
 Gemma 4 environment variables:
   GAUDIUM_G4_NORM       Layer RMS-norm node: row | tile | vendor (default: tile for sizes with
                         per-layer inputs, else vendor). Changes compiled graphs; streams may
                         differ between settings at exact BF16 logit ties.
+
+Inkling 2 environment variables (debugging; none changes a served stream unless noted):
+  GAUDIUM_IK_AMAX_BF16  1: decode the 4-bit expert matrices with their per-expert scale terms
+                        rounded to BF16 first, as the publisher's reference loader ends up
+                        doing (for comparisons with it; changes the weights slightly)
+  GAUDIUM_IK_APPS       Load and run only the first N layer applications (kernel checks)
+  GAUDIUM_IK_STEP_PREFILL  1: prefill the prompt one row at a time with the decode step
+  GAUDIUM_IK_DUMP       Directory: after the prompt, every tensor of the one-row decode step and
+                        the head of every K / V state is written there as <name>.bin
+  GAUDIUM_IK_VERIFY_CHECK  N (2..64): after a greedy request its tokens are run again in passes
+                        of N rows and every row's logits are compared with the one-row step's
+  GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first image
+                        request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence rows x 1024)
+                        and img<k>_feat (tokens x 2304) as raw BF16 (it syncs after each one)
 
 Generate options:
   --model <dir>         Model directory (or GAUDIUM_MODEL)
@@ -490,6 +493,8 @@ or reads it to rewrite a file.
 | `GAUDIUM_IMAGE_REF_DIR` | the decoder tests in `src/vision/decode/` (`--ignored`) | A directory of image files with the raw RGB dump the reference image library wrote for each; every file must decode to the same bytes. |
 | `GAUDIUM_IMAGE_PIPELINE_REF_DIR` | `vision::media::tests::reference_pipeline_records_match_bit_for_bit` (`--ignored`) | A directory written by `gaudium/tests/data/vision/make_pipeline_refs.py`: image files with the patch rows of the checkpoint's own image processor, which must match bit for bit. |
 | `GAUDIUM_VISION_REF_DIR` | `vision::tests::reference_prompt_records_match_bit_for_bit` (`--ignored`) | A directory of reference prompt records (token ids, image grids, positions, patch rows) that the prompt layout and the image preprocessing must reproduce. |
+| `GAUDIUM_GGUF_REF_DIR` | `gguf::tests::reference_gguf_files_open_and_decode` (`--ignored`) | A directory of published GGUF files (and its `dspark/` subdirectory): every file must open, the Inkling 2 Mini model must have its 744 tensors with architecture `inkling2_loop` and NVFP4 weights, every NVFP4 tensor its per-expert `.scale`, and one row of every type must decode to finite numbers. |
+| `GAUDIUM_INKLING2_GGUF` | `engine::inkling2::gguf_source::tests::gguf_and_checkpoint_pack_the_same_device_tensors` (`--ignored`, with `GAUDIUM_INKLING2_DIR`) | A GGUF file of the same Inkling 2 model as the checkpoint directory `GAUDIUM_INKLING2_DIR`: both must pack byte-identical device tensors. |
 | `GAUDIUM_UPDATE_REFERENCE` | `tests/reference_docs.rs` | `1` = rewrite the copy of the help text on this page from the binary instead of failing when it differs. |
 
 <!-- test-variables:end -->
