@@ -55,6 +55,9 @@ const MAX_REDIRECTS: u64 = 3;
 const KEEPALIVE_MS: u64 = 20_000;
 /// Largest response head of a target.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// Largest piece of the answer handed to one write call to the page (one TLS record), so that
+/// each call is bounded by the time left of the exchange.
+const PAGE_WRITE_PIECE: usize = 16 * 1024;
 /// Decisions kept for `GET /gaudium/proxy`.
 const RECENT_KEPT: usize = 50;
 
@@ -369,10 +372,13 @@ fn parse_target(url: &str, tls: Result<(), &str>) -> Result<Target, String> {
         Some(p) if p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()) => p.parse().unwrap_or(0),
         Some(_) => 0,
     };
+    // the text before `://` is shown only when it is a scheme: it could hold a user part
     let shown_scheme = if scheme_text.is_empty() {
         "none"
-    } else {
+    } else if scheme_ok(scheme_text) {
         scheme_text
+    } else {
+        "not a scheme"
     };
     match rule::url_check(scheme, has_user, host_ok, port, tls.is_ok()) {
         UrlVerdict::PxUrlOk => {}
@@ -414,20 +420,129 @@ fn parse_target(url: &str, tls: Result<(), &str>) -> Result<Target, String> {
     })
 }
 
-/// The URL a `Location` header points to, seen from `base`.
+/// A URI scheme name (RFC 3986, section 3.1), of a length worth showing.
+fn scheme_ok(s: &str) -> bool {
+    s.len() <= 32
+        && s.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+/// The URL a `Location` header points to, resolved against the whole URL of the request that
+/// got it (RFC 3986, section 5.2): a reference with a scheme stands alone, `//host...` keeps the
+/// scheme, `/path` the authority, a relative path is merged with the base's directory, `?query`
+/// keeps the path, `#fragment` and the empty reference keep path and query; dot segments are
+/// removed. The result is a URL to check like any other target (`parse_target`).
 fn resolve_location(base: &Target, location: &str) -> String {
-    let loc = location.trim();
-    if loc.contains("://") {
-        loc.to_string()
-    } else if let Some(rest) = loc.strip_prefix("//") {
-        format!("{}://{rest}", base.scheme_name())
-    } else if loc.starts_with('/') {
-        format!("{}{loc}", base.origin())
+    // the parts of the reference (RFC 3986, appendix B)
+    let r = location.trim();
+    let (r, fragment) = match r.split_once('#') {
+        Some((r, f)) => (r, Some(f)),
+        None => (r, None),
+    };
+    let (r, query) = match r.split_once('?') {
+        Some((r, q)) => (r, Some(q)),
+        None => (r, None),
+    };
+    let (scheme, r) = match r.find(':') {
+        Some(i) if i > 0 && !r[..i].contains('/') => (Some(&r[..i]), &r[i + 1..]),
+        _ => (None, r),
+    };
+    let (authority, path) = match r.strip_prefix("//") {
+        Some(rest) => {
+            let cut = rest.find('/').unwrap_or(rest.len());
+            (Some(&rest[..cut]), &rest[cut..])
+        }
+        None => (None, r),
+    };
+    let (base_path, base_query) = match base.path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (base.path.as_str(), None),
+    };
+
+    // the target (section 5.2.2); the base always has an authority and a path that starts with `/`
+    let (scheme, authority, path, query) = if let Some(s) = scheme {
+        (
+            s.to_string(),
+            authority.map(str::to_string),
+            remove_dot_segments(path),
+            query,
+        )
+    } else if let Some(a) = authority {
+        (
+            base.scheme_name().to_string(),
+            Some(a.to_string()),
+            remove_dot_segments(path),
+            query,
+        )
     } else {
-        let dir = base.path.split('?').next().unwrap_or("/");
-        let dir = &dir[..dir.rfind('/').map_or(0, |i| i + 1)];
-        format!("{}{dir}{loc}", base.origin())
+        let (path, query) = if path.is_empty() {
+            (base_path.to_string(), query.or(base_query))
+        } else if path.starts_with('/') {
+            (remove_dot_segments(path), query)
+        } else {
+            // merged with the base's directory (section 5.2.3)
+            let dir = &base_path[..base_path.rfind('/').map_or(0, |i| i + 1)];
+            (remove_dot_segments(&format!("{dir}{path}")), query)
+        };
+        (
+            base.scheme_name().to_string(),
+            Some(base.authority()),
+            path,
+            query,
+        )
+    };
+
+    // recomposed (section 5.3)
+    let mut out = format!("{scheme}:");
+    if let Some(a) = authority {
+        out.push_str("//");
+        out.push_str(&a);
     }
+    out.push_str(&path);
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+/// A path without its `.` and `..` segments (RFC 3986, section 5.2.4).
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    // each segment with the `/` before it
+    let mut out: Vec<&str> = Vec::new();
+    loop {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = &input[3..];
+            out.pop();
+        } else if input == "/.." {
+            input = "/";
+            out.pop();
+        } else if input == "." || input == ".." {
+            input = "";
+        } else if input.is_empty() {
+            break;
+        } else {
+            let from = usize::from(input.starts_with('/'));
+            let end = input[from..].find('/').map_or(input.len(), |i| i + from);
+            out.push(&input[..end]);
+            input = &input[end..];
+        }
+    }
+    out.concat()
 }
 
 // ================================================================================================
@@ -870,6 +985,8 @@ pub(super) struct McpProxy {
     proxied: AtomicU64,
     refused: AtomicU64,
     failed: AtomicU64,
+    /// Answers ended because the page stopped reading them.
+    stalled: AtomicU64,
     recent: Mutex<VecDeque<String>>,
 }
 
@@ -949,6 +1066,7 @@ impl McpProxy {
             proxied: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            stalled: AtomicU64::new(0),
             recent: Mutex::new(VecDeque::new()),
         })
     }
@@ -1017,7 +1135,7 @@ impl McpProxy {
             "{{\"enabled\":{},\"allow\":[{}],\"allow_private\":[{}],\"https_targets\":{},\
              \"limits\":{{\"max_request_bytes\":{},\"max_response_bytes\":{},\"connect_timeout_ms\":{},\
              \"idle_timeout_ms\":{},\"total_timeout_ms\":{},\"keepalive_ms\":{},\"max_redirects\":{}}},\
-             \"counts\":{{\"proxied\":{},\"refused\":{},\"failed\":{}}},\"recent\":[{}]}}",
+             \"counts\":{{\"proxied\":{},\"refused\":{},\"failed\":{},\"stalled\":{}}},\"recent\":[{}]}}",
             self.enabled(),
             list(&self.allow),
             list(&self.allow_private),
@@ -1032,6 +1150,7 @@ impl McpProxy {
             self.proxied.load(Ordering::Relaxed),
             self.refused.load(Ordering::Relaxed),
             self.failed.load(Ordering::Relaxed),
+            self.stalled.load(Ordering::Relaxed),
             recent,
         )
     }
@@ -1245,6 +1364,12 @@ impl McpProxy {
 
     /// The route handler. `key_ok`: the request carries the server's API key, or there is none.
     pub fn handle(&self, req: &HttpRequest, key_ok: bool, stream: &mut Conn) {
+        // No write to the page outlasts the exchange's limits, the proxy's own short answers
+        // included (`write_page` bounds each write of a relayed answer more closely). The
+        // connection ends with the exchange (`Connection: close`), so the bound is not undone.
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(
+            rule::write_wait(self.limits.idle_ms, self.limits.total_ms).max(1),
+        )));
         let method = match req.method.as_str() {
             "GET" => Some(Method::PxGet),
             "POST" => Some(Method::PxPost),
@@ -1301,7 +1426,7 @@ impl McpProxy {
                     "permission_error",
                     format!(
                         "the request comes from a page of another origin ({}), not from this server's own page",
-                        origin.chars().filter(|c| !c.is_control()).take(120).collect::<String>()
+                        shown_url(origin).chars().take(120).collect::<String>()
                     ),
                 );
             }
@@ -1425,7 +1550,7 @@ impl McpProxy {
                 }
                 method = rule::redirect_method(method, kind);
                 // once a redirect left the origin the page named, its headers stay behind
-                same_origin = same_origin && next.origin() == named_origin;
+                same_origin = rule::hop_same_origin(same_origin, next.origin() == named_origin);
                 target = next;
                 hop += 1;
                 continue;
@@ -1539,21 +1664,20 @@ impl McpProxy {
         );
         if framing == Framing::Empty || framing == Framing::Length(0) {
             out.push_str("Content-Length: 0\r\n\r\n");
-            let _ = stream.write_all(out.as_bytes());
-            let _ = stream.flush();
+            if let Err(e) = self.write_page(stream, out.as_bytes(), started) {
+                self.page_ended(stream, target, e);
+            }
             return;
         }
         out.push_str("Transfer-Encoding: chunked\r\n\r\n");
-        if stream
-            .write_all(out.as_bytes())
-            .and_then(|()| stream.flush())
-            .is_err()
-        {
-            return;
+        if let Err(e) = self.write_page(stream, out.as_bytes(), started) {
+            return self.page_ended(stream, target, e);
         }
 
         let mut sent: u64 = 0;
         let mut at_line_start = true;
+        // the target's silence is counted from here: its last bytes, or the end of the last write
+        // of its bytes to the page (time spent waiting on the page is not the target's silence)
         let mut last_from_target = Instant::now();
         let mut last_to_page = Instant::now();
         // `Ok(true)`: the body ended as its framing says; `Ok(false)`: it was cut
@@ -1564,8 +1688,8 @@ impl McpProxy {
                 Step::Data(n) => {
                     let take = rule::resp_take(sent, n as u64, self.limits.max_response) as usize;
                     if take > 0 {
-                        if write_chunk(stream, &buf[..take]).is_err() {
-                            return; // the page is gone
+                        if let Err(e) = self.write_page(stream, &chunk(&buf[..take]), started) {
+                            return self.page_ended(stream, target, e);
                         }
                         at_line_start = buf[take - 1] == b'\n';
                         last_to_page = Instant::now();
@@ -1578,6 +1702,7 @@ impl McpProxy {
                     }
                     sent += take as u64;
                     buf.drain(..n);
+                    last_from_target = Instant::now();
                 }
                 Step::More => {
                     let idle = ms_since(last_from_target);
@@ -1594,8 +1719,9 @@ impl McpProxy {
                         ms_since(last_to_page),
                         self.limits.keepalive_ms,
                     ) {
-                        if write_chunk(stream, b": keep-alive\n").is_err() {
-                            return;
+                        if let Err(e) = self.write_page(stream, &chunk(b": keep-alive\n"), started)
+                        {
+                            return self.page_ended(stream, target, e);
                         }
                         last_to_page = Instant::now();
                     }
@@ -1625,8 +1751,9 @@ impl McpProxy {
         };
         match ended {
             Ok(true) => {
-                let _ = stream.write_all(b"0\r\n\r\n");
-                let _ = stream.flush();
+                if let Err(e) = self.write_page(stream, b"0\r\n\r\n", started) {
+                    self.page_ended(stream, target, e);
+                }
             }
             // A body that did not end as its framing says is not ended cleanly towards the page
             // either: the page sees a cut answer, not a short one that looks whole.
@@ -1637,6 +1764,69 @@ impl McpProxy {
             Err(why) => eprintln!("[mcp-proxy] {}: answer cut: {why}", target.shown()),
         }
     }
+
+    /// Writes `data` to the page. One write call waits no longer than what is left of the
+    /// exchange's limits: the idle limit, counted from the page's last progress, and the total
+    /// limit. When nothing is left, the write is given up.
+    fn write_page(&self, stream: &mut Conn, data: &[u8], started: Instant) -> Result<(), PageEnd> {
+        let mut off = 0;
+        let mut progress = Instant::now();
+        while off < data.len() {
+            let (idle, total) = (ms_since(progress), ms_since(started));
+            let idle_left = rule::time_left(idle, self.limits.idle_ms);
+            let total_left = rule::time_left(total, self.limits.total_ms);
+            if rule::write_gives_up(idle_left, total_left) {
+                return Err(PageEnd::Stalled(
+                    if rule::expired(total, self.limits.total_ms) {
+                        format!("the exchange lasted {} s", total / 1000)
+                    } else {
+                        format!("the page took nothing for {} s", idle / 1000)
+                    },
+                ));
+            }
+            let wait = rule::write_wait(idle_left, total_left);
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(wait.max(1))));
+            // a write that timed out is tried again with the same bytes (TLS asks for that)
+            let end = data.len().min(off + PAGE_WRITE_PIECE);
+            match stream.write(&data[off..end]) {
+                Ok(0) => return Err(PageEnd::Gone),
+                Ok(n) => {
+                    off += n;
+                    progress = Instant::now();
+                }
+                Err(e) if timed_out(&e) || e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(PageEnd::Gone),
+            }
+        }
+        stream.flush().map_err(|_| PageEnd::Gone)
+    }
+
+    /// A write to the page did not complete. A page that stopped reading has its connection
+    /// ended at once (no goodbye that could wait on it) and is counted; the connection to the
+    /// target closes when the caller lets go of it.
+    fn page_ended(&self, stream: &mut Conn, target: &Target, end: PageEnd) {
+        let PageEnd::Stalled(why) = end else {
+            return; // the page is gone
+        };
+        stream.abandon();
+        self.note(
+            &self.stalled,
+            format!("stalled {}: {why}; the answer was cut", target.shown()),
+            format!(
+                "\"result\":\"stalled\",\"url\":{},\"reason\":{}",
+                jq(&target.shown()),
+                jq(&why)
+            ),
+        );
+    }
+}
+
+/// How a write to the page ended without completing.
+enum PageEnd {
+    /// The page closed its connection, or writing to it failed.
+    Gone,
+    /// The page took nothing for the idle limit, or the exchange ran out of time.
+    Stalled(String),
 }
 
 fn ms_since(t: Instant) -> u64 {
@@ -1671,25 +1861,50 @@ fn entry_text(e: &Entry) -> String {
     }
 }
 
-/// A URL as the request gave it, for logs: cut at its query and shortened.
+/// A URL as the request gave it, for logs and messages: cut at its query and fragment (they may
+/// hold a credential), without a user part, and shortened. Any text is accepted, also one that is
+/// not a valid URL.
 fn shown_url(url: &str) -> String {
-    url.split(['?', '#'])
-        .next()
-        .unwrap_or("")
+    without_user(url.split(['?', '#']).next().unwrap_or(""))
         .chars()
         .filter(|c| !c.is_control())
         .take(200)
         .collect()
 }
 
-/// One transfer chunk, written and flushed at once so the page reads it when it arrives.
-fn write_chunk(stream: &mut Conn, data: &[u8]) -> io::Result<()> {
+/// `url` without the user part of its authority (`user:password@`): everything up to the last
+/// `@` of the authority is left out. The authority starts after the scheme and the slashes that
+/// follow it, or at the start of the text when there is no `scheme:/` (so a malformed URL loses
+/// its user part too), and ends at the first `/`, `\`, `?` or `#`.
+fn without_user(url: &str) -> String {
+    let after_scheme = match url.find(':') {
+        Some(i) if scheme_ok(&url[..i]) => i + 1,
+        _ => 0,
+    };
+    let rest = &url[after_scheme..];
+    let slashes = rest.len() - rest.trim_start_matches(['/', '\\']).len();
+    // `scheme:` without slashes may be no scheme at all (`user:password@host`)
+    let start = if slashes > 0 || after_scheme == 0 {
+        after_scheme + slashes
+    } else {
+        0
+    };
+    let len = url[start..]
+        .find(['/', '\\', '?', '#'])
+        .unwrap_or(url.len() - start);
+    match url[start..start + len].rfind('@') {
+        Some(at) => format!("{}{}", &url[..start], &url[start + at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// One transfer chunk of the answer to the page.
+fn chunk(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 16);
     out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
-    stream.write_all(&out)?;
-    stream.flush()
+    out
 }
 
 /// An answer of the proxy itself. It carries no cross-origin grant: only this server's own page

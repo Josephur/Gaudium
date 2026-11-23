@@ -64,6 +64,25 @@ impl Conn {
             Conn::Tls(s) => lock(s).set_read_timeout(t),
         }
     }
+
+    /// How long one write may block before it returns `WouldBlock` (`None`: as long as it takes).
+    pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
+        match self {
+            Conn::Plain(s) => s.set_write_timeout(t),
+            Conn::Tls(s) => lock(s).set_write_timeout(t),
+        }
+    }
+
+    /// Ends the connection at once, without a goodbye that could wait on a client that stopped
+    /// reading: every later write fails at once.
+    pub fn abandon(&self) {
+        match self {
+            Conn::Plain(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            Conn::Tls(s) => lock(s).abandon(),
+        }
+    }
 }
 
 fn lock(s: &Mutex<TlsStream>) -> std::sync::MutexGuard<'_, TlsStream> {

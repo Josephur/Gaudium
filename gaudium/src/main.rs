@@ -199,9 +199,10 @@ fn print_usage() {
          \x20                       also allows the target, so an MCP server on this machine\n\
          \x20                       needs this option only\n\
          \x20 --mcp-proxy-max-mb <N>  Largest response the proxy passes on, in MiB (default: 64)\n\
-         \x20 --mcp-proxy-timeout <secs>  Longest silence of a target before the proxy gives up\n\
-         \x20                       (default: 600). An idle event stream gets a comment line\n\
-         \x20                       every 20 s so that a front end does not cut it\n\
+         \x20 --mcp-proxy-timeout <secs>  Longest silence of a target, or wait on a page that\n\
+         \x20                       stopped reading, before the proxy gives up (default: 600).\n\
+         \x20                       An idle event stream gets a comment line every 20 s so\n\
+         \x20                       that a front end does not cut it\n\
          \x20 --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets\n\
          \x20                       besides the system's (an MCP server with a private certificate)\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\

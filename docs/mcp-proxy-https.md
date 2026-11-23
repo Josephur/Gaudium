@@ -60,13 +60,18 @@ Streamable HTTP, DELETE ends a session).
   (the server's API key) and its cookies are never forwarded.
 - The target's status, headers and body come back as they arrive; an event stream is passed on
   event by event, not collected. `Mcp-Session-Id` reaches the page.
-- Redirects are followed by the proxy itself, each through every check below.
+- Redirects are followed by the proxy itself, each through every check below. A relative
+  `Location` is resolved against the whole URL of the request that got it (RFC 3986,
+  section 5): `?query` keeps the path, `#fragment` keeps path and query, `.` and `..` segments
+  are removed.
 - A request the proxy refuses is answered with a JSON error whose message starts with
   `mcp proxy: `; a target that could not be reached, or did not answer properly, with one that
   starts with `proxy error: ` (status 502).
-- `GET /gaudium/proxy` (behind the API key) shows the settings, counters and the last 50
+- `GET /gaudium/proxy` (behind the API key) shows the settings, counters (proxied, refused,
+  failed, and `stalled`: answers ended because the page stopped reading them) and the last 50
   decisions. Every decision is also a `[mcp-proxy]` line in the server's log. URLs are logged
-  without their query, which may hold a credential.
+  and shown without their query and fragment, which may hold a credential, and without a user
+  part (`user:password@`), also when the URL is refused or malformed.
 
 ## Threat model and guards
 
@@ -86,8 +91,8 @@ resolves to a public address when it is checked and to `127.0.0.1` when it is co
 | Addresses checked after lookup | every address of the target is classed: public, loopback, private (RFC 1918, shared address space, unique-local, documentation and benchmarking ranges), link-local (with the metadata endpoints), or never (unspecified, multicast, reserved). Non-public needs `--mcp-proxy-allow-private`; "never" is refused even when listed. An IPv6 address that carries an IPv4 one (IPv4-mapped, the `64:ff9b::/96` translation prefix, 6to4) is classed by that IPv4 address |
 | One refused address refuses the name | a name with a public and a private address is refused as a whole |
 | No second lookup | the connection goes to an address that was checked; `Host` and the TLS server name stay the name |
-| Redirects | followed by the proxy, at most 3, each new target through all checks. A redirect to another origin takes no header along that may carry a credential (only content negotiation), and a POST becomes a GET without its body on 301 / 302 / 303 |
-| Limits | request body 8 MiB (413); response `--mcp-proxy-max-mb` (default 64 MiB): a longer one is refused when its length is declared, cut otherwise; connect 10 s; silence of the target `--mcp-proxy-timeout` (default 600 s); one exchange 1 h at most |
+| Redirects | followed by the proxy, at most 3, each new target through all checks. A redirect to another origin takes no header along that may carry a credential (only content negotiation), nor does any later hop of the chain, even one back to the origin the page named; a POST becomes a GET without its body on 301 / 302 / 303 |
+| Limits | request body 8 MiB (413); response `--mcp-proxy-max-mb` (default 64 MiB): a longer one is refused when its length is declared, cut otherwise; connect 10 s; silence of the target `--mcp-proxy-timeout` (default 600 s); one exchange 1 h at most. A write to the page waits no longer than what is left of these: a page that takes nothing of the answer for `--mcp-proxy-timeout`, or an exchange past 1 h, ends the exchange, closes the connection to the target and counts as `stalled` |
 | Headers | to the target: only the prefixed ones, without the ones that frame the connection (`Host`, `Content-Length`, `Connection`, ...). To the page: not the target's cookies, cross-origin grants, redirect target or page policies; the answer carries `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`, so a target's HTML opened from the proxy's address runs without the Gaudium page's rights |
 | HTTPS targets | verified against the system's trust store (plus `--mcp-proxy-ca <file>`), with the host name checked; without the TLS library they are refused, never fetched in the clear |
 
