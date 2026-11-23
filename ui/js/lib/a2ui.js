@@ -53,24 +53,35 @@ export const hasA2ui = (content) => String(content || '').indexOf(OPEN_TAG) >= 0
 
 // A model's most common slip in deeply nested JSON is a closing bracket too few or too many. This balances the brackets
 // of `text` (outside strings): a closer that does not match what is open first closes what stands in its way, a closer
-// with nothing to close is dropped, what is still open at the end is closed, and a comma before a closer goes.
+// with nothing to close is dropped, what is still open at the end is closed, and a comma before a closer goes. Where an
+// object expects a property name and an object or a list opens instead (`{"a":{"b":1},{"d":2}`), closers are missing
+// before that comma: the objects are closed back to the list the new element belongs to.
 export function balanceJson(text) {
   const t = String(text || '');
-  const stack = []; let out = '', inStr = false;
+  const stack = []; let out = '', inStr = false, wantKey = false;
   const close = { '{': '}', '[': ']' };
   const dropComma = () => { out = out.replace(/,\s*$/, ''); };
   for (let i = 0; i < t.length; i++) {
     const c = t[i];
     if (inStr) { out += c; if (c === '\\' && i + 1 < t.length) out += t[++i]; else if (c === '"') inStr = false; continue; }
-    if (c === '"') { inStr = true; out += c; continue; }
-    if (c === '{' || c === '[') { stack.push(c); out += c; continue; }
+    if (c === '"') { inStr = true; wantKey = false; out += c; continue; }
+    if (c === '{' || c === '[') {
+      if (wantKey && stack.includes('[')) {
+        out = out.replace(/,\s*$/, '');
+        while (stack[stack.length - 1] !== '[') out += close[stack.pop()];
+        out += ',';
+      }
+      stack.push(c); out += c; wantKey = false; continue;
+    }
     if (c === '}' || c === ']') {
       const want = c === '}' ? '{' : '[';
       if (!stack.includes(want)) continue;
       dropComma();
       while (stack[stack.length - 1] !== want) out += close[stack.pop()];
-      stack.pop(); out += c; continue;
+      stack.pop(); out += c; wantKey = false; continue;
     }
+    if (c === ',') wantKey = stack[stack.length - 1] === '{';
+    else if (!/\s/.test(c)) wantKey = false;
     out += c;
   }
   if (inStr) out += '"';
@@ -102,6 +113,90 @@ export function parseBlock(raw) {
     if (list) return { messages: list, repaired: true };
   } catch { /* reported below */ }
   return { error: `The block is not valid JSON (${String(first.message || first).slice(0, 160)}).` };
+}
+
+// A model that has tools at hand sometimes sends its interface as a call of a tool named after the tag instead of
+// writing the block. `callIsA2ui` knows such a call by its name; `blockFromCall` finds the messages in its arguments
+// (the array itself, one message, or either of them under any argument name, also as a JSON string) and returns them
+// as a block for the reply's text, or null when the arguments hold no message. A call named after a message
+// (`createSurface`) carries that message's body as its arguments.
+const MESSAGE_KEYS = ['createSurface', 'updateComponents', 'updateDataModel', 'deleteSurface'];
+const messageKey = (name) => MESSAGE_KEYS.find((k) => k.toLowerCase() === String(name || '').trim().replace(/[-_ ]/g, '').toLowerCase());
+// Beside other tools the interface is offered as a tool of its own (a model with tools at hand reaches for one, and loops
+// over the others when there is none for this). The call never runs: `adoptCalls` turns it into the block it stands for.
+export const RENDER_TOOL = {
+  name: 'render_a2ui',
+  description: 'Shows an interactive interface (A2UI) to the user. Same as writing an <a2ui-json> block: do one or the other for an interface, never both. '
+    + 'Creates the surface `surfaceId` from `components` (the flat component list, one with id "root") and `dataModel`, as the system instructions describe for createSurface. '
+    + 'To change a surface that exists, pass its surfaceId again with the components to add or replace and/or the new dataModel. After the call your turn ends and the user sees the interface.',
+  inputSchema: { type: 'object', properties: { surfaceId: { type: 'string' }, components: { type: 'array', items: { type: 'object' } }, dataModel: { type: 'object' } }, required: ['surfaceId', 'components'] },
+};
+export const callIsA2ui = (name) => /^(?:render[-_ ]?)?a2ui(?:[-_ ]?json)?$/i.test(String(name || '').trim()) || !!messageKey(name);
+const isMessage = (v) => !!v && typeof v === 'object' && !Array.isArray(v) && MESSAGE_KEYS.some((k) => v[k] && typeof v[k] === 'object');
+function messagesIn(v, depth) {
+  if (depth > 4 || v == null) return null;
+  if (typeof v === 'string') {
+    if (!/[[{]/.test(v)) return null;
+    const inner = v.replace(new RegExp(`${OPEN_TAG}|${CLOSE_TAG}`, 'g'), '');
+    const r = parseBlock(inner);
+    return r.messages ? messagesIn(r.messages, depth + 1) : null;
+  }
+  if (typeof v !== 'object') return null;
+  if (isMessage(v)) return [v];
+  if (Array.isArray(v)) {
+    if (v.some(isMessage)) return v.filter(isMessage);
+    for (const x of v) { const m = messagesIn(x, depth + 1); if (m) return m; }
+    return null;
+  }
+  for (const k of Object.keys(v)) { const m = messagesIn(v[k], depth + 1); if (m) return m; }
+  return null;
+}
+export function blockFromCall(args, name, known) {
+  let msgs = messagesIn(typeof args === 'string' ? args : args || null, 0);
+  if (!msgs) {
+    let body = args;
+    if (typeof body === 'string') { try { body = JSON.parse(body); } catch { try { body = JSON.parse(balanceJson(body)); } catch { body = null; } } }
+    const key = messageKey(name);
+    if (body && typeof body === 'object' && !Array.isArray(body) && typeof body.surfaceId === 'string') {
+      if (key) msgs = [{ version: '1.0', [key]: body }];
+      else {   // the render tool: a new surface, or components and data for one that exists
+        const list = (v) => { if (typeof v === 'string') { const r = parseBlock(v); return r.messages || null; } return Array.isArray(v) ? v : null; };
+        const obj = (v) => { if (typeof v === 'string') { try { v = JSON.parse(balanceJson(v)); } catch { return undefined; } } return v && typeof v === 'object' && !Array.isArray(v) ? v : undefined; };
+        const components = list(body.components); const dataModel = obj(body.dataModel !== undefined ? body.dataModel : body.data);
+        const id = body.surfaceId;
+        if (known && known.has(id)) {
+          msgs = [];
+          if (components && components.length) msgs.push({ version: '1.0', updateComponents: { surfaceId: id, components } });
+          if (dataModel) msgs.push({ version: '1.0', updateDataModel: { surfaceId: id, value: dataModel } });
+        } else if (components && components.length) msgs = [{ version: '1.0', createSurface: { surfaceId: id, catalogId: BASIC_CATALOG, components, ...(dataModel ? { dataModel } : {}) } }];
+      }
+    }
+  }
+  return msgs && msgs.length ? `${OPEN_TAG}\n${JSON.stringify(msgs)}\n${CLOSE_TAG}` : null;
+}
+// The calls of a finished reply: those that are an interface move into the text. `known` is the set of surface ids that
+// exist already; a surface a block of this same reply creates counts as known too (a call for it updates it). When the
+// reply already holds a block, an interface call with nothing to draw is a model that did both: the call is dropped
+// (counted in `moved` and `dropped`) instead of being answered with an error that starts another turn.
+// Returns {content, calls, moved, dropped}.
+export function adoptCalls(content, calls, known) {
+  let text = String(content || ''), moved = 0, dropped = 0; const rest = [];
+  const ids = new Set(known || []);
+  const learn = (src) => {
+    for (const p of splitContent(src)) {
+      if (p.t !== 'a2ui') continue;
+      for (const m of parseBlock(p.raw).messages || []) if (m && m.createSurface && typeof m.createSurface.surfaceId === 'string') ids.add(m.createSurface.surfaceId);
+    }
+  };
+  learn(text);
+  for (const c of calls || []) {
+    const isUi = callIsA2ui(c && c.name);
+    const b = isUi ? blockFromCall(c.arguments, c.name, ids) : null;
+    if (!b) { if (isUi && hasA2ui(text)) { moved++; dropped++; } else rest.push(c); continue; }
+    text = `${text.replace(/\s+$/, '')}${text.trim() ? '\n\n' : ''}${b}`; moved++;
+    learn(b);
+  }
+  return { content: text, calls: rest, moved, dropped };
 }
 
 // ------------------------------------------------------------------------------------------------- JSON Pointer (RFC 6901)

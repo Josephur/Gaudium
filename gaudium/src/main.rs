@@ -114,6 +114,13 @@ fn print_usage() {
          \x20                       the Web UI then offers interactive interfaces in its settings.\n\
          \x20                       GET /gaudium/a2ui shows what is offered and the instructions.\n\
          \x20                       Requests that declare nothing are unchanged\n\
+         \x20 --a2ui-prompt <file>  Read the A2UI instructions from <file> instead of the built-in\n\
+         \x20                       text (or GAUDIUM_A2UI_PROMPT), and re-read it whenever it\n\
+         \x20                       changes: edits apply to the next request, no restart. A file\n\
+         \x20                       that is missing, empty, over 256 KiB, not UTF-8 text, or that\n\
+         \x20                       never names the <a2ui-json> tags is not used: the last good\n\
+         \x20                       version (or the built-in text) stays, the reason is logged and\n\
+         \x20                       shown under instructions_source in GET /gaudium/a2ui\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \n\
          Live status environment variables:\n\
@@ -1626,6 +1633,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut api_key: Option<String> = env::var("GAUDIUM_API_KEY").ok().filter(|s| !s.is_empty());
     let mut a2ui =
         env::var("GAUDIUM_A2UI").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
+    let mut a2ui_prompt: Option<PathBuf> = env::var_os("GAUDIUM_A2UI_PROMPT")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
     let mut verbose = false;
     let mut per_model: Vec<(String, ModelRunOptions)> = Vec::new();
     let mut draft_k: Vec<u64> = Vec::new();
@@ -1788,6 +1798,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             }
             "--api-key" => api_key = Some(next_val(&mut i, "--api-key")?),
             "--a2ui" => a2ui = true,
+            "--a2ui-prompt" => {
+                a2ui_prompt = Some(PathBuf::from(next_val(&mut i, "--a2ui-prompt")?))
+            }
             "--verbose" => verbose = true,
             other => return Err(format!("unknown --serve flag '{other}'")),
         }
@@ -1823,6 +1836,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         queue_config,
         api_key,
         a2ui,
+        a2ui_prompt,
         verbose,
         per_model,
         draft_k,

@@ -18,7 +18,7 @@ import { modelDesc, modelFacts, precisionShort, hasDrafter, dfFamilyName } from 
 import { reserveTokens, compactPercent, projection, summaryMaxTokens, usedLive, estimateMessages, estimateText, longestText, elideMessage, setVisionLimits } from './lib/context.js';
 import { visionLimits } from './lib/media.js';
 import { newSegment } from './lib/stream.js';
-import { blocksOfPath, syncRuntime, wrapMessage, errorMessage } from './lib/a2ui.js';
+import { blocksOfPath, syncRuntime, wrapMessage, errorMessage, adoptCalls, callIsA2ui, RENDER_TOOL } from './lib/a2ui.js';
 import { loadSettings, saveSettings, applyTheme, effectiveDark, loadDockCollapsed, saveDockCollapsed } from './lib/settings.js';
 
 const settings0 = loadSettings();
@@ -144,6 +144,8 @@ function collectTools() {
     if (!srv.enabled) continue; const c = mcpClients.get(srv.id); if (!c) continue;
     for (const t of c.tools) { if ((srv.disabledTools || []).includes(t.name) || map.has(t.name)) continue; entries.push({ tool: t }); map.set(t.name, { client: c, server: srv.name }); }
   }
+  // beside other tools, the interface is a tool too (lib/a2ui.js RENDER_TOOL); alone, the model writes the block
+  if (entries.length && s.a2ui && a2uiOffered() && !map.has(RENDER_TOOL.name)) entries.push({ tool: RENDER_TOOL });
   return { defs: toOpenAiTools(entries), map };
 }
 const asks = new Map();   // tool call id -> resolve(choice)
@@ -266,6 +268,10 @@ async function streamPass(st, convId, targetId, body, { kind = null, compacted =
   const hasAny = !!(seg && (seg.content || seg.reasoning || seg.toolCalls.length || seg.error || seg.timings));
   const segIndex = (getConv(convId).messages[targetId].segments || []).length;
   if (hasAny) {
+    if (seg.toolCalls.length && !aborted) {   // an interface sent as a tool call is an interface all the same (lib/a2ui.js)
+      const ad = adoptCalls(seg.content, seg.toolCalls, new Set(a2uiRt ? a2uiRt.surfaces.keys() : []));
+      if (ad.moved) { seg.content = ad.content; seg.toolCalls = ad.calls; if (!ad.calls.length && seg.finish === 'tool_calls') seg.finish = 'stop'; }
+    }
     if (seg.toolCalls.length) for (const c of seg.toolCalls) c.status = aborted ? 'skipped' : 'pending';
     const fin = finishSegment(seg, st);
     if (kind && fin.content) fin.content = SUMMARY_PREFILL + fin.content;
@@ -492,7 +498,7 @@ async function runTools(convId, aid, segIndex, map, signal) {
   for (let k = 0; k < calls.length; k++) {
     if (signal.aborted) { patch(k, { status: 'skipped' }); continue; }
     const c = calls[k]; const prov = map.get(c.name);
-    if (!prov) { patch(k, { status: 'error', error: `No connected tool is called ${c.name}.` }); continue; }
+    if (!prov) { patch(k, { status: 'error', error: callIsA2ui(c.name) ? 'The interface could not be read: pass surfaceId and components (a JSON array of component objects, one with the id "root").' : `No connected tool is called ${c.name}.` }); continue; }
     const server = prov.server || 'built-in';
     patch(k, { server });
     let args = {};

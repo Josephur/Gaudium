@@ -263,3 +263,95 @@ law a2ui_scan_empty_list:
 
 def a2ui_scan_empty_list(m):
   {==}
+
+# ============================================================================
+# 5. Instructions Read From a File (hot reload)
+# ============================================================================
+# The server may read the instructions from a file and re-read it whenever it changes on disk.
+# Each request looks at the file's stamp (modification time, size, or that it is gone). A changed
+# file is loaded only when every check passes; otherwise the text served so far stays (the last
+# good file text, or the built-in instructions when no file text was ever good) and the server
+# says why. An unchanged stamp does nothing, so a bad file is reported once, not per request.
+
+type A2PromptPick is Data:
+  A2PkKeep{}
+  A2PkLoad{}
+  A2PkReject{}
+
+# changed: the stamp differs from the one seen last; valid: the new text passed every check
+def a2ui_prompt_pick(changed: Bool, valid: Bool) -> A2PromptPick:
+  match changed:
+    case False{}:
+      A2PkKeep{}
+    case True{}:
+      match valid:
+        case True{}:
+          A2PkLoad{}
+        case False{}:
+          A2PkReject{}
+
+# The new text replaces the served one.
+def a2ui_prompt_loads(p: A2PromptPick) -> Bool:
+  match p:
+    case A2PkLoad{}:
+      True{}
+    case _:
+      False{}
+
+# The server reports that the file was not taken.
+def a2ui_prompt_warns(p: A2PromptPick) -> Bool:
+  match p:
+    case A2PkReject{}:
+      True{}
+    case _:
+      False{}
+
+# The size check: a file with something in it, and no larger than the cap.
+def a2ui_prompt_size_ok(+len: Nat, cap: Nat) -> Bool:
+  Bool.and(Nat.is_gt(len, 0n), Nat.is_le(len, cap))
+
+# LAW 5.1: Text that failed a check is never served, changed or not.
+law a2ui_prompt_invalid_never_loads:
+  for +c: Bool
+  {a2ui_prompt_loads(a2ui_prompt_pick(c, False{})) == False{} : Bool}
+
+def a2ui_prompt_invalid_never_loads(c):
+  match c:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW 5.2: A rejected file is always reported (a bad edit is never dropped silently).
+law a2ui_prompt_reject_warns:
+  {a2ui_prompt_warns(a2ui_prompt_pick(True{}, False{})) == True{} : Bool}
+
+def a2ui_prompt_reject_warns():
+  {==}
+
+# LAW 5.3: An unchanged file neither reloads nor reports again.
+law a2ui_prompt_unchanged_quiet:
+  for +v: Bool
+  {Bool.or(a2ui_prompt_loads(a2ui_prompt_pick(False{}, v)), a2ui_prompt_warns(a2ui_prompt_pick(False{}, v))) == False{} : Bool}
+
+def a2ui_prompt_unchanged_quiet(v):
+  match v:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW 5.4: Loading and reporting never happen together.
+law a2ui_prompt_load_xor_warn:
+  for +p: A2PromptPick
+  {Bool.and(a2ui_prompt_loads(p), a2ui_prompt_warns(p)) == False{} : Bool}
+
+def a2ui_prompt_load_xor_warn(p):
+  match p:
+    case A2PkKeep{}: {==}
+    case A2PkLoad{}: {==}
+    case A2PkReject{}: {==}
+
+# LAW 5.5: An empty file never passes the size check.
+law a2ui_prompt_empty_rejected:
+  for c: Nat
+  {a2ui_prompt_size_ok(0n, c) == False{} : Bool}
+
+def a2ui_prompt_empty_rejected(c):
+  {==}

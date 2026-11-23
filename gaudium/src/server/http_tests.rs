@@ -201,6 +201,7 @@ fn harness() -> Harness {
             queue_config: None,
             api_key: None,
             a2ui: true,
+            a2ui_prompt: None,
             verbose: false,
             per_model: Vec::new(),
             draft_k: Vec::new(),
@@ -1118,6 +1119,7 @@ fn served_engine_configuration_follows_the_server_options() {
         queue_config: None,
         api_key: None,
         a2ui: false,
+        a2ui_prompt: None,
         verbose: false,
         per_model: vec![("a".into(), opts), ("moe".into(), own)],
         draft_k: Vec::new(),
@@ -1451,6 +1453,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         queue_config: None,
         api_key: None,
         a2ui: false,
+        a2ui_prompt: None,
         verbose: false,
         per_model: vec![
             (

@@ -57,7 +57,10 @@ test('a bracket too few or too many is repaired', () => {
   }
   assert.equal(A.parseBlock(good).repaired, undefined);
   assert.match(A.parseBlock('[{"a" 1}]').error, /not valid JSON/);   // not a bracket slip: reported
-  assert.match(A.parseBlock('[{"a":{"b":1},{"d":2}]').error, /not valid JSON/);   // a bracket missing in the middle cannot be placed: reported
+  // a bracket missing in the middle: the next element of the list shows where it belongs
+  assert.deepEqual(A.parseBlock('[{"a":{"b":1},{"d":2}]'), { messages: [{ a: { b: 1 } }, { d: 2 }], repaired: true });
+  assert.deepEqual(A.parseBlock('[{"c":[{"id":"x","action":{"event":{"name":"n","context":{"p":1}}}, {"id":"y"}]}]').messages, [{ c: [{ id: 'x', action: { event: { name: 'n', context: { p: 1 } } } }, { id: 'y' }] }]);
+  assert.match(A.parseBlock('{"a":1,{"d":2}}').error, /not valid JSON/);   // no list to return to: reported
   const rt = new A.A2uiRuntime();
   const r = rt.applyBlock('k', '[{"version":"1.0","createSurface":{"surfaceId":"s","components":[{"id":"root","component":"Divider"}],"dataModel":{"a":{"b":1}}}]');
   assert.deepEqual([r.created, r.repaired, r.errors], [['s'], true, []]);
@@ -248,4 +251,43 @@ test('the example in the server instructions is a valid interface', () => {
   assert.equal(A.runChecks(send, { data: s.data, scope: '' }).valid, true);
   assert.deepEqual(A.actionMessage(s, send, { data: s.data, scope: '' }).action.context, { size: ['small'], name: 'Ada', extras: [{ label: 'Oat milk', chosen: false }, { label: 'Extra shot', chosen: false }] });
   for (const name of [...text.matchAll(/`(\w+)` \{/g)].map((m) => m[1])) assert.ok(A.COMPONENTS[name] || A.FUNCTION_NAMES.includes(name), `${name} is described but not drawn`);
+});
+
+test('an interface sent as a tool call moves into the reply text', () => {
+  const msgs = [create('s1', [{ id: 'root', component: 'Text', text: 'hi' }])];
+  for (const name of ['a2ui-json', 'a2ui_json', 'A2UI', 'a2ui']) assert.ok(A.callIsA2ui(name), name);
+  for (const name of ['web_search', 'a2ui_render_x', '']) assert.ok(!A.callIsA2ui(name), name);
+  const want = block(msgs);
+  for (const args of [msgs, msgs[0], { messages: msgs }, { json: JSON.stringify(msgs) }, { content: block(msgs) }, { a: { b: msgs[0] } }])
+    assert.equal(A.blockFromCall(JSON.stringify(args)), want, JSON.stringify(args).slice(0, 40));
+  for (const args of ['', '{}', '{"query":"x"}', 'not json', '{"text":"[1,2]"}']) assert.equal(A.blockFromCall(args), null, args);
+  // a call named after a message carries the message's body
+  for (const name of ['createSurface', 'create_surface', 'updateComponents']) assert.ok(A.callIsA2ui(name), name);
+  assert.equal(A.blockFromCall(JSON.stringify(msgs[0].createSurface), 'createSurface'), want);
+  assert.equal(A.blockFromCall('{"query":"x"}', 'createSurface'), null);
+  assert.equal(A.blockFromCall(JSON.stringify({ surfaceId: 's1', path: '/a', value: 2 }), 'updateDataModel'), block([{ version: '1.0', updateDataModel: { surfaceId: 's1', path: '/a', value: 2 } }]));
+  // the render tool: a new surface, then more for the surface that exists; arguments may arrive as JSON text
+  const comps = msgs[0].createSurface.components;
+  assert.ok(A.callIsA2ui(A.RENDER_TOOL.name));
+  assert.equal(A.blockFromCall(JSON.stringify({ surfaceId: 's1', components: comps, dataModel: {} }), 'render_a2ui'), want);
+  assert.equal(A.blockFromCall(JSON.stringify({ surfaceId: 's1', components: JSON.stringify(comps), dataModel: '{}' }), 'render_a2ui'), want);
+  assert.equal(A.blockFromCall(JSON.stringify({ surfaceId: 's1', components: comps, dataModel: { a: 1 } }), 'render_a2ui', new Set(['s1'])),
+    block([{ version: '1.0', updateComponents: { surfaceId: 's1', components: comps } }, { version: '1.0', updateDataModel: { surfaceId: 's1', value: { a: 1 } } }]));
+  assert.equal(A.blockFromCall('{"surfaceId":"s1"}', 'render_a2ui'), null);
+  assert.equal(A.blockFromCall('{"surfaceId":"s1","components":[]}', 'render_a2ui'), null);   // no empty surface
+  const other = { id: 'c2', name: 'web_search', arguments: '{"query":"x"}' };
+  const r = A.adoptCalls('Here you go:\n', [{ id: 'c1', name: 'a2ui-json', arguments: JSON.stringify({ messages: msgs }) }, other]);
+  assert.deepEqual([r.content, r.calls, r.moved], [`Here you go:\n\n${want}`, [other], 1]);
+  const rt = new A.A2uiRuntime();
+  assert.deepEqual(rt.applyBlock('k', A.splitContent(r.content).find((p) => p.t === 'a2ui').raw).created, ['s1']);
+  // a call with nothing to draw stays a call (it is answered with an error the model can act on)
+  const bad = [{ id: 'c1', name: 'a2ui-json', arguments: '{}' }];
+  assert.deepEqual(A.adoptCalls('', bad), { content: '', calls: bad, moved: 0, dropped: 0 });
+  assert.equal(A.adoptCalls('', [{ name: 'a2ui', arguments: JSON.stringify(msgs) }]).content, want);
+  // a reply that wrote the block and also called the tool with nothing in it: the empty call goes, no error turn
+  const both = A.adoptCalls(`Here:\n${want}`, [{ id: 'c1', name: 'render_a2ui', arguments: '{"surfaceId":"other","components":[]}' }, other]);
+  assert.deepEqual([both.content, both.calls, both.moved, both.dropped], [`Here:\n${want}`, [other], 1, 1]);
+  // the same surface sent both ways: the call updates the surface the block just created, it does not create it twice
+  const twice = A.adoptCalls(want, [{ id: 'c1', name: 'render_a2ui', arguments: JSON.stringify({ surfaceId: 's1', components: comps }) }]);
+  assert.equal(twice.content, `${want}\n\n${block([{ version: '1.0', updateComponents: { surfaceId: 's1', components: comps } }])}`);
 });

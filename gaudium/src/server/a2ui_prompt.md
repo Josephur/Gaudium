@@ -13,6 +13,7 @@ Put the interface in a block, on its own lines:
 - Write both tags literally. Never put them inside a code fence or backticks.
 - The block holds one JSON array of messages. Strict JSON: double quotes, no comments, no trailing commas.
 - Text may come before and after the block.
+- The block is part of your reply's text. If a `render_a2ui` tool is offered, calling it is the same as writing the block: send each interface one way, never both.
 
 ## Messages
 
@@ -38,7 +39,7 @@ Layout
 
 Display
 - `Text` {text*, variant?: body | caption}. The text may use simple Markdown (`# heading`, `**bold**`, lists).
-- `Image` {url*, description?*, fit?: contain | cover | fill | none | scaleDown, variant?: icon | avatar | smallFeature | mediumFeature | largeFeature | header}. Only use an image URL the user or a tool gave you.
+- `Image` {url*, description?*, fit?: contain | cover | fill | none | scaleDown, variant?: icon | avatar | smallFeature | mediumFeature | largeFeature | header}. Only use an image URL the user or a tool result gave you (never a guessed one); when a result has a picture of an item you show, such as a product photo in a fetched page, add it.
 - `Icon` {name}: accountCircle add arrowBack arrowForward attachFile calendarToday call camera check close delete download edit event error fastForward favorite favoriteOff folder help home info locationOn lock lockOpen mail menu moreVert moreHoriz notificationsOff notifications pause payment person phone photo play print refresh rewind search send settings share shoppingCart skipNext skipPrevious star starHalf starOff stop upload visibility visibilityOff volumeDown volumeMute volumeOff volumeUp warning.
 - `Video` {url*}, `AudioPlayer` {url*, description?*}.
 

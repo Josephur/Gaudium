@@ -7,7 +7,7 @@
 //! - Gaudium UI telemetry & card-lifecycle endpoints (`/gaudium/ui`, `/gaudium/engine`,
 //!   `/gaudium/live`, `/gaudium/events`, `/gaudium/count_tokens`, `/v1/chat/completions/control`)
 //! - A2UI interfaces as a per-request option (`--a2ui`, the request field `gaudium_a2ui`,
-//!   `/gaudium/a2ui`; see `a2ui.rs`)
+//!   `/gaudium/a2ui`, instructions hot-reloaded from `--a2ui-prompt <file>`; see `a2ui.rs`)
 //!
 //! Single-card safety & verified core invariants:
 //! - Uses `core::lifecycle::can_switch_resident_model` before switching resident models or parking.
@@ -84,6 +84,9 @@ pub struct ServerConfig {
     /// Offer A2UI: a request that declares renderer capabilities (`gaudium_a2ui`) gets the
     /// instructions that teach the model to write interface blocks.
     pub a2ui: bool,
+    /// Read the A2UI instructions from this file instead of the built-in text, again whenever it
+    /// changes on disk (a file that fails its checks is not served; see `a2ui.rs`).
+    pub a2ui_prompt: Option<PathBuf>,
     pub verbose: bool,
     /// Per-model options keyed by served model id.
     pub per_model: Vec<(String, ModelRunOptions)>,
@@ -1154,6 +1157,9 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
     // The readout reads each engine's launch feed and profile block in-process, whether or not
     // a live-record directory is configured.
     crate::live_report::enable_in_memory();
+    if let Some(p) = &cfg.a2ui_prompt {
+        a2ui::use_prompt_file(p.clone());
+    }
 
     let mut models = Vec::with_capacity(cfg.models.len());
     for entry in &cfg.models {
