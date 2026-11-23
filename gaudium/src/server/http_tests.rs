@@ -1921,10 +1921,29 @@ fn json_target(body: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
             let Ok(mut tcp) = tcp else { break };
             let mut buf = Vec::new();
             let mut b = [0u8; 2048];
-            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let head_end = loop {
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(i + 4);
+                }
                 match tcp.read(&mut b) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => break None,
                     Ok(n) => buf.extend_from_slice(&b[..n]),
+                }
+            };
+            // The body is read too before the answer goes out: a socket closed with request
+            // bytes still unread resets the connection, and the client loses the answer.
+            if let Some(head_end) = head_end {
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while buf.len() < head_end + body_len {
+                    match tcp.read(&mut b) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&b[..n]),
+                    }
                 }
             }
             log.lock()
