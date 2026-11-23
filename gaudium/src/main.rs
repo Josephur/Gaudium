@@ -846,7 +846,18 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let kernels_dir = kernels_dir
         .ok_or_else(|| "missing --kernels <dir> (or GAUDIUM_KERNELS env var)".to_string())?;
 
-    let tok = Tokenizer::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+    // a model given as one file (a GGUF build) keeps its tokenizer files beside it
+    let text_dir = if model_dir.is_file() {
+        model_dir.parent().map(Path::to_path_buf).unwrap_or_default()
+    } else {
+        model_dir.clone()
+    };
+    let tok = Tokenizer::from_model_dir(&text_dir).map_err(|e| {
+        format!(
+            "tokenizer files in {}: {e}",
+            text_dir.display()
+        )
+    })?;
     if let Some(im_end) = tok.token_id("<|im_end|>") {
         params.extra_eos_ids.push(im_end);
     }
