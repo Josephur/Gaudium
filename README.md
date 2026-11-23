@@ -1,0 +1,101 @@
+# Gaudium
+
+Gaudium is an inference engine for the **Intel Gaudi 2** (HL-225 HPU), built from scratch
+for that chip: its MME matrix engines, TPC vector cores, HBM, DMA engines and SynapseAI's
+compiled-recipe launch model. It has its own speculative decoding, whose output is
+token-identical to plain one-token-at-a-time decoding, and an OpenAI-compatible HTTP/SSE
+server with a bundled Web UI.
+
+## Status: mid-port from C++ to Rust
+
+> **Gaudium is in the middle of a port from C++ to Rust.** The project started as a C++
+> engine. Since November 2026 it is being rewritten in **Rust with a formally verified
+> Bend 2 core** (see [Architecture](#architecture)). The rewrite is not a line-by-line
+> translation: each part is redesigned and has to match or beat the C++ engine's measured
+> speed on the card before it replaces it.
+>
+> This repository holds only the Rust engine. Some features of the C++ engine are not
+> ported yet, interfaces and flags still change, and nothing here is a stable release.
+
+What the Rust engine does today:
+
+- Runs Qwen3-family models (dense Qwen3, Qwen3.5 / Qwen3.8 hybrid DeltaNet + attention
+  models, and Qwen3.6 MoE) and Gemma 4, in BF16 or FP8 weights.
+- Speculative decoding with several drafter kinds (DSpine, a block drafter, a model's
+  own MTP head or assistant drafter), always token-identical to the non-speculative run.
+- Image input for vision-language checkpoints.
+- Long contexts (up to 256K on the models that support it), planned against HBM at load
+  time: a context that does not fit is refused at start with the exact shortfall.
+- Prefix reuse between consecutive requests.
+- An OpenAI-compatible (and Anthropic-style) chat API with streaming, tool calls, an
+  optional MCP proxy for the Web UI, optional HTTPS on the same port, and A2UI interfaces.
+
+## Architecture
+
+Gaudium follows **"Verified Core, Rust Shell"**, built with
+[RustyBends](https://github.com/Josephur/RustyBends):
+
+| Part | Where | What |
+|---|---|---|
+| Verified core | `gaudium/verified/*.bend` | Decision logic written in [Bend 2](https://github.com/bendlang/bend) with proved `law`s: device and recipe lifecycles, KV-cache and HBM accounting, token / context budgets, tensor bounds, request routing. Proofs are checked at `cargo build` time and erased; the functions are emitted as plain Rust. |
+| Rust shell | `gaudium/src/` | SynapseAI FFI, tensor buffers, Safetensors loading, tokenizer, chat templates, sampling, the HTTP server and CLI. No crates beyond the Rust standard library at run time. |
+| Device kernels | `kernels/` | TPC-C kernels (compiled with `tpc-clang`) and the Synapse Graph Compiler glue plugins. |
+| Web UI | `ui/` | A self-contained browser UI served by `gaudium --serve`. |
+
+`rusty-bends-build/` is a copy of the RustyBends build crate (a build dependency only, so
+nothing of Bend reaches the binary). Proved laws are locked in `gaudium/rusty-bends.lock`
+so that a later change cannot quietly weaken one.
+
+## Building
+
+You need:
+
+- A Linux host with an Intel Gaudi 2 card and the Intel Gaudi software stack (SynapseAI,
+  `tpc-clang`, headers under `/usr/include/habanalabs`) to build the kernels and run on the card.
+- Rust (stable) and [Bend 2](https://github.com/bendlang/bend) at the version in
+  `gaudium/bend.pin` (looked up at `~/.bend/bin/bend`, or set `BEND_BIN`).
+- Optionally Lean (via `~/.elan/bin`) so the build also checks every proof
+  (`BEND_VERDICT=require`).
+
+```bash
+# Kernels and glue plugins (on the Gaudi host, needs the Intel Gaudi SDK)
+make -C kernels -j16
+
+# Engine: checks every Bend law, then builds the Rust binary
+cd gaudium
+BEND_VERDICT=require cargo build --release
+cargo test
+
+# Web UI tests
+cd ../ui && node --test test/
+```
+
+The verified core and the Rust tests build and run without a Gaudi card; only running a
+model needs one.
+
+## Running
+
+```bash
+gaudium --help                      # every flag and environment variable
+gaudium                             # verified-core self-check
+gaudium --hpu-smoke                 # small live test on the card
+gaudium --serve --model <model_dir> --kernels <kernel_build_dir> --ui-dir ui \
+        --max-ctx 32768             # API + Web UI on port 8090
+```
+
+[`docs/reference.md`](docs/reference.md) has the full `--help` text and every environment
+variable; [`docs/mcp-proxy-https.md`](docs/mcp-proxy-https.md) covers the MCP proxy and HTTPS.
+
+Only one process may open the card at a time.
+
+## Contributing
+
+Read [`AGENTS.md`](AGENTS.md) (the project rules: verified-first logic, exactness, memory
+planning, repo hygiene) and [`BEND_GUIDE.md`](BEND_GUIDE.md) before changing code. Every
+change lands through a pull request.
+
+## License
+
+Gaudium is released under the [MIT License](LICENSE). The copy of `rusty-bends-build` is
+Apache-2.0, like RustyBends. Third-party libraries bundled with the Web UI are listed in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
