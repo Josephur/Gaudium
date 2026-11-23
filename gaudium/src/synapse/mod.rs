@@ -8,3 +8,4 @@ pub mod ops;
 pub mod profiler;
 pub mod recipe_cache;
 pub mod upload;
+pub mod xfer;

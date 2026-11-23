@@ -813,3 +813,83 @@ law pc_reused_within_prompt:
 
 def pc_reused_within_prompt(p, r):
   pc_min_le_r(r, p)
+
+# ============================================================================
+# 10. The bounded end of a slot write
+# ============================================================================
+#
+# `pc_commit` above ends a write without knowing how far the prefill came. The engine ends a
+# write with this function: it is given the whole tiles that finished on the device, and a slot
+# becomes readable only when the tile that writes it is one of them.
+
+def pc_commit_done_if(t: Nat, finished: Bool) -> PcSlot:
+  match finished:
+    case True{}:
+      PcHeld{t}
+    case False{}:
+      PcWriting{t}
+
+# `done_tiles` whole tiles of the prompt have finished on the device (synchronised): a slot
+# being written with the state after at most that many tiles holds it from now on; a slot
+# whose tile has not finished stays as it is; empty and held slots are not touched.
+def pc_commit_done(s: PcSlot, done_tiles: Nat) -> PcSlot:
+  match s:
+    case PcEmpty{}:
+      PcEmpty{}
+    case PcWriting{+t}:
+      pc_commit_done_if(t, Nat.is_le(t, done_tiles))
+    case PcHeld{t}:
+      PcHeld{t}
+
+def pc_commit_done_aux(t: Nat, d: Nat, b: Bool, h: {Bool.and(b, Nat.is_lt(d, t)) == False{} : Bool}) -> {Bool.and(pc_readable(pc_commit_done_if(t, b)), Nat.is_lt(d, pc_slot_tiles(pc_commit_done_if(t, b)))) == False{} : Bool}:
+  match b:
+    case True{}:
+      h
+    case False{}:
+      {==}
+
+# LAW PC.33: a slot being written for a position past the finished tiles is never readable
+# after it, and a slot it makes readable holds a position at or before the finished tiles:
+# whatever the slot was before the write began.
+law pc_unfinished_slot_stays_unreadable:
+  for +s: PcSlot
+  for +t: Nat
+  for +d: Nat
+  {Bool.and(pc_readable(pc_commit_done(pc_begin_write(s, t), d)), Nat.is_lt(d, pc_slot_tiles(pc_commit_done(pc_begin_write(s, t), d)))) == False{} : Bool}
+
+def pc_unfinished_slot_stays_unreadable(s, t, d):
+  pc_commit_done_aux(t, d, Nat.is_le(t, d), pc_le_lt_excl(t, d))
+
+def pc_commit_done_tiles_aux(t: Nat, b: Bool) -> {pc_slot_tiles(pc_commit_done_if(t, b)) == t : Nat}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# LAW PC.34: it never changes the position a slot is written for.
+law pc_commit_done_keeps_position:
+  for +s: PcSlot
+  for +t: Nat
+  for +d: Nat
+  {pc_slot_tiles(pc_commit_done(pc_begin_write(s, t), d)) == t : Nat}
+
+def pc_commit_done_keeps_position(s, t, d):
+  pc_commit_done_tiles_aux(t, Nat.is_le(t, d))
+
+# LAW PC.35: it never changes a held slot.
+law pc_commit_done_keeps_held:
+  for +t: Nat
+  for +d: Nat
+  {pc_commit_done(PcHeld{t}, d) == PcHeld{t} : PcSlot}
+
+def pc_commit_done_keeps_held(t, d):
+  {==}
+
+# LAW PC.36: nor an empty one: finishing tiles never makes an empty slot readable.
+law pc_commit_done_keeps_empty:
+  for +d: Nat
+  {pc_commit_done(PcEmpty{}, d) == PcEmpty{} : PcSlot}
+
+def pc_commit_done_keeps_empty(d):
+  {==}

@@ -130,8 +130,18 @@ export function finalStats(seg) {
     msPerStep: g.ms_per_step || (t.launches > 0 ? t.predicted_ms / t.launches : null),
     switchStep: g.switch_step != null && g.switch_step >= 0 ? g.switch_step : null,
     vitMs: g.vit_ms || (g.vision && g.vision.tower_ms) || null, vision: g.vision || null, prefixReuse: prefix ? prefix.reuse : null, prefixVitSkipped: prefix ? prefix.vit_skipped : null,
+    prefixTier: prefix ? prefix.tier || null : null, hostRestoreMs: prefix && prefix.host ? prefix.host.restore_ms || 0 : null,
     steps,
   };
+}
+
+// Where a request's reused tokens came from, in words: the engine's `prefix.tier` (device = the card still held them,
+// host = copied back from host memory by the --cache-ram tier). null when nothing was reused or the engine does not say.
+export function reuseSource(st) {
+  if (!st || !(st.cacheN > 0)) return null;
+  if (st.prefixTier === 'host') return { text: 'from host memory', title: `The card no longer held this conversation: its rows were copied back from host memory${st.hostRestoreMs ? ` in ${Math.round(st.hostRestoreMs)} ms` : ''} instead of prefilled again (--cache-ram)` };
+  if (st.prefixTier === 'device') return { text: 'still on the card', title: 'The card still held these rows from the request before' };
+  return null;
 }
 
 // Context use: prompt_n + cache_n + predicted_n

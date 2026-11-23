@@ -553,3 +553,189 @@ def pfx_reuse_within_drafter_rows(pos, lcp, p, tile, nm, mu, du):
     Bool.or(Bool.not(nm), Nat.is_le(pos, mu)),
     Nat.is_le(pos, du)
   )
+
+# ============================================================================
+# 6. Host-RAM tier of prefix reuse: the rules that build on the ones above
+# ============================================================================
+#
+# The tier itself (entry life, budget, what a save and a restore decide) is `host_cache.bend`.
+
+# Is `pos` a valid place to resume from an entry kept in host memory? The same rule as for a
+# position kept on the device (`pfx_reuse_valid`, with `cap` the rows the new prompt shares
+# with the entry's prompt, cut at the first image that differs), and the entry must hold the
+# rows before it: `saved_rows` rows are complete in host memory.
+def hc_resume_valid(+pos: Nat, cap: Nat, prompt_len: Nat, +tile: Nat, saved_rows: Nat) -> Bool:
+  Bool.and(pfx_reuse_valid(pos, cap, prompt_len, tile, False{}, 0n, False{}, 0n), Nat.is_le(pos, saved_rows))
+
+# May an entry leave to make room? Never one a copy reads or writes (`pool_can_evict`), and
+# never the entry the room is for.
+def hc_can_evict(pins: Nat, busy: Bool, is_target: Bool) -> Bool:
+  Bool.and(pool_can_evict(pins, busy), Bool.not(is_target))
+
+# Bytes (or blocks) a ledger has given out.
+def pool_allocated(p: PoolAcct) -> Nat:
+  match p:
+    case PoolAcct{a, f}:
+      a
+
+# (x && w) && y == False when x && y == False
+def kv_and3_excl_l(x: Bool, w: Bool, y: Bool, h: {Bool.and(x, y) == False{} : Bool}) -> {Bool.and(Bool.and(x, w), y) == False{} : Bool}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      match w:
+        case False{}:
+          {==}
+        case True{}:
+          h
+
+# (x && w) && y == False when w && y == False
+def kv_and3_excl_r(x: Bool, w: Bool, y: Bool, h: {Bool.and(w, y) == False{} : Bool}) -> {Bool.and(Bool.and(x, w), y) == False{} : Bool}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      h
+
+# a <= b and b < a never hold together
+def kv_le_lt_excl(+a: Nat, +b: Nat) -> {Bool.and(Nat.is_le(a, b), Nat.is_lt(b, a)) == False{} : Bool}:
+  match a b:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+ap 1n+bp:
+      kv_le_lt_excl(ap, bp)
+
+def kv_and_not_true_r(b: Bool) -> {Bool.and(b, Bool.not(True{})) == False{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW KV.17: a resume point of an entry never lies at or beyond the rows the new prompt shares
+# with the entry's prompt (and so never across an image that differs: the shared rows stop
+# before it).
+law hc_resume_within_shared_rows:
+  for +pos: Nat
+  for +cap: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +saved: Nat
+  {Bool.and(hc_resume_valid(pos, cap, p, tile, saved), Nat.is_le(cap, pos)) == False{} : Bool}
+
+def hc_resume_within_shared_rows(pos, cap, p, tile, saved):
+  kv_and3_excl_l(
+    pfx_reuse_valid(pos, cap, p, tile, False{}, 0n, False{}, 0n),
+    Nat.is_le(pos, saved),
+    Nat.is_le(cap, pos),
+    pfx_reuse_within_common_prefix(pos, cap, p, tile, False{}, 0n, False{}, 0n)
+  )
+
+# LAW KV.18: nor beyond the rows the entry holds complete.
+law hc_resume_within_saved_rows:
+  for +pos: Nat
+  for +cap: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +saved: Nat
+  {Bool.and(hc_resume_valid(pos, cap, p, tile, saved), Nat.is_lt(saved, pos)) == False{} : Bool}
+
+def hc_resume_within_saved_rows(pos, cap, p, tile, saved):
+  kv_and3_excl_r(
+    pfx_reuse_valid(pos, cap, p, tile, False{}, 0n, False{}, 0n),
+    Nat.is_le(pos, saved),
+    Nat.is_lt(saved, pos),
+    kv_le_lt_excl(pos, saved)
+  )
+
+# LAW KV.19: nor at or beyond the end of the prompt: the last rows are always prefilled.
+law hc_resume_before_prompt_end:
+  for +pos: Nat
+  for +cap: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +saved: Nat
+  {Bool.and(hc_resume_valid(pos, cap, p, tile, saved), Nat.is_le(p, pos)) == False{} : Bool}
+
+def hc_resume_before_prompt_end(pos, cap, p, tile, saved):
+  kv_and3_excl_l(
+    pfx_reuse_valid(pos, cap, p, tile, False{}, 0n, False{}, 0n),
+    Nat.is_le(pos, saved),
+    Nat.is_le(p, pos),
+    pfx_reuse_before_prompt_end(pos, cap, p, tile, False{}, 0n, False{}, 0n)
+  )
+
+# LAW KV.20: and it is always a whole number of prefill tiles.
+law hc_resume_on_tile_boundary:
+  for +pos: Nat
+  for +cap: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +saved: Nat
+  {Bool.and(hc_resume_valid(pos, cap, p, tile, saved), Bool.not(Nat.is_eq(Nat.mod(pos, tile), 0n))) == False{} : Bool}
+
+def hc_resume_on_tile_boundary(pos, cap, p, tile, saved):
+  kv_and3_excl_l(
+    pfx_reuse_valid(pos, cap, p, tile, False{}, 0n, False{}, 0n),
+    Nat.is_le(pos, saved),
+    Bool.not(Nat.is_eq(Nat.mod(pos, tile), 0n)),
+    pfx_reuse_on_tile_boundary(pos, cap, p, tile, False{}, 0n, False{}, 0n)
+  )
+
+# LAW KV.21: the entry a save makes room for is never evicted for it.
+law hc_target_never_evicted:
+  for +pins: Nat
+  for +busy: Bool
+  {hc_can_evict(pins, busy, True{}) == False{} : Bool}
+
+def hc_target_never_evicted(pins, busy):
+  kv_and_not_true_r(pool_can_evict(pins, busy))
+
+# LAW KV.22: an entry a copy reads is never evicted.
+law hc_pinned_never_evicted:
+  for +p: Nat
+  for +busy: Bool
+  for +t: Bool
+  {hc_can_evict(1n+p, busy, t) == False{} : Bool}
+
+def hc_pinned_never_evicted(p, busy, t):
+  {==}
+
+# LAW KV.23: an entry a copy writes is never evicted.
+law hc_busy_never_evicted:
+  for +pins: Nat
+  for +t: Bool
+  {hc_can_evict(pins, True{}, t) == False{} : Bool}
+
+def hc_busy_never_evicted(pins, t):
+  match pins:
+    case 0n: {==}
+    case 1n+_: {==}
+
+def kv_alloc_le_total(p: PoolAcct) -> {True{} == Nat.is_le(pool_allocated(p), pool_total(p)) : Bool}:
+  match p:
+    case PoolAcct{a, f}:
+      kv_le_add_r(a, f)
+
+# LAW KV.24: what a ledger has given out never exceeds its capacity, whatever is asked of it:
+# the bytes the host tier holds stay within its budget.
+law pool_alloc_within_capacity:
+  for +a: Nat
+  for +f: Nat
+  for +req: Nat
+  {Nat.is_le(pool_allocated(pool_alloc(PoolAcct{a, f}, req)), Nat.add(a, f)) == True{} : Bool}
+
+def pool_alloc_within_capacity(a, f, req):
+  %pool_alloc_conserved(a, f, req) : {Nat.is_le(pool_allocated(pool_alloc(PoolAcct{a, f}, req)), _) == True{} : Bool}
+  Equal.sym(Bool, True{}, Nat.is_le(pool_allocated(pool_alloc(PoolAcct{a, f}, req)), pool_total(pool_alloc(PoolAcct{a, f}, req))), kv_alloc_le_total(pool_alloc(PoolAcct{a, f}, req)))
+
+# LAW KV.25: nor after bytes are given back.
+law pool_free_within_capacity:
+  for +a: Nat
+  for +f: Nat
+  for +rel: Nat
+  {Nat.is_le(pool_allocated(pool_free(PoolAcct{a, f}, rel)), Nat.add(a, f)) == True{} : Bool}
+
+def pool_free_within_capacity(a, f, rel):
+  %pool_free_conserved(a, f, rel) : {Nat.is_le(pool_allocated(pool_free(PoolAcct{a, f}, rel)), _) == True{} : Bool}
+  Equal.sym(Bool, True{}, Nat.is_le(pool_allocated(pool_free(PoolAcct{a, f}, rel)), pool_total(pool_free(PoolAcct{a, f}, rel))), kv_alloc_le_total(pool_free(PoolAcct{a, f}, rel)))

@@ -13,6 +13,7 @@ pub mod cache_ram;
 pub mod core;
 pub mod engine;
 pub mod fp8;
+pub mod hostmem;
 pub mod json;
 pub mod kernels;
 pub mod live_profile;
