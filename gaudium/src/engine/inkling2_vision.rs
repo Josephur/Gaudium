@@ -1806,7 +1806,10 @@ impl Inkling2Engine {
             return Ok(false);
         }
         let img = vis.image_token_id;
-        let tile = &prompt_ids[pos..pos + t as usize];
+        // the tile may run more rows than the prompt has left (padding rows past the cursor,
+        // id 0): those are text rows
+        let tv = (prompt_ids.len() - pos.min(prompt_ids.len())).min(t as usize);
+        let tile = &prompt_ids[pos..pos + tv];
         if !tile.contains(&img) {
             return Ok(false);
         }
@@ -1814,7 +1817,7 @@ impl Inkling2Engine {
         let mut rank = prompt_ids[..pos].iter().filter(|&&x| x == img).count() as u64;
         let mut fidx = Vec::with_capacity(t as usize * 4);
         let mut keep = Vec::with_capacity(t as usize * 2);
-        for &id in tile {
+        for &id in tile.iter().chain(std::iter::repeat_n(&0, t as usize - tv)) {
             let is_img = id == img;
             let col = ikv_feat_row(is_img, rank);
             if is_img {
