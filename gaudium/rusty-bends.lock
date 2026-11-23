@@ -320,6 +320,9 @@ a3addbdf3b41fa93  px_check_within_addr_ok  law px_check_within_addr_ok : for + m
 db773639491c5a20  px_gate_method_never_runs  law px_gate_method_never_runs : for + k : Bool for + e : Bool for + s : Bool { px_gate_runs ( px_gate ( k , e , s , False { } ) ) == False { } : Bool }
 0f901cc3c4394291  px_gate_needs_key  law px_gate_needs_key : for e : Bool for s : Bool for m : Bool { px_gate_runs ( px_gate ( False { } , e , s , m ) ) == False { } : Bool }
 495fe892c0fd0a3a  px_gate_off_never_runs  law px_gate_off_never_runs : for + k : Bool for s : Bool for m : Bool { px_gate_runs ( px_gate ( k , False { } , s , m ) ) == False { } : Bool }
+f0da31c398c12661  px_hop_left_keeps_bound_headers  law px_hop_left_keeps_bound_headers : for + p : Bool for s : Bool { px_req_header_goes ( p , PxRhBound { } , px_hop_same_origin ( False { } , s ) ) == False { } : Bool }
+6ea353b97993166a  px_hop_left_stays_left  law px_hop_left_stays_left : for s : Bool { px_hop_same_origin ( False { } , s ) == False { } : Bool }
+ec9a5fb1ce8d8fa8  px_hop_off_origin_clears  law px_hop_off_origin_clears : for + w : Bool { px_hop_same_origin ( w , False { } ) == False { } : Bool }
 cfc7b72468abb316  px_join_all_must_pass  law px_join_all_must_pass : for + a : PxAddr for + n : PxAddr { px_addr_passes ( px_addr_join ( a , n ) ) == Bool.and ( px_addr_passes ( a ) , px_addr_passes ( n ) ) : Bool }
 477e277c8c489d28  px_keepalive_never_mid_line  law px_keepalive_never_mid_line : for + s : Bool for q : Nat for e : Nat { px_keepalive_due ( s , False { } , q , e ) == False { } : Bool }
 69e3e98a9de7c23b  px_keepalive_only_event_stream  law px_keepalive_only_event_stream : for l : Bool for q : Nat for e : Nat { px_keepalive_due ( False { } , l , q , e ) == False { } : Bool }
@@ -371,6 +374,10 @@ db71263f424c44a6  px_v6_mapped_no_wider  law px_v6_mapped_no_wider : for + a : N
 a684148242cdeb04  px_v6_nat64_no_wider  law px_v6_nat64_no_wider : for + a : Nat for + b : Nat for + c : Nat for + d : Nat { Bool.or ( px_ac_public ( px_v4_class ( a , b , c , d ) ) , Bool.not ( px_ac_public ( px_v6_class ( 0n , 100n , 255n , 155n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , a , b , c , d ) ) ) ) == True { } : Bool }
 d37f393f738d7222  px_v6_unique_local_not_public  law px_v6_unique_local_not_public : for b1 : Nat for b2 : Nat for b3 : Nat for b4 : Nat for b5 : Nat for b6 : Nat for b7 : Nat for b8 : Nat for b9 : Nat for b10 : Nat for b11 : Nat for b12 : Nat for b13 : Nat for b14 : Nat for b15 : Nat { px_ac_public ( px_v6_class ( 253n , b1 , b2 , b3 , b4 , b5 , b6 , b7 , b8 , b9 , b10 , b11 , b12 , b13 , b14 , b15 ) ) == False { } : Bool }
 2586c80b9cf7a4c4  px_v6_unspecified_never  law px_v6_unspecified_never : for l : Bool { px_addr_ok ( px_v6_class ( 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n , 0n ) , l ) == False { } : Bool }
+c33898efdb0d53e6  px_write_idle_gives_up  law px_write_idle_gives_up : for + t : Nat { px_write_gives_up ( 0n , t ) == True { } : Bool }
+161ef990493105b8  px_write_spent_gives_up  law px_write_spent_gives_up : for + i : Nat { px_write_gives_up ( i , 0n ) == True { } : Bool }
+2b1ee1dcff89fe96  px_write_wait_within_idle  law px_write_wait_within_idle : for + i : Nat for + t : Nat { Nat.is_le ( px_write_wait ( i , t ) , i ) == True { } : Bool }
+6f3ad6c263405dff  px_write_wait_within_total  law px_write_wait_within_total : for + i : Nat for + t : Nat { Nat.is_le ( px_write_wait ( i , t ) , t ) == True { } : Bool }
 2afc489632120517  qwen36_35b_moe_dims_valid  law qwen36_35b_moe_dims_valid : { Bool.and ( gqa_dims_valid ( 16n , 2n , 256n ) , Bool.and ( gdn_dims_valid ( 16n , 32n , 4n ) , moe_dims_valid ( 256n , 8n , 512n ) ) ) == True { } : Bool }
 b4326499ace96154  qwen38_27b_dims_valid  law qwen38_27b_dims_valid : { Bool.and ( gqa_dims_valid ( 24n , 4n , 256n ) , gdn_dims_valid ( 16n , 48n , 4n ) ) == True { } : Bool }
 f1cbe1206fb49073  recipe_destroy_idempotent  law recipe_destroy_idempotent : for s : RecipeState { recipe_step ( recipe_step ( s , EvRecDestroy { } ) , EvRecDestroy { } ) == recipe_step ( s , EvRecDestroy { } ) : RecipeState }

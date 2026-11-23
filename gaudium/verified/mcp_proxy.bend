@@ -1393,17 +1393,10 @@ def px_hop_off_origin_clears(w):
     case True{}: {==}
     case False{}: {==}
 
-# LAW 10.3: A hop that stays on the origin the page named does not change the flag.
-law px_hop_on_origin_keeps:
-  for +w: Bool
-  {px_hop_same_origin(w, True{}) == w : Bool}
+# (That a hop which stays on the named origin keeps the flag is today's behaviour, pinned by a
+# Rust test and by no law: a later version may be stricter and drop credentials on every hop.)
 
-def px_hop_on_origin_keeps(w):
-  match w:
-    case True{}: {==}
-    case False{}: {==}
-
-# LAW 10.4: After a redirect left the origin, a header that may carry a credential is never
+# LAW 10.3: After a redirect left the origin, a header that may carry a credential is never
 # forwarded again, whatever later hops do.
 law px_hop_left_keeps_bound_headers:
   for +p: Bool
