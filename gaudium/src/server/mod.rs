@@ -1048,8 +1048,11 @@ impl AppState {
 
 /// The host-RAM tier's store of a server with this configuration (`None`: off): its budget
 /// from `--cache-ram`, or the default share of the host memory available now, checked against
-/// what the host and its control group can give beside the pinned transfer buffers of a loaded
-/// engine. A budget that was asked for and cannot be honoured is an error with the numbers.
+/// what the host and its control groups can give beside what a loaded engine takes for its
+/// copies (the pinned transfer ring, and the buffer of its first copies at each load). A
+/// budget that was asked for and cannot be honoured is an error with the numbers. This is the
+/// plan; each of those allocations is asked for again when it is made
+/// (`hostmem::Admitted`).
 fn host_cache_of(cfg: &ServerConfig) -> Result<Option<Arc<crate::cache_ram::SharedCache>>, String> {
     use crate::synapse::xfer::{XferRing, RING_BUFS, RING_BUF_BYTES};
     if cfg.prefix_slots == 0 {
@@ -1059,17 +1062,20 @@ fn host_cache_of(cfg: &ServerConfig) -> Result<Option<Arc<crate::cache_ram::Shar
         return Ok(None);
     }
     let ring = XferRing::planned_bytes(RING_BUFS, RING_BUF_BYTES);
+    let first_copies = crate::engine::qwen3::host_tier::first_copies_bytes();
     let mem = crate::hostmem::HostMemory::read();
-    let (budget, how) = crate::cache_ram::resolve_budget(cfg.cache_ram_bytes, ring, &mem)?;
+    let (budget, how) =
+        crate::cache_ram::resolve_budget(cfg.cache_ram_bytes, ring + first_copies, &mem)?;
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     if budget == 0 {
         eprintln!("[server] cache-ram: {how}");
         return Ok(None);
     }
     eprintln!(
-        "[server] cache-ram: {:.2} GiB of host memory for prefixes the card no longer holds ({how}); taken as prefixes are saved, plus {:.2} GiB of pinned transfer buffers while a model is loaded",
+        "[server] cache-ram: {:.2} GiB of host memory for prefixes the card no longer holds ({how}); taken as prefixes are saved, plus {} MiB of pinned transfer buffers while a model is loaded and {} MiB for the first copies at each load",
         gib(budget),
-        gib(ring),
+        ring >> 20,
+        first_copies >> 20,
     );
     Ok(Some(Arc::new(crate::cache_ram::SharedCache::new(
         budget,

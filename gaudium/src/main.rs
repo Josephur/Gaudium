@@ -105,12 +105,19 @@ fn print_usage() {
          \x20                       instead of prefilled when that is faster by the engine's own\n\
          \x20                       measured rates; the output is that of a whole prefill. GB may\n\
          \x20                       be a decimal; 0 = off. Default: a quarter of the host memory\n\
-         \x20                       available at start (the smaller of the host's and the control\n\
-         \x20                       group's). Memory is taken as prefixes are saved and given back\n\
-         \x20                       when they leave; a full cache evicts the entry used least\n\
-         \x20                       recently. A budget that does not fit in what is available is\n\
-         \x20                       refused at start with the numbers. While a model is loaded,\n\
-         \x20                       0.25 GiB of pinned transfer buffers come on top. Needs\n\
+         \x20                       available at start (the smallest of what the host and the\n\
+         \x20                       control groups above the process have left; version 1 and 2\n\
+         \x20                       memory controllers are read). No default is taken, and the\n\
+         \x20                       cache is off, when a memory limit of the process cannot be\n\
+         \x20                       read: name a budget to turn it on there. Memory is taken as\n\
+         \x20                       prefixes are saved and given back when they leave; a full\n\
+         \x20                       cache evicts the entry used least recently. A budget that does\n\
+         \x20                       not fit in what is available is refused at start with the\n\
+         \x20                       numbers. While a model is loaded, 256 MiB of pinned transfer\n\
+         \x20                       buffers come on top, and 128 MiB for a moment at each load;\n\
+         \x20                       all of it is asked for against what the host has left at that\n\
+         \x20                       moment, and an engine that cannot have it serves without the\n\
+         \x20                       cache. Needs\n\
          \x20                       --prefix-cache > 0; about 64 KiB per token and 0.15 GiB per\n\
          \x20                       kept position for a 16-attention-layer, 48-DeltaNet-layer model\n\
          \x20 --queue-config <file> Card-queue settings, re-read on every turn (or GAUDIUM_QUEUE_CONFIG;\n\

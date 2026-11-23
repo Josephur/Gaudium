@@ -3191,3 +3191,93 @@ law xf_probe_need_covers_the_copy:
 
 def xf_probe_need_covers_the_copy(b, c):
   hc_le_max_r(b, Nat.add(c, c))
+
+# ============================================================================
+# 20. One admission for every host allocation, and limits that cannot be read
+# ============================================================================
+#
+# Every mapping and every pinning of host memory this feature makes (a segment of the store, an
+# engine's transfer ring, the buffer of its first copies, the buffers of the copy probe) is
+# taken out of a leave: so many bytes, asked for against what the host and every control group
+# above the process have left at that moment (`hc_available` and `hc_chain_step` over the
+# chain). The shell cannot map or pin without one.
+
+# May `need` bytes of host memory be taken now, with `available` bytes available now?
+def hm_admit(need: Nat, available: Nat) -> Bool:
+  Nat.is_le(need, available)
+
+# Fresh host memory an allocation of `need` bytes takes: what it needs beyond the mapped
+# segments it takes again (`reused` bytes of them, memory the process already has).
+def hm_fresh(need: Nat, reused: Nat) -> Nat:
+  Nat.sub(need, reused)
+
+# Does a leave with `left` bytes cover one more mapping of `bytes`?
+def hm_covers(left: Nat, bytes: Nat) -> Bool:
+  Nat.is_le(bytes, left)
+
+# What a leave has left once a mapping of `bytes` was taken out of it.
+def hm_left(left: Nat, bytes: Nat) -> Nat:
+  Nat.sub(left, bytes)
+
+# The budget of a server that names none is taken from what is available (`hc_default_budget`).
+# May it be, when the limits of the process are established (`limits_known`: what the host has
+# available was read, and so was the limit of every memory-controlled group the process is
+# in)? Not otherwise: a share of a figure that leaves out a limit can be more than that limit
+# allows, and the kernel stops a process that takes it. The operator who names a budget knows
+# the limit; the server does not guess one.
+def hc_default_allowed(limits_known: Bool) -> Bool:
+  limits_known
+
+# LAW HC.149: nothing is admitted beyond what is available at the moment it is asked for.
+law hm_never_admits_beyond_available:
+  for +n: Nat
+  for +a: Nat
+  {Bool.and(hm_admit(n, a), Nat.is_lt(a, n)) == False{} : Bool}
+
+def hm_never_admits_beyond_available(n, a):
+  hc_le_lt_excl(n, a)
+
+# LAW HC.150: a mapping larger than what its leave has left is never covered ...
+law hm_never_covers_beyond_the_leave:
+  for +l: Nat
+  for +b: Nat
+  {Bool.and(hm_covers(l, b), Nat.is_lt(l, b)) == False{} : Bool}
+
+def hm_never_covers_beyond_the_leave(l, b):
+  hc_le_lt_excl(b, l)
+
+# LAW HC.151: ... a leave never grows by being used ...
+law hm_left_never_grows:
+  for +l: Nat
+  for +b: Nat
+  {Nat.is_le(hm_left(l, b), l) == True{} : Bool}
+
+def hm_left_never_grows(l, b):
+  hc_sub_le_self(l, b)
+
+# LAW HC.152: ... and what a covered mapping took and what is left never add up to more than
+# the leave held: all the mappings made under one leave stay within what was admitted.
+law hm_taken_and_left_within_the_leave:
+  for +b: Nat
+  for +r: Nat
+  {Nat.is_le(Nat.add(b, hm_left(Nat.add(b, r), b)), Nat.add(b, r)) == True{} : Bool}
+
+def hm_taken_and_left_within_the_leave(b, r):
+  %Equal.sym(Nat, Nat.sub(Nat.add(b, r), b), r, hc_add_sub_cancel(b, r)) : {Nat.is_le(Nat.add(b, _), Nat.add(b, r)) == True{} : Bool}
+  hc_le_refl(Nat.add(b, r))
+
+# LAW HC.153: the fresh memory of an allocation is never counted above what it needs.
+law hm_fresh_within_need:
+  for +n: Nat
+  for +r: Nat
+  {Nat.is_le(hm_fresh(n, r), n) == True{} : Bool}
+
+def hm_fresh_within_need(n, r):
+  hc_sub_le_self(n, r)
+
+# LAW HC.154: a server whose limits could not be read never takes a default budget.
+law hc_unread_limit_allows_no_default:
+  {hc_default_allowed(False{}) == False{} : Bool}
+
+def hc_unread_limit_allows_no_default():
+  {==}

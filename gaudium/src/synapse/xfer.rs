@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use crate::hostmem::AnonMap;
+use crate::hostmem::{Admitted, AnonMap};
 use crate::synapse::device::{DeviceEvent, HpuDevice, PinnedBuf};
 use crate::synapse::ffi::{SynDeviceId, SynStreamHandle, SynapseApi, SynapseError};
 use crate::verified::{
@@ -309,13 +309,16 @@ fn then_drained<T, E>(
 
 impl XferRing {
     /// Allocates and maps the ring: `bufs` buffers of `buf_bytes`, each its own mapping, none
-    /// touched before it is pinned.
+    /// touched before it is pinned. Every buffer, of either kind, is taken out of `leave`
+    /// ([`Self::planned_bytes`] of host memory, asked for by the caller just before): pinning
+    /// makes the pages at once, so a ring the host cannot hold must be refused before it.
     pub fn new(
         dev: &HpuDevice,
         bufs: usize,
         buf_bytes: usize,
         kind: RingKind,
         threads: usize,
+        mut leave: Admitted,
     ) -> Result<Self, SynapseError> {
         let bufs = bufs.max(2);
         let buf_bytes = AnonMap::mapped_len(buf_bytes as u64) as usize;
@@ -323,9 +326,13 @@ impl XferRing {
         let mut events = Vec::with_capacity(bufs);
         for _ in 0..bufs {
             let mem = match kind {
-                RingKind::Malloc => RingMem::Pinned(dev.alloc_pinned(buf_bytes)?),
+                RingKind::Malloc => {
+                    leave.draw(buf_bytes as u64).map_err(SynapseError::Guard)?;
+                    RingMem::Pinned(dev.alloc_pinned(buf_bytes)?)
+                }
                 RingKind::MappedHuge => {
-                    let map = AnonMap::new(buf_bytes as u64).map_err(SynapseError::Guard)?;
+                    let map =
+                        AnonMap::new(buf_bytes as u64, &mut leave).map_err(SynapseError::Guard)?;
                     // SAFETY: `map` is live host memory of exactly this length and stays live
                     // until the unmap in `RingMem::drop`.
                     unsafe { dev.host_map_extents(map.as_ptr(), &[map.len() as u64])? };
@@ -359,9 +366,10 @@ impl XferRing {
     #[cfg(test)]
     fn on_host_memory(bufs: usize, buf_bytes: usize, threads: usize) -> Self {
         let buf_bytes = AnonMap::mapped_len(buf_bytes as u64) as usize;
+        let mut leave = Admitted::ask(Self::planned_bytes(bufs, buf_bytes), u64::MAX).unwrap();
         Self {
             bufs: (0..bufs.max(2))
-                .map(|_| RingMem::Plain(AnonMap::new(buf_bytes as u64).unwrap()))
+                .map(|_| RingMem::Plain(AnonMap::new(buf_bytes as u64, &mut leave).unwrap()))
                 .collect(),
             events: Vec::new(),
             buf_bytes,
@@ -996,7 +1004,11 @@ pub fn probe(gib: u64) -> Result<(), String> {
 
     for kind in [RingKind::MappedHuge, RingKind::Malloc] {
         let t0 = Instant::now();
-        let mut ring = XferRing::new(&dev, RING_BUFS, RING_BUF_BYTES, kind, 4)
+        let leave = crate::hostmem::HostMemory::read().admit(
+            "the probe's pinned transfer ring",
+            XferRing::planned_bytes(RING_BUFS, RING_BUF_BYTES),
+        )?;
+        let mut ring = XferRing::new(&dev, RING_BUFS, RING_BUF_BYTES, kind, 4, leave)
             .map_err(|e| format!("ring {kind:?}: {e}"))?;
         println!(
             "ring {kind:?}: {} x {} MiB pinned in {:.1} ms",
@@ -1019,7 +1031,9 @@ pub fn probe(gib: u64) -> Result<(), String> {
         // memory that was already written
         for threads in [1usize, 2, 4, 6, 8] {
             ring.set_threads(threads);
-            let mut host = AnonMap::new(bytes)?;
+            let mut leave = crate::hostmem::HostMemory::read()
+                .admit("the probe's host buffer", AnonMap::mapped_len(bytes))?;
+            let mut host = AnonMap::new(bytes, &mut leave)?;
             for piece_bytes in [256u64 << 10, 32 << 20] {
                 // the pieces of this size that lie inside the device bytes and inside `host`
                 let pieces: Vec<Piece> = (0u64..)
@@ -1057,10 +1071,17 @@ pub fn probe(gib: u64) -> Result<(), String> {
     }
     // the host copy alone, between two anonymous mappings
     let n = copy_bytes as usize;
-    let mut a = AnonMap::new(n as u64)?;
+    let admit = || {
+        crate::hostmem::HostMemory::read().admit(
+            "a buffer of the probe's host-copy test",
+            AnonMap::mapped_len(n as u64),
+        )
+    };
+    let mut a = AnonMap::new(n as u64, &mut admit()?)?;
+    // written before the next buffer is asked for: that asking counts it
     a.as_mut_slice().fill(1);
     for threads in [1usize, 2, 4, 6, 8] {
-        let mut b = AnonMap::new(n as u64)?;
+        let mut b = AnonMap::new(n as u64, &mut admit()?)?;
         let job = [Job {
             ring: a.as_mut_ptr(),
             host: b.as_mut_ptr(),
@@ -1484,13 +1505,16 @@ mod tests {
             groups: vec![
                 Group {
                     limit: None,
+                    high: None,
                     in_use: Some(gib),
                 },
                 Group {
                     limit: Some(3 * gib),
+                    high: None,
                     in_use: Some(gib),
                 },
             ],
+            unread: None,
         };
         let e = probe_admission(2 * gib, gib, ring, &limited).unwrap_err();
         assert!(
@@ -1582,12 +1606,19 @@ mod tests {
     #[ignore]
     fn host_copy_rates() {
         let n = 1usize << 30;
-        let mut a = AnonMap::new(n as u64).unwrap();
+        // each buffer is asked for against what this machine has when it is mapped
+        let map = || {
+            let mut leave = crate::hostmem::HostMemory::read()
+                .admit("a buffer of the copy test", n as u64)
+                .unwrap();
+            AnonMap::new(n as u64, &mut leave).unwrap()
+        };
+        let mut a = map();
         a.as_mut_slice().fill(3);
         let gib = |s: f64| n as f64 / s / (1u64 << 30) as f64;
         for piece in [256usize << 10, 2 << 20, 32 << 20] {
             for fresh in [true, false] {
-                let mut b = AnonMap::new(n as u64).unwrap();
+                let mut b = map();
                 if !fresh {
                     b.as_mut_slice().fill(1);
                 }
@@ -1602,7 +1633,7 @@ mod tests {
                     };
                 }
                 let plain = t0.elapsed().as_secs_f64();
-                let mut c = AnonMap::new(n as u64).unwrap();
+                let mut c = map();
                 if !fresh {
                     c.as_mut_slice().fill(1);
                 }

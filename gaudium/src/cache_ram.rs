@@ -22,7 +22,13 @@
 //! (`allocated + free == budget`, the locked rules of the block pool counted in bytes).
 //!
 //! Memory: a segment is an anonymous mapping of its own (`hostmem::AnonMap`). The budget is
-//! charged for what is mapped, and pages exist only once written. Segments of entries that
+//! charged for what is mapped, and pages exist only once written. No segment is mapped without
+//! a leave (`hostmem::Admitted`): the room an allocation is given ([`HostCache::make_room`])
+//! is a leave for its fresh memory, asked for against what the host and the control groups of
+//! the process have left at that moment. The memory an engine takes beside the store (its
+//! pinned transfer ring, the buffer of its first copies) is asked for here too
+//! ([`HostCache::admit_beside`]), because the store can make room for it by evicting.
+//! Segments of entries that
 //! leave during a save are handed to that save first (a cache that is full evicts on every
 //! save, and a segment that is reused costs neither an unmap nor fresh pages: measured on the
 //! Gaudi 2 host, memory that was written before takes a copy at about twice the rate of fresh
@@ -30,14 +36,16 @@
 //! ([`HostCache::settle`]). A spare segment is taken again only by an allocation of exactly its
 //! size, so it counts as memory the save has only then (`hc_spare_credit`); when the host
 //! cannot give what an allocation needs, the spare segments of other sizes go back to the
-//! system before anything else happens (`hc_spares_return`). Nothing here is pinned.
+//! system before anything else happens (`hc_spares_return`). Only a segment that was written
+//! whole becomes a spare one: a segment a copy did not finish goes back to the system at once,
+//! so a spare segment is always memory the process really has. Nothing here is pinned.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::core::kv_pool::BlockPoolTracker;
 use crate::engine::qwen3::prefix_cache::{shared_rows, ImageId};
-use crate::hostmem::AnonMap;
+use crate::hostmem::{Admitted, AnonMap};
 use crate::verified::{
     hc_abort, hc_begin_read, hc_begin_write, hc_busy, hc_can_evict, hc_continue_pick,
     hc_copy_whole, hc_end_write, hc_evict_before, hc_may_read, hc_may_restore, hc_pins,
@@ -45,7 +53,7 @@ use crate::verified::{
     hc_ring_cover_after_cut, hc_ring_due, hc_ring_serves, hc_room, hc_save_need, hc_shared_tiles,
     hc_spare_credit, hc_spares_return, hc_state_due, hc_state_kept, hc_state_leaves_first,
     hc_state_may_leave, hc_state_survives_cut, hc_state_wanted, hc_states_over, hc_take_now,
-    hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
+    hc_tiles, hc_truncate, hm_fresh, pc_boundary, HcEntry, HcRoom,
 };
 
 /// Identity of the engine an entry was made by: a digest of everything that decides the bytes
@@ -346,14 +354,17 @@ impl HostCache {
         AnonMap::mapped_len(bytes)
     }
 
-    fn alloc(&mut self, bytes: u64) -> Option<Seg> {
+    /// A segment for `bytes`, charged to the budget: a spare one of that size, which is memory
+    /// the store already has, else a fresh mapping taken out of `leave` (the leave
+    /// [`Self::make_room`] gave for this allocation; a mapping it does not cover is refused).
+    fn alloc(&mut self, bytes: u64, leave: &mut Admitted) -> Option<Seg> {
         let charge = Self::charge_of(bytes);
         self.ledger.alloc(charge).ok()?;
         // a spare segment of this size first: every byte a copy reads later is written by it
         if let Some(i) = self.spare.iter().position(|s| s.charged() == charge) {
             return Some(self.spare.swap_remove(i));
         }
-        match AnonMap::new(bytes) {
+        match AnonMap::new(bytes, leave) {
             Ok(map) => Some(Seg { map }),
             Err(e) => {
                 let _ = self.ledger.free_blocks(charge);
@@ -364,20 +375,37 @@ impl HostCache {
     }
 
     /// The budget gets the segment's bytes back; the segment itself stays for the copy in
-    /// progress to take ([`Self::settle`] unmaps what is left).
+    /// progress to take ([`Self::settle`] unmaps what is left). Only for a segment that was
+    /// written whole (it held rows, a state or an image of an entry): a spare segment counts as
+    /// memory the process has, which is true of written pages only.
     fn release(&mut self, seg: Seg) {
         let _ = self.ledger.free_blocks(seg.charged());
         self.spare.push(seg);
     }
 
+    /// The budget gets the segment's bytes back and the segment goes back to the system now:
+    /// for a segment a copy did not finish. Some of its pages were never written, so it is not
+    /// memory the process has and must not be counted as such.
+    fn discard(&mut self, seg: Seg) {
+        let _ = self.ledger.free_blocks(seg.charged());
+        drop(seg);
+    }
+
     fn remove(&mut self, id: u64) {
         if let Some(mut e) = self.entries.remove(&id) {
+            // what a copy was still writing (the tiles past the ones the entry holds whole,
+            // the piece that is pending) goes back to the system; the rest was written whole
+            // and stays for the copy in progress to take
+            let whole = (hc_tiles(e.life) as usize).min(e.rows.len());
+            let unfinished: Vec<Seg> = e.rows.drain(whole..).chain(e.pending.take()).collect();
             let mut segs: Vec<Seg> = std::mem::take(&mut e.rows);
             segs.extend(e.states.drain(..).map(|(_, s)| s));
             segs.extend(e.ring.take().map(|r| r.seg));
-            segs.extend(e.pending.take());
             for s in segs {
                 self.release(s);
+            }
+            for s in unfinished {
+                self.discard(s);
             }
         }
     }
@@ -398,7 +426,11 @@ impl HostCache {
     /// spare segments of other sizes go back to the system first (`hc_spares_return`: they are
     /// mapped memory nothing here can use); then the entries used least recently leave. A
     /// request that cannot be met even so evicts nothing.
-    fn make_room(&mut self, target: Option<u64>, seg: u64, count: u64) -> bool {
+    ///
+    /// The room comes as a leave for the fresh memory the allocation maps: what it needs
+    /// beyond the spare segments it takes again (`hm_fresh`), admitted against the host figure
+    /// this very answer was computed from. `None`: no room.
+    fn make_room(&mut self, target: Option<u64>, seg: u64, count: u64) -> Option<Admitted> {
         let need = seg.saturating_mul(count);
         loop {
             let host = self.host_now();
@@ -409,36 +441,78 @@ impl HostCache {
                 self.evictable(target),
             );
             if room == HcRoom::HcFits {
-                return true;
+                return Admitted::ask(hm_fresh(need, reusable), host);
             }
             if hc_spares_return(need, host, reusable, self.spare_bytes_not_of(seg)) {
                 self.return_spares_not_of(seg);
                 continue;
             }
-            if room == HcRoom::HcRefuse {
-                return false;
+            if room == HcRoom::HcRefuse || !self.evict_one(target, need) {
+                return None;
             }
-            let mut victim: Option<(u64, u64)> = None;
-            for (&id, e) in &self.entries {
-                if !hc_can_evict(hc_pins(e.life), hc_busy(e.life), Some(id) == target) {
-                    continue;
+        }
+    }
+
+    /// The entry used least recently among those that may leave (never `target`, never one a
+    /// copy reads or writes) leaves. `false`: there is none.
+    fn evict_one(&mut self, target: Option<u64>, need: u64) -> bool {
+        let mut victim: Option<(u64, u64)> = None;
+        for (&id, e) in &self.entries {
+            if !hc_can_evict(hc_pins(e.life), hc_busy(e.life), Some(id) == target) {
+                continue;
+            }
+            if victim.is_none_or(|(_, used)| hc_evict_before(e.used, used)) {
+                victim = Some((id, e.used));
+            }
+        }
+        let Some((id, _)) = victim else { return false };
+        if self.verbose {
+            let e = &self.entries[&id];
+            eprintln!(
+                "[cache-ram] evicted entry {id}: {} rows, {:.2} GiB (room for {:.2} GiB)",
+                pc_boundary(hc_tiles(e.life), e.tile),
+                e.bytes() as f64 / (1u64 << 30) as f64,
+                need as f64 / (1u64 << 30) as f64
+            );
+        }
+        self.remove(id);
+        self.stats.evictions += 1;
+        true
+    }
+
+    /// Leave for `need` bytes of host memory beside the store's own segments, for `what` (an
+    /// engine's pinned transfer ring, the buffer of its first copies): asked for against what
+    /// the host has available now. When that is short, the entries used least recently leave
+    /// first, as for a save, and their memory goes back to the system at once; what cannot be
+    /// had even with every entry gone is refused with the numbers, and nothing leaves for it
+    /// (the verified `hc_room`, then `hm_admit`).
+    pub fn admit_beside(&mut self, what: &str, need: u64) -> Result<Admitted, String> {
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        loop {
+            let host = self.host_now();
+            let evictable = self.evictable(None);
+            let refused = |host: u64| {
+                format!(
+                    "{what} needs {:.2} GiB of host memory, and {:.2} GiB are available now{}",
+                    gib(need),
+                    gib(host),
+                    match evictable {
+                        0 => String::new(),
+                        b => format!(" (the cache could give back {:.2} GiB)", gib(b)),
+                    }
+                )
+            };
+            match hc_room(need, host, evictable) {
+                HcRoom::HcFits => return Admitted::ask(need, host).ok_or_else(|| refused(host)),
+                HcRoom::HcRefuse => return Err(refused(host)),
+                HcRoom::HcEvict => {
+                    if !self.evict_one(None, need) {
+                        return Err(refused(host));
+                    }
+                    // the entry's segments go back to the system before the host is asked again
+                    self.settle();
                 }
-                if victim.is_none_or(|(_, used)| hc_evict_before(e.used, used)) {
-                    victim = Some((id, e.used));
-                }
             }
-            let Some((id, _)) = victim else { return false };
-            if self.verbose {
-                let e = &self.entries[&id];
-                eprintln!(
-                    "[cache-ram] evicted entry {id}: {} rows, {:.2} GiB (room for {:.2} GiB)",
-                    pc_boundary(hc_tiles(e.life), e.tile),
-                    e.bytes() as f64 / (1u64 << 30) as f64,
-                    need as f64 / (1u64 << 30) as f64
-                );
-            }
-            self.remove(id);
-            self.stats.evictions += 1;
         }
     }
 
@@ -732,18 +806,18 @@ impl HostCache {
     /// A save starts to copy the rows of the next `n` tiles into entry `id`: their segments,
     /// in tile order. `None`: no room (nothing was changed).
     pub fn begin_rows(&mut self, id: u64, n: u64, tile_bytes: u64) -> Option<Vec<*mut u8>> {
-        if !self.entries.contains_key(&id)
-            || !self.make_room(Some(id), Self::charge_of(tile_bytes), n)
-        {
+        if !self.entries.contains_key(&id) {
             return None;
         }
+        let mut leave = self.make_room(Some(id), Self::charge_of(tile_bytes), n)?;
         let mut segs = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            match self.alloc(tile_bytes) {
+            match self.alloc(tile_bytes, &mut leave) {
                 Some(s) => segs.push(s),
                 None => {
+                    // nothing was written to these yet
                     for s in segs {
-                        self.release(s);
+                        self.discard(s);
                     }
                     return None;
                 }
@@ -768,8 +842,9 @@ impl HostCache {
         let keep = hc_tiles(e.life);
         let gone: Vec<Seg> = e.rows.drain((keep as usize).min(e.rows.len())..).collect();
         let empty = !hc_readable(e.life);
+        // the tiles the copy did not finish
         for s in gone {
-            self.release(s);
+            self.discard(s);
         }
         if empty {
             self.remove(id);
@@ -780,10 +855,11 @@ impl HostCache {
     /// A save starts to copy one more piece of entry `id` (a state, or the ring image) of
     /// `bytes`: where it goes. `None`: no room.
     pub fn begin_piece(&mut self, id: u64, bytes: u64) -> Option<*mut u8> {
-        if !self.entries.contains_key(&id) || !self.make_room(Some(id), Self::charge_of(bytes), 1) {
+        if !self.entries.contains_key(&id) {
             return None;
         }
-        let mut seg = self.alloc(bytes)?;
+        let mut leave = self.make_room(Some(id), Self::charge_of(bytes), 1)?;
+        let mut seg = self.alloc(bytes, &mut leave)?;
         let ptr = seg.map.as_mut_ptr();
         let e = self.entries.get_mut(&id).expect("entry");
         if let Some(old) = e.pending.replace(seg) {
@@ -804,6 +880,7 @@ impl HostCache {
         };
         e.life = hc_end_write(e.life, hc_tiles(e.life));
         let mut gone: Vec<Seg> = Vec::new();
+        let mut unfinished: Option<Seg> = None;
         let mut kept = false;
         if let Some(seg) = e.pending.take() {
             kept = hc_state_kept(done, all, tiles, hc_tiles(e.life));
@@ -814,11 +891,14 @@ impl HostCache {
                 let at = e.states.partition_point(|(k, _)| *k < tiles);
                 e.states.insert(at, (tiles, seg));
             } else {
-                gone.push(seg);
+                unfinished = Some(seg);
             }
         }
         for s in gone {
             self.release(s);
+        }
+        if let Some(s) = unfinished {
+            self.discard(s);
         }
         kept
     }
@@ -833,6 +913,7 @@ impl HostCache {
         };
         e.life = hc_end_write(e.life, hc_tiles(e.life));
         let mut gone: Vec<Seg> = Vec::new();
+        let mut unfinished: Option<Seg> = None;
         let mut whole = false;
         if let Some(seg) = e.pending.take() {
             whole = hc_copy_whole(done, all);
@@ -844,11 +925,14 @@ impl HostCache {
                         .map(|r| r.seg),
                 );
             } else {
-                gone.push(seg);
+                unfinished = Some(seg);
             }
         }
         for s in gone {
             self.release(s);
+        }
+        if let Some(s) = unfinished {
+            self.discard(s);
         }
         whole
     }
@@ -940,6 +1024,19 @@ impl SharedCache {
         }
     }
 
+    /// A store on a made-up host: `available` is asked with the bytes the store has mapped.
+    #[cfg(test)]
+    pub fn on_host(budget_bytes: u64, ring_bytes: u64, available: fn(u64) -> u64) -> Self {
+        let mut cache = HostCache::new(budget_bytes, false);
+        cache.host_available = Some(available);
+        let snap = cache.stats();
+        Self {
+            inner: Mutex::new(cache),
+            snap: Mutex::new(snap),
+            ring_bytes,
+        }
+    }
+
     /// The counters as of the last finished save or restore.
     pub fn stats(&self) -> CacheStats {
         *self.snap.lock().unwrap_or_else(|e| e.into_inner())
@@ -952,33 +1049,48 @@ impl SharedCache {
 }
 
 /// The budget a server runs with, from what the operator asked for (`None`: the default share)
-/// and what the host can give now: `Ok((bytes, how it was chosen))`, 0 = off. A budget that was
-/// asked for and cannot be honoured is an error that says so with the numbers.
+/// and what the host can give now: `Ok((bytes, how it was chosen))`, 0 = off. `beside_bytes`:
+/// what a loaded engine takes beside the store (its pinned transfer ring and the buffer of its
+/// first copies). A budget that was asked for and cannot be honoured is an error that says so
+/// with the numbers.
+///
+/// When the limits of this process are not established (`HostMemory::limits_known`), no
+/// default budget is taken (the verified `hc_default_allowed`): the tier is off unless the
+/// operator names a budget, which is then checked against what could be read.
 pub fn resolve_budget(
     asked: Option<u64>,
-    ring_bytes: u64,
+    beside_bytes: u64,
     mem: &crate::hostmem::HostMemory,
 ) -> Result<(u64, String), String> {
-    use crate::verified::{hc_beside_pinned, hc_budget_fits, hc_default_budget, hc_default_share};
+    use crate::verified::{
+        hc_beside_pinned, hc_budget_fits, hc_default_allowed, hc_default_budget, hc_default_share,
+    };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let available = mem.available();
     match asked {
         Some(0) => Ok((0, "off (--cache-ram 0)".into())),
         Some(b) => {
-            if !hc_budget_fits(b, ring_bytes, available) {
+            if !hc_budget_fits(b, beside_bytes, available) {
                 return Err(format!(
-                    "--cache-ram {:.2} GiB cannot be honoured: with {:.2} GiB of pinned transfer buffers it needs {:.2} GiB, and {:.2} GiB are available ({}). Lower --cache-ram, or free host memory",
+                    "--cache-ram {:.2} GiB cannot be honoured: with {:.2} GiB for the copies of a loaded engine it needs {:.2} GiB, and {:.2} GiB are available ({}). Lower --cache-ram, or free host memory",
                     gib(b),
-                    gib(ring_bytes),
-                    gib(b.saturating_add(ring_bytes)),
+                    gib(beside_bytes),
+                    gib(b.saturating_add(beside_bytes)),
                     gib(available),
                     mem.describe()
                 ));
             }
             Ok((b, format!("--cache-ram; {}", mem.describe())))
         }
+        None if !hc_default_allowed(mem.limits_known()) => Ok((
+            0,
+            format!(
+                "off: the memory limit of this process is not established ({}), and a default budget could be more than it allows; --cache-ram <GB> turns it on with a budget you name",
+                mem.unread.as_deref().unwrap_or("unknown")
+            ),
+        )),
         None => {
-            let b = hc_default_budget(hc_beside_pinned(available, ring_bytes));
+            let b = hc_default_budget(hc_beside_pinned(available, beside_bytes));
             Ok((
                 b,
                 format!(
@@ -1588,6 +1700,122 @@ mod tests {
         assert!(d <= 40 * gib);
         assert_eq!(d, (40 * gib - ring) / 4);
         assert_eq!(crate::verified::hc_default_share(), 4);
+    }
+
+    #[test]
+    fn a_limit_that_cannot_be_read_takes_no_default_budget() {
+        let gib = 1u64 << 30;
+        let beside = 384 * MIB;
+        let mut mem = crate::hostmem::HostMemory::of_host(40 * gib);
+        mem.unread = Some("memory.max of its own group cannot be read (Permission denied)".into());
+        // no default: the cache is off, and the line says why and how to turn it on
+        let (b, how) = resolve_budget(None, beside, &mem).unwrap();
+        assert_eq!(b, 0);
+        assert!(
+            how.starts_with("off: the memory limit of this process is not established (memory.max of its own group cannot be read")
+                && how.contains("--cache-ram <GB> turns it on"),
+            "{how}"
+        );
+        // a budget the operator names is honoured, checked against what could be read
+        let (b, how) = resolve_budget(Some(8 * gib), beside, &mem).unwrap();
+        assert_eq!(b, 8 * gib);
+        assert!(how.contains("not established"), "{how}");
+        assert!(resolve_budget(Some(40 * gib), beside, &mem).is_err());
+        assert_eq!(resolve_budget(Some(0), beside, &mem).unwrap().0, 0);
+        // with the limits established the default is the share, as before
+        mem.unread = None;
+        assert_eq!(
+            resolve_budget(None, beside, &mem).unwrap().0,
+            (40 * gib - beside) / 4
+        );
+        // today's rule in one line
+        assert!(crate::verified::hc_default_allowed(true));
+        assert!(!crate::verified::hc_default_allowed(false));
+    }
+
+    #[test]
+    fn memory_beside_the_store_is_asked_for_and_entries_leave_for_it() {
+        // a host of 20 MiB; the budget (64 MiB) is not what bounds the store
+        fn available(held: u64) -> u64 {
+            (20 * MIB).saturating_sub(held)
+        }
+        let mut c = HostCache::new(64 * MIB, false);
+        c.host_available = Some(available);
+        // an empty store: what the host has is what can be had
+        assert_eq!(c.admit_beside("a ring", 20 * MIB).unwrap().left(), 20 * MIB);
+        assert!(c.admit_beside("a ring", 20 * MIB + 1).is_err());
+        // two entries, 10 MiB and 6 MiB: 4 MiB of the host are left
+        let a = save(&mut c, &prompt(2 * 512 + 50, 1), 2, &[2]).unwrap();
+        let b = save(&mut c, &prompt(512 + 50, 2), 1, &[1]).unwrap();
+        c.settle();
+        assert_eq!(c.mapped_bytes(), 16 * MIB);
+        // what fits as things are evicts nothing
+        assert_eq!(c.admit_beside("a buffer", 4 * MIB).unwrap().left(), 4 * MIB);
+        assert_eq!((c.stats().evictions, c.stats().entries), (0, 2));
+        // More than the host has left: the entry used least recently leaves, its memory goes
+        // back to the system, and then the 8 MiB are there.
+        let leave = c.admit_beside("its pinned transfer ring", 8 * MIB).unwrap();
+        assert_eq!(leave.left(), 8 * MIB);
+        assert!(!c.contains(a) && c.contains(b));
+        assert_eq!((c.stats().evictions, c.spare_bytes()), (1, 0));
+        assert_eq!(c.mapped_bytes(), 6 * MIB);
+        // More than the host has even with every entry gone: refused with the numbers, and
+        // nothing leaves for it.
+        let e = c
+            .admit_beside("its pinned transfer ring", 21 * MIB)
+            .unwrap_err();
+        assert!(
+            e.contains("its pinned transfer ring needs 0.02 GiB of host memory, and 0.01 GiB are available now")
+                && e.contains("the cache could give back 0.01 GiB"),
+            "{e}"
+        );
+        assert!(c.contains(b));
+        assert_eq!(c.stats().evictions, 1);
+        // an entry a copy reads does not leave for it either
+        c.begin_read(b, 1).unwrap();
+        assert!(c.admit_beside("a buffer", 16 * MIB).is_err());
+        assert!(c.contains(b));
+        c.end_read(b, true);
+        assert!(c.admit_beside("a buffer", 16 * MIB).is_ok());
+        assert!(!c.contains(b));
+        // a store that asks no host (tests of other things) admits what it is asked
+        let mut plain = HostCache::new(64 * MIB, false);
+        assert!(plain.admit_beside("a ring", 1 << 40).is_ok());
+    }
+
+    #[test]
+    fn a_segment_a_copy_did_not_finish_goes_back_to_the_system_at_once() {
+        fn available(held: u64) -> u64 {
+            (20 * MIB).saturating_sub(held)
+        }
+        let mut c = HostCache::new(64 * MIB, false);
+        c.host_available = Some(available);
+        let p = prompt(4 * 512 + 50, 1);
+        let t = c.open_save(ENG, T, TB, &p, &[], 4, &[4], 8, SB, 0).unwrap();
+        // four tiles are mapped for the copy (16 of the host's 20 MiB); a fifth would not be
+        assert!(c.begin_rows(t.entry, 6, TB).is_none());
+        assert_eq!(c.mapped_bytes(), 0);
+        let segs = c.begin_rows(t.entry, 4, TB).unwrap();
+        assert_eq!(c.mapped_bytes(), 4 * TB);
+        unsafe { segs[0].write_bytes(1, TB as usize) };
+        // The copy is cut after one tile. The three it did not finish were never written:
+        // they are not memory the store has, so they are unmapped, not kept as spare segments
+        // (which count as memory at hand for the next allocation).
+        assert_eq!(c.end_rows(t.entry, 1), 1);
+        assert_eq!((c.spare_bytes(), c.mapped_bytes()), (0, TB));
+        // the same for a state whose copy is cut
+        c.begin_piece(t.entry, SB).unwrap();
+        assert_eq!(c.mapped_bytes(), TB + SB);
+        assert!(!c.end_state(t.entry, 1, 0, 1));
+        assert_eq!((c.spare_bytes(), c.mapped_bytes()), (0, TB));
+        // and for everything a failed copy was writing
+        let segs = c.begin_rows(t.entry, 2, TB).unwrap();
+        assert_eq!(segs.len(), 2);
+        c.fail(t.entry);
+        assert_eq!(c.mapped_bytes(), c.spare_bytes());
+        assert!(c.spare_bytes() <= TB);
+        c.settle();
+        assert_eq!((c.mapped_bytes(), c.held_bytes()), (0, 0));
     }
 
     #[test]

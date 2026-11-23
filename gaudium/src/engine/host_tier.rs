@@ -57,6 +57,13 @@ const ROUND_TILES: u64 = 64;
 const RATE_MIN_BYTES: u64 = 32 * 1024 * 1024;
 /// Bytes the rates are first measured with, when the engine is loaded.
 const CALIBRATE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Host bytes the first copies of a loaded engine take at most (the buffer of
+/// [`HostTier::calibrate`], mapped and freed again at each load): part of what a server plans
+/// beside its store.
+pub fn first_copies_bytes() -> u64 {
+    crate::hostmem::AnonMap::mapped_len(CALIBRATE_BYTES)
+}
 /// Rows of a K/V block: the engine writes cache rows in blocks of this many, so a tile whose
 /// rows are to be one range per head is a whole number of them.
 const KV_BLOCK_ROWS: u64 = 128;
@@ -492,9 +499,23 @@ impl HostTier {
 
     /// Measures the two copy rates through `copier` with the first bytes of the first K/V
     /// cache, which are read and written back unchanged.
+    ///
+    /// The host buffer they go through is asked for now, like every other host memory of the
+    /// tier (`HostCache::admit_beside`: against what the host has available at this moment,
+    /// with the store's entries leaving first when that is short). A buffer that is refused
+    /// is an error with the numbers, and the engine serves without the tier.
     pub fn calibrate(&mut self, copier: &mut dyn Copier) -> Result<(), String> {
         let bytes = hc_calibrate_bytes(CALIBRATE_BYTES, self.rows.cache_bytes());
-        let mut map = crate::hostmem::AnonMap::new(bytes)?;
+        let mut leave = {
+            let mut store = self.cache.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let leave = store.admit_beside(
+                "the buffer of its first copies",
+                crate::hostmem::AnonMap::mapped_len(bytes),
+            );
+            self.cache.publish(&store);
+            leave?
+        };
+        let mut map = crate::hostmem::AnonMap::new(bytes, &mut leave)?;
         let pieces = [Piece {
             dev: self.rows.caches[0],
             host: map.as_mut_ptr(),
@@ -1181,6 +1202,33 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
     // The ring: a few buffers of untouched memory, each mapped for the device on its own (the
     // one pinned host memory of the tier, planned when the server started). An engine that
     // cannot get it serves without the tier: no model fails to load for lack of a cache.
+    //
+    // Its memory is asked for now, against what the host and the control groups of the
+    // process have left at this moment (the plan at start was made before any model was
+    // loaded): the store's entries leave first when that is short, and a ring that still
+    // does not fit is refused, with the numbers, before a page of it exists.
+    let ring_leave = {
+        let mut store = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let leave = store.admit_beside(
+            "its pinned transfer ring",
+            XferRing::planned_bytes(
+                crate::synapse::xfer::RING_BUFS,
+                crate::synapse::xfer::RING_BUF_BYTES,
+            ),
+        );
+        cache.publish(&store);
+        leave
+    };
+    let ring_leave = match ring_leave {
+        Ok(leave) => leave,
+        Err(e) => {
+            eprintln!(
+                "[cache-ram] off for this engine: {e} ({})",
+                crate::hostmem::HostMemory::read().describe()
+            );
+            return Ok(());
+        }
+    };
     let t0 = Instant::now();
     let mut xfer = match XferRing::new(
         &eng.dev,
@@ -1188,6 +1236,7 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         crate::synapse::xfer::RING_BUF_BYTES,
         crate::synapse::xfer::RingKind::MappedHuge,
         crate::synapse::xfer::COPY_THREADS,
+        ring_leave,
     ) {
         Ok(x) => x,
         Err(e) => {
@@ -1201,7 +1250,10 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         ring: &mut xfer,
         dev: &eng.dev,
     }) {
-        eprintln!("[cache-ram] off for this engine: the first copy through the transfer ring failed ({e})");
+        eprintln!(
+            "[cache-ram] off for this engine: its first copies through the transfer ring could not be made: {e} ({})",
+            crate::hostmem::HostMemory::read().describe()
+        );
         return Ok(());
     }
     if cfg.verbose {
@@ -2248,6 +2300,57 @@ mod tests {
             identity_of("another engine", &fingerprint(&base)),
             id(&base)
         );
+    }
+
+    #[test]
+    fn the_first_copies_ask_for_their_buffer_and_an_engine_that_cannot_have_it_gets_no_tier() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        const MIB: u64 = 1 << 20;
+        // a made-up host: what it has, less what the store has mapped
+        static HOST: AtomicU64 = AtomicU64::new(0);
+        fn available(held: u64) -> u64 {
+            HOST.load(Ordering::Relaxed).saturating_sub(held)
+        }
+        HOST.store(64 * MIB, Ordering::Relaxed);
+        let cache = Arc::new(SharedCache::on_host(64 * MIB, 0, available));
+        let mut r = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        // the buffer is one huge page here (these caches are small); with room it is taken,
+        // the rates are measured, and nothing of it is left
+        r.tier.calibrate(&mut r.dev).unwrap();
+        assert!(r.dev.down > 0 && r.dev.up == r.dev.down);
+        assert_eq!(cache.stats().held_bytes, 0);
+        // a conversation is saved
+        let p = prompt(3 * 512 + 100, 1);
+        r.request(&p, true);
+        assert!(r.idle().complete);
+        let held = cache.stats().held_bytes;
+        assert!(held >= 4 * MIB);
+        // The engine is loaded again on a host that has 1 MiB left beside the store: less than
+        // the buffer. The store gives way: its entry leaves, and the copies are made.
+        HOST.store(held + MIB, Ordering::Relaxed);
+        let mut r2 = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        r2.tier.calibrate(&mut r2.dev).unwrap();
+        assert!(r2.dev.down > 0);
+        assert_eq!(
+            (
+                cache.stats().entries,
+                cache.stats().evictions,
+                cache.stats().held_bytes
+            ),
+            (0, 1, 0)
+        );
+        // A host that cannot hold the buffer even with the store empty: refused with the
+        // numbers before a byte is copied. The engine then serves without the tier.
+        HOST.store(MIB, Ordering::Relaxed);
+        let mut r3 = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        let e = r3.tier.calibrate(&mut r3.dev).unwrap_err();
+        assert!(
+            e.contains("the buffer of its first copies needs 0.00 GiB of host memory, and 0.00 GiB are available now"),
+            "{e}"
+        );
+        assert_eq!((r3.dev.down, r3.dev.up), (0, 0));
+        // what a server plans for these copies beside its store
+        assert_eq!(first_copies_bytes(), 128 * MIB);
     }
 
     #[test]
