@@ -259,6 +259,17 @@ Gemma 4 environment variables:
                         per-layer inputs, else vendor). Changes compiled graphs; streams may
                         differ between settings at exact BF16 logit ties.
 
+Inkling 2 environment variables (debugging; none changes a served stream unless noted):
+  GAUDIUM_IK_AMAX_BF16  1: decode the 4-bit expert matrices with their per-expert scale terms
+                        rounded to BF16 first, as the publisher's reference loader ends up
+                        doing (for comparisons with it; changes the weights slightly)
+  GAUDIUM_IK_APPS       Load and run only the first N layer applications (kernel checks)
+  GAUDIUM_IK_STEP_PREFILL  1: prefill the prompt one row at a time with the decode step
+  GAUDIUM_IK_DUMP       Directory: after the prompt, every tensor of the one-row decode step and
+                        the head of every K / V state is written there as <name>.bin
+  GAUDIUM_IK_VERIFY_CHECK  N (2..64): after a greedy request its tokens are run again in passes
+                        of N rows and every row's logits are compared with the one-row step's
+
 Generate options:
   --model <dir>         Model directory (or GAUDIUM_MODEL)
   --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)

@@ -281,6 +281,17 @@ fn print_usage() {
          \x20                       per-layer inputs, else vendor). Changes compiled graphs; streams may\n\
          \x20                       differ between settings at exact BF16 logit ties.\n\
          \n\
+         Inkling 2 environment variables (debugging; none changes a served stream unless noted):\n\
+         \x20 GAUDIUM_IK_AMAX_BF16  1: decode the 4-bit expert matrices with their per-expert scale terms\n\
+         \x20                       rounded to BF16 first, as the publisher's reference loader ends up\n\
+         \x20                       doing (for comparisons with it; changes the weights slightly)\n\
+         \x20 GAUDIUM_IK_APPS       Load and run only the first N layer applications (kernel checks)\n\
+         \x20 GAUDIUM_IK_STEP_PREFILL  1: prefill the prompt one row at a time with the decode step\n\
+         \x20 GAUDIUM_IK_DUMP       Directory: after the prompt, every tensor of the one-row decode step and\n\
+         \x20                       the head of every K / V state is written there as <name>.bin\n\
+         \x20 GAUDIUM_IK_VERIFY_CHECK  N (2..64): after a greedy request its tokens are run again in passes\n\
+         \x20                       of N rows and every row's logits are compared with the one-row step's\n\
+         \n\
          Generate options:\n\
          \x20 --model <dir>         Model directory (or GAUDIUM_MODEL)\n\
          \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\

@@ -1483,8 +1483,9 @@ impl Inkling2Engine {
         let t_up = Instant::now();
         let store = crate::safetensors::SafetensorsStore::open(&cfg.model_dir)
             .map_err(|e| format!("open safetensors: {e}"))?;
-        let packer = packer::IkPacker::new(&store, &dims, max_ctx)
+        let source = packer::StSource::new(&store)
             .with_amax_bf16(std::env::var("GAUDIUM_IK_AMAX_BF16").is_ok_and(|v| v == "1"));
+        let packer = packer::IkPacker::new(&source, &dims, max_ctx);
         let mut stage_upload = dev
             .alloc_pinned(STAGE_BUF_BYTES)
             .map_err(|e| format!("alloc pinned upload stage: {e}"))?;
@@ -1502,7 +1503,6 @@ impl Inkling2Engine {
                 .map_err(|e| format!("upload weight '{name}': {e}"))?;
             uploaded_bytes += expected;
         }
-        drop(packer);
         drop(store);
         if cfg.verbose {
             let dt = t_up.elapsed().as_secs_f64();
@@ -1933,13 +1933,16 @@ impl Inkling2Engine {
         let rows = self.verify_check as usize;
         let row_bytes = self.dims.vocab_pad as usize * 2;
         let (mut passes, mut bad_tokens, mut bad_rows, mut bad_values) = (0u64, 0u64, 0u64, 0u64);
+        let mut pass_ms = 0.0f64;
         let mut b = 0usize;
         // step i reads generated[i] at position prompt_len + i and gives generated[i + 1]
         while b + rows < generated.len() && b + rows <= step_logits.len() {
             let cursor = (prompt_len + b) as u64;
             let bucket = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
             self.ensure_step(rows as u64, bucket)?;
+            let t0 = Instant::now();
             let got = self.run_rows(&generated[b..b + rows], cursor, bucket)?;
+            pass_ms += t0.elapsed().as_secs_f64() * 1000.0;
             let logits = self.read_step_logits(rows)?;
             for k in 0..rows {
                 if got[k] != generated[b + k + 1] {
@@ -1947,8 +1950,10 @@ impl Inkling2Engine {
                 }
                 let a = &logits[k * row_bytes..(k + 1) * row_bytes];
                 let diff = a
-                    .chunks_exact(2)
-                    .zip(step_logits[b + k].chunks_exact(2))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(step_logits[b + k].as_chunks::<2>().0)
                     .filter(|(x, y)| x != y)
                     .count() as u64;
                 if diff > 0 {
@@ -1960,7 +1965,8 @@ impl Inkling2Engine {
             b += rows;
         }
         eprintln!(
-            "[gaudium] VERIFY-CHECK rows={rows}: {passes} passes, {} rows; tokens differing from the one-row stream: {bad_tokens}; rows with any differing logit: {bad_rows} ({bad_values} values)",
+            "[gaudium] VERIFY-CHECK rows={rows}: {passes} passes ({:.2} ms per pass), {} rows; tokens differing from the one-row stream: {bad_tokens}; rows with any differing logit: {bad_rows} ({bad_values} values)",
+            pass_ms / (passes.max(1) as f64),
             passes * rows as u64
         );
         Ok(())
