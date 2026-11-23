@@ -273,4 +273,49 @@ mod tests {
         ru.will_write(5);
         assert_eq!(ru.hi, 8);
     }
+
+    // Today's choices of the `ikr_*` rules that their laws deliberately leave open (the laws
+    // only bound them): the order of preference, the slack formula, what a one-row prompt takes.
+
+    #[test]
+    fn live_is_taken_before_the_snapshot() {
+        // both states hold what a resume at their rows reads
+        let p = ikr_pick(100, 120, 100, 100, 508);
+        assert_eq!(p, IkResume::IrLive);
+        assert_eq!(ikr_start(p, 100, 100), 100);
+        // the snapshot gives more rows, live is still taken
+        let p = ikr_pick(50, 60, 80, 80, 508);
+        assert_eq!(p, IkResume::IrLive);
+        assert_eq!(ikr_start(p, 50, 80), 50);
+    }
+
+    #[test]
+    fn the_snapshot_is_taken_when_live_is_not_usable() {
+        // a long generation wrote the live rings past the slack
+        let p = ikr_pick(100, 100 + 509, 100, 100, 508);
+        assert_eq!(p, IkResume::IrSnap);
+        assert_eq!(ikr_start(p, 100, 100), 100);
+        // the snapshot's rows equal the prompt only as far as the rows on the card do
+        let p = ikr_pick(60, 1000, 90, 90, 508);
+        assert_eq!(p, IkResume::IrSnap);
+        assert_eq!(ikr_start(p, 60, 90), 60);
+        // neither state holds what a resume reads
+        assert_eq!(ikr_pick(100, 1000, 100, 1000, 508), IkResume::IrFresh);
+    }
+
+    #[test]
+    fn slack_is_the_smaller_spare_of_the_two_rings() {
+        assert_eq!(ikr_slack(2048, 1024, 512, 4), 508);
+        assert_eq!(ikr_slack(2048, 1024, 1024, 4), 1020);
+        assert_eq!(ikr_slack(1024, 1024, 512, 4), 0);
+    }
+
+    #[test]
+    fn a_prompt_of_one_row_takes_over_nothing() {
+        assert_eq!(ikr_cap(1, 1), 0);
+        assert_eq!(ikr_cap(5, 1), 0);
+        assert_eq!(ikr_pick(ikr_cap(1, 1), 1, 0, 0, 508), IkResume::IrFresh);
+        // an empty prompt takes over nothing either
+        assert_eq!(ikr_cap(3, 0), 0);
+    }
 }
