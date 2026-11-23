@@ -1577,36 +1577,10 @@ def hc_resume_better_irreflexive(p, u):
   %Equal.sym(Bool, hc_resume_better(p, u, p, u), Nat.is_gt(u, u), hc_resume_better_same(p, u, u)) : {_ == False{} : Bool}
   hc_gt_refl(u)
 
-# LAW HC.59: a candidate with a nearer resume point is never preferred to one with a further
-# point.
-law hc_resume_nearer_never_better:
-  for +ap: Nat
-  for +au: Nat
-  for +bp: Nat
-  for +bu: Nat
-  {Bool.and(hc_resume_better(ap, au, bp, bu), Nat.is_lt(ap, bp)) == False{} : Bool}
+# (That the further resume point wins is today's choice, pinned by a Rust test and by no law:
+# a later version may prefer a nearer point that costs less to copy.)
 
-def hc_resume_nearer_never_better(ap, au, bp, bu):
-  match ap bp:
-    case 0n 0n:
-      hc_and_false_r(Nat.is_gt(au, bu))
-    case 0n 1n+_: {==}
-    case 1n+_ 0n: {==}
-    case 1n+app 1n+bpp:
-      hc_resume_nearer_never_better(app, au, bpp, bu)
-
-# LAW HC.60: among equal resume points the choice depends on the use order alone, never on
-# where the point lies.
-law hc_resume_tie_by_use_order_alone:
-  for +p: Nat
-  for +q: Nat
-  for +au: Nat
-  for +bu: Nat
-  {hc_resume_better(p, au, p, bu) == hc_resume_better(q, au, q, bu) : Bool}
-
-def hc_resume_tie_by_use_order_alone(p, q, au, bu):
-  %Equal.sym(Bool, hc_resume_better(q, au, q, bu), Nat.is_gt(au, bu), hc_resume_better_same(q, au, bu)) : {hc_resume_better(p, au, p, bu) == _ : Bool}
-  hc_resume_better_same(p, au, bu)
+# (That equal resume points are told apart by the use order alone is today's choice too.)
 
 # LAW HC.61: two candidates are never each preferred to the other.
 law hc_resume_better_asymmetric:
@@ -1683,18 +1657,8 @@ def hc_pick_more_aux(g: Bool, x: Bool, y: Bool, z: Bool, h: {Bool.and(y, z) == F
         case True{}:
           h
 
-# LAW HC.65: an entry that shares no more whole tiles with the prompt than the best one found
-# so far never takes its place.
-law hc_pick_never_for_fewer_shared:
-  for +s: Bool
-  for +r: Bool
-  for +c: Nat
-  for +t: Nat
-  for +b: Nat
-  {Bool.and(hc_continue_pick(s, r, c, t, b), Nat.is_le(c, b)) == False{} : Bool}
-
-def hc_pick_never_for_fewer_shared(s, r, c, t, b):
-  hc_pick_more_aux(Bool.and(s, r), hc_continues(c, t), Nat.is_gt(c, b), Nat.is_le(c, b), hc_gt_le_excl(c, b))
+# (That the entry sharing the most whole tiles is the one continued is today's choice, pinned
+# by a Rust test and by no law.)
 
 # LAW HC.66: a kept position past the tiles its entry is cut to never stays.
 law hc_state_past_cut_never_survives:
