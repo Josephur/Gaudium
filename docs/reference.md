@@ -29,6 +29,10 @@ Usage:
   gaudium --inspect-model <dir>             Validate config.json & Safetensors
   gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json
   gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test
+  gaudium --probe-copy [GiB]                Measure copies between the card and host memory
+                                            (both directions, through the pinned transfer ring
+                                            the host-RAM prefix cache uses; opens the card;
+                                            default: 2 GiB of device memory)
   gaudium --apply-template <model_dir> <request.json|->
                                             Print the prompt a chat request renders to with
                                             the model's own chat template (host only)
@@ -71,6 +75,29 @@ Serve options:
                         it and says so. A request with cache_prompt: false prefills
                         its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a
                         drafter or with DSpine
+  --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a
+                        conversation: after another conversation, another model, or
+                        the idle release (--idle-park). What a request could resume
+                        from (K/V rows of the prompt, the state at its kept positions)
+                        is copied to host memory after the response, and copied back
+                        instead of prefilled when that is faster by the engine's own
+                        measured rates; the output is that of a whole prefill. GB may
+                        be a decimal; 0 = off. Default: a quarter of the host memory
+                        available at start (the smallest of what the host and the
+                        control groups above the process have left; version 1 and 2
+                        memory controllers are read). No default is taken, and the
+                        cache is off, when a memory limit of the process cannot be
+                        read: name a budget to turn it on there. Memory is taken as
+                        prefixes are saved and given back when they leave; a full
+                        cache evicts the entry used least recently. A budget that does
+                        not fit in what is available is refused at start with the
+                        numbers. While a model is loaded, 256 MiB of pinned transfer
+                        buffers come on top, and 128 MiB for a moment at each load;
+                        all of it is asked for against what the host has left at that
+                        moment, and an engine that cannot have it serves without the
+                        cache. Needs
+                        --prefix-cache > 0; about 64 KiB per token and 0.15 GiB per
+                        kept position for a 16-attention-layer, 48-DeltaNet-layer model
   --queue-config <file> Card-queue settings, re-read on every turn (or GAUDIUM_QUEUE_CONFIG;
                         default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock
                         state dir). Keys: group_max_wait_min (default 45), group_max_skips

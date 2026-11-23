@@ -51,6 +51,10 @@ fn print_usage() {
          \x20 gaudium --inspect-model <dir>             Validate config.json & Safetensors\n\
          \x20 gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json\n\
          \x20 gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test\n\
+         \x20 gaudium --probe-copy [GiB]                Measure copies between the card and host memory\n\
+         \x20                                           (both directions, through the pinned transfer ring\n\
+         \x20                                           the host-RAM prefix cache uses; opens the card;\n\
+         \x20                                           default: 2 GiB of device memory)\n\
          \x20 gaudium --apply-template <model_dir> <request.json|->\n\
          \x20                                           Print the prompt a chat request renders to with\n\
          \x20                                           the model's own chat template (host only)\n\
@@ -93,6 +97,29 @@ fn print_usage() {
          \x20                       it and says so. A request with cache_prompt: false prefills\n\
          \x20                       its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a\n\
          \x20                       drafter or with DSpine\n\
+         \x20 --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a\n\
+         \x20                       conversation: after another conversation, another model, or\n\
+         \x20                       the idle release (--idle-park). What a request could resume\n\
+         \x20                       from (K/V rows of the prompt, the state at its kept positions)\n\
+         \x20                       is copied to host memory after the response, and copied back\n\
+         \x20                       instead of prefilled when that is faster by the engine's own\n\
+         \x20                       measured rates; the output is that of a whole prefill. GB may\n\
+         \x20                       be a decimal; 0 = off. Default: a quarter of the host memory\n\
+         \x20                       available at start (the smallest of what the host and the\n\
+         \x20                       control groups above the process have left; version 1 and 2\n\
+         \x20                       memory controllers are read). No default is taken, and the\n\
+         \x20                       cache is off, when a memory limit of the process cannot be\n\
+         \x20                       read: name a budget to turn it on there. Memory is taken as\n\
+         \x20                       prefixes are saved and given back when they leave; a full\n\
+         \x20                       cache evicts the entry used least recently. A budget that does\n\
+         \x20                       not fit in what is available is refused at start with the\n\
+         \x20                       numbers. While a model is loaded, 256 MiB of pinned transfer\n\
+         \x20                       buffers come on top, and 128 MiB for a moment at each load;\n\
+         \x20                       all of it is asked for against what the host has left at that\n\
+         \x20                       moment, and an engine that cannot have it serves without the\n\
+         \x20                       cache. Needs\n\
+         \x20                       --prefix-cache > 0; about 64 KiB per token and 0.15 GiB per\n\
+         \x20                       kept position for a 16-attention-layer, 48-DeltaNet-layer model\n\
          \x20 --queue-config <file> Card-queue settings, re-read on every turn (or GAUDIUM_QUEUE_CONFIG;\n\
          \x20                       default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock\n\
          \x20                       state dir). Keys: group_max_wait_min (default 45), group_max_skips\n\
@@ -1747,6 +1774,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut vision_max_patches = gaudium::server::DEFAULT_VISION_MAX_PATCHES;
     let mut vision_max_tokens = gaudium::server::DEFAULT_VISION_MAX_TOKENS;
     let mut prefix_slots = gaudium::engine::qwen3::prefix_cache::DEFAULT_SLOTS;
+    let mut cache_ram_bytes: Option<u64> = None;
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -1902,6 +1930,16 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("invalid --prefix-cache '{s}'"))?;
             }
+            "--cache-ram" => {
+                // GiB, whole or decimal ("8", "0.5"); 0 turns the host tier off
+                let s = next_val(&mut i, "--cache-ram")?;
+                let gib: f64 = s
+                    .parse()
+                    .ok()
+                    .filter(|g: &f64| g.is_finite() && *g >= 0.0)
+                    .ok_or_else(|| format!("invalid --cache-ram '{s}' (GiB, 0 = off)"))?;
+                cache_ram_bytes = Some((gib * (1u64 << 30) as f64) as u64);
+            }
             "--queue-config" => {
                 queue_config = Some(PathBuf::from(next_val(&mut i, "--queue-config")?))
             }
@@ -1980,6 +2018,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         mcp_proxy,
         tls_cert,
         tls_key,
+        cache_ram_bytes,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {
@@ -2037,6 +2076,21 @@ fn main() {
     if args.len() == 2 && args[1] == "--hpu-smoke" {
         if let Err(e) = hpu_smoke() {
             eprintln!("HPU SMOKE FAIL: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if (args.len() == 2 || args.len() == 3) && args[1] == "--probe-copy" {
+        let gib = match args.get(2).map(|s| s.parse::<u64>()) {
+            None => 2,
+            Some(Ok(g)) if g > 0 => g,
+            _ => {
+                eprintln!("COPY PROBE FAIL: --probe-copy expects a whole number of GiB");
+                process::exit(1);
+            }
+        };
+        if let Err(e) = gaudium::synapse::xfer::probe(gib) {
+            eprintln!("COPY PROBE FAIL: {e}");
             process::exit(1);
         }
         return;

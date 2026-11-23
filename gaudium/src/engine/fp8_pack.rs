@@ -203,6 +203,9 @@ pub struct ExtPacker<'a> {
     stats: RefCell<PackStats>,
     /// Mapped cache files whose bytes were handed out by `pack`: append-only, unmapped on drop.
     maps: RefCell<Vec<crate::safetensors::MappedShard>>,
+    /// The cache files this load took a matrix from, or wrote one into: name, size and
+    /// modification time of each, as they were when the load used them.
+    cache_used: RefCell<std::collections::BTreeSet<String>>,
 }
 
 /// The four GEMM input sites of a decoder layer.
@@ -270,11 +273,44 @@ impl<'a> ExtPacker<'a> {
             memo: RefCell::new(None),
             stats: RefCell::new(PackStats::default()),
             maps: RefCell::new(Vec::new()),
+            cache_used: RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 
     pub fn stats(&self) -> PackStats {
         *self.stats.borrow()
+    }
+
+    /// Notes the two cache files of matrix `name` as this load used them.
+    fn note_cache_files(&self, dir: &Path, name: &str) {
+        for ext in ["w8", "scale"] {
+            let file = format!("{name}.{ext}");
+            let md = std::fs::metadata(dir.join(&file)).ok();
+            let mtime = md
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            self.cache_used.borrow_mut().insert(format!(
+                "{file}:{}:{mtime}",
+                md.as_ref().map_or(0, |m| m.len())
+            ));
+        }
+    }
+
+    /// What this load's FP8 matrices came from, for the identity of the engine it loads: the
+    /// number of cache files it used and a digest of their names, sizes and modification
+    /// times (`none` for a load without a cache directory, whose matrices are quantised from
+    /// the checkpoint every time). A cached matrix is uploaded as it is found, so another file
+    /// under the same name is another engine.
+    pub fn cache_files_id(&self) -> String {
+        let used = self.cache_used.borrow();
+        if used.is_empty() {
+            return "none".into();
+        }
+        let text: Vec<&str> = used.iter().map(String::as_str).collect();
+        let d = crate::cache_ram::digest128(text.join(",").as_bytes());
+        format!("{}:{:016x}{:016x}", used.len(), d[0], d[1])
     }
 
     /// One line on what this load packed (verbose loads).
@@ -678,6 +714,7 @@ impl<'a> ExtPacker<'a> {
                     st.fp8_codes += (plan.n * plan.k) as u64;
                     let (ptr, len) = (map.as_bytes().as_ptr(), map.as_bytes().len());
                     self.maps.borrow_mut().push(map);
+                    self.note_cache_files(dir, name);
                     // SAFETY: the mapping's address does not move with the `Vec`, `maps` is
                     // append-only, and it is unmapped only when `self` is dropped, which the
                     // `&'a self` borrow puts after every use of the returned slice.
@@ -692,6 +729,8 @@ impl<'a> ExtPacker<'a> {
         if let Some(dir) = &self.cache_dir {
             cache_store_fp8(dir, name, &w8, &scale)
                 .map_err(|e| format!("write FP8 cache entry {name} in {}: {e}", dir.display()))?;
+            // the files a later load will find: this load and that one are the same engine
+            self.note_cache_files(dir, name);
         }
         let mut st = self.stats.borrow_mut();
         st.fp8_matrices += 1;
@@ -806,9 +845,14 @@ fn env_path(var: &str) -> Option<PathBuf> {
 /// The activation-scale table a load reads: the configured file, `GAUDIUM_FP8_ACT`, or
 /// `<model_dir>-gaudium-pc/act_scales_lc.txt`.
 pub fn act_path_of(cfg: &Qwen3Config) -> PathBuf {
+    act_path_with(cfg, &env_path)
+}
+
+/// [`act_path_of`] with the environment given (`env(name)`: the path a variable holds).
+pub fn act_path_with(cfg: &Qwen3Config, env: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {
     cfg.fp8_act
         .clone()
-        .or_else(|| env_path("GAUDIUM_FP8_ACT"))
+        .or_else(|| env("GAUDIUM_FP8_ACT"))
         .unwrap_or_else(|| default_fp8_dir(&cfg.model_dir).join(ACT_TABLE_FILE))
 }
 
@@ -817,6 +861,28 @@ pub fn cache_dir_of(cfg: &Qwen3Config) -> Option<PathBuf> {
     cfg.fp8_cache
         .clone()
         .or_else(|| env_path("GAUDIUM_FP8_CACHE"))
+}
+
+/// The activation-scale table a load parsed, for the identity of the engine it loads: the
+/// number of sites and a digest of every site's entry (`none` for the empty table of a BF16
+/// load). It is taken from the table in memory, the one the graphs are built with, so it is
+/// the same wherever the file was found (the setting, `GAUDIUM_FP8_ACT`, the default place),
+/// and another one as soon as a scale differs.
+pub fn act_table_id(act: &BTreeMap<String, ActScale>) -> String {
+    if act.is_empty() {
+        return "none".into();
+    }
+    let mut text = String::new();
+    for (site, a) in act {
+        text.push_str(&format!(
+            "{site} {} {:08x} {:08x}\n",
+            a.k,
+            a.amax.to_bits(),
+            a.rms.to_bits()
+        ));
+    }
+    let d = crate::cache_ram::digest128(text.as_bytes());
+    format!("{}:{:016x}{:016x}", act.len(), d[0], d[1])
 }
 
 /// Resolves the run precision of a load into `spec.fp8_weights` and returns the calibration
@@ -1182,12 +1248,33 @@ mod tests {
         assert!(p8.pack("L0_m_cs", true).unwrap().is_err());
         assert_eq!(p8.stats().fp8_from_cache, 0);
         // second packer: served from the cache, identical bytes
-        let p8b = ExtPacker::new(&store, &spec8, act, Some(cache));
+        let p8b = ExtPacker::new(&store, &spec8, act.clone(), Some(cache.clone()));
         let sc2 = p8b.pack("L0_W_down_scale", true).unwrap().unwrap();
         let w8b = p8b.pack("L0_W_down", true).unwrap().unwrap();
         assert_eq!(w8b.as_ref(), w8.as_ref());
         assert_eq!(sc2.as_ref(), sc.as_ref());
         assert_eq!(p8b.stats().fp8_from_cache, 2);
+        // The load that wrote the cache and the load that read it used the same files: one
+        // identity. A packer without a cache has none to name.
+        let id = p8.cache_files_id();
+        assert!(id.starts_with("2:"), "{id}");
+        assert_eq!(p8b.cache_files_id(), id);
+        let plain = ExtPacker::new(&store, &spec8, BTreeMap::new(), None);
+        assert_eq!(plain.cache_files_id(), "none");
+        // A cached matrix is uploaded as it is found. One that was replaced (same name, same
+        // size, other codes) gives the load that uses it another identity.
+        drop((w8b, sc2));
+        drop(p8b);
+        let codes = cache.join("L0_W_down.w8");
+        let mut other = fs::read(&codes).unwrap();
+        other[0] ^= 0x55;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&codes, &other).unwrap();
+        let p8c = ExtPacker::new(&store, &spec8, act.clone(), Some(cache.clone()));
+        let w8c = p8c.pack("L0_W_down", true).unwrap().unwrap();
+        assert_eq!(w8c.as_ref(), &other[..]);
+        assert_ne!(p8c.cache_files_id(), id);
+        drop(w8c);
         fs::remove_dir_all(&dir).unwrap();
     }
 

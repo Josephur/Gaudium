@@ -28,6 +28,19 @@ struct ScriptedEngine {
     /// the last row.
     held: Vec<i32>,
     prefix: crate::engine::qwen3::prefix_cache::PrefixStats,
+    /// The host-RAM tier as an engine reports it, and the calls the server made to it.
+    tier: Arc<Mutex<ScriptedTier>>,
+}
+
+/// What the scripted engine says about its host tier, and what the server asked of it.
+#[derive(Default)]
+struct ScriptedTier {
+    /// Reports of the next requests, in order (none: the engine has no host tier).
+    next: VecDeque<crate::engine::qwen3::host_tier::TierReport>,
+    last: Option<crate::engine::qwen3::host_tier::TierReport>,
+    /// `idle_work` calls, with the number of waiting requests each saw.
+    idle_waiting: Vec<u64>,
+    releases: u64,
 }
 
 impl GenEngine for ScriptedEngine {
@@ -68,6 +81,29 @@ impl GenEngine for ScriptedEngine {
 
     fn prefix_stats(&self) -> Option<crate::engine::qwen3::prefix_cache::PrefixStats> {
         Some(self.prefix)
+    }
+
+    fn idle_work(&mut self, waiting: &dyn Fn() -> u64) {
+        self.tier.lock().unwrap().idle_waiting.push(waiting());
+    }
+
+    fn before_release(&mut self) {
+        self.tier.lock().unwrap().releases += 1;
+    }
+
+    fn host_tier_facts(&self) -> Option<crate::engine::qwen3::host_tier::TierFacts> {
+        use crate::engine::qwen3::host_tier::{Rates, TierFacts};
+        self.tier.lock().unwrap().last.map(|last| TierFacts {
+            rates: Rates {
+                to_host: 9 << 30,
+                to_device: 14 << 30,
+                prefill_rows: 7000,
+            },
+            bytes_per_row: 65536,
+            bytes_per_state: 150 << 20,
+            ring_bytes: 175 << 20,
+            last,
+        })
     }
 
     fn hbm_bytes(&self) -> [u64; 5] {
@@ -113,11 +149,20 @@ impl GenEngine for ScriptedEngine {
         self.prefix.last_prompt_rows = prompt_ids.len() as u64;
         self.prefix.last_reused_rows = reused as u64;
         self.prefix.last_lcp = common as u64;
+        let host_tier = {
+            let mut t = self.tier.lock().unwrap();
+            let r = t.next.pop_front();
+            if r.is_some() {
+                t.last = r;
+            }
+            r
+        };
         let mut rep = GenReport {
             prompt_tokens: prompt_ids.len(),
             method: "scripted".into(),
             reused_tokens: reused as u64,
             prefix_common: common as u64,
+            host_tier,
             ..GenReport::default()
         };
         for id in ids {
@@ -147,6 +192,7 @@ struct Harness {
     replies: Arc<Mutex<VecDeque<String>>>,
     prompts: Arc<Mutex<Vec<String>>>,
     images: SeenImages,
+    tier: Arc<Mutex<ScriptedTier>>,
 }
 
 /// A second model family for the tests: reasoning and tool calls between special tokens, the
@@ -159,6 +205,11 @@ const CALL_FORM_CONFIG: &str = r#"{"bos_token": "<bos>", "response_template": {"
                    "content_args": {"string_delims": [["<|\"|>", "<|\"|>"]]}}}}}"#;
 
 fn harness() -> Harness {
+    harness_with_cache(None)
+}
+
+/// The harness with a host-RAM tier store in the server (`--cache-ram`), or without one.
+fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) -> Harness {
     let spec = ModelSpec::from_config_json(
         r#"{"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text",
             "hidden_size": 5120, "intermediate_size": 17408, "vocab_size": 248320,
@@ -207,6 +258,7 @@ fn harness() -> Harness {
     let replies = Arc::new(Mutex::new(VecDeque::new()));
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let images = Arc::new(Mutex::new(Vec::new()));
+    let tier = Arc::new(Mutex::new(ScriptedTier::default()));
     let engine = ScriptedEngine {
         spec: spec.clone(),
         tok: Arc::clone(&tok),
@@ -220,6 +272,7 @@ fn harness() -> Harness {
             slot_bytes: 1024,
             ..Default::default()
         },
+        tier: Arc::clone(&tier),
     };
     let state = Arc::new(AppState {
         cfg: ServerConfig {
@@ -247,6 +300,7 @@ fn harness() -> Harness {
             mcp_proxy: ProxyOptions::default(),
             tls_cert: None,
             tls_key: None,
+            cache_ram_bytes: Some(0),
         },
         models: vec![model("tags", chat::TEST_TEMPLATE, None)],
         slot: Mutex::new(EngineSlot {
@@ -268,6 +322,8 @@ fn harness() -> Harness {
             hbm_bytes: None,
             facts: None,
             prefix: None,
+            host_tier: None,
+            idle_due: false,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
@@ -277,6 +333,7 @@ fn harness() -> Harness {
         turns: TurnQueue::default(),
         proxy: proxy::McpProxy::disabled(),
         tls: None,
+        host_cache,
     });
     let _ = model; // (one resident model per harness)
     Harness {
@@ -284,6 +341,7 @@ fn harness() -> Harness {
         replies,
         prompts,
         images,
+        tier,
     }
 }
 
@@ -330,6 +388,8 @@ fn call_form_harness() -> Harness {
             hbm_bytes: None,
             facts: None,
             prefix: None,
+            host_tier: None,
+            idle_due: false,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
@@ -339,12 +399,14 @@ fn call_form_harness() -> Harness {
         turns: TurnQueue::default(),
         proxy: proxy::McpProxy::disabled(),
         tls: None,
+        host_cache: None,
     });
     Harness {
         state,
         replies: h.replies,
         prompts: h.prompts,
         images: h.images,
+        tier: h.tier,
     }
 }
 
@@ -441,6 +503,8 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
             hbm_bytes: None,
             facts: None,
             prefix: None,
+            host_tier: None,
+            idle_due: false,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
@@ -450,12 +514,14 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
         turns: TurnQueue::default(),
         proxy: proxy::McpProxy::disabled(),
         tls: None,
+        host_cache: None,
     });
     Harness {
         state,
         replies: h.replies,
         prompts: h.prompts,
         images: h.images,
+        tier: h.tier,
     }
 }
 
@@ -1178,6 +1244,7 @@ fn served_engine_configuration_follows_the_server_options() {
         mcp_proxy: ProxyOptions::default(),
         tls_cert: None,
         tls_key: None,
+        cache_ram_bytes: Some(0),
     };
     // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
     let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
@@ -1204,6 +1271,128 @@ fn served_engine_configuration_follows_the_server_options() {
     // is compiled
     assert!(build_cache(&cfg, &[]).is_err());
     assert!(build_cache(&cfg, &["nope".to_string()]).is_err());
+}
+
+/// The host-RAM tier as a client sees it: where a request's reused rows came from and what was
+/// copied for it, the store and the engine's measured rates in `/props`, and the two moments
+/// the server gives the engine for its saves (after a response, before a release).
+/// A connection that ends while a chat request still holds the card must leave that request's
+/// idle work pending: the request's own connection does it once the card is free.
+#[test]
+fn idle_work_stays_pending_until_a_connection_can_start_it() {
+    use crate::engine::qwen3::host_tier::TierReport;
+    let cache = Arc::new(crate::cache_ram::SharedCache::new(8 << 30, 256 << 20, false, false));
+    let h = harness_with_cache(Some(Arc::clone(&cache)));
+    h.tier.lock().unwrap().next.push_back(TierReport::default());
+    h.script("First.");
+    assert_eq!(h.chat("").0, 200);
+    let idles = || h.tier.lock().unwrap().idle_waiting.len();
+    let due = || h.state.slot.lock().unwrap().idle_due;
+    assert_eq!((idles(), due()), (1, false));
+    // A chat request is at its end: it has left idle work pending and still holds the card.
+    h.state.slot.lock().unwrap().idle_due = true;
+    let card = h.state.card_op.lock().unwrap();
+    // Another connection (a token count: no card) comes and goes meanwhile. It cannot start
+    // the work, and it must not mark it done.
+    let (status, text) = h.post(
+        "/gaudium/count_tokens",
+        r#"{"messages":[{"role":"user","content":"Weather in Oslo?"}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    assert_eq!((idles(), due()), (1, true));
+    // The chat request lets go of the card and its connection ends: now the work is done, once.
+    drop(card);
+    h.state.idle_work();
+    assert_eq!((idles(), due()), (2, false));
+    // nothing is pending: a connection that ends starts nothing
+    let (status, _) = h.post(
+        "/gaudium/count_tokens",
+        r#"{"messages":[{"role":"user","content":"Weather in Oslo?"}]}"#,
+    );
+    assert_eq!(status, 200);
+    assert_eq!((idles(), due()), (2, false));
+    // work that is pending while a request uses the engine waits for that request too
+    {
+        let mut s = h.state.slot.lock().unwrap();
+        s.idle_due = true;
+        s.active_requests = 1;
+    }
+    h.state.idle_work();
+    assert_eq!((idles(), due()), (2, true));
+    h.state.slot.lock().unwrap().active_requests = 0;
+    h.state.idle_work();
+    assert_eq!((idles(), due()), (3, false));
+}
+
+#[test]
+fn the_host_tier_is_reported_and_given_its_idle_time() {
+    use crate::engine::qwen3::host_tier::{Tier, TierReport};
+    let cache = Arc::new(crate::cache_ram::SharedCache::new(8 << 30, 256 << 20, false, false));
+    let h = harness_with_cache(Some(Arc::clone(&cache)));
+    let u = |v: &JsonValue, path: &[&str]| at(v, path).as_u64().unwrap();
+    // a first request: everything prefilled
+    h.tier.lock().unwrap().next.push_back(TierReport::default());
+    h.script("First.");
+    let (status, v) = h.chat("");
+    assert_eq!(status, 200, "{}", v.dump());
+    assert_eq!(at(&v, &["gaudium", "prefix", "tier"]).as_str(), Some("prefilled"));
+    assert_eq!(at(&v, &["gaudium", "prefix", "host", "restore_bytes"]).as_u64(), Some(0));
+    // the engine got its idle time after the response, with no request waiting
+    assert_eq!(h.tier.lock().unwrap().idle_waiting, vec![0]);
+    // a second request whose rows came back from host memory, after it paid for a save
+    h.tier.lock().unwrap().next.push_back(TierReport {
+        tier: Tier::Host,
+        restore_ms: 26.9,
+        restore_bytes: 407_502_848,
+        restore_rows: 1024,
+        save_ms: 3.5,
+        save_bytes: 1 << 20,
+    });
+    h.script("Second.");
+    let (_, v) = h.chat("");
+    assert!(u(&v, &["timings", "cache_n"]) > 0);
+    assert_eq!(at(&v, &["gaudium", "prefix", "tier"]).as_str(), Some("host"));
+    let host = at(&v, &["gaudium", "prefix", "host"]);
+    assert_eq!(u(host, &["restore_bytes"]), 407_502_848);
+    assert_eq!(u(host, &["restore_tokens"]), 1024);
+    assert_eq!(u(host, &["save_bytes"]), 1 << 20);
+    assert!((at(host, &["restore_ms"]).as_f64().unwrap() - 26.9).abs() < 1e-6);
+    assert_eq!(h.tier.lock().unwrap().idle_waiting.len(), 2);
+    // /props: the store, and the resident engine's rates and entry sizes
+    let props = json::parse_json(&h.state.props_json(0, true)).unwrap();
+    let cr = at(&props, &["cache_ram"]);
+    assert_eq!(u(cr, &["budget_bytes"]), 8 << 30);
+    assert_eq!((u(cr, &["held_bytes"]), u(cr, &["entries"])), (0, 0));
+    assert_eq!(u(cr, &["engine", "bytes_per_token"]), 65536);
+    assert_eq!(u(cr, &["engine", "to_device_bytes_per_s"]), 14 << 30);
+    assert_eq!(u(cr, &["engine", "prefill_tokens_per_s"]), 7000);
+    assert_eq!(at(cr, &["engine", "last", "tier"]).as_str(), Some("host"));
+    // a request with `cache_prompt: false` on the Messages endpoint reaches the engine as one
+    h.script("Third.");
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"model":"m","max_tokens":16,"cache_prompt":false,"messages":[{"role":"user","content":"Weather in Oslo?"}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    let m = json::parse_json(&text).unwrap();
+    assert_eq!(u(&m, &["usage", "cache_read_input_tokens"]), 0);
+    // the release of the card: the engine is told first
+    assert_eq!(h.tier.lock().unwrap().releases, 0);
+    h.state.park(false, "test").unwrap();
+    assert_eq!(h.tier.lock().unwrap().releases, 1);
+    // without a store the server gives no idle work and reports no cache
+    let plain = harness();
+    plain.script("Plain.");
+    let (_, v) = plain.chat("");
+    assert_eq!(at(&v, &["gaudium", "prefix", "tier"]).as_str(), Some("prefilled"));
+    assert!(v.get("gaudium").and_then(|g| g.get("prefix")).and_then(|p| p.get("host")).is_none());
+    assert!(plain.tier.lock().unwrap().idle_waiting.is_empty());
+    let props = json::parse_json(&plain.state.props_json(0, true)).unwrap();
+    assert!(matches!(at(&props, &["cache_ram"]), JsonValue::Null));
+    // rows reused by an engine that names no tier came from the device
+    plain.script("Again.");
+    let (_, v) = plain.chat("");
+    assert_eq!(at(&v, &["gaudium", "prefix", "tier"]).as_str(), Some("device"));
 }
 
 /// Prefix reuse as a client sees it: the rows an engine took over from the request before are
@@ -1607,6 +1796,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         mcp_proxy: ProxyOptions::default(),
         tls_cert: None,
         tls_key: None,
+        cache_ram_bytes: Some(0),
     };
     // plain decode and a DSpine drafter: the server-wide tower
     for id in ["plain", "ds"] {
@@ -1694,6 +1884,7 @@ fn net_harness(
         replies,
         prompts,
         images,
+        tier,
     } = harness();
     let mut st = Arc::try_unwrap(state).ok().expect("the harness owns its state");
     st.proxy = proxy;
@@ -1704,6 +1895,7 @@ fn net_harness(
         replies,
         prompts,
         images,
+        tier,
     }
 }
 

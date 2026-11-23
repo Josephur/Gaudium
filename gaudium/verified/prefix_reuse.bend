@@ -813,3 +813,232 @@ law pc_reused_within_prompt:
 
 def pc_reused_within_prompt(p, r):
   pc_min_le_r(r, p)
+
+# ============================================================================
+# 10. The bounded end of a slot write
+# ============================================================================
+#
+# `pc_commit` above ends a write without knowing how far the prefill came. The engine ends a
+# write with this function: it is given the whole tiles that finished on the device, and a slot
+# becomes readable only when the tile that writes it is one of them.
+
+def pc_commit_done_if(t: Nat, finished: Bool) -> PcSlot:
+  match finished:
+    case True{}:
+      PcHeld{t}
+    case False{}:
+      PcWriting{t}
+
+# `done_tiles` whole tiles of the prompt have finished on the device (synchronised): a slot
+# being written with the state after at most that many tiles holds it from now on; a slot
+# whose tile has not finished stays as it is; empty and held slots are not touched.
+def pc_commit_done(s: PcSlot, done_tiles: Nat) -> PcSlot:
+  match s:
+    case PcEmpty{}:
+      PcEmpty{}
+    case PcWriting{+t}:
+      pc_commit_done_if(t, Nat.is_le(t, done_tiles))
+    case PcHeld{t}:
+      PcHeld{t}
+
+def pc_commit_done_aux(t: Nat, d: Nat, b: Bool, h: {Bool.and(b, Nat.is_lt(d, t)) == False{} : Bool}) -> {Bool.and(pc_readable(pc_commit_done_if(t, b)), Nat.is_lt(d, pc_slot_tiles(pc_commit_done_if(t, b)))) == False{} : Bool}:
+  match b:
+    case True{}:
+      h
+    case False{}:
+      {==}
+
+# LAW PC.33: a slot being written for a position past the finished tiles is never readable
+# after it, and a slot it makes readable holds a position at or before the finished tiles:
+# whatever the slot was before the write began.
+law pc_unfinished_slot_stays_unreadable:
+  for +s: PcSlot
+  for +t: Nat
+  for +d: Nat
+  {Bool.and(pc_readable(pc_commit_done(pc_begin_write(s, t), d)), Nat.is_lt(d, pc_slot_tiles(pc_commit_done(pc_begin_write(s, t), d)))) == False{} : Bool}
+
+def pc_unfinished_slot_stays_unreadable(s, t, d):
+  pc_commit_done_aux(t, d, Nat.is_le(t, d), pc_le_lt_excl(t, d))
+
+def pc_commit_done_tiles_aux(t: Nat, b: Bool) -> {pc_slot_tiles(pc_commit_done_if(t, b)) == t : Nat}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# LAW PC.34: it never changes the position a slot is written for.
+law pc_commit_done_keeps_position:
+  for +s: PcSlot
+  for +t: Nat
+  for +d: Nat
+  {pc_slot_tiles(pc_commit_done(pc_begin_write(s, t), d)) == t : Nat}
+
+def pc_commit_done_keeps_position(s, t, d):
+  pc_commit_done_tiles_aux(t, Nat.is_le(t, d))
+
+# LAW PC.35: it never changes a held slot.
+law pc_commit_done_keeps_held:
+  for +t: Nat
+  for +d: Nat
+  {pc_commit_done(PcHeld{t}, d) == PcHeld{t} : PcSlot}
+
+def pc_commit_done_keeps_held(t, d):
+  {==}
+
+# LAW PC.36: nor an empty one: finishing tiles never makes an empty slot readable.
+law pc_commit_done_keeps_empty:
+  for +d: Nat
+  {pc_commit_done(PcEmpty{}, d) == PcEmpty{} : PcSlot}
+
+def pc_commit_done_keeps_empty(d):
+  {==}
+
+# ============================================================================
+# 11. Choices and guards the table asks for
+# ============================================================================
+#
+# The table loops over its slots and its tiles; whether it is forgotten, which kept position a
+# request resumes from and which tile reads the resume slot is decided here.
+
+# Is the table to be forgotten before a request is planned? When the K/V rows were zeroed since
+# its positions were written, and on an engine that cannot resume a prefill.
+def pc_table_void(rows_zeroed: Bool, supported: Bool) -> Bool:
+  Bool.or(rows_zeroed, Bool.not(supported))
+
+# Does the kept position at row `pos` take the place of the best one found so far (`best_pos`,
+# 0 while there is none)? Only a slot that is readable, at a position the reuse rule allows
+# (`valid`), and further into the prompt.
+def pc_resume_pick(readable: Bool, valid: Bool, pos: Nat, best_pos: Nat) -> Bool:
+  Bool.and(Bool.and(readable, valid), Nat.is_gt(pos, best_pos))
+
+# Does the tile that starts after `tile_idx` whole tiles read its state from the resume slot?
+# Only the tile at the resume point of a request that resumes at all (`resume_rows` > 0).
+def pc_reads_resume_slot(tile_idx: Nat, resume_tiles: Nat, resume_rows: Nat) -> Bool:
+  Bool.and(Nat.is_eq(tile_idx, resume_tiles), Nat.is_gt(resume_rows, 0n))
+
+# First valid position of the drafter's context rows after a request, on an engine whose
+# drafter keeps `ring_rows` of them: the rule of section 7 when there is a ring, and nothing to
+# track when there is none.
+def pc_ring_after(prev_from: Nat, resume: Nat, written_end: Nat, ring_rows: Nat) -> Nat:
+  match ring_rows:
+    case 0n:
+      prev_from
+    case 1n+r:
+      pc_ring_from(prev_from, resume, written_end, 1n+r)
+
+# a > b and a <= b never hold together
+def pc_gt_le_excl(+a: Nat, +b: Nat) -> {Bool.and(Nat.is_gt(a, b), Nat.is_le(a, b)) == False{} : Bool}:
+  match a b:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+ap 1n+bp:
+      pc_gt_le_excl(ap, bp)
+
+# LAW PC.37: a table whose K/V rows were zeroed is always forgotten.
+law pc_zeroed_table_is_void:
+  for +s: Bool
+  {pc_table_void(True{}, s) == True{} : Bool}
+
+def pc_zeroed_table_is_void(s):
+  {==}
+
+# LAW PC.38: so is the table of an engine that cannot resume a prefill.
+law pc_unsupported_table_is_void:
+  for +z: Bool
+  {pc_table_void(z, False{}) == True{} : Bool}
+
+def pc_unsupported_table_is_void(z):
+  match z:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW PC.39: a request never resumes from a table that is forgotten.
+law pc_void_table_never_reused:
+  for +w: Bool
+  for +z: Bool
+  for +s: Bool
+  {Bool.and(pc_request_may_reuse(w, z, s), pc_table_void(z, s)) == False{} : Bool}
+
+def pc_void_table_never_reused(w, z, s):
+  match w:
+    case False{}: {==}
+    case True{}:
+      match z:
+        case True{}: {==}
+        case False{}:
+          match s:
+            case True{}: {==}
+            case False{}: {==}
+
+# LAW PC.40: a slot that is not readable is never resumed from.
+law pc_unreadable_slot_never_resumed:
+  for +v: Bool
+  for +p: Nat
+  for +b: Nat
+  {pc_resume_pick(False{}, v, p, b) == False{} : Bool}
+
+def pc_unreadable_slot_never_resumed(v, p, b):
+  {==}
+
+# LAW PC.41: nor a position the reuse rule does not allow.
+law pc_invalid_position_never_resumed:
+  for +r: Bool
+  for +p: Nat
+  for +b: Nat
+  {pc_resume_pick(r, False{}, p, b) == False{} : Bool}
+
+def pc_invalid_position_never_resumed(r, p, b):
+  match r:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW PC.42: a position at or before the best one found so far never takes its place.
+law pc_resume_never_moves_back:
+  for +r: Bool
+  for +v: Bool
+  for +p: Nat
+  for +b: Nat
+  {Bool.and(pc_resume_pick(r, v, p, b), Nat.is_le(p, b)) == False{} : Bool}
+
+def pc_resume_never_moves_back(r, v, p, b):
+  pc_and3_excl(Bool.and(r, v), Nat.is_gt(p, b), Nat.is_le(p, b), pc_gt_le_excl(p, b))
+
+# LAW PC.43: no tile of a cold prefill reads a resume slot.
+law pc_cold_prefill_reads_no_resume_slot:
+  for +t: Nat
+  for +r: Nat
+  {pc_reads_resume_slot(t, r, 0n) == False{} : Bool}
+
+def pc_cold_prefill_reads_no_resume_slot(t, r):
+  pc_and_false_r(Nat.is_eq(t, r))
+
+def pc_reads_other_aux(x: Bool, y: Bool) -> {Bool.and(Bool.and(x, y), Bool.not(x)) == False{} : Bool}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      pc_and_false_r(y)
+
+# LAW PC.44: nor does any tile but the one at the resume point.
+law pc_other_tile_reads_no_resume_slot:
+  for +t: Nat
+  for +r: Nat
+  for +n: Nat
+  {Bool.and(pc_reads_resume_slot(t, r, n), Bool.not(Nat.is_eq(t, r))) == False{} : Bool}
+
+def pc_other_tile_reads_no_resume_slot(t, r, n):
+  pc_reads_other_aux(Nat.is_eq(t, r), Nat.is_gt(n, 0n))
+
+# LAW PC.45: with a ring, the first position that counts as valid after a request is never
+# before the one the ring rule gives: a row the request overwrote is never taken for valid.
+law pc_ring_after_never_before_the_rule:
+  for +p: Nat
+  for +r: Nat
+  for +w: Nat
+  for +n: Nat
+  {Nat.is_le(pc_ring_from(p, r, w, 1n+n), pc_ring_after(p, r, w, 1n+n)) == True{} : Bool}
+
+def pc_ring_after_never_before_the_rule(p, r, w, n):
+  pc_le_refl(pc_ring_from(p, r, w, 1n+n))

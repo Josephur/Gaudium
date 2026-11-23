@@ -820,6 +820,8 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
         "reasoning_effort",
         "coupled",
         "draft_trunc",
+        // false = a whole prefill: neither the device nor host memory is resumed from
+        "cache_prompt",
     ] {
         if let Some(v) = present(body, k) {
             if !chat.iter().any(|(name, _)| *name == k) {
@@ -1235,6 +1237,32 @@ mod tests {
             let err = translate_str(body).unwrap_err();
             assert!(err.contains(want), "{body}: {err}");
         }
+    }
+
+    #[test]
+    fn the_engine_s_own_request_fields_reach_the_chat_request() {
+        // `cache_prompt: false` asks for a whole prefill (no rows taken over from the device or
+        // from host memory): a Messages client must be able to ask for it too
+        let t = translate_str(
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}],
+                "cache_prompt":false,"seed":7,"min_p":0.05,"coupled":false}"#,
+        )
+        .unwrap();
+        assert_eq!(t.chat.get("cache_prompt").and_then(JsonValue::as_bool), Some(false));
+        assert_eq!(t.chat.get("seed").and_then(JsonValue::as_u64), Some(7));
+        assert_eq!(t.chat.get("coupled").and_then(JsonValue::as_bool), Some(false));
+        assert!(t.ignored.is_empty(), "{:?}", t.ignored);
+        // a request that does not name it leaves the chat endpoint's default (reuse allowed)
+        let t = translate_str(
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert!(t.chat.get("cache_prompt").is_none());
+        let t = translate_str(
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}],"cache_prompt":true}"#,
+        )
+        .unwrap();
+        assert_eq!(t.chat.get("cache_prompt").and_then(JsonValue::as_bool), Some(true));
     }
 
     #[test]

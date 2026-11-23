@@ -436,6 +436,73 @@ pub fn prefix_json(p: &crate::engine::qwen3::prefix_cache::PrefixStats) -> Strin
     )
 }
 
+/// The `cache_ram` object of `/props`: the store's budget and what it holds, its counters, and
+/// (while an engine with a host tier is on the card) the measured rates the restore rule uses
+/// and what an entry costs.
+pub fn cache_ram_json(
+    st: &crate::cache_ram::CacheStats,
+    facts: Option<&crate::engine::qwen3::host_tier::TierFacts>,
+) -> String {
+    let mut out = format!(
+        "{{\"budget_bytes\":{},\"held_bytes\":{},\"entries\":{},\"held_tokens\":{},\"held_positions\":{},\
+         \"saves\":{},\"save_bytes\":{},\"save_ms\":{:.1},\"restores\":{},\"restore_bytes\":{},\"restore_ms\":{:.1},\
+         \"evictions\":{},\"refused\":{},\"yielded\":{}",
+        st.budget_bytes,
+        st.held_bytes,
+        st.entries,
+        st.held_rows,
+        st.held_states,
+        st.saves,
+        st.save_bytes,
+        st.save_s * 1e3,
+        st.restores,
+        st.restore_bytes,
+        st.restore_s * 1e3,
+        st.evictions,
+        st.refused,
+        st.yielded,
+    );
+    if let Some(f) = facts {
+        out.push_str(&format!(
+            ",\"engine\":{{\"bytes_per_token\":{},\"bytes_per_position\":{},\"drafter_ring_bytes\":{},\
+             \"to_host_bytes_per_s\":{},\"to_device_bytes_per_s\":{},\"prefill_tokens_per_s\":{},\
+             \"last\":{}}}",
+            f.bytes_per_row,
+            f.bytes_per_state,
+            f.ring_bytes,
+            f.rates.to_host,
+            f.rates.to_device,
+            f.rates.prefill_rows,
+            tier_json(&f.last),
+        ));
+    }
+    out.push('}');
+    out
+}
+
+/// What the host tier did for one request: `tier` and the copies it made.
+pub fn tier_json(t: &crate::engine::qwen3::host_tier::TierReport) -> String {
+    format!(
+        "{{\"tier\":\"{}\",\"restore_ms\":{:.2},\"restore_bytes\":{},\"restore_tokens\":{},\"save_ms\":{:.2},\"save_bytes\":{}}}",
+        t.tier.name(),
+        t.restore_ms,
+        t.restore_bytes,
+        t.restore_rows,
+        t.save_ms,
+        t.save_bytes,
+    )
+}
+
+/// Where the reused rows of a request came from when the engine reports no host tier: the
+/// device when any were reused.
+pub fn tier_name(
+    report: Option<&crate::engine::qwen3::host_tier::TierReport>,
+    reused: u64,
+) -> &'static str {
+    use crate::engine::qwen3::host_tier::Tier;
+    report.map_or(Tier::of(false, reused), |r| r.tier).name()
+}
+
 pub fn vision_section_json(
     c: &crate::vision::media::MediaCounts,
     host_ms: f64,

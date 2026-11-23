@@ -43,6 +43,9 @@ pub mod prefill;
 // prefix reuse across requests: kept positions, their device slots
 #[path = "prefix_cache.rs"]
 pub mod prefix_cache;
+// prefix reuse from host memory: what is copied between the device and the store, and when
+#[path = "host_tier.rs"]
+pub mod host_tier;
 #[path = "request_reset.rs"]
 mod request_reset;
 mod vision_hooks;
@@ -107,6 +110,9 @@ pub struct Qwen3Config {
     /// kept on the device so that a later request resumes there (`engine/prefix_cache.rs`).
     /// 0 = off. A load keeps as many as fit beside the rest of its plan.
     pub prefix_slots: u64,
+    /// The host-RAM tier of prefix reuse: the server's store (`cache_ram.rs`). `None`: this
+    /// engine keeps nothing in host memory.
+    pub host_cache: Option<Arc<crate::cache_ram::SharedCache>>,
 }
 
 impl Qwen3Config {
@@ -135,6 +141,7 @@ impl Qwen3Config {
             request_reset: None,
             step: crate::engine::step_opts::StepOpts::from_env(),
             prefix_slots: 0,
+            host_cache: None,
         }
     }
 }
@@ -239,6 +246,9 @@ pub struct Qwen3GenReport {
     pub reused_tokens: u64,
     /// Rows of the prompt that equal the prompt the engine held (0 without prefix reuse).
     pub prefix_common: u64,
+    /// Where the reused rows came from, and what the host-RAM tier copied for this request
+    /// (`None`: the engine has no host tier).
+    pub host_tier: Option<host_tier::TierReport>,
 }
 
 /// One greedy-vs-reference disagreement observed under teacher forcing.
@@ -984,6 +994,9 @@ pub struct Qwen3Engine {
     driver_version: String,
     cache: RecipeCache,
     elf_hashes: Vec<(String, String)>,
+    /// The FP8 inputs this load used (the activation-scale table as parsed, the cached
+    /// matrices as found): part of the identity the host-RAM tier stamps entries with.
+    fp8_id: String,
 
     // Recipes (must drop before `dev`)
     head_t1: CompiledRecipe,
@@ -1029,6 +1042,10 @@ pub struct Qwen3Engine {
     prefix_slots: Vec<prefix_cache::SlotAddrs>,
     prefix_plan: prefix_cache::Plan,
     prefix_images: Vec<prefix_cache::ImageId>,
+    /// Prefix reuse from host memory (`engine/host_tier.rs`) and the pinned ring its copies go
+    /// through (host memory mapped for the device: must drop before `dev`).
+    host: Option<host_tier::HostTier>,
+    xfer: Option<crate::synapse::xfer::XferRing>,
     /// Print recipe / timing diagnostics (`Qwen3Config::verbose`).
     verbose: bool,
     live: LiveReporter,
@@ -2051,6 +2068,9 @@ impl Qwen3Engine {
         let t_up = Instant::now();
         let store =
             SafetensorsStore::open(&cfg.model_dir).map_err(|e| format!("open safetensors: {e}"))?;
+        // what the host tier's identity says about this load's FP8 inputs: the table as parsed
+        // (now), the cache files as used (after the upload)
+        let fp8_table_id = crate::engine::fp8_pack::act_table_id(&fp8_act_table);
         // [moe/fp8 hook] FP8 checkpoints / FP8 device weights / MoE wide MLPs
         let ext_packer = crate::engine::fp8_pack::ExtPacker::new(
             &store,
@@ -2187,6 +2207,10 @@ impl Qwen3Engine {
         )?;
         drop(stage_upload); // the upload staging memory is not needed after the load
         ext_packer.log_summary(cfg.verbose); // [moe/fp8 hook]
+        let fp8_id = format!(
+            "table={fp8_table_id}|cache_files={}",
+            ext_packer.cache_files_id()
+        );
 
         let logits_bytes = (spec.vocab as usize) * 2;
         let stage_io_bytes = logits_bytes.max((prefill_tile as usize) * 4).max(4096);
@@ -2310,6 +2334,7 @@ impl Qwen3Engine {
             driver_version,
             cache,
             elf_hashes,
+            fp8_id,
             head_t1,
             step_recipes,
             embed_recipes,
@@ -2346,6 +2371,8 @@ impl Qwen3Engine {
             prefix_slots,
             prefix_plan: prefix_cache::Plan::default(),
             prefix_images: Vec::new(),
+            host: None,
+            xfer: None,
             verbose: cfg.verbose,
             live,
             vision,
@@ -2359,6 +2386,7 @@ impl Qwen3Engine {
             dev,
         };
         eng.warm_prefill_tiles(cfg.prefill_warm_rows, cfg.verbose)?;
+        host_tier::attach(&mut eng, cfg)?;
         Ok(Some(eng))
     }
 
@@ -2424,6 +2452,45 @@ impl Qwen3Engine {
     /// load keeps none).
     pub fn prefix_stats(&self) -> Option<prefix_cache::PrefixStats> {
         self.prefix.enabled().then(|| self.prefix.stats())
+    }
+
+    /// Work for the time between two requests: copies what the device holds for its prompt
+    /// into the host-RAM tier. `waiting` says how many requests wait for the card; the copy
+    /// stops between pieces once one does and goes on at the next call. An error is a failed
+    /// device copy: the entry it wrote is gone, the engine goes on.
+    pub fn idle_work(&mut self, waiting: &dyn Fn() -> u64) {
+        if !self.host.as_ref().is_some_and(|t| t.has_unsaved()) {
+            return;
+        }
+        let mut stop = || !crate::verified::hc_idle_may_run(waiting());
+        // A client that sends its next request as soon as it has the answer (a tool loop) must
+        // not find the card inside a copy: the save starts only once the card has been idle
+        // for a moment, and a request that arrives before that takes the card at once.
+        let t0 = Instant::now();
+        while t0.elapsed() < host_tier::IDLE_GRACE {
+            if stop() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if let Err(e) = host_tier::save(self, &mut stop) {
+            eprintln!("[cache-ram] save failed: {e}");
+        }
+    }
+
+    /// Before the card is released (idle release, another model, shutdown): everything the
+    /// device holds for its prompt goes to the host-RAM tier, and every stream is drained.
+    pub fn before_release(&mut self) {
+        if let Err(e) = host_tier::save(self, &mut || false) {
+            eprintln!("[cache-ram] save before the release failed: {e}");
+        }
+        let _ = self.dev.sync_all();
+    }
+
+    /// The host-RAM tier's measured rates, its sizes and what it did for the last request
+    /// (`None`: this engine has none).
+    pub fn host_tier_facts(&self) -> Option<host_tier::TierFacts> {
+        self.host.as_ref().map(|t| t.facts())
     }
 
     /// A recipe that was not ready when a request needed it: the request waited for it.
@@ -2652,9 +2719,30 @@ impl Qwen3Engine {
         });
         self.prefix.request_end(res.is_ok(), written_end);
         let (reused, common) = (self.prefix_plan.resume, self.prefix_plan.lcp);
+        // host tier: what the request wrote no longer equals anything saved; what it left is
+        // to be saved (after the response: `idle_work`)
+        if let Some(tier) = self.host.as_mut() {
+            let (prefilled, secs) = res.as_ref().map_or((0, 0.0), |r| {
+                (
+                    (r.prompt_tokens as u64).saturating_sub(reused),
+                    // the restore is inside the prefill clock, not part of the prefill itself
+                    (r.ttft_ms - tier.last().restore_ms - tier.last().save_ms).max(0.0) / 1e3,
+                )
+            });
+            let cancelled = res.as_ref().is_ok_and(|r| r.stopped_by_cancel);
+            tier.end_request(
+                res.is_ok(),
+                reused,
+                written_end,
+                if cancelled { 0 } else { prefilled },
+                secs,
+            );
+        }
+        let tier_report = self.host.as_ref().map(|t| t.last());
         let res = res.map(|mut r| {
             r.reused_tokens = reused;
             r.prefix_common = common;
+            r.host_tier = tier_report;
             r
         });
         // [prefill] measurement of the half-layer recipe forms, once, after the first request
@@ -2705,9 +2793,17 @@ impl Qwen3Engine {
             && self.calib.is_none()
             && !self.pf.opts.profile
             && self.pf.opts.half_probe == 0;
-        self.prefix_plan =
-            self.prefix
-                .plan(prompt_ids, &self.prefix_images, reuse_wanted, rows_zeroed);
+        // Host tier: rows and state the card has lost come back from host memory first, when
+        // that is faster than prefilling them (`engine/host_tier.rs`); the plan then finds them
+        // as if they had never left.
+        let restored = host_tier::begin_request(self, prompt_ids, reuse_wanted, rows_zeroed)?;
+        self.prefix_plan = self.prefix.plan_from(
+            prompt_ids,
+            &self.prefix_images,
+            reuse_wanted,
+            rows_zeroed,
+            restored,
+        );
         let resume = self.prefix_plan.resume as usize;
         spec::set_context_floor(self, self.prefix_plan.ring_flo)?;
         if resume > 0 {
@@ -3244,6 +3340,7 @@ impl Qwen3Engine {
                 // set by the caller from the request's prefix plan
                 reused_tokens: 0,
                 prefix_common: 0,
+                host_tier: None,
             });
         }
 

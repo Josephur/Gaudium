@@ -35,9 +35,10 @@ use super::*;
 use crate::core::kv_pool::{is_prefix_reuse_valid, PrefixReuseQuery};
 use crate::verified::{
     pc_abort, pc_anchor_tiles, pc_begin_write, pc_boundary, pc_cap, pc_capture_ok, pc_class_usable,
-    pc_commit, pc_cost, pc_image_limit, pc_image_same, pc_is_free, pc_ladder_tiles, pc_may_take,
-    pc_prefill_rows, pc_readable, pc_request_may_reuse, pc_retain, pc_reused_rows, pc_ring_flo,
-    pc_ring_from, pc_slot_tiles, pc_victim_better, pc_victim_class, PcSlot,
+    pc_commit_done, pc_cost, pc_image_limit, pc_image_same, pc_is_free, pc_ladder_tiles,
+    pc_may_take, pc_prefill_rows, pc_readable, pc_reads_resume_slot, pc_request_may_reuse,
+    pc_resume_pick, pc_retain, pc_reused_rows, pc_ring_after, pc_ring_flo, pc_slot_tiles,
+    pc_table_void, pc_victim_better, pc_victim_class, PcSlot,
 };
 
 /// Positions an engine keeps when the configuration names no count.
@@ -162,6 +163,54 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+/// Slot limit of reuse from the image runs of a held prompt and of a new one: the first pair
+/// that is not the same picture at the same place stops reuse before it. A prompt with more
+/// runs than the other stops it before its first extra run.
+pub fn image_limit(held_images: &[ImageId], images: &[ImageId]) -> u64 {
+    let n = held_images.len().max(images.len());
+    let mut limit = u64::MAX;
+    for k in (0..n).rev() {
+        let (h, w) = (held_images.get(k), images.get(k));
+        let same = match (h, w) {
+            (Some(h), Some(w)) => pc_image_same(
+                h.start == w.start,
+                h.len == w.len && h.rows == w.rows && h.cols == w.cols,
+                h.pixels == w.pixels,
+            ),
+            _ => false,
+        };
+        limit = pc_image_limit(
+            same,
+            h.map_or(u64::MAX, |x| x.start),
+            w.map_or(u64::MAX, |x| x.start),
+            limit,
+        );
+    }
+    limit
+}
+
+/// How far a new prompt is a held one: `(common token prefix, rows that count as the same)`,
+/// the second cut at the first image that differs (the verified `pc_cap`). The one rule for a
+/// prompt held on the device and for one kept in host memory.
+pub fn shared_rows(
+    prompt: &[i32],
+    images: &[ImageId],
+    held: &[i32],
+    held_images: &[ImageId],
+) -> (u64, u64) {
+    let lcp = common_prefix(prompt, held) as u64;
+    (lcp, pc_cap(lcp, image_limit(held_images, images)))
+}
+
+/// What the device alone gives a request, without changing the table ([`PrefixCache::peek`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Peek {
+    /// Rows the prompt shares with the held one.
+    pub cap: u64,
+    /// Position a plan would resume at (0 = a cold prefill).
+    pub resume: u64,
+}
+
 impl PrefixCache {
     pub fn new(tile: u64, slots: u64, slot_bytes: u64, supported: bool, ctx_rows: u64) -> Self {
         let n = if supported && tile > 0 { slots } else { 0 };
@@ -233,30 +282,62 @@ impl PrefixCache {
         self.cur_resume = 0;
     }
 
-    /// Slot limit of reuse from the image runs of the held prompt and of the new one: the first
-    /// pair that is not the same picture at the same place stops reuse before it. A prompt with
-    /// more runs than the other stops it before its first extra run.
-    fn image_limit(&self, images: &[ImageId]) -> u64 {
-        let n = self.held_images.len().max(images.len());
-        let mut limit = u64::MAX;
-        for k in (0..n).rev() {
-            let (h, w) = (self.held_images.get(k), images.get(k));
-            let same = match (h, w) {
-                (Some(h), Some(w)) => pc_image_same(
-                    h.start == w.start,
-                    h.len == w.len && h.rows == w.rows && h.cols == w.cols,
-                    h.pixels == w.pixels,
-                ),
-                _ => false,
-            };
-            limit = pc_image_limit(
-                same,
-                h.map_or(u64::MAX, |x| x.start),
-                w.map_or(u64::MAX, |x| x.start),
-                limit,
-            );
+    /// The kept position a request resumes from, `(position, slot)`: among `states` (the slots
+    /// as the request's prompt leaves them) the one the verified choice keeps
+    /// (`pc_resume_pick`: a readable slot at a position the reuse rule allows, the furthest).
+    fn best_resume(
+        &self,
+        states: &[PcSlot],
+        cap: u64,
+        prompt_len: u64,
+        wanted: bool,
+        rows_zeroed: bool,
+    ) -> (u64, Option<usize>) {
+        let mut resume = 0u64;
+        let mut resume_slot = None;
+        if pc_request_may_reuse(wanted, rows_zeroed, self.supported) {
+            for (i, &state) in states.iter().enumerate() {
+                let pos = pc_boundary(pc_slot_tiles(state), self.tile);
+                let valid = is_prefix_reuse_valid(PrefixReuseQuery {
+                    snap_pos: pos,
+                    lcp: cap,
+                    prompt_len,
+                    tile: self.tile,
+                    need_mtp: false,
+                    mtp_upto: 0,
+                    need_dflash: self.ctx_rows > 0,
+                    dflash_upto: self.held.len() as u64,
+                });
+                if pc_resume_pick(pc_readable(state), valid, pos, resume) {
+                    resume = pos;
+                    resume_slot = Some(i);
+                }
+            }
         }
-        limit
+        (resume, resume_slot)
+    }
+
+    /// What [`Self::plan`] would do for this prompt with the state the device holds now, without
+    /// changing the table: the rows the prompt shares with the held one and the position its
+    /// prefill would resume at. The host-RAM tier asks this before it decides to restore.
+    pub fn peek(
+        &self,
+        prompt: &[i32],
+        images: &[ImageId],
+        wanted: bool,
+        rows_zeroed: bool,
+    ) -> Peek {
+        if pc_table_void(rows_zeroed, self.supported) {
+            return Peek::default();
+        }
+        let (_, cap) = shared_rows(prompt, images, &self.held, &self.held_images);
+        let states: Vec<PcSlot> = self
+            .slots
+            .iter()
+            .map(|s| pc_retain(s.state, cap, self.tile))
+            .collect();
+        let (resume, _) = self.best_resume(&states, cap, prompt.len() as u64, wanted, rows_zeroed);
+        Peek { cap, resume }
     }
 
     /// Plans a request: where its prefill resumes, which slots it reads and writes. `wanted`:
@@ -270,11 +351,29 @@ impl PrefixCache {
         wanted: bool,
         rows_zeroed: bool,
     ) -> Plan {
+        self.plan_from(prompt, images, wanted, rows_zeroed, None)
+    }
+
+    /// [`Self::plan`] for a request whose rows were just restored from a prompt kept in host
+    /// memory ([`Self::adopt_restored`]): `restored` = `(common token prefix, shared rows)` of
+    /// the new prompt and that whole saved prompt. The table holds only the restored part of
+    /// it, so the rows the two prompts share are taken from the comparison the restore made.
+    /// (Nothing is restored for a request whose table is forgotten here, `pc_table_void`: the
+    /// host tier asks `pc_request_may_reuse` first. Such a request resumes nowhere whatever
+    /// `restored` says.)
+    pub fn plan_from(
+        &mut self,
+        prompt: &[i32],
+        images: &[ImageId],
+        wanted: bool,
+        rows_zeroed: bool,
+        restored: Option<(u64, u64)>,
+    ) -> Plan {
         self.seq += 1;
         self.stats.requests += 1;
         let p = prompt.len() as u64;
         let tile = self.tile;
-        if rows_zeroed || !self.supported {
+        if pc_table_void(rows_zeroed, self.supported) {
             self.clear();
         }
         if !self.supported {
@@ -285,37 +384,17 @@ impl PrefixCache {
         }
         // how far the new prompt is the held one (a cold request still leaves those rows as
         // they are: it writes the same rows again)
-        let lcp = common_prefix(prompt, &self.held) as u64;
-        let cap = pc_cap(lcp, self.image_limit(images));
+        let (lcp, cap) = match restored {
+            Some(shared) => shared,
+            None => shared_rows(prompt, images, &self.held, &self.held_images),
+        };
         for s in &mut self.slots {
             s.state = pc_retain(s.state, cap, tile);
         }
 
         // the kept position to resume from: the furthest one the verified rule allows
-        let mut resume = 0u64;
-        let mut resume_slot = None;
-        if pc_request_may_reuse(wanted, rows_zeroed, self.supported) {
-            for (i, s) in self.slots.iter().enumerate() {
-                if !pc_readable(s.state) {
-                    continue;
-                }
-                let pos = pc_boundary(pc_slot_tiles(s.state), tile);
-                let ok = is_prefix_reuse_valid(PrefixReuseQuery {
-                    snap_pos: pos,
-                    lcp: cap,
-                    prompt_len: p,
-                    tile,
-                    need_mtp: false,
-                    mtp_upto: 0,
-                    need_dflash: self.ctx_rows > 0,
-                    dflash_upto: self.held.len() as u64,
-                });
-                if ok && pos > resume {
-                    resume = pos;
-                    resume_slot = Some(i);
-                }
-            }
-        }
+        let states: Vec<PcSlot> = self.slots.iter().map(|s| s.state).collect();
+        let (resume, resume_slot) = self.best_resume(&states, cap, p, wanted, rows_zeroed);
         let resume_tiles = resume / tile.max(1);
 
         // the positions this request keeps: the ladder behind its anchor, each into the slot
@@ -414,10 +493,9 @@ impl PrefixCache {
         if !self.supported {
             return;
         }
+        // which writes are finished is the verified function's decision (`pc_commit_done`)
         for s in &mut self.slots {
-            if matches!(s.state, PcSlot::PcWriting(t) if t <= tiles) {
-                s.state = pc_commit(s.state);
-            }
+            s.state = pc_commit_done(s.state, tiles);
         }
         self.extend_held(prompt, images, pc_boundary(tiles, self.tile));
     }
@@ -460,9 +538,120 @@ impl PrefixCache {
         for s in &mut self.slots {
             s.state = pc_abort(s.state);
         }
-        if self.ctx_rows > 0 {
-            self.ring_from =
-                pc_ring_from(self.ring_from, self.cur_resume, written_end, self.ctx_rows);
+        // (nothing is tracked on an engine without a ring: `pc_ring_after`)
+        self.ring_from =
+            pc_ring_after(self.ring_from, self.cur_resume, written_end, self.ctx_rows);
+    }
+
+    // ---- what the host-RAM tier reads and writes (`engine/host_tier.rs`) ----
+
+    pub fn tile(&self) -> u64 {
+        self.tile
+    }
+
+    /// The prompt whose prefill wrote the K/V rows now on the device, and its image runs.
+    pub fn held(&self) -> (&[i32], &[ImageId]) {
+        (&self.held, &self.held_images)
+    }
+
+    /// Kept positions as `(whole tiles, slot)`, ascending.
+    pub fn held_slots(&self) -> Vec<(u64, usize)> {
+        let mut v: Vec<(u64, usize)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| pc_readable(s.state))
+            .map(|(i, s)| (pc_slot_tiles(s.state), i))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Rows up to the last kept position (0: none is kept).
+    pub fn kept_rows(&self) -> u64 {
+        self.held_slots()
+            .last()
+            .map_or(0, |&(t, _)| pc_boundary(t, self.tile))
+    }
+
+    pub fn slot_count(&self) -> u64 {
+        self.slots.len() as u64
+    }
+
+    /// First position whose drafter context row is valid.
+    pub fn ring_from(&self) -> u64 {
+        self.ring_from
+    }
+
+    /// Rows of the drafter's context caches (0: no drafter that keeps context rows).
+    pub fn ctx_rows(&self) -> u64 {
+        self.ctx_rows
+    }
+
+    /// The device rows `[0, tokens.len())` are about to be replaced by a copy of the rows of
+    /// `tokens` (a prompt kept in host memory): the table now describes that prompt. Kept
+    /// positions stay where the old held prompt and the restored one are the same up to them
+    /// (their state is the state of the same rows); every other one is dropped. Returns the
+    /// slot the state after `tiles` whole tiles is to be copied into, in the middle of a write
+    /// until [`Self::restore_done`] (`None`: a slot already holds that state, or the table
+    /// has no slot for it).
+    pub fn adopt_restored(
+        &mut self,
+        tokens: &[i32],
+        images: &[ImageId],
+        tiles: u64,
+        ring_from: u64,
+    ) -> Option<usize> {
+        if !self.supported {
+            return None;
+        }
+        let (_, cap) = shared_rows(tokens, images, &self.held, &self.held_images);
+        for s in &mut self.slots {
+            s.state = pc_retain(s.state, cap, self.tile);
+        }
+        self.held = tokens.to_vec();
+        self.held_images = images.to_vec();
+        self.ring_from = ring_from;
+        self.cur_resume = 0;
+        if self
+            .slots
+            .iter()
+            .any(|s| pc_readable(s.state) && pc_slot_tiles(s.state) == tiles)
+        {
+            return None;
+        }
+        // the slot for the restored state: the verified order of the device tier (a free slot
+        // first, then the held position worth least); no slot is read by a tile now
+        let mut best: Option<(usize, u64, u64)> = None;
+        for (i, s) in self.slots.iter().enumerate() {
+            let class = pc_victim_class(s.state, false, false);
+            let cost = pc_cost(s.rank, self.seq, s.seq);
+            let better = match best {
+                None => true,
+                Some((_, bc, bk)) => pc_victim_better(class, cost, bc, bk),
+            };
+            if better {
+                best = Some((i, class, cost));
+            }
+        }
+        let (i, class, _) = best?;
+        if !pc_class_usable(class) {
+            return None;
+        }
+        self.slots[i] = Slot {
+            state: pc_begin_write(self.slots[i].state, tiles),
+            rank: 0,
+            seq: self.seq,
+        };
+        Some(i)
+    }
+
+    /// The copy into the slots [`Self::adopt_restored`] began has ended. `done_tiles`: the whole
+    /// tiles whose rows and state are complete on the device (0 after a copy that failed). A
+    /// slot whose state is not complete holds nothing.
+    pub fn restore_done(&mut self, done_tiles: u64) {
+        for s in &mut self.slots {
+            s.state = pc_abort(pc_commit_done(s.state, done_tiles));
         }
     }
 }
@@ -505,7 +694,8 @@ pub(super) fn state_io(
             .ok_or_else(|| format!("prefix cache: slot {slot} has no state buffer for layer {l}"))
     };
     let resume_tiles = plan.resume / tile.max(1);
-    let src = if tile_idx == resume_tiles && plan.resume > 0 {
+    // which tile reads the resume slot is the verified function's decision
+    let src = if pc_reads_resume_slot(tile_idx, resume_tiles, plan.resume) {
         plan.resume_slot
     } else {
         plan.capture_at(tile_idx)
@@ -809,5 +999,19 @@ mod tests {
         let back: Vec<u64> = (0..5).map(crate::verified::pc_ladder_back).collect();
         assert_eq!(back, vec![0, 1, 3, 7, 15]);
         assert_eq!(DEFAULT_SLOTS, 8);
+        // which kept position: a readable slot at a position the rule allows, the furthest
+        assert!(pc_resume_pick(true, true, 1024, 512) && pc_resume_pick(true, true, 512, 0));
+        assert!(!pc_resume_pick(true, true, 512, 512) && !pc_resume_pick(true, true, 512, 1024));
+        assert!(!pc_resume_pick(false, true, 1024, 512) && !pc_resume_pick(true, false, 1024, 512));
+        // the table is forgotten after zeroed rows and on an engine that cannot resume
+        assert!(pc_table_void(true, true) && pc_table_void(false, false));
+        assert!(!pc_table_void(false, true));
+        // the tile at the resume point reads the resume slot, and no other
+        assert!(pc_reads_resume_slot(3, 3, 1536));
+        assert!(!pc_reads_resume_slot(4, 3, 1536) && !pc_reads_resume_slot(0, 0, 0));
+        // the ring's first valid position is tracked only on an engine that has a ring
+        assert_eq!(crate::verified::pc_ring_after(100, 512, 9000, 8960), 100);
+        assert_eq!(crate::verified::pc_ring_after(100, 512, 9500, 8960), 540);
+        assert_eq!(crate::verified::pc_ring_after(100, 512, 9500, 0), 100);
     }
 }

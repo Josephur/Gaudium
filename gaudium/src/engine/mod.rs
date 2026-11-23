@@ -92,6 +92,17 @@ pub trait GenEngine: Send {
     fn prefix_stats(&self) -> Option<qwen3::prefix_cache::PrefixStats> {
         None
     }
+    /// Work for the time between two requests (the host-RAM tier's save). `waiting`: how many
+    /// requests wait for the card now; the work gives way once one does.
+    fn idle_work(&mut self, _waiting: &dyn Fn() -> u64) {}
+    /// Called before the engine is dropped to release the card: what is worth keeping goes to
+    /// host memory, and nothing is left queued on the device.
+    fn before_release(&mut self) {}
+    /// The host-RAM tier of this engine: measured rates, entry sizes, the last request
+    /// (`None`: it has none).
+    fn host_tier_facts(&self) -> Option<qwen3::host_tier::TierFacts> {
+        None
+    }
 }
 
 impl GenEngine for qwen3::Qwen3Engine {
@@ -142,6 +153,15 @@ impl GenEngine for qwen3::Qwen3Engine {
     }
     fn prefix_stats(&self) -> Option<qwen3::prefix_cache::PrefixStats> {
         qwen3::Qwen3Engine::prefix_stats(self)
+    }
+    fn idle_work(&mut self, waiting: &dyn Fn() -> u64) {
+        qwen3::Qwen3Engine::idle_work(self, waiting)
+    }
+    fn before_release(&mut self) {
+        qwen3::Qwen3Engine::before_release(self)
+    }
+    fn host_tier_facts(&self) -> Option<qwen3::host_tier::TierFacts> {
+        qwen3::Qwen3Engine::host_tier_facts(self)
     }
 }
 

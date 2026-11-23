@@ -1028,6 +1028,14 @@ pub fn default_fp8_dir(draft_dir: &Path) -> std::path::PathBuf {
 /// File name of a drafter's activation-scale table inside its FP8 directory.
 pub const ACT_TABLE_FILE: &str = "act_scales_ds.txt";
 
+/// The drafter's activation-scale table a load looks for: the one the run options name, else
+/// the one in the drafter's default FP8 directory.
+pub fn act_table_path(draft_dir: &Path, opts: &crate::engine::step_opts::StepOpts) -> std::path::PathBuf {
+    opts.draft_fp8_act
+        .clone()
+        .unwrap_or_else(|| default_fp8_dir(draft_dir).join(ACT_TABLE_FILE))
+}
+
 impl DSpine {
     /// Applies the run options: the draft vocabulary of the block readout and, when the
     /// drafter's activation-scale table is there (or `force_fp8` demands it), FP8 layers.
@@ -1045,10 +1053,7 @@ impl DSpine {
             None => 0,
             Some(_) => opts.draft_rows(spec.vocab, super::mtp::DV_TAIL)?,
         };
-        let table = opts
-            .draft_fp8_act
-            .clone()
-            .unwrap_or_else(|| default_fp8_dir(draft_dir).join(ACT_TABLE_FILE));
+        let table = act_table_path(draft_dir, opts);
         let want = match opts.draft_fp8 {
             _ if opts.draft_fp8_calibrate.is_some() => false,
             Some(v) => v,

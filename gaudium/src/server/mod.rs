@@ -117,6 +117,9 @@ pub struct ServerConfig {
     pub tls_cert: Option<PathBuf>,
     /// PEM private key of the HTTPS listener (`--tls-key`). Only its path is held here.
     pub tls_key: Option<PathBuf>,
+    /// Budget of the host-RAM tier of prefix reuse in bytes (`--cache-ram`): `None` = a share
+    /// of the host memory available at start, `Some(0)` = off.
+    pub cache_ram_bytes: Option<u64>,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -260,6 +263,12 @@ struct EngineSlot {
     /// Prefix reuse of the resident engine as of its last request (`None`: no engine, or one
     /// without it).
     prefix: Option<crate::engine::qwen3::prefix_cache::PrefixStats>,
+    /// The resident engine's host-RAM tier as of its last request (`None`: no engine, or one
+    /// without it).
+    host_tier: Option<crate::engine::qwen3::host_tier::TierFacts>,
+    /// A chat request ended and the engine has not had its idle time since
+    /// (`AppState::idle_work`).
+    idle_due: bool,
 }
 
 struct EventHubState {
@@ -339,6 +348,9 @@ struct AppState {
     proxy: proxy::McpProxy,
     /// The certificate of the HTTPS listener; `None`: plain HTTP only.
     tls: Option<crate::tls::TlsServer>,
+    /// The host-RAM tier of prefix reuse (`--cache-ram`): entries outlive the engine that made
+    /// them (another model, the idle release). `None`: off.
+    host_cache: Option<Arc<crate::cache_ram::SharedCache>>,
 }
 
 impl AppState {
@@ -817,6 +829,22 @@ impl AppState {
             }
         };
         out.push_str(&format!(",\"prefix_cache\":{prefix}"));
+        // the host-RAM tier: what it holds for every model (null: off), and the resident
+        // engine's measured rates while this model is on the card
+        let cache_ram = match &self.host_cache {
+            Some(c) => {
+                let facts = {
+                    let s = self.slot.lock().unwrap();
+                    match (&s.lifecycle, s.host_tier) {
+                        (Lifecycle::Ready(r), Some(f)) if *r == idx => Some(f),
+                        _ => None,
+                    }
+                };
+                readout::cache_ram_json(&c.stats(), facts.as_ref())
+            }
+            None => "null".to_string(),
+        };
+        out.push_str(&format!(",\"cache_ram\":{cache_ram}"));
         if include_router && self.models.len() > 1 {
             out.push_str(",\"role\":\"router\",\"max_instances\":1,\"models_autoload\":true");
         }
@@ -850,10 +878,15 @@ impl AppState {
                     self.models[target_idx].id
                 );
                 s.since = Instant::now();
+                // what the card holds for its conversation goes to host memory first
+                if let Some(e) = s.engine.as_mut() {
+                    e.before_release();
+                }
                 s.engine = None; // drops Qwen3Engine -> drains streams & releases /dev/accel/accel0
                 s.hbm_bytes = None;
                 s.facts = None;
                 s.prefix = None;
+                s.host_tier = None;
                 s.lifecycle = Lifecycle::Parked;
             }
             if !can_switch_resident_model(s.active_requests, s.lifecycle.as_backend_state()) {
@@ -874,13 +907,15 @@ impl AppState {
 
         let m = &self.models[target_idx];
         let t0 = Instant::now();
-        let (qcfg, drafter_dir) = engine_config_of(&self.cfg, &m.id, &m.dir, m.max_ctx);
+        let (mut qcfg, drafter_dir) = engine_config_of(&self.cfg, &m.id, &m.dir, m.max_ctx);
+        qcfg.host_cache = self.host_cache.clone();
 
         match load_engine(&qcfg) {
             Ok(eng) => {
                 let dt = t0.elapsed().as_secs_f64();
                 let hbm = eng.hbm_bytes();
                 let prefix = eng.prefix_stats();
+                let host_tier = eng.host_tier_facts();
                 // what the readout says about this model comes from the engine that loaded it
                 let facts = RunFacts {
                     from_engine: true,
@@ -907,6 +942,7 @@ impl AppState {
                 s.hbm_bytes = Some(hbm);
                 s.facts = Some(facts);
                 s.prefix = prefix;
+                s.host_tier = host_tier;
                 drop(s);
                 self.publish_engine_event();
                 if self.cfg.verbose {
@@ -936,6 +972,43 @@ impl AppState {
         }
     }
 
+    /// The engine's idle time after a chat request (the host-RAM tier saves what the card holds
+    /// for its conversation). Called when any connection has ended, on that connection's
+    /// thread, and done only while the card is free: a request that already holds or waits
+    /// for the card comes first, and the work gives way to one that arrives.
+    ///
+    /// The work a chat request left pending stays pending until a caller can really start it
+    /// (the verified `hc_idle_starts`, `hc_idle_left`). A connection that ends while the
+    /// request still holds the card finds the card busy and changes nothing; the request's own
+    /// connection, or whichever ends next, then does the work.
+    fn idle_work(&self) {
+        if self.host_cache.is_none() {
+            return;
+        }
+        // not while another request has the card (it saves what it would overwrite itself)
+        let Ok(_op) = self.card_op.try_lock() else {
+            return;
+        };
+        let taken = {
+            let mut s = self.slot.lock().unwrap();
+            let ready = matches!(s.lifecycle, Lifecycle::Ready(_)) && s.engine.is_some();
+            let starts = crate::verified::hc_idle_starts(s.idle_due, s.active_requests, ready);
+            s.idle_due = crate::verified::hc_idle_left(s.idle_due, starts);
+            if starts {
+                s.engine.take()
+            } else {
+                None
+            }
+        };
+        let Some(mut engine) = taken else { return };
+        let waiting = || -> u64 { self.slot.lock().unwrap().waiting.iter().sum() };
+        engine.idle_work(&waiting);
+        let host_tier = engine.host_tier_facts();
+        let mut s = self.slot.lock().unwrap();
+        s.engine = Some(engine);
+        s.host_tier = host_tier;
+    }
+
     /// Cleanly drains and releases `/dev/accel/accel0`.
     fn park(&self, admin_parked: bool, reason: &str) -> Result<(), String> {
         let _op = self.card_op.lock().unwrap();
@@ -949,10 +1022,17 @@ impl AppState {
             s.lifecycle = Lifecycle::Stopping;
             s.detail = reason.to_string();
             s.since = Instant::now();
+            // what the card holds for its conversation goes to host memory first, so the next
+            // turn after the release does not prefill it again (not when the server is
+            // stopping: the store goes with the process)
+            if let Some(e) = s.engine.as_mut().filter(|_| !crate::signals::term_requested()) {
+                e.before_release();
+            }
             s.engine = None; // drains streams & releases device + unlinks cardlock holder/live/shm
             s.hbm_bytes = None;
             s.facts = None;
             s.prefix = None;
+            s.host_tier = None;
         }
         s.lifecycle = Lifecycle::Parked;
         s.detail = reason.to_string();
@@ -964,6 +1044,44 @@ impl AppState {
         }
         Ok(())
     }
+}
+
+/// The host-RAM tier's store of a server with this configuration (`None`: off): its budget
+/// from `--cache-ram`, or the default share of the host memory available now, checked against
+/// what the host and its control groups can give beside what a loaded engine takes for its
+/// copies (the pinned transfer ring, and the buffer of its first copies at each load). A
+/// budget that was asked for and cannot be honoured is an error with the numbers. This is the
+/// plan; each of those allocations is asked for again when it is made
+/// (`hostmem::Admitted`).
+fn host_cache_of(cfg: &ServerConfig) -> Result<Option<Arc<crate::cache_ram::SharedCache>>, String> {
+    use crate::synapse::xfer::{XferRing, RING_BUFS, RING_BUF_BYTES};
+    if cfg.prefix_slots == 0 {
+        if cfg.cache_ram_bytes.is_some_and(|b| b > 0) {
+            eprintln!("[server] cache-ram: off (--prefix-cache 0: no engine keeps a position to resume a prefill from)");
+        }
+        return Ok(None);
+    }
+    let ring = XferRing::planned_bytes(RING_BUFS, RING_BUF_BYTES);
+    let first_copies = crate::engine::qwen3::host_tier::first_copies_bytes();
+    let mem = crate::hostmem::HostMemory::read();
+    let (budget, how) =
+        crate::cache_ram::resolve_budget(cfg.cache_ram_bytes, ring + first_copies, &mem)?;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if budget == 0 {
+        eprintln!("[server] cache-ram: {how}");
+        return Ok(None);
+    }
+    eprintln!(
+        "[server] cache-ram: {:.2} GiB of host memory for prefixes the card no longer holds ({how}); taken as prefixes are saved, plus {} MiB of pinned transfer buffers while a model is loaded and {} MiB for the first copies at each load",
+        gib(budget),
+        ring >> 20,
+        first_copies >> 20,
+    );
+    // a budget the operator named stays theirs when a limit stops being readable later
+    Ok(Some(Arc::new(
+        crate::cache_ram::SharedCache::new(budget, ring, cfg.verbose, true)
+            .budget_named(cfg.cache_ram_bytes.is_some()),
+    )))
 }
 
 /// Starts the Gaudium HTTP/SSE + Web UI server (blocks until terminated).
@@ -1336,6 +1454,8 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         });
     }
 
+    let host_cache = host_cache_of(&cfg)?;
+
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
     let _ = listener.set_nonblocking(true);
@@ -1367,6 +1487,8 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             hbm_bytes: None,
             facts: None,
             prefix: None,
+            host_tier: None,
+            idle_due: false,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
@@ -1376,6 +1498,7 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         turns: TurnQueue::default(),
         proxy,
         tls,
+        host_cache,
     });
 
     // Optional eager warm-up in a background thread so HTTP/UI responds immediately!
@@ -1682,8 +1805,11 @@ fn check_auth(cfg: &ServerConfig, req: &HttpRequest) -> bool {
 /// server has a certificate.
 fn handle_connection(state: Arc<AppState>, tcp: TcpStream) {
     if let Some(stream) = Conn::open(tcp, state.tls.as_ref()) {
-        handle_request(state, stream);
+        handle_request(Arc::clone(&state), stream);
     }
+    // The connection is closed: nothing of a response waits for what follows. After a chat
+    // request the engine now gets its idle time (the host-RAM tier's save).
+    state.idle_work();
 }
 
 fn handle_request(state: Arc<AppState>, mut stream: Conn) {
@@ -2783,12 +2909,16 @@ fn run_chat(
     // the tower's own timings of this request (kept apart from the decoder's prefill)
     let vision_report = engine.last_vision_report().filter(|_| n_images > 0);
     let prefix_stats = engine.prefix_stats();
+    let host_tier = engine.host_tier_facts();
 
     // Return engine cleanly to slot & decrement active counter!
     {
         let mut s = state.slot.lock().unwrap();
         s.engine = Some(engine);
         s.prefix = prefix_stats;
+        s.host_tier = host_tier;
+        // once this connection is closed, the engine gets its idle time (`AppState::idle_work`)
+        s.idle_due = state.host_cache.is_some();
         s.active_requests = s.active_requests.saturating_sub(1);
         s.last_activity = Instant::now();
     }
@@ -2916,12 +3046,19 @@ fn run_chat(
             // prefix reuse: rows taken over from the previous request, and how many rows of
             // the prompt equal the one the engine held (a resume point lies below that)
             if prefix_stats.is_some_and(|p| p.slots > 0) {
+                // `tier`: where the reused rows came from (device, host, or prefilled: none
+                // were reused); `host`: what the host-RAM tier copied for this request
                 details.push_str(&format!(
-                    ",\"prefix\":{{\"hit\":{},\"reused_tokens\":{},\"common_tokens\":{}}}",
+                    ",\"prefix\":{{\"hit\":{},\"reused_tokens\":{},\"common_tokens\":{},\"tier\":\"{}\"",
                     timings.cache_n > 0,
                     timings.cache_n,
                     rep.prefix_common,
+                    readout::tier_name(rep.host_tier.as_ref(), timings.cache_n),
                 ));
+                if let Some(t) = rep.host_tier.as_ref() {
+                    details.push_str(&format!(",\"host\":{}", readout::tier_json(t)));
+                }
+                details.push('}');
             }
             if n_images > 0 {
                 details.push_str(&format!(

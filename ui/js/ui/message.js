@@ -5,7 +5,7 @@ import { Icon } from './icons.js';
 import { renderMarkdown } from '../lib/markdown.js';
 import { Readout, WarmUp } from './readout.js';
 import { useFollow } from './follow.js';
-import { methodInfo, familyAt, liveStats, finalStats, stepsFromSamples, fmtInt, fmt1, fmt2, fmtMs, fmtPct, fmtBytes } from '../lib/stats.js';
+import { methodInfo, familyAt, liveStats, finalStats, stepsFromSamples, fmtInt, fmt1, fmt2, fmtMs, fmtPct, fmtBytes, reuseSource } from '../lib/stats.js';
 import { requestSections } from '../lib/model.js';
 import { parseArgs } from '../lib/stream.js';
 import { splitContent, hasA2ui, readUserTurn, actionLabel } from '../lib/a2ui.js';
@@ -173,7 +173,7 @@ function StatsLine({ s, open, onToggle, info, nCtx }) {
     <span><b>${fmtInt(s.n)}</b> tokens</span>
     ${s.perStep ? html`<span><b>${fmt1(s.perStep)}</b> tok/step</span>` : null}
     ${s.accept != null ? html`<span>accept <b>${fmtPct(s.accept)}</b></span>` : null}
-    ${s.cacheN > 0 ? html`<span class="reuse" title="Prompt tokens the engine reused from its prefix cache instead of prefilling them">reused ${fmtInt(s.cacheN)}</span>` : null}
+    ${s.cacheN > 0 ? html`<span class="reuse" title=${(reuseSource(s) || {}).title || 'Prompt tokens the engine reused from its prefix cache instead of prefilling them'}>reused ${fmtInt(s.cacheN)}${s.prefixTier === 'host' ? ' (host memory)' : ''}</span>` : null}
     ${nCtx ? html`<span title="Context used: prompt + reused + generated tokens, of the engine's context">context <b>${fmtInt(s.promptN + s.cacheN + s.n)}</b>/${fmtInt(nCtx)}</span>` : null}
     <button class="more" onClick=${onToggle} aria-expanded=${open}>${open ? 'hide readout' : 'readout'}</button>
   </div>`;

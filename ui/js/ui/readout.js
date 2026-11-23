@@ -3,7 +3,7 @@
 // from the engine's level-0 profile (docs/profiling.md) via /gaudium/events; the card state from the same stream.
 import { html, cx } from './h.js';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { methodInfo, familyAt, familyName, fmt1, fmt2, fmtInt, fmtMs, fmtPct, fmtGBs } from '../lib/stats.js';
+import { methodInfo, familyAt, familyName, fmt1, fmt2, fmtInt, fmtMs, fmtPct, fmtGBs, reuseSource } from '../lib/stats.js';
 import { placementOf, isSpeculative, mtpHeadLabel } from '../lib/model.js';
 
 const HBM_SPEC = 2450, HBM_BEST = 2240;   // GB/s: Gaudi 2 HBM2E spec (tier B) and the best measured on this card (docs/profiling.md)
@@ -183,7 +183,7 @@ export function Readout({ mode, st, info, switchStep, rec, steps, sampling, note
     <${ModelPanel} desc=${desc} sec=${sec} mode=${mode} />
     <div class="ro-foot">
       ${note ? html`<span class="ro-note" title=${note.title || note.text}>${note.text}</span>` : null}
-      ${st.cacheN > 0 ? html`<span class="reuse">reused <b>${fmtInt(st.cacheN)}</b> tokens · prefill ${fmtMs(st.promptMs)}</span>` : html`<span>prompt <b>${fmtInt(st.promptN)}</b> tokens in ${fmtMs(st.promptMs)}</span>`}
+      ${st.cacheN > 0 ? html`<span class="reuse" title=${(reuseSource(st) || {}).title || ''}>reused <b>${fmtInt(st.cacheN)}</b> tokens${reuseSource(st) ? ` ${reuseSource(st).text}` : ''} · prefill ${fmtMs(st.promptMs)}</span>` : html`<span>prompt <b>${fmtInt(st.promptN)}</b> tokens in ${fmtMs(st.promptMs)}</span>`}
       <span><b>${fmtInt(st.n)}</b> tokens in ${fmtMs(st.ms)}</span>
       ${st.waitMs > 800 ? html`<span title="Time the request waited for the card before the engine took it">waited ${fmtMs(st.waitMs)} for the card</span>` : null}
       <span><b>${fmtInt(st.launches)}</b> launches${st.msPerStep ? ` · ${fmt1(st.msPerStep)} ms each` : ''}</span>

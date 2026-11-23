@@ -5,6 +5,7 @@
 //! all streams before releasing the device (`AGENTS.md` §8).
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -87,6 +88,10 @@ pub struct HpuDevice {
     allocs: Vec<HbmAllocRecord>,
     shared_ws_addr: u64,
     shared_ws_size: u64,
+    /// True from the open until the streams have been drained for the last time in `Drop`.
+    /// What holds host memory mapped for this device reads it before it unmaps
+    /// (`synapse/xfer.rs`).
+    open: Arc<AtomicBool>,
 }
 
 impl HpuDevice {
@@ -169,7 +174,14 @@ impl HpuDevice {
             allocs: Vec::new(),
             shared_ws_addr: 0,
             shared_ws_size: 0,
+            open: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// Whether this device is still open, for a holder of host memory that is mapped for it
+    /// and may be dropped before or after it.
+    pub fn open_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.open)
     }
 
     pub fn api(&self) -> &Arc<SynapseApi> {
@@ -544,6 +556,66 @@ impl HpuDevice {
         })
     }
 
+    /// Enqueues one host-to-device transfer of `bytes` from mapped host memory, NOT
+    /// synchronised: the host range must stay untouched until the H2D stream (or an event
+    /// recorded on it after this call) is synchronised.
+    ///
+    /// # Safety
+    /// `[src, src + bytes)` must lie inside host memory mapped for this device (`synHostMalloc`
+    /// or `synHostMap`) that stays mapped until the transfer has completed.
+    pub unsafe fn enqueue_h2d_raw(
+        &self,
+        src: *const u8,
+        bytes: u64,
+        dst_hbm: u64,
+    ) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("h2d refused: {e:?}")))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        syn_check("synMemCopyAsync(H2D)", unsafe {
+            (self.api.syn_mem_copy_async)(
+                self.h2d,
+                src as u64,
+                bytes,
+                dst_hbm,
+                SynDmaDir::HostToDram as u32,
+            )
+        })
+    }
+
+    /// Enqueues one device-to-host transfer of `bytes` into mapped host memory, NOT
+    /// synchronised: the host range holds the bytes only once the D2H stream (or an event
+    /// recorded on it after this call) is synchronised.
+    ///
+    /// # Safety
+    /// `[dst, dst + bytes)` must lie inside host memory mapped for this device (`synHostMalloc`
+    /// or `synHostMap`) that stays mapped until the transfer has completed.
+    pub unsafe fn enqueue_d2h_raw(
+        &self,
+        src_hbm: u64,
+        bytes: u64,
+        dst: *mut u8,
+    ) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("d2h refused: {e:?}")))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        syn_check("synMemCopyAsync(D2H)", unsafe {
+            (self.api.syn_mem_copy_async)(
+                self.d2h,
+                src_hbm,
+                bytes,
+                dst as u64,
+                SynDmaDir::DramToHost as u32,
+            )
+        })
+    }
+
     /// Copies `bytes` from `src_hbm` into the start of a pinned host buffer (blocking on D2H stream).
     pub fn copy_d2h_pinned_sync(
         &self,
@@ -692,6 +764,8 @@ impl Drop for HpuDevice {
     fn drop(&mut self) {
         // CRITICAL: Drain EVERY stream before freeing HBM or destroying streams/device!
         self.drain_all();
+        // from here on nothing is queued and the streams are about to go
+        self.open.store(false, Ordering::Release);
         for alloc in self.allocs.drain(..) {
             unsafe {
                 (self.api.syn_device_free)(self.dev_id, alloc.addr, 0);
