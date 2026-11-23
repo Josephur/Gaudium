@@ -1468,6 +1468,13 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             Some(t) => t.format.clone(),
             None => builtin_format(spec.family),
         };
+        // the tokens that end a reply of the model's own output form (a block form: its
+        // end-of-sequence token and the other roles' headers)
+        for marker in format.stop_markers() {
+            if let Some(id) = tok.token_id(marker).filter(|id| !extra_eos_ids.contains(id)) {
+                extra_eos_ids.push(id);
+            }
+        }
         // `--max-ctx` (or the model's own `--model-ctx`), clamped to the model's own limit.
         let max_ctx = served_max_ctx(&cfg, &entry.id, &entry.dir);
         let vision = vision_serve_of(&cfg, &entry.id, &entry.dir, max_ctx)

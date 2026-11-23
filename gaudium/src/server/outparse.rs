@@ -30,6 +30,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::tool_calls::{hold_back_limit, release_len, CallEvent, CallStream};
 use crate::json::{escape_json_into, parse_json, JsonValue};
+use crate::verified::MbState;
+
+mod blocks;
 
 const FN_OPEN: &str = "<function=";
 const FN_CLOSE: &str = "</function>";
@@ -45,6 +48,9 @@ pub enum CallStyle {
     Json,
     /// `NAME{key:value,...}` right after the opening tag.
     Call,
+    /// Typed message blocks the model opens itself (`blocks`): reasoning, text and calls each in
+    /// a block of their own, a call as `{"name": NAME, "args": {...}}`.
+    Blocks,
 }
 
 /// How a model family writes its reasoning and its tool calls.
@@ -83,6 +89,11 @@ impl OutputFormat {
         tokenizer_config: Option<&JsonValue>,
         chat_template: &str,
     ) -> (Self, Option<String>) {
+        if blocks::is_block_template(chat_template) {
+            // the template's own block markers say everything (a `response_template` of the
+            // tokenizer configuration describes the same blocks)
+            return (blocks::block_format(), None);
+        }
         let mut f = Self::default();
         if !chat_template.contains(FN_OPEN) && chat_template.contains("\"arguments\"") {
             f.style = CallStyle::Json;
@@ -143,6 +154,9 @@ impl OutputFormat {
     pub fn forced_prefix(&self, name: &str) -> String {
         let named = !name.is_empty();
         match self.style {
+            // a call without a name cannot be opened: its name comes first
+            CallStyle::Blocks if !named => String::new(),
+            CallStyle::Blocks => blocks::forced_call_prefix(name),
             CallStyle::Call => format!(
                 "{}{}",
                 self.tool_open,
@@ -168,9 +182,26 @@ impl OutputFormat {
         }
     }
 
+    /// Whether this form can write the opening of a forced call (`name` empty: `tool_choice`
+    /// required, any function).
+    pub fn can_force(&self, name: &str) -> bool {
+        !self.forced_prefix(name).is_empty()
+    }
+
+    /// The tokens that end a reply of this form besides the model's own end-of-sequence ids.
+    pub fn stop_markers(&self) -> &'static [&'static str] {
+        match self.style {
+            CallStyle::Blocks => &blocks::STOP_MARKERS,
+            _ => &[],
+        }
+    }
+
     /// Whether `text` is part of one of this form's tags (a special token whose text must reach
     /// the parser).
     pub fn is_marker_piece(&self, text: &str) -> bool {
+        if self.style == CallStyle::Blocks {
+            return blocks::is_marker(text);
+        }
         !text.is_empty()
             && [
                 &self.think_open,
@@ -410,6 +441,11 @@ pub struct OutputParser {
     csep: String,
     /// Call form: the string being read is streamed (else held and cast when it closes).
     str_streamed: bool,
+    /// Message blocks: where the verified block reader is, the open block's name and the open
+    /// call's text.
+    mb: MbState,
+    mb_name: String,
+    mb_call: String,
 }
 
 impl OutputParser {
@@ -459,6 +495,9 @@ impl OutputParser {
             cfilled: Vec::new(),
             csep: String::new(),
             str_streamed: false,
+            mb: Self::block_start(reasoning_open),
+            mb_name: String::new(),
+            mb_call: String::new(),
         }
     }
 
@@ -582,6 +621,9 @@ impl OutputParser {
     }
 
     fn route(&mut self, text: &str, d: &mut Delta, last: bool) {
+        if self.f.style == CallStyle::Blocks {
+            return self.route_blocks(text, d, last);
+        }
         self.buf.push_str(text);
         loop {
             if self.stopped {
@@ -1839,5 +1881,116 @@ mod tests {
             );
             assert!(s.consistent() && s.c.is_empty());
         }
+    }
+
+    fn blocks() -> OutputFormat {
+        OutputFormat::detect(
+            None,
+            "{{ '<|message_user|><|content_text|>' ~ m ~ '<|end_message|><|message_model|>' }}",
+        )
+        .0
+    }
+
+    fn block_parser(tools_on: bool, split: bool) -> OutputParser {
+        OutputParser::new(false, split, tools_on.then(tools), Vec::new(), blocks())
+    }
+
+    const H: &str = "<|message_model|>";
+    const E: &str = "<|end_message|>";
+
+    #[test]
+    fn message_blocks_split_at_every_piece_size() {
+        let reply = format!(
+            "{H}<|content_thinking|>Let me think <about> it.{E}{H}<|content_text|>Hello <|world!{E}\
+             {H}get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":{{\"city\":\"Oslo\",\"days\":2}}}}{E}\
+             {H}<|content_invoke_tool_json|>{{\"name\":\"write_file\",\"args\":{{\"path\":\"a\",\"content\":\"x<|y\"}}}}{E}\
+             <|content_model_end_sampling|>trailing text is not read"
+        );
+        for step in 1..reply.chars().count() {
+            let mut p = block_parser(true, true);
+            let s = stream_parse(&mut p, &reply, step);
+            assert_eq!(s.r, "Let me think <about> it.", "step {step}");
+            assert_eq!(s.c, "Hello <|world!", "step {step}");
+            assert!(s.consistent(), "step {step}");
+            assert_eq!(s.calls.len(), 2, "step {step}");
+            assert_eq!(s.calls[0].name, "get_weather");
+            assert_eq!(args_of(&s.calls[0]).get("days").unwrap().as_i64(), Some(2));
+            assert_eq!(s.calls[1].name, "write_file");
+            assert_eq!(
+                args_of(&s.calls[1]).get("content").unwrap().as_str(),
+                Some("x<|y")
+            );
+            assert_eq!((p.content(), p.reasoning()), (s.c.as_str(), s.r.as_str()));
+        }
+    }
+
+    #[test]
+    fn message_blocks_without_split_tools_or_ends() {
+        let reply = format!(
+            "{H}<|content_thinking|>hmm{E}{H}x<|content_invoke_tool_json|>{{\"name\":\"x\",\"args\":{{}}}}{E}"
+        );
+        // reasoning stays in the content; without tools a call block is text
+        let s = stream_parse(&mut block_parser(false, false), &reply, 3);
+        assert_eq!((s.r.as_str(), s.c.as_str()), ("", "hmm{\"name\":\"x\",\"args\":{}}"));
+        assert!(s.calls.is_empty());
+        // a call cut off by the end of generation: kept when whole, dropped (never shown) when not
+        let whole = format!("{H}<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":{{\"city\":\"Oslo\"}}}}");
+        let s = stream_parse(&mut block_parser(true, true), &whole, 2);
+        assert_eq!(s.calls.len(), 1);
+        assert!(s.consistent());
+        let cut = format!("{H}<|content_text|>Sure.{E}{H}get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":{{\"ci");
+        for step in 1..cut.len() {
+            let s = stream_parse(&mut block_parser(true, true), &cut, step);
+            assert_eq!((s.c.as_str(), s.calls.len()), ("Sure.", 0), "step {step}");
+        }
+        // a closed block that is no call is given back as content
+        let bad = format!("{H}<|content_invoke_tool_json|>not json{E}{H}<|content_text|>!{E}");
+        let s = stream_parse(&mut block_parser(true, true), &bad, 4);
+        assert_eq!((s.c.as_str(), s.calls.len()), ("not json!", 0));
+        // the name before the call marker stands in for a JSON without one
+        let named = format!("{H}get_weather<|content_invoke_tool_json|>{{\"args\":{{\"days\":1}}}}{E}");
+        let s = stream_parse(&mut block_parser(true, true), &named, 5);
+        assert_eq!(s.calls[0].name, "get_weather");
+        // another role's header ends the reply
+        let over = format!("{H}<|content_text|>Done.{E}<|message_user|><|content_text|>more{E}");
+        let s = stream_parse(&mut block_parser(true, true), &over, 1);
+        assert_eq!(s.c, "Done.");
+        // one call only: the reply ends after it
+        let mut p = block_parser(true, true);
+        p.set_max_calls(1);
+        let two = format!(
+            "{H}<|content_invoke_tool_json|>{{\"name\":\"a\",\"args\":{{}}}}{E}{H}<|content_invoke_tool_json|>{{\"name\":\"b\",\"args\":{{}}}}{E}"
+        );
+        let s = stream_parse(&mut p, &two, 7);
+        assert!(p.stopped() && s.calls.len() == 1 && s.calls[0].name == "a");
+        // a prompt that ends inside a reasoning block starts there
+        let mut p = OutputParser::new(true, true, None, Vec::new(), blocks());
+        let s = stream_parse(&mut p, &format!("still thinking{E}{H}<|content_text|>ok{E}"), 2);
+        assert_eq!((s.r.as_str(), s.c.as_str()), ("still thinking", "ok"));
+    }
+
+    #[test]
+    fn message_block_form_is_detected_and_forces_named_calls() {
+        let f = blocks();
+        assert_eq!(f.style, CallStyle::Blocks);
+        assert_eq!((f.think_open.as_str(), f.think_close.as_str()), ("<|content_thinking|>", E));
+        assert!(f.is_marker_piece(E) && f.is_marker_piece("<|content_model_end_sampling|>"));
+        assert!(!f.is_marker_piece("<|endoftext|>") && !f.is_marker_piece(""));
+        assert!(f.stop_markers().contains(&"<|message_user|>"));
+        assert!(OutputFormat::default().stop_markers().is_empty());
+        // a call to any tool cannot be opened (its name comes first); a named one can
+        assert!(!f.can_force("") && f.can_force("get_weather") && OutputFormat::default().can_force(""));
+        let prefix = f.forced_prefix("get_weather");
+        assert_eq!(
+            prefix,
+            format!("{H}get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":")
+        );
+        let mut p = block_parser(true, true);
+        let opened = p.feed(&prefix);
+        let rest = format!("{{\"city\":\"Oslo\"}}}}{E}<|content_model_end_sampling|>");
+        let t = stream_parse(&mut p, &rest, 3);
+        assert_eq!(t.calls.len(), 1);
+        assert_eq!(args_of(&t.calls[0]).dump(), "{\"city\":\"Oslo\"}");
+        assert!(t.c.is_empty() && opened.is_empty());
     }
 }

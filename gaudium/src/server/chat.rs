@@ -8,9 +8,9 @@
 use std::path::Path;
 
 use super::jinja::{self, Template, Value};
-use super::outparse::OutputFormat;
-use crate::core::effort::{Effort, EffortLevels};
-use crate::core::tool_calls::{ToolChoice, ToolPolicy};
+use super::outparse::{CallStyle, OutputFormat};
+use crate::core::effort::{Effort, EffortForm, EffortLevels, NumberEffort, OFF};
+use crate::core::tool_calls::{ForcePlace, ToolChoice, ToolPolicy};
 use crate::json::{parse_json, JsonValue};
 use crate::vision::media::MediaRef;
 
@@ -26,6 +26,8 @@ pub struct ChatTemplate {
     pub supports_tools: bool,
     /// The levels of the effort scale the template accepts for `reasoning_effort`.
     pub effort: EffortLevels,
+    /// How the template takes reasoning off and numeric efforts.
+    pub effort_form: EffortForm,
 }
 
 impl ChatTemplate {
@@ -63,15 +65,23 @@ impl ChatTemplate {
             format,
             supports_tools: source.contains("tools"),
             effort: EffortLevels::NONE,
+            effort_form: EffortForm::default(),
         };
         if source.contains("reasoning_effort") {
             t.effort = t.detect_effort();
+            t.effort_form = t.detect_effort_form();
         }
         Ok((t, note))
     }
 
     /// A one-message chat rendered with reasoning on and `reasoning_effort` set to `level`.
     fn probe_effort(&self, level: &str) -> Result<String, jinja::Error> {
+        self.probe(Some(Value::str(level)), true)
+    }
+
+    /// A one-message chat rendered with the reasoning flag `thinking` and `reasoning_effort`
+    /// set to `effort` (`None`: not set).
+    fn probe(&self, effort: Option<Value>, thinking: bool) -> Result<String, jinja::Error> {
         let mut ctx: Vec<(String, Value)> = vec![
             (
                 "messages".into(),
@@ -82,9 +92,27 @@ impl ChatTemplate {
         for (k, v) in &self.tokens {
             ctx.push((k.clone(), Value::str(v)));
         }
-        ctx.push(("enable_thinking".into(), Value::Bool(true)));
-        ctx.push(("reasoning_effort".into(), Value::str(level)));
+        ctx.push(("enable_thinking".into(), Value::Bool(thinking)));
+        if let Some(e) = effort {
+            ctx.push(("reasoning_effort".into(), e));
+        }
         self.template.render(ctx)
+    }
+
+    /// The off level, numbers and the flag, found like the levels: a value is accepted when the
+    /// template renders with it and tells it apart from a value it cannot know.
+    fn detect_effort_form(&self) -> EffortForm {
+        let unknown = self.probe_effort("gaudium-unknown-effort").ok();
+        let accepted = |v: Value| match (self.probe(Some(v), true), &unknown) {
+            (Ok(text), Some(u)) => text != *u,
+            (Ok(_), None) => true,
+            (Err(_), _) => false,
+        };
+        EffortForm {
+            off_level: accepted(Value::str(OFF)),
+            numbers: accepted(Value::Float(0.5)),
+            reads_flag: self.probe(None, true).ok() != self.probe(None, false).ok(),
+        }
     }
 
     /// The template renders with this level (it does not raise).
@@ -275,7 +303,11 @@ fn video_ref(p: &JsonValue) -> Result<MediaRef, String> {
 /// before image input). With an image or a video the parts stay a list, each media part reduced
 /// to its type (the template writes its placeholder; the bytes stay out of the context) and
 /// appended to `media` in order.
-fn convert_parts(parts: &[JsonValue], media: &mut Vec<MediaRef>) -> Result<JsonValue, String> {
+fn convert_parts(
+    parts: &[JsonValue],
+    media: &mut Vec<MediaRef>,
+    keep_list: bool,
+) -> Result<JsonValue, String> {
     let mut out: Vec<JsonValue> = Vec::with_capacity(parts.len());
     let mut text = String::new();
     let mut has_media = false;
@@ -316,7 +348,7 @@ fn convert_parts(parts: &[JsonValue], media: &mut Vec<MediaRef>) -> Result<JsonV
             other => return Err(format!("unknown content part type '{other}'")),
         }
     }
-    Ok(if has_media {
+    Ok(if has_media || keep_list {
         JsonValue::Array(out)
     } else {
         JsonValue::Str(text)
@@ -381,7 +413,12 @@ fn convert_tool_call(call: &JsonValue) -> Result<JsonValue, String> {
 }
 
 /// The request's messages as the template gets them, and their images and videos in order.
-fn convert_messages(msgs: &JsonValue) -> Result<(Vec<JsonValue>, Vec<MediaRef>), String> {
+/// `keep_lists`: text-only content parts stay a list (a template that renders each part as a
+/// block of its own), else they are joined into one string.
+fn convert_messages(
+    msgs: &JsonValue,
+    keep_lists: bool,
+) -> Result<(Vec<JsonValue>, Vec<MediaRef>), String> {
     let Some(list) = msgs.as_array() else {
         return Err("'messages' must be an array".into());
     };
@@ -402,7 +439,9 @@ fn convert_messages(msgs: &JsonValue) -> Result<(Vec<JsonValue>, Vec<MediaRef>),
             let v = match (k.as_str(), v) {
                 ("role", JsonValue::Str(r)) if r == "developer" => JsonValue::Str("system".into()),
                 ("content", JsonValue::Str(_) | JsonValue::Null) => v.clone(),
-                ("content", JsonValue::Array(parts)) => convert_parts(parts, &mut media)?,
+                ("content", JsonValue::Array(parts)) => {
+                    convert_parts(parts, &mut media, keep_lists)?
+                }
                 ("content", _) => {
                     return Err(
                         "message content must be a string, an array of parts, or null".into(),
@@ -458,7 +497,11 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
     let Some(raw_msgs) = body.get("messages") else {
         return Err("'messages' is required".into());
     };
-    let (msgs, media) = convert_messages(raw_msgs)?;
+    let continue_final = flag(body, "continue_final_message").unwrap_or(false);
+    // a block template renders each text part as its own block (a continued final message is
+    // cut after its text, which must then be one string)
+    let keep_lists = t.format.style == CallStyle::Blocks && !continue_final;
+    let (msgs, media) = convert_messages(raw_msgs, keep_lists)?;
     let mut ignored = Vec::new();
 
     let mut kwargs = match body.get("chat_template_kwargs") {
@@ -466,10 +509,34 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
         Some(k @ JsonValue::Object(_)) => k.clone(),
         Some(_) => return Err("chat_template_kwargs must be an object".into()),
     };
+    // the request's effort turned reasoning off
+    let mut effort_off = false;
+    if let Some(n @ (JsonValue::Int(_) | JsonValue::Float(_))) = body.get("reasoning_effort") {
+        if kwargs.get("reasoning_effort").is_none() {
+            match t.effort_form.number(n.as_f64() == Some(0.0)) {
+                NumberEffort::Pass { thinks } => {
+                    effort_off = !thinks;
+                    if kwargs.get("enable_thinking").is_none() {
+                        set(&mut kwargs, "enable_thinking", JsonValue::Bool(thinks));
+                    }
+                    set(&mut kwargs, "reasoning_effort", n.clone());
+                }
+                NumberEffort::Refuse => {
+                    return Err(format!(
+                        "reasoning_effort must be a level name for this model (its levels: none{}{})",
+                        if t.effort.supported() { ", " } else { "" },
+                        t.effort.advertised().join(", ")
+                    ))
+                }
+            }
+        }
+    }
     if let Some(effort) = body.get("reasoning_effort").and_then(JsonValue::as_str) {
         if kwargs.get("reasoning_effort").is_none() {
             // the verified plan: reasoning off, on at one of the template's levels, or on alone
-            let (thinks, level) = match t.effort.plan(effort) {
+            let plan = t.effort.plan(effort);
+            effort_off = plan == Effort::Off;
+            let (thinks, level) = match plan {
                 Effort::Off => (false, None),
                 Effort::Level(l) => (true, Some(l)),
                 Effort::ThinkOnly => (true, None),
@@ -493,7 +560,6 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
         }
     }
 
-    let continue_final = flag(body, "continue_final_message").unwrap_or(false);
     let add_generation_prompt = flag(body, "add_generation_prompt").unwrap_or(!continue_final);
     if continue_final && add_generation_prompt {
         return Err("continue_final_message and add_generation_prompt cannot both be true".into());
@@ -536,6 +602,12 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
                 .push("enable_thinking with a forced tool call (the call opens the reply)".into());
         }
         set(&mut kwargs, "enable_thinking", JsonValue::Bool(false));
+    }
+    // reasoning off reaches a template that ignores the flag through its off level
+    let off = effort_off
+        || kwargs.get("enable_thinking").and_then(JsonValue::as_bool) == Some(false);
+    if t.effort_form.off_by_level(off, kwargs.get("reasoning_effort").is_some()) {
+        set(&mut kwargs, "reasoning_effort", JsonValue::Str(OFF.into()));
     }
 
     let mut ctx: Vec<(String, Value)> = vec![(
@@ -596,14 +668,21 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
         _ => false,
     };
     let mut forced_prefix = String::new();
-    if policy.forces {
-        if reasoning_open(&text) {
-            // the template opened the reasoning anyway: the call cannot be placed
-            ignored.push("tool_choice with a template that always reasons (not forced)".into());
-        } else {
+    let in_reasoning = reasoning_open(&text);
+    match policy.placement(in_reasoning, t.format.can_force(&force_name)) {
+        ForcePlace::FpPlace => {
             forced_prefix = t.format.forced_prefix(&force_name);
             text.push_str(&forced_prefix);
         }
+        // the template opened the reasoning anyway: the call cannot be placed
+        ForcePlace::FpIgnored if in_reasoning => {
+            ignored.push("tool_choice with a template that always reasons (not forced)".into())
+        }
+        // the model writes a call's name first, so a call to any tool cannot be opened for it
+        ForcePlace::FpIgnored => ignored.push(
+            "tool_choice=required with a model whose calls open with their name (not forced; name the function to force it)".into(),
+        ),
+        ForcePlace::FpNone => {}
     }
 
     // the reply is parsed against the offered tools, plus tools known but not rendered
@@ -712,11 +791,205 @@ pub(super) const EFFORT_TEMPLATE: &str = r#"{%- set thinking = enable_thinking i
     {{- '<|im_start|>assistant\n' ~ ('<think>\n' if thinking else '<think>\n\n</think>\n\n') }}
 {%- endif %}"#;
 
+/// A small template in the message-block form: typed blocks, an effort block whose level is a
+/// name or a number (0 = no reasoning), and the reasoning flag ignored (the tests' own).
+#[cfg(test)]
+pub(super) const BLOCK_TEMPLATE: &str = r#"{%- set levels = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99} -%}
+{%- macro effort() -%}
+{%- set e = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}
+{%- set n = levels[e | trim] if e is string else e | float -%}
+{%- if n is undefined or n < 0.0 or n > 0.99 -%}{{ raise_exception("Unknown effort: " ~ e) }}{%- endif -%}
+<|message_system|><|content_text|>Effort: {{ n }}<|end_message|>
+{%- endmacro -%}
+{%- if tools -%}<|message_system|>tool_declare<|content_xml|>{{ tools | tojson(sort_keys=true, separators=(",", ":")) }}<|end_message|>{%- endif -%}
+{{- effort() -}}
+{%- for m in messages -%}
+{%- set r = "<|message_model|>" if m.role == "assistant" else "<|message_" ~ m.role ~ "|>" -%}
+{%- if m.content is string and m.content -%}{{ r }}<|content_text|>{{ m.content }}<|end_message|>
+{%- elif m.content is sequence -%}{%- for p in m.content -%}{{ r }}{{ "<|content_image|><|unused_200054|>" if p.type == "image" else "<|content_text|>" ~ p.text }}<|end_message|>{%- endfor -%}
+{%- endif -%}
+{%- for tc in m.tool_calls or [] -%}<|message_model|>{{ tc.function.name }}<|content_invoke_tool_json|>{"name":{{ tc.function.name | tojson }},"args":{{ tc.function.arguments | tojson(sort_keys=true, separators=(",", ":")) }}}<|end_message|>{%- endfor -%}
+{%- if m.role == "assistant" -%}<|content_model_end_sampling|>{%- endif -%}
+{%- endfor -%}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const TEMPLATE: &str = TEST_TEMPLATE;
+
+    fn block_prompt(t: &ChatTemplate, extra: &str) -> Result<ChatPrompt, String> {
+        let body = format!("{{\"messages\":[{{\"role\":\"user\",\"content\":\"w?\"}}]{extra}}}");
+        render_chat(t, &parse_json(&body).unwrap())
+    }
+
+    #[test]
+    fn block_templates_take_efforts_names_numbers_and_reasoning_off() {
+        let t = ChatTemplate::from_parts(BLOCK_TEMPLATE, None).unwrap().0;
+        assert_eq!(t.format.style, CallStyle::Blocks);
+        assert_eq!(
+            t.effort.advertised(),
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            t.effort_form,
+            EffortForm {
+                off_level: true,
+                numbers: true,
+                reads_flag: false
+            }
+        );
+        let effort = |extra: &str| {
+            let p = block_prompt(&t, extra).unwrap();
+            assert!(!p.reasoning_open && p.forced_prefix.is_empty());
+            let at = p.text.find("Effort: ").unwrap() + 8;
+            p.text[at..p.text[at..].find('<').unwrap() + at].to_string()
+        };
+        assert_eq!(effort(""), "0.9");
+        assert_eq!(effort(",\"reasoning_effort\":\"low\""), "0.2");
+        assert_eq!(effort(",\"reasoning_effort\":\"max\""), "0.99");
+        assert_eq!(effort(",\"reasoning_effort\":0.5"), "0.5");
+        // reasoning off: the effort's own word, the flag (the Web UI), a zero effort
+        assert_eq!(effort(",\"reasoning_effort\":\"none\""), "0.0");
+        assert_eq!(
+            effort(",\"reasoning_effort\":\"none\",\"chat_template_kwargs\":{\"enable_thinking\":true}"),
+            "0.0"
+        );
+        assert_eq!(effort(",\"chat_template_kwargs\":{\"enable_thinking\":false}"), "0.0");
+        assert_eq!(effort(",\"reasoning_effort\":0"), "0.0");
+        // an effort the request names wins over the off level
+        assert_eq!(
+            effort(",\"chat_template_kwargs\":{\"enable_thinking\":false,\"reasoning_effort\":\"low\"}"),
+            "0.2"
+        );
+        assert_eq!(
+            block_prompt(&t, ",\"reasoning_effort\":\"turbo\"").unwrap_err(),
+            "reasoning_effort 'turbo' is not a level of this model (its levels: none, minimal, low, medium, high, xhigh, max)"
+        );
+        // the template's own refusal is the request's error
+        assert_eq!(
+            block_prompt(&t, ",\"reasoning_effort\":1.5").unwrap_err(),
+            "chat template: Unknown effort: 1.5"
+        );
+        // a template that takes no numbers refuses one (it would be ignored otherwise)
+        let named = ChatTemplate::from_parts(EFFORT_TEMPLATE, None).unwrap().0;
+        assert_eq!(named.effort_form, EffortForm { reads_flag: true, ..EffortForm::default() });
+        assert!(block_prompt(&named, ",\"reasoning_effort\":0.5")
+            .unwrap_err()
+            .starts_with("reasoning_effort must be a level name for this model (its levels: none, low"));
+        // the flag reaches a template that reads it, without the off level
+        let p = block_prompt(&named, ",\"chat_template_kwargs\":{\"enable_thinking\":false}").unwrap();
+        assert!(p.text.starts_with("<|im_start|>user") && !p.reasoning_open);
+    }
+
+    #[test]
+    fn block_templates_keep_text_parts_and_force_named_calls() {
+        let t = ChatTemplate::from_parts(BLOCK_TEMPLATE, None).unwrap().0;
+        let body = parse_json(&format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"a"}},{{"type":"text","text":"b"}}]}},
+                {{"role":"assistant","content":null,"tool_calls":[{{"id":"c1","type":"function","function":{{"name":"get_weather","arguments":"{{\"days\":2,\"city\":\"Oslo\"}}"}}}}]}},
+                {{"role":"tool","tool_call_id":"c1","content":"sunny"}}],{TOOLS}}}"#
+        ))
+        .unwrap();
+        let p = render_chat(&t, &body).unwrap();
+        assert!(p.text.contains(
+            "<|message_user|><|content_text|>a<|end_message|><|message_user|><|content_text|>b<|end_message|>\
+             <|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\",\"days\":2}}<|end_message|><|content_model_end_sampling|>\
+             <|message_tool|><|content_text|>sunny<|end_message|>"
+        ), "{}", p.text);
+        // a named call opens the reply; reasoning is off through the off level
+        let p = block_prompt(
+            &t,
+            &format!(",{TOOLS},\"tool_choice\":{{\"type\":\"function\",\"function\":{{\"name\":\"get_weather\"}}}}"),
+        )
+        .unwrap();
+        assert_eq!(
+            p.forced_prefix,
+            "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":"
+        );
+        assert!(p.text.ends_with(&p.forced_prefix) && p.text.contains("Effort: 0.0"));
+        assert!(p.ignored.is_empty());
+        // a call to any tool cannot be opened in this form: noted, not forced
+        let p = block_prompt(&t, &format!(",{TOOLS},\"tool_choice\":\"required\"")).unwrap();
+        assert!(p.forced_prefix.is_empty() && p.ignored.len() == 1);
+        assert!(p.ignored[0].contains("name the function"));
+    }
+
+    /// Set `GAUDIUM_INKLING2_DIR` to an Inkling 2 model directory.
+    #[test]
+    #[ignore = "needs GAUDIUM_INKLING2_DIR with the model's chat template and tokenizer configuration"]
+    fn inkling2_requests_render_through_the_model_template() {
+        let dir = std::env::var("GAUDIUM_INKLING2_DIR").expect("GAUDIUM_INKLING2_DIR");
+        let (t, note) = ChatTemplate::load(Path::new(&dir)).unwrap().unwrap();
+        assert!(note.is_none() && t.supports_tools);
+        assert_eq!(t.format.style, CallStyle::Blocks);
+        assert_eq!(t.token("eos_token"), "<|content_model_end_sampling|>");
+        assert_eq!(
+            t.effort.advertised(),
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            t.effort_form,
+            EffortForm {
+                off_level: true,
+                numbers: true,
+                reads_flag: false
+            }
+        );
+        let level = |extra: &str| -> Result<String, String> {
+            let p = block_prompt(&t, extra)?;
+            let at = p.text.find("Thinking effort level: ").unwrap() + 23;
+            Ok(p.text[at..p.text[at..].find('<').unwrap() + at].to_string())
+        };
+        for (extra, want) in [
+            ("", "0.9"),
+            (",\"reasoning_effort\":\"none\"", "0"),
+            (",\"chat_template_kwargs\":{\"enable_thinking\":false}", "0"),
+            (",\"reasoning_effort\":\"minimal\"", "0.1"),
+            (",\"reasoning_effort\":\"medium\"", "0.7"),
+            (",\"reasoning_effort\":\"xhigh\"", "0.99"),
+            (",\"reasoning_effort\":0.5", "0.5"),
+            (",\"reasoning_effort\":0", "0"),
+        ] {
+            assert_eq!(level(extra).unwrap(), want, "{extra}");
+        }
+        assert_eq!(
+            level(",\"reasoning_effort\":1").unwrap_err(),
+            "chat template: reasoning_effort must be in [0.0, 0.99]"
+        );
+        // the prompt ends after the last message: the model opens its own block
+        let p = block_prompt(&t, "").unwrap();
+        assert!(p.text.ends_with("<|message_user|><|content_text|>w?<|end_message|>"));
+        // a client's tool calls (JSON text arguments) and results, the result named by its call
+        let body = parse_json(&format!(
+            r#"{{"messages":[{{"role":"user","content":"w?"}},
+                {{"role":"assistant","content":"","reasoning_content":"r","tool_calls":[{{"id":"c1","type":"function","function":{{"name":"get_weather","arguments":"{{\"days\":2,\"city\":\"Oslo\"}}"}}}}]}},
+                {{"role":"tool","tool_call_id":"c1","content":"sunny"}},
+                {{"role":"user","content":[{{"type":"text","text":"and this?"}},{{"type":"image_url","image_url":{{"url":"data:x"}}}}]}}],{TOOLS}}}"#
+        ))
+        .unwrap();
+        let p = render_chat(&t, &body).unwrap();
+        assert!(p.text.contains(
+            "<|message_model|><|content_thinking|>r<|end_message|>\
+             <|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\",\"days\":2}}<|end_message|><|content_model_end_sampling|>\
+             <|message_tool|>get_weather<|content_text|>sunny<|end_message|>\
+             <|message_user|><|content_text|>and this?<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>"
+        ), "{}", p.text);
+        assert_eq!(p.media.len(), 1);
+        // the template's refusals are the request's error
+        let err = render_chat(
+            &t,
+            &parse_json(r#"{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{}}]}]}"#).unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("audio"), "{err}");
+        let err = render_chat(
+            &t,
+            &parse_json(r#"{"messages":[{"role":"user","content":"x"},{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"data:x"}}]}]}"#).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err, "chat template: Image content is only supported for user and tool messages");
+    }
 
     const TOOLS: &str = r#""tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#;
 
@@ -862,7 +1135,7 @@ mod tests {
                 {"type":"video","video":{"frames":["data:7"],"timestamps":[0.5]}}]}]}"#,
         )
         .unwrap();
-        let (msgs, media) = convert_messages(body.get("messages").unwrap()).unwrap();
+        let (msgs, media) = convert_messages(body.get("messages").unwrap(), false).unwrap();
         assert_eq!(
             msgs[0].get("content").unwrap().dump(),
             r#"[{"type":"text","text":"a"},{"type":"image"},{"type":"image"},{"type":"image"},{"type":"video"},{"type":"video"},{"type":"video"}]"#
@@ -892,7 +1165,7 @@ mod tests {
             r#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#,
         )
         .unwrap();
-        let (msgs, media) = convert_messages(body.get("messages").unwrap()).unwrap();
+        let (msgs, media) = convert_messages(body.get("messages").unwrap(), false).unwrap();
         assert_eq!(msgs[0].get("content").unwrap().as_str(), Some("ab"));
         assert!(media.is_empty() && !has_media_parts(&body));
 
@@ -979,6 +1252,18 @@ mod tests {
         .0;
         assert_eq!(open.effort.advertised(), ["low", "high"]);
         assert!(open.effort_renders("max"));
+    }
+
+    /// Set `GAUDIUM_INKLING2_DIR` to an Inkling 2 model directory (its `chat_template.jinja`).
+    #[test]
+    #[ignore = "needs GAUDIUM_INKLING2_DIR with the model's chat_template.jinja"]
+    fn inkling2_template_renders_like_jinja2() {
+        let dir = std::env::var("GAUDIUM_INKLING2_DIR").expect("GAUDIUM_INKLING2_DIR");
+        let source = std::fs::read_to_string(Path::new(&dir).join("chat_template.jinja")).unwrap();
+        let fixture =
+            parse_json(include_str!("../../tests/data/chat/inkling2_renders.json")).unwrap();
+        let bad = jinja::fixture_mismatches(&source, fixture.get("cases").unwrap());
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     #[test]

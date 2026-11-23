@@ -41,7 +41,7 @@ type MbAct is Data:
   MaContent{}     # the text is visible content
   MaName{}        # the text is the block's name
   MaCallText{}    # the text belongs to the open call
-  MaReadCall{}    # the call block ended: its text is read as one call
+  MaReadCall{}    # the call block ended: read as one call (given back as content if it is none)
   MaCutCall{}     # the call block was left open: read if it is one whole call, else dropped
 
 # ============================================================================
@@ -614,3 +614,31 @@ def mb_finish_idempotent(s, split):
     case MsText{}: {==}
     case MsCall{}: {==}
     case MsDone{}: {==}
+
+# ============================================================================
+# 5. The call marker
+# ============================================================================
+
+# The tool-call content type opens a call only when the request offers tools; without tools the
+# block is read as text (its JSON is plain content).
+def mb_call_event(tools_on: Bool) -> MbEvent:
+  match tools_on:
+    case True{}:
+      MeOpenCall{}
+    case False{}:
+      MeOpenText{}
+
+# promise: without offered tools no block is ever read as a tool call
+# harm: a reply to a request without tools would lose text into a call nobody asked for
+law mb_no_tools_no_call:
+  {mb_call_event(False{}) == MeOpenText{} : MbEvent}
+
+def mb_no_tools_no_call():
+  {==}
+
+# promise: with offered tools the call marker always opens a tool call
+law mb_tools_call_opens:
+  {mb_call_event(True{}) == MeOpenCall{} : MbEvent}
+
+def mb_tools_call_opens():
+  {==}

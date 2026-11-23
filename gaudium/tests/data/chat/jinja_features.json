@@ -1,0 +1,201 @@
+{
+ "template": "{%- macro block(role, kind, text) -%}<{{ role }}:{{ kind }}>{{ text }}</>{%- endmacro -%}\n{%- set kinds = {\"user\": \"U\", \"assistant\": \"A\", \"system\": \"S\"} -%}\n{%- set st = namespace(n=0, seen=[]) -%}\n{%- for m in messages -%}\n{%- if m.role not in kinds -%}{{ raise_exception(\"Unknown role: \" ~ m.role) }}{%- endif -%}\n{%- set st.n = st.n + 1 -%}\n{%- set st.seen = st.seen + [m.role] -%}\n{%- set body -%}\n{%- if m.content is string -%}{{ block(kinds[m.role], \"t\", m.content) }}\n{%- elif m.content is sequence -%}{%- for p in m.content -%}{{ block(kinds[m.role], p.type, p.text | default(\"\")) }}{%- endfor -%}\n{%- endif -%}\n{%- endset -%}\n{%- if m.role == \"assistant\" -%}{%- generation -%}{{ body }}{%- endgeneration -%}{%- else -%}{{ body }}{%- endif -%}\n{%- if m.args is defined -%}\n{%- if m.args is not mapping -%}{{ raise_exception(\"args must be an object\") }}{%- endif -%}\n[{{ m.args | tojson }}|{{ m.args | tojson(sort_keys=true) }}|{{ m.args | tojson(separators=(\",\", \":\")) }}|{{ m.args | tojson(ensure_ascii=true, sort_keys=true, separators=(\",\", \":\")) }}|{{ m.args | tojson(indent=2) }}]\n{%- for k, v in m.args | dictsort(case_sensitive=true) -%}{{ k | tojson }}={{ v | tojson(separators=(\",\", \":\")) }}{%- if not loop.last -%};{%- endif -%}{%- endfor -%}\n{%- for k, v in m.args | dictsort -%}({{ k }}){%- endfor -%}\n{%- endif -%}\n{%- endfor -%}\n{{- \"#\" ~ st.n ~ \":\" ~ (st.seen | join(\",\")) -}}\n{%- if level is defined -%}\n{%- set num = level | float if level is not string else {\"low\": 0.2, \"high\": 0.9}[level | trim] -%}\n{%- if num is undefined -%}{{ raise_exception(\"Unknown level: \" ~ level) }}{%- endif -%}\n{%- if num < 0.0 or num > 0.99 -%}{{ raise_exception(\"level must be in [0.0, 0.99]\") }}{%- endif -%}\n{{- \" L=\" -}}{%- if num == 0.0 -%}0{%- else -%}{{ num }}{%- endif -%}\n{%- endif -%}\n{{- \" \" ~ (title | default(\"none\"))[1:4] ~ (title | default(\"none\"))[-2:] ~ (title | default(\"x\"))[::-1] -}}\n",
+ "cases": [
+  {
+   "name": "plain",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "text": "<U:t>Hi</>#1:user onenex"
+  },
+  {
+   "name": "parts",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "a"
+       },
+       {
+        "type": "image"
+       }
+      ]
+     }
+    ]
+   },
+   "text": "<U:text>a</><U:image></>#1:user onenex"
+  },
+  {
+   "name": "args",
+   "context": {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "ok",
+      "args": {
+       "b": 1,
+       "a": [
+        1,
+        2.5,
+        null,
+        true
+       ],
+       "B": {
+        "z": "é😀",
+        "y": "line\n\"q\""
+       },
+       "_": {}
+      }
+     }
+    ]
+   },
+   "text": "<A:t>ok</>[{\"b\": 1, \"a\": [1, 2.5, null, true], \"B\": {\"z\": \"é😀\", \"y\": \"line\\n\\\"q\\\"\"}, \"_\": {}}|{\"B\": {\"y\": \"line\\n\\\"q\\\"\", \"z\": \"é😀\"}, \"_\": {}, \"a\": [1, 2.5, null, true], \"b\": 1}|{\"b\":1,\"a\":[1,2.5,null,true],\"B\":{\"z\":\"é😀\",\"y\":\"line\\n\\\"q\\\"\"},\"_\":{}}|{\"B\":{\"y\":\"line\\n\\\"q\\\"\",\"z\":\"\\u00e9\\ud83d\\ude00\"},\"_\":{},\"a\":[1,2.5,null,true],\"b\":1}|{\n  \"b\": 1,\n  \"a\": [\n    1,\n    2.5,\n    null,\n    true\n  ],\n  \"B\": {\n    \"z\": \"é😀\",\n    \"y\": \"line\\n\\\"q\\\"\"\n  },\n  \"_\": {}\n}]\"B\"={\"z\":\"é😀\",\"y\":\"line\\n\\\"q\\\"\"};\"_\"={};\"a\"=[1,2.5,null,true];\"b\"=1(_)(a)(b)(B)#1:assistant onenex"
+  },
+  {
+   "name": "args_empty",
+   "context": {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "",
+      "args": {}
+     }
+    ]
+   },
+   "text": "<A:t></>[{}|{}|{}|{}|{}]#1:assistant onenex"
+  },
+  {
+   "name": "args_not_mapping",
+   "context": {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "",
+      "args": [
+       1
+      ]
+     }
+    ]
+   },
+   "error": "args must be an object"
+  },
+  {
+   "name": "bad_role",
+   "context": {
+    "messages": [
+     {
+      "role": "robot",
+      "content": "x"
+     }
+    ]
+   },
+   "error": "Unknown role: robot"
+  },
+  {
+   "name": "multi",
+   "context": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "s"
+     },
+     {
+      "role": "user",
+      "content": "u"
+     },
+     {
+      "role": "assistant",
+      "content": "a"
+     }
+    ]
+   },
+   "text": "<S:t>s</><U:t>u</><A:t>a</>#3:system,user,assistant onenex"
+  },
+  {
+   "name": "level_name",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     }
+    ],
+    "level": " high "
+   },
+   "text": "<U:t>x</>#1:user L=0.9 onenex"
+  },
+  {
+   "name": "level_number",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     }
+    ],
+    "level": 0.5
+   },
+   "text": "<U:t>x</>#1:user L=0.5 onenex"
+  },
+  {
+   "name": "level_zero",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     }
+    ],
+    "level": 0
+   },
+   "text": "<U:t>x</>#1:user L=0 onenex"
+  },
+  {
+   "name": "level_high_number",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     }
+    ],
+    "level": 0.99
+   },
+   "text": "<U:t>x</>#1:user L=0.99 onenex"
+  },
+  {
+   "name": "level_out_of_range",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     }
+    ],
+    "level": 1.5
+   },
+   "error": "level must be in [0.0, 0.99]"
+  },
+  {
+   "name": "title_slices",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     }
+    ],
+    "title": "Inkling été"
+   },
+   "text": "<U:t>x</>#1:user nkltéété gnilknI"
+  }
+ ]
+}

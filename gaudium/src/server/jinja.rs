@@ -298,15 +298,64 @@ fn python_str_repr(s: &str) -> String {
     o
 }
 
-/// Python `json.dumps(v, ensure_ascii=False, indent=indent)`.
-fn json_dumps(v: &Value, indent: Option<usize>, level: usize, o: &mut String) -> R<()> {
+/// The arguments of Python's `json.dumps` that `tojson` passes on.
+#[derive(Clone)]
+struct JsonOpts {
+    indent: Option<usize>,
+    item_sep: String,
+    key_sep: String,
+    sort_keys: bool,
+    ensure_ascii: bool,
+}
+
+impl JsonOpts {
+    /// `json.dumps(v, ensure_ascii=False, indent=indent)`.
+    fn new(indent: Option<usize>) -> Self {
+        Self {
+            item_sep: if indent.is_some() { "," } else { ", " }.into(),
+            key_sep: ": ".into(),
+            indent,
+            sort_keys: false,
+            ensure_ascii: false,
+        }
+    }
+}
+
+/// A JSON string literal as Python writes it (`ensure_ascii`: every non-ASCII character as
+/// `\uXXXX`, UTF-16 surrogate pairs above the BMP).
+fn json_str(o: &mut String, s: &str, ensure_ascii: bool) {
+    o.push('"');
+    if ensure_ascii && !s.is_ascii() {
+        let mut ascii = String::new();
+        for c in s.chars() {
+            if c.is_ascii() {
+                ascii.push(c);
+                continue;
+            }
+            crate::json::escape_json_into(o, &ascii);
+            ascii.clear();
+            let mut units = [0u16; 2];
+            for u in c.encode_utf16(&mut units) {
+                o.push_str(&format!("\\u{u:04x}"));
+            }
+        }
+        crate::json::escape_json_into(o, &ascii);
+    } else {
+        crate::json::escape_json_into(o, s);
+    }
+    o.push('"');
+}
+
+/// Python `json.dumps(v, ...)` with the options of [`JsonOpts`].
+fn json_dumps(v: &Value, opts: &JsonOpts, level: usize, o: &mut String) -> R<()> {
+    let indent = opts.indent;
     let newline = |o: &mut String, level: usize| {
         if let Some(n) = indent {
             o.push('\n');
             o.push_str(&" ".repeat(n * level));
         }
     };
-    let item_sep = if indent.is_some() { "," } else { ", " };
+    let item_sep = opts.item_sep.as_str();
     match v {
         Value::None => o.push_str("null"),
         Value::Bool(b) => o.push_str(if *b { "true" } else { "false" }),
@@ -316,11 +365,7 @@ fn json_dumps(v: &Value, indent: Option<usize>, level: usize, o: &mut String) ->
             x if x.is_infinite() => if x > 0.0 { "Infinity" } else { "-Infinity" }.to_string(),
             x => python_float(x),
         }),
-        Value::Str(s) => {
-            o.push('"');
-            crate::json::escape_json_into(o, s);
-            o.push('"');
-        }
+        Value::Str(s) => json_str(o, s, opts.ensure_ascii),
         Value::List(l) => {
             if l.is_empty() {
                 o.push_str("[]");
@@ -332,17 +377,20 @@ fn json_dumps(v: &Value, indent: Option<usize>, level: usize, o: &mut String) ->
                     o.push_str(item_sep);
                 }
                 newline(o, level + 1);
-                json_dumps(x, indent, level + 1, o)?;
+                json_dumps(x, opts, level + 1, o)?;
             }
             newline(o, level);
             o.push(']');
         }
         Value::Dict(_) | Value::Namespace(_) => {
-            let pairs: Pairs = match v {
+            let mut pairs: Pairs = match v {
                 Value::Dict(d) => d.as_ref().clone(),
                 Value::Namespace(n) => n.borrow().clone(),
                 _ => unreachable!(),
             };
+            if opts.sort_keys {
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            }
             if pairs.is_empty() {
                 o.push_str("{}");
                 return Ok(());
@@ -353,10 +401,9 @@ fn json_dumps(v: &Value, indent: Option<usize>, level: usize, o: &mut String) ->
                     o.push_str(item_sep);
                 }
                 newline(o, level + 1);
-                o.push('"');
-                crate::json::escape_json_into(o, k);
-                o.push_str("\": ");
-                json_dumps(x, indent, level + 1, o)?;
+                json_str(o, k, opts.ensure_ascii);
+                o.push_str(&opts.key_sep);
+                json_dumps(x, opts, level + 1, o)?;
             }
             newline(o, level);
             o.push('}');
@@ -645,6 +692,9 @@ enum Node {
     SetBlock(String, Vec<Node>),
     Macro(Arc<MacroDef>),
     Do(Expr),
+    /// A run of nodes rendered in place (`{% generation %}`: the reference marks the assistant's
+    /// part of the text with it and renders the body unchanged).
+    Seq(Vec<Node>),
     Break,
     Continue,
 }
@@ -1184,6 +1234,11 @@ impl TemplateParser {
                 p.done()?;
                 Ok(Node::Do(e))
             }
+            "generation" => {
+                p.done()?;
+                let (body, _) = self.until(&["endgeneration"])?;
+                Ok(Node::Seq(body))
+            }
             "break" => Ok(Node::Break),
             "continue" => Ok(Node::Continue),
             other => syn(format!("unknown statement '{other}'")),
@@ -1366,6 +1421,10 @@ impl Interp {
                 Node::Do(e) => {
                     self.eval(e)?;
                 }
+                Node::Seq(body) => match self.exec(body, out)? {
+                    Flow::Normal => {}
+                    flow => return Ok(flow),
+                },
                 Node::Break => return Ok(Flow::Break),
                 Node::Continue => return Ok(Flow::Continue),
             }
@@ -1665,12 +1724,29 @@ impl Interp {
     fn filter(&mut self, name: &str, v: Value, a: &Args) -> R<Value> {
         Ok(match name {
             "tojson" => {
+                // the chat-template `tojson`: json.dumps(v, ensure_ascii=False, indent=None,
+                // separators=None, sort_keys=False), each settable by keyword
                 let indent = a
-                    .get(0, "indent")
+                    .get(1, "indent")
                     .and_then(|x| x.as_int())
                     .map(|n| n.max(0) as usize);
+                let mut opts = JsonOpts::new(indent);
+                if let Some(e) = a.get(0, "ensure_ascii") {
+                    opts.ensure_ascii = e.truthy();
+                }
+                match a.get(2, "separators") {
+                    None | Some(Value::None) => {}
+                    Some(Value::List(l)) if l.len() == 2 => {
+                        opts.item_sep = l[0].to_text();
+                        opts.key_sep = l[1].to_text();
+                    }
+                    Some(_) => return rt("tojson: separators must be an (item, key) pair"),
+                }
+                if let Some(k) = a.get(3, "sort_keys") {
+                    opts.sort_keys = k.truthy();
+                }
                 let mut o = String::new();
-                json_dumps(&v, indent, 0, &mut o)?;
+                json_dumps(&v, &opts, 0, &mut o)?;
                 Value::str(o)
             }
             "string" => Value::str(v.to_text()),
@@ -2401,10 +2477,54 @@ fn strftime_utc(format: &str, secs: i64) -> String {
     o
 }
 
+/// Renders `source` with the context of each fixture case (`{"name", "context", "text" | "error"}`,
+/// written by `tests/data/chat/make_template_fixtures.py`) and returns the cases whose rendering
+/// (or `raise_exception` message) differs from the reference's.
+#[cfg(test)]
+pub(crate) fn fixture_mismatches(source: &str, cases: &JsonValue) -> Vec<String> {
+    let template = Template::parse(source).expect("the template parses");
+    let mut bad = Vec::new();
+    for case in cases.as_array().expect("a list of cases") {
+        let name = case.get("name").and_then(JsonValue::as_str).unwrap_or("?");
+        let vars = case
+            .get("context")
+            .and_then(JsonValue::as_object)
+            .expect("a context object")
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::from_json(v)))
+            .collect();
+        let got = template.render(vars);
+        let want_text = case.get("text").and_then(JsonValue::as_str);
+        let want_err = case.get("error").and_then(JsonValue::as_str);
+        let ok = match (&got, want_text, want_err) {
+            (Ok(t), Some(w), _) => t == w,
+            (Err(Error::Raised(m)), _, Some(w)) => m == w,
+            _ => false,
+        };
+        if !ok {
+            bad.push(format!(
+                "{name}: got {got:?}, want {:?}",
+                want_text.or(want_err)
+            ));
+        }
+    }
+    bad
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::json::parse_json;
+
+    #[test]
+    fn features_render_like_jinja2() {
+        let fixture = parse_json(include_str!("../../tests/data/chat/jinja_features.json")).unwrap();
+        let source = fixture.get("template").and_then(JsonValue::as_str).unwrap();
+        let cases = fixture.get("cases").unwrap();
+        assert!(cases.as_array().unwrap().len() >= 10);
+        let bad = fixture_mismatches(source, cases);
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
 
     fn render(src: &str, ctx: &str) -> String {
         try_render(src, ctx).unwrap_or_else(|e| panic!("{src}: {e}"))
