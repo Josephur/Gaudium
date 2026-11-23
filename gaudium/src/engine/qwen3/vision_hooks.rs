@@ -3,7 +3,8 @@
 //! A request with images does three extra things, all before the first prefill tile:
 //! 1. lays the prompt out (image-pad spans, M-RoPE positions),
 //! 2. rewrites the decoder's slot-indexed RoPE rows from the first image slot on,
-//! 3. runs the vision tower per image, leaving the merged embeddings in HBM.
+//! 3. runs the vision tower per image, leaving the merged embeddings in HBM (an image whose rows
+//!    all lie inside a prefix reused from the previous request is skipped: `engine/prefix_cache.rs`).
 //!
 //! During prefill, each tile's image-pad rows are overwritten on the device with those
 //! embeddings right after the tile's embedding gather. Decode needs nothing: it reads the RoPE
@@ -108,7 +109,8 @@ impl Qwen3Engine {
     }
 
     /// Reads the image embeddings of the last image request back from HBM: `tokens x HID`
-    /// BF16 values, rows in prompt order (validation against a reference tower).
+    /// BF16 values, rows in prompt order (validation against a reference tower). The rows of an
+    /// image that a resumed request did not encode again hold what an earlier request left.
     pub fn read_vision_embeddings(&self) -> Result<Vec<u8>, String> {
         let (Some(tower), Some(layout)) = (self.vision.as_ref(), self.last_prompt_layout()) else {
             return Err("no image request has run on this engine".into());
@@ -120,17 +122,47 @@ impl Qwen3Engine {
         Ok(out)
     }
 
-    /// Start of a request: runs the tower and installs the request's RoPE rows when images were
-    /// handed over, otherwise restores rows left by an earlier image request. Everything is
-    /// synchronized on return (success or error).
-    pub(super) fn vision_begin_request(
+    /// Start of a request, before its prefix plan: takes the images handed over and lays the
+    /// prompt out (image-pad spans, M-RoPE positions). `None`: a text-only request, or an
+    /// engine without image input. Nothing touches the device here.
+    pub(super) fn vision_prepare(
         &mut self,
         prompt_ids: &[i32],
-        max_new: u64,
-    ) -> Result<Option<PromptLayout>, String> {
+    ) -> Result<Option<(Vec<PreparedImage>, PromptLayout)>, String> {
         let images = std::mem::take(&mut self.vision_req.pending);
         self.vision_req.last_report = None;
         self.vision_req.last_layout = None;
+        let Some(tower) = self.vision.as_ref() else {
+            return Ok(None);
+        };
+        if images.is_empty() {
+            return Ok(None);
+        }
+        let grids: Vec<(usize, usize)> = images.iter().map(|i| (i.grid_h, i.grid_w)).collect();
+        let layout = layout_prompt(prompt_ids, &grids, tower.spec())?;
+        if layout.image_tokens() as u64 > tower.max_tokens() {
+            return Err(format!(
+                "the prompt holds {} image tokens; the vision embedding buffer was planned for {}",
+                layout.image_tokens(),
+                tower.max_tokens()
+            ));
+        }
+        Ok(Some((images, layout)))
+    }
+
+    /// Start of a request, after its prefix plan: installs the request's RoPE rows and runs the
+    /// tower when the request has images, otherwise restores rows left by an earlier image
+    /// request. `resume`: the prefill starts at this row; an image whose rows all lie before it
+    /// is not encoded again (no tile of this request reads its embeddings: its rows are among
+    /// the reused ones, which the verified rule only allows for the same picture at the same
+    /// place). Everything is synchronized on return (success or error).
+    pub(super) fn vision_begin_request(
+        &mut self,
+        prepared: Option<(Vec<PreparedImage>, PromptLayout)>,
+        prompt_len: usize,
+        max_new: u64,
+        resume: usize,
+    ) -> Result<Option<PromptLayout>, String> {
         let Some(tower) = self.vision.as_mut() else {
             return Ok(None);
         };
@@ -138,26 +170,17 @@ impl Qwen3Engine {
         let rope_s = self.weights_addr["rope_s"];
         let theta = self.spec.rope_theta;
         let rot = self.spec.rotary_dim as usize;
-        if images.is_empty() {
+        let Some((images, layout)) = prepared else {
             tower.apply_request_rope(&self.dev, rope_c, rope_s, theta, rot, None, 0)?;
             return Ok(None);
-        }
+        };
 
         let dev = &self.dev;
         let (cache, drv) = (&self.cache, self.driver_version.as_str());
         let max_ctx = self.max_ctx as usize;
-        let run = |tower: &mut VisionTower| -> Result<(PromptLayout, VisionReport), String> {
-            let grids: Vec<(usize, usize)> = images.iter().map(|i| (i.grid_h, i.grid_w)).collect();
-            let layout = layout_prompt(prompt_ids, &grids, tower.spec())?;
-            if layout.image_tokens() as u64 > tower.max_tokens() {
-                return Err(format!(
-                    "the prompt holds {} image tokens; the vision embedding buffer was planned for {}",
-                    layout.image_tokens(),
-                    tower.max_tokens()
-                ));
-            }
+        let run = |tower: &mut VisionTower| -> Result<VisionReport, String> {
             let t_rope = Instant::now();
-            let row_hi = (prompt_ids.len() + max_new as usize + ROPE_ROW_MARGIN).min(max_ctx);
+            let row_hi = (prompt_len + max_new as usize + ROPE_ROW_MARGIN).min(max_ctx);
             let rope_rows =
                 tower.apply_request_rope(dev, rope_c, rope_s, theta, rot, Some(&layout), row_hi)?;
             let rope_ms = t_rope.elapsed().as_secs_f64() * 1000.0;
@@ -165,14 +188,20 @@ impl Qwen3Engine {
             let compile0 = tower.compile_ms();
             let t_enc = Instant::now();
             let mut prep_ms = 0.0;
+            let mut reused_images = 0usize;
             for (img, span) in images.iter().zip(&layout.spans) {
+                if span.end() <= resume {
+                    reused_images += 1;
+                    continue;
+                }
                 prep_ms += tower.encode_image(dev, cache, drv, img, span.emb_row)?;
             }
             tower.sync(dev)?;
             let compile_ms = tower.compile_ms() - compile0;
             let total_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-            let report = VisionReport {
+            Ok(VisionReport {
                 images: images.len(),
+                reused_images,
                 patches: images.iter().map(|i| i.n_patches() as u64).sum(),
                 image_tokens: layout.image_tokens() as u64,
                 prep_ms,
@@ -181,11 +210,10 @@ impl Qwen3Engine {
                 rope_ms,
                 rope_rows,
                 rope_delta: layout.delta,
-            };
-            Ok((layout, report))
+            })
         };
         match run(tower) {
-            Ok((layout, report)) => {
+            Ok(report) => {
                 self.vision_req.last_report = Some(report);
                 self.vision_req.last_layout = Some(layout.clone());
                 Ok(Some(layout))

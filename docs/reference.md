@@ -61,6 +61,15 @@ Serve options:
                         change to kernels, graphs or contexts
   --build-cache-only <id>  The same for one served model id (repeatable)
   --idle-park <secs>    Auto-release Gaudi 2 after N seconds idle (0=off, default: 300)
+  --prefix-cache <N>    Prefix reuse across requests: a request whose prompt starts like
+                        the one before it prefills only the rest, with the same output
+                        as a whole prefill. N = positions of the previous prompt whose
+                        recurrent state is kept on the card to resume from (default: 8;
+                        0 = off; 0.15 GiB each for a 48-layer DeltaNet model). The
+                        context is planned first: a load keeps as many as fit beside
+                        it and says so. A request with cache_prompt: false prefills
+                        its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a
+                        drafter or with DSpine
   --queue-config <file> Card-queue settings, re-read on every turn (or GAUDIUM_QUEUE_CONFIG;
                         default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock
                         state dir). Keys: group_max_wait_min (default 45), group_max_skips
@@ -345,6 +354,10 @@ Generate options:
                         DeltaNet start state; KV rows past the cursor are masked),
                         dirty (also the KV rows earlier requests wrote) or full
                         (or GAUDIUM_REQUEST_RESET; same output in every mode)
+  --prefix-cache <N>    Prefix reuse between the requests of one run (default: 0 = off,
+                        every request prefills its whole prompt): keep the recurrent
+                        state at N positions of the previous prompt (see --prefix-cache
+                        under Server options)
   --prefill <k=v,..>    Prefill levers of the Qwen engines (default: all on): tile=N rows
                         per tile (multiple of 64 up to 512; 0 = the widest that fits),
                         mme=0|1 DeltaNet recurrence as chunked MME GEMMs, rows=0|1|2 its

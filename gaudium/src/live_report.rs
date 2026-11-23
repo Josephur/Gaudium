@@ -130,6 +130,8 @@ pub struct LaunchEvent {
     pub ttft_ms: f64,
     /// Prompt tokens in the model's context so far (the whole prompt from the first token on).
     pub prefill_pos: u64,
+    /// Prompt tokens taken over from the previous request (`set_cached`), not prefilled.
+    pub prompt_cached: u64,
     /// `begin_request` -> this event, on the reporter's clock.
     pub request_ms: f64,
 }
@@ -1156,6 +1158,7 @@ impl State {
             },
             ttft_ms: self.ttft_ms.unwrap_or(0.0),
             prefill_pos: self.prefill_done,
+            prompt_cached: self.prompt_cached,
             request_ms: ((t - self.t_begin_s) * 1e3).max(0.0),
         }
     }

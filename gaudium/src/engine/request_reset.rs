@@ -159,6 +159,13 @@ impl ResetState {
     pub(super) fn last_ms(&self) -> f64 {
         self.last_ms
     }
+
+    /// Does the reset of the next request zero K/V rows (a reset mode that does so for every
+    /// request, or the reset after a request that ended with an error)? A request after such a
+    /// reset cannot take anything over from the one before it.
+    pub(super) fn zeroes_rows(&self) -> bool {
+        scope_of(self.mode, self.unclean) != Scope::StateOnly
+    }
 }
 
 /// Enqueues the load-time zero fill of every K/V cache and state ring (`regions` = `(addr,

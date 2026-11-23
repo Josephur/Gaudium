@@ -733,6 +733,20 @@ impl SpecRuntime {
         }
     }
 
+    /// Can a request of this runtime resume its prefill from held state (prefix reuse)? The
+    /// drafters whose context a resumed prefill provably leaves as a cold one would: none (the
+    /// oracle streams) and DSpine, whose context rows are positional and written per tile.
+    /// The MTP head and DFlash2 keep further per-request state and are not validated for it.
+    pub fn prefix_reuse_ok(&self) -> bool {
+        self.mtp.is_none() && self.dflash2.is_none() && self.tree.is_none()
+    }
+
+    /// Rows of the drafter's context caches: a ring's rows, or one per context position; 0
+    /// without a drafter that keeps context rows.
+    pub fn context_rows(&self) -> u64 {
+        self.drafter.as_ref().map_or(0, |d| d.cfg.ctx_rows(self.lmax))
+    }
+
     pub fn max_ws(&self) -> u64 {
         self.max_ws
     }
@@ -1893,6 +1907,22 @@ pub(super) fn begin_request(eng: &mut Qwen3Engine, prompt_ids: &[i32]) {
             rt.prompt.clear();
             rt.prompt.extend_from_slice(prompt_ids);
         }
+    }
+}
+
+/// Start of a request, after its prefix plan: tells a drafter that keeps its context in rings
+/// the first position whose ring row is valid for this request (`floor`, from the verified
+/// `pc_ring_flo`). A cold request reads from position 0.
+pub(super) fn set_context_floor(eng: &mut Qwen3Engine, floor: u64) -> Result<(), String> {
+    let Qwen3Engine {
+        specdec,
+        dev,
+        stage_io,
+        ..
+    } = eng;
+    match specdec.as_mut().and_then(|rt| rt.drafter.as_mut()) {
+        Some(d) => d.set_context_floor(dev, stage_io, floor),
+        None => Ok(()),
     }
 }
 

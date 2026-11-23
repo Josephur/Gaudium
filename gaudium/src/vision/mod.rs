@@ -359,6 +359,9 @@ impl VisionSpec {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VisionReport {
     pub images: usize,
+    /// Images the tower did not run for: all their rows lie inside the prefix a request took
+    /// over from the one before it.
+    pub reused_images: usize,
     pub patches: u64,
     pub image_tokens: u64,
     /// Host input preparation and uploads (pixels, position rows, tower RoPE tables).

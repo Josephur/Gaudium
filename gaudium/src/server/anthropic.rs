@@ -147,8 +147,17 @@ pub fn sse(event: &str, data: &str) -> String {
 
 /// Input / output token counts in the Messages shape.
 pub fn usage_json(input_tokens: u64, output_tokens: u64) -> String {
+    usage_json_cached(input_tokens, 0, output_tokens)
+}
+
+/// The usage of a request whose prompt of `prompt_tokens` took `reused` tokens over from the
+/// request before it (prefix reuse): those are reported as read from the cache, the rest as
+/// input.
+pub fn usage_json_cached(prompt_tokens: u64, reused: u64, output_tokens: u64) -> String {
     format!(
-        "{{\"input_tokens\":{input_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":{output_tokens}}}"
+        "{{\"input_tokens\":{},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{},\"output_tokens\":{output_tokens}}}",
+        crate::verified::pc_prefill_rows(prompt_tokens, reused),
+        crate::verified::pc_reused_rows(prompt_tokens, reused),
     )
 }
 

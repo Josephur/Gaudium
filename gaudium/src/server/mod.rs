@@ -99,6 +99,9 @@ pub struct ServerConfig {
     pub vision_max_patches: u64,
     /// Image tokens one request may hold (the tower's embedding buffer).
     pub vision_max_tokens: u64,
+    /// Prefix reuse across requests: positions of the previous prompt whose recurrent state an
+    /// engine keeps on the card (0 = off; a load keeps as many as fit beside the context).
+    pub prefix_slots: u64,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -239,6 +242,9 @@ struct EngineSlot {
     hbm_bytes: Option<[u64; 5]>,
     /// How the resident model runs, read from its loaded engine.
     facts: Option<RunFacts>,
+    /// Prefix reuse of the resident engine as of its last request (`None`: no engine, or one
+    /// without it).
+    prefix: Option<crate::engine::qwen3::prefix_cache::PrefixStats>,
 }
 
 struct EventHubState {
@@ -781,6 +787,16 @@ impl AppState {
             ",\"model_desc\":{}",
             self.model_desc_with(idx, &self.run_facts(idx))
         ));
+        // prefix reuse of this model's engine while it is on the card (null: not loaded, or an
+        // engine that prefills every prompt whole)
+        let prefix = {
+            let s = self.slot.lock().unwrap();
+            match (&s.lifecycle, s.prefix) {
+                (Lifecycle::Ready(r), Some(p)) if *r == idx => readout::prefix_json(&p),
+                _ => "null".to_string(),
+            }
+        };
+        out.push_str(&format!(",\"prefix_cache\":{prefix}"));
         if include_router && self.models.len() > 1 {
             out.push_str(",\"role\":\"router\",\"max_instances\":1,\"models_autoload\":true");
         }
@@ -817,6 +833,7 @@ impl AppState {
                 s.engine = None; // drops Qwen3Engine -> drains streams & releases /dev/accel/accel0
                 s.hbm_bytes = None;
                 s.facts = None;
+                s.prefix = None;
                 s.lifecycle = Lifecycle::Parked;
             }
             if !can_switch_resident_model(s.active_requests, s.lifecycle.as_backend_state()) {
@@ -843,6 +860,7 @@ impl AppState {
             Ok(eng) => {
                 let dt = t0.elapsed().as_secs_f64();
                 let hbm = eng.hbm_bytes();
+                let prefix = eng.prefix_stats();
                 // what the readout says about this model comes from the engine that loaded it
                 let facts = RunFacts {
                     from_engine: true,
@@ -868,6 +886,7 @@ impl AppState {
                 s.last_activity = Instant::now();
                 s.hbm_bytes = Some(hbm);
                 s.facts = Some(facts);
+                s.prefix = prefix;
                 drop(s);
                 self.publish_engine_event();
                 if self.cfg.verbose {
@@ -913,6 +932,7 @@ impl AppState {
             s.engine = None; // drains streams & releases device + unlinks cardlock holder/live/shm
             s.hbm_bytes = None;
             s.facts = None;
+            s.prefix = None;
         }
         s.lifecycle = Lifecycle::Parked;
         s.detail = reason.to_string();
@@ -1050,6 +1070,7 @@ fn engine_config_of(
     qcfg.cache_dir = cfg.cache_dir.clone();
     qcfg.no_cache = cfg.no_cache;
     qcfg.verbose = cfg.verbose;
+    qcfg.prefix_slots = cfg.prefix_slots;
     if let Some((patches, tokens)) = vision_plan_of(cfg, id, dir, max_ctx) {
         // The tower's buffers are planned for the largest image. Its recipes are compiled at
         // load for that size (so the shared workspace covers them); other image sizes compile
@@ -1282,6 +1303,7 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             last_request_json: None,
             hbm_bytes: None,
             facts: None,
+            prefix: None,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
@@ -2479,6 +2501,11 @@ fn run_chat(
         draft_trunc,
         stop_on_eos: true,
         extra_eos_ids: m.extra_eos_ids.clone(),
+        // `cache_prompt: false` asks for a whole prefill (the reference a resumed one equals)
+        cache_prompt: val
+            .get("cache_prompt")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
         ..Qwen3GenParams::default()
     };
 
@@ -2663,11 +2690,13 @@ fn run_chat(
     }
     // the tower's own timings of this request (kept apart from the decoder's prefill)
     let vision_report = engine.last_vision_report().filter(|_| n_images > 0);
+    let prefix_stats = engine.prefix_stats();
 
     // Return engine cleanly to slot & decrement active counter!
     {
         let mut s = state.slot.lock().unwrap();
         s.engine = Some(engine);
+        s.prefix = prefix_stats;
         s.active_requests = s.active_requests.saturating_sub(1);
         s.last_activity = Instant::now();
     }
@@ -2717,13 +2746,14 @@ fn run_chat(
                 summary.as_ref().map(|s| s.launches)
             };
             let timings = Timings {
-                prompt_n: rep.prompt_tokens as u64,
                 prompt_ms: rep.ttft_ms,
                 predicted_n: n_gen,
                 predicted_ms: rep.decode_ms,
                 launches,
                 draft_n: rep.drafted,
                 draft_n_accepted: rep.draft_accepted,
+                // the prompt as reused + prefilled rows
+                ..Timings::of_prompt(rep.prompt_tokens as u64, rep.reused_tokens)
             };
             let timings_json = timings.json();
 
@@ -2742,9 +2772,11 @@ fn run_chat(
             state.hub.publish(final_live);
 
             let usage = format!(
-                "{{\"prompt_tokens\":{},\"completion_tokens\":{n_gen},\"total_tokens\":{}}}",
+                "{{\"prompt_tokens\":{},\"completion_tokens\":{n_gen},\"total_tokens\":{},\
+                 \"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}",
                 rep.prompt_tokens,
-                rep.prompt_tokens as u64 + n_gen
+                rep.prompt_tokens as u64 + n_gen,
+                timings.cache_n,
             );
             let seed_json = if is_greedy {
                 "null".to_string()
@@ -2789,6 +2821,16 @@ fn run_chat(
             if has_calls {
                 details.push_str(&format!(",\"tool_calls\":{}", parser.tool_calls().len()));
             }
+            // prefix reuse: rows taken over from the previous request, and how many rows of
+            // the prompt equal the one the engine held (a resume point lies below that)
+            if prefix_stats.is_some_and(|p| p.slots > 0) {
+                details.push_str(&format!(
+                    ",\"prefix\":{{\"hit\":{},\"reused_tokens\":{},\"common_tokens\":{}}}",
+                    timings.cache_n > 0,
+                    timings.cache_n,
+                    rep.prefix_common,
+                ));
+            }
             if n_images > 0 {
                 details.push_str(&format!(
                     ",\"vision\":{}",
@@ -2822,7 +2864,11 @@ fn run_chat(
             if let Api::Messages { show_thinking } = api {
                 let mut b = builder.unwrap_or_else(|| anthropic::Builder::new(show_thinking));
                 let stop = stop_reason_name(end, has_calls);
-                let usage = anthropic::usage_json(rep.prompt_tokens as u64, n_gen);
+                let usage = anthropic::usage_json_cached(
+                    rep.prompt_tokens as u64,
+                    rep.reused_tokens,
+                    n_gen,
+                );
                 let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
                 let events = b.feed(&pending);
                 if stream_mode {

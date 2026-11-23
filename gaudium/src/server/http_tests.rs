@@ -23,6 +23,11 @@ struct ScriptedEngine {
     pending_images: Vec<(usize, usize, usize)>,
     /// The tower inputs each request ran with.
     images: SeenImages,
+    /// Prefix reuse as an engine reports it: the prompt of the request before, and the counters.
+    /// A request takes over the rows it shares with that prompt, in whole 4-row tiles and never
+    /// the last row.
+    held: Vec<i32>,
+    prefix: crate::engine::qwen3::prefix_cache::PrefixStats,
 }
 
 impl GenEngine for ScriptedEngine {
@@ -45,6 +50,7 @@ impl GenEngine for ScriptedEngine {
         let last = self.images.lock().unwrap().last().cloned()?;
         (!last.is_empty()).then(|| crate::vision::VisionReport {
             images: last.len(),
+            reused_images: 0,
             patches: last.iter().map(|g| (g.0 * g.1) as u64).sum(),
             image_tokens: last.iter().map(|g| (g.0 * g.1 / 4) as u64).sum(),
             prep_ms: 1.0,
@@ -58,6 +64,10 @@ impl GenEngine for ScriptedEngine {
 
     fn max_ctx(&self) -> u64 {
         16384
+    }
+
+    fn prefix_stats(&self) -> Option<crate::engine::qwen3::prefix_cache::PrefixStats> {
+        Some(self.prefix)
     }
 
     fn hbm_bytes(&self) -> [u64; 5] {
@@ -86,9 +96,28 @@ impl GenEngine for ScriptedEngine {
             .pop_front()
             .ok_or("no scripted reply")?;
         let ids = self.tok.encode(&reply, true);
+        let common = prompt_ids
+            .iter()
+            .zip(&self.held)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let reused = if params.cache_prompt {
+            common.min(prompt_ids.len() - 1) / 4 * 4
+        } else {
+            0
+        };
+        self.held = prompt_ids.to_vec();
+        self.prefix.requests += 1;
+        self.prefix.hits += u64::from(reused > 0);
+        self.prefix.reused_rows += reused as u64;
+        self.prefix.last_prompt_rows = prompt_ids.len() as u64;
+        self.prefix.last_reused_rows = reused as u64;
+        self.prefix.last_lcp = common as u64;
         let mut rep = GenReport {
             prompt_tokens: prompt_ids.len(),
             method: "scripted".into(),
+            reused_tokens: reused as u64,
+            prefix_common: common as u64,
             ..GenReport::default()
         };
         for id in ids {
@@ -185,6 +214,12 @@ fn harness() -> Harness {
         prompts: Arc::clone(&prompts),
         pending_images: Vec::new(),
         images: Arc::clone(&images),
+        held: Vec::new(),
+        prefix: crate::engine::qwen3::prefix_cache::PrefixStats {
+            slots: 8,
+            slot_bytes: 1024,
+            ..Default::default()
+        },
     };
     let state = Arc::new(AppState {
         cfg: ServerConfig {
@@ -208,6 +243,7 @@ fn harness() -> Harness {
             vision: true,
             vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
             vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
+            prefix_slots: 0,
         },
         models: vec![model("tags", chat::TEST_TEMPLATE, None)],
         slot: Mutex::new(EngineSlot {
@@ -228,6 +264,7 @@ fn harness() -> Harness {
             last_request_json: None,
             hbm_bytes: None,
             facts: None,
+            prefix: None,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
@@ -287,6 +324,7 @@ fn call_form_harness() -> Harness {
             last_request_json: None,
             hbm_bytes: None,
             facts: None,
+            prefix: None,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
@@ -395,6 +433,7 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
             last_request_json: None,
             hbm_bytes: None,
             facts: None,
+            prefix: None,
         }),
         card_op: Mutex::new(()),
         cancels: Mutex::new(HashMap::new()),
@@ -1126,9 +1165,12 @@ fn served_engine_configuration_follows_the_server_options() {
         vision: true,
         vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
         vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
+        prefix_slots: 5,
     };
     // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
     let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
+    // the kept positions the server was started with
+    assert_eq!(q.prefix_slots, 5);
     assert_eq!(
         drafter.as_deref(),
         Some(Path::new("/models/Target-DSpine-b16"))
@@ -1150,6 +1192,82 @@ fn served_engine_configuration_follows_the_server_options() {
     // is compiled
     assert!(build_cache(&cfg, &[]).is_err());
     assert!(build_cache(&cfg, &["nope".to_string()]).is_err());
+}
+
+/// Prefix reuse as a client sees it: the rows an engine took over from the request before are
+/// reported apart from the rows it prefilled, in the reply, in `/props` and in the Messages
+/// usage, and `cache_prompt: false` reaches the engine.
+#[test]
+fn prefix_reuse_is_reported_to_the_client() {
+    let h = harness();
+    let u = |v: &JsonValue, path: &[&str]| at(v, path).as_u64().unwrap();
+    // a first request has nothing to take over
+    h.script("First.");
+    let (status, v) = h.chat("");
+    assert_eq!(status, 200, "{}", v.dump());
+    let prompt = u(&v, &["usage", "prompt_tokens"]);
+    assert_eq!(u(&v, &["timings", "cache_n"]), 0);
+    assert_eq!(u(&v, &["timings", "prompt_n"]), prompt);
+    assert_eq!(u(&v, &["usage", "prompt_tokens_details", "cached_tokens"]), 0);
+    assert_eq!(at(&v, &["gaudium", "prefix", "hit"]).as_bool(), Some(false));
+    // the same prompt again: all but its last rows are taken over
+    h.script("Second.");
+    let (_, v) = h.chat("");
+    let cached = u(&v, &["timings", "cache_n"]);
+    assert!(cached > 0 && cached < prompt, "{cached} of {prompt}");
+    assert_eq!(cached + u(&v, &["timings", "prompt_n"]), prompt);
+    assert_eq!(
+        u(&v, &["usage", "prompt_tokens_details", "cached_tokens"]),
+        cached
+    );
+    assert_eq!(u(&v, &["usage", "prompt_tokens"]), prompt);
+    assert_eq!(at(&v, &["gaudium", "prefix", "hit"]).as_bool(), Some(true));
+    assert_eq!(u(&v, &["gaudium", "prefix", "reused_tokens"]), cached);
+    assert_eq!(u(&v, &["gaudium", "prefix", "common_tokens"]), prompt);
+    // /props: what the engine keeps and what its requests took over
+    let props = json::parse_json(&h.state.props_json(0, true)).unwrap();
+    let pc = at(&props, &["prefix_cache"]);
+    assert_eq!(u(pc, &["positions"]), 8);
+    assert_eq!((u(pc, &["requests"]), u(pc, &["hits"])), (2, 1));
+    assert_eq!(u(pc, &["reused_tokens"]), cached);
+    assert_eq!(at(pc, &["last", "hit"]).as_bool(), Some(true));
+    assert_eq!(u(pc, &["last", "reused_tokens"]), cached);
+    assert_eq!(u(pc, &["last", "prompt_tokens"]), prompt);
+    // a request that asks for a whole prefill gets one
+    h.script("Third.");
+    let (_, v) = h.chat(",\"cache_prompt\":false");
+    assert_eq!(u(&v, &["timings", "cache_n"]), 0);
+    assert_eq!(u(&v, &["timings", "prompt_n"]), prompt);
+    assert_eq!(at(&v, &["gaudium", "prefix", "hit"]).as_bool(), Some(false));
+    // the stream carries the split in its timings too
+    h.script("Fourth.");
+    let (_, text) = h.post(
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"Weather in Oslo?"}],"stream":true}"#,
+    );
+    let last = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|l| l.contains("\"usage\""))
+        .last()
+        .expect("a final chunk with usage");
+    let fin = json::parse_json(last).unwrap();
+    assert_eq!(u(&fin, &["timings", "cache_n"]), cached);
+    assert_eq!(u(&fin, &["timings", "prompt_n"]), prompt - cached);
+    // the Messages API: reused rows are cache reads, the rest is input
+    h.script("Fifth.");
+    let body = r#"{"model":"tags","max_tokens":64,"messages":[{"role":"user","content":"Weather in Oslo?"}]}"#;
+    h.post("/v1/messages", body);
+    h.script("Sixth.");
+    let (status, text) = h.post("/v1/messages", body);
+    assert_eq!(status, 200, "{text}");
+    let m = json::parse_json(&text).unwrap();
+    let read = u(&m, &["usage", "cache_read_input_tokens"]);
+    assert!(read > 0);
+    assert_eq!(
+        read + u(&m, &["usage", "input_tokens"]),
+        u(&m, &["timings", "cache_n"]) + u(&m, &["timings", "prompt_n"])
+    );
 }
 
 /// An image in a chat request: decoded, prepared and handed to the engine; its pad run in the
@@ -1474,6 +1592,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         vision: true,
         vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
         vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
+        prefix_slots: 0,
     };
     // plain decode and a DSpine drafter: the server-wide tower
     for id in ["plain", "ds"] {

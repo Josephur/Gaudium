@@ -388,3 +388,168 @@ def pfx_reuse_at_prompt_end_false(p, lcp, tile, nm, mu, nd, du):
           %kv_lt_refl_false(1n+pp) : {Bool.and(Nat.is_eq(Nat.mod(1n+pp, 1n+tp), 0n), Bool.and(Bool.and(Nat.is_lt(1n+pp, lcp), _), Bool.and(Bool.or(Bool.not(nm), Nat.is_le(1n+pp, mu)), Bool.or(Bool.not(nd), Nat.is_le(1n+pp, du))))) == False{} : Bool}
           %Equal.sym(Bool, Bool.and(Nat.is_lt(1n+pp, lcp), False{}), False{}, kv_bool_and_false_r(Nat.is_lt(1n+pp, lcp))) : {Bool.and(Nat.is_eq(Nat.mod(1n+pp, 1n+tp), 0n), Bool.and(_, Bool.and(Bool.or(Bool.not(nm), Nat.is_le(1n+pp, mu)), Bool.or(Bool.not(nd), Nat.is_le(1n+pp, du))))) == False{} : Bool}
           kv_bool_and_false_r(Nat.is_eq(Nat.mod(1n+pp, 1n+tp), 0n))
+
+# ============================================================================
+# 5. Bounds of the prefix reuse rule (what every resume point satisfies)
+# ============================================================================
+
+# a < b and b <= a never hold together
+def kv_lt_le_excl(+a: Nat, +b: Nat) -> {Bool.and(Nat.is_lt(a, b), Nat.is_le(b, a)) == False{} : Bool}:
+  match a b:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+ap 1n+bp:
+      kv_lt_le_excl(ap, bp)
+
+def kv_and_not_self(b: Bool) -> {Bool.and(b, Bool.not(b)) == False{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# (a && ((x && b) && c)) && y == False when x && y == False
+def kv_reuse_excl_x(a: Bool, x: Bool, b: Bool, c: Bool, y: Bool, h: {Bool.and(x, y) == False{} : Bool}) -> {Bool.and(Bool.and(a, Bool.and(Bool.and(x, b), c)), y) == False{} : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match x:
+        case False{}: {==}
+        case True{}:
+          match b:
+            case False{}: {==}
+            case True{}:
+              match c:
+                case False{}: {==}
+                case True{}: h
+
+# (a && ((x && b) && c)) && y == False when b && y == False
+def kv_reuse_excl_b(a: Bool, x: Bool, b: Bool, c: Bool, y: Bool, h: {Bool.and(b, y) == False{} : Bool}) -> {Bool.and(Bool.and(a, Bool.and(Bool.and(x, b), c)), y) == False{} : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match x:
+        case False{}: {==}
+        case True{}:
+          match b:
+            case False{}: {==}
+            case True{}:
+              match c:
+                case False{}: {==}
+                case True{}: h
+
+# ((g && (t && m)) && r) && !m == False
+def kv_reuse_excl_m(g: Bool, t: Bool, m: Bool, r: Bool) -> {Bool.and(Bool.and(Bool.and(g, Bool.and(t, m)), r), Bool.not(m)) == False{} : Bool}:
+  match g:
+    case False{}: {==}
+    case True{}:
+      match t:
+        case False{}: {==}
+        case True{}:
+          match m:
+            case False{}: {==}
+            case True{}:
+              match r:
+                case False{}: {==}
+                case True{}: {==}
+
+# (a && (b && (c && d))) && !d == False
+def kv_reuse_excl_d(a: Bool, b: Bool, c: Bool, d: Bool) -> {Bool.and(Bool.and(a, Bool.and(b, Bool.and(c, d))), Bool.not(d)) == False{} : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match c:
+            case False{}: {==}
+            case True{}:
+              kv_and_not_self(d)
+
+# LAW KV.13: a resume point never lies at or beyond the rows the new prompt shares with the
+# held one.
+law pfx_reuse_within_common_prefix:
+  for +pos: Nat
+  for +lcp: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +nm: Bool
+  for +mu: Nat
+  for +nd: Bool
+  for +du: Nat
+  {Bool.and(pfx_reuse_valid(pos, lcp, p, tile, nm, mu, nd, du), Nat.is_le(lcp, pos)) == False{} : Bool}
+
+def pfx_reuse_within_common_prefix(pos, lcp, p, tile, nm, mu, nd, du):
+  kv_reuse_excl_x(
+    Bool.and(Nat.is_gt(pos, 0n), Bool.and(Nat.is_gt(tile, 0n), Nat.is_eq(Nat.mod(pos, tile), 0n))),
+    Nat.is_lt(pos, lcp),
+    Nat.is_lt(pos, p),
+    Bool.and(Bool.or(Bool.not(nm), Nat.is_le(pos, mu)), Bool.or(Bool.not(nd), Nat.is_le(pos, du))),
+    Nat.is_le(lcp, pos),
+    kv_lt_le_excl(pos, lcp)
+  )
+
+# LAW KV.14: a resume point never lies at or beyond the end of the prompt: at least one row is
+# always prefilled, so the readout of the last prompt row is always this request's own.
+law pfx_reuse_before_prompt_end:
+  for +pos: Nat
+  for +lcp: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +nm: Bool
+  for +mu: Nat
+  for +nd: Bool
+  for +du: Nat
+  {Bool.and(pfx_reuse_valid(pos, lcp, p, tile, nm, mu, nd, du), Nat.is_le(p, pos)) == False{} : Bool}
+
+def pfx_reuse_before_prompt_end(pos, lcp, p, tile, nm, mu, nd, du):
+  kv_reuse_excl_b(
+    Bool.and(Nat.is_gt(pos, 0n), Bool.and(Nat.is_gt(tile, 0n), Nat.is_eq(Nat.mod(pos, tile), 0n))),
+    Nat.is_lt(pos, lcp),
+    Nat.is_lt(pos, p),
+    Bool.and(Bool.or(Bool.not(nm), Nat.is_le(pos, mu)), Bool.or(Bool.not(nd), Nat.is_le(pos, du))),
+    Nat.is_le(p, pos),
+    kv_lt_le_excl(pos, p)
+  )
+
+# LAW KV.15: a resume point is always a whole number of prefill tiles.
+law pfx_reuse_on_tile_boundary:
+  for +pos: Nat
+  for +lcp: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +nm: Bool
+  for +mu: Nat
+  for +nd: Bool
+  for +du: Nat
+  {Bool.and(pfx_reuse_valid(pos, lcp, p, tile, nm, mu, nd, du), Bool.not(Nat.is_eq(Nat.mod(pos, tile), 0n))) == False{} : Bool}
+
+def pfx_reuse_on_tile_boundary(pos, lcp, p, tile, nm, mu, nd, du):
+  kv_reuse_excl_m(
+    Nat.is_gt(pos, 0n),
+    Nat.is_gt(tile, 0n),
+    Nat.is_eq(Nat.mod(pos, tile), 0n),
+    Bool.and(
+      Bool.and(Nat.is_lt(pos, lcp), Nat.is_lt(pos, p)),
+      Bool.and(Bool.or(Bool.not(nm), Nat.is_le(pos, mu)), Bool.or(Bool.not(nd), Nat.is_le(pos, du)))
+    )
+  )
+
+# LAW KV.16: with a drafter that keeps context rows, a resume point never lies beyond the rows
+# the drafter still holds.
+law pfx_reuse_within_drafter_rows:
+  for +pos: Nat
+  for +lcp: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +nm: Bool
+  for +mu: Nat
+  for +du: Nat
+  {Bool.and(pfx_reuse_valid(pos, lcp, p, tile, nm, mu, True{}, du), Bool.not(Nat.is_le(pos, du))) == False{} : Bool}
+
+def pfx_reuse_within_drafter_rows(pos, lcp, p, tile, nm, mu, du):
+  kv_reuse_excl_d(
+    Bool.and(Nat.is_gt(pos, 0n), Bool.and(Nat.is_gt(tile, 0n), Nat.is_eq(Nat.mod(pos, tile), 0n))),
+    Bool.and(Nat.is_lt(pos, lcp), Nat.is_lt(pos, p)),
+    Bool.or(Bool.not(nm), Nat.is_le(pos, mu)),
+    Nat.is_le(pos, du)
+  )
