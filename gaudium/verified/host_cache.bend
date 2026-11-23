@@ -3313,12 +3313,9 @@ law hm_fresh_and_reused_cover_the_need:
 def hm_fresh_and_reused_cover_the_need(n, r):
   hm_le_sub_add(n, r)
 
-# LAW HC.155: a server whose limits could not be read never takes a default budget.
-law hc_unread_limit_allows_no_default:
-  {hc_default_allowed(False{}) == False{} : Bool}
-
-def hc_unread_limit_allows_no_default():
-  {==}
+# (That a server whose limits could not be read takes no default budget at all is today's
+# decision, pinned by Rust tests and by no law: a later version may take a smaller one that is
+# safe on other grounds.)
 
 # LAW HC.156: the store never counts more host memory than was read ...
 law hc_host_counted_within_read:
@@ -3338,11 +3335,5 @@ def hc_host_counted_within_read(k, n, b):
         case False{}:
           hc_zero_le(b)
 
-# LAW HC.157: ... and none at all under a limit that could not be read, unless the operator
-# named the budget.
-law hc_unread_limit_counts_nothing_unnamed:
-  for +b: Nat
-  {hc_host_counted(False{}, False{}, b) == 0n : Nat}
-
-def hc_unread_limit_counts_nothing_unnamed(b):
-  {==}
+# (That the store counts no host memory at all under an unread limit and an unnamed budget is
+# the same decision, and is left to the Rust tests for the same reason.)

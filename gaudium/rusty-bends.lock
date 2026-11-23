@@ -102,6 +102,7 @@ ab8e09f97c3466ff  hc_failed_write_leaves_nothing  law hc_failed_write_leaves_not
 53b09638cc411bd8  hc_free_now_within_budget  law hc_free_now_within_budget : for + f : Nat for + a : Nat { Nat.is_le ( hc_free_now ( f , a ) , f ) == True { } : Bool }
 2968aab19d192eba  hc_free_now_within_host  law hc_free_now_within_host : for + f : Nat for + a : Nat { Nat.is_le ( hc_free_now ( f , a ) , a ) == True { } : Bool }
 0034766057628190  hc_held_states_never_charged  law hc_held_states_never_charged : for + u : Nat for + h : Nat for + tc : Nat for + k : Nat for + x : Nat for + sc : Nat for + f : Bool for + rc : Nat { hc_save_need ( u , h , tc , k , Nat.add ( k , x ) , sc , f , rc ) == hc_save_need ( u , h , tc , 0n , 0n , sc , f , rc ) : Nat }
+5ce02e15d44a2956  hc_host_counted_within_read  law hc_host_counted_within_read : for + k : Bool for + n : Bool for + b : Nat { Nat.is_le ( hc_host_counted ( k , n , b ) , b ) == True { } : Bool }
 b79373ef3ff274bc  hc_idle_busy_engine_keeps_work_pending  law hc_idle_busy_engine_keeps_work_pending : for + a : Nat for + r : Bool { hc_idle_left ( True { } , hc_idle_starts ( True { } , 1n + a , r ) ) == True { } : Bool }
 81ec42439c1a1f48  hc_idle_never_starts_on_a_busy_engine  law hc_idle_never_starts_on_a_busy_engine : for + d : Bool for + a : Nat for + r : Bool { hc_idle_starts ( d , 1n + a , r ) == False { } : Bool }
 6808703926fab8ac  hc_idle_never_starts_on_an_unready_engine  law hc_idle_never_starts_on_an_unready_engine : for + d : Bool for + a : Nat { hc_idle_starts ( d , a , False { } ) == False { } : Bool }
@@ -207,6 +208,12 @@ f637e57e5aabaea2  hc_writing_is_busy  law hc_writing_is_busy : for + t : Nat for
 886d6689866e18ba  hc_written_entry_never_read  law hc_written_entry_never_read : for + e : HcEntry for + u : Nat for + t : Nat { hc_may_read ( hc_begin_write ( e , u ) , t ) == False { } : Bool }
 08cdd002a2423f2d  hidden_zero_rejected  law hidden_zero_rejected : for + v : Nat { hidden_dims_valid ( 0n , v ) == False { } : Bool }
 7ab60bcdca0eaca5  hidden_zero_vocab_rejected  law hidden_zero_vocab_rejected : for + h : Nat { hidden_dims_valid ( h , 0n ) == False { } : Bool }
+e4d9dc6e571b9e77  hm_fresh_and_reused_cover_the_need  law hm_fresh_and_reused_cover_the_need : for + n : Nat for + r : Nat { Nat.is_le ( n , Nat.add ( hm_fresh ( n , r ) , r ) ) == True { } : Bool }
+cfcc46b0912bc3ed  hm_fresh_within_need  law hm_fresh_within_need : for + n : Nat for + r : Nat { Nat.is_le ( hm_fresh ( n , r ) , n ) == True { } : Bool }
+88ad775b850d1ae6  hm_left_never_grows  law hm_left_never_grows : for + l : Nat for + b : Nat { Nat.is_le ( hm_left ( l , b ) , l ) == True { } : Bool }
+80cbb11270a55b9d  hm_never_admits_beyond_available  law hm_never_admits_beyond_available : for + n : Nat for + a : Nat { Bool.and ( hm_admit ( n , a ) , Nat.is_lt ( a , n ) ) == False { } : Bool }
+a47dbeb2f055e0dd  hm_never_covers_beyond_the_leave  law hm_never_covers_beyond_the_leave : for + l : Nat for + b : Nat { Bool.and ( hm_covers ( l , b ) , Nat.is_lt ( l , b ) ) == False { } : Bool }
+9111006def5018cb  hm_taken_and_left_within_the_leave  law hm_taken_and_left_within_the_leave : for + b : Nat for + r : Nat { Nat.is_le ( Nat.add ( b , hm_left ( Nat.add ( b , r ) , b ) ) , Nat.add ( b , r ) ) == True { } : Bool }
 d21532af3aa140c6  hold_conserved  law hold_conserved : for + b : Nat for + t : Nat { Nat.add ( hold_max ( b , t ) , hold_release ( b , hold_max ( b , t ) ) ) == b : Nat }
 06a1321d4cd0be64  hold_empty_tag_holds_nothing  law hold_empty_tag_holds_nothing : for b : Nat { hold_max ( b , 0n ) == 0n : Nat }
 ecd414a23b12f2c1  hold_max_le_buf  law hold_max_le_buf : for + b : Nat for t : Nat { Nat.is_le ( hold_max ( b , t ) , b ) == True { } : Bool }
