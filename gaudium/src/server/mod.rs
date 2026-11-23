@@ -8,6 +8,11 @@
 //!   `/gaudium/live`, `/gaudium/events`, `/gaudium/count_tokens`, `/v1/chat/completions/control`)
 //! - A2UI interfaces as a per-request option (`--a2ui`, the request field `gaudium_a2ui`,
 //!   `/gaudium/a2ui`, instructions hot-reloaded from `--a2ui-prompt <file>`; see `a2ui.rs`)
+//! - The MCP proxy for the Web UI's MCP servers (`--mcp-proxy`, `/cors-proxy`, `/gaudium/proxy`;
+//!   see `proxy.rs`)
+//!
+//! HTTP and HTTPS share the port (`--tls-cert`, `--tls-key`; see `conn.rs`): the first byte of a
+//! connection says which of the two the client speaks.
 //!
 //! Single-card safety & verified core invariants:
 //! - Uses `core::lifecycle::can_switch_resident_model` before switching resident models or parking.
@@ -41,12 +46,16 @@ use crate::vision::VisionSpec;
 mod a2ui;
 mod anthropic;
 mod chat;
+mod conn;
 mod jinja;
 mod outparse;
+mod proxy;
 mod readout;
 mod stream_out;
 
 use chat::{ChatPrompt, ChatTemplate};
+use conn::Conn;
+pub use proxy::ProxyOptions;
 use outparse::{Delta, OutputFormat, OutputParser};
 use readout::{DrafterFacts, RunFacts, Timings};
 use stream_out::StreamOut;
@@ -102,6 +111,12 @@ pub struct ServerConfig {
     /// Prefix reuse across requests: positions of the previous prompt whose recurrent state an
     /// engine keeps on the card (0 = off; a load keeps as many as fit beside the context).
     pub prefix_slots: u64,
+    /// The MCP proxy (`--mcp-proxy` and its options).
+    pub mcp_proxy: ProxyOptions,
+    /// PEM certificate chain of the HTTPS listener (`--tls-cert`).
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key of the HTTPS listener (`--tls-key`). Only its path is held here.
+    pub tls_key: Option<PathBuf>,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -320,6 +335,10 @@ struct AppState {
     dtypes: Mutex<HashMap<(usize, bool, bool), Option<crate::engine::qwen3_traffic::StepDtypes>>>,
     /// Chat requests take turns on the card through this queue (model load + generation in one turn).
     turns: TurnQueue,
+    /// The MCP proxy (off unless the server was started with `--mcp-proxy`).
+    proxy: proxy::McpProxy,
+    /// The certificate of the HTTPS listener; `None`: plain HTTP only.
+    tls: Option<crate::tls::TlsServer>,
 }
 
 impl AppState {
@@ -772,7 +791,7 @@ impl AppState {
              \"supports_system_role\":true,\"supports_preserve_reasoning\":true,\"supports_reasoning_effort\":false,\
              \"supports_object_arguments\":false,\"reasoning_effort_levels\":[]}},\
              \"bos_token\":{},\"eos_token\":{},\"build_info\":{},\"is_sleeping\":false,\
-             \"cors_proxy_enabled\":false,\"a2ui\":{}",
+             \"cors_proxy_enabled\":{},\"a2ui\":{}",
             m.max_ctx,
             jq(&m.id),
             jq(&m.dir.display().to_string()),
@@ -780,6 +799,7 @@ impl AppState {
             jq(m.chat.as_ref().map_or("", |t| t.token("bos_token"))),
             jq(m.chat.as_ref().map_or("<|im_end|>", |t| t.token("eos_token"))),
             jq(&format!("gaudium-rust {}", env!("CARGO_PKG_VERSION"))),
+            self.proxy.enabled(),
             a2ui::capabilities_json(self.cfg.a2ui, false),
         );
         // what this model is and how it runs (the same description the event stream carries)
@@ -1165,6 +1185,46 @@ pub fn build_cache(cfg: &ServerConfig, only: &[String]) -> Result<(), String> {
     }
 }
 
+/// The HTTPS listener's certificate, as the flags and this machine allow
+/// (`verified/tls_listener.bend`, `ls_start`): `None` serves plain HTTP only; an error refuses
+/// the start. The key file is read by the TLS library; neither its contents nor the library's
+/// view of it appear in a message.
+fn start_tls(cfg: &ServerConfig) -> Result<Option<crate::tls::TlsServer>, String> {
+    use crate::core::listener;
+    let (cert, key) = (cfg.tls_cert.as_deref(), cfg.tls_key.as_deref());
+    // the library is only looked for when HTTPS was asked for
+    let lib = (cert.is_some() || key.is_some()).then(crate::tls::availability);
+    let server = match (cert, key, &lib) {
+        (Some(c), Some(k), Some(Ok(_))) => Some(crate::tls::TlsServer::new(c, k)),
+        _ => None,
+    };
+    let start = listener::tls_start(
+        cert.is_some(),
+        key.is_some(),
+        matches!(lib, Some(Ok(_))),
+        matches!(server, Some(Ok(_))),
+    );
+    if listener::start_refused(start) {
+        return Err(match server {
+            Some(Err(e)) => format!("HTTPS listener (--tls-cert, --tls-key): {e}"),
+            _ => "--tls-cert and --tls-key go together: give both files, or neither".into(),
+        });
+    }
+    if listener::start_warns(start) {
+        eprintln!(
+            "[server] HTTPS was asked for (--tls-cert, --tls-key) and is NOT offered: {}. Serving plain HTTP only.",
+            lib.as_ref().and_then(|l| l.as_ref().err()).cloned().unwrap_or_default()
+        );
+    }
+    if !listener::serves_tls(start) {
+        return Ok(None);
+    }
+    if let Some(Ok(version)) = &lib {
+        eprintln!("[server] HTTPS on: {version}");
+    }
+    Ok(server.and_then(Result::ok))
+}
+
 /// Longest wait for a connection before the accept loop looks at the stop request again.
 const ACCEPT_WAIT_MS: i32 = 200;
 
@@ -1172,6 +1232,9 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
     if cfg.models.is_empty() {
         return Err("at least one --model <dir> is required for --serve".into());
     }
+    // Settings that can refuse the start are checked before anything is loaded.
+    let proxy = proxy::McpProxy::new(&cfg.mcp_proxy, cfg.api_key.is_some())?;
+    let tls = start_tls(&cfg)?;
     // Shared stop-request handler; re-asserted by the device layer after every card open, because
     // the runtime replaces signal dispositions while initializing.
     crate::signals::install();
@@ -1311,6 +1374,8 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         hub: EventHub::new(),
         dtypes: Mutex::new(HashMap::new()),
         turns: TurnQueue::default(),
+        proxy,
+        tls,
     });
 
     // Optional eager warm-up in a background thread so HTTP/UI responds immediately!
@@ -1351,9 +1416,17 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
             .ok();
     }
 
+    if let Some(line) = state.proxy.summary(cfg.api_key.is_some()) {
+        eprintln!("[server] {line}");
+    }
     eprintln!(
-        "[server] listening on http://{}/ (models: {}, lazy={}, idle_park={}s, ui={})",
+        "[server] listening on http://{0}/{1} (models: {2}, lazy={3}, idle_park={4}s, ui={5})",
         addr,
+        if state.tls.is_some() {
+            format!(" and https://{addr}/ (same port)")
+        } else {
+            String::new()
+        },
         state
             .models
             .iter()
@@ -1408,7 +1481,7 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest>, String> {
+fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
     let mut reader = BufReader::new(stream);
     let mut req_line = String::new();
     let n = reader
@@ -1493,7 +1566,7 @@ fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest>, String> 
 }
 
 fn write_response_with_body(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     status: u16,
     reason: &str,
     content_type: &str,
@@ -1519,7 +1592,7 @@ fn write_response_with_body(
 }
 
 fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     status: u16,
     reason: &str,
     content_type: &str,
@@ -1528,11 +1601,12 @@ fn write_response(
     write_response_with_body(stream, status, reason, content_type, body, true);
 }
 
-fn write_json(stream: &mut TcpStream, status: u16, json: &str) {
+fn write_json(stream: &mut Conn, status: u16, json: &str) {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
         503 => "Service Unavailable",
@@ -1548,7 +1622,7 @@ fn write_json(stream: &mut TcpStream, status: u16, json: &str) {
     );
 }
 
-fn write_error(stream: &mut TcpStream, status: u16, err_type: &str, msg: &str) {
+fn write_error(stream: &mut Conn, status: u16, err_type: &str, msg: &str) {
     let body = format!(
         "{{\"error\":{{\"message\":{},\"type\":{},\"code\":{}}}}}",
         jq(msg),
@@ -1558,7 +1632,7 @@ fn write_error(stream: &mut TcpStream, status: u16, err_type: &str, msg: &str) {
     write_json(stream, status, &body);
 }
 
-fn write_sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
+fn write_sse_headers(stream: &mut Conn) -> std::io::Result<()> {
     let head = "HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream; charset=utf-8\r\n\
                 Transfer-Encoding: chunked\r\n\
@@ -1570,18 +1644,20 @@ fn write_sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.flush()
 }
 
-fn write_sse_chunk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
+fn write_sse_chunk(stream: &mut Conn, data: &[u8]) -> std::io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
-    let prefix = format!("{:x}\r\n", data.len());
-    stream.write_all(prefix.as_bytes())?;
-    stream.write_all(data)?;
-    stream.write_all(b"\r\n")?;
+    // one write per chunk (one TLS record on an HTTPS connection)
+    let mut out = Vec::with_capacity(data.len() + 16);
+    out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+    stream.write_all(&out)?;
     stream.flush()
 }
 
-fn write_sse_end(stream: &mut TcpStream) {
+fn write_sse_end(stream: &mut Conn) {
     let _ = stream.write_all(b"0\r\n\r\n");
     let _ = stream.flush();
 }
@@ -1602,9 +1678,17 @@ fn check_auth(cfg: &ServerConfig, req: &HttpRequest) -> bool {
         .is_some_and(|k| k.trim() == expected)
 }
 
-fn handle_connection(state: Arc<AppState>, mut stream: TcpStream) {
+/// Serves one accepted socket: plain HTTP, or TLS when the client opens with a handshake and the
+/// server has a certificate.
+fn handle_connection(state: Arc<AppState>, tcp: TcpStream) {
+    if let Some(stream) = Conn::open(tcp, state.tls.as_ref()) {
+        handle_request(state, stream);
+    }
+}
+
+fn handle_request(state: Arc<AppState>, mut stream: Conn) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let req = match read_http_request(&stream) {
+    let req = match read_http_request(&mut stream) {
         Ok(Some(r)) => r,
         Ok(None) => return,
         Err(e) => {
@@ -1644,6 +1728,14 @@ fn handle_connection(state: Arc<AppState>, mut stream: TcpStream) {
     }
 
     match (req.method.as_str(), req.path.as_str()) {
+        // every method: the proxy answers the ones it does not forward itself
+        (_, "/cors-proxy") => {
+            let key_ok = check_auth(&state.cfg, &req);
+            state.proxy.handle(&req, key_ok, &mut stream);
+        }
+        ("GET", "/gaudium/proxy") => {
+            write_json(&mut stream, 200, &state.proxy.status_json());
+        }
         ("GET", "/health") | ("GET", "/v1/health") => {
             write_json(&mut stream, 200, "{\"status\":\"ok\"}");
         }
@@ -1718,7 +1810,7 @@ fn handle_connection(state: Arc<AppState>, mut stream: TcpStream) {
     }
 }
 
-fn handle_events_sse(state: &AppState, stream: &mut TcpStream) {
+fn handle_events_sse(state: &AppState, stream: &mut Conn) {
     if write_sse_headers(stream).is_err() {
         return;
     }
@@ -1756,7 +1848,7 @@ fn handle_events_sse(state: &AppState, stream: &mut TcpStream) {
     write_sse_end(stream);
 }
 
-fn handle_engine_action(state: &Arc<AppState>, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_engine_action(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON");
@@ -1821,7 +1913,7 @@ fn handle_engine_action(state: &Arc<AppState>, req: &HttpRequest, stream: &mut T
     }
 }
 
-fn handle_model_load(state: &AppState, req: &HttpRequest, stream: &mut TcpStream, load: bool) {
+fn handle_model_load(state: &AppState, req: &HttpRequest, stream: &mut Conn, load: bool) {
     let body_str = String::from_utf8_lossy(&req.body);
     let val = json::parse_json(&body_str).unwrap_or(JsonValue::Null);
     let model = val.get("model").and_then(|v| v.as_str());
@@ -1839,7 +1931,7 @@ fn handle_model_load(state: &AppState, req: &HttpRequest, stream: &mut TcpStream
     }
 }
 
-fn handle_tokenize(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_tokenize(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON");
@@ -1868,7 +1960,7 @@ fn handle_tokenize(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) 
     write_json(stream, 200, &format!("{{\"tokens\":[{list}]}}"));
 }
 
-fn handle_detokenize(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_detokenize(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON");
@@ -1892,7 +1984,7 @@ fn handle_detokenize(state: &AppState, req: &HttpRequest, stream: &mut TcpStream
     write_json(stream, 200, &format!("{{\"content\":{}}}", jq(&text)));
 }
 
-fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON");
@@ -2116,7 +2208,7 @@ impl Drop for WaitTicket<'_> {
     }
 }
 
-fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON");
@@ -2141,7 +2233,7 @@ enum Api {
 }
 
 impl Api {
-    fn error(self, stream: &mut TcpStream, status: u16, err_type: &str, msg: &str) {
+    fn error(self, stream: &mut Conn, status: u16, err_type: &str, msg: &str) {
         match self {
             Api::Chat => write_error(stream, status, err_type, msg),
             Api::Messages { .. } => {
@@ -2245,7 +2337,7 @@ fn tokenize_prompt(
     Ok((ids, Some(media)))
 }
 
-fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
@@ -2255,7 +2347,7 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Tcp
 }
 
 /// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path.
-fn handle_messages(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_messages(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let api = Api::Messages {
         show_thinking: true,
     };
@@ -2279,7 +2371,7 @@ fn handle_messages(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) 
 }
 
 /// `POST /v1/messages/count_tokens`: the prompt size of a Messages request without running it.
-fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let api = Api::Messages {
         show_thinking: true,
     };
@@ -2300,7 +2392,7 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut TcpSt
 }
 
 /// `POST /apply-template`: the prompt text a chat request renders to.
-fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut TcpStream) {
+fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
@@ -2318,7 +2410,7 @@ fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut TcpSt
 fn run_chat(
     state: &AppState,
     val: &JsonValue,
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     api: Api,
     mut ignored: Vec<String>,
 ) {
@@ -2964,7 +3056,7 @@ fn resolve_static_rel(url_path: &str) -> &str {
     }
 }
 
-fn handle_static_ui(state: &AppState, url_path: &str, stream: &mut TcpStream, send_body: bool) {
+fn handle_static_ui(state: &AppState, url_path: &str, stream: &mut Conn, send_body: bool) {
     let Some(ui_root) = state.cfg.ui_dir.as_deref() else {
         write_error(
             stream,

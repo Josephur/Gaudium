@@ -6,6 +6,8 @@ pub mod gemma4;
 pub mod hbm;
 pub mod kv_pool;
 pub mod lifecycle;
+pub mod listener;
+pub mod proxy;
 pub mod shapes;
 pub mod tool_calls;
 pub mod vision;

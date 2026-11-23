@@ -14,12 +14,12 @@
 //! the reported launches cover every token seen. An engine without a launch feed gets one chunk
 //! per token and no launch counts.
 
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use super::anthropic::Builder;
+use super::conn::Conn;
 use super::outparse::Delta;
 use super::readout::{jq, Timings};
 use crate::live_report::{LaunchEvent, LaunchKind};
@@ -29,7 +29,7 @@ const PROGRESS_EVERY_MS: u128 = 100;
 
 pub(super) struct StreamOut {
     /// `None`: a non-streaming request (nothing is written; counters still run).
-    stream: Option<TcpStream>,
+    stream: Option<Conn>,
     /// `"id":..,"object":"chat.completion.chunk","created":..,"model":..` of every chunk.
     chunk_head: String,
     timings_per_token: bool,
@@ -59,7 +59,7 @@ pub(super) struct StreamOut {
 impl StreamOut {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        stream: Option<TcpStream>,
+        stream: Option<Conn>,
         req_id: &str,
         model_id: &str,
         created: u64,
@@ -294,7 +294,7 @@ mod tests {
     use super::*;
     use crate::json::{self, JsonValue};
     use std::io::Read;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
 
     fn pair() -> (TcpStream, TcpStream) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -340,7 +340,7 @@ mod tests {
 
     fn writer(tx: TcpStream, feed: bool, progress: bool) -> StreamOut {
         StreamOut::new(
-            Some(tx),
+            Some(tx.into()),
             "chatcmpl-1",
             "m",
             7,

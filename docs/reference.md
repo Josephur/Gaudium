@@ -121,6 +121,39 @@ Serve options:
                         never names the <a2ui-json> tags is not used: the last good
                         version (or the built-in text) stays, the reason is logged and
                         shown under instructions_source in GET /gaudium/a2ui
+  --tls-cert <file>     Serve HTTPS as well: the PEM certificate (with its chain) for
+  --tls-key <file>      the server, and its unencrypted PEM private key. HTTP and HTTPS
+                        then share the port: http://host:port and https://host:port both
+                        answer, and clients that used plain HTTP go on working. Opened
+                        over https the Web UI may use the microphone and the clipboard
+                        from other machines. TLS comes from the system's OpenSSL 3
+                        (libssl.so.3), loaded when asked for: without it the server
+                        starts, says that HTTPS is not offered, and serves plain HTTP.
+                        Behind a front end that ends TLS itself give neither option
+  --mcp-proxy           Offer the MCP proxy (/cors-proxy) to the Web UI: the server
+                        makes the requests to an MCP server instead of the browser (for
+                        servers without CORS headers, servers only this machine
+                        reaches, and plain-http servers used from an https page). Off
+                        by default. It needs the targets it may reach (the two options
+                        below); requests need the API key when one is set; a page of
+                        another site cannot drive it. GET /gaudium/proxy shows its
+                        settings and last decisions
+  --mcp-proxy-allow <list>  Targets the proxy may reach, comma separated (repeatable):
+                        host, host:port, *.domain, an address, an address range
+                        (192.0.2.0/24), or * for any target (* needs --api-key). Each
+                        address a target resolves to must be public, and the
+                        connection goes to the address that was checked
+  --mcp-proxy-allow-private <list>  Targets that may be reached although their address
+                        is loopback, private or link-local: the same forms without *
+                        (localhost:8931, 127.0.0.1, 192.168.0.0/16). An entry here
+                        also allows the target, so an MCP server on this machine
+                        needs this option only
+  --mcp-proxy-max-mb <N>  Largest response the proxy passes on, in MiB (default: 64)
+  --mcp-proxy-timeout <secs>  Longest silence of a target before the proxy gives up
+                        (default: 600). An idle event stream gets a comment line
+                        every 20 s so that a front end does not cut it
+  --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets
+                        besides the system's (an MCP server with a private certificate)
   --verbose             Print server, HBM, and recipe diagnostics
 
 Live status environment variables:

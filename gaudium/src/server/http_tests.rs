@@ -244,6 +244,9 @@ fn harness() -> Harness {
             vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
             vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
             prefix_slots: 0,
+            mcp_proxy: ProxyOptions::default(),
+            tls_cert: None,
+            tls_key: None,
         },
         models: vec![model("tags", chat::TEST_TEMPLATE, None)],
         slot: Mutex::new(EngineSlot {
@@ -272,6 +275,8 @@ fn harness() -> Harness {
         hub: EventHub::new(),
         dtypes: Mutex::new(HashMap::new()),
         turns: TurnQueue::default(),
+        proxy: proxy::McpProxy::disabled(),
+        tls: None,
     });
     let _ = model; // (one resident model per harness)
     Harness {
@@ -332,6 +337,8 @@ fn call_form_harness() -> Harness {
         hub: EventHub::new(),
         dtypes: Mutex::new(HashMap::new()),
         turns: TurnQueue::default(),
+        proxy: proxy::McpProxy::disabled(),
+        tls: None,
     });
     Harness {
         state,
@@ -441,6 +448,8 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
         hub: EventHub::new(),
         dtypes: Mutex::new(HashMap::new()),
         turns: TurnQueue::default(),
+        proxy: proxy::McpProxy::disabled(),
+        tls: None,
     });
     Harness {
         state,
@@ -1166,6 +1175,9 @@ fn served_engine_configuration_follows_the_server_options() {
         vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
         vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
         prefix_slots: 5,
+        mcp_proxy: ProxyOptions::default(),
+        tls_cert: None,
+        tls_key: None,
     };
     // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
     let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
@@ -1592,6 +1604,9 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
         vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
         prefix_slots: 0,
+        mcp_proxy: ProxyOptions::default(),
+        tls_cert: None,
+        tls_key: None,
     };
     // plain decode and a DSpine drafter: the server-wide tower
     for id in ["plain", "ds"] {
@@ -1662,4 +1677,427 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         None
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------------------------------------------
+// The MCP proxy route and the HTTPS listener, through the server's connection handler
+// ------------------------------------------------------------------------------------------------
+
+/// The harness with the MCP proxy, the HTTPS listener and the API key set as given.
+fn net_harness(
+    proxy: proxy::McpProxy,
+    tls: Option<crate::tls::TlsServer>,
+    api_key: Option<&str>,
+) -> Harness {
+    let Harness {
+        state,
+        replies,
+        prompts,
+        images,
+    } = harness();
+    let mut st = Arc::try_unwrap(state).ok().expect("the harness owns its state");
+    st.proxy = proxy;
+    st.tls = tls;
+    st.cfg.api_key = api_key.map(str::to_string);
+    Harness {
+        state: Arc::new(st),
+        replies,
+        prompts,
+        images,
+    }
+}
+
+/// A proxy that may reach the loopback address (where the tests' target listens).
+fn loopback_proxy(keyed: bool) -> proxy::McpProxy {
+    let opts = ProxyOptions {
+        enabled: true,
+        allow_private: vec!["127.0.0.1".into()],
+        ..ProxyOptions::default()
+    };
+    proxy::McpProxy::new(&opts, keyed).unwrap()
+}
+
+/// A target on a loopback port that answers every request with `body` as JSON and records the
+/// head of each request it got.
+fn json_target(body: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    thread::spawn(move || {
+        for tcp in l.incoming() {
+            let Ok(mut tcp) = tcp else { break };
+            let mut buf = Vec::new();
+            let mut b = [0u8; 2048];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match tcp.read(&mut b) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&b[..n]),
+                }
+            }
+            log.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf).to_ascii_lowercase());
+            let _ = write!(
+                tcp,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s-1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (port, seen)
+}
+
+/// Serves the next `n` connections with the server's connection handler.
+fn serve(state: &Arc<AppState>, n: usize) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::clone(state);
+    thread::spawn(move || {
+        for _ in 0..n {
+            let Ok((s, _)) = listener.accept() else { break };
+            let st = Arc::clone(&state);
+            thread::spawn(move || handle_connection(st, s));
+        }
+    });
+    addr
+}
+
+/// `(status, head in lower case, body with its transfer chunks joined)` of a raw response.
+fn split_response(raw: &[u8]) -> (u16, String, String) {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("no response head in {:?}", String::from_utf8_lossy(raw)));
+    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let mut rest = &raw[split + 4..];
+    if !head.contains("transfer-encoding: chunked") {
+        return (status, head, String::from_utf8_lossy(rest).into_owned());
+    }
+    let mut out = Vec::new();
+    while let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") {
+        let n = usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap().trim(), 16)
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&rest[eol + 2..eol + 2 + n]);
+        rest = &rest[eol + 2 + n + 2..];
+    }
+    (status, head, String::from_utf8_lossy(&out).into_owned())
+}
+
+/// One plain-HTTP exchange: `head` is the request line and header lines, `body` its body.
+fn plain_exchange(state: &Arc<AppState>, head: &str, body: &str) -> (u16, String, String) {
+    let addr = serve(state, 1);
+    let mut c = TcpStream::connect(addr).unwrap();
+    write!(c, "{head}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    let mut raw = Vec::new();
+    let _ = c.read_to_end(&mut raw);
+    split_response(&raw)
+}
+
+fn proxy_path(port: u16) -> String {
+    format!("/cors-proxy?url=http%3A%2F%2F127.0.0.1%3A{port}%2Fmcp")
+}
+
+#[test]
+fn props_report_the_proxy_truthfully_and_the_route_says_when_it_is_off() {
+    let h = harness();
+    let props = json::parse_json(&h.state.props_json(0, true)).unwrap();
+    assert_eq!(at(&props, &["cors_proxy_enabled"]).as_bool(), Some(false));
+    let (status, _, body) = plain_exchange(
+        &h.state,
+        "GET /cors-proxy?url=http%3A%2F%2F192.0.2.1%2F HTTP/1.1\r\nHost: localhost",
+        "",
+    );
+    assert_eq!(status, 403);
+    assert!(body.contains("feature_disabled") && body.contains("mcp proxy: "), "{body}");
+
+    let h = net_harness(loopback_proxy(false), None, None);
+    let (status, _, body) = plain_exchange(&h.state, "GET /props HTTP/1.1\r\nHost: localhost", "");
+    assert_eq!(status, 200);
+    let props = json::parse_json(&body).unwrap();
+    assert_eq!(at(&props, &["cors_proxy_enabled"]).as_bool(), Some(true));
+
+    // GET, POST and DELETE reach the target through the route
+    let (port, seen) = json_target("{\"ok\":true}");
+    for method in ["GET", "POST", "DELETE"] {
+        let (status, head, body) = plain_exchange(
+            &h.state,
+            &format!("{method} {} HTTP/1.1\r\nHost: localhost", proxy_path(port)),
+            "",
+        );
+        assert_eq!((status, body.as_str()), (200, "{\"ok\":true}"), "{method}");
+        assert!(head.contains("mcp-session-id: s-1"), "{head}");
+        assert!(!head.contains("access-control-allow-origin"), "{head}");
+    }
+    let seen = seen.lock().unwrap();
+    assert!(seen[0].starts_with("get /mcp http/1.1"), "{}", seen[0]);
+    assert!(seen[1].starts_with("post /mcp http/1.1"));
+    assert!(seen[2].starts_with("delete /mcp http/1.1"));
+    drop(seen);
+
+    let (status, _, body) =
+        plain_exchange(&h.state, "GET /gaudium/proxy HTTP/1.1\r\nHost: localhost", "");
+    assert_eq!(status, 200);
+    let v = json::parse_json(&body).unwrap();
+    assert_eq!(at(&v, &["counts", "proxied"]).as_f64(), Some(3.0));
+    assert_eq!(s(&v, &["allow_private", "0"]), "127.0.0.1");
+}
+
+#[test]
+fn the_proxy_route_is_behind_the_api_key_and_never_forwards_it() {
+    let h = net_harness(loopback_proxy(true), None, Some("server-key"));
+    let (port, seen) = json_target("{\"ok\":true}");
+    let path = proxy_path(port);
+
+    let (status, _, body) =
+        plain_exchange(&h.state, &format!("POST {path} HTTP/1.1\r\nHost: localhost"), "{}");
+    assert_eq!(status, 401);
+    assert!(body.contains("authentication_error"), "{body}");
+    let (status, _, _) = plain_exchange(
+        &h.state,
+        &format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong"),
+        "{}",
+    );
+    assert_eq!(status, 401);
+    assert!(seen.lock().unwrap().is_empty());
+    let (status, _, _) =
+        plain_exchange(&h.state, "GET /gaudium/proxy HTTP/1.1\r\nHost: localhost", "");
+    assert_eq!(status, 401);
+
+    let (status, _, body) = plain_exchange(
+        &h.state,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer server-key\r\n\
+             x-gaudium-proxy-header-authorization: Bearer mcp-token\r\n\
+             x-gaudium-proxy-header-content-type: application/json"
+        ),
+        "{}",
+    );
+    assert_eq!((status, body.as_str()), (200, "{\"ok\":true}"));
+    let seen = seen.lock().unwrap();
+    assert!(seen[0].contains("authorization: bearer mcp-token"), "{}", seen[0]);
+    assert!(!seen[0].contains("server-key"), "{}", seen[0]);
+}
+
+/// Behind a front end that ends TLS and forwards plain HTTP (a tunnel, a reverse proxy, a
+/// forwarded router port), the server gets a `Host` it has never heard of and a page whose
+/// origin is https. Nothing is configured with that name, and every answer is the one a direct
+/// request gets.
+#[test]
+fn a_request_through_a_tls_front_end_gets_the_answers_of_a_direct_one() {
+    let h = net_harness(loopback_proxy(false), None, None);
+    let (port, seen) = json_target("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    let direct = "Host: 127.0.0.1:8090";
+    let fronted = "Host: chat.example.com\r\nX-Forwarded-Proto: https\r\n\
+                   X-Forwarded-For: 198.51.100.7\r\nX-Forwarded-Host: chat.example.com\r\n\
+                   Origin: https://chat.example.com\r\nSec-Fetch-Site: same-origin";
+    // a front end that rewrites Host to its upstream's name and adds no forwarding header
+    let rewritten = "Host: 127.0.0.1:8090\r\nX-Forwarded-Proto: https\r\n\
+                     Origin: https://chat.example.com\r\nSec-Fetch-Site: same-origin";
+    // an older browser on the same route (no fetch-site statement): Origin against Host
+    let bare = "Host: chat.example.com\r\nX-Forwarded-Proto: https\r\nOrigin: https://chat.example.com";
+
+    let proxied = format!("POST {} HTTP/1.1", proxy_path(port));
+    let chat = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}";
+    for (line, body) in [
+        ("GET /health HTTP/1.1", ""),
+        ("GET /props HTTP/1.1", ""),
+        ("GET /v1/models HTTP/1.1", ""),
+        ("GET /gaudium/a2ui HTTP/1.1", ""),
+        (proxied.as_str(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"),
+        // a target that is not listed (an address: nothing is looked up)
+        ("DELETE /cors-proxy?url=http%3A%2F%2F192.0.2.1%2F HTTP/1.1", ""),
+        ("POST /tokenize HTTP/1.1", "{\"content\":\"Hello there\"}"),
+    ] {
+        let (d_status, _, d_body) = plain_exchange(&h.state, &format!("{line}\r\n{direct}"), body);
+        for (name, headers) in [("fronted", fronted), ("rewritten", rewritten), ("bare", bare)] {
+            let (status, head, got) = plain_exchange(&h.state, &format!("{line}\r\n{headers}"), body);
+            assert_eq!((status, &got), (d_status, &d_body), "{line} ({name})");
+            // no answer sends the browser anywhere by name
+            assert!(!head.contains("location:"), "{line} ({name}): {head}");
+            assert!(!head.contains("chat.example.com"), "{line} ({name}): {head}");
+        }
+    }
+    // a chat request runs the same way (its answer carries an id and timings of its own)
+    for headers in [direct, fronted] {
+        h.script("</think>\n\nHello.");
+        let (status, _, body) = plain_exchange(
+            &h.state,
+            &format!("POST /v1/chat/completions HTTP/1.1\r\n{headers}"),
+            chat,
+        );
+        assert_eq!(status, 200, "{body}");
+        let v = json::parse_json(&body).unwrap();
+        assert_eq!(s(&v, &["choices", "0", "message", "content"]), "Hello.");
+    }
+    // the proxied request reached the target each time, and the target saw none of the front
+    // end's headers
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    for head in seen.iter() {
+        assert!(head.contains(&format!("host: 127.0.0.1:{port}")), "{head}");
+        assert!(!head.contains("x-forwarded") && !head.contains("chat.example.com"), "{head}");
+    }
+}
+
+/// One exchange over TLS with the engine's own client: `(status, head, body)`.
+fn tls_exchange(
+    client: &crate::tls::TlsClient,
+    addr: std::net::SocketAddr,
+    name: &str,
+    head: &str,
+    body: &str,
+) -> (u16, String, String) {
+    let mut c = client
+        .connect(TcpStream::connect(addr).unwrap(), name)
+        .expect("a TLS connection to the server");
+    write!(c, "{head}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    let mut raw = Vec::new();
+    let _ = c.read_to_end(&mut raw);
+    split_response(&raw)
+}
+
+#[test]
+fn http_and_https_share_the_port() {
+    let Some(tc) =
+        crate::tls::test_util::test_cert(&["DNS:localhost", "DNS:gaudium.example.com", "IP:127.0.0.1"])
+    else {
+        return;
+    };
+    let server = crate::tls::TlsServer::new(&tc.cert, &tc.key).unwrap();
+    let h = net_harness(loopback_proxy(false), Some(server), None);
+    let client = crate::tls::TlsClient::new(Some(&tc.cert)).unwrap();
+    let (port, _) = json_target("{\"ok\":true}");
+
+    // every connection below goes to ONE listening port
+    let addr = serve(&h.state, 16);
+    let plain = |head: &str, body: &str| {
+        let mut c = TcpStream::connect(addr).unwrap();
+        write!(c, "{head}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut raw = Vec::new();
+        let _ = c.read_to_end(&mut raw);
+        split_response(&raw)
+    };
+
+    // plain HTTP goes on working beside HTTPS
+    let (status, _, body) = plain("GET /health HTTP/1.1\r\nHost: localhost", "");
+    assert_eq!((status, body.as_str()), (200, "{\"status\":\"ok\"}"));
+
+    // HTTPS under each name the page may be opened by: this machine, a LAN name, an address
+    for name in ["localhost", "gaudium.example.com", "127.0.0.1"] {
+        let (status, _, body) = tls_exchange(
+            &client,
+            addr,
+            name,
+            &format!("GET /props HTTP/1.1\r\nHost: {name}"),
+            "",
+        );
+        assert_eq!(status, 200, "{name}");
+        let props = json::parse_json(&body).unwrap();
+        assert_eq!(at(&props, &["cors_proxy_enabled"]).as_bool(), Some(true), "{name}");
+    }
+
+    // the proxy from an HTTPS page to a plain-http MCP server (what a browser cannot do itself)
+    let (status, head, body) = tls_exchange(
+        &client,
+        addr,
+        "localhost",
+        &format!(
+            "POST {} HTTP/1.1\r\nHost: localhost:8090\r\nOrigin: https://localhost:8090\r\n\
+             Sec-Fetch-Site: same-origin\r\nx-gaudium-proxy-header-content-type: application/json",
+            proxy_path(port)
+        ),
+        "{}",
+    );
+    assert_eq!((status, body.as_str()), (200, "{\"ok\":true}"));
+    assert!(head.contains("mcp-session-id: s-1"), "{head}");
+
+    // a streamed chat completion over TLS (the stream writer holds a second handle on the
+    // connection)
+    h.script("</think>\n\nHello over TLS.");
+    let (status, _, body) = tls_exchange(
+        &client,
+        addr,
+        "localhost",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json",
+        "{\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
+    );
+    assert_eq!(status, 200, "{body}");
+    let st = collect_chat_stream(&body);
+    assert_eq!(st.content, "Hello over TLS.");
+    assert!(st.done);
+
+    // a client that does not know the certificate's issuer refuses the server
+    let strict = crate::tls::TlsClient::new(None).unwrap();
+    assert!(strict
+        .connect(TcpStream::connect(addr).unwrap(), "localhost")
+        .is_err());
+
+    // another program's TLS client, when there is one
+    let curl = std::process::Command::new("curl")
+        .args(["--silent", "--show-error", "--max-time", "10", "--cacert"])
+        .arg(&tc.cert)
+        .arg(format!("https://localhost:{}/health", addr.port()))
+        .output();
+    match curl {
+        Ok(out) => assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "{\"status\":\"ok\"}",
+            "curl: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => eprintln!("skipped the curl check: curl is not available ({e})"),
+    }
+}
+
+#[test]
+fn a_tls_client_gets_no_http_answer_from_a_server_without_a_certificate() {
+    let Some(tc) = crate::tls::test_util::test_cert(&["DNS:localhost"]) else {
+        return;
+    };
+    let h = harness();
+    let addr = serve(&h.state, 2);
+    let client = crate::tls::TlsClient::new(Some(&tc.cert)).unwrap();
+    // the handshake is not answered: the connection closes
+    assert!(client
+        .connect(TcpStream::connect(addr).unwrap(), "localhost")
+        .is_err());
+    // and the server goes on serving plain HTTP
+    let mut c = TcpStream::connect(addr).unwrap();
+    write!(c, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let mut raw = Vec::new();
+    let _ = c.read_to_end(&mut raw);
+    assert_eq!(split_response(&raw).0, 200);
+}
+
+#[test]
+fn the_https_listener_starts_only_with_both_files_and_says_why_not() {
+    let mut cfg = harness().state.cfg.clone();
+    assert!(start_tls(&cfg).unwrap().is_none());
+    cfg.tls_cert = Some(PathBuf::from("/nonexistent/cert.pem"));
+    let e = start_tls(&cfg).err().unwrap();
+    assert!(e.contains("--tls-cert and --tls-key go together"), "{e}");
+    cfg.tls_key = Some(PathBuf::from("/nonexistent/key.pem"));
+    if crate::tls::availability().is_err() {
+        // no TLS library on this machine: the server starts, plain HTTP only
+        assert!(start_tls(&cfg).unwrap().is_none());
+        return;
+    }
+    let e = start_tls(&cfg).err().unwrap();
+    assert!(e.contains("HTTPS listener") && e.contains("/nonexistent/cert.pem"), "{e}");
+    let Some(tc) = crate::tls::test_util::test_cert(&["DNS:localhost"]) else {
+        return;
+    };
+    cfg.tls_cert = Some(tc.cert.clone());
+    cfg.tls_key = Some(tc.key.clone());
+    assert!(start_tls(&cfg).unwrap().is_some());
+    // the error for a wrong key names the file, never what is in it
+    cfg.tls_key = Some(tc.cert.clone());
+    let e = start_tls(&cfg).err().unwrap();
+    assert!(e.contains("private key file"), "{e}");
+    assert!(!e.contains("BEGIN") && !e.contains("MII"), "{e}");
 }
