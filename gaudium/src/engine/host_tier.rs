@@ -41,8 +41,9 @@ use super::*;
 use crate::cache_ram::{digest128, EngineId, HostCache, SharedCache};
 use crate::synapse::xfer::{Piece, XferRing, XferStats};
 use crate::verified::{
-    hc_clean_hi, hc_clean_join_hi, hc_clean_join_lo, hc_clean_lo, hc_copy_wins, hc_must_flush,
-    hc_ring_stale, hc_rows_saveable, hc_tile_clean, hc_written_hi, hc_written_lo, pc_boundary,
+    hc_clean_hi, hc_clean_join_hi, hc_clean_join_lo, hc_clean_lo, hc_copy_wins, hc_loses_unsaved,
+    hc_must_flush, hc_ring_stale, hc_rows_saveable, hc_tile_clean, hc_written_hi, hc_written_lo,
+    pc_boundary,
 };
 
 /// Tiles whose rows one copy call takes (a waiting request is noticed between ring buffers
@@ -310,6 +311,10 @@ pub struct HostTier {
     last: TierReport,
     /// The running request's rows were restored from host memory.
     restored: bool,
+    /// Rows the last finished request took over (0: its prompt was prefilled whole).
+    last_reused: u64,
+    /// The entry a save that a request cut short was writing.
+    partial: Option<u64>,
     verbose: bool,
 }
 
@@ -339,6 +344,8 @@ impl HostTier {
             rates: Rates::default(),
             last: TierReport::default(),
             restored: false,
+            last_reused: 0,
+            partial: None,
             verbose,
         }
     }
@@ -427,10 +434,23 @@ impl HostTier {
             self.unsaved = false;
         }
         let peek = table.peek(prompt, images, wanted, rows_zeroed);
-        if hc_must_flush(self.unsaved, peek.cap, table.kept_rows()) {
+        let kept_rows = table.kept_rows();
+        if hc_must_flush(self.unsaved, self.last_reused, peek.cap, kept_rows) {
             let rep = self.save(table, copier, &mut || false)?;
             self.last.save_ms = rep.ms;
             self.last.save_bytes = rep.bytes;
+        } else if hc_loses_unsaved(self.unsaved, peek.cap, kept_rows) {
+            // The request drops kept positions of a prompt that was only ever prefilled once:
+            // it does not pay for their save. A save of them that a request cut short has left
+            // rows with no position to resume from; they go.
+            if let Some(id) = self.partial.take() {
+                let mut store = self.cache.inner.lock().unwrap_or_else(|e| e.into_inner());
+                store.drop_unresumable(id);
+                store.settle();
+                self.cache.publish(&store);
+                self.clean.remove(&id);
+            }
+            self.unsaved = false;
         }
 
         let tile = self.rows.tile;
@@ -566,6 +586,7 @@ impl HostTier {
             return;
         }
         self.last.tier = Tier::of(self.restored, resume);
+        self.last_reused = resume;
         let tile = self.rows.tile;
         let (w0, w1) = (
             hc_written_lo(resume, tile),
@@ -758,6 +779,7 @@ impl HostTier {
         rep.ms = t0.elapsed().as_secs_f64() * 1e3;
         // a save cut short goes on at the next call; one that found no room does not ask again
         self.unsaved = rep.yielded;
+        self.partial = rep.yielded.then_some(entry);
         let s = store.stats_mut();
         if rep.bytes > 0 {
             s.saves += 1;
@@ -1432,25 +1454,72 @@ mod tests {
     }
 
     #[test]
-    fn a_request_that_would_overwrite_unsaved_positions_copies_them_out_first() {
+    fn a_request_pays_for_a_save_only_of_a_conversation_that_went_on() {
         let mut r = rig(64 << 20, 4);
-        let a1 = prompt(4 * 512 + 100, 1);
-        r.request(&a1, true);
-        // no idle time: another conversation arrives at once
+        // a prompt that was prefilled once, then another conversation at once (no idle time):
+        // the request pays for nothing, and nothing of the first prompt is kept
+        let x = prompt(4 * 512 + 100, 7);
+        r.request(&x, true);
         let b = prompt(2 * 512 + 50, 2);
         let (_, rep) = r.request(&b, true);
-        assert!(rep.save_bytes > 0);
-        assert_eq!(r.cache.stats().entries, 1);
-        // a request of the same conversation pays for nothing
+        assert_eq!((rep.save_bytes, r.dev.down), (0, 0));
+        assert_eq!(r.cache.stats().entries, 0);
+        // a conversation that went on (its second turn took rows over), then another one at
+        // once: its new rows and positions are copied out first, on that request's time
+        let a1 = prompt(4 * 512 + 100, 1);
+        r.request(&a1, true);
+        r.idle();
+        let mut a2 = a1.clone();
+        a2.extend(prompt(1100, 5));
+        assert_eq!(r.request(&a2, true).1.tier, Tier::Device);
+        let down = r.dev.down;
+        let (_, rep) = r.request(&b, true);
+        let tile_bytes = r.dev.layout.tile_bytes();
+        assert_eq!(rep.save_bytes, 2 * tile_bytes + 2 * 4608);
+        assert_eq!(r.dev.down - down, rep.save_bytes);
+        // a request of the conversation the card holds pays for nothing
         let mut b2 = b.clone();
         b2.extend(prompt(600, 3));
         assert_eq!(r.request(&b2, true).1.save_bytes, 0);
-        // and the first conversation is back from host memory
-        let mut a2 = a1.clone();
-        a2.extend(prompt(200, 5));
+        // and the first conversation's third turn comes back from host memory, exactly
         r.idle();
-        let (resume, rep) = r.request(&a2, true);
-        assert_eq!((resume, rep.tier), (4 * 512, Tier::Host));
+        let mut a3 = a2.clone();
+        a3.extend(prompt(200, 6));
+        let restored = r
+            .tier
+            .begin_request(&mut r.table, &mut r.dev, &a3, &[], true, false)
+            .unwrap();
+        let plan = r.table.plan_from(&a3, &[], true, false, restored);
+        assert_eq!(plan.resume, 6 * 512);
+        let (rows, state) = Rig::cold(&a3, plan.resume, 4);
+        assert!(r.dev.rows_of(0, plan.resume) == rows);
+        assert!(r.resume_state(plan.resume) == state);
+    }
+
+    #[test]
+    fn a_save_that_was_cut_short_and_never_finished_leaves_no_rows_behind() {
+        let mut r = rig(64 << 20, 4);
+        let a1 = prompt(6 * 512 + 100, 1);
+        r.request(&a1, true);
+        // the idle save of a prompt that was prefilled once is cut short after some tiles
+        let mut asked = 0;
+        let rep = r
+            .tier
+            .save(&r.table, &mut r.dev, &mut || {
+                asked += 1;
+                asked > 2
+            })
+            .unwrap();
+        assert!(rep.yielded);
+        assert_eq!(r.cache.stats().entries, 1);
+        // the request that cut it short is another conversation: the device loses the rest,
+        // the request does not pay for it, and the rows already copied (nothing could ever
+        // resume from them) are given back
+        let b = prompt(2 * 512 + 50, 2);
+        let (_, rep) = r.request(&b, true);
+        assert_eq!(rep.save_bytes, 0);
+        assert_eq!(r.cache.stats().entries, 0);
+        assert_eq!(r.cache.stats().held_bytes, 0);
     }
 
     #[test]
@@ -1575,6 +1644,9 @@ mod tests {
         // a prompt continues an entry when it shares at least as many tiles as it drops
         use crate::verified::hc_continues;
         assert!(hc_continues(5, 6) && hc_continues(3, 6) && !hc_continues(2, 6));
+        // a request pays for a save only of a conversation whose last request took rows over
+        use crate::verified::hc_must_flush;
+        assert!(hc_must_flush(true, 512, 0, 2048) && !hc_must_flush(true, 0, 0, 2048));
         // the rings are copied again when the entry has no image or grew
         use crate::verified::hc_ring_stale;
         assert!(hc_ring_stale(false, false) && hc_ring_stale(true, true));

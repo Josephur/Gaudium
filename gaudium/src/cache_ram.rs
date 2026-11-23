@@ -37,7 +37,7 @@ use crate::engine::qwen3::prefix_cache::{shared_rows, ImageId};
 use crate::hostmem::AnonMap;
 use crate::verified::{
     hc_abort, hc_begin_read, hc_begin_write, hc_busy, hc_can_evict, hc_continues, hc_end_read,
-    hc_end_write, hc_evict_before, hc_free_now, hc_may_restore, hc_pins, hc_readable,
+    hc_end_write, hc_evict_before, hc_free_now, hc_may_restore, hc_pins, hc_readable, hc_resumable,
     hc_resume_valid, hc_ring_cover_after_cut, hc_ring_serves, hc_room, hc_shared_tiles,
     hc_state_leaves_first, hc_states_over, hc_tiles, hc_truncate, pc_boundary, HcEntry, HcRoom,
 };
@@ -748,6 +748,18 @@ impl HostCache {
         }
         for s in gone {
             self.release(s);
+        }
+    }
+
+    /// Entry `id` was left by a save that will not go on (the device no longer holds what it
+    /// was copying): it goes when nothing can resume from it.
+    pub fn drop_unresumable(&mut self, id: u64) {
+        let gone = self
+            .entries
+            .get(&id)
+            .is_some_and(|e| !hc_resumable(e.states.len() as u64));
+        if gone {
+            self.remove(id);
         }
     }
 

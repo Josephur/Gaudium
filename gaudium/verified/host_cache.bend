@@ -544,11 +544,23 @@ def hc_ring_serves(image_tiles: Nat, resume_tiles: Nat) -> Bool:
 def hc_ring_cover_after_cut(+image_tiles: Nat, +keep: Nat) -> Nat:
   Nat.min(image_tiles, keep)
 
-# Must a request first copy out what the device holds and host memory does not? Only when
-# something is unsaved and the request shares fewer rows with the held prompt than the last
-# kept position needs: the positions behind the shared rows are about to be dropped.
-def hc_must_flush(unsaved: Bool, cap: Nat, kept_rows: Nat) -> Bool:
+# Is a request about to drop kept positions that host memory lacks? Only when something is
+# unsaved and the request shares fewer rows with the held prompt than the last kept position
+# needs: the positions behind the shared rows are dropped.
+def hc_loses_unsaved(unsaved: Bool, cap: Nat, kept_rows: Nat) -> Bool:
   Bool.and(unsaved, Nat.is_lt(cap, kept_rows))
+
+# Must that request first copy them out, on its own time? Only for a conversation that has
+# shown it goes on: the request that left the state took rows over itself (`reused_rows`). A
+# prompt that was only ever prefilled once (a batch of unrelated requests looks like that) is
+# saved in idle time or not at all, so no request pays for a prefix nobody comes back to.
+def hc_must_flush(unsaved: Bool, reused_rows: Nat, cap: Nat, kept_rows: Nat) -> Bool:
+  Bool.and(hc_loses_unsaved(unsaved, cap, kept_rows), Nat.is_gt(reused_rows, 0n))
+
+# Can anything resume from an entry with this many kept positions? Not from one with none: its
+# rows have no state to continue from.
+def hc_resumable(states: Nat) -> Bool:
+  Nat.is_gt(states, 0n)
 
 # ============================================================================
 # 10. Where a request's reused rows came from
@@ -1004,23 +1016,32 @@ def hc_idle_save_yields(w):
 
 # LAW HC.37: a request pays for no copy when nothing is unsaved.
 law hc_nothing_unsaved_never_flushes:
+  for +r: Nat
   for +c: Nat
   for +k: Nat
-  {hc_must_flush(False{}, c, k) == False{} : Bool}
+  {hc_must_flush(False{}, r, c, k) == False{} : Bool}
 
-def hc_nothing_unsaved_never_flushes(c, k):
+def hc_nothing_unsaved_never_flushes(r, c, k):
   {==}
+
+def hc_and_false_l_and(u: Bool, x: Bool, y: Bool, h: {x == False{} : Bool}) -> {Bool.and(Bool.and(u, x), y) == False{} : Bool}:
+  match u:
+    case False{}:
+      {==}
+    case True{}:
+      %Equal.sym(Bool, x, False{}, h) : {Bool.and(_, y) == False{} : Bool}
+      {==}
 
 # LAW HC.38: nor when it keeps every kept position (it shares at least their rows).
 law hc_shared_request_never_flushes:
   for +u: Bool
+  for +r: Nat
   for +k: Nat
   for +x: Nat
-  {hc_must_flush(u, Nat.add(k, x), k) == False{} : Bool}
+  {hc_must_flush(u, r, Nat.add(k, x), k) == False{} : Bool}
 
-def hc_shared_request_never_flushes(u, k, x):
-  %hc_lt_add_r_false(k, x) : {Bool.and(u, _) == False{} : Bool}
-  hc_and_false_r(u)
+def hc_shared_request_never_flushes(u, r, k, x):
+  hc_and_false_l_and(u, Nat.is_lt(Nat.add(k, x), k), Nat.is_gt(r, 0n), Equal.sym(Bool, False{}, Nat.is_lt(Nat.add(k, x), k), hc_lt_add_r_false(k, x)))
 
 # LAW HC.39: a prompt never keeps more tiles of an entry than the entry holds.
 law hc_shared_tiles_within_entry:
@@ -1217,3 +1238,39 @@ law hc_free_now_within_host:
 
 def hc_free_now_within_host(f, a):
   hc_min_le_r(f, a)
+
+# LAW HC.55: an entry with no kept position is never one to resume from.
+law hc_no_position_not_resumable:
+  for u: Unit
+  {hc_resumable(0n) == False{} : Bool}
+
+def hc_no_position_not_resumable(u):
+  {==}
+
+# LAW HC.56: a request drops nothing unsaved when nothing is unsaved.
+law hc_nothing_unsaved_nothing_lost:
+  for +c: Nat
+  for +k: Nat
+  {hc_loses_unsaved(False{}, c, k) == False{} : Bool}
+
+def hc_nothing_unsaved_nothing_lost(c, k):
+  {==}
+
+# LAW HC.57: a request never pays for a copy unless it would drop kept positions that host
+# memory lacks.
+law hc_flush_only_for_a_loss:
+  for +u: Bool
+  for +r: Nat
+  for +c: Nat
+  for +k: Nat
+  {Bool.and(hc_must_flush(u, r, c, k), Bool.not(hc_loses_unsaved(u, c, k))) == False{} : Bool}
+
+def hc_flush_only_for_a_loss_aux(a: Bool, b: Bool) -> {Bool.and(Bool.and(a, b), Bool.not(a)) == False{} : Bool}:
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      hc_and_false_r(b)
+
+def hc_flush_only_for_a_loss(u, r, c, k):
+  hc_flush_only_for_a_loss_aux(hc_loses_unsaved(u, c, k), Nat.is_gt(r, 0n))
