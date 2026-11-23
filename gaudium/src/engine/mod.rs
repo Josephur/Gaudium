@@ -9,6 +9,7 @@ pub mod fp8_pack;
 pub mod gemma4;
 pub mod gemma4_fp8;
 pub mod gemma4_packer;
+pub mod inkling2;
 pub mod mem_report;
 pub mod moe;
 pub mod packer;
@@ -198,6 +199,30 @@ impl GenEngine for gemma4::Gemma4Engine {
     }
 }
 
+impl GenEngine for inkling2::Inkling2Engine {
+    fn spec(&self) -> &ModelSpec {
+        inkling2::Inkling2Engine::spec(self)
+    }
+    fn max_ctx(&self) -> u64 {
+        inkling2::Inkling2Engine::max_ctx(self)
+    }
+    fn hbm_bytes(&self) -> [u64; 5] {
+        inkling2::Inkling2Engine::hbm_bytes(self)
+    }
+    fn generate_cancellable(
+        &mut self,
+        prompt_ids: &[i32],
+        params: &GenParams,
+        cancel: Option<&AtomicBool>,
+        on_token: &mut dyn FnMut(i32),
+    ) -> Result<GenReport, String> {
+        inkling2::Inkling2Engine::generate_cancellable(self, prompt_ids, params, cancel, on_token)
+    }
+    fn live_profile(&self) -> Option<crate::live_report::ProfileHandle> {
+        Some(inkling2::Inkling2Engine::live_profile(self))
+    }
+}
+
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
 pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
     let spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
@@ -207,6 +232,7 @@ pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
             Ok(Box::new(qwen3::Qwen3Engine::load(cfg)?))
         }
         ModelFamily::Gemma4 => Ok(Box::new(gemma4::Gemma4Engine::load(cfg)?)),
+        ModelFamily::Inkling2 => Ok(Box::new(inkling2::Inkling2Engine::load(cfg)?)),
         other => Err(format!(
             "no live Gaudi 2 engine is wired up for model family {other:?} yet"
         )),

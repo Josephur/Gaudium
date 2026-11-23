@@ -96,15 +96,19 @@ GlueCodeReturn GetKernelGuids(_IN_ DeviceId deviceId, _INOUT_ uint32_t* kernelCo
 
 GlueCodeReturn InstantiateTpcKernel(_IN_ HabanaKernelParams* p, _INOUT_ HabanaKernelInstantiation* out) {
     const std::string g = p->guid.name;
-    if (g == "gaudium_ik_mix") {   // s0..s3 bf16 {H, T}, part bf16 | f32 {H, T}, query f32 {H, NQ}, ctl i32 {8} -> out f32 {H, T, NQ}; node params: eps, scale (f32 bits)
-        NIN(7) NOUT(1)
-        const bool pf32 = IN(4).geometry.dataType == DATA_F32;
-        const TensorDataType in[7] = {DATA_BF16, DATA_BF16, DATA_BF16, DATA_BF16, pf32 ? DATA_F32 : DATA_BF16, DATA_F32, DATA_I32}, ot[1] = {DATA_F32};
+    if (g == "gaudium_ik_mix") {
+        // 7 inputs: s0..s3 bf16 {H, T}, part bf16 {H, T}, query f32 {H, NQ}, ctl i32 {8} -> out f32 {H, T, NQ}
+        // 8 inputs: the same with part f32 {H, T} and one more input xs bf16 {H, T} (the layer's input).   node params: eps, scale (f32 bits)
+        const bool pf32 = p->inputTensorNr == 8;
+        if (p->inputTensorNr != 7 && p->inputTensorNr != 8) { p->inputTensorNr = 7; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
+        NOUT(1)
+        const TensorDataType in[8] = {DATA_BF16, DATA_BF16, DATA_BF16, DATA_BF16, pf32 ? DATA_F32 : DATA_BF16, DATA_F32, DATA_I32, DATA_BF16}, ot[1] = {DATA_F32};
         if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
         const uint64_t H = dim(OUT(0), 0), T = dim(OUT(0), 1), NQ = dim(OUT(0), 2);
         if (OUT(0).geometry.dims != 3 || H == 0 || H % 128 || NQ == 0 || NQ > 4) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         for (int i = 0; i < 5; ++i) if (IN(i).geometry.dims != 2 || dim(IN(i), 0) != H || dim(IN(i), 1) != T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
-        if (IN(5).geometry.dims != 2 || dim(IN(5), 0) != H || dim(IN(5), 1) != NQ || dim(IN(6), 0) < 2) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (IN(5).geometry.dims != 2 || dim(IN(5), 0) != H || dim(IN(5), 1) != NQ || dim(IN(6), 0) < 3) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (pf32 && (IN(7).geometry.dims != 2 || dim(IN(7), 0) != H || dim(IN(7), 1) != T)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         if (!has_params(p, 2)) return GLUE_FAILED;
         out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = T;
         all_whole(p, out);
@@ -124,14 +128,14 @@ GlueCodeReturn InstantiateTpcKernel(_IN_ HabanaKernelParams* p, _INOUT_ HabanaKe
         out->kernel.paramsNr = 3; for (int i = 0; i < 3; ++i) out->kernel.scalarParams[i] = node_u32(p, i);
         return put_elf(out, "GAUDIUM_IKGIN_ELF");
     }
-    if (g == "gaudium_ik_mgate") {   // h f32 {H, T, NQH}, m f32 {H, T, NQM}, fg bf16 | f32 {2 H, T} -> out f32 {H, T}; node params: jh, jm
+    if (g == "gaudium_ik_mgate") {   // h f32 {H, T, NQH}, m f32 {H, T, NQM}, fg bf16 | f32 {2 H, T} -> out f32 {H, T} or {H, T, 1}; node params: jh, jm
         NIN(3) NOUT(1)
         const bool f32 = IN(2).geometry.dataType == DATA_F32;
         const TensorDataType in[3] = {DATA_F32, DATA_F32, f32 ? DATA_F32 : DATA_BF16}, ot[1] = {DATA_F32};
         if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
         const uint64_t H = dim(OUT(0), 0), T = dim(OUT(0), 1);
         if (!has_params(p, 2)) return GLUE_FAILED;
-        if (OUT(0).geometry.dims != 2 || H == 0 || H % 128) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        if ((OUT(0).geometry.dims != 2 && !(OUT(0).geometry.dims == 3 && dim(OUT(0), 2) == 1)) || H == 0 || H % 128) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         if (IN(0).geometry.dims != 3 || IN(1).geometry.dims != 3 || dim(IN(0), 0) != H || dim(IN(0), 1) != T || dim(IN(1), 0) != H || dim(IN(1), 1) != T || node_u32(p, 0) >= dim(IN(0), 2) || node_u32(p, 1) >= dim(IN(1), 2)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         if (IN(2).geometry.dims != 2 || dim(IN(2), 0) != 2 * H || dim(IN(2), 1) != T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         out->indexSpaceRank = 2; out->indexSpaceGeometry[0] = H / 128; out->indexSpaceGeometry[1] = T;

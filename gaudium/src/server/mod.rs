@@ -1160,6 +1160,7 @@ fn template_family(family: ModelFamily) -> &'static str {
         ModelFamily::Qwen3 => "qwen3",
         ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe => "qwen3.5",
         ModelFamily::Gemma4 | ModelFamily::Gemma4Assistant => "gemma4",
+        ModelFamily::Inkling2 => "inkling2",
     }
 }
 

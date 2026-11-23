@@ -24,6 +24,8 @@ pub enum ModelFamily {
     Qwen35Moe,
     Gemma4,
     Gemma4Assistant,
+    /// Looped MoE decoder without rotary positions (`inkling2`, `inkling2_loop`).
+    Inkling2,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +52,46 @@ pub struct Gemma4Spec {
     pub v_heads: u64,
     pub v_head_dim: u64,
     pub v_hidden: u64,
+}
+
+/// Geometry of an Inkling 2 decoder beyond the common fields (`text_config` of its `config.json`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Inkling2Spec {
+    /// First layer of the span that runs `passes` times with shared weights (`loop_end` = one past
+    /// its last layer). A model without a loop has `passes == 1` and an empty span.
+    pub loop_start: u64,
+    pub loop_end: u64,
+    pub passes: u64,
+    /// Rank of the message gates between two passes.
+    pub gate_rank: u64,
+    /// Layers summed into one block of the attention residuals.
+    pub block: u64,
+    /// Values per head of the relative states; backward distance the bias covers.
+    pub d_rel: u64,
+    pub rel_extent: u64,
+    /// Positions a sliding layer sees.
+    pub window: u64,
+    /// Taps of the short causal convolutions.
+    pub conv_taps: u64,
+    pub log_floor: u64,
+    pub log_alpha: f64,
+    pub qk_clip: f64,
+    pub rel_clip: f64,
+    pub gate_softcap: f64,
+    pub up_softcap: f64,
+    pub logit_softcap: f64,
+    pub route_scale: f64,
+    /// Rows of the unembedding the model can emit (the checkpoint pads it to `vocab`).
+    pub unpadded_vocab: u64,
+    /// Placeholder token an image's features replace (0: none declared).
+    pub image_token_id: u64,
+}
+
+impl Inkling2Spec {
+    /// Layer applications of one token.
+    pub fn apps(&self, n_layers: u64) -> u64 {
+        crate::verified::ik_apps(n_layers, self.loop_start, self.loop_end, self.passes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +135,7 @@ pub struct ModelSpec {
     /// node on stacked BF16 expert tensors instead of the dense-masked wide MLP (`engine/moe.rs`).
     pub moe_routed: bool,
     pub gemma4: Option<Gemma4Spec>,
+    pub inkling2: Option<Inkling2Spec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,8 +202,12 @@ impl ModelSpec {
         let model_type = str_field(&root, "model_type").to_owned();
         let text_model_type = str_field(tc, "model_type");
 
-        let family = if architecture.contains("Gemma4Assistant") || model_type == "gemma4_assistant"
+        let family = if architecture.contains("Inkling2")
+            || model_type.starts_with("inkling2")
+            || text_model_type.starts_with("inkling2")
         {
+            ModelFamily::Inkling2
+        } else if architecture.contains("Gemma4Assistant") || model_type == "gemma4_assistant" {
             ModelFamily::Gemma4Assistant
         } else if architecture.contains("Gemma4")
             || model_type.starts_with("gemma4")
@@ -247,7 +294,19 @@ impl ModelSpec {
         }
 
         let layer_types: Vec<String> =
-            if let Some(arr) = tc.get("layer_types").and_then(JsonValue::as_array) {
+            if let Some(local) = tc.get("local_layer_ids").and_then(JsonValue::as_array) {
+                // the layers with a sliding window are listed; every other layer is global
+                let local: Vec<u64> = local.iter().filter_map(JsonValue::as_u64).collect();
+                (0..n_layers)
+                    .map(|l| {
+                        if local.contains(&l) {
+                            "sliding_attention".to_owned()
+                        } else {
+                            "full_attention".to_owned()
+                        }
+                    })
+                    .collect()
+            } else if let Some(arr) = tc.get("layer_types").and_then(JsonValue::as_array) {
                 arr.iter()
                     .map(|x| x.as_str().unwrap_or("").to_owned())
                     .collect()
@@ -292,9 +351,47 @@ impl ModelSpec {
         };
         let gdn_conv_k = u64_field(tc, "linear_conv_kernel_dim");
 
-        let n_experts = u64_field(tc, "num_experts");
+        let mut n_experts = u64_field(tc, "num_experts");
         let experts_per_tok = u64_field(tc, "num_experts_per_tok");
-        let moe_intermediate = u64_field(tc, "moe_intermediate_size");
+        let mut moe_intermediate = u64_field(tc, "moe_intermediate_size");
+
+        let inkling2 = if family == ModelFamily::Inkling2 {
+            n_experts = u64_field(tc, "n_routed_experts");
+            moe_intermediate = intermediate;
+            let lc = tc.get("loop_config");
+            let lf = |key: &str| lc.map_or(0, |v| u64_field(v, key));
+            let passes = lf("num_passes").max(1);
+            Some(Inkling2Spec {
+                loop_start: lf("core_start"),
+                loop_end: lf("core_end"),
+                passes,
+                gate_rank: lf("gate_rank"),
+                block: u64_field(tc, "n_layers_per_attn_res_block"),
+                d_rel: u64_field(tc, "d_rel"),
+                rel_extent: u64_field(tc, "rel_extent"),
+                window: u64_field(tc, "sliding_window_size"),
+                conv_taps: u64_field(tc, "sconv_kernel_size"),
+                log_floor: u64_field(tc, "log_scaling_n_floor"),
+                log_alpha: f64_field(tc, "log_scaling_alpha", 0.0),
+                qk_clip: f64_field(tc, "qk_l2_clip_threshold", 0.0),
+                rel_clip: f64_field(tc, "rel_l2_clip_threshold", 0.0),
+                gate_softcap: f64_field(tc, "mlp_gate_softcap", 0.0),
+                up_softcap: f64_field(tc, "mlp_up_softcap", 0.0),
+                logit_softcap: f64_field(tc, "final_logit_softcapping", 0.0),
+                route_scale: f64_field(tc, "route_scale", 1.0),
+                unpadded_vocab: {
+                    let v = u64_field(tc, "unpadded_vocab_size");
+                    if v > 0 {
+                        v
+                    } else {
+                        vocab
+                    }
+                },
+                image_token_id: u64_field(&root, "image_token_id"),
+            })
+        } else {
+            None
+        };
 
         let has_vision = root
             .get("vision_config")
@@ -406,6 +503,7 @@ impl ModelSpec {
             fp8_weights: false,
             moe_routed: false,
             gemma4,
+            inkling2,
         };
         Ok(spec)
     }
@@ -484,6 +582,14 @@ impl ModelSpec {
             ModelFamily::Gemma4Assistant => {
                 validate_hidden(self.hidden, self.vocab)
                     .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
+            }
+            ModelFamily::Inkling2 => {
+                // the family has a shape guard of its own (`verified/inkling2.bend`)
+                let ik = self.inkling2.as_ref().ok_or_else(|| {
+                    SpecError::InvalidDims("Inkling 2 spec without its geometry".into())
+                })?;
+                crate::core::inkling2::validate_inkling2(self, ik)
+                    .map_err(SpecError::InvalidDims)?;
             }
         }
         Ok(())

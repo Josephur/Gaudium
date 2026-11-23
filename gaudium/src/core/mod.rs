@@ -5,6 +5,7 @@ pub mod budget;
 pub mod effort;
 pub mod gemma4;
 pub mod hbm;
+pub mod inkling2;
 pub mod kv_pool;
 pub mod lifecycle;
 pub mod listener;
