@@ -177,6 +177,16 @@ def ln_session_admits(blocked: Bool) -> Bool:
 def ln_session_yields(idle: Bool, blocked: Bool) -> Bool:
   Bool.and(idle, blocked)
 
+# A lane's next row after a step that wrote `rows` rows at `cursor` and emitted `emitted`
+# tokens: it moves past the rows the step accepted, never past the rows it wrote.
+def ln_lane_cursor_next(cursor: Nat, emitted: Nat, rows: Nat) -> Nat:
+  Nat.add(cursor, Nat.min(emitted, rows))
+
+# The recurrent-state buffer (0 or 1) a lane's next step reads, after a step that read `p`: the
+# one that step wrote.
+def ln_lane_parity_next(p: Nat) -> Nat:
+  Nat.sub(1n, p)
+
 # What a running lane session does next.
 type SessionMove is Data:
   SmEnd{}
@@ -1137,3 +1147,55 @@ def ln_next_admits_only_waiting(i, b):
     case True{} False{}: {==}
     case False{} True{}: {==}
     case False{} False{}: {==}
+
+# promise: a step moves a lane's cursor only over rows the step wrote.
+law ln_cursor_never_past_rows:
+  for +c: Nat
+  for +e: Nat
+  for +r: Nat
+  {Nat.is_le(ln_lane_cursor_next(c, e, r), Nat.add(c, r)) == True{} : Bool}
+
+def ln_cursor_never_past_rows(c, e, r):
+  L.nat_add_le_mono(c, c, Nat.min(e, r), r, L.nat_le_refl(c), L.nat_min_le_r(e, r))
+
+# promise: a step never moves a lane's cursor back.
+law ln_cursor_never_back:
+  for +c: Nat
+  for +e: Nat
+  for +r: Nat
+  {Nat.is_le(c, ln_lane_cursor_next(c, e, r)) == True{} : Bool}
+
+def ln_cursor_never_back(c, e, r):
+  L.nat_add_le_r(c, Nat.min(e, r))
+
+# promise: a lane's next step reads one of its two recurrent-state buffers.
+law ln_parity_in_range:
+  for +p: Nat
+  {Nat.is_le(ln_lane_parity_next(p), 1n) == True{} : Bool}
+
+def ln_parity_in_range(p):
+  match p:
+    case 0n:
+      {==}
+    case 1n+q:
+      match q:
+        case 0n:
+          {==}
+        case 1n+u:
+          {==}
+
+# promise: a lane's next step reads the recurrent-state buffer the step before it wrote, never the one it read.
+law ln_parity_alternates:
+  for +p: Nat
+  {Bool.or(Nat.is_gt(p, 1n), Nat.is_ne(ln_lane_parity_next(p), p)) == True{} : Bool}
+
+def ln_parity_alternates(p):
+  match p:
+    case 0n:
+      {==}
+    case 1n+q:
+      match q:
+        case 0n:
+          {==}
+        case 1n+u:
+          {==}

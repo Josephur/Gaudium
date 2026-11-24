@@ -663,6 +663,15 @@ impl Run {
         )
     }
 
+    /// After a step that wrote `rows` rows at the cursor and emitted `emitted` tokens: the
+    /// cursor and the recurrent-state parity of the next step (the verified transition), and the
+    /// step count of the report.
+    fn advance(&mut self, emitted: u64, rows: u64) {
+        self.cursor = crate::verified::ln_lane_cursor_next(self.cursor, emitted, rows);
+        self.parity = crate::verified::ln_lane_parity_next(self.parity as u64) as usize;
+        self.steps += 1;
+    }
+
     /// Notes a cancellation of the request; whether it ends is then [`Run::done`]'s decision.
     fn observe_cancel(&mut self) {
         self.stopped_by_cancel |= self.cancel.load(Ordering::Relaxed);
@@ -1231,9 +1240,7 @@ fn serve_loop(
             let toks = step(eng, &group, runs, sampled)?;
             for (&lane, tok) in group.iter().zip(toks) {
                 let run = runs[lane].as_mut().expect("a decoding lane runs");
-                run.parity ^= 1;
-                run.cursor += 1;
-                run.steps += 1;
+                run.advance(1, 1);
                 run.observe_cancel();
                 if !run.done() {
                     run.emit(tok);

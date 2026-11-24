@@ -406,6 +406,16 @@ mod tests {
     }
 
     #[test]
+    fn a_step_advances_a_lanes_cursor_and_parity() {
+        use crate::verified::{ln_lane_cursor_next, ln_lane_parity_next};
+        assert_eq!(ln_lane_cursor_next(70, 1, 1), 71, "one decode row");
+        assert_eq!(ln_lane_cursor_next(70, 3, 8), 73, "three accepted of eight");
+        assert_eq!(ln_lane_cursor_next(70, 9, 8), 78, "never past the rows written");
+        assert_eq!(ln_lane_parity_next(0), 1);
+        assert_eq!(ln_lane_parity_next(1), 0);
+    }
+
+    #[test]
     fn plan_and_slot_checks() {
         assert_eq!(plan_check(4, 10, 20, 60), Ok(60));
         assert_eq!(plan_check(4, 10, 20, 59), Err(1));
