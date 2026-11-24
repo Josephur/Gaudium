@@ -30,8 +30,8 @@
 use crate::fp8::f32_to_bf16_rne;
 use crate::json::{parse_json, JsonValue};
 use crate::verified::{
-    g4v_grid_ok, g4v_size_ok, g4v_table_holds, g4v_soft_budget, g4v_target_h, g4v_target_w, g4v_tokens, g4v_tower_ok,
-    g4v_width_ok,
+    g4v_grid_ok, g4v_pool_count, g4v_pool_x, g4v_pool_y, g4v_size_ok, g4v_table_holds, g4v_soft_budget, g4v_target_h,
+    g4v_target_w, g4v_tokens, g4v_tower_ok, g4v_width_ok,
 };
 use crate::vision::preprocess::{resize_rgb, PreparedImage, RgbImage};
 use crate::vision::{ImageProcessor, VisionSpec};
@@ -426,21 +426,15 @@ fn raster_patches(rh: usize, rw: usize, p: usize, mut put: impl FnMut(usize, usi
 }
 
 /// The patch grid positions in pooling order: block by block of `pool x pool` patches (blocks
-/// in reading order, a block's patches in reading order). The tower does not depend on the order
-/// of its patches (each carries its own position); in this order the mean of a block is one
-/// product with a 0 / 1 matrix.
+/// in reading order, the order of the soft tokens; a block's patches in reading order), from the
+/// verified `g4v_pool_y` / `g4v_pool_x`. The tower does not depend on the order of its patches
+/// (each carries its own position); in this order the mean of a block is one product with a
+/// 0 / 1 matrix. `pool` is positive (`g4v_grid_ok`).
 pub fn pooling_order(gh: usize, gw: usize, pool: usize) -> Vec<(usize, usize)> {
-    let mut o = Vec::with_capacity(gh * gw);
-    for by in 0..gh / pool {
-        for bx in 0..gw / pool {
-            for dy in 0..pool {
-                for dx in 0..pool {
-                    o.push((by * pool + dy, bx * pool + dx));
-                }
-            }
-        }
-    }
-    o
+    let (nby, nbx, p) = ((gh / pool) as u64, (gw / pool) as u64, pool as u64);
+    (0..g4v_pool_count(nby, nbx, p))
+        .map(|i| (g4v_pool_y(i, nbx, p) as usize, g4v_pool_x(i, nbx, p) as usize))
+        .collect()
 }
 
 fn resize_for(img: &RgbImage, vs: &VisionSpec) -> Result<(usize, usize, Vec<u8>), String> {

@@ -172,6 +172,25 @@ def g4v_table_holds(+gh: Nat, +gw: Nat, +npos: Nat) -> Bool:
 def g4v_arena_step() -> Nat:
   256n
 
+# Pooling order of a patch grid with `nbx` pooling blocks of `pool x pool` patches per row (the
+# tower's input rows): row `i` holds a patch of the block of soft token `i / pool^2`, the blocks in
+# raster order (the order of the soft tokens), at offset `i % pool^2` inside its block. The grid
+# row of that patch:
+def g4v_pool_y(+i: Nat, +nbx: Nat, +pool: Nat) -> Nat:
+  Nat.add(Nat.mul(Nat.div(Nat.div(i, Nat.mul(pool, pool)), nbx), pool), Nat.div(Nat.mod(i, Nat.mul(pool, pool)), pool))
+
+# ... and its grid column.
+def g4v_pool_x(+i: Nat, +nbx: Nat, +pool: Nat) -> Nat:
+  Nat.add(Nat.mul(Nat.mod(Nat.div(i, Nat.mul(pool, pool)), nbx), pool), Nat.mod(Nat.mod(i, Nat.mul(pool, pool)), pool))
+
+# Rows of the pooling order of `nby x nbx` whole blocks.
+def g4v_pool_count(nby: Nat, nbx: Nat, +pool: Nat) -> Nat:
+  Nat.mul(Nat.mul(nby, nbx), Nat.mul(pool, pool))
+
+# The pooling-order row of the patch at grid row `y`, column `x` (the inverse of the two above).
+def g4v_pool_row(+y: Nat, +x: Nat, nbx: Nat, +pool: Nat) -> Nat:
+  Nat.add(Nat.mul(Nat.add(Nat.mul(Nat.div(y, pool), nbx), Nat.div(x, pool)), Nat.mul(pool, pool)), Nat.add(Nat.mul(Nat.mod(y, pool), pool), Nat.mod(x, pool)))
+
 # Device bytes one buffer of `bytes` takes in a sealed arena: at least one step, a whole number
 # of steps (what the arena's sub-allocation consumes for it).
 def g4v_part_bytes(+bytes: Nat) -> Nat:
@@ -868,3 +887,153 @@ law g4v_processor_budget_holds_a_token:
 
 def g4v_processor_budget_holds_a_token(p, m, f, c, px):
   g4v_processor_budget_go(Bool.and(Nat.is_eq(f, 1n), Nat.is_eq(c, 3n)), g4v_soft_budget(px, Nat.mul(p, m)))
+
+# ----------------------------------------------------------------------------
+# Pooling order of the tower's patches
+# ----------------------------------------------------------------------------
+
+# go(q (1 + bp) + n, bp, d, 0) == go(n, bp, q + d, 0): whole multiples of the divisor only count.
+def g4v_dm_mul_add(+q: Nat, +bp: Nat, +n: Nat, +d: Nat) -> {Nat.divmod.go(Nat.add(Nat.mul(q, 1n+bp), n), bp, d, 0n) == Nat.divmod.go(n, bp, Nat.add(q, d), 0n) : Nat & Nat}:
+  match q:
+    case 0n:
+      {==}
+    case 1n+qp:
+      %Equal.sym(Nat, Nat.add(Nat.add(bp, Nat.mul(qp, 1n+bp)), n), Nat.add(bp, Nat.add(Nat.mul(qp, 1n+bp), n)), L.nat_add_assoc(bp, Nat.mul(qp, 1n+bp), n)) : {Nat.divmod.go(1n+_, bp, d, 0n) == Nat.divmod.go(n, bp, 1n+Nat.add(qp, d), 0n) : Nat & Nat}
+      %L.nat_add_succ_r(bp, Nat.add(Nat.mul(qp, 1n+bp), n)) : {Nat.divmod.go(_, bp, d, 0n) == Nat.divmod.go(n, bp, 1n+Nat.add(qp, d), 0n) : Nat & Nat}
+      %L.nat_add_zero_r(bp) : {Nat.divmod.go(Nat.add(bp, 1n+Nat.add(Nat.mul(qp, 1n+bp), n)), _, d, 0n) == Nat.divmod.go(n, bp, 1n+Nat.add(qp, d), 0n) : Nat & Nat}
+      %Equal.sym(Nat & Nat, Nat.divmod.go(Nat.add(bp, 1n+Nat.add(Nat.mul(qp, 1n+bp), n)), Nat.add(bp, 0n), d, 0n), Nat.divmod.go(1n+Nat.add(Nat.mul(qp, 1n+bp), n), 0n, d, Nat.add(bp, 0n)), IK.ikp_dm_skip(bp, 1n+Nat.add(Nat.mul(qp, 1n+bp), n), 0n, d, 0n)) : {_ == Nat.divmod.go(n, bp, 1n+Nat.add(qp, d), 0n) : Nat & Nat}
+      %Equal.sym(Nat, Nat.add(bp, 0n), bp, L.nat_add_zero_r(bp)) : {Nat.divmod.go(Nat.add(Nat.mul(qp, 1n+bp), n), _, 1n+d, 0n) == Nat.divmod.go(n, bp, 1n+Nat.add(qp, d), 0n) : Nat & Nat}
+      %L.nat_add_succ_r(qp, d) : {Nat.divmod.go(Nat.add(Nat.mul(qp, 1n+bp), n), bp, 1n+d, 0n) == Nat.divmod.go(n, bp, _, 0n) : Nat & Nat}
+      g4v_dm_mul_add(qp, bp, n, 1n+d)
+
+# go(r, bp, d, 0) == (d, r) when r <= bp: a remainder below the divisor stays one.
+def g4v_dm_small(+r: Nat, +bp: Nat, +d: Nat, h: {Nat.is_le(r, bp) == True{} : Bool}) -> {Nat.divmod.go(r, bp, d, 0n) == (d, r) : Nat & Nat}:
+  %L.nat_add_zero_r(r) : {Nat.divmod.go(_, bp, d, 0n) == (d, r) : Nat & Nat}
+  %Equal.trans(Nat, Nat.add(r, Nat.sub(bp, r)), Nat.add(Nat.sub(bp, r), r), bp, L.nat_add_comm(r, Nat.sub(bp, r)), L.nat_sub_add_cancel(bp, r, h)) : {Nat.divmod.go(Nat.add(r, 0n), _, d, 0n) == (d, r) : Nat & Nat}
+  %Equal.sym(Nat & Nat, Nat.divmod.go(Nat.add(r, 0n), Nat.add(r, Nat.sub(bp, r)), d, 0n), Nat.divmod.go(0n, Nat.sub(bp, r), d, Nat.add(r, 0n)), IK.ikp_dm_skip(r, 0n, Nat.sub(bp, r), d, 0n)) : {_ == (d, r) : Nat & Nat}
+  %Equal.sym(Nat, Nat.add(r, 0n), r, L.nat_add_zero_r(r)) : {(d, _) == (d, r) : Nat & Nat}
+  {==}
+
+# divmod(q (1 + bp) + r, 1 + bp) == (q, r) when r <= bp.
+def g4v_divmod_qr(+q: Nat, +bp: Nat, +r: Nat, h: {Nat.is_le(r, bp) == True{} : Bool}) -> {Nat.divmod(Nat.add(Nat.mul(q, 1n+bp), r), 1n+bp) == (q, r) : Nat & Nat}:
+  %Equal.sym(Nat & Nat, Nat.divmod.go(Nat.add(Nat.mul(q, 1n+bp), r), bp, 0n, 0n), Nat.divmod.go(r, bp, Nat.add(q, 0n), 0n), g4v_dm_mul_add(q, bp, r, 0n)) : {_ == (q, r) : Nat & Nat}
+  %Equal.sym(Nat, Nat.add(q, 0n), q, L.nat_add_zero_r(q)) : {Nat.divmod.go(r, bp, _, 0n) == (q, r) : Nat & Nat}
+  g4v_dm_small(r, bp, q, h)
+
+# (q (1 + bp) + r) / (1 + bp) == q when r <= bp.
+def g4v_div_qr(+q: Nat, +bp: Nat, +r: Nat, h: {Nat.is_le(r, bp) == True{} : Bool}) -> {Nat.div(Nat.add(Nat.mul(q, 1n+bp), r), 1n+bp) == q : Nat}:
+  %Equal.sym(Nat & Nat, Nat.divmod(Nat.add(Nat.mul(q, 1n+bp), r), 1n+bp), (q, r), g4v_divmod_qr(q, bp, r, h)) : {Pair.fst(Nat, Nat, _) == q : Nat}
+  {==}
+
+# (q (1 + bp) + r) % (1 + bp) == r when r <= bp.
+def g4v_mod_qr(+q: Nat, +bp: Nat, +r: Nat, h: {Nat.is_le(r, bp) == True{} : Bool}) -> {Nat.mod(Nat.add(Nat.mul(q, 1n+bp), r), 1n+bp) == r : Nat}:
+  %Equal.sym(Nat & Nat, Nat.divmod(Nat.add(Nat.mul(q, 1n+bp), r), 1n+bp), (q, r), g4v_divmod_qr(q, bp, r, h)) : {Pair.snd(Nat, Nat, _) == r : Nat}
+  {==}
+
+# a < 1 + b gives a <= b.
+def g4v_lt_succ_le(+a: Nat, +b: Nat, h: {Nat.is_lt(a, 1n+b) == True{} : Bool}) -> {Nat.is_le(a, b) == True{} : Bool}:
+  Equal.trans(Bool, Nat.is_le(a, b), Nat.is_lt(a, 1n+b), True{}, Equal.sym(Bool, Nat.is_lt(a, 1n+b), Nat.is_le(a, b), L.nat_lt_succ_eq_le(a, b)), h)
+
+# The offset inside a block, a % (1 + pp)^2, splits into a row below 1 + pp ...
+def g4v_pool_dy_le(+a: Nat, +pp: Nat) -> {Nat.is_le(Nat.div(Nat.mod(a, Nat.mul(1n+pp, 1n+pp)), 1n+pp), pp) == True{} : Bool}:
+  g4v_lt_succ_le(Nat.div(Nat.mod(a, Nat.mul(1n+pp, 1n+pp)), 1n+pp), pp, L.nat_div_lt_of_lt_mul(Nat.mod(a, Nat.mul(1n+pp, 1n+pp)), 1n+pp, pp, L.nat_mod_lt(a, Nat.add(pp, Nat.mul(pp, 1n+pp)))))
+
+# ... and a column below 1 + pp.
+def g4v_mod_le(+a: Nat, +pp: Nat) -> {Nat.is_le(Nat.mod(a, 1n+pp), pp) == True{} : Bool}:
+  g4v_lt_succ_le(Nat.mod(a, 1n+pp), pp, L.nat_mod_lt(a, pp))
+
+# p + x < p + y when x < y.
+def g4v_lt_add_l(+p: Nat, +x: Nat, +y: Nat, h: {Nat.is_lt(x, y) == True{} : Bool}) -> {Nat.is_lt(Nat.add(p, x), Nat.add(p, y)) == True{} : Bool}:
+  match p:
+    case 0n:
+      h
+    case 1n+pp:
+      g4v_lt_add_l(pp, x, y, h)
+
+# a < n and b < p give a p + b < n p.
+def g4v_lt_mul_add(+a: Nat, +b: Nat, +n: Nat, +p: Nat, ha: {Nat.is_lt(a, n) == True{} : Bool}, hb: {Nat.is_lt(b, p) == True{} : Bool}) -> {Nat.is_lt(Nat.add(Nat.mul(a, p), b), Nat.mul(n, p)) == True{} : Bool}:
+  match a n:
+    case 0n 0n:
+      L.bool_absurd({Nat.is_lt(Nat.add(Nat.mul(0n, p), b), Nat.mul(0n, p)) == True{} : Bool}, ha)
+    case 0n 1n+np:
+      L.nat_lt_le_trans(b, p, Nat.add(p, Nat.mul(np, p)), hb, L.nat_add_le_r(p, Nat.mul(np, p)))
+    case 1n+ap 0n:
+      L.bool_absurd({Nat.is_lt(Nat.add(Nat.mul(1n+ap, p), b), Nat.mul(0n, p)) == True{} : Bool}, ha)
+    case 1n+ap 1n+np:
+      %Equal.sym(Nat, Nat.add(Nat.add(p, Nat.mul(ap, p)), b), Nat.add(p, Nat.add(Nat.mul(ap, p), b)), L.nat_add_assoc(p, Nat.mul(ap, p), b)) : {Nat.is_lt(_, Nat.add(p, Nat.mul(np, p))) == True{} : Bool}
+      g4v_lt_add_l(p, Nat.add(Nat.mul(ap, p), b), Nat.mul(np, p), g4v_lt_mul_add(ap, b, np, p, ha, hb))
+
+# LAW G4V.17
+# promise: every row of the pooling order holds a patch of a column inside the grid's whole blocks.
+# harm: the host would read a patch's pixels and position row from outside the image.
+law g4v_pool_x_within:
+  for +i: Nat
+  for +nbxp: Nat
+  for +pp: Nat
+  {Nat.is_lt(g4v_pool_x(i, 1n+nbxp, 1n+pp), Nat.mul(1n+nbxp, 1n+pp)) == True{} : Bool}
+
+def g4v_pool_x_within(i, nbxp, pp):
+  g4v_lt_mul_add(Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), 1n+nbxp, 1n+pp, L.nat_mod_lt(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), nbxp), L.nat_mod_lt(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), pp))
+
+# The y bound once the row index is below the count (b says it is).
+def g4v_pool_y_within_go(+i: Nat, +nby: Nat, +nbxp: Nat, +pp: Nat, b: Bool, e: {Nat.is_lt(i, g4v_pool_count(nby, 1n+nbxp, 1n+pp)) == b : Bool}) -> {Bool.and(b, Nat.is_le(Nat.mul(nby, 1n+pp), g4v_pool_y(i, 1n+nbxp, 1n+pp))) == False{} : Bool}:
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_lt_le_false(g4v_pool_y(i, 1n+nbxp, 1n+pp), Nat.mul(nby, 1n+pp), g4v_lt_mul_add(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), nby, 1n+pp, L.nat_div_lt_of_lt_mul(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), nby, nbxp, L.nat_div_lt_of_lt_mul(i, Nat.mul(nby, 1n+nbxp), Nat.add(pp, Nat.mul(pp, 1n+pp)), e)), L.nat_div_lt_of_lt_mul(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp, pp, L.nat_mod_lt(i, Nat.add(pp, Nat.mul(pp, 1n+pp))))))
+
+# LAW G4V.18
+# promise: every row of the pooling order of whole blocks holds a patch of a row inside the grid's whole blocks.
+# harm: the host would read a patch's pixels and position row from outside the image.
+law g4v_pool_y_within:
+  for +i: Nat
+  for +nby: Nat
+  for +nbxp: Nat
+  for +pp: Nat
+  {Bool.and(Nat.is_lt(i, g4v_pool_count(nby, 1n+nbxp, 1n+pp)), Nat.is_le(Nat.mul(nby, 1n+pp), g4v_pool_y(i, 1n+nbxp, 1n+pp))) == False{} : Bool}
+
+def g4v_pool_y_within(i, nby, nbxp, pp):
+  g4v_pool_y_within_go(i, nby, nbxp, pp, Nat.is_lt(i, g4v_pool_count(nby, 1n+nbxp, 1n+pp)), {==})
+
+# LAW G4V.19
+# promise: the rows of a soft token in the pooling order all lie in the token's own pooling block, the blocks in raster order (the reference's order of the soft tokens): its block column.
+# harm: a token would pool patches of another block, or the tokens would leave the tower out of order.
+law g4v_pool_x_in_token_block:
+  for +i: Nat
+  for +nbxp: Nat
+  for +pp: Nat
+  {Nat.div(g4v_pool_x(i, 1n+nbxp, 1n+pp), 1n+pp) == Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp) : Nat}
+
+def g4v_pool_x_in_token_block(i, nbxp, pp):
+  g4v_div_qr(Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), pp, Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), g4v_mod_le(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), pp))
+
+# LAW G4V.20
+# promise: the rows of a soft token in the pooling order all lie in the token's own pooling block, the blocks in raster order (the reference's order of the soft tokens): its block row.
+# harm: a token would pool patches of another block, or the tokens would leave the tower out of order.
+law g4v_pool_y_in_token_block:
+  for +i: Nat
+  for +nbx: Nat
+  for +pp: Nat
+  {Nat.div(g4v_pool_y(i, nbx, 1n+pp), 1n+pp) == Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), nbx) : Nat}
+
+def g4v_pool_y_in_token_block(i, nbx, pp):
+  g4v_div_qr(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), nbx), pp, Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), g4v_pool_dy_le(i, pp))
+
+# LAW G4V.21
+# promise: the pooling order holds no patch twice: the row a patch is read from is recovered from its grid position.
+# harm: a patch would enter its token's mean twice and another patch not at all.
+law g4v_pool_rows_distinct:
+  for +i: Nat
+  for +nbxp: Nat
+  for +pp: Nat
+  {g4v_pool_row(g4v_pool_y(i, 1n+nbxp, 1n+pp), g4v_pool_x(i, 1n+nbxp, 1n+pp), 1n+nbxp, 1n+pp) == i : Nat}
+
+def g4v_pool_rows_distinct(i, nbxp, pp):
+  %Equal.sym(Nat, Nat.div(g4v_pool_y(i, 1n+nbxp, 1n+pp), 1n+pp), Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), g4v_div_qr(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), pp, Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), g4v_pool_dy_le(i, pp))) : {Nat.add(Nat.mul(Nat.add(Nat.mul(_, 1n+nbxp), Nat.div(g4v_pool_x(i, 1n+nbxp, 1n+pp), 1n+pp)), Nat.mul(1n+pp, 1n+pp)), Nat.add(Nat.mul(Nat.mod(g4v_pool_y(i, 1n+nbxp, 1n+pp), 1n+pp), 1n+pp), Nat.mod(g4v_pool_x(i, 1n+nbxp, 1n+pp), 1n+pp))) == i : Nat}
+  %Equal.sym(Nat, Nat.div(g4v_pool_x(i, 1n+nbxp, 1n+pp), 1n+pp), Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), g4v_div_qr(Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), pp, Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), g4v_mod_le(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), pp))) : {Nat.add(Nat.mul(Nat.add(Nat.mul(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), 1n+nbxp), _), Nat.mul(1n+pp, 1n+pp)), Nat.add(Nat.mul(Nat.mod(g4v_pool_y(i, 1n+nbxp, 1n+pp), 1n+pp), 1n+pp), Nat.mod(g4v_pool_x(i, 1n+nbxp, 1n+pp), 1n+pp))) == i : Nat}
+  %Equal.sym(Nat, Nat.mod(g4v_pool_y(i, 1n+nbxp, 1n+pp), 1n+pp), Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), g4v_mod_qr(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), pp, Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), g4v_pool_dy_le(i, pp))) : {Nat.add(Nat.mul(Nat.add(Nat.mul(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), 1n+nbxp), Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp)), Nat.mul(1n+pp, 1n+pp)), Nat.add(Nat.mul(_, 1n+pp), Nat.mod(g4v_pool_x(i, 1n+nbxp, 1n+pp), 1n+pp))) == i : Nat}
+  %Equal.sym(Nat, Nat.mod(g4v_pool_x(i, 1n+nbxp, 1n+pp), 1n+pp), Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), g4v_mod_qr(Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), pp, Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), g4v_mod_le(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), pp))) : {Nat.add(Nat.mul(Nat.add(Nat.mul(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), 1n+nbxp), Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp)), Nat.mul(1n+pp, 1n+pp)), Nat.add(Nat.mul(Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), 1n+pp), _)) == i : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.mul(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), 1n+nbxp), Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp)), Nat.div(i, Nat.mul(1n+pp, 1n+pp)), L.nat_div_mod_r(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), nbxp)) : {Nat.add(Nat.mul(_, Nat.mul(1n+pp, 1n+pp)), Nat.add(Nat.mul(Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), 1n+pp), Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp))) == i : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.mul(Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), 1n+pp), Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp)), Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), L.nat_div_mod_r(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), pp)) : {Nat.add(Nat.mul(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), Nat.mul(1n+pp, 1n+pp)), _) == i : Nat}
+  L.nat_div_mod_r(i, Nat.add(pp, Nat.mul(pp, 1n+pp)))

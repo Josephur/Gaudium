@@ -158,6 +158,9 @@ fn pooling_order_is_a_permutation_of_whole_blocks() {
             // the 9 patches of output token i / 9 are one 3 x 3 block, blocks in reading order
             let blk = i / 9;
             assert_eq!((y / 3, x / 3), (blk / (gw / 3), blk % (gw / 3)));
+            // and the row is recovered from the patch's position
+            let row = crate::verified::g4v_pool_row(y as u64, x as u64, (gw / 3) as u64, 3);
+            assert_eq!(row, i as u64);
         }
     }
 }
