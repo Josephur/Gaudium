@@ -51,6 +51,27 @@ def rt_entry_bytes(recipe_bytes: Nat, meta_bytes: Nat) -> Nat:
 def rt_count_add(held: Nat, bytes: Nat) -> Nat:
   Nat.add(held, bytes)
 
+# Bytes of one file of an entry that is gone from the disk: all of them when it is gone, none when
+# it is still there.
+def rt_if_gone(bytes: Nat, gone: Bool) -> Nat:
+  match gone:
+    case True{}:
+      bytes
+    case False{}:
+      0n
+
+# Bytes an entry's removal takes off the count of held bytes: those of each of its files that is
+# gone afterwards (removed now, or already removed by someone else). `None` past 64 bits.
+# rusty-bends: total
+def rt_gone_bytes(recipe_bytes: Nat, recipe_gone: Bool, meta_bytes: Nat, meta_gone: Bool) -> Nat:
+  Nat.add(rt_if_gone(recipe_bytes, recipe_gone), rt_if_gone(meta_bytes, meta_gone))
+
+# The sidecar of an entry is removed first. May its recipe file go next? Only when the entry has
+# no sidecar on disk, or the sidecar is gone: a sidecar never stays behind without the check
+# reading it, and a recipe is never left without being an entry anyone can still trim.
+def rt_may_remove_recipe(meta_present: Bool, meta_gone: Bool) -> Bool:
+  Bool.or(Bool.not(meta_present), meta_gone)
+
 # Bytes still held after an entry of `bytes` bytes was (`removed`) or was not removed.
 def rt_after(+held: Nat, bytes: Nat, removed: Bool) -> Nat:
   match removed:
@@ -111,6 +132,59 @@ def rt_sub_le(+h: Nat, +b: Nat) -> {Nat.is_le(Nat.sub(h, b), h) == True{} : Bool
     case 1n+p 1n+q:
       L.nat_le_succ_r(Nat.sub(p, q), p, rt_sub_le(p, q))
 
+def rt_lt_zero_false(b: Nat) -> {Nat.is_lt(b, 0n) == False{} : Bool}:
+  match b:
+    case 0n:
+      {==}
+    case 1n+_:
+      {==}
+
+def rt_before_trans(+c: Nat, +a: Nat, +b: Nat) -> {Bool.and(Bool.and(rt_evict_before(a, b), rt_evict_before(b, c)), Bool.not(rt_evict_before(a, c))) == False{} : Bool}:
+  match c:
+    case 0n:
+      %Equal.sym(Bool, Nat.is_lt(b, 0n), False{}, rt_lt_zero_false(b)) : {Bool.and(Bool.and(Nat.is_lt(a, b), _), Bool.not(Nat.is_lt(a, 0n))) == False{} : Bool}
+      %Equal.sym(Bool, Bool.and(Nat.is_lt(a, b), False{}), False{}, rt_and_false_r(Nat.is_lt(a, b))) : {Bool.and(_, Bool.not(Nat.is_lt(a, 0n))) == False{} : Bool}
+      {==}
+    case 1n+cp:
+      match a:
+        case 0n:
+          rt_and_false_r(Bool.and(Nat.is_lt(0n, b), Nat.is_lt(b, 1n+cp)))
+        case 1n+ap:
+          match b:
+            case 0n:
+              {==}
+            case 1n+bp:
+              rt_before_trans(cp, ap, bp)
+
+def rt_lt_irrefl(a: Nat) -> {Nat.is_lt(a, a) == False{} : Bool}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+p:
+      rt_lt_irrefl(p)
+
+def rt_or_false_r(b: Bool) -> {Bool.or(b, False{}) == b : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+def rt_before_asym(+a: Nat, +b: Nat) -> {Bool.and(rt_evict_before(a, b), rt_evict_before(b, a)) == False{} : Bool}:
+  match a:
+    case 0n:
+      match b:
+        case 0n:
+          {==}
+        case 1n+_:
+          {==}
+    case 1n+ap:
+      match b:
+        case 0n:
+          {==}
+        case 1n+bp:
+          rt_before_asym(ap, bp)
+
 # ============================================================================
 # 3. Laws
 # ============================================================================
@@ -160,17 +234,17 @@ def rt_recent_protected(u, d, x, f):
   %Equal.sym(Bool, Nat.is_lt(d, Nat.add(d, 1n+x)), True{}, rt_lt_add_succ(d, x)) : {Bool.or(f, _) == True{} : Bool}
   rt_or_true_r(f)
 
-# promise: an entry whose time lies ahead of the clock is protected by any keep window.
+# promise: an entry dated ahead of the clock by less than the keep window is protected.
 # harm: a clock step back or a copied file could make fresh recipes look ancient and remove them
-law rt_ahead_protected:
+law rt_ahead_within_window_protected:
   for +n: Nat
   for +e: Nat
   for +k: Nat
   for +f: Bool
-  {rt_protected(Nat.add(n, e), n, 1n+k, f) == True{} : Bool}
+  {rt_protected(Nat.add(n, e), n, 1n+Nat.add(e, k), f) == True{} : Bool}
 
-def rt_ahead_protected(n, e, k, f):
-  %Equal.sym(Nat, Nat.sub(n, Nat.add(n, e)), 0n, rt_sub_ahead_zero(n, e)) : {Bool.or(f, Nat.is_lt(_, 1n+k)) == True{} : Bool}
+def rt_ahead_within_window_protected(n, e, k, f):
+  %Equal.sym(Nat, Nat.sub(n, Nat.add(n, e)), 0n, rt_sub_ahead_zero(n, e)) : {Bool.or(f, Nat.is_lt(_, 1n+Nat.add(e, k))) == True{} : Bool}
   rt_or_true_r(f)
 
 # promise: a protected entry is never removed, however far the cache is over its target.
@@ -214,6 +288,28 @@ def rt_evict_before_irreflexive(a):
   %L.nat_add_zero_r(a) : {Nat.is_lt(_, a) == False{} : Bool}
   rt_add_lt_false(a, 0n)
 
+# promise: of two entries, at most one leaves before the other.
+law rt_evict_before_asymmetric:
+  for +a: Nat
+  for +b: Nat
+  {Bool.and(rt_evict_before(a, b), rt_evict_before(b, a)) == False{} : Bool}
+
+def rt_evict_before_asymmetric(a, b):
+  rt_before_asym(a, b)
+
+# promise: the eviction order is a strict order: no entry leaves before itself, and an entry that leaves before a second one, which leaves before a third, leaves before the third, so sorting by it is well defined.
+# harm: an inconsistent order could make the sort misplace entries and remove recent recipes before old ones
+law rt_evict_before_strict_order:
+  for +a: Nat
+  for +b: Nat
+  for +c: Nat
+  {Bool.or(Bool.and(Bool.and(rt_evict_before(a, b), rt_evict_before(b, c)), Bool.not(rt_evict_before(a, c))), rt_evict_before(a, a)) == False{} : Bool}
+
+def rt_evict_before_strict_order(a, b, c):
+  %Equal.sym(Bool, Nat.is_lt(a, a), False{}, rt_lt_irrefl(a)) : {Bool.or(Bool.and(Bool.and(Nat.is_lt(a, b), Nat.is_lt(b, c)), Bool.not(Nat.is_lt(a, c))), _) == False{} : Bool}
+  %Equal.sym(Bool, Bool.or(Bool.and(Bool.and(Nat.is_lt(a, b), Nat.is_lt(b, c)), Bool.not(Nat.is_lt(a, c))), False{}), Bool.and(Bool.and(Nat.is_lt(a, b), Nat.is_lt(b, c)), Bool.not(Nat.is_lt(a, c))), rt_or_false_r(Bool.and(Bool.and(Nat.is_lt(a, b), Nat.is_lt(b, c)), Bool.not(Nat.is_lt(a, c))))) : {_ == False{} : Bool}
+  rt_before_trans(c, a, b)
+
 # promise: an entry that was not removed leaves the count of held bytes unchanged.
 # harm: a failed removal would be counted as freed space and the trim would stop over budget
 law rt_kept_holds:
@@ -252,7 +348,7 @@ law rt_entry_bytes_covers_meta:
 def rt_entry_bytes_covers_meta(r, m):
   L.nat_add_le_l(r, m)
 
-# promise: counting an entry in and then removing it gives back the count before it, so the count a trim starts from is the sum the removals take apart.
+# promise: counting an entry's bytes in and then taking the same bytes off gives back the count before it.
 # harm: the starting count could disagree with what the removals free and the trim would stop over or under budget
 law rt_count_then_remove_returns:
   for +h: Nat
@@ -262,14 +358,43 @@ law rt_count_then_remove_returns:
 def rt_count_then_remove_returns(h, b):
   L.nat_add_sub_cancel_r(h, b)
 
-# promise: counting an entry in never lowers the count.
-law rt_count_never_shrinks:
-  for +h: Nat
-  for +b: Nat
-  {Nat.is_le(h, rt_count_add(h, b)) == True{} : Bool}
+# promise: an entry whose two files are both gone takes exactly its counted bytes off the count.
+# harm: the bytes counted in and the bytes taken off could differ and the trim would stop over or under budget
+law rt_both_gone_frees_the_entry:
+  for +r: Nat
+  for +m: Nat
+  {rt_gone_bytes(r, True{}, m, True{}) == rt_entry_bytes(r, m) : Nat}
 
-def rt_count_never_shrinks(h, b):
-  L.nat_add_le_r(h, b)
+def rt_both_gone_frees_the_entry(r, m):
+  {==}
+
+# promise: a removal never takes more off the count than the entry's counted bytes, whichever of its files are gone.
+law rt_gone_bytes_within_entry:
+  for +r: Nat
+  for +rg: Bool
+  for +m: Nat
+  for +mg: Bool
+  {Nat.is_le(rt_gone_bytes(r, rg, m, mg), rt_entry_bytes(r, m)) == True{} : Bool}
+
+def rt_gone_bytes_within_entry(r, rg, m, mg):
+  match rg mg:
+    case True{} True{}:
+      L.nat_le_refl(Nat.add(r, m))
+    case True{} False{}:
+      %Equal.sym(Nat, Nat.add(r, 0n), r, L.nat_add_zero_r(r)) : {Nat.is_le(_, Nat.add(r, m)) == True{} : Bool}
+      L.nat_add_le_r(r, m)
+    case False{} True{}:
+      L.nat_add_le_l(r, m)
+    case False{} False{}:
+      L.nat_le_zero(Nat.add(r, m))
+
+# promise: the recipe file of an entry whose sidecar is still on disk is never removed.
+# harm: a failed sidecar removal followed by the recipe's would leave a sidecar that no load can ever match
+law rt_recipe_stays_with_its_sidecar:
+  {rt_may_remove_recipe(True{}, False{}) == False{} : Bool}
+
+def rt_recipe_stays_with_its_sidecar():
+  {==}
 
 # promise: the count of held bytes never grows during a trim.
 law rt_after_never_grows:

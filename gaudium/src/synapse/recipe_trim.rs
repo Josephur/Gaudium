@@ -30,8 +30,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::synapse::recipe_cache::{in_use_registry, refresh_recency, RECIPE_EXT, SHA256_EXT};
 use crate::verified::{
-    rt_after, rt_count_add, rt_entry_bytes, rt_evict_before, rt_last_used, rt_protected,
-    rt_should_evict,
+    rt_after, rt_count_add, rt_entry_bytes, rt_evict_before, rt_gone_bytes, rt_last_used,
+    rt_may_remove_recipe, rt_protected, rt_should_evict,
 };
 
 /// Default keep window of `--cache-keep-days`, in days.
@@ -84,6 +84,9 @@ pub struct TrimReport {
     /// Entries kept although the cache was over budget when the walk reached them, because this
     /// process holds them or they were used within the keep window.
     pub protected_over_budget: u64,
+    /// Entries over budget that another process removed while this trim ran: their bytes are
+    /// gone, but not freed by this trim.
+    pub gone_meanwhile: u64,
     /// Files and directories that are not cache entries, left alone.
     pub unknown_files: u64,
     pub unknown_bytes: u64,
@@ -123,6 +126,12 @@ impl TrimReport {
             s.push_str(&format!(
                 "; {} recent or in-use entries kept over budget",
                 self.protected_over_budget
+            ));
+        }
+        if self.gone_meanwhile > 0 {
+            s.push_str(&format!(
+                "; {} entries were removed by someone else meanwhile",
+                self.gone_meanwhile
             ));
         }
         if self.unknown_files > 0 {
@@ -233,13 +242,33 @@ fn scan(dir: &Path) -> io::Result<Scan> {
     Ok(out)
 }
 
-/// Removes one file of an entry: `Ok(true)` when it is gone afterwards (removed now, or already
-/// removed by someone else), `Err` when it is still there.
-fn remove_file(path: &Path) -> io::Result<bool> {
+/// What became of one file of an entry.
+#[derive(Debug)]
+enum Removal {
+    /// This trim removed it.
+    Removed,
+    /// It was not there (another process removed it, or the entry never had it).
+    Absent,
+    /// It is still there.
+    Failed(io::Error),
+    /// Not tried: the rules keep it.
+    Kept,
+}
+
+impl Removal {
+    fn gone(&self) -> bool {
+        matches!(self, Removal::Removed | Removal::Absent)
+    }
+    fn removed(&self) -> bool {
+        matches!(self, Removal::Removed)
+    }
+}
+
+fn remove_file(path: &Path) -> Removal {
     match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(e) => Err(e),
+        Ok(()) => Removal::Removed,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Removal::Absent,
+        Err(e) => Removal::Failed(e),
     }
 }
 
@@ -320,35 +349,47 @@ pub(crate) fn trim_at(
             rep.protected_over_budget += 1;
             continue;
         }
+        // bytes of each file as counted at the scan; a file written since counts 0
+        let (r_bytes, m_bytes) = (
+            seen.recipe.map_or(0, |f| f.bytes),
+            seen.sidecar.map_or(0, |f| f.bytes),
+        );
+        let gone_bytes =
+            |r: &Removal, m: &Removal| rt_gone_bytes(r_bytes, r.gone(), m_bytes, m.gone());
         if opts.dry_run {
-            let bytes = size(seen)?;
+            let bytes = gone_bytes(&Removal::Absent, &Removal::Absent).ok_or_else(overflow)?;
             held = rt_after(held, bytes, true);
             rep.evicted += 1;
             rep.freed_bytes = add(rep.freed_bytes, bytes)?;
             continue;
         }
-        // sidecar first: from here on the entry is not a hit for anyone
-        let mut freed = 0u64;
-        let mut whole = true;
-        for (path, stat) in [(&sidecar_path, seen.sidecar), (&recipe_path, seen.recipe)] {
-            let Some(stat) = stat else { continue };
-            match remove_file(path) {
-                Ok(gone) => {
-                    held = rt_after(held, stat.bytes, gone);
-                    freed = add(freed, stat.bytes)?;
-                }
-                Err(e) => {
-                    held = rt_after(held, stat.bytes, false);
-                    rep.errors.push(format!("remove {}: {e}", path.display()));
-                    whole = false;
-                    break; // never remove the recipe of a sidecar that is still there
-                }
+        // Sidecar first: from here on the entry is not a hit for anyone. The files are the ones
+        // on disk now, so a sidecar written since the scan goes too.
+        let side = remove_file(&sidecar_path);
+        let recipe = if rt_may_remove_recipe(fresh.sidecar.is_some(), side.gone()) {
+            remove_file(&recipe_path)
+        } else {
+            Removal::Kept
+        };
+        drop(held_set);
+        held = rt_after(held, gone_bytes(&recipe, &side).ok_or_else(overflow)?, true);
+        let freed = rt_gone_bytes(r_bytes, recipe.removed(), m_bytes, side.removed())
+            .ok_or_else(overflow)?;
+        rep.freed_bytes = add(rep.freed_bytes, freed)?;
+        let mut failed = false;
+        for (r, path) in [(&side, &sidecar_path), (&recipe, &recipe_path)] {
+            if let Removal::Failed(e) = r {
+                rep.errors.push(format!("remove {}: {e}", path.display()));
+                failed = true;
             }
         }
-        drop(held_set);
-        rep.freed_bytes = add(rep.freed_bytes, freed)?;
-        if whole {
+        if failed {
+            continue;
+        }
+        if side.removed() || recipe.removed() {
             rep.evicted += 1;
+        } else {
+            rep.gone_meanwhile += 1;
         }
     }
     rep.bytes_after = held;
