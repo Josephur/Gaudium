@@ -839,8 +839,10 @@ impl HostTier {
             rep.complete = true;
             return Ok(rep);
         }
-        // [lanes] nothing of an entry another lane rewrote since is trusted (the save extends
-        // what this lane's record says the entry already has)
+        // [lanes] nothing of an entry another lane rewrote since is trusted. (Defensive: the
+        // entry this save opens is cut to the tiles the prompt still shares, its clean range is
+        // clipped to them below and the rings are copied whenever `hc_ring_due` holds, so only
+        // `begin_request` acts on what this voids. It keeps every use of a record behind the check.)
         self.void_rewritten();
         let kept = table.held_slots();
         let (held, images) = table.held();
