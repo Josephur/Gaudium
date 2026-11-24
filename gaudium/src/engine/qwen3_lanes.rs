@@ -1669,6 +1669,31 @@ mod tests {
     }
 
     #[test]
+    fn batched_step_with_fp8_kv_gives_each_slot_its_caches_and_shares_each_layers_scale_table() {
+        let mut spec = qwen38_27b_spec();
+        spec.kv_dtype = crate::verified::KvDtype::KvFp8;
+        let elfs = vec![("GAUDIUM_GDNS_ELF".to_string(), "aa".to_string())];
+        let g = build_batched_step_graph(&spec, 16384, 2, 3, &elfs, false);
+        let specs = g.persistent_tensor_specs();
+        let find = |n: &str| specs.iter().find(|s| s.0 == n);
+        // one scale table per attention layer, a layer table bound like the weights
+        let table = find("L3_kv8").expect("layer 3's scale table");
+        assert!(is_weight_or_table("L3_kv8"));
+        assert!(slot_bound("L3_kv8").is_none());
+        for j in 0..3 {
+            assert!(find(&format!("s{j}_L3_kv8")).is_none(), "no per-slot table");
+            let k = find(&format!("s{j}_L3_kcache")).expect("the slot's cache");
+            assert_eq!(k.1, SynDataType::Fp8_143, "FP8 caches per slot");
+            assert_eq!(slot_bound(&format!("s{j}_L3_kcache")).map(|b| b.0), Some(j));
+        }
+        // the same table as the single-stream step's
+        let solo = build_decode_step_graph(&spec, 16384, 2, &elfs);
+        let s = solo.persistent_tensor_specs();
+        let solo_table = s.iter().find(|x| x.0 == "L3_kv8").expect("solo table");
+        assert_eq!((table.1, &table.2, table.3), (solo_table.1, &solo_table.2, solo_table.3));
+    }
+
+    #[test]
     fn batched_step_shares_the_trunk_and_gives_each_slot_its_own_lane_buffers() {
         let spec = qwen38_27b_spec();
         let elfs = vec![("GAUDIUM_GDNS_ELF".to_string(), "aa".to_string())];

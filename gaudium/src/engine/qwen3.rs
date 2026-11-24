@@ -1652,7 +1652,10 @@ impl Qwen3Engine {
         } else {
             Vec::new()
         };
-        let spec_lane_bytes: u64 = spec_lane_bufs.iter().map(|(_, b)| align256(*b)).sum();
+        // (each buffer as the arena allocates it: the verified rule of the lanes' step buffers)
+        let spec_lane_bytes: u64 = spec_lane_bufs
+            .iter()
+            .fold(0, |acc, (_, b)| crate::verified::ln_lane_bufs_add(acc, *b));
         let lane_bytes = kv_bytes + spec_lane_bytes;
         let kv_all = crate::verified::ln_lane_arena_bytes(kv_bytes, spec_lane_bytes, n_lanes as u64);
         let lane_act_bytes = lane_plan.as_ref().map_or(0, |p| p.act_bytes());
