@@ -548,6 +548,9 @@ a1c2f97bf00a530d  kv8_load_needs_family  law kv8_load_needs_family : for + kc : 
 cbf3b034df5d5d27  kv8_table_covers_heads  law kv8_table_covers_heads : for + a : Nat for + b : Nat { Bool.and ( kv8_table_heads_ok ( a , b ) , Nat.is_lt ( a , b ) ) == False { } : Bool }
 # promise kv8_table_covers_heads: a scale table that lists fewer kv heads for a layer than the model has is refused
 # harm kv8_table_covers_heads: a head without its own measured maximum would take another head's V multiplier, and its largest values could clip
+6e6434e12ee11df2  kv_batches_apart  law kv_batches_apart : for + c1 : Nat for + g1 : Nat for + c2 : Nat for + g2 : Nat for + n : Nat for + h : Nat for h1 : { Nat.is_lt ( g1 , n ) == True { } : Bool } for h2 : { Nat.is_lt ( g2 , n ) == True { } : Bool } { Bool.or ( Bool.and ( Nat.is_eq ( c1 , c2 ) , Nat.is_eq ( g1 , g2 ) ) , Bool.or ( Nat.is_le ( Nat.add ( kv_batch_off ( c1 , g1 , n , h ) , h ) , kv_batch_off ( c2 , g2 , n , h ) ) , Nat.is_le ( Nat.add ( kv_batch_off ( c2 , g2 , n , h ) , h ) , kv_batch_off ( c1 , g1 , n , h ) ) ) ) == True { } : Bool }
+# promise kv_batches_apart: the batches of two different (chunk, kv head) pairs of a cache never overlap, whatever order the layout puts them in
+# harm kv_batches_apart: the read-back would fold one head's or one chunk's bytes into another's maxima, measure the wrong batch without a sign, and a V multiplier could clip
 f5cd20a46e2dd85b  kv_bf16_load_stays_bf16  law kv_bf16_load_stays_bf16 : for t : Bool { kv_layer_dtype ( t , KvBf16 { } ) == KvBf16 { } : KvDtype }
 # promise kv_bf16_load_stays_bf16: a load configured for BF16 K/V never gets an FP8 cache
 # harm kv_bf16_load_stays_bf16: a cache would be FP8 without a scale table made for it
@@ -567,6 +570,12 @@ d5295993693309a4  kv_half_core_only_asked  law kv_half_core_only_asked : for d :
 # promise kv_half_core_only_asked: a prefill tile builds the half-width core only when its form asks for it
 # harm kv_half_core_only_asked: a load whose form turned the core off would still build it
 ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat for + k : Nat for + b : Nat for + lmax : Nat { Nat.is_le ( kv_high_water ( p , c , k , b , lmax ) , lmax ) == True { } : Bool }
+eb581db27a9b1619  kv_piece_fits_stage  law kv_piece_fits_stage : for + done : Nat for + len : Nat for + piece : Nat { Nat.is_le ( kv_piece_len ( done , len , piece ) , piece ) == True { } : Bool }
+# promise kv_piece_fits_stage: a copy of the read-back never takes more bytes than the staging buffer holds
+# harm kv_piece_fits_stage: the device-to-host copy would overrun the pinned staging buffer, or be refused and fail the calibration
+8a5b53996209b8a9  kv_piece_progress  law kv_piece_progress : for + done : Nat for + len : Nat for + p : Nat { Bool.or ( Nat.is_le ( len , done ) , Nat.is_lt ( 0n , kv_piece_len ( done , len , 1n + p ) ) ) == True { } : Bool }
+# promise kv_piece_progress: while bytes of a read are left and the staging buffer holds at least one byte, each copy moves at least one byte
+# harm kv_piece_progress: a copy of zero bytes would leave the read where it was, and the calibration's read-back would never finish
 ca129145f53b70bf  kv_piece_within  law kv_piece_within : for + done : Nat for + len : Nat for + piece : Nat { Bool.or ( Nat.is_lt ( len , done ) , Nat.is_le ( Nat.add ( done , kv_piece_len ( done , len , piece ) ) , len ) ) == True { } : Bool }
 # promise kv_piece_within: each copy of a read ends inside the range being read, whatever the staging buffer's size
 # harm kv_piece_within: the last copy of a head's batch would read past the batch, and past the cache for the last one
@@ -579,6 +588,9 @@ afeb8bc174d22774  kv_side_cache_bf16  law kv_side_cache_bf16 : for d : KvDtype {
 0666259195f6e281  kv_tile_rows_fp8_within  law kv_tile_rows_fp8_within : for + t : Nat for + m : Nat { Nat.is_le ( kv_tile_rows ( t , KvFp8 { } , m ) , m ) == True { } : Bool }
 # promise kv_tile_rows_fp8_within: a prefill tile on an FP8 cache never has more rows than the widest FP8 tile measured correct
 # harm kv_tile_rows_fp8_within: a wider FP8 attention tile, measured to give NaN rows past one cache chunk, would prefill wrong K/V and hidden states
+b482ee9e4bc6c7e1  kv_tile_rows_nonzero  law kv_tile_rows_nonzero : for + t : Nat for d : KvDtype for + m : Nat { Nat.is_lt ( 0n , kv_tile_rows ( 1n + t , d , 1n + m ) ) == True { } : Bool }
+# promise kv_tile_rows_nonzero: a prefill tile asked for with at least one row keeps at least one row on either cache dtype, whenever the FP8 bound allows one
+# harm kv_tile_rows_nonzero: a tile of zero rows would never advance through the prompt, and its prefill would hang or compile an empty graph
 3db2160775c84806  kv_tile_rows_not_wider  law kv_tile_rows_not_wider : for + t : Nat for d : KvDtype for + m : Nat { Nat.is_le ( kv_tile_rows ( t , d , m ) , t ) == True { } : Bool }
 # promise kv_tile_rows_not_wider: the cache dtype only ever narrows a prefill tile, never makes it wider than the tile asked for
 # harm kv_tile_rows_not_wider: a tile wider than every width asked for (an explicit width or a candidate, at most the engine's widest) would overrun buffers sized for those widths
