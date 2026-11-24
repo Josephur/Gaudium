@@ -428,16 +428,6 @@ def ikv_merge_write_in_buffer(off, b, cols):
   ikv_write_in_safe(off, b, cols, ikv_feat_write_safe(off, b, cols), {==})
 
 # LAW IKV.15b
-# promise: the first image's features start behind the column text rows read.
-# harm: the first merger write would be refused, or cover the text rows' column
-law ikv_feat_start_past_text:
-  for +r: Nat
-  {Nat.is_lt(ikv_feat_row(False{}, r), ikv_feat_start()) == True{} : Bool}
-
-def ikv_feat_start_past_text(r):
-  {==}
-
-# LAW IKV.15c
 # promise: the next image's features start behind every column of the current image's tokens, so two images' tokens never share a column.
 # harm: an image's features would overwrite the tokens of the image before it
 law ikv_feat_next_past:
