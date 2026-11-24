@@ -646,6 +646,8 @@ c4187b93477568c1  ln_batch_lane_busy  law ln_batch_lane_busy : for + s : LaneSta
 # promise ln_cursor_never_past_emitted: a step moves a lane's cursor at most over the rows it accepted.
 e6ce37735cf24bee  ln_cursor_never_past_rows  law ln_cursor_never_past_rows : for + c : Nat for + e : Nat for + r : Nat { Nat.is_le ( ln_lane_cursor_next ( c , e , r ) , Nat.add ( c , r ) ) == True { } : Bool }
 # promise ln_cursor_never_past_rows: a step moves a lane's cursor only over rows the step wrote.
+ae7e697de821a522  ln_drafter_never_plain  law ln_drafter_never_plain : for + d : Bool for + b : Bool { ln_ld_is_none ( ln_lane_drafter_of ( True { } , d , b ) ) == False { } : Bool }
+# promise ln_drafter_never_plain: a load with a drafter is never judged as plain decode by the lane rule.
 04929caaa3dc95e3  ln_drain_left_only_by_release  law ln_drain_left_only_by_release : for + ev : LaneEvent { Bool.or ( ln_ev_is_release ( ev ) , ln_is_drain ( ln_step ( LnDrain { } , ev ) ) ) == True { } : Bool }
 # promise ln_drain_left_only_by_release: a lane whose request ended leaves that state only when its report is delivered and it is released.
 a1ec6796ab0a929d  ln_due_older_waiter_blocks  law ln_due_older_waiter_blocks : for + w : Nat for + e : Nat { ln_admission_blocked ( True { } , w , Nat.add ( 1n + w , e ) ) == True { } : Bool }
@@ -701,6 +703,8 @@ a388dd3e65dec6b0  ln_next_never_yields_busy  law ln_next_never_yields_busy : for
 # promise ln_next_never_yields_unblocked: a lane session hands the card's turn back only when its next admission would pass over a due waiter.
 575524d345a31039  ln_other_drafter_no_lanes  law ln_other_drafter_no_lanes : { ln_drafter_ok ( LdOther { } ) == False { } : Bool }
 # promise ln_other_drafter_no_lanes: a drafter without batched steps (any kind other than plain decode and DSpine with checkpointed verify rows) never gets lanes.
+4437a52916c98c89  ln_other_never_dspine  law ln_other_never_dspine : for + b : Bool { ln_ld_is_dspine ( ln_lane_drafter_of ( True { } , False { } , b ) ) == False { } : Bool }
+# promise ln_other_never_dspine: a drafter other than DSpine is never judged as DSpine by the lane rule.
 29f0b746463b60c9  ln_parity_alternates  law ln_parity_alternates : for + p : Nat { Bool.or ( Nat.is_gt ( p , 1n ) , Nat.is_ne ( ln_lane_parity_next ( p ) , p ) ) == True { } : Bool }
 # promise ln_parity_alternates: a lane's next step reads the recurrent-state buffer the step before it wrote, never the one it read.
 da2684c09ec42ceb  ln_parity_in_range  law ln_parity_in_range : for + p : Nat { Nat.is_le ( ln_lane_parity_next ( p ) , 1n ) == True { } : Bool }
