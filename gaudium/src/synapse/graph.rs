@@ -646,6 +646,7 @@ impl GraphBuilder {
         if cache.is_enabled() {
             let _ = cache.ensure_dir();
             if let Some(rpath) = cache.recipe_path(&self.recipe_name, &fp) {
+                cache.mark_in_use(&self.recipe_name, &fp);
                 if let Ok(cpath) = CString::new(rpath.to_string_lossy().as_bytes()) {
                     let st = unsafe { (api.syn_recipe_serialize)(handle, cpath.as_ptr()) };
                     if st == 0 {
@@ -682,6 +683,8 @@ impl GraphBuilder {
         let cpath = CString::new(cached_path.to_string_lossy().as_bytes())
             .map_err(|e| SynapseError::InvalidArg(e.to_string()))?;
         let mut handle: SynRecipeHandle = std::ptr::null_mut();
+        // A trim in another process may remove the file after `lookup_verified` checked it: the
+        // load then fails and this is a cache miss (the caller compiles), never a partial read.
         let st = unsafe { (api.syn_recipe_deserialize)(&mut handle, cpath.as_ptr()) };
         if st != 0 || handle.is_null() {
             return Ok(None);

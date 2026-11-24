@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 // ============================================================================
 // 1. Pure Rust SHA-256 (FIPS 180-4, zero external dependencies)
@@ -408,6 +410,46 @@ pub fn verify_launch_bindings(
 // 4. On-Disk Compiled-Recipe Cache Directory
 // ============================================================================
 
+/// Extension of a cached recipe file.
+pub const RECIPE_EXT: &str = ".recipe";
+/// Extension of a cached recipe's SHA-256 sidecar.
+pub const SHA256_EXT: &str = ".sha256";
+
+/// Entries (`<name>-<hash>`) this process has loaded, looked up or written: a trim run by this
+/// process never removes them (`recipe_trim`), and the server refreshes their recency before
+/// each trim so they still count as recent after a restart.
+pub(crate) fn in_use_registry() -> &'static Mutex<BTreeSet<String>> {
+    static IN_USE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    IN_USE.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn note_in_use(stem: &str) {
+    let mut set = in_use_registry().lock().unwrap_or_else(|p| p.into_inner());
+    if !set.contains(stem) {
+        set.insert(stem.to_owned());
+    }
+}
+
+/// Sets a file's modification time to now. Recency of cache entries is kept this way rather than
+/// in access times, which `noatime` / `relatime` mounts do not keep.
+fn touch(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.set_modified(SystemTime::now())
+}
+
+/// Refreshes the sidecar time of every entry this process holds that is in `dir` (best effort:
+/// an entry another process removed is skipped).
+pub fn refresh_recency(dir: &Path) {
+    let stems: Vec<String> = in_use_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    for stem in stems {
+        let _ = touch(&dir.join(format!("{stem}{SHA256_EXT}")));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecipeCache {
     root: Option<PathBuf>,
@@ -438,25 +480,51 @@ impl RecipeCache {
         self.root.is_some()
     }
 
+    /// The cache directory, when the cache is on.
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    fn stem(name: &str, fingerprint_hex: &str) -> String {
+        let short = &fingerprint_hex[..fingerprint_hex.len().min(16)];
+        format!("{name}-{short}")
+    }
+
     pub fn recipe_path(&self, name: &str, fingerprint_hex: &str) -> Option<PathBuf> {
         let root = self.root.as_ref()?;
-        let short = &fingerprint_hex[..fingerprint_hex.len().min(16)];
-        Some(root.join(format!("{name}-{short}.recipe")))
+        Some(root.join(format!("{}{RECIPE_EXT}", Self::stem(name, fingerprint_hex))))
     }
 
     pub fn meta_path(&self, name: &str, fingerprint_hex: &str) -> Option<PathBuf> {
         let root = self.root.as_ref()?;
-        let short = &fingerprint_hex[..fingerprint_hex.len().min(16)];
-        Some(root.join(format!("{name}-{short}.sha256")))
+        Some(root.join(format!("{}{SHA256_EXT}", Self::stem(name, fingerprint_hex))))
+    }
+
+    /// Marks the entry as held by this process before it is written, so a trim in this process
+    /// leaves a recipe that is being serialized alone.
+    pub fn mark_in_use(&self, name: &str, fingerprint_hex: &str) {
+        if self.root.is_some() {
+            note_in_use(&Self::stem(name, fingerprint_hex));
+        }
     }
 
     /// Returns cached recipe path iff the `.recipe` file exists and matches its stored `.sha256`.
+    ///
+    /// A hit sets the sidecar's modification time to now (the entry's recency for trims). The
+    /// entry is marked as held by this process before anything is read, so a trim in this
+    /// process either removed it before (a miss) or keeps it. A trim in another process may
+    /// remove the files at any moment: a file that is gone fails its read (a miss), and the bytes
+    /// that were read are checked against the sidecar, so a hit is never a partial file. The
+    /// caller loads the recipe again by its path; a file removed after this check fails that
+    /// load, which callers take as a miss as well.
     pub fn lookup_verified(&self, name: &str, fingerprint_hex: &str) -> Option<PathBuf> {
         let rpath = self.recipe_path(name, fingerprint_hex)?;
         let mpath = self.meta_path(name, fingerprint_hex)?;
+        note_in_use(&Self::stem(name, fingerprint_hex));
         let expected_sha = fs::read_to_string(&mpath).ok()?.trim().to_owned();
         let bytes = fs::read(&rpath).ok()?;
         if sha256_hex(&bytes) == expected_sha {
+            let _ = touch(&mpath);
             Some(rpath)
         } else {
             None
@@ -471,6 +539,7 @@ impl RecipeCache {
         ) else {
             return Ok(());
         };
+        note_in_use(&Self::stem(name, fingerprint_hex));
         let bytes = fs::read(&rpath)?;
         let digest = sha256_hex(&bytes);
         let tmp = mpath.with_extension("tmp");

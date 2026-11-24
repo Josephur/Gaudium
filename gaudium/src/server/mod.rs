@@ -126,6 +126,8 @@ pub struct ServerConfig {
     /// Requests a model runs at once (`--parallel`): lanes of their own, decoded together.
     /// Models whose engine or drafter has no batched steps are served with one lane.
     pub parallel: u64,
+    /// Trim the recipe cache to a budget in the background (`--cache-max-gb`); `None` = never.
+    pub cache_trim: Option<crate::synapse::recipe_trim::ServerTrim>,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -1724,6 +1726,15 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
         lanes: lanes::LaneHub::new(n_models),
     });
 
+    // The recipe-cache trim starts once the first load has taken (and marked) its recipes, so it
+    // never races that load for an entry; with --lazy it starts now.
+    let (trim_start, trim_wait) = std::sync::mpsc::channel::<()>();
+    if let Some(trim) = cfg.cache_trim.clone() {
+        if let Err(e) = crate::synapse::recipe_trim::spawn_server_trim(trim, trim_wait) {
+            eprintln!("[server] recipe cache trim not started: {e}");
+        }
+    }
+
     // Optional eager warm-up in a background thread so HTTP/UI responds immediately!
     if !cfg.lazy {
         let st = Arc::clone(&state);
@@ -1733,8 +1744,11 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
                 if let Err(e) = st.ensure_loaded(0, true) {
                     eprintln!("[server] initial model load failed: {e}");
                 }
+                let _ = trim_start.send(());
             })
             .ok();
+    } else {
+        drop(trim_start);
     }
 
     // Idle auto-park watchdog thread (keeps card free when unused!).
