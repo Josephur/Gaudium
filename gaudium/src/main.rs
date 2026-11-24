@@ -111,6 +111,13 @@ fn print_usage() {
          \x20 --cache-keep-days <D> With --cache-max-gb: recipes used within D days are kept even\n\
          \x20                       over the budget (default: 1; decimals allowed)\n\
          \x20 --cache-trim-every <M> With --cache-max-gb: minutes between trims (default: 60)\n\
+         \x20 --profile-steps <A-B[:file]>  Device trace of the batched launches A..B (0-based,\n\
+         \x20                       counted from the load) of a model served with --parallel\n\
+         \x20                       lanes: prints each launch's split by node family (a slot's\n\
+         \x20                       nodes fold together as s#_) and engine; :file also writes the\n\
+         \x20                       raw events. Repeatable. The batched recipes compile fresh\n\
+         \x20                       (the others load from the recipe cache); a profiled run is\n\
+         \x20                       not a timing result\n\
          \x20 --lazy                Start without holding Gaudi 2; load on first chat/start\n\
          \x20 --build-cache         With --serve: compile every recipe the served models load into\n\
          \x20                       the recipe cache and exit, without opening the card and without\n\
@@ -2326,6 +2333,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut cache_max_gb: Option<f64> = None;
     let mut cache_keep_days: Option<f64> = None;
     let mut cache_trim_every: Option<u64> = None;
+    let mut profile: Vec<gaudium::synapse::profiler::ProfileWindow> = Vec::new();
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -2503,6 +2511,12 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                         .ok_or_else(|| format!("invalid --cache-trim-every '{s}' (minutes, > 0)"))?,
                 );
             }
+            "--profile-steps" => {
+                profile.push(gaudium::synapse::profiler::ProfileWindow::parse(&next_val(
+                    &mut i,
+                    "--profile-steps",
+                )?)?)
+            }
             "--lazy" => lazy = true,
             "--build-cache" => build_cache = true,
             "--build-cache-only" => {
@@ -2630,6 +2644,11 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         }
     };
 
+    if !profile.is_empty() {
+        // as for --generate: the template before the device opens (the batched lane recipes
+        // compile in the process, the others load from the recipe cache)
+        gaudium::synapse::profiler::setup_env();
+    }
     let cfg = ServerConfig {
         host,
         port,
@@ -2658,6 +2677,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         cache_ram_bytes,
         parallel,
         cache_trim,
+        profile,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {

@@ -146,3 +146,37 @@ pub(super) fn end_request(eng: &mut Qwen3Engine, launched: u64) -> Result<(), St
     }
     Ok(())
 }
+
+/// Before batched lane launch `idx` (`--parallel` lanes, counted from the engine's load; the lane
+/// loop collects every launch before the next, so none is in flight). The windows of request 0
+/// count these launches.
+pub(super) fn before_lane_launch(eng: &mut Qwen3Engine, idx: u64) -> Result<(), String> {
+    let Qwen3Engine { prof, dev, .. } = eng;
+    let Some(p) = prof.as_mut() else {
+        return Ok(());
+    };
+    if p.prof.wants_stop(0, idx, false) {
+        report(p, dev, idx)?;
+    }
+    if p.prof.wants_start(0, idx, false) {
+        unsafe { dev.sync_stream(dev.compute_stream()) }
+            .map_err(|e| format!("profile: drain before start: {e}"))?;
+        p.prof
+            .start(0, idx, false)
+            .map_err(|e| format!("profile start: {e}"))?;
+        p.open_at = idx;
+    }
+    Ok(())
+}
+
+/// End of a lane session after `launched` batched launches: closes a window still open.
+pub(super) fn end_lanes(eng: &mut Qwen3Engine, launched: u64) -> Result<(), String> {
+    let Qwen3Engine { prof, dev, .. } = eng;
+    let Some(p) = prof.as_mut() else {
+        return Ok(());
+    };
+    if p.prof.open_window().is_some_and(|w| !w.prefill) {
+        report(p, dev, launched)?;
+    }
+    Ok(())
+}

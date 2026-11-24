@@ -365,6 +365,8 @@ pub(super) struct LanePlan {
     pub max_ws: u64,
     pub sampled: bool,
     pub family: LaneFamily,
+    /// The batched recipes bypass the recipe cache (`--profile-steps`).
+    pub fresh: bool,
 }
 
 /// Bytes of one scalar buffer of the step io (each one its own 256-aligned buffer).
@@ -400,7 +402,12 @@ impl LanePlan {
         driver_version: &str,
         verbose: bool,
         compile_all: bool,
+        fresh: bool,
     ) -> Result<Self, String> {
+        // a profiled load compiles its batched recipes here (node names reach a trace only from
+        // recipes compiled in the process); the engine's other recipes still load from the cache
+        let off = RecipeCache::disabled();
+        let cache = if fresh { &off } else { cache };
         let widest = family.graph(spec, lmax, n as u64, max_chunks, sampler);
         let mut act_specs = BTreeMap::new();
         for (name, _dt, _dims, bytes) in widest.persistent_tensor_specs() {
@@ -486,6 +493,7 @@ impl LanePlan {
             max_ws,
             sampled: sampler,
             family,
+            fresh,
         })
     }
 
@@ -519,6 +527,10 @@ pub(super) struct LaneRt {
     recipes: HashMap<(u64, u64, bool), CompiledRecipe>,
     launches: HashMap<LaunchKey, PreparedLaunch>,
     pub table: LaneTable,
+    /// Batched launches since the load (the lane windows of `--profile-steps` count them).
+    launched: u64,
+    /// Batched recipes compiled on first use bypass the recipe cache (`--profile-steps`).
+    fresh: bool,
 }
 
 /// Prepared launches kept before the cache is cleared.
@@ -560,6 +572,8 @@ impl LaneRt {
             recipes: plan.eager.into_iter().collect(),
             launches: HashMap::new(),
             table: LaneTable::new(n),
+            launched: 0,
+            fresh: plan.fresh,
         }
     }
 
@@ -1159,6 +1173,8 @@ fn ensure_recipe(eng: &mut Qwen3Engine, key: (u64, u64, bool)) -> Result<f64, St
     } = eng;
     let rt = lanes.as_mut().expect("lanes");
     let (b, nch, sm) = key;
+    let off = RecipeCache::disabled();
+    let cache = if rt.fresh { &off } else { &*cache };
     let mut r = rt
         .family
         .graph(spec, *max_ctx, b, nch, sm)
@@ -1352,6 +1368,7 @@ fn step(
         lanes.iter().map(|&l| l as u8).collect(),
         parities.iter().map(|&p| p as u8).collect(),
     );
+    lane_launch_hook(eng)?;
     {
         let rt = eng.lanes.as_ref().expect("lanes");
         rt.recipes[&key]
@@ -1371,6 +1388,17 @@ fn step(
         .iter()
         .map(|c| i32::from_le_bytes(*c))
         .collect())
+}
+
+/// Before every batched launch: the device-trace windows of `--profile-steps` (by the count of
+/// batched launches since the load).
+fn lane_launch_hook(eng: &mut Qwen3Engine) -> Result<(), String> {
+    let idx = {
+        let rt = eng.lanes.as_mut().expect("lanes");
+        rt.launched += 1;
+        rt.launched - 1
+    };
+    prof_rt::before_lane_launch(eng, idx)
 }
 
 /// One batched speculative step of `lanes` (all of one readout kind): every lane's emitted
@@ -1412,6 +1440,7 @@ fn spec_step(
         lanes.iter().map(|&l| l as u8).collect(),
         parities.iter().map(|&p| p as u8).collect(),
     );
+    lane_launch_hook(eng)?;
     {
         let rt = eng.lanes.as_ref().expect("lanes");
         rt.recipes[&key]
@@ -1462,6 +1491,8 @@ pub(super) fn serve(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed) -> Result<()
     let n = eng.lanes.as_ref().expect("lanes").n;
     let mut runs: Vec<Option<Run>> = (0..n).map(|_| None).collect();
     let res = serve_loop(eng, feed, &mut runs);
+    let launched = eng.lanes.as_ref().expect("lanes").launched;
+    let res = res.and(prof_rt::end_lanes(eng, launched));
     if let Err(e) = &res {
         // every request taken gets its end: the lanes still busy end with the error
         for (lane, slot) in runs.iter_mut().enumerate() {

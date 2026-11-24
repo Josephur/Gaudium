@@ -1576,6 +1576,7 @@ impl Qwen3Engine {
                 &driver_version,
                 cfg.verbose || plan_only,
                 plan_only,
+                !cfg.step.profile.is_empty(),
             )?;
             max_ws = max_ws.max(p.max_ws);
             Some(p)

@@ -128,6 +128,9 @@ pub struct ServerConfig {
     pub parallel: u64,
     /// Trim the recipe cache to a budget in the background (`--cache-max-gb`); `None` = never.
     pub cache_trim: Option<crate::synapse::recipe_trim::ServerTrim>,
+    /// Device-trace windows (`--profile-steps`) of the batched launches of a model served with
+    /// lanes; empty = none.
+    pub profile: Vec<crate::synapse::profiler::ProfileWindow>,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -1394,6 +1397,7 @@ fn engine_config_of(
     qcfg.cache_dir = cfg.cache_dir.clone();
     qcfg.no_cache = cfg.no_cache;
     qcfg.verbose = cfg.verbose;
+    qcfg.step.profile = cfg.profile.clone();
     qcfg.prefix_slots = cfg.prefix_slots;
     qcfg.lanes = ModelText::open(dir)
         .and_then(|t| t.spec())

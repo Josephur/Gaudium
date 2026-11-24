@@ -84,6 +84,13 @@ Serve options:
   --cache-keep-days <D> With --cache-max-gb: recipes used within D days are kept even
                         over the budget (default: 1; decimals allowed)
   --cache-trim-every <M> With --cache-max-gb: minutes between trims (default: 60)
+  --profile-steps <A-B[:file]>  Device trace of the batched launches A..B (0-based,
+                        counted from the load) of a model served with --parallel
+                        lanes: prints each launch's split by node family (a slot's
+                        nodes fold together as s#_) and engine; :file also writes the
+                        raw events. Repeatable. The batched recipes compile fresh
+                        (the others load from the recipe cache); a profiled run is
+                        not a timing result
   --lazy                Start without holding Gaudi 2; load on first chat/start
   --build-cache         With --serve: compile every recipe the served models load into
                         the recipe cache and exit, without opening the card and without
