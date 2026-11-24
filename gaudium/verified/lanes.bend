@@ -103,11 +103,15 @@ def ln_ev_is_admit(ev: LaneEvent) -> Bool:
 # 2. Routing a request to a lane
 # ============================================================================
 
-# Is free lane `a` (it would take over `ra` rows of the request's prompt, last used at `sa`) a
-# better place for a request than free lane `b`? More rows taken over wins; between equals, the
-# lane used longest ago, so the conversations used most recently keep their rows.
-def ln_route_better(+ra: Nat, +sa: Nat, +rb: Nat, +sb: Nat) -> Bool:
-  Bool.or(Nat.is_gt(ra, rb), Bool.and(Nat.is_eq(ra, rb), Nat.is_lt(sa, sb)))
+# Is free lane `a` a better place for a request than free lane `b`? `ra`: the prompt rows lane
+# `a` would take over (resume), `ca`: the rows its held prompt shares with the request, `sa`:
+# when it was last used. More rows taken over wins; between equals, more shared rows (a
+# conversation stays in its lane, the other lanes keep theirs); then the lane used longest ago.
+def ln_route_better(+ra: Nat, +ca: Nat, +sa: Nat, +rb: Nat, +cb: Nat, +sb: Nat) -> Bool:
+  Bool.or(
+    Nat.is_gt(ra, rb),
+    Bool.and(Nat.is_eq(ra, rb), Bool.or(Nat.is_gt(ca, cb), Bool.and(Nat.is_eq(ca, cb), Nat.is_lt(sa, sb))))
+  )
 
 # ============================================================================
 # 3. The device plan of N lanes
@@ -393,24 +397,29 @@ def ln_route_only_admittable(s):
 law ln_route_more_reuse_wins:
   for +rb: Nat
   for +e: Nat
+  for +ca: Nat
   for +sa: Nat
+  for +cb: Nat
   for +sb: Nat
-  {ln_route_better(1n+Nat.add(rb, e), sa, rb, sb) == True{} : Bool}
+  {ln_route_better(1n+Nat.add(rb, e), ca, sa, rb, cb, sb) == True{} : Bool}
 
-def ln_route_more_reuse_wins(rb, e, sa, sb):
-  %ln_gt_succ_add(rb, e) : {Bool.or(_, Bool.and(Nat.is_eq(1n+Nat.add(rb, e), rb), Nat.is_lt(sa, sb))) == True{} : Bool}
+def ln_route_more_reuse_wins(rb, e, ca, sa, cb, sb):
+  %ln_gt_succ_add(rb, e) : {Bool.or(_, Bool.and(Nat.is_eq(1n+Nat.add(rb, e), rb), Bool.or(Nat.is_gt(ca, cb), Bool.and(Nat.is_eq(ca, cb), Nat.is_lt(sa, sb))))) == True{} : Bool}
   {==}
 
 # promise: no lane is a better place than itself, so the lane routing picks is well defined.
 law ln_route_irreflexive:
   for +r: Nat
+  for +c: Nat
   for +s: Nat
-  {ln_route_better(r, s, r, s) == False{} : Bool}
+  {ln_route_better(r, c, s, r, c, s) == False{} : Bool}
 
-def ln_route_irreflexive(r, s):
-  %ln_gt_refl_false(r) : {Bool.or(_, Bool.and(Nat.is_eq(r, r), Nat.is_lt(s, s))) == False{} : Bool}
-  %ln_eq_refl_true(r) : {Bool.or(False{}, Bool.and(_, Nat.is_lt(s, s))) == False{} : Bool}
-  %ln_lt_refl_false(s) : {Bool.or(False{}, Bool.and(True{}, _)) == False{} : Bool}
+def ln_route_irreflexive(r, c, s):
+  %ln_gt_refl_false(r) : {Bool.or(_, Bool.and(Nat.is_eq(r, r), Bool.or(Nat.is_gt(c, c), Bool.and(Nat.is_eq(c, c), Nat.is_lt(s, s))))) == False{} : Bool}
+  %ln_eq_refl_true(r) : {Bool.or(False{}, Bool.and(_, Bool.or(Nat.is_gt(c, c), Bool.and(Nat.is_eq(c, c), Nat.is_lt(s, s))))) == False{} : Bool}
+  %ln_gt_refl_false(c) : {Bool.or(False{}, Bool.and(True{}, Bool.or(_, Bool.and(Nat.is_eq(c, c), Nat.is_lt(s, s))))) == False{} : Bool}
+  %ln_eq_refl_true(c) : {Bool.or(False{}, Bool.and(True{}, Bool.or(False{}, Bool.and(_, Nat.is_lt(s, s))))) == False{} : Bool}
+  %ln_lt_refl_false(s) : {Bool.or(False{}, Bool.and(True{}, Bool.or(False{}, Bool.and(True{}, _)))) == False{} : Bool}
   {==}
 
 # promise: a lane plan is refused exactly when it lacks device memory, and then it reports a positive shortfall.

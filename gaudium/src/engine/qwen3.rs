@@ -2020,15 +2020,20 @@ impl Qwen3Engine {
         if cfg.verbose || plan_only {
             let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
             eprintln!(
-                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} ({}) + state rings {:.2} ({} slots) + prefix reuse {:.2} ({} kept positions) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
+                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} ({}) + state rings {:.2} ({} slots) + prefix reuse {:.2} ({} kept positions{}) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
                 gib(planned_total),
                 gib(weights_bytes),
-                gib(kv_bytes.saturating_sub(gdn_state_bytes)),
+                gib(kv_all.saturating_sub(gdn_state_bytes * lanes_u)),
                 crate::core::kv_cache::kv_dtype_name(kv8::trunk_dtype(&spec)),
-                gib(gdn_state_bytes),
+                gib(gdn_state_bytes * lanes_u),
                 gdn_slots,
                 gib(pfx_bytes),
                 pfx_granted,
+                if n_lanes > 1 {
+                    format!(" per lane; {n_lanes} lanes")
+                } else {
+                    String::new()
+                },
                 gib(act_bytes),
                 gib(spec_bytes[0]),
                 gib(spec_bytes[1]),
@@ -2078,7 +2083,7 @@ impl Qwen3Engine {
             eprintln!(
                 "[gaudium] HBM plan fits: weights={:.2} GiB, kv+state={:.2} GiB, acts={:.2} MiB, ws={:.2} MiB",
                 weights_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                (kv_bytes + pfx_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
+                (kv_all + pfx_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
                 act_bytes as f64 / (1024.0 * 1024.0),
                 ws_bytes as f64 / (1024.0 * 1024.0),
             );

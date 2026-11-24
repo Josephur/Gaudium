@@ -87,19 +87,22 @@ impl LaneTable {
     }
 
     /// The lane a request goes to: among the lanes routing may use, the best by the verified
-    /// order (`reuse(lane)` = prompt rows that lane would take over). `None`: no lane is free.
-    pub fn route(&self, reuse: impl Fn(usize) -> u64) -> Option<usize> {
-        let mut best: Option<(usize, u64)> = None;
+    /// order. `reuse(lane)` = `(prompt rows that lane would take over, rows its held prompt
+    /// shares with the request)`. `None`: no lane is free.
+    pub fn route(&self, reuse: impl Fn(usize) -> (u64, u64)) -> Option<usize> {
+        let mut best: Option<(usize, (u64, u64))> = None;
         for (i, &s) in self.states.iter().enumerate() {
             if !ln_route_eligible(s) {
                 continue;
             }
-            let r = reuse(i);
+            let (r, c) = reuse(i);
             best = match best {
-                Some((b, rb)) if !ln_route_better(r, self.stamps[i], rb, self.stamps[b]) => {
-                    Some((b, rb))
+                Some((b, (rb, cb)))
+                    if !ln_route_better(r, c, self.stamps[i], rb, cb, self.stamps[b]) =>
+                {
+                    Some((b, (rb, cb)))
                 }
-                _ => Some((i, r)),
+                _ => Some((i, (r, c))),
             };
         }
         best.map(|(i, _)| i)
@@ -264,13 +267,16 @@ mod tests {
             t.finish(l).unwrap();
             t.release(l).unwrap();
         }
-        assert_eq!(t.route(|_| 0), Some(2), "the unused lane");
-        assert_eq!(t.route(|l| if l == 0 { 10 } else { 0 }), Some(0));
+        assert_eq!(t.route(|_| (0, 0)), Some(2), "the unused lane");
+        assert_eq!(t.route(|l| (if l == 0 { 10 } else { 0 }, 0)), Some(0));
+        // rows taken over first, then shared rows, then the lane used longest ago
+        assert_eq!(t.route(|l| (u64::from(l == 1) * 512, u64::from(l == 0) * 900)), Some(1));
+        assert_eq!(t.route(|l| (0, u64::from(l == 0) * 70)), Some(0));
         t.admit(2, false).unwrap();
-        assert_eq!(t.route(|_| 5), Some(1), "used longer ago than lane 0");
+        assert_eq!(t.route(|_| (5, 5)), Some(1), "used longer ago than lane 0");
         t.admit(1, false).unwrap();
         t.admit(0, false).unwrap();
-        assert_eq!(t.route(|_| 0), None);
+        assert_eq!(t.route(|_| (0, 0)), None);
     }
 
     #[test]

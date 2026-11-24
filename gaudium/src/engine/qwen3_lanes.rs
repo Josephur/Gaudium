@@ -614,17 +614,17 @@ fn view(rt: &LaneRt, runs: &[Option<Run>]) -> Vec<LaneView> {
         .collect()
 }
 
-/// Prompt rows lane `lane` would take over for `prompt` (routing).
-fn lane_reuse(eng: &Qwen3Engine, lane: usize, prompt: &[i32], params: &Qwen3GenParams) -> u64 {
+/// `(prompt rows lane `lane` would take over for `prompt`, rows its held prompt shares with it)`
+/// (routing).
+fn lane_reuse(eng: &Qwen3Engine, lane: usize, prompt: &[i32], params: &Qwen3GenParams) -> (u64, u64) {
     let rt = eng.lanes.as_ref().expect("lanes");
     let (prefix, reset) = if rt.active == lane {
         (&eng.prefix, &eng.reset)
     } else {
         (&rt.bufs[lane].prefix, &rt.bufs[lane].reset)
     };
-    prefix
-        .peek(prompt, &[], params.cache_prompt, reset.zeroes_rows())
-        .resume
+    let p = prefix.peek(prompt, &[], params.cache_prompt, reset.zeroes_rows());
+    (p.resume, p.cap)
 }
 
 fn done_event(report: Result<Qwen3GenReport, String>, eng: &Qwen3Engine, images: bool) -> LaneOut {
