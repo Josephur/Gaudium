@@ -292,31 +292,40 @@ impl LaneFamily {
         Ok(Self::K0 { hashes })
     }
 
-    fn graph(&self, spec: &ModelSpec, lmax: u64, b: u64, nch: u64, sampled: bool) -> GraphBuilder {
+    fn graph(&self, spec: &ModelSpec, lmax: u64, key: &StepKey) -> GraphBuilder {
+        let (ts, nch, sampled) = (&key.0, key.1, key.2);
         match self {
-            Self::K0 { hashes } => build_batched_step_graph(spec, lmax, nch, b, hashes, sampled),
-            Self::Spec(g) => g.build(spec, b, nch, sampled),
+            Self::K0 { hashes } => {
+                build_batched_step_graph(spec, lmax, nch, ts.len() as u64, hashes, sampled)
+            }
+            Self::Spec(g) => g.build(spec, ts, nch, sampled),
         }
     }
 
-    fn name(&self, b: u64, nch: u64, sampled: bool) -> String {
+    fn name(&self, key: &StepKey) -> String {
+        let (ts, nch, sampled) = (&key.0, key.1, key.2);
         match self {
-            Self::K0 { .. } => batched_step_name(b, nch, sampled),
-            Self::Spec(g) => spec::lanes::batched_spec_name(
-                b,
-                g.t,
-                nch,
-                sampled,
-                spec::replay::enabled(&g.hashes),
-            ),
+            Self::K0 { .. } => batched_step_name(ts.len() as u64, nch, sampled),
+            Self::Spec(g) => {
+                spec::lanes::batched_spec_name(ts, nch, sampled, spec::replay::enabled(&g.hashes))
+            }
         }
     }
 
-    /// Rows a slot writes per step.
-    fn rows(&self) -> u64 {
+    /// Rows a slot writes per step at its narrow and at its wide width (the same without a
+    /// width of its own per lane).
+    fn rows(&self) -> (u64, u64) {
         match self {
-            Self::K0 { .. } => 1,
-            Self::Spec(g) => g.t,
+            Self::K0 { .. } => (1, 1),
+            Self::Spec(g) => (g.narrow, g.wide),
+        }
+    }
+
+    /// The slot rows of every step of `b` slots (widest first).
+    fn slot_rows(&self, b: u64) -> Vec<Vec<u64>> {
+        match self {
+            Self::K0 { .. } => vec![vec![1; b as usize]],
+            Self::Spec(g) => g.slot_rows(b),
         }
     }
 
@@ -370,7 +379,7 @@ pub(super) struct LanePlan {
     /// buffer each).
     pub io_bytes: u64,
     /// Recipes compiled at load (their workspaces are part of the plan).
-    pub eager: Vec<((u64, u64, bool), CompiledRecipe)>,
+    pub eager: Vec<(StepKey, CompiledRecipe)>,
     pub max_ws: u64,
     pub sampled: bool,
     pub family: LaneFamily,
@@ -417,7 +426,7 @@ impl LanePlan {
         // recipes compiled in the process); the engine's other recipes still load from the cache
         let off = RecipeCache::disabled();
         let cache = if fresh { &off } else { cache };
-        let widest = family.graph(spec, lmax, n as u64, max_chunks, sampler);
+        let widest = family.graph(spec, lmax, &(vec![family.rows().1; n], max_chunks, sampler));
         let mut act_specs = BTreeMap::new();
         for (name, _dt, _dims, bytes) in widest.persistent_tensor_specs() {
             if weights(&name)
@@ -430,29 +439,30 @@ impl LanePlan {
             act_specs.insert(name, bytes);
         }
         let io_bytes = crate::verified::ln_lane_io_bytes(io_names(n).len() as u64, IO_SCALAR);
-        let mut keys: Vec<(u64, u64, bool)> = Vec::new();
+        // every slot-rows combination of every width at one chunk (and with `compile_all` at
+        // every chunk count), and the widest step at every chunk (it sizes the workspace)
+        let widest_rows = vec![family.rows().1; n];
+        let mut keys: Vec<StepKey> = Vec::new();
         let fams: &[bool] = if sampler { &[false, true] } else { &[false] };
         for &sm in fams {
-            if compile_all {
-                for nch in step_chunk_counts(max_chunks) {
-                    for b in 1..=n as u64 {
-                        keys.push((b, nch, sm));
+            let chunk_counts = if compile_all {
+                step_chunk_counts(max_chunks)
+            } else {
+                vec![1]
+            };
+            for nch in chunk_counts {
+                for b in 1..=n as u64 {
+                    for ts in family.slot_rows(b) {
+                        keys.push((ts, nch, sm));
                     }
                 }
-            } else {
-                for b in 1..=n as u64 {
-                    keys.push((b, 1, sm));
-                }
-                if max_chunks > 1 {
-                    keys.push((n as u64, max_chunks, sm));
-                }
+            }
+            if !compile_all && max_chunks > 1 {
+                keys.push((widest_rows.clone(), max_chunks, sm));
             }
         }
         let t0 = Instant::now();
-        let describe = |i: usize| -> GraphBuilder {
-            let (b, nch, sm) = keys[i];
-            family.graph(spec, lmax, b, nch, sm)
-        };
+        let describe = |i: usize| -> GraphBuilder { family.graph(spec, lmax, &keys[i]) };
         let mut cached = crate::synapse::graph::load_cached_parallel(
             keys.len(),
             crate::synapse::graph::recipe_load_threads(),
@@ -463,7 +473,7 @@ impl LanePlan {
         );
         let (mut hits, mut built, mut max_ws) = (0u64, 0u64, 0u64);
         let mut eager = Vec::with_capacity(keys.len());
-        for (i, &key) in keys.iter().enumerate() {
+        for (i, key) in keys.iter().enumerate() {
             let r = match std::mem::replace(&mut cached[i], Ok(None)) {
                 Ok(Some(r)) => r,
                 _ => describe(i)
@@ -471,7 +481,7 @@ impl LanePlan {
                     .map_err(|e| {
                         format!(
                             "compile batched step {}: {e}",
-                            family.name(key.0, key.1, key.2)
+                            family.name(key)
                         )
                     })?,
             };
@@ -481,7 +491,7 @@ impl LanePlan {
                 built += 1;
             }
             max_ws = max_ws.max(r.ws_size);
-            eager.push((key, r));
+            eager.push((key.clone(), r));
         }
         if verbose {
             eprintln!(
@@ -515,8 +525,11 @@ impl LanePlan {
     }
 }
 
+/// Key of a batched step recipe: every slot's rows (widest first), the chunk count, sampled.
+pub(super) type StepKey = (Vec<u64>, u64, bool);
+
 /// Key of a prepared batched launch: the recipe, and the lane and state parity of every slot.
-type LaunchKey = (u64, u64, bool, Vec<u8>, Vec<u8>);
+type LaunchKey = (StepKey, Vec<u8>, Vec<u8>);
 
 /// Lanes of a loaded engine.
 pub(super) struct LaneRt {
@@ -533,7 +546,7 @@ pub(super) struct LaneRt {
     base: BTreeMap<String, u64>,
     pub family: LaneFamily,
     sampled: bool,
-    recipes: HashMap<(u64, u64, bool), CompiledRecipe>,
+    recipes: HashMap<StepKey, CompiledRecipe>,
     launches: HashMap<LaunchKey, PreparedLaunch>,
     pub table: LaneTable,
     /// Batched launches since the load (the lane windows of `--profile-steps` count them).
@@ -542,6 +555,57 @@ pub(super) struct LaneRt {
     fresh: bool,
     /// Where a lane session's wall time goes (report only: `--verbose`).
     timing: StepTiming,
+    /// The measured step times the lanes' width choices use.
+    widths: WidthCosts,
+    /// Completion events of the speculative launches (two: one may be queued behind the other),
+    /// and the one the next launch records.
+    events: Vec<crate::synapse::device::DeviceEvent>,
+    next_event: usize,
+    /// When the last collected launch's results were read (the next launch queued behind it
+    /// started on the device about then).
+    last_collect: Option<Instant>,
+}
+
+/// What the lanes' width choices know of a batched speculative step's time (measured,
+/// exponentially averaged): per slot count and chunk count, the launch with every slot at its
+/// narrow width; per slot count, the extra time of one slot at its wide width.
+#[derive(Debug, Default)]
+struct WidthCosts {
+    narrow_ms: HashMap<(u64, u64), f64>,
+    extra_ms: HashMap<u64, f64>,
+}
+
+impl WidthCosts {
+    /// Weight of a new launch in the averages.
+    const ALPHA: f64 = 0.2;
+
+    fn ema(slot: &mut Option<f64>, x: f64) {
+        *slot = Some(match *slot {
+            Some(m) => m + Self::ALPHA * (x - m),
+            None => x,
+        });
+    }
+
+    /// A launch of `b` slots over `nch` chunks, `wide` of them at their wide width, took `ms`.
+    fn observe(&mut self, b: u64, nch: u64, wide: u64, ms: f64) {
+        if wide == 0 {
+            let mut m = self.narrow_ms.get(&(b, nch)).copied();
+            Self::ema(&mut m, ms);
+            self.narrow_ms.insert((b, nch), m.unwrap_or(ms));
+        } else if let Some(&t0) = self.narrow_ms.get(&(b, nch)) {
+            let mut m = self.extra_ms.get(&b).copied();
+            Self::ema(&mut m, ((ms - t0) / wide as f64).max(0.0));
+            self.extra_ms.insert(b, m.unwrap_or(0.0));
+        }
+    }
+
+    /// `(time of the narrow step, extra time of one wide slot)` in ms for `b` slots over `nch`
+    /// chunks: `None` until the narrow step was measured; the extra time is 0 until a wide slot
+    /// was (so a lane that expects more from the wide step tries it).
+    fn estimate(&self, b: u64, nch: u64) -> Option<(f64, f64)> {
+        let t0 = *self.narrow_ms.get(&(b, nch))?;
+        Some((t0, self.extra_ms.get(&b).copied().unwrap_or(0.0)))
+    }
 }
 
 /// The wall time of a lane session's batched launches, split at the launch and its sync.
@@ -638,6 +702,10 @@ impl LaneRt {
             launched: 0,
             fresh: plan.fresh,
             timing: StepTiming::default(),
+            widths: WidthCosts::default(),
+            events: Vec::new(),
+            next_event: 0,
+            last_collect: None,
         }
     }
 
@@ -681,6 +749,14 @@ impl LaneRt {
         }
         for (k, &v) in weights {
             self.base.entry(k.clone()).or_insert(v);
+        }
+        if matches!(self.family, LaneFamily::Spec(_)) {
+            for _ in 0..2 {
+                self.events.push(
+                    dev.create_event(false)
+                        .map_err(|e| format!("lanes: create a step event: {e}"))?,
+                );
+            }
         }
         Ok(())
     }
@@ -816,6 +892,9 @@ struct Run {
     /// Drafts verified, and accepted, over the request (speculative lanes).
     drafted: u64,
     accepted: u64,
+    /// The request's acceptance per draft position at the lanes' two widths (speculative lanes
+    /// with a width of their own; it only estimates what a wider step would bring).
+    policy: Option<spec::WidthPolicy>,
 }
 
 impl Run {
@@ -1029,6 +1108,12 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
         reused: eng.prefix_plan.resume,
         drafted: 0,
         accepted: 0,
+        policy: match eng.lanes.as_ref().map(|rt| rt.family.rows()) {
+            Some((narrow, wide)) if wide > narrow => {
+                Some(spec::WidthPolicy::new(&[narrow - 1, wide - 1]))
+            }
+            _ => None,
+        },
     };
     match pre {
         Err(e) => {
@@ -1078,7 +1163,8 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
             if !run.done() && eng.specdec.is_some() {
                 // a speculative lane: the first block of drafts, and the lane's step buffers
                 // of this parity (row 0 = the first token, at the cursor)
-                let t = eng.lanes.as_ref().expect("lanes").family.rows() as usize;
+                // (the first step's ids at the widest rows a lane may verify at)
+                let t = eng.lanes.as_ref().expect("lanes").family.rows().1 as usize;
                 let drafts = {
                     let Qwen3Engine {
                         specdec,
@@ -1115,6 +1201,16 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
             }
             Ok(Some(run))
         }
+    }
+}
+
+/// The draft widths a speculative lane verifies at, as the method label shows them (`7` or
+/// `7/15`).
+fn lane_ks(g: &spec::lanes::SpecLaneGraph) -> String {
+    if g.wide == g.narrow {
+        format!("{}", g.narrow - 1)
+    } else {
+        format!("{}/{}", g.narrow - 1, g.wide - 1)
     }
 }
 
@@ -1160,10 +1256,10 @@ fn end_lane(eng: &mut Qwen3Engine, lane: usize, mut run: Run) {
         method: match (eng.lanes.as_ref().map(|rt| &rt.family), run.sampled) {
             (Some(LaneFamily::Spec(g)), true) => format!(
                 "dspine K={} {wprec} T={:.2}",
-                g.t - 1,
+                lane_ks(g),
                 run.params.temperature
             ),
-            (Some(LaneFamily::Spec(g)), false) => format!("dspine K={} {wprec} greedy", g.t - 1),
+            (Some(LaneFamily::Spec(g)), false) => format!("dspine K={} {wprec} greedy", lane_ks(g)),
             (_, true) => format!("K=0 {wprec} T={:.2}", run.params.temperature),
             (_, false) => format!("K=0 {wprec} greedy"),
         },
@@ -1223,12 +1319,12 @@ pub(super) fn launch_one_row(
     Ok(0.0)
 }
 
-/// Makes the batched step `(b, nch, sampled)` launchable; the ms a first use took.
-fn ensure_recipe(eng: &mut Qwen3Engine, key: (u64, u64, bool)) -> Result<f64, String> {
+/// Makes the batched step `key` launchable; the ms a first use took.
+fn ensure_recipe(eng: &mut Qwen3Engine, key: &StepKey) -> Result<f64, String> {
     if eng
         .lanes
         .as_ref()
-        .is_some_and(|rt| rt.recipes.contains_key(&key))
+        .is_some_and(|rt| rt.recipes.contains_key(key))
     {
         return Ok(0.0);
     }
@@ -1243,14 +1339,13 @@ fn ensure_recipe(eng: &mut Qwen3Engine, key: (u64, u64, bool)) -> Result<f64, St
         ..
     } = eng;
     let rt = lanes.as_mut().expect("lanes");
-    let (b, nch, sm) = key;
     let off = RecipeCache::disabled();
     let cache = if rt.fresh { &off } else { &*cache };
     let mut r = rt
         .family
-        .graph(spec, *max_ctx, b, nch, sm)
+        .graph(spec, *max_ctx, key)
         .compile(Arc::clone(dev.api()), cache, driver_version)
-        .map_err(|e| format!("compile batched step {}: {e}", rt.family.name(b, nch, sm)))?;
+        .map_err(|e| format!("compile batched step {}: {e}", rt.family.name(key)))?;
     r.bind_shared_workspace(dev)
         .map_err(|e| format!("bind {} ws: {e}", r.name))?;
     if eng.verbose {
@@ -1260,25 +1355,29 @@ fn ensure_recipe(eng: &mut Qwen3Engine, key: (u64, u64, bool)) -> Result<f64, St
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
-    rt.recipes.insert(key, r);
+    rt.recipes.insert(key.clone(), r);
     Ok(t0.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// The key of the prepared launch of batched step `key` with `lanes[j]` (state parity
+/// `parities[j]`) in slot `j`.
+fn launch_key(key: &StepKey, lanes: &[usize], parities: &[usize]) -> LaunchKey {
+    (
+        key.clone(),
+        lanes.iter().map(|&l| l as u8).collect(),
+        parities.iter().map(|&p| p as u8).collect(),
+    )
 }
 
 /// The prepared launch of batched step `key` with `lanes[j]` (state parity `parities[j]`) in
 /// slot `j`.
 fn prepare(
     eng: &mut Qwen3Engine,
-    key: (u64, u64, bool),
+    key: &StepKey,
     lanes: &[usize],
     parities: &[usize],
 ) -> Result<(), String> {
-    let lk: LaunchKey = (
-        key.0,
-        key.1,
-        key.2,
-        lanes.iter().map(|&l| l as u8).collect(),
-        parities.iter().map(|&p| p as u8).collect(),
-    );
+    let lk = launch_key(key, lanes, parities);
     if eng
         .lanes
         .as_ref()
@@ -1374,7 +1473,7 @@ fn prepare(
             }
         }
     }
-    let recipe = &rt.recipes[&key];
+    let recipe = &rt.recipes[key];
     let exact = select_exact_bindings(recipe, &pool)?;
     let prepared = recipe
         .prepare_launch(&exact)
@@ -1411,13 +1510,13 @@ fn step(
             ));
         }
     }
-    let key = (b, nch, sampled);
-    ensure_recipe(eng, key)?;
+    let key: StepKey = (vec![1; lanes.len()], nch, sampled);
+    ensure_recipe(eng, &key)?;
     let parities: Vec<usize> = lanes
         .iter()
         .map(|&l| runs[l].as_ref().expect("a decoding lane runs").parity)
         .collect();
-    prepare(eng, key, lanes, &parities)?;
+    prepare(eng, &key, lanes, &parities)?;
     // ids and cursors in one synchronised upload
     let (io_ids, io_tokens, io_cursor) = {
         let rt = eng.lanes.as_ref().expect("lanes");
@@ -1446,13 +1545,7 @@ fn step(
     eng.dev
         .copy_h2d_pinned_batch_sync(&eng.stage_io, &copies)
         .map_err(|e| format!("write batched step inputs H2D: {e}"))?;
-    let lk: LaunchKey = (
-        b,
-        nch,
-        sampled,
-        lanes.iter().map(|&l| l as u8).collect(),
-        parities.iter().map(|&p| p as u8).collect(),
-    );
+    let lk = launch_key(&key, lanes, &parities);
     lane_launch_hook(eng)?;
     {
         let rt = eng.lanes.as_ref().expect("lanes");
@@ -1490,60 +1583,85 @@ fn lane_launch_hook(eng: &mut Qwen3Engine) -> Result<(), String> {
     prof_rt::before_lane_launch(eng, idx)
 }
 
-/// One batched speculative step of `lanes` (all of one readout kind): every lane's emitted
-/// tokens (its accepted drafts, then the bonus token; a negative value ends the list).
-fn spec_step(
+/// A batched speculative launch on the device, not collected yet.
+struct LaneLaunch {
+    /// `(lane, rows)` of every slot, widest first.
+    lanes: Vec<(usize, u64)>,
+    /// The state parity every slot's lane read (its emitted tokens are in that parity's buffer).
+    parities: Vec<usize>,
+    nch: u64,
+    /// Its completion event (`LaneRt::events`).
+    event: usize,
+    t0: Instant,
+    launched: Instant,
+}
+
+/// Launches a batched speculative step of `lanes` (`(lane, rows)`, widest first; all of one
+/// readout kind) whose slots read state parity `parities[j]` at a cursor of at most
+/// `cursors[j]` (the slot table is checked for those rows).
+fn spec_launch(
     eng: &mut Qwen3Engine,
-    lanes: &[usize],
-    runs: &[Option<Run>],
+    lanes: &[(usize, u64)],
+    cursors: &[u64],
+    parities: &[usize],
     sampled: bool,
-) -> Result<Vec<Vec<i32>>, String> {
+) -> Result<LaneLaunch, String> {
     let t0 = eng.lanes.as_mut().expect("lanes").timing.begin();
-    let b = lanes.len() as u64;
-    let t = eng.lanes.as_ref().expect("lanes").family.rows();
-    let slots: Vec<(u64, u64)> = lanes
-        .iter()
-        .map(|&l| (runs[l].as_ref().expect("a decoding lane runs").cursor, t))
-        .collect();
+    let slots: Vec<(u64, u64)> = lanes.iter().zip(cursors).map(|(&(_, t), &c)| (c, t)).collect();
     let nch = step_chunks(batch_chunks(&slots, KV_CHUNK), eng.max_chunks);
     for (j, &(c, r)) in slots.iter().enumerate() {
         if !slot_fits(c, r, nch, KV_CHUNK, eng.max_chunks) {
             return Err(format!(
                 "batched speculative step: slot {j} (lane {}, rows to {}) does not fit {nch} chunks of a lane of {} chunks",
-                lanes[j],
+                lanes[j].0,
                 c + r,
                 eng.max_chunks
             ));
         }
     }
-    let key = (b, nch, sampled);
-    ensure_recipe(eng, key)?;
-    let parities: Vec<usize> = lanes
-        .iter()
-        .map(|&l| runs[l].as_ref().expect("a decoding lane runs").parity)
-        .collect();
-    prepare(eng, key, lanes, &parities)?;
-    let lk: LaunchKey = (
-        b,
-        nch,
-        sampled,
-        lanes.iter().map(|&l| l as u8).collect(),
-        parities.iter().map(|&p| p as u8).collect(),
-    );
+    let key: StepKey = (lanes.iter().map(|&(_, t)| t).collect(), nch, sampled);
+    ensure_recipe(eng, &key)?;
+    let ids: Vec<usize> = lanes.iter().map(|&(l, _)| l).collect();
+    prepare(eng, &key, &ids, parities)?;
+    let lk = launch_key(&key, &ids, parities);
     lane_launch_hook(eng)?;
+    let rt = eng.lanes.as_mut().expect("lanes");
+    rt.recipes[&key]
+        .launch_prepared(&eng.dev, &rt.launches[&lk])
+        .map_err(|e| format!("launch {}: {e}", rt.family.name(&key)))?;
+    let event = rt.next_event;
+    if let Some(ev) = rt.events.get(event) {
+        ev.record_compute(&eng.dev)
+            .map_err(|e| format!("record a lane step event: {e}"))?;
+    }
+    rt.next_event = (event + 1) % rt.events.len().max(1);
+    Ok(LaneLaunch {
+        lanes: lanes.to_vec(),
+        parities: parities.to_vec(),
+        nch,
+        event,
+        t0,
+        launched: Instant::now(),
+    })
+}
+
+/// Waits for launch `l` and reads every slot's emitted tokens (its accepted drafts, then the
+/// bonus token; a negative value ends the list), in the order of its lanes.
+fn spec_collect(eng: &mut Qwen3Engine, l: &LaneLaunch) -> Result<Vec<Vec<i32>>, String> {
     {
         let rt = eng.lanes.as_ref().expect("lanes");
-        rt.recipes[&key]
-            .launch_prepared(&eng.dev, &rt.launches[&lk])
-            .map_err(|e| format!("launch {}: {e}", rt.family.name(b, nch, sampled)))?;
+        match rt.events.get(l.event) {
+            Some(ev) => ev
+                .synchronize()
+                .map_err(|e| format!("wait for a batched speculative step: {e}"))?,
+            // SAFETY: the compute stream belongs to `eng.dev`.
+            None => unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
+                .map_err(|e| format!("sync batched speculative step: {e}"))?,
+        }
     }
-    let launched = Instant::now();
-    // SAFETY: the compute stream belongs to `eng.dev`.
-    unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
-        .map_err(|e| format!("sync batched speculative step: {e}"))?;
     let synced = Instant::now();
-    let mut out = Vec::with_capacity(lanes.len());
-    for (&lane, &p) in lanes.iter().zip(&parities) {
+    let mut out = Vec::with_capacity(l.lanes.len());
+    for (&(lane, t), &p) in l.lanes.iter().zip(&l.parities) {
         let name = format!("sp_emit{p}");
         let addr = {
             let rt = eng.lanes.as_ref().expect("lanes");
@@ -1555,8 +1673,200 @@ fn spec_step(
         };
         out.push(spec::read_i32s(eng, addr, t as usize)?);
     }
-    eng.lanes.as_mut().expect("lanes").timing.end(t0, launched, synced);
+    let now = Instant::now();
+    let rt = eng.lanes.as_mut().expect("lanes");
+    rt.timing.end(l.t0, l.launched, synced);
+    // the launch's own time, for the lanes' width choices: from its start on the device (its
+    // enqueue, or the collection of the launch it was queued behind) to its results
+    let start = rt.last_collect.map_or(l.t0, |c| c.max(l.t0));
+    rt.last_collect = Some(now);
+    let wide = l.lanes.iter().filter(|&&(_, t)| t > rt.family.rows().0).count() as u64;
+    rt.widths.observe(l.lanes.len() as u64, l.nch, wide, (now - start).as_secs_f64() * 1e3);
     Ok(out)
+}
+
+/// One step of the speculative lanes `group` (all of one readout kind), and the next one queued
+/// ahead of it when the verified rule allows (`waiting`: a request waits for a lane; `one_group`:
+/// the group is every decoding lane): a launch queued in the previous call (`ahead`) is this step
+/// when it has exactly this group's lanes. A lane whose request ended in a step drops the step queued
+/// behind it, which is collected before the lane is released.
+fn spec_group_step(
+    eng: &mut Qwen3Engine,
+    runs: &mut [Option<Run>],
+    group: &[usize],
+    sampled: bool,
+    waiting: bool,
+    one_group: bool,
+    ahead: &mut Option<LaneLaunch>,
+) -> Result<(), String> {
+    // a lane without room in its context for a batched step's rows takes single-row steps to
+    // the end of its request, as a single stream does
+    let (narrow, _) = eng.lanes.as_ref().expect("lanes").family.rows();
+    let max_ctx = eng.max_ctx;
+    let parity = |runs: &[Option<Run>], l: usize| runs[l].as_ref().expect("a decoding lane runs").parity;
+    if let Some(a) = ahead.take() {
+        // the step in flight: queue the one after it (same lanes, at most its rows further on,
+        // the other state parity) unless the group changed or a lane may leave the batched steps
+        let mut lanes_a: Vec<usize> = a.lanes.iter().map(|&(l, _)| l).collect();
+        lanes_a.sort_unstable();
+        let mut lanes_g = group.to_vec();
+        lanes_g.sort_unstable();
+        let bound: BTreeMap<usize, u64> = a
+            .lanes
+            .iter()
+            .map(|&(l, t)| (l, runs[l].as_ref().expect("a decoding lane runs").cursor + t))
+            .collect();
+        let next = if crate::core::lanes::queue_ahead(
+            waiting,
+            one_group && lanes_a == lanes_g,
+            bound.values().all(|&c| spec_batched(c, narrow, max_ctx)),
+        ) {
+            let lanes = a.lanes.iter().map(|&(l, _)| l).collect::<Vec<_>>();
+            let with_rows = lane_rows_of(eng, &lanes, runs, &|l| bound[&l]);
+            let cursors: Vec<u64> = with_rows.iter().map(|&(l, _)| bound[&l]).collect();
+            let parities: Vec<usize> = with_rows
+                .iter()
+                .map(|&(l, _)| {
+                    let p = a.parities[a.lanes.iter().position(|&(x, _)| x == l).expect("its lane")];
+                    crate::verified::ln_lane_parity_next(p as u64) as usize
+                })
+                .collect();
+            Some(spec_launch(eng, &with_rows, &cursors, &parities, sampled)?)
+        } else {
+            None
+        };
+        let em = spec_collect(eng, &a)?;
+        apply_spec(eng, runs, a.lanes.iter().zip(em).map(|(&(l, t), e)| (l, t, e)).collect())?;
+        if let Some(b) = next {
+            let ended = b.lanes.iter().any(|&(l, _)| runs[l].as_ref().is_none_or(|r| r.done()));
+            if crate::core::lanes::ahead_lands(ended) {
+                // a request ended: the step behind it lands before the lane is released
+                let em = spec_collect(eng, &b)?;
+                let live = b
+                    .lanes
+                    .iter()
+                    .zip(em)
+                    .filter(|((l, _), _)| runs[*l].as_ref().is_some_and(|r| !r.done()))
+                    .map(|(&(l, t), e)| (l, t, e))
+                    .collect();
+                apply_spec(eng, runs, live)?;
+            } else {
+                *ahead = Some(b);
+            }
+        }
+        return Ok(());
+    }
+    let (stepping, single): (Vec<usize>, Vec<usize>) = group.iter().copied().partition(|&l| {
+        let run = runs[l].as_ref().expect("a decoding lane runs");
+        spec_batched(run.cursor, narrow, max_ctx)
+    });
+    let mut emitted: Vec<(usize, u64, Vec<i32>)> = Vec::with_capacity(group.len());
+    if !stepping.is_empty() {
+        let with_rows = lane_rows_of(eng, &stepping, runs, &|l| {
+            runs[l].as_ref().expect("a decoding lane runs").cursor
+        });
+        let cursors: Vec<u64> = with_rows
+            .iter()
+            .map(|&(l, _)| runs[l].as_ref().expect("a decoding lane runs").cursor)
+            .collect();
+        let parities: Vec<usize> = with_rows.iter().map(|&(l, _)| parity(runs, l)).collect();
+        let a = spec_launch(eng, &with_rows, &cursors, &parities, sampled)?;
+        // (every lane's rows of this step fit its context: it is in `stepping`)
+        if crate::core::lanes::queue_ahead(waiting, one_group && single.is_empty(), true) {
+            // collected (and the next step queued) by the next call
+            *ahead = Some(a);
+            return Ok(());
+        }
+        let em = spec_collect(eng, &a)?;
+        emitted.extend(with_rows.iter().zip(em).map(|(&(l, t), e)| (l, t, e)));
+    }
+    for &lane in &single {
+        emitted.push((lane, 1, single_row_step(eng, lane, runs)?));
+    }
+    apply_spec(eng, runs, emitted)
+}
+
+/// A speculative step's results: per lane `(lane, rows it verified, emitted tokens)`.
+fn apply_spec(
+    eng: &mut Qwen3Engine,
+    runs: &mut [Option<Run>],
+    emitted: Vec<(usize, u64, Vec<i32>)>,
+) -> Result<(), String> {
+    for (lane, rows, em) in emitted {
+        let run = runs[lane].as_mut().expect("a decoding lane runs");
+        let n_emit = em.iter().take_while(|&&v| v >= 0).count();
+        if n_emit == 0 {
+            return Err(format!(
+                "lane {lane}: the accept kernel emitted no token at cursor {} ({em:?})",
+                run.cursor
+            ));
+        }
+        run.advance(n_emit as u64, rows);
+        run.drafted += rows - 1;
+        run.accepted += n_emit as u64 - 1;
+        if rows > 1 {
+            if let Some(p) = run.policy.as_mut() {
+                p.observe(rows - 1, n_emit - 1, 0.0);
+            }
+        }
+        run.observe_cancel();
+        for &tok in &em[..n_emit] {
+            if run.done() {
+                break;
+            }
+            run.emit(tok);
+        }
+        if run.done() {
+            eng.lanes
+                .as_mut()
+                .expect("lanes")
+                .table
+                .finish(lane)
+                .map_err(|e| format!("lanes: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The rows each of the speculative lanes `stepping` verifies in its next batched step, widest
+/// first: a lane goes wide when the extra tokens it expects from the wide step beat the batch's
+/// expected tokens per unit of time over the wide step's extra time (the verified rule), and its
+/// wide rows fit its rings and its context.
+/// `cursor_of(lane)`: the lane's cursor, or a bound of it for a step queued ahead.
+fn lane_rows_of(
+    eng: &Qwen3Engine,
+    stepping: &[usize],
+    runs: &[Option<Run>],
+    cursor_of: &dyn Fn(usize) -> u64,
+) -> Vec<(usize, u64)> {
+    let rt = eng.lanes.as_ref().expect("lanes");
+    let (narrow, wide) = rt.family.rows();
+    let ring = eng.specdec.as_ref().map_or(narrow, |sd| sd.gdn_slots());
+    let run = |l: usize| runs[l].as_ref().expect("a decoding lane runs");
+    // the time of this step with every lane narrow, and of one more lane wide
+    let narrow_slots: Vec<(u64, u64)> = stepping.iter().map(|&l| (cursor_of(l), narrow)).collect();
+    let nch = step_chunks(batch_chunks(&narrow_slots, KV_CHUNK), eng.max_chunks);
+    let est = (wide > narrow)
+        .then(|| rt.widths.estimate(stepping.len() as u64, nch))
+        .flatten();
+    // expected tokens per lane at each width, in thousandths
+    let milli = |x: f64| (x.max(0.0) * 1000.0).round() as u64;
+    let expect = |l: usize, rows: u64| run(l).policy.as_ref().map_or(0.0, |p| p.expected_tokens(rows - 1));
+    let total: u64 = stepping.iter().map(|&l| milli(expect(l, narrow))).sum();
+    let mut out: Vec<(usize, u64)> = stepping
+        .iter()
+        .map(|&l| {
+            let go = est.is_some_and(|(t0, extra)| {
+                let gain = milli(expect(l, wide)).saturating_sub(milli(expect(l, narrow)));
+                crate::core::lanes::lane_goes_wide(gain, milli(extra), total, milli(t0))
+            });
+            let rows = crate::core::lanes::lane_step_rows(go, narrow, wide, ring, cursor_of(l), eng.max_ctx);
+            (l, rows)
+        })
+        .collect();
+    // (the slots of a step are ordered widest first: one recipe per row combination)
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
 }
 
 /// One single-row step of speculative lane `lane` (near the end of its context): its emitted
@@ -1592,6 +1902,8 @@ pub(super) fn serve(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed) -> Result<()
     let launched = eng.lanes.as_ref().expect("lanes").launched;
     let res = res.and(prof_rt::end_lanes(eng, launched));
     if let Err(e) = &res {
+        // a launch queued ahead lands first (never leave launches queued behind an error)
+        let _ = eng.dev.sync_all();
         // every request taken gets its end: the lanes still busy end with the error
         for (lane, slot) in runs.iter_mut().enumerate() {
             if let Some(mut run) = slot.take() {
@@ -1625,15 +1937,26 @@ fn serve_loop(
     feed: &mut dyn LaneFeed,
     runs: &mut [Option<Run>],
 ) -> Result<(), String> {
+    // a speculative launch queued ahead, not collected yet
+    let mut ahead: Option<LaneLaunch> = None;
     loop {
         // 1. admission: the oldest waiting request, while the lane gate lets it in
+        let mut waiting = false;
         loop {
             let idle = eng.lanes.as_ref().expect("lanes").table.busy() == 0;
             let exclusive = match feed.head(idle) {
-                FeedHead::End => return Ok(()),
+                FeedHead::End => {
+                    if let Some(a) = ahead.take() {
+                        // (a session ends with no lane busy, so nothing is queued; collected
+                        // anyway so that no launch outlives the session)
+                        spec_collect(eng, &a)?;
+                    }
+                    return Ok(());
+                }
                 FeedHead::Empty => break,
                 FeedHead::Job { exclusive } => exclusive,
             };
+            waiting = true;
             if !eng
                 .lanes
                 .as_ref()
@@ -1692,51 +2015,10 @@ fn serve_loop(
                 continue;
             }
             if eng.specdec.is_some() {
-                // a lane without room in its context for a batched step's rows takes single-row
-                // steps to the end of its request, as a single stream does
-                let t = eng.lanes.as_ref().expect("lanes").family.rows();
-                let max_ctx = eng.max_ctx;
-                let (stepping, single): (Vec<usize>, Vec<usize>) =
-                    group.iter().copied().partition(|&l| {
-                        let run = runs[l].as_ref().expect("a decoding lane runs");
-                        spec_batched(run.cursor, t, max_ctx)
-                    });
-                let mut emitted: Vec<(usize, u64, Vec<i32>)> = Vec::with_capacity(group.len());
-                if !stepping.is_empty() {
-                    let em = spec_step(eng, &stepping, runs, sampled)?;
-                    emitted.extend(stepping.iter().zip(em).map(|(&l, e)| (l, t, e)));
-                }
-                for &lane in &single {
-                    emitted.push((lane, 1, single_row_step(eng, lane, runs)?));
-                }
-                for (lane, rows, em) in emitted {
-                    let run = runs[lane].as_mut().expect("a decoding lane runs");
-                    let n_emit = em.iter().take_while(|&&v| v >= 0).count();
-                    if n_emit == 0 {
-                        return Err(format!(
-                            "lane {lane}: the accept kernel emitted no token at cursor {} ({em:?})",
-                            run.cursor
-                        ));
-                    }
-                    run.advance(n_emit as u64, rows);
-                    run.drafted += rows - 1;
-                    run.accepted += n_emit as u64 - 1;
-                    run.observe_cancel();
-                    for &tok in &em[..n_emit] {
-                        if run.done() {
-                            break;
-                        }
-                        run.emit(tok);
-                    }
-                    if run.done() {
-                        eng.lanes
-                            .as_mut()
-                            .expect("lanes")
-                            .table
-                            .finish(lane)
-                            .map_err(|e| format!("lanes: {e}"))?;
-                    }
-                }
+                // the next step may be queued ahead while this one runs (its inputs are on the
+                // device already): one group of speculative lanes, nothing waiting
+                let one_group = batch.len() == group.len();
+                spec_group_step(eng, runs, &group, sampled, waiting, one_group, &mut ahead)?;
                 eng.live.step(group.len() as u64, 0, 0);
                 continue;
             }
@@ -1782,6 +2064,26 @@ fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn width_costs_learn_the_narrow_step_first_then_the_extra_of_a_wide_slot() {
+        let mut w = WidthCosts::default();
+        assert_eq!(w.estimate(4, 1), None);
+        // a wide launch before any narrow one of that shape teaches nothing yet
+        w.observe(4, 1, 2, 30.0);
+        assert_eq!(w.estimate(4, 1), None);
+        w.observe(4, 1, 0, 20.0);
+        assert_eq!(w.estimate(4, 1), Some((20.0, 0.0)));
+        w.observe(4, 1, 2, 24.0);
+        assert_eq!(w.estimate(4, 1), Some((20.0, 2.0)));
+        // exponential averages (today's weight 0.2)
+        w.observe(4, 1, 0, 30.0);
+        let (t0, extra) = w.estimate(4, 1).unwrap();
+        assert!((t0 - 22.0).abs() < 1e-9 && (extra - 2.0).abs() < 1e-9);
+        // other shapes are their own
+        assert_eq!(w.estimate(4, 2), None);
+        assert_eq!(w.estimate(3, 1), None);
+    }
 
     fn qwen38_27b_spec() -> ModelSpec {
         ModelSpec::from_config_json(

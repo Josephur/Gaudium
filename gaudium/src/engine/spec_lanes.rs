@@ -19,43 +19,64 @@
 use super::*;
 use crate::engine::qwen3::lanes_rt::slot_pfx;
 
-/// Name of a batched speculative step recipe (`r`: the replay form of the DeltaNet verify rows).
-pub fn batched_spec_name(b: u64, t: u64, nch: u64, sampled: bool, replay: bool) -> String {
+/// Name of a batched speculative step recipe of slots of `ts` rows (widest first; `r`: the
+/// replay form of the DeltaNet verify rows): `..._B3_T8_C1` when every slot has the same rows,
+/// `..._B3_T16x1_8x2_C1` otherwise.
+pub fn batched_spec_name(ts: &[u64], nch: u64, sampled: bool, replay: bool) -> String {
+    let b = ts.len();
+    let mut runs: Vec<(u64, usize)> = Vec::new();
+    for &t in ts {
+        match runs.last_mut() {
+            Some((r, n)) if *r == t => *n += 1,
+            _ => runs.push((t, 1)),
+        }
+    }
+    let rows = if runs.len() == 1 {
+        runs[0].0.to_string()
+    } else {
+        runs.iter()
+            .map(|(t, n)| format!("{t}x{n}"))
+            .collect::<Vec<_>>()
+            .join("_")
+    };
     format!(
-        "g_spec_ds{}{}_B{b}_T{t}_C{nch}",
+        "g_spec_ds{}{}_B{b}_T{rows}_C{nch}",
         if sampled { "s" } else { "" },
         if replay { "r" } else { "" }
     )
 }
 
-/// `b` groups of `t` columns of `x {d, b * t}` as `b` tensors `{d, t}` (intermediates).
+/// The slots' column groups of `x {d, sum ts}` (`ts[j]` columns of slot `j`) as tensors
+/// `{d, ts[j]}` (intermediates).
 fn split_groups(
     gb: &mut GraphBuilder,
     x: TensorId,
     dt: SynDataType,
     d: u64,
-    b: u64,
-    t: u64,
+    ts: &[u64],
     name: &str,
 ) -> Vec<TensorId> {
-    let parts: Vec<TensorId> = (0..b)
-        .map(|j| gb.add_intermediate(format!("{name}_g{j}"), dt, &[d, t]))
+    let parts: Vec<TensorId> = ts
+        .iter()
+        .enumerate()
+        .map(|(j, &t)| gb.add_intermediate(format!("{name}_g{j}"), dt, &[d, t]))
         .collect();
     gb.op_split(format!("{name}_split"), x, &parts, 1);
     parts
 }
 
-/// The batched speculative step of `b` slots of `t` rows over `nch` KV chunks with a DSpine
-/// drafter (`ns` = slots of the DeltaNet state rings). `elf_hashes` must include the drafter's
-/// kernels (and the sampler's for `sampled`). The checkpoint form of the DeltaNet verify rows.
+/// The batched speculative step over `nch` KV chunks of one slot per entry of `ts` (`ts[j]` =
+/// the verify rows of slot `j`, widest first) with a DSpine drafter (`ns` = rows of the DeltaNet
+/// state rings and update buffers, at least every slot's). `elf_hashes` must include the
+/// drafter's kernels (and the sampler's for `sampled`); they also select the form of the
+/// DeltaNet verify rows (checkpoint or replay).
 #[allow(clippy::too_many_arguments)]
 pub fn build_batched_spec_step_graph(
     spec: &ModelSpec,
     lmax: u64,
     nch: u64,
-    t: u64,
+    ts: &[u64],
     ns: u64,
-    b: u64,
     dc: &dspine::DSpineCfg,
     elf_hashes: &[(String, String)],
     sampled: bool,
@@ -64,20 +85,22 @@ pub fn build_batched_spec_step_graph(
     // the replay form of the DeltaNet verify rows (no per-row state checkpoints) when the step
     // family carries its kernel, as in the single-stream steps
     let gdn_replay = replay::enabled(elf_hashes);
-    let mut gb = GraphBuilder::new(batched_spec_name(b, t, nch, sampled, gdn_replay));
+    let mut gb = GraphBuilder::new(batched_spec_name(ts, nch, sampled, gdn_replay));
     gb.set_fp8_weights(spec.fp8_weights);
     for (k, h) in elf_hashes {
         gb.record_kernel_elf_hash(k, h);
     }
+    let b = ts.len() as u64;
+    let t_max = ts.iter().copied().max().unwrap_or(1);
     let hid = spec.hidden;
-    let rows = b * t;
+    let rows: u64 = ts.iter().sum();
     let table =
         gb.get_or_add_persistent_tensor("embed_table", SynDataType::Bf16, &[hid, spec.vocab]);
     let rope_c = gb.get_or_add_persistent_tensor("rope_c", SynDataType::Float, &[128, lmax]);
     let rope_s = gb.get_or_add_persistent_tensor("rope_s", SynDataType::Float, &[128, lmax]);
     // per slot: its ids, cursor and ring slot (the lane's step buffers of this parity)
     let ids: Vec<TensorId> = (0..b)
-        .map(|j| gb.add_persistent_tensor(format!("{}ids", slot_pfx(j)), SynDataType::Int32, &[t]))
+        .map(|j| gb.add_persistent_tensor(format!("{}ids", slot_pfx(j)), SynDataType::Int32, &[ts[j as usize]]))
         .collect();
     let cursors: Vec<TensorId> = (0..b)
         .map(|j| {
@@ -113,9 +136,9 @@ pub fn build_batched_spec_step_graph(
         let attn = if spec.is_full_attention_layer(l) {
             let (nh, dh) = (spec.n_heads, spec.head_dim);
             let (qg, k, v) = append_attn_proj(&mut gb, spec, x, h_pre, &lpfx, rows);
-            let qgs = split_groups(&mut gb, qg, SynDataType::Bf16, spec.qg_dim(), b, t, &format!("{lpfx}qg"));
-            let ks = split_groups(&mut gb, k, SynDataType::Bf16, spec.kv_dim(), b, t, &format!("{lpfx}k"));
-            let vs = split_groups(&mut gb, v, SynDataType::Bf16, spec.kv_dim(), b, t, &format!("{lpfx}v"));
+            let qgs = split_groups(&mut gb, qg, SynDataType::Bf16, spec.qg_dim(), ts, &format!("{lpfx}qg"));
+            let ks = split_groups(&mut gb, k, SynDataType::Bf16, spec.kv_dim(), ts, &format!("{lpfx}k"));
+            let vs = split_groups(&mut gb, v, SynDataType::Bf16, spec.kv_dim(), ts, &format!("{lpfx}v"));
             // every slot on its own rows, cursor and caches, stage by stage across the slots
             let slots: Vec<AttnSlot> = (0..b as usize)
                 .map(|j| AttnSlot {
@@ -124,7 +147,7 @@ pub fn build_batched_spec_step_graph(
                     v: vs[j],
                     cursor: cursors[j],
                     spfx: format!("{}{lpfx}", slot_pfx(j as u64)),
-                    t: t,
+                    t: ts[j],
                 })
                 .collect();
             let cores = append_attn_core_slots(&mut gb, spec, &slots, rope_c, rope_s, &lpfx, nch);
@@ -135,7 +158,7 @@ pub fn build_batched_spec_step_graph(
             let (hv, dl) = (spec.gdn_v_heads, spec.gdn_v_dim);
             let (qkvz, ba) = append_linear_proj(&mut gb, spec, x, h_pre, &lpfx, rows);
             let spfx: Vec<String> = (0..b).map(|j| format!("{}{lpfx}", slot_pfx(j))).collect();
-            let widths = vec![t; b as usize];
+            let widths = ts.to_vec();
             let core = if gdn_replay {
                 replay::append_gdn_replay_slots(
                     &mut gb, spec, qkvz, ba, &a_in, &cursors, &rp_first, &lpfx, &spfx, &widths, ns,
@@ -171,7 +194,7 @@ pub fn build_batched_spec_step_graph(
     let logits = add_linear_bf16(&mut gb, h_final, lm_w, hid, spec.vocab, rows, "logits");
     // per slot: its verify tokens
     let tokens: Vec<TensorId> = if sampled {
-        let cols = split_groups(&mut gb, logits, SynDataType::Bf16, spec.vocab, b, t, "logits");
+        let cols = split_groups(&mut gb, logits, SynDataType::Bf16, spec.vocab, ts, "logits");
         (0..b as usize)
             .map(|j| {
                 let sp = slot_pfx(j as u64);
@@ -184,7 +207,7 @@ pub fn build_batched_spec_step_graph(
                     &mut gb,
                     cols[j],
                     spec.vocab,
-                    t,
+                    ts[j],
                     &at,
                     &format!("{sp}tokens"),
                     &format!("{sp}samp_f"),
@@ -198,21 +221,22 @@ pub fn build_batched_spec_step_graph(
         gb.op_argmax_bf16("argmax", logits, all, 0);
         let parts: Vec<TensorId> = (0..b)
             .map(|j| {
-                gb.add_persistent_tensor(format!("{}tokens", slot_pfx(j)), SynDataType::Int32, &[1, t])
+                gb.add_persistent_tensor(format!("{}tokens", slot_pfx(j)), SynDataType::Int32, &[1, ts[j as usize]])
             })
             .collect();
         gb.op_split("tokens_split", all, &parts, 1);
         parts
     };
 
-    let parent = gb.get_or_add_persistent_tensor("sp_parent", SynDataType::Int32, &[t]);
-    let depth = gb.get_or_add_persistent_tensor("sp_depth", SynDataType::Int32, &[t]);
+    // the chain tables, at the widest slot's rows (a narrower slot's kernels read their first rows)
+    let parent = gb.get_or_add_persistent_tensor("sp_parent", SynDataType::Int32, &[t_max]);
+    let depth = gb.get_or_add_persistent_tensor("sp_depth", SynDataType::Int32, &[t_max]);
     let mut draft_slots = Vec::with_capacity(b as usize);
     for j in 0..b as usize {
         let sp = slot_pfx(j as u64);
         let a_out = gb.add_persistent_tensor(format!("{sp}a_out"), SynDataType::Int32, &[1]);
         let cursor_out = gb.add_persistent_tensor(format!("{sp}cursor_out"), SynDataType::Int32, &[1]);
-        let emitted = gb.add_persistent_tensor(format!("{sp}emitted"), SynDataType::Int32, &[t]);
+        let emitted = gb.add_persistent_tensor(format!("{sp}emitted"), SynDataType::Int32, &[ts[j]]);
         let fix_out = gb.add_persistent_tensor(format!("{sp}fix_out"), SynDataType::Int32, &[2]);
         gb.add_node(
             "gaudium_accept_t",
@@ -224,7 +248,7 @@ pub fn build_batched_spec_step_graph(
         draft_slots.push(dspine::StepSlot {
             samp: (format!("{sp}samp_f"), format!("{sp}samp_i")),
             pfx: sp,
-            t,
+            t: ts[j],
             cursor: cursors[j],
             tokens: tokens[j],
             a_out,
@@ -244,24 +268,40 @@ pub fn build_batched_spec_step_graph(
 #[derive(Debug, Clone)]
 pub struct SpecLaneGraph {
     pub lmax: u64,
+    /// Rows of the DeltaNet state rings and update buffers: at least `wide`.
     pub ns: u64,
-    /// Verify rows per slot.
-    pub t: u64,
+    /// Verify rows of a lane at its narrow width (every lane may step at it).
+    pub narrow: u64,
+    /// Verify rows of a lane at its wide width (`narrow` when lanes have one width).
+    pub wide: u64,
     pub dc: dspine::DSpineCfg,
     pub hashes: Vec<(String, String)>,
     pub samp_hashes: Vec<(String, String)>,
 }
 
 impl SpecLaneGraph {
-    pub fn build(&self, spec: &ModelSpec, b: u64, nch: u64, sampled: bool) -> GraphBuilder {
+    /// The step of slots of `ts` rows (widest first).
+    pub fn build(&self, spec: &ModelSpec, ts: &[u64], nch: u64, sampled: bool) -> GraphBuilder {
         let hashes = if sampled {
             &self.samp_hashes
         } else {
             &self.hashes
         };
-        build_batched_spec_step_graph(
-            spec, self.lmax, nch, self.t, self.ns, b, &self.dc, hashes, sampled,
-        )
+        build_batched_spec_step_graph(spec, self.lmax, nch, ts, self.ns, &self.dc, hashes, sampled)
+    }
+
+    /// The slot rows of every step of `b` slots: `k` wide slots, then `b - k` narrow ones.
+    pub fn slot_rows(&self, b: u64) -> Vec<Vec<u64>> {
+        if self.wide == self.narrow {
+            return vec![vec![self.narrow; b as usize]];
+        }
+        (0..=b)
+            .map(|k| {
+                let mut ts = vec![self.wide; k as usize];
+                ts.resize(b as usize, self.narrow);
+                ts
+            })
+            .collect()
     }
 }
 
@@ -309,7 +349,7 @@ mod tests {
     fn batched_spec_step_gives_each_slot_its_verify_accept_and_drafter() {
         let spec = target_27b();
         let dc = dspine::DSpineCfg::from_json(dspine::tests::CFG_27B).unwrap();
-        let g = build_batched_spec_step_graph(&spec, 16384, 1, 8, 16, 3, &dc, &[], false);
+        let g = build_batched_spec_step_graph(&spec, 16384, 1, &[8, 8, 8], 16, &dc, &[], false);
         assert_eq!(g.recipe_name(), "g_spec_ds_B3_T8_C1");
         let solo = build_spec_step_graph(&spec, 16384, 1, 8, 16, Some(&dc), &[]);
         let views = g.node_io_views();
@@ -361,7 +401,7 @@ mod tests {
         }
         assert_eq!(spec_slot_bound("s1_blk_scores"), None);
         // the output norm in calls of at most 32 rows: 8 slots of 8 rows are two calls a layer
-        let g8 = build_batched_spec_step_graph(&spec, 16384, 1, 8, 16, 8, &dc, &[], false);
+        let g8 = build_batched_spec_step_graph(&spec, 16384, 1, &[8; 8], 16, &dc, &[], false);
         assert_eq!(count(&g8.node_io_views(), "gaudium_gdn_post"), 2 * 48);
         for n in g8.node_io_views().iter().filter(|n| n.guid == "gaudium_gdn_post") {
             assert_eq!(n.inputs[0].dims[2], 32, "{}", n.name);
@@ -371,7 +411,7 @@ mod tests {
             ("GAUDIUM_ACCEPTT_ELF".into(), "00".into()),
             (super::replay::GDNR_ELF.into(), "11".into()),
         ];
-        let r = build_batched_spec_step_graph(&spec, 16384, 1, 8, 16, 3, &dc, &rp, false);
+        let r = build_batched_spec_step_graph(&spec, 16384, 1, &[8, 8, 8], 16, &dc, &rp, false);
         assert_eq!(r.recipe_name(), "g_spec_dsr_B3_T8_C1");
         let rspecs = r.persistent_tensor_specs();
         let rdims = |n: &str| rspecs.iter().find(|s| s.0 == n).map(|s| s.2.clone());
@@ -389,6 +429,34 @@ mod tests {
         let rviews = r.node_io_views();
         assert_eq!(count(&rviews, "gaudium_gdn_f32r"), 3 * 48);
         assert_eq!(count(&rviews, "gaudium_gdn_post"), 48);
+        // slots of their own widths: the trunk over every slot's rows, each slot on its own
+        let m = build_batched_spec_step_graph(&spec, 16384, 1, &[16, 8, 8], 16, &dc, &rp, false);
+        assert_eq!(m.recipe_name(), "g_spec_dsr_B3_T16x1_8x2_C1");
+        let mspecs = m.persistent_tensor_specs();
+        let mdims = |n: &str| mspecs.iter().find(|s| s.0 == n).map(|s| s.2.clone());
+        assert_eq!(mdims("L3_qg"), Some(vec![spec.qg_dim(), 32]));
+        assert_eq!(mdims("s0_ids"), Some(vec![16]));
+        assert_eq!(mdims("s1_ids"), Some(vec![8]));
+        assert_eq!(mdims("s0_emitted"), Some(vec![16]));
+        assert_eq!(mdims("s2_emitted"), Some(vec![8]));
+        assert_eq!(mdims("s0_L0_rpd_out"), Some(vec![64, 8, 48, 16]));
+        assert_eq!(mdims("s1_L0_rpd_out"), Some(vec![64, 8, 48, 8]));
+        assert_eq!(mdims("sp_depth"), Some(vec![16]));
+        // the output norm: 16 + 8 + 8 rows in one call
+        assert_eq!(count(&m.node_io_views(), "gaudium_gdn_post"), 48);
+        assert_eq!(batched_spec_name(&[16, 16, 8], 2, true, false), "g_spec_dss_B3_T16x2_8x1_C2");
+        let lg = SpecLaneGraph {
+            lmax: 16384,
+            ns: 16,
+            narrow: 8,
+            wide: 16,
+            dc: dc.clone(),
+            hashes: Vec::new(),
+            samp_hashes: Vec::new(),
+        };
+        assert_eq!(lg.slot_rows(2), vec![vec![8, 8], vec![16, 8], vec![16, 16]]);
+        let one = SpecLaneGraph { wide: 8, ns: 8, ..lg.clone() };
+        assert_eq!(one.slot_rows(3), vec![vec![8, 8, 8]]);
         // the drafter's weights are the solo step's names
         for (name, ..) in &specs {
             if dspine::is_drafter_weight(name) && !name.ends_with("df_nofix") {

@@ -1770,3 +1770,330 @@ law ln_ld_is_dspine_of_dspine:
 
 def ln_ld_is_dspine_of_dspine():
   {==}
+
+# ============================================================================
+# 7. A draft width per lane
+# ============================================================================
+#
+# A speculative lane verifies at the narrow width asked for (`ln_lane_width_pick`), or at the
+# wide one when the step's cost model expects more tokens per unit of time from it and its rows
+# fit both its context and its state rings. Every slot of a batched step has its own width.
+
+# The widest of two draft widths asked for (folded over every width asked for).
+def ln_lane_width_wide(+a: Nat, +b: Nat) -> Nat:
+  Nat.max(a, b)
+
+# The verify rows a lane's state rings and step buffers hold: the wide rows when the verify rows
+# keep no per-row state copies (`replay`: the rings hold the rows' updates, not states), else the
+# narrow rows.
+def ln_lane_ring_rows(narrow: Nat, wide: Nat, replay: Bool) -> Nat:
+  match replay:
+    case True{}:
+      wide
+    case False{}:
+      narrow
+
+# Does a lane go wide in its next step? It expects `gain` more tokens (in thousandths) from the
+# wide step; the step costs `delta` more (microseconds) and the batch expects `total` tokens in
+# `step` microseconds: wide when `gain / delta` beats the batch's `total / step`
+# (cross-multiplied, so a lane that expects nothing more never goes wide).
+# rusty-bends: total
+def ln_lane_goes_wide(gain: Nat, delta: Nat, total: Nat, step: Nat) -> Bool:
+  Nat.is_gt(Nat.mul(gain, step), Nat.mul(delta, total))
+
+# The rows of a lane's next batched step once it is known whether it goes wide (`go`) and whether
+# its wide rows fit its state rings (`in_ring`) and its context (`in_ctx`).
+def ln_step_rows_of(go: Bool, in_ring: Bool, in_ctx: Bool, narrow: Nat, wide: Nat) -> Nat:
+  match go:
+    case False{}:
+      narrow
+    case True{}:
+      match in_ring:
+        case False{}:
+          narrow
+        case True{}:
+          match in_ctx:
+            case False{}:
+              narrow
+            case True{}:
+              wide
+
+# The rows a speculative lane verifies in its next batched step: the wide rows when it goes wide
+# (`go`) and they fit its `ring` slots and its context (`cursor + wide <= max_ctx`), else the
+# narrow rows.
+def ln_lane_step_rows(go: Bool, narrow: Nat, +wide: Nat, ring: Nat, cursor: Nat, max_ctx: Nat) -> Nat:
+  ln_step_rows_of(go, Nat.is_le(wide, ring), Nat.is_le(Nat.add(cursor, wide), max_ctx), narrow, wide)
+
+def ln_max_is_input(+a: Nat, +b: Nat) -> {Bool.or(Nat.is_eq(Nat.max(a, b), a), Nat.is_eq(Nat.max(a, b), b)) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      %ln_eq_refl_true(b) : {Bool.or(Nat.is_eq(b, 0n), _) == True{} : Bool}
+      ln_or_true_r(Nat.is_eq(b, 0n))
+    case 1n+ap 0n:
+      %ln_eq_refl_true(ap) : {Bool.or(_, Nat.is_eq(1n+ap, 0n)) == True{} : Bool}
+      {==}
+    case 1n+ap 1n+bp:
+      ln_max_is_input(ap, bp)
+
+def ln_gt_or_le(+a: Nat, +b: Nat) -> {Bool.or(Nat.is_gt(a, b), Nat.is_le(a, b)) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      {==}
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      ln_gt_or_le(ap, bp)
+
+# promise: the widest draft width a lane may verify at is one that was asked for.
+law ln_lane_width_wide_is_asked:
+  for +a: Nat
+  for +b: Nat
+  {Bool.or(Nat.is_eq(ln_lane_width_wide(a, b), a), Nat.is_eq(ln_lane_width_wide(a, b), b)) == True{} : Bool}
+
+def ln_lane_width_wide_is_asked(a, b):
+  ln_max_is_input(a, b)
+
+# promise: a lane's state rings hold the rows of one of the widths it may verify at.
+law ln_lane_ring_rows_is_asked:
+  for +n: Nat
+  for +w: Nat
+  for +r: Bool
+  {Bool.or(Nat.is_eq(ln_lane_ring_rows(n, w, r), n), Nat.is_eq(ln_lane_ring_rows(n, w, r), w)) == True{} : Bool}
+
+def ln_lane_ring_rows_is_asked(n, w, r):
+  match r:
+    case True{}:
+      %ln_eq_refl_true(w) : {Bool.or(Nat.is_eq(w, n), _) == True{} : Bool}
+      ln_or_true_r(Nat.is_eq(w, n))
+    case False{}:
+      %ln_eq_refl_true(n) : {Bool.or(_, Nat.is_eq(n, w)) == True{} : Bool}
+      {==}
+
+# promise: a lane that expects no more tokens from the wide step never goes wide.
+law ln_goes_wide_needs_gain:
+  for +d: Nat
+  for +t: Nat
+  for +s: Nat
+  {ln_lane_goes_wide(0n, d, t, s) == False{} : Bool}
+
+def ln_zero_never_gt(+x: Nat) -> {Nat.is_gt(0n, x) == False{} : Bool}:
+  match x:
+    case 0n:
+      {==}
+    case 1n+p:
+      {==}
+
+def ln_goes_wide_needs_gain(d, t, s):
+  ln_zero_never_gt(Nat.mul(d, t))
+
+def ln_rows_asked_aux(g: Bool, b: Bool, x: Bool, +n: Nat, +w: Nat) -> {Bool.or(Nat.is_eq(ln_step_rows_of(g, b, x, n, w), n), Nat.is_eq(ln_step_rows_of(g, b, x, n, w), w)) == True{} : Bool}:
+  match g b x:
+    case False{} _ _:
+      %ln_eq_refl_true(n) : {Bool.or(_, Nat.is_eq(n, w)) == True{} : Bool}
+      {==}
+    case True{} False{} _:
+      %ln_eq_refl_true(n) : {Bool.or(_, Nat.is_eq(n, w)) == True{} : Bool}
+      {==}
+    case True{} True{} False{}:
+      %ln_eq_refl_true(n) : {Bool.or(_, Nat.is_eq(n, w)) == True{} : Bool}
+      {==}
+    case True{} True{} True{}:
+      %ln_eq_refl_true(w) : {Bool.or(Nat.is_eq(w, n), _) == True{} : Bool}
+      ln_or_true_r(Nat.is_eq(w, n))
+
+# promise: a lane verifies at the narrow or at the wide width asked for, never at another.
+law ln_step_rows_is_asked:
+  for +g: Bool
+  for +n: Nat
+  for +w: Nat
+  for +r: Nat
+  for +c: Nat
+  for +m: Nat
+  {Bool.or(Nat.is_eq(ln_lane_step_rows(g, n, w, r, c, m), n), Nat.is_eq(ln_lane_step_rows(g, n, w, r, c, m), w)) == True{} : Bool}
+
+def ln_step_rows_is_asked(g, n, w, r, c, m):
+  ln_rows_asked_aux(g, Nat.is_le(w, r), Nat.is_le(Nat.add(c, w), m), n, w)
+
+def ln_rows_ring_aux(g: Bool, +n: Nat, +w: Nat, +r: Nat, b: Bool, x: Bool, e: {b == Nat.is_le(w, r) : Bool}) -> {Bool.or(Nat.is_gt(n, r), Nat.is_le(ln_step_rows_of(g, b, x, n, w), r)) == True{} : Bool}:
+  match g:
+    case False{}:
+      ln_gt_or_le(n, r)
+    case True{}:
+      match b:
+        case False{}:
+          ln_gt_or_le(n, r)
+        case True{}:
+          match x:
+            case False{}:
+              ln_gt_or_le(n, r)
+            case True{}:
+              %e : {Bool.or(Nat.is_gt(n, r), _) == True{} : Bool}
+              ln_or_true_r(Nat.is_gt(n, r))
+
+# promise: a lane never verifies more rows in a batched step than its state rings hold, whenever its narrow rows fit them.
+law ln_step_rows_in_ring:
+  for +g: Bool
+  for +n: Nat
+  for +w: Nat
+  for +r: Nat
+  for +c: Nat
+  for +m: Nat
+  {Bool.or(Nat.is_gt(n, r), Nat.is_le(ln_lane_step_rows(g, n, w, r, c, m), r)) == True{} : Bool}
+
+def ln_step_rows_in_ring(g, n, w, r, c, m):
+  ln_rows_ring_aux(g, n, w, r, Nat.is_le(w, r), Nat.is_le(Nat.add(c, w), m), {==})
+
+def ln_rows_ctx_aux(g: Bool, +n: Nat, +w: Nat, +c: Nat, +m: Nat, b: Bool, x: Bool, e: {x == Nat.is_le(Nat.add(c, w), m) : Bool}) -> {Bool.or(Nat.is_gt(Nat.add(c, n), m), Nat.is_le(Nat.add(c, ln_step_rows_of(g, b, x, n, w)), m)) == True{} : Bool}:
+  match g:
+    case False{}:
+      ln_gt_or_le(Nat.add(c, n), m)
+    case True{}:
+      match b:
+        case False{}:
+          ln_gt_or_le(Nat.add(c, n), m)
+        case True{}:
+          match x:
+            case False{}:
+              ln_gt_or_le(Nat.add(c, n), m)
+            case True{}:
+              %e : {Bool.or(Nat.is_gt(Nat.add(c, n), m), _) == True{} : Bool}
+              ln_or_true_r(Nat.is_gt(Nat.add(c, n), m))
+
+# promise: a lane never verifies rows past the end of its context in a batched step, whenever its narrow rows fit it.
+law ln_step_rows_in_ctx:
+  for +g: Bool
+  for +n: Nat
+  for +w: Nat
+  for +r: Nat
+  for +c: Nat
+  for +m: Nat
+  {Bool.or(Nat.is_gt(Nat.add(c, n), m), Nat.is_le(Nat.add(c, ln_lane_step_rows(g, n, w, r, c, m)), m)) == True{} : Bool}
+
+def ln_step_rows_in_ctx(g, n, w, r, c, m):
+  ln_rows_ctx_aux(g, n, w, c, m, Nat.is_le(w, r), Nat.is_le(Nat.add(c, w), m), {==})
+
+# promise: a lane not chosen to go wide verifies at the narrow width.
+law ln_step_rows_unchosen_narrow:
+  for +n: Nat
+  for +w: Nat
+  for +r: Nat
+  for +c: Nat
+  for +m: Nat
+  {ln_lane_step_rows(False{}, n, w, r, c, m) == n : Nat}
+
+def ln_step_rows_unchosen_narrow(n, w, r, c, m):
+  {==}
+
+def ln_wide_held_of(fits: Bool, narrow: Nat, wide: Nat) -> Nat:
+  match fits:
+    case True{}:
+      wide
+    case False{}:
+      narrow
+
+# The widest draft width a lane may verify at, of the narrow and wide widths asked, when its state
+# rings hold `ring` rows: the wide width when its rows (`wide + 1`) fit them, else the narrow one.
+def ln_lane_wide_held(narrow: Nat, +wide: Nat, ring: Nat) -> Nat:
+  ln_wide_held_of(Nat.is_le(Nat.add(wide, 1n), ring), narrow, wide)
+
+def ln_held_ring_aux(+n: Nat, +w: Nat, +r: Nat, b: Bool, e: {b == Nat.is_le(Nat.add(w, 1n), r) : Bool}) -> {Bool.or(Nat.is_gt(Nat.add(n, 1n), r), Nat.is_le(Nat.add(ln_wide_held_of(b, n, w), 1n), r)) == True{} : Bool}:
+  match b:
+    case True{}:
+      %e : {Bool.or(Nat.is_gt(Nat.add(n, 1n), r), _) == True{} : Bool}
+      ln_or_true_r(Nat.is_gt(Nat.add(n, 1n), r))
+    case False{}:
+      ln_gt_or_le(Nat.add(n, 1n), r)
+
+# promise: a lane is never given a draft width whose verify rows its state rings cannot hold, whenever they hold the narrow width's.
+law ln_wide_held_in_ring:
+  for +n: Nat
+  for +w: Nat
+  for +r: Nat
+  {Bool.or(Nat.is_gt(Nat.add(n, 1n), r), Nat.is_le(Nat.add(ln_lane_wide_held(n, w, r), 1n), r)) == True{} : Bool}
+
+def ln_wide_held_in_ring(n, w, r):
+  ln_held_ring_aux(n, w, r, Nat.is_le(Nat.add(w, 1n), r), {==})
+
+def ln_held_asked_aux(b: Bool, +n: Nat, +w: Nat) -> {Bool.or(Nat.is_eq(ln_wide_held_of(b, n, w), n), Nat.is_eq(ln_wide_held_of(b, n, w), w)) == True{} : Bool}:
+  match b:
+    case True{}:
+      %ln_eq_refl_true(w) : {Bool.or(Nat.is_eq(w, n), _) == True{} : Bool}
+      ln_or_true_r(Nat.is_eq(w, n))
+    case False{}:
+      %ln_eq_refl_true(n) : {Bool.or(_, Nat.is_eq(n, w)) == True{} : Bool}
+      {==}
+
+# promise: the widest width a lane is given is one of the widths asked for.
+law ln_wide_held_is_asked:
+  for +n: Nat
+  for +w: Nat
+  for +r: Nat
+  {Bool.or(Nat.is_eq(ln_lane_wide_held(n, w, r), n), Nat.is_eq(ln_lane_wide_held(n, w, r), w)) == True{} : Bool}
+
+def ln_wide_held_is_asked(n, w, r):
+  ln_held_asked_aux(Nat.is_le(Nat.add(w, 1n), r), n, w)
+
+# ============================================================================
+# 8. A lane step queued ahead
+# ============================================================================
+#
+# A speculative step's inputs (ids, cursor, accepted row) are written by the step before it on
+# the card, so the next step can be queued while one runs. It covers the same lanes, at most the
+# rows the step in flight can add further on.
+
+# May the next step of a group of speculative lanes be queued ahead of the step in flight? Only
+# while no request waits for a lane (`waiting`), when the group is every decoding lane and its
+# lanes are the step in flight's (`same`), and when every lane's next rows fit its context at the
+# furthest cursor the step in flight can leave it at (`fits`).
+def ln_queue_ahead(waiting: Bool, same: Bool, fits: Bool) -> Bool:
+  Bool.and(Bool.not(waiting), Bool.and(same, fits))
+
+# Does the step queued ahead land before the lanes are released (rather than run on)? When the
+# request of one of its lanes ended in the step before it (`ended`).
+def ln_ahead_lands(ended: Bool) -> Bool:
+  match ended:
+    case True{}:
+      True{}
+    case False{}:
+      False{}
+
+# promise: no step is queued ahead while a request waits for a lane.
+law ln_queue_ahead_not_waiting:
+  for +s: Bool
+  for +f: Bool
+  {ln_queue_ahead(True{}, s, f) == False{} : Bool}
+
+def ln_queue_ahead_not_waiting(s, f):
+  {==}
+
+# promise: no step is queued ahead for lanes whose next rows might not fit their context.
+law ln_queue_ahead_fits:
+  for +w: Bool
+  for +s: Bool
+  {ln_queue_ahead(w, s, False{}) == False{} : Bool}
+
+def ln_queue_ahead_fits(w, s):
+  match w s:
+    case True{} _: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a step queued ahead for a group that changed is never kept.
+law ln_queue_ahead_same:
+  for +w: Bool
+  for +f: Bool
+  {ln_queue_ahead(w, False{}, f) == False{} : Bool}
+
+def ln_queue_ahead_same(w, f):
+  match w:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a lane whose request ended is never released while a step queued ahead still covers it.
+law ln_ahead_lands_when_ended:
+  {ln_ahead_lands(True{}) == True{} : Bool}
+
+def ln_ahead_lands_when_ended():
+  {==}

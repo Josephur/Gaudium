@@ -16,7 +16,8 @@ seed per prompt): a seeded sampled stream must equal its reference as exactly as
 
 Options add prompts: `--long 6000,10000` long prompts of about that many words (their streams
 cover several KV chunks), `--image` one prompt with a generated PNG (an image request runs alone
-on a lane server). `--turns` checks routing after the concurrent runs: every long prompt's next
+on a lane server), `--suite <suite.json>` the image cases of a vision suite file (its images and
+prompts; an answer without the case's expected words fails the check). `--turns` checks routing after the concurrent runs: every long prompt's next
 turn (its reply and one more user message) must take over rows of the lane that held it.
 
 Only the Python standard library is used. Results go to stdout and, with `--out`, to a JSON file.
@@ -74,10 +75,45 @@ def png_data_url(w=96, h=96):
 
 
 IMAGE_MARK = "<image>"
+# image prompts of a vision suite file (`--suite`): prompt -> (data URLs, expected word groups)
+SUITE_IMAGES = {}
+
+
+def file_data_url(path):
+    mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+    with open(path, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
+
+
+def load_suite(path):
+    """The image cases of a vision suite file, as prompts of their own (their images and the
+    words their answers must contain)."""
+    import os
+    with open(path) as f:
+        suite = json.load(f)
+    base = os.path.dirname(os.path.abspath(path))
+    out = []
+    for case in suite.get("cases", []):
+        urls = [file_data_url(os.path.join(base, im)) for im in case["images"]]
+        prompt = IMAGE_MARK + f"[{case['name']}] " + case["prompt"]
+        SUITE_IMAGES[prompt] = (urls, case.get("expect", []))
+        out.append(prompt)
+    return out
+
+
+def expect_ok(prompt, content):
+    """Does an answer to a suite image prompt contain one word of every expected group?"""
+    _, groups = SUITE_IMAGES.get(prompt, (None, []))
+    low = content.lower()
+    return all(any(w.lower() in low for w in g) for g in groups)
 
 
 def chat(base, model, prompt, mode, seed, max_tokens, api_key, timeout, history=None):
-    if prompt.startswith(IMAGE_MARK):
+    if prompt in SUITE_IMAGES:
+        urls, _ = SUITE_IMAGES[prompt]
+        text = prompt[len(IMAGE_MARK):].split("] ", 1)[1]
+        content = [{"type": "image_url", "image_url": {"url": u}} for u in urls] + [{"type": "text", "text": text}]
+    elif prompt.startswith(IMAGE_MARK):
         content = [{"type": "image_url", "image_url": {"url": png_data_url()}},
                    {"type": "text", "text": prompt[len(IMAGE_MARK):]}]
     else:
@@ -89,6 +125,9 @@ def chat(base, model, prompt, mode, seed, max_tokens, api_key, timeout, history=
         "stream": False,
         "gaudium_return_tokens": True,
     }
+    if prompt in SUITE_IMAGES:
+        # as the vision suite asks them: a short answer, no thinking
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     if mode == "greedy":
         body["temperature"] = 0.0
     else:
@@ -150,6 +189,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--long", default="", help="extra long prompts of about these many words")
     ap.add_argument("--image", action="store_true", help="one extra prompt with an image")
+    ap.add_argument("--suite", default="", help="a vision suite file: its image cases as extra prompts, each answer checked for its expected words")
     ap.add_argument("--turns", action="store_true", help="next turns of the long prompts must reuse rows")
     ap.add_argument("--serial", action="store_true", help="with --check: every prompt alone, one after another")
     a = ap.parse_args()
@@ -163,6 +203,10 @@ def main():
     if a.image:
         PROMPTS.insert(n, IMAGE_MARK + "Describe the colours of this image in one sentence.")
         n += 1
+    if a.suite:
+        for p in load_suite(a.suite):
+            PROMPTS.insert(n, p)
+            n += 1
     out = {"base": a.base, "model": a.model, "max_tokens": a.max_tokens, "modes": modes}
 
     if a.write_ref:
@@ -171,8 +215,11 @@ def main():
             for m in modes:
                 r = chat(a.base, a.model, PROMPTS[i], m, a.seed + i, a.max_tokens, a.api_key, a.timeout)
                 ref[key(i, m)] = r
+                sem = ""
+                if PROMPTS[i] in SUITE_IMAGES:
+                    sem = ", expected words " + ("found" if expect_ok(PROMPTS[i], r["content"]) else "MISSING")
                 print(f"ref prompt {i:2d} {m:7s}: {r['n']:4d} tokens, decode {r['n'] / max(r['decode_ms'], 1e-9) * 1e3:7.1f} tok/s, "
-                      f"prefill {r['prefill_ms']:7.1f} ms ({r['method']})", flush=True)
+                      f"prefill {r['prefill_ms']:7.1f} ms ({r['method']}){sem}", flush=True)
         with open(a.write_ref, "w") as f:
             json.dump(ref, f)
         out["ref"] = ref
@@ -214,6 +261,9 @@ def main():
                         continue
                     want = ref[key(idx[j], m)]["tokens"]
                     d = first_diff(res[j]["tokens"], want)
+                    if PROMPTS[idx[j]] in SUITE_IMAGES and not expect_ok(PROMPTS[idx[j]], res[j]["content"]):
+                        diffs.append({"slot": j, "prompt": idx[j], "expected_words": "missing"})
+                        d = d if d is not None else -1
                     if d is None:
                         same += 1
                     else:

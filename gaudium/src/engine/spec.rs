@@ -227,6 +227,23 @@ impl WidthPolicy {
         choose_shape(&stats, &cands, &self.cost, None, &keys).map_or(0, |c| cands[c].spine() as u64)
     }
 
+    /// [lanes] Expected tokens of a step that verifies `k` drafts (its accepted drafts and the
+    /// bonus token), by the acceptance seen so far; estimates of positions untested for longer
+    /// than [`WidthPolicy::MAX_AGE`] steps count as untested, as in [`Self::choose`]. 0 for a
+    /// width this policy does not have.
+    pub fn expected_tokens(&self, k: u64) -> f64 {
+        let Some(i) = self.shapes.iter().position(|s| s.spine() as u64 == k) else {
+            return 0.0;
+        };
+        let mut stats = self.stats.clone();
+        for (j, &age) in self.age.iter().enumerate().skip(2) {
+            if age > Self::MAX_AGE && j < stats.cn.len() {
+                stats.cn[j] = 0;
+            }
+        }
+        stats.expected_tokens(&self.shapes[i])
+    }
+
     /// A step verified `k` drafts, the first `accepted` of them were right, and it took `ms`.
     pub fn observe(&mut self, k: u64, accepted: usize, ms: f64) {
         if let Some(i) = self.shapes.iter().position(|s| s.spine() as u64 == k) {
@@ -918,10 +935,19 @@ pub struct SpecLane {
 }
 
 impl SpecRuntime {
-    /// [lanes] Rows of a batched step: the narrowest verify width (the one the lanes step at).
-    pub fn lane_rows(&self) -> u64 {
+    /// [lanes] Verify rows of a lane at its narrow and its wide width: the narrowest and the
+    /// widest of this runtime's widths (a lanes load gives it the wide one only when the lanes'
+    /// rings hold its rows).
+    pub fn lane_rows(&self) -> (u64, u64) {
         // (the single-row width is every runtime's fallback, not a width asked for)
-        crate::core::lanes::lane_width(self.widths.iter().copied().filter(|&t| t > 1)).unwrap_or(1)
+        let asked = || self.widths.iter().copied().filter(|&t| t > 1);
+        let narrow = crate::core::lanes::lane_width(asked()).unwrap_or(1);
+        (narrow, crate::core::lanes::lane_width_wide(asked()).unwrap_or(narrow))
+    }
+
+    /// Is this runtime's DeltaNet verify form the replay form (no per-row state copies)?
+    pub fn replay_form(&self) -> bool {
+        self.gdn_replay
     }
 
     /// [lanes] The buffers a lane owns, `(name, bytes)`: the step buffers of both parities, the
@@ -1030,7 +1056,8 @@ impl SpecRuntime {
         lanes::SpecLaneGraph {
             lmax: self.lmax,
             ns: self.ns,
-            t: self.lane_rows(),
+            narrow: self.lane_rows().0,
+            wide: self.lane_rows().1,
             dc: self
                 .drafter
                 .as_ref()

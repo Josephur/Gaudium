@@ -1585,14 +1585,23 @@ impl Qwen3Engine {
         }
         let mut specdec = match &cfg.spec {
             Some(sc) => Some(spec::SpecRuntime::prepare(
-                // [lanes] lanes step at one width, the narrowest asked for (its rings are sized
-                // for it): every lane verifies the same rows in a launch
+                // [lanes] a lane verifies at the narrowest width asked, or at the widest when its
+                // rings hold the widest rows (the verified ring rule: the replay form keeps the
+                // rows' updates there, the checkpoint form a state per row)
                 &if n_lanes > 1 {
-                    let mut one = sc.clone();
-                    one.draft_k = vec![
-                        crate::core::lanes::lane_width(sc.draft_k.iter().copied()).unwrap_or(1),
-                    ];
-                    one
+                    let mut lw = sc.clone();
+                    let narrow =
+                        crate::core::lanes::lane_width(sc.draft_k.iter().copied()).unwrap_or(1);
+                    let wide =
+                        crate::core::lanes::lane_width_wide(sc.draft_k.iter().copied()).unwrap_or(narrow);
+                    let replay =
+                        cfg.step.gdn_verify == crate::engine::step_opts::GdnVerify::Replay;
+                    let ring = crate::core::lanes::lane_ring_rows(narrow + 1, wide + 1, replay);
+                    // the narrow width and the widest one the rings hold (the same one when they
+                    // hold the narrow rows only)
+                    lw.draft_k = vec![narrow, crate::core::lanes::lane_wide_held(narrow, wide, ring)];
+                    lw.draft_k.dedup();
+                    lw
                 } else {
                     sc.clone()
                 },

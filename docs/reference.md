@@ -127,9 +127,11 @@ Serve options:
                         Qwen3.5 / Qwen3.8 models without a drafter or with a DSpine
                         drafter whose verify rows are checkpointed or replayed
                         (--gdn-verify checkpoint, the default, or replay, which keeps
-                        no per-row state copies: about 1.7 GiB less per lane on the
-                        27B); every lane verifies and drafts at the narrowest
-                        --draft-k width. Other models are
+                        no per-row state copies: about 2 GiB less per lane on the
+                        27B). With replay each lane verifies at a width of its own,
+                        the narrowest or the widest --draft-k, chosen every step from
+                        its own acceptance and the measured step times; with
+                        checkpoint every lane steps at the narrowest. Other models are
                         served with one lane (the log says why). /props total_slots
                         and /slots show the lanes. Not with --cache-ram yet (the
                         host-RAM tier is off for a model served with lanes)
@@ -445,7 +447,8 @@ Generate options:
                         default 7; mtp: at most 15, default 4; assistant: default 4);
                         several values let the engine pick a width per step from
                         acceptance (mtp: every step then drafts the widest listed block;
-                        a model served with --parallel lanes steps at the narrowest)
+                        --parallel lanes: each lane at the narrowest or the widest
+                        listed with --gdn-verify replay, else at the narrowest)
   --sweep-draft-k       Measurement: with several --draft-k widths, run every request once
                         per listed width as a fixed-width run, then once with the width
                         policy (one engine load for a whole width sweep)

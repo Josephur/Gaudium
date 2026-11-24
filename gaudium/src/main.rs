@@ -154,9 +154,11 @@ fn print_usage() {
          \x20                       Qwen3.5 / Qwen3.8 models without a drafter or with a DSpine\n\
          \x20                       drafter whose verify rows are checkpointed or replayed\n\
          \x20                       (--gdn-verify checkpoint, the default, or replay, which keeps\n\
-         \x20                       no per-row state copies: about 1.7 GiB less per lane on the\n\
-         \x20                       27B); every lane verifies and drafts at the narrowest\n\
-         \x20                       --draft-k width. Other models are\n\
+         \x20                       no per-row state copies: about 2 GiB less per lane on the\n\
+         \x20                       27B). With replay each lane verifies at a width of its own,\n\
+         \x20                       the narrowest or the widest --draft-k, chosen every step from\n\
+         \x20                       its own acceptance and the measured step times; with\n\
+         \x20                       checkpoint every lane steps at the narrowest. Other models are\n\
          \x20                       served with one lane (the log says why). /props total_slots\n\
          \x20                       and /slots show the lanes. Not with --cache-ram yet (the\n\
          \x20                       host-RAM tier is off for a model served with lanes)\n\
@@ -472,7 +474,8 @@ fn print_usage() {
          \x20                       default 7; mtp: at most 15, default 4; assistant: default 4);\n\
          \x20                       several values let the engine pick a width per step from\n\
          \x20                       acceptance (mtp: every step then drafts the widest listed block;\n\
-         \x20                       a model served with --parallel lanes steps at the narrowest)\n\
+         \x20                       --parallel lanes: each lane at the narrowest or the widest\n\
+         \x20                       listed with --gdn-verify replay, else at the narrowest)\n\
          \x20 --sweep-draft-k       Measurement: with several --draft-k widths, run every request once\n\
          \x20                       per listed width as a fixed-width run, then once with the width\n\
          \x20                       policy (one engine load for a whole width sweep)\n\

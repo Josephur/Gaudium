@@ -334,6 +334,52 @@ pub fn lane_width(widths: impl IntoIterator<Item = u64>) -> Option<u64> {
         .reduce(crate::verified::ln_lane_width_pick)
 }
 
+/// The widest draft width a lane may step at, of the widths asked for (`None`: none was).
+pub fn lane_width_wide(widths: impl IntoIterator<Item = u64>) -> Option<u64> {
+    widths
+        .into_iter()
+        .reduce(crate::verified::ln_lane_width_wide)
+}
+
+/// The verify rows a lane's state rings and step buffers hold, of its narrow and wide rows
+/// (`replay`: the replay form of the DeltaNet verify rows).
+pub fn lane_ring_rows(narrow: u64, wide: u64, replay: bool) -> u64 {
+    crate::verified::ln_lane_ring_rows(narrow, wide, replay)
+}
+
+/// Does a lane go wide in its next step? `gain`: its expected extra tokens from the wide step,
+/// in thousandths; `delta`: the step's extra time with it wide, in microseconds; `total` /
+/// `step`: the batch's expected tokens (thousandths) and its time (microseconds). Values too large
+/// for the arithmetic keep the lane narrow.
+pub fn lane_goes_wide(gain: u64, delta: u64, total: u64, step: u64) -> bool {
+    crate::verified::ln_lane_goes_wide(gain, delta, total, step).unwrap_or(false)
+}
+
+/// The widest draft width a lane is given, of the `narrow` and `wide` widths asked, when its
+/// state rings hold `ring` rows.
+pub fn lane_wide_held(narrow: u64, wide: u64, ring: u64) -> u64 {
+    crate::verified::ln_lane_wide_held(narrow, wide, ring)
+}
+
+/// May the next step of a group of speculative lanes be queued ahead of the one in flight?
+/// (`waiting`: a request waits for a lane; `same`: the group is every decoding lane and the step
+/// in flight's; `fits`: every lane's next rows fit its context from the furthest cursor.)
+pub fn queue_ahead(waiting: bool, same: bool, fits: bool) -> bool {
+    crate::verified::ln_queue_ahead(waiting, same, fits)
+}
+
+/// Does the step queued ahead land before the lanes are released? (`ended`: a request of one of
+/// its lanes ended in the step before it.)
+pub fn ahead_lands(ended: bool) -> bool {
+    crate::verified::ln_ahead_lands(ended)
+}
+
+/// The rows a speculative lane verifies in its next batched step (`go`: it goes wide) of its
+/// `narrow` and `wide` rows, its rings of `ring` rows, at `cursor` in a context of `max_ctx`.
+pub fn lane_step_rows(go: bool, narrow: u64, wide: u64, ring: u64, cursor: u64, max_ctx: u64) -> u64 {
+    crate::verified::ln_lane_step_rows(go, narrow, wide, ring, cursor, max_ctx)
+}
+
 /// Does a speculative lane at `cursor` take the batched step of `rows` rows in a context of
 /// `max_ctx` rows (or single-row steps to the end of its request)?
 pub fn spec_batched(cursor: u64, rows: u64, max_ctx: u64) -> bool {
@@ -544,9 +590,34 @@ mod tests {
 
     #[test]
     fn lanes_step_at_the_narrowest_width_asked_for() {
+        assert_eq!(lane_wide_held(7, 15, 16), 15);
+        assert_eq!(lane_wide_held(7, 15, 8), 7);
+        assert!(queue_ahead(false, true, true));
+        assert!(!queue_ahead(true, true, true));
+        assert!(ahead_lands(true) && !ahead_lands(false));
+        assert_eq!(lane_width_wide([7, 15]), Some(15));
+        assert_eq!(lane_width_wide([7]), Some(7));
+        assert_eq!(lane_ring_rows(8, 16, true), 16);
+        assert_eq!(lane_ring_rows(8, 16, false), 8);
         assert_eq!(lane_width([15, 7]), Some(7));
         assert_eq!(lane_width([7]), Some(7));
         assert_eq!(lane_width([]), None);
+    }
+
+    #[test]
+    fn a_lane_goes_wide_when_its_gain_beats_the_batch_rate_and_its_rows_fit() {
+        // today's rule: gain / delta against the batch's tokens per time
+        assert!(lane_goes_wide(2000, 1500, 30_000, 40_000)); // 1.33 / ms > 0.75 / ms
+        assert!(!lane_goes_wide(500, 1500, 30_000, 40_000));
+        assert!(!lane_goes_wide(0, 0, 30_000, 40_000));
+        assert!(lane_goes_wide(1, 0, 30_000, 40_000)); // a wide step that costs nothing more
+        assert!(!lane_goes_wide(u64::MAX, 2, 1, u64::MAX)); // overflow keeps it narrow
+        // the rows: wide only when chosen, inside the rings and the context
+        assert_eq!(lane_step_rows(true, 8, 16, 16, 100, 32768), 16);
+        assert_eq!(lane_step_rows(false, 8, 16, 16, 100, 32768), 8);
+        assert_eq!(lane_step_rows(true, 8, 16, 8, 100, 32768), 8);
+        assert_eq!(lane_step_rows(true, 8, 16, 16, 32760, 32768), 8);
+        assert_eq!(lane_step_rows(true, 8, 16, 16, 32752, 32768), 16);
     }
 
     #[test]
