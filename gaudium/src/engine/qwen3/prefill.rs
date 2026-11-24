@@ -52,6 +52,11 @@ pub const GDN_CHUNK: u64 = 64;
 pub const TILE_MAX: u64 = 512;
 /// Tile widths tried in order when the width is not fixed: the widest whose scratch fits.
 const TILE_CANDIDATES: [u64; 2] = [512, 256];
+/// [kv8] Widest prefill tile an FP8 K/V cache takes (`kv_tile_rows`), measured on the card
+/// (SynapseAI 1.24, issue #63): the 512-row FP8 attention tile gives NaN rows once it reads more
+/// than one cache chunk (any softmax build, with or without chunk groups); 256-row tiles are
+/// correct at every chunk count.
+pub const KV8_TILE_MAX: u64 = 256;
 /// `CAST_ROUND_HALF_NE` of `ns_ConvertToFp8::Params::round_mode`.
 const CAST_ROUND_HALF_NE: u32 = 0;
 
@@ -240,8 +245,15 @@ impl TileForm {
         } else {
             0
         };
-        let s16 = if fastexp && dense_hybrid {
+        let s16_asked = if fastexp && dense_hybrid {
             o.s16.unwrap_or(s16_default)
+        } else {
+            0
+        };
+        // [kv8] the half-width core (BF16 scores, its own V relayout of the BF16 cache) reads
+        // BF16 caches only (`kv_half_core_taken`)
+        let s16 = if crate::verified::kv_half_core_taken(s16_asked > 0, super::kv8::trunk_dtype(spec)) {
+            s16_asked
         } else {
             0
         };
@@ -276,6 +288,9 @@ impl TileForm {
                 ]),
             }
         }
+        if self.fastexp && crate::verified::kv_is_fp8(crate::engine::qwen3::kv8::trunk_dtype(&spec)) {
+            v.extend_from_slice(super::kv8::KV8_PREFILL_ELFS); // [kv8]
+        }
         if self.fastexp {
             v.push("GAUDIUM_ASOFTCX_ELF");
             v.push(if spec.head_dim == 128 {
@@ -298,12 +313,21 @@ impl TileForm {
     /// Tile widths tried when the width is not fixed, widest first. The 512-row tile was
     /// measured with the tile forms only, so a model on the serial DeltaNet kernels or the
     /// plain softmax keeps the 256-row tile those recipes were validated at.
-    pub fn tile_candidates(&self, spec: &ModelSpec) -> &'static [u64] {
-        if self.fastexp && (self.mme || spec.n_linear_layers() == 0) {
+    pub fn tile_candidates(&self, spec: &ModelSpec) -> Vec<u64> {
+        let form: &[u64] = if self.fastexp && (self.mme || spec.n_linear_layers() == 0) {
             &TILE_CANDIDATES
         } else {
             &TILE_CANDIDATES[1..]
-        }
+        };
+        // [kv8] each width as the trunk's cache takes it (`kv_tile_rows`: an FP8 cache at most
+        // KV8_TILE_MAX rows)
+        let d = super::kv8::trunk_dtype(spec);
+        let mut v: Vec<u64> = form
+            .iter()
+            .map(|&w| crate::verified::kv_tile_rows(w, d, KV8_TILE_MAX))
+            .collect();
+        v.dedup();
+        v
     }
 
     fn label(&self) -> String {
@@ -481,27 +505,25 @@ fn append_attn_first_tile(
 
     let qn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}qn_w"), SynDataType::Float, &[dh]);
     let kn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}kn_w"), SynDataType::Float, &[dh]);
-    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), SynDataType::Bf16, &[dh, r, b]);
-    let kcache = gb.add_persistent_tensor(
-        format!("{lpfx}kcache"),
-        SynDataType::Bf16,
-        &[dh, KV_CHUNK, b],
-    );
-    let vcache = gb.add_persistent_tensor(
-        format!("{lpfx}vcache"),
-        SynDataType::Bf16,
-        &[dh, KV_CHUNK, b],
-    );
+    // [kv8] the cache dtype of this layer (q block, caches and P) and its scale table
+    let kv = super::kv8::AttnKv::of(gb, spec, lpfx);
+    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), kv.dt, &[dh, r, b]);
+    let kcache =
+        gb.add_persistent_tensor(format!("{lpfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
+    let vcache =
+        gb.add_persistent_tensor(format!("{lpfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
     gb.add_node(
         g_aprep,
         format!("{lpfx}attn_prep"),
-        &[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor],
+        &kv.inputs(&[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor]),
         &[qb, kcache, vcache],
         &u32_params(&[0u32]),
     );
 
     let ao = gb.add_persistent_tensor(format!("{lpfx}ao"), SynDataType::Float, &[dh, r, nkv]);
-    let s16 = form.s16 > 0;
+    // the half-width core reads BF16 caches: an FP8 layer never takes it, whatever the form
+    // (`kv_half_core_taken`)
+    let s16 = crate::verified::kv_half_core_taken(form.s16 > 0, super::kv8::cache_dtype(spec, lpfx));
     let gsz = chunk_groups(nch, form.groups);
     if gsz.len() == 1 && !s16 {
         // one group: the plain node chain with the tile builds of the softmax and the combine
@@ -511,13 +533,13 @@ fn append_attn_first_tile(
             &[KV_CHUNK, r, b],
         );
         gb.op_batch_gemm(format!("{lpfx}qk"), qb, kcache, scores, false, true);
-        let pm = gb.add_persistent_tensor(format!("{lpfx}P"), SynDataType::Bf16, &[KV_CHUNK, r, b]);
+        let pm = gb.add_persistent_tensor(format!("{lpfx}P"), kv.dt, &[KV_CHUNK, r, b]);
         let stats =
             gb.add_persistent_tensor(format!("{lpfx}stats"), SynDataType::Float, &[64, 2, r, b]);
         gb.add_node(
             "gaudium_attn_softmax_chunk",
             format!("{lpfx}softmax"),
-            &[scores, cursor],
+            &kv.inputs(&[scores, cursor]),
             &[pm, stats],
             &u32_params(&[t as u32, nch as u32, 0, 0, 1]),
         );
@@ -535,7 +557,7 @@ fn append_attn_first_tile(
         // half-width core: queries in the score unit of the 128-lane softmax, V chunks in the
         // key order of its P. Kept persistent (scratch) so no recipe's workspace grows with the
         // context.
-        let p8 = form.s16 >= 2;
+        let p8 = s16 && form.s16 >= 2;
         let (qsrc, vsrc, vdt) = if s16 {
             let qs =
                 gb.add_persistent_tensor(format!("{lpfx}qs16"), SynDataType::Bf16, &[dh, r, b]);
@@ -581,7 +603,7 @@ fn append_attn_first_tile(
                 (qs, vn, SynDataType::Bf16)
             }
         } else {
-            (qb, vcache, SynDataType::Bf16)
+            (qb, vcache, kv.dt)
         };
         let sdt = if s16 {
             SynDataType::Bf16
@@ -591,23 +613,23 @@ fn append_attn_first_tile(
         let pdt = if p8 {
             SynDataType::Fp8_143
         } else {
-            SynDataType::Bf16
+            kv.dt
         };
         let qv = group_views(
             gb,
             qsrc,
             &format!("{lpfx}qb"),
-            SynDataType::Bf16,
+            if s16 { SynDataType::Bf16 } else { kv.dt },
             dh,
             r,
             nkv,
             &gsz,
         );
-        let kv = group_views(
+        let kvw = group_views(
             gb,
             kcache,
             &format!("{lpfx}kc"),
-            SynDataType::Bf16,
+            kv.dt,
             dh,
             KV_CHUNK,
             nkv,
@@ -621,7 +643,7 @@ fn append_attn_first_tile(
             let gp = format!("{lpfx}g{g}_");
             let bg = nkv * n;
             let sc = gb.add_persistent_tensor(format!("{gp}scores"), sdt, &[KV_CHUNK, r, bg]);
-            gb.op_batch_gemm(format!("{gp}qk"), qv[g], kv[g], sc, false, true);
+            gb.op_batch_gemm(format!("{gp}qk"), qv[g], kvw[g], sc, false, true);
             let pg = gb.add_persistent_tensor(format!("{gp}P"), pdt, &[KV_CHUNK, r, bg]);
             let stg =
                 gb.add_persistent_tensor(format!("{gp}stats"), SynDataType::Float, &[64, 2, r, bg]);
@@ -638,7 +660,7 @@ fn append_attn_first_tile(
                 gb.add_node(
                     "gaudium_attn_softmax_chunk",
                     format!("{gp}softmax"),
-                    &[sc, cursor],
+                    &kv.inputs(&[sc, cursor]),
                     &[pg, stg],
                     &u32_params(&[t as u32, n as u32, 0, 0, 1, base]),
                 );
@@ -1702,7 +1724,7 @@ impl TileRt {
             opts,
             form,
             tile: if opts.tile > 0 {
-                opts.tile
+                crate::verified::kv_tile_rows(opts.tile, super::kv8::trunk_dtype(spec), KV8_TILE_MAX)
             } else {
                 form.tile_candidates(spec)[0]
             },
@@ -1960,9 +1982,21 @@ impl TileRt {
         fits: &dyn Fn(u64, u64) -> bool,
     ) -> Result<(u64, u64), String> {
         let candidates: Vec<u64> = if self.opts.tile > 0 {
-            vec![self.opts.tile]
+            // [kv8] a fixed width as the trunk's cache takes it (`kv_tile_rows`)
+            let t = crate::verified::kv_tile_rows(
+                self.opts.tile,
+                super::kv8::trunk_dtype(spec),
+                KV8_TILE_MAX,
+            );
+            if t != self.opts.tile {
+                eprintln!(
+                    "[gaudium] prefill tile {} -> {t} rows: FP8 K/V prefill tiles are at most {KV8_TILE_MAX} rows",
+                    self.opts.tile
+                );
+            }
+            vec![t]
         } else {
-            self.form.tile_candidates(spec).to_vec()
+            self.form.tile_candidates(spec)
         };
         let mut chosen = None;
         for (i, &tile) in candidates.iter().enumerate() {

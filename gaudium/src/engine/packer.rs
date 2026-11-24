@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use crate::fp8::bf16_to_f32;
 use crate::model_spec::ModelSpec;
 use crate::safetensors::{SafetensorsStore, TensorMeta};
-use crate::verified::{lane128, lane256};
+use crate::verified::{kv_wv_row, lane128, lane256};
 
 /// Weight packer for Qwen3 & Qwen3.5/3.8 hybrid (Gated DeltaNet + Full Attention) BF16 models.
 pub struct WeightPacker<'a> {
@@ -21,6 +21,9 @@ pub struct WeightPacker<'a> {
     /// [moe/fp8 hook] Extension asked first for every device tensor: FP8 checkpoints, FP8 device
     /// weights and MoE wide MLPs (`engine/fp8_pack.rs`).
     pub ext: Option<&'a crate::engine::fp8_pack::ExtPacker<'a>>,
+    /// [kv8] The K/V calibration of an FP8 K/V load: the layers' scale tables (`L<l>_kv8`) are
+    /// built from it.
+    pub kv8: Option<&'a crate::core::kv_cache::KvCalibration>,
 }
 
 impl<'a> WeightPacker<'a> {
@@ -30,6 +33,7 @@ impl<'a> WeightPacker<'a> {
             spec,
             chunked_attn: true,
             ext: None,
+            kv8: None,
         }
     }
 
@@ -242,6 +246,16 @@ impl<'a> WeightPacker<'a> {
 
         if is_attn {
             match what {
+                // [kv8] the layer's FP8 scale table, from its norm weights as packed above
+                "kv8" => {
+                    let cal = self.kv8.ok_or_else(|| {
+                        format!("'{name}': an FP8 K/V scale table without a K/V calibration")
+                    })?;
+                    let qn = self.pack_weight(&format!("L{layer_idx}_qn_w"))?;
+                    let kn = self.pack_weight(&format!("L{layer_idx}_kn_w"))?;
+                    return crate::engine::qwen3::kv8::table_bytes(m, cal, layer_idx, &qn, &kn)
+                        .map(Cow::Owned);
+                }
                 "W_qg" => {
                     let (full, t) = self.tensor_ref(&format!("{lpfx}self_attn.q_proj.weight"))?;
                     self.need_bf16(&full, t, qg, Some(hid))?;
@@ -281,11 +295,12 @@ impl<'a> WeightPacker<'a> {
                     let mut dst = vec![0u8; src.len()];
                     for g in 0..(nkv as usize) {
                         for c in 0..(dh as usize) {
-                            let dst_c = if dh == 128 {
-                                lane128(c as u64) as usize
-                            } else {
-                                lane256(c as u64) as usize
-                            };
+                            // [kv8] the cache dtype's V row order (`verified/kv_cache.bend`)
+                            let dst_c = kv_wv_row(
+                                c as u64,
+                                dh,
+                                crate::engine::qwen3::kv8::trunk_dtype(m),
+                            ) as usize;
                             let s_off = (g * (dh as usize) + c) * row_bytes;
                             let d_off = (g * (dh as usize) + dst_c) * row_bytes;
                             dst[d_off..d_off + row_bytes]

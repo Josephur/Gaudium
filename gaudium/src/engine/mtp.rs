@@ -1185,6 +1185,9 @@ impl Mtp {
         // The head runs in BF16 in every graph (its matrices are not `L<l>_*` names, so an FP8
         // trunk leaves them alone): a block-FP8 checkpoint's head matrices are dequantised here.
         lspec.fp8_weights = false;
+        // [kv8] and its own cache is BF16 whatever the trunk's is (`kv_layer_dtype`): its V
+        // projection keeps the BF16 row order
+        lspec.kv_dtype = crate::engine::qwen3::kv8::cache_dtype(spec, "M_");
         let ext =
             crate::engine::fp8_pack::ExtPacker::new(packer.store(), &lspec, BTreeMap::new(), None);
         let mut layer = WeightPacker::new(packer.store(), &lspec);

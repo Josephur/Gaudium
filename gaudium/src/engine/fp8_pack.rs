@@ -40,7 +40,6 @@ use crate::fp8::{
 };
 use crate::model_spec::ModelSpec;
 use crate::safetensors::SafetensorsStore;
-use crate::verified::{lane128, lane256};
 
 /// Checkpoint block-scale granularity along both axes.
 const BLOCK: usize = 128;
@@ -562,12 +561,15 @@ impl<'a> ExtPacker<'a> {
                 let mut map = vec![(0u32, 0u32); kvd as usize];
                 for g in 0..nkv {
                     for c in 0..dh {
+                        // [kv8] the cache dtype's V row order (`verified/kv_cache.bend`)
                         let dc = if !chunked_attn {
                             c
-                        } else if dh == 128 {
-                            lane128(c)
                         } else {
-                            lane256(c)
+                            crate::verified::kv_wv_row(
+                                c,
+                                dh,
+                                crate::engine::qwen3::kv8::trunk_dtype(m),
+                            )
                         };
                         map[(g * dh + dc) as usize] = (0, (g * dh + c) as u32);
                     }
@@ -699,8 +701,14 @@ impl<'a> ExtPacker<'a> {
             && ["_W_gate", "_W_up", "_W_down"]
                 .iter()
                 .any(|s| name.ends_with(s));
+        // [kv8] and so do the V projections of FP8 K/V loads (their rows in the FP8 V order)
+        let kv8_rows = crate::verified::kv_is_fp8(crate::engine::qwen3::kv8::trunk_dtype(
+            self.spec,
+        )) && name.ends_with("_W_v");
         let entry = if shared_only {
             format!("{name}_shared")
+        } else if kv8_rows {
+            format!("{name}_kv8")
         } else {
             name.to_owned()
         };

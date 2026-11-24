@@ -64,8 +64,9 @@ const CALIBRATE_BYTES: u64 = 128 * 1024 * 1024;
 pub fn first_copies_bytes() -> u64 {
     crate::hostmem::AnonMap::mapped_len(CALIBRATE_BYTES)
 }
-/// Rows of a K/V block: the engine writes cache rows in blocks of this many, so a tile whose
-/// rows are to be one range per head is a whole number of them.
+/// Rows of a BF16 K/V block: the engine writes cache rows in blocks of this many, so a tile
+/// whose rows are to be one range per head is a whole number of them. A cache of another dtype
+/// has its own block (`kv_vperm_rows`, [`RowLayout::with_block`]).
 const KV_BLOCK_ROWS: u64 = 128;
 
 /// How long the card is left idle after a response before the save starts: a request that
@@ -212,8 +213,7 @@ pub struct RowLayout {
 }
 
 impl RowLayout {
-    /// The layout of caches of `cache_bytes` each. An error says why this engine's caches
-    /// cannot be copied tile by tile.
+    /// The layout of BF16 caches of `cache_bytes` each ([`Self::with_block`] with the BF16 block).
     pub fn new(
         caches: Vec<u64>,
         cache_bytes: u64,
@@ -223,6 +223,22 @@ impl RowLayout {
         row_bytes: u64,
         tile: u64,
     ) -> Result<Self, String> {
+        Self::with_block(caches, cache_bytes, chunks, chunk_rows, heads, row_bytes, tile, KV_BLOCK_ROWS)
+    }
+
+    /// The layout of caches of `cache_bytes` each whose V rows are permuted in blocks of `block`
+    /// rows. An error says why this engine's caches cannot be copied tile by tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_block(
+        caches: Vec<u64>,
+        cache_bytes: u64,
+        chunks: u64,
+        chunk_rows: u64,
+        heads: u64,
+        row_bytes: u64,
+        tile: u64,
+        block: u64,
+    ) -> Result<Self, String> {
         // whether these caches can be copied tile by tile is the verified `hc_layout`'s decision
         match hc_layout(
             caches.len() as u64,
@@ -231,14 +247,14 @@ impl RowLayout {
             heads,
             row_bytes,
             tile,
-            KV_BLOCK_ROWS,
+            block,
             cache_bytes,
         ) {
             HcLayout::HcLayoutOk => {}
             HcLayout::HcLayoutEmpty => return Err("no K/V caches to copy".into()),
             HcLayout::HcLayoutTile => {
                 return Err(format!(
-                    "a prefill tile of {tile} rows does not divide a K/V chunk of {chunk_rows} rows into whole {KV_BLOCK_ROWS}-row blocks"
+                    "a prefill tile of {tile} rows does not divide a K/V chunk of {chunk_rows} rows into whole {block}-row blocks"
                 ))
             }
             HcLayout::HcLayoutSize => {
@@ -1113,7 +1129,7 @@ pub(super) fn engine_text(cfg: &Qwen3Config, eng: &Qwen3Engine) -> String {
         format!("{sc:?}|{dir}")
     });
     format!(
-        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8={}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
+        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8={}|kv8={}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
         cfg.model_dir.display(),
         files_of(&cfg.model_dir, false),
         eng.spec,
@@ -1123,6 +1139,8 @@ pub(super) fn engine_text(cfg: &Qwen3Config, eng: &Qwen3Engine) -> String {
         eng.pf.opts,
         cfg.precision,
         eng.fp8_id,
+        // [kv8] the K/V dtype is in `spec`; the scale tables' calibration here
+        eng.kv8_id,
         cfg.moe_routed,
         cfg.request_reset,
         cfg.step,
@@ -1160,14 +1178,17 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         eprintln!("[cache-ram] off for this engine: its K/V caches differ in size");
         return Ok(());
     }
-    let rows = match RowLayout::new(
+    // [kv8] one head's row of one position in the caches' own dtype, and its V block
+    let kv_dt = super::kv8::trunk_dtype(&eng.spec);
+    let rows = match RowLayout::with_block(
         caches,
         cache_bytes,
         eng.max_chunks,
         KV_CHUNK,
         eng.spec.n_kv_heads,
-        eng.spec.head_dim * 2,
+        crate::core::kv_cache::row_bytes(1, eng.spec.head_dim, kv_dt),
         eng.prefill_tile,
+        crate::verified::kv_vperm_rows(kv_dt),
     ) {
         Ok(r) => r,
         Err(why) => {
@@ -2537,5 +2558,10 @@ mod tests {
         assert!(RowLayout::new(vec![0], 2 * 2 * 4096 * 16, 2, 4096, 2, 16, 384).is_err());
         assert!(RowLayout::new(vec![0], 12345, 2, 4096, 2, 16, 512).is_err());
         assert!(RowLayout::new(vec![], 0, 2, 4096, 2, 16, 512).is_err());
+        // [kv8] FP8 caches permute V rows in 256-row blocks: a 128-row tile would split one
+        let fp8 = crate::verified::kv_vperm_rows(crate::verified::KvDtype::KvFp8);
+        assert!(RowLayout::with_block(vec![0], 2 * 2 * 4096 * 16, 2, 4096, 2, 16, 128, fp8).is_err());
+        assert!(RowLayout::with_block(vec![0], 2 * 2 * 4096 * 16, 2, 4096, 2, 16, 256, fp8).is_ok());
+        assert!(RowLayout::new(vec![0], 2 * 2 * 4096 * 16, 2, 4096, 2, 16, 128).is_ok());
     }
 }

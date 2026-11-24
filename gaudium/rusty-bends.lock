@@ -31,6 +31,9 @@ c969518b535cece3  call_fragment_needs_header  law call_fragment_needs_header : f
 81e5f5a57090c670  call_started_never_abandoned  law call_started_never_abandoned : { call_accepts ( CpArgs { } , CeAbandon { } ) == False { } : Bool }
 8a9c1856c1d5424d  call_stopped_absorbing  law call_stopped_absorbing : for ev : CallEvent { call_step ( CpStopped { } , ev ) == CpStopped { } : CallPhase }
 6de60792641ce27a  call_stopped_accepts_nothing  law call_stopped_accepts_nothing : for ev : CallEvent { call_accepts ( CpStopped { } , ev ) == False { } : Bool }
+f63d6f88affafb04  ctx_for_prompt_admits  law ctx_for_prompt_admits : for + p : Nat for + extra : Nat { prompt_admitted ( 1n + p , Nat.add ( ctx_for_prompt ( 1n + p ) , extra ) ) == True { } : Bool }
+# promise ctx_for_prompt_admits: a capacity of at least ctx_for_prompt(p) admits a non-empty prompt of p tokens, also after it is rounded up to whole cache chunks
+# harm ctx_for_prompt_admits: a calibration load would refuse its own longest prompt after the engine had loaded
 cc2d96177d64bd71  dev_alloc_launch_disjoint  law dev_alloc_launch_disjoint : for + s : DevState { Bool.and ( dev_can_alloc ( s ) , dev_can_launch ( s ) ) == False { } : Bool }
 66013e0cb837f25a  dev_closed_absorbing  law dev_closed_absorbing : for ev : DevEvent { dev_step ( DevClosed { } , ev ) == DevClosed { } : DevState }
 ebbddef48543f39e  dev_drain_blocks_all  law dev_drain_blocks_all : for + s : DevState { Bool.or ( dev_can_alloc ( dev_drain ( s ) ) , Bool.or ( dev_can_dma ( dev_drain ( s ) ) , dev_can_launch ( dev_drain ( s ) ) ) ) == False { } : Bool }
@@ -501,7 +504,96 @@ e6d2c9266532af2c  ikv_token_cap_within_patches  law ikv_token_cap_within_patches
 # promise ikv_tokens_within_limit: an image whose tile grid the token check accepts never has more tokens than the limit.
 f42d899343546720  ikv_tokens_zero_cols_refused  law ikv_tokens_zero_cols_refused : for + rows : Nat for m : Nat { ikv_tokens_fit ( rows , 0n , m ) == False { } : Bool }
 # promise ikv_tokens_zero_cols_refused: an image with no tile column is refused.
+1ff65a91a0e26a6c  kv8_accepted_decode  law kv8_accepted_decode : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + k : Nat for + r : Nat for + s : Nat for + f : KvDecode for ok : { kv8_load_check ( kc , ac , m , n , w , k , r , s , f ) == KrNone { } : Kv8Refusal } { kv8_decode_ok ( f ) == True { } : Bool }
+# promise kv8_accepted_decode: a load the FP8 K/V check accepts always serves a decode form that may run on FP8 K/V
+# harm kv8_accepted_decode: a drafter never checked against FP8-K/V K=0 would serve its tokens as exact
+9234f5ec79c019e5  kv8_accepted_family  law kv8_accepted_family : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + k : Nat for + r : Nat for + s : Nat for + f : KvDecode for ok : { kv8_load_check ( kc , ac , m , n , w , k , r , s , f ) == KrNone { } : Kv8Refusal } { kv8_family_ok ( m , n ) == True { } : Bool }
+# promise kv8_accepted_family: a load the FP8 K/V check accepts always has a family that has run FP8 K/V on the card
+# harm kv8_accepted_family: graphs nothing has validated on FP8 K/V would serve tokens without a checked reference
+2b8df61462e8f179  kv8_accepted_not_calibrating  law kv8_accepted_not_calibrating : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + k : Nat for + r : Nat for + s : Nat for + f : KvDecode for ok : { kv8_load_check ( kc , ac , m , n , w , k , r , s , f ) == KrNone { } : Kv8Refusal } { Bool.or ( kc , ac ) == False { } : Bool }
+# promise kv8_accepted_not_calibrating: a load the FP8 K/V check accepts is never a calibration load, of the K/V maxima or of the activation scales
+# harm kv8_accepted_not_calibrating: a calibration would measure through the FP8 attention, the K/V maxima already clipped by the multipliers they are meant to choose
+1481978fb14b4d11  kv8_accepted_shape  law kv8_accepted_shape : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + k : Nat for + r : Nat for + s : Nat for + f : KvDecode for ok : { kv8_load_check ( kc , ac , m , n , w , k , r , s , f ) == KrNone { } : Kv8Refusal } { kv8_shape_ok ( w , k , r , s ) == True { } : Bool }
+# promise kv8_accepted_shape: a load the FP8 K/V check accepts always has a head shape the FP8 attention kernels accept
+# harm kv8_accepted_shape: the kernels would read cache rows or scale-table slots its heads do not have
+17dcbaf889122ee2  kv8_fit_capped  law kv8_fit_capped : for + a : Nat for + top : Nat for + margin : Nat for + cap : Nat { Nat.is_le ( kv8_fit ( a , top , margin , cap ) , cap ) == True { } : Bool }
+# promise kv8_fit_capped: a multiplier never exceeds its cap
+# harm kv8_fit_capped: a head measured as all zero would get a multiplier that blows any later value up to the format's maximum
+583c506a729fb4d5  kv8_fit_never_clips  law kv8_fit_never_clips : for + a : Nat for + top : Nat for + margin : Nat for + cap : Nat { Bool.or ( Nat.is_lt ( Nat.sub ( top , margin ) , a ) , Nat.is_le ( Nat.add ( a , kv8_fit ( a , top , margin , cap ) ) , Nat.sub ( top , margin ) ) ) == True { } : Bool }
+# promise kv8_fit_never_clips: whenever a multiplier can fit, the scaled maximum stays at or below top - margin, so with a margin of one or more nothing is clipped
+# harm kv8_fit_never_clips: the largest K / V values would saturate at the format's maximum
+eea0924cfa2fa432  kv8_load_needs_decode  law kv8_load_needs_decode : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + h : Nat for + r : Nat for + s : Nat for + f : KvDecode { Bool.and ( kv8_load_taken ( kv8_load_check ( kc , ac , m , n , w , h , r , s , f ) ) , Bool.not ( kv8_decode_ok ( f ) ) ) == False { } : Bool }
+# promise kv8_load_needs_decode: a load that takes FP8 K/V always serves a decode form that may run on FP8 K/V
+# harm kv8_load_needs_decode: a drafter never checked against FP8-K/V K=0 would serve its tokens as exact
+a1c2f97bf00a530d  kv8_load_needs_family  law kv8_load_needs_family : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + h : Nat for + r : Nat for + s : Nat for + f : KvDecode { Bool.and ( kv8_load_taken ( kv8_load_check ( kc , ac , m , n , w , h , r , s , f ) ) , Bool.not ( kv8_family_ok ( m , n ) ) ) == False { } : Bool }
+# promise kv8_load_needs_family: a model whose family has not run FP8 K/V on the card never takes it
+# harm kv8_load_needs_family: graphs nothing has validated on FP8 K/V would serve tokens without a checked reference
+60800cb71d90d8da  kv8_load_needs_shape  law kv8_load_needs_shape : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + h : Nat for + r : Nat for + s : Nat for + f : KvDecode { Bool.and ( kv8_load_taken ( kv8_load_check ( kc , ac , m , n , w , h , r , s , f ) ) , Bool.not ( kv8_shape_ok ( w , h , r , s ) ) ) == False { } : Bool }
+# promise kv8_load_needs_shape: a load that takes FP8 K/V always has a head shape the FP8 attention kernels accept
+# harm kv8_load_needs_shape: the kernels would read cache rows or scale-table slots its heads do not have
+5962855c7c961a1f  kv8_load_never_calibrating  law kv8_load_never_calibrating : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + h : Nat for + r : Nat for + s : Nat for + f : KvDecode { Bool.and ( kv8_load_taken ( kv8_load_check ( kc , ac , m , n , w , h , r , s , f ) ) , Bool.or ( kc , ac ) ) == False { } : Bool }
+# promise kv8_load_never_calibrating: a calibration load, of the K/V maxima or of the activation scales, never takes FP8 K/V
+# harm kv8_load_never_calibrating: a calibration would measure through the FP8 attention, the K/V maxima already clipped by the multipliers they are meant to choose
+4e94b3b4b28733f7  kv8_min4_within_each  law kv8_min4_within_each : for + a : Nat for + b : Nat for + c : Nat for + d : Nat { Bool.and ( Bool.and ( Nat.is_le ( kv8_min4 ( a , b , c , d ) , a ) , Nat.is_le ( kv8_min4 ( a , b , c , d ) , b ) ) , Bool.and ( Nat.is_le ( kv8_min4 ( a , b , c , d ) , c ) , Nat.is_le ( kv8_min4 ( a , b , c , d ) , d ) ) ) == True { } : Bool }
+# promise kv8_min4_within_each: a layer's one V multiplier is never larger than any of its heads' own
+# harm kv8_min4_within_each: the heads with the largest V values would be clipped
+2a7f3f2b85bac040  kv8_plain_decode_ok  law kv8_plain_decode_ok : { kv8_decode_ok ( KdPlain { } ) == True { } : Bool }
+# promise kv8_plain_decode_ok: the non-speculative decode always runs on FP8 K/V, so every speculative form has its exactness reference
+# harm kv8_plain_decode_ok: an FP8 K/V load could offer a drafter with nothing to check its tokens against
+5f4bc6ba5ca18326  kv8_shape_needs_groups  law kv8_shape_needs_groups : for + w : Nat for + r : Nat for + s : Nat { kv8_shape_ok ( w , 0n , r , s ) == False { } : Bool }
+# promise kv8_shape_needs_groups: a model without kv heads is never accepted by the FP8 kernels
+80e696ec1290a904  kv8_shape_within_slots  law kv8_shape_within_slots : for + w : Nat for + n : Nat for + r : Nat for + s : Nat { Bool.and ( kv8_shape_ok ( w , n , r , s ) , Nat.is_lt ( s , n ) ) == False { } : Bool }
+# promise kv8_shape_within_slots: a head shape the FP8 kernels accept never has more kv groups than the scale table has slots
+# harm kv8_shape_within_slots: a group past the table would read another kind's multiplier
+cbf3b034df5d5d27  kv8_table_covers_heads  law kv8_table_covers_heads : for + a : Nat for + b : Nat { Bool.and ( kv8_table_heads_ok ( a , b ) , Nat.is_lt ( a , b ) ) == False { } : Bool }
+# promise kv8_table_covers_heads: a scale table that lists fewer kv heads for a layer than the model has is refused
+# harm kv8_table_covers_heads: a head without its own measured maximum would take another head's V multiplier, and its largest values could clip
+f5cd20a46e2dd85b  kv_bf16_load_stays_bf16  law kv_bf16_load_stays_bf16 : for t : Bool { kv_layer_dtype ( t , KvBf16 { } ) == KvBf16 { } : KvDtype }
+# promise kv_bf16_load_stays_bf16: a load configured for BF16 K/V never gets an FP8 cache
+# harm kv_bf16_load_stays_bf16: a cache would be FP8 without a scale table made for it
+3ecec3b47c1c0b81  kv_elem_nonzero  law kv_elem_nonzero : for d : KvDtype { Nat.is_le ( 1n , kv_elem_bytes ( d ) ) == True { } : Bool }
+# promise kv_elem_nonzero: a cache element always takes at least one byte, so a cache row is never sized zero
+# harm kv_elem_nonzero: the host-RAM tier would lay out rows of zero bytes and copy nothing it needs
+922c10ab87fa63a1  kv_fp8_refused_without_fp8_attention  law kv_fp8_refused_without_fp8_attention : { kv_setting_taken ( False { } , KvFp8 { } ) == False { } : Bool }
+# promise kv_fp8_refused_without_fp8_attention: an engine without the FP8 attention kernels never takes an FP8 K/V setting
+# harm kv_fp8_refused_without_fp8_attention: a load asked for FP8 K/V would run, and report, BF16 caches without saying so
+4f2ae6bc0834a730  kv_fp8_row_not_larger  law kv_fp8_row_not_larger : for + h : Nat for + w : Nat { Nat.is_le ( kv_row_bytes ( h , w , KvFp8 { } ) , kv_row_bytes ( h , w , KvBf16 { } ) ) == True { } : Bool }
+# promise kv_fp8_row_not_larger: an FP8 cache position never takes more bytes than the same position in BF16
+# harm kv_fp8_row_not_larger: the host-RAM tier would hold FP8 entries larger than the BF16 ones they replace
+86788f90f6a00099  kv_half_core_never_fp8  law kv_half_core_never_fp8 : for a : Bool { kv_half_core_taken ( a , KvFp8 { } ) == False { } : Bool }
+# promise kv_half_core_never_fp8: the half-width prefill core, which reads BF16 caches only, is never built on an FP8 cache
+# harm kv_half_core_never_fp8: its BF16 scores and V relayout would read FP8 bytes as BF16 values, and the prefill would write wrong K/V and hidden states
+d5295993693309a4  kv_half_core_only_asked  law kv_half_core_only_asked : for d : KvDtype { kv_half_core_taken ( False { } , d ) == False { } : Bool }
+# promise kv_half_core_only_asked: a prefill tile builds the half-width core only when its form asks for it
+# harm kv_half_core_only_asked: a load whose form turned the core off would still build it
 ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat for + k : Nat for + b : Nat for + lmax : Nat { Nat.is_le ( kv_high_water ( p , c , k , b , lmax ) , lmax ) == True { } : Bool }
+ca129145f53b70bf  kv_piece_within  law kv_piece_within : for + done : Nat for + len : Nat for + piece : Nat { Bool.or ( Nat.is_lt ( len , done ) , Nat.is_le ( Nat.add ( done , kv_piece_len ( done , len , piece ) ) , len ) ) == True { } : Bool }
+# promise kv_piece_within: each copy of a read ends inside the range being read, whatever the staging buffer's size
+# harm kv_piece_within: the last copy of a head's batch would read past the batch, and past the cache for the last one
+12898f9dfe9d246a  kv_range_inside_ends_inside  law kv_range_inside_ends_inside : for + o : Nat for + n : Nat for + b : Nat for ok : { kv_range_inside ( o , n , b ) == True { } : Bool } { Nat.is_le ( Nat.add ( o , n ) , b ) == True { } : Bool }
+# promise kv_range_inside_ends_inside: a range the read-back admits ends inside the cache allocation it reads
+# harm kv_range_inside_ends_inside: a device-to-host copy would read past the cache, from another buffer or an unmapped address
+afeb8bc174d22774  kv_side_cache_bf16  law kv_side_cache_bf16 : for d : KvDtype { kv_layer_dtype ( False { } , d ) == KvBf16 { } : KvDtype }
+# promise kv_side_cache_bf16: a cache whose graphs have no FP8 attention kernels and scale table is always BF16
+# harm kv_side_cache_bf16: a BF16 graph would read FP8 bytes as BF16 values
+0666259195f6e281  kv_tile_rows_fp8_within  law kv_tile_rows_fp8_within : for + t : Nat for + m : Nat { Nat.is_le ( kv_tile_rows ( t , KvFp8 { } , m ) , m ) == True { } : Bool }
+# promise kv_tile_rows_fp8_within: a prefill tile on an FP8 cache never has more rows than the widest FP8 tile measured correct
+# harm kv_tile_rows_fp8_within: a wider FP8 attention tile, measured to give NaN rows past one cache chunk, would prefill wrong K/V and hidden states
+3db2160775c84806  kv_tile_rows_not_wider  law kv_tile_rows_not_wider : for + t : Nat for d : KvDtype for + m : Nat { Nat.is_le ( kv_tile_rows ( t , d , m ) , t ) == True { } : Bool }
+# promise kv_tile_rows_not_wider: the cache dtype only ever narrows a prefill tile, never makes it wider than the tile asked for
+# harm kv_tile_rows_not_wider: a tile wider than every width asked for (an explicit width or a candidate, at most the engine's widest) would overrun buffers sized for those widths
+221a51e4695468d8  kv_wv_row_in_head_128  law kv_wv_row_in_head_128 : for + c : Nat for + d : KvDtype for ok : { Nat.is_lt ( c , 128n ) == True { } : Bool } { Nat.is_lt ( kv_wv_row ( c , 128n , d ) , 128n ) == True { } : Bool }
+# promise kv_wv_row_in_head_128: every channel of a 128-channel head lands on a row of that head in its V projection
+# harm kv_wv_row_in_head_128: a V channel would be packed outside its head, over another head's rows or past the weight
+b8e1a330637b27dc  kv_wv_row_in_head_256  law kv_wv_row_in_head_256 : for + c : Nat for + d : KvDtype for ok : { Nat.is_lt ( c , 256n ) == True { } : Bool } { Nat.is_lt ( kv_wv_row ( c , 256n , d ) , 256n ) == True { } : Bool }
+# promise kv_wv_row_in_head_256: every channel of a 256-channel head lands on a row of that head in its V projection
+# harm kv_wv_row_in_head_256: a V channel would be packed outside its head, over another head's rows or past the weight
+f861b1614e4bcd0f  kv_wv_rows_distinct_128  law kv_wv_rows_distinct_128 : for + a : Nat for + b : Nat for + d : KvDtype for ha : { Nat.is_lt ( a , 128n ) == True { } : Bool } for hb : { Nat.is_lt ( b , 128n ) == True { } : Bool } for e : { kv_wv_row ( a , 128n , d ) == kv_wv_row ( b , 128n , d ) : Nat } { a == b : Nat }
+# promise kv_wv_rows_distinct_128: two channels of a 128-channel head never land on the same row of its V projection
+# harm kv_wv_rows_distinct_128: one V channel would overwrite another in the packed weight, and the attention output would lose it
+e8dd4d122e82d747  kv_wv_rows_distinct_256  law kv_wv_rows_distinct_256 : for + a : Nat for + b : Nat for + d : KvDtype for ha : { Nat.is_lt ( a , 256n ) == True { } : Bool } for hb : { Nat.is_lt ( b , 256n ) == True { } : Bool } for e : { kv_wv_row ( a , 256n , d ) == kv_wv_row ( b , 256n , d ) : Nat } { a == b : Nat }
+# promise kv_wv_rows_distinct_256: two channels of a 256-channel head never land on the same row of its V projection
+# harm kv_wv_rows_distinct_256: one V channel would overwrite another in the packed weight, and the attention output would lose it
 3ddfe8a0a0c54651  lane_busy_blocks_exclusive  law lane_busy_blocks_exclusive : for b : Nat for max_lanes : Nat { lane_can_admit ( 1n + b , max_lanes , False { } , True { } ) == False { } : Bool }
 3f71bff599d5e309  lane_exclusive_blocks_all  law lane_exclusive_blocks_all : for busy : Nat for max_lanes : Nat for want_excl : Bool { lane_can_admit ( busy , max_lanes , True { } , want_excl ) == False { } : Bool }
 4775d7007e9e1d84  lane_full_blocks_shared  law lane_full_blocks_shared : for + cap : Nat for excl : Bool { lane_can_admit ( cap , cap , excl , False { } ) == False { } : Bool }

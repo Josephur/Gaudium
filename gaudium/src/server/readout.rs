@@ -60,11 +60,23 @@ pub(super) struct RunFacts {
     /// The projection / MLP matrices run as FP8.
     pub fp8_weights: bool,
     pub moe_routed: bool,
+    /// [kv8] The K/V cache setting of the load (`--kv-cache`): the trunk's caches follow it.
+    pub kv_dtype: crate::verified::KvDtype,
     pub drafter: Option<DrafterFacts>,
     /// The engine was loaded with image input.
     pub vision: bool,
     /// Exact device-memory ledger `[weights, kv, state, scratch, workspace]` of the loaded engine.
     pub hbm_bytes: Option<[u64; 5]>,
+}
+
+/// The spec a model's step graph is described from: the checkpoint's, with what its load sets
+/// (weight precision, expert form, K/V cache).
+pub(super) fn run_spec(spec: &ModelSpec, facts: &RunFacts) -> ModelSpec {
+    let mut s = spec.clone();
+    s.fp8_weights = facts.fp8_weights;
+    s.moe_routed = facts.moe_routed;
+    s.kv_dtype = facts.kv_dtype;
+    s
 }
 
 /// Run label of the method a request takes, in the readout's label grammar: `0` (no drafts),
@@ -623,6 +635,7 @@ mod tests {
             from_engine: true,
             fp8_weights: true,
             moe_routed: false,
+            kv_dtype: crate::verified::KvDtype::KvBf16,
             drafter: Some(dspine(&[15, 7])),
             vision: false,
             hbm_bytes: Some([
@@ -674,6 +687,7 @@ mod tests {
             from_engine: false,
             fp8_weights: false,
             moe_routed: false,
+            kv_dtype: crate::verified::KvDtype::KvBf16,
             drafter: None,
             vision: false,
             hbm_bytes: None,
@@ -693,6 +707,28 @@ mod tests {
             0
         );
         assert!(v.get("drafter").is_none() && v.get("hbm_gb").is_none());
+
+        // an FP8 K/V load: the description follows the load's cache setting, not the checkpoint
+        let fp8_kv = RunFacts {
+            kv_dtype: crate::verified::KvDtype::KvFp8,
+            ..facts.clone()
+        };
+        let dt8 = crate::engine::qwen3_traffic::step_dtypes(&run_spec(&spec, &fp8_kv)).unwrap();
+        let v8 = json::parse_json(&model_desc_json(
+            "m",
+            "m",
+            &spec,
+            131072,
+            &fp8_kv,
+            Some(&dt8),
+        ))
+        .unwrap();
+        let p8 = v8.get("precision").unwrap();
+        assert_eq!(p8.get("kv").and_then(|x| x.as_str()), Some("FP8"));
+        assert_eq!(
+            p8.get("weights").and_then(|x| x.as_str()),
+            p.get("weights").and_then(|x| x.as_str())
+        );
         let w = v
             .get("precision")
             .and_then(|p| p.get("weights"))

@@ -4,9 +4,9 @@
 //! capping, and mixed-batch sampler lattice decisions delegate to `verified/token_budget.bend`.
 
 use crate::verified::{
-    clamp_top_k, ctx_reserve, effective_max_new, kv_high_water, method_allows_sampling,
-    prompt_admitted, prompt_room, remaining_budget, sampler_family_join, sampling_request_admitted,
-    served_ctx, step_headroom_fits, SamplerFamily, SpecMethod,
+    clamp_top_k, ctx_for_prompt as v_ctx_for_prompt, ctx_reserve, effective_max_new, kv_high_water,
+    method_allows_sampling, prompt_admitted, prompt_room, remaining_budget, sampler_family_join,
+    sampling_request_admitted, served_ctx, step_headroom_fits, SamplerFamily, SpecMethod,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,13 @@ pub fn engine_ctx_reserve() -> u64 {
 /// Returns the advertised served context (`lmax - 128`, saturating at 0).
 pub fn advertised_served_ctx(lmax: u64) -> u64 {
     served_ctx(lmax)
+}
+
+/// The context capacity a load sizes for its longest prompt of `prompt_len` tokens and one
+/// generated token (`ctx_for_prompt`): any capacity at least this large, rounded up to whole
+/// chunks or not, admits that prompt.
+pub fn ctx_for_prompt(prompt_len: u64) -> u64 {
+    v_ctx_for_prompt(prompt_len)
 }
 
 /// Checked per-sequence token budget tracker (never underflows remaining budget).
@@ -130,6 +137,21 @@ pub fn bounded_top_k(top_k: u64, vocab: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_load_sized_for_its_longest_prompt_admits_it() {
+        use crate::verified::align_up;
+        // a 4000-token prompt: 4001 rows rounded to one chunk would leave 3968 served positions
+        for p in [1u64, 3967, 3968, 4000, 4095, 4096, 32_000] {
+            let lmax = align_up(ctx_for_prompt(p), 4096);
+            assert!(
+                SequenceBudget::admit(p, Some(1), lmax).is_ok(),
+                "prompt {p}, lmax {lmax}"
+            );
+        }
+        assert_eq!(align_up(ctx_for_prompt(4000), 4096), 8192);
+        assert_eq!(align_up(ctx_for_prompt(3967), 4096), 4096);
+    }
 
     #[test]
     fn served_ctx_and_prompt_admission_boundaries() {

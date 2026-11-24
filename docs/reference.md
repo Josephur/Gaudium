@@ -47,6 +47,8 @@ Usage:
                                             without opening the card (Qwen engines)
   gaudium --serve [options]                 Start OpenAI HTTP/SSE + Gaudium Web UI server
   gaudium --fp8-calibrate [options]         Measure a model's FP8 activation scales (BF16 graphs)
+  gaudium --kv-calibrate [options]          Measure the K/V maxima a model's FP8 K/V scale tables
+                                            are made from (BF16 caches, read back per prompt)
   gaudium --fp8-pack --model <dir> --fp8-cache <dir>
                                             Quantise a Gemma 4 BF16 checkpoint's matrices into an
                                             FP8 cache directory (host only, no card)
@@ -156,6 +158,12 @@ Serve options:
                         above: its largest image in patches, or off for text only
   --fp8-act <id=file>   FP8 activation-scale table for FP8 model <id> (repeatable)
   --fp8-cache <id=dir>  Cache directory for model <id>'s quantised FP8 matrices
+  --kv-cache <id=d>     K/V cache of model <id>: bf16 (default) or fp8 (half the bytes per
+                        position, so a longer context fits; its K=0 stream is its own and
+                        the reference of its drafter; dense Qwen3.5 / 3.8 hybrids, K=0 or
+                        DSpine; needs the scale table from --kv-calibrate)
+  --kv-scales <id=file> K/V calibration of model <id> (default:
+                        <model_dir>-gaudium-pc/kv_scales.txt)
   --api-key <key>       Optional Bearer / X-Api-Key auth token (or GAUDIUM_API_KEY)
   --a2ui                Offer A2UI 1.0 interfaces (or GAUDIUM_A2UI=1): a chat request that
                         declares its renderer in the field gaudium_a2ui (true, or an
@@ -455,6 +463,13 @@ Generate options:
   --fp8-act <file>      FP8 activation-scale table (or GAUDIUM_FP8_ACT; default:
                         <model_dir>-gaudium-pc/act_scales_lc.txt)
   --fp8-cache <dir>     Cache directory for the quantised FP8 matrices (or GAUDIUM_FP8_CACHE)
+  --kv-cache <d>        K/V cache: bf16 (default) or fp8 (FP8 q / K / V / P in the trunk's
+                        attention, half the K/V bytes; a precision of its own: its K=0
+                        stream is the reference of FP8-K/V speculation. Dense Qwen3.5 / 3.8
+                        hybrids, K=0 or DSpine; needs the table from --kv-calibrate;
+                        its prefill runs 256-row tiles)
+  --kv-scales <file>    K/V calibration the FP8 scale tables are made from (default:
+                        <model_dir>-gaudium-pc/kv_scales.txt)
   --moe-form <f>        MoE expert execution: dense (default: one masked wide MLP per layer)
                         or routed (stacked BF16 experts, only the routed ones are read;
                         faster decode, more device memory, its own token stream: the
@@ -497,6 +512,23 @@ FP8 calibration options (prefill only, BF16 graphs; writes `<site> <k> <amax> <r
   --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)
   --no-cache            Disable on-disk compiled recipe cache
   --verbose             Print HBM, recipe compile, and per-site diagnostics
+
+K/V calibration options (prefill only, BF16 caches; writes `layer <l> k <amax..> v <amax..>`
+lines, the largest |K| and |V| per kv head; FP8 K/V takes its V multipliers from them):
+  --model <dir>         Model directory (or GAUDIUM_MODEL)
+  --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)
+  --prompt-ids-file <p> Calibration prompt as token IDs (repeatable)
+  --prompt-file <path>  Calibration prompt as text (repeatable)
+  --out <file>          Table to write (default: <model_dir>-gaudium-pc/kv_scales.txt)
+  --max-ctx <N>         Context capacity, multiple of 4096 (default and least: what the
+                        longest prompt needs, with the engine's reserve)
+  --precision <p>       Weight precision of the measuring load, as the served one: auto
+                        (default), bf16 or fp8
+  --fp8-act <file>      FP8 activation-scale table of an fp8 load
+  --fp8-cache <dir>     Cache directory for the quantised FP8 matrices
+  --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)
+  --no-cache            Disable on-disk compiled recipe cache
+  --verbose             Print HBM, recipe compile, and per-layer diagnostics
 ```
 <!-- help:end -->
 
