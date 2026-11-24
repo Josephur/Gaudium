@@ -506,8 +506,28 @@ pub(crate) fn append_gdn_ckpt_slots(
 
 /// Rows one call of the DeltaNet output norm covers in the batched steps: the kernel's build for
 /// decode and verify rows takes at most this many (more rows get the prefill build, which
-/// switches its function tables row by row).
+/// switches its function tables row by row). A slot is never split across calls, so a call stays
+/// within this limit only while every slot's rows fit under it: a slot holds at most
+/// [`SPEC_MAX_ROWS`] rows, hence the two are kept equal.
 pub(crate) const GDN_POST_ROWS: u64 = SPEC_MAX_ROWS;
+
+/// [lanes] Consecutive slots of `widths[j]` rows each, grouped into the calls of the output norm
+/// (the verified rule: which slot opens a new call, and the rows of the call it lands in).
+pub(crate) fn post_call_groups(widths: &[u64], limit: u64) -> Vec<std::ops::Range<usize>> {
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0u64;
+    for (j, &w) in widths.iter().enumerate() {
+        // (before the first slot there is no call to close)
+        if j > 0 && crate::verified::ln_post_call_opens(acc, w, limit) {
+            groups.push(start..j);
+            start = j;
+        }
+        acc = crate::verified::ln_post_call_rows(acc, w, limit);
+    }
+    groups.push(start..widths.len());
+    groups
+}
 
 /// [lanes] The output norm and gate of every slot's rows (`os[j]` = slot `j`'s recurrence
 /// output, `widths[j]` rows; `qkvz` = every slot's projection rows in slot order): consecutive
@@ -525,20 +545,7 @@ pub(crate) fn append_gdn_post_groups(
     let dl = spec.gdn_v_dim;
     let f32t = SynDataType::Float;
     let rows: u64 = widths.iter().sum();
-    // consecutive slots, as many as a call's rows allow (the verified rule: which slot opens a
-    // new call, and the rows of the call it lands in)
-    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut start = 0usize;
-    let mut acc = 0u64;
-    for (j, &w) in widths.iter().enumerate() {
-        // (before the first slot there is no call to close)
-        if j > 0 && crate::verified::ln_post_call_opens(acc, w, GDN_POST_ROWS) {
-            groups.push(start..j);
-            start = j;
-        }
-        acc = crate::verified::ln_post_call_rows(acc, w, GDN_POST_ROWS);
-    }
-    groups.push(start..widths.len());
+    let groups = post_call_groups(widths, GDN_POST_ROWS);
     let norm_w = gb.get_or_add_persistent_tensor(format!("{wpfx}norm_w"), f32t, &[dl]);
     let core = gb.add_persistent_tensor(format!("{wpfx}core"), SynDataType::Bf16, &[hv * dl, rows]);
     if groups.len() == 1 {
@@ -2941,6 +2948,40 @@ fn check_coupled_walk(eng: &mut Qwen3Engine, base: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_output_norm_calls_take_whole_slots_within_the_limit() {
+        // today's 8 narrow lanes (8 rows each) give two calls of 32 rows
+        assert_eq!(post_call_groups(&[8; 8], GDN_POST_ROWS), vec![0..4, 4..8]);
+        // a wide slot first (16 rows), then narrow ones
+        assert_eq!(post_call_groups(&[16, 8, 8, 8, 8], GDN_POST_ROWS), vec![0..3, 3..5]);
+        assert_eq!(post_call_groups(&[32, 32], GDN_POST_ROWS), vec![0..1, 1..2]);
+        assert_eq!(post_call_groups(&[8], GDN_POST_ROWS), vec![0..1]);
+        // every slot of every list of 1 to 5 slots of 1 to SPEC_MAX_ROWS rows lands in exactly one
+        // call, in order, and no call passes the limit
+        let ws = [1u64, 7, 8, 16, 17, 31, SPEC_MAX_ROWS];
+        let mut lists: Vec<Vec<u64>> = Vec::new();
+        let mut level: Vec<Vec<u64>> = vec![Vec::new()];
+        for _ in 0..5 {
+            level = level
+                .iter()
+                .flat_map(|l| ws.iter().map(move |&w| [l.as_slice(), &[w]].concat()))
+                .collect();
+            lists.extend(level.iter().cloned());
+        }
+        for widths in &lists {
+            let groups = post_call_groups(widths, GDN_POST_ROWS);
+            assert_eq!(groups.first().map(|g| g.start), Some(0), "{widths:?}");
+            assert_eq!(groups.last().map(|g| g.end), Some(widths.len()), "{widths:?}");
+            for pair in groups.windows(2) {
+                assert_eq!(pair[0].end, pair[1].start, "{widths:?}");
+            }
+            for g in &groups {
+                assert!(!g.is_empty(), "{widths:?}");
+                assert!(widths[g.clone()].iter().sum::<u64>() <= GDN_POST_ROWS, "{widths:?}");
+            }
+        }
+    }
 
     fn qwen38_27b_spec() -> ModelSpec {
         let cfg = r#"{
