@@ -148,7 +148,8 @@ pub struct Kv8Load<'a> {
     pub family: &'a str,
 }
 
-/// The load takes FP8 K/V (`kv8_load_check`); the error says what refused it.
+/// The load takes FP8 K/V (`kv8_load_check`) exactly when the check returns `KrNone`: the laws
+/// `kv8_accepted_*` state what that result rules out. The error says what refused it.
 pub fn check_fp8_load(l: &Kv8Load) -> Result<(), String> {
     match kv8_load_check(
         l.kv_calibrate,

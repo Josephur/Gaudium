@@ -4,6 +4,8 @@
 #   - The bytes of one cache element and of one position of one layer's cache, per dtype
 #   - Which caches take the configured dtype (those whose graphs have the FP8 attention kernels
 #     and a scale table: the trunk's) and which stay BF16
+#   - Which engines take an FP8 setting; which prefill cores read which caches, and the widest
+#     prefill tile an FP8 cache takes
 #   - The block the V rows of a cache are permuted in, per dtype
 #   - Which head shapes the FP8 attention kernels take (one FP8 vector per cache row, the scale
 #     table's group slots)
@@ -166,6 +168,26 @@ def kv_vperm_rows(d: KvDtype) -> Nat:
       128n
     case KvFp8{}:
       256n
+
+# Whether a prefill tile whose form asks for the half-width core (`asked`: BF16 scores and the
+# core's own V relayout of a BF16 cache) builds it on a cache of dtype `d`. The core reads BF16
+# caches only, so a tile on an FP8 cache builds the full-width core instead.
+def kv_half_core_taken(asked: Bool, d: KvDtype) -> Bool:
+  match d:
+    case KvBf16{}:
+      asked
+    case KvFp8{}:
+      False{}
+
+# The rows a prefill tile asked for with `rows` rows (an explicit width or a candidate) takes on a
+# trunk cache of dtype `d`: a BF16 cache as asked, an FP8 cache at most `fp8_max` rows (the widest
+# FP8 attention tile measured correct on the card, a parameter of the rule).
+def kv_tile_rows(+rows: Nat, d: KvDtype, +fp8_max: Nat) -> Nat:
+  match d:
+    case KvBf16{}:
+      rows
+    case KvFp8{}:
+      Nat.min(rows, fp8_max)
 
 # ============================================================================
 # 3. The FP8 attention kernels' shape rule
@@ -335,6 +357,84 @@ def kc_gate_decode(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool) -> {Bool.and(kv8_l
                 case True{}:
                   {==}
 
+# The refusal r as a type: `t` for KrNone{}, `f` for every refusal (erased before Rust codegen).
+def kc_none_type(r: Kv8Refusal, t: Type, f: Type) -> Type:
+  match r:
+    case KrNone{}:
+      t
+    case KrCalibration{}:
+      f
+    case KrFamily{}:
+      f
+    case KrShape{}:
+      f
+    case KrDecode{}:
+      f
+
+# What an accepted result (`KrNone{}`) of `kv8_refusal` rules out, one lemma per condition: a
+# refusal is never `KrNone{}` (erased before Rust codegen).
+def kc_none_not_calibrating(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool, ok: {kv8_refusal(c, fa, sh, dc) == KrNone{} : Kv8Refusal}) -> {c == False{} : Bool}:
+  match c:
+    case True{}:
+      %ok : kc_none_type(_, {True{} == False{} : Bool}, Unit)
+      Unit{}
+    case False{}:
+      {==}
+
+def kc_none_family(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool, ok: {kv8_refusal(c, fa, sh, dc) == KrNone{} : Kv8Refusal}) -> {fa == True{} : Bool}:
+  match c:
+    case True{}:
+      %ok : kc_none_type(_, {fa == True{} : Bool}, Unit)
+      Unit{}
+    case False{}:
+      match fa:
+        case False{}:
+          %ok : kc_none_type(_, {False{} == True{} : Bool}, Unit)
+          Unit{}
+        case True{}:
+          {==}
+
+def kc_none_shape(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool, ok: {kv8_refusal(c, fa, sh, dc) == KrNone{} : Kv8Refusal}) -> {sh == True{} : Bool}:
+  match c:
+    case True{}:
+      %ok : kc_none_type(_, {sh == True{} : Bool}, Unit)
+      Unit{}
+    case False{}:
+      match fa:
+        case False{}:
+          %ok : kc_none_type(_, {sh == True{} : Bool}, Unit)
+          Unit{}
+        case True{}:
+          match sh:
+            case False{}:
+              %ok : kc_none_type(_, {False{} == True{} : Bool}, Unit)
+              Unit{}
+            case True{}:
+              {==}
+
+def kc_none_decode(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool, ok: {kv8_refusal(c, fa, sh, dc) == KrNone{} : Kv8Refusal}) -> {dc == True{} : Bool}:
+  match c:
+    case True{}:
+      %ok : kc_none_type(_, {dc == True{} : Bool}, Unit)
+      Unit{}
+    case False{}:
+      match fa:
+        case False{}:
+          %ok : kc_none_type(_, {dc == True{} : Bool}, Unit)
+          Unit{}
+        case True{}:
+          match sh:
+            case False{}:
+              %ok : kc_none_type(_, {dc == True{} : Bool}, Unit)
+              Unit{}
+            case True{}:
+              match dc:
+                case False{}:
+                  %ok : kc_none_type(_, {False{} == True{} : Bool}, Unit)
+                  Unit{}
+                case True{}:
+                  {==}
+
 # ============================================================================
 # 6. Row order of the V projection
 # ============================================================================
@@ -476,19 +576,58 @@ law kv8_plain_decode_ok:
 def kv8_plain_decode_ok():
   {==}
 
-# Not sealed: the law review found it guarantees its promise only while `kv_is_fp8` is right (with
-# `kv_is_fp8(KvFp8{})` wrong, `kv_setting_taken(False{}, KvFp8{})` is True and the law still
-# holds). Proposed instead: `kv_setting_taken(False{}, KvFp8{}) == False{}`.
 # promise: an engine without the FP8 attention kernels never takes an FP8 K/V setting
 # harm: a load asked for FP8 K/V would run, and report, BF16 caches without saying so
-law kv_fp8_needs_fp8_attention:
-  for +d: KvDtype
-  {Bool.and(kv_setting_taken(False{}, d), kv_is_fp8(d)) == False{} : Bool}
+law kv_fp8_refused_without_fp8_attention:
+  {kv_setting_taken(False{}, KvFp8{}) == False{} : Bool}
 
-def kv_fp8_needs_fp8_attention(d):
+def kv_fp8_refused_without_fp8_attention():
+  {==}
+
+# promise: the half-width prefill core, which reads BF16 caches only, is never built on an FP8 cache
+# harm: its BF16 scores and V relayout would read FP8 bytes as BF16 values, and the prefill would write wrong K/V and hidden states
+law kv_half_core_never_fp8:
+  for a: Bool
+  {kv_half_core_taken(a, KvFp8{}) == False{} : Bool}
+
+def kv_half_core_never_fp8(a):
+  {==}
+
+# promise: a prefill tile builds the half-width core only when its form asks for it
+# harm: a load whose form turned the core off would still build it
+law kv_half_core_only_asked:
+  for d: KvDtype
+  {kv_half_core_taken(False{}, d) == False{} : Bool}
+
+def kv_half_core_only_asked(d):
   match d:
     case KvBf16{}: {==}
     case KvFp8{}: {==}
+
+# promise: a prefill tile on an FP8 cache never has more rows than the widest FP8 tile measured correct
+# harm: a wider FP8 attention tile, measured to give NaN rows past one cache chunk, would prefill wrong K/V and hidden states
+law kv_tile_rows_fp8_within:
+  for +t: Nat
+  for +m: Nat
+  {Nat.is_le(kv_tile_rows(t, KvFp8{}, m), m) == True{} : Bool}
+
+def kv_tile_rows_fp8_within(t, m):
+  kc_min_le_r(t, m)
+
+# promise: the cache dtype only ever narrows a prefill tile, never makes it wider than the tile asked for
+# harm: a tile wider than every width asked for (an explicit width or a candidate, at most the engine's widest) would overrun buffers sized for those widths
+law kv_tile_rows_not_wider:
+  for +t: Nat
+  for d: KvDtype
+  for +m: Nat
+  {Nat.is_le(kv_tile_rows(t, d, m), t) == True{} : Bool}
+
+def kv_tile_rows_not_wider(t, d, m):
+  match d:
+    case KvBf16{}:
+      L.nat_le_refl(t)
+    case KvFp8{}:
+      kc_min_le_l(t, m)
 
 # promise: a calibration load, of the K/V maxima or of the activation scales, never takes FP8 K/V
 # harm: a calibration would measure through the FP8 attention, the K/V maxima already clipped by the multipliers they are meant to choose
@@ -567,3 +706,78 @@ law kv8_table_covers_heads:
 
 def kv8_table_covers_heads(a, b):
   kc_eq_lt_excl(a, b)
+
+# The four laws below state the load gate's guarantees on the result Rust matches on: a load is
+# accepted exactly when `kv8_load_check` returns `KrNone{}` (`core/kv_cache.rs` `check_fp8_load`).
+
+# promise: a load the FP8 K/V check accepts is never a calibration load, of the K/V maxima or of the activation scales
+# harm: a calibration would measure through the FP8 attention, the K/V maxima already clipped by the multipliers they are meant to choose
+law kv8_accepted_not_calibrating:
+  for +kc: Bool
+  for +ac: Bool
+  for +m: Bool
+  for +n: Nat
+  for +w: Nat
+  for +k: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: KvDecode
+  for ok: {kv8_load_check(kc, ac, m, n, w, k, r, s, f) == KrNone{} : Kv8Refusal}
+  {Bool.or(kc, ac) == False{} : Bool}
+
+def kv8_accepted_not_calibrating(kc, ac, m, n, w, k, r, s, f, ok):
+  kc_none_not_calibrating(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, k, r, s), kv8_decode_ok(f), ok)
+
+# promise: a load the FP8 K/V check accepts always has a family that has run FP8 K/V on the card
+# harm: graphs nothing has validated on FP8 K/V would serve tokens without a checked reference
+law kv8_accepted_family:
+  for +kc: Bool
+  for +ac: Bool
+  for +m: Bool
+  for +n: Nat
+  for +w: Nat
+  for +k: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: KvDecode
+  for ok: {kv8_load_check(kc, ac, m, n, w, k, r, s, f) == KrNone{} : Kv8Refusal}
+  {kv8_family_ok(m, n) == True{} : Bool}
+
+def kv8_accepted_family(kc, ac, m, n, w, k, r, s, f, ok):
+  kc_none_family(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, k, r, s), kv8_decode_ok(f), ok)
+
+# promise: a load the FP8 K/V check accepts always has a head shape the FP8 attention kernels accept
+# harm: the kernels would read cache rows or scale-table slots its heads do not have
+law kv8_accepted_shape:
+  for +kc: Bool
+  for +ac: Bool
+  for +m: Bool
+  for +n: Nat
+  for +w: Nat
+  for +k: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: KvDecode
+  for ok: {kv8_load_check(kc, ac, m, n, w, k, r, s, f) == KrNone{} : Kv8Refusal}
+  {kv8_shape_ok(w, k, r, s) == True{} : Bool}
+
+def kv8_accepted_shape(kc, ac, m, n, w, k, r, s, f, ok):
+  kc_none_shape(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, k, r, s), kv8_decode_ok(f), ok)
+
+# promise: a load the FP8 K/V check accepts always serves a decode form that may run on FP8 K/V
+# harm: a drafter never checked against FP8-K/V K=0 would serve its tokens as exact
+law kv8_accepted_decode:
+  for +kc: Bool
+  for +ac: Bool
+  for +m: Bool
+  for +n: Nat
+  for +w: Nat
+  for +k: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: KvDecode
+  for ok: {kv8_load_check(kc, ac, m, n, w, k, r, s, f) == KrNone{} : Kv8Refusal}
+  {kv8_decode_ok(f) == True{} : Bool}
+
+def kv8_accepted_decode(kc, ac, m, n, w, k, r, s, f, ok):
+  kc_none_decode(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, k, r, s), kv8_decode_ok(f), ok)

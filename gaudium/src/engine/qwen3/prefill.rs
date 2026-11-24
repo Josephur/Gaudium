@@ -52,6 +52,11 @@ pub const GDN_CHUNK: u64 = 64;
 pub const TILE_MAX: u64 = 512;
 /// Tile widths tried in order when the width is not fixed: the widest whose scratch fits.
 const TILE_CANDIDATES: [u64; 2] = [512, 256];
+/// [kv8] Widest prefill tile an FP8 K/V cache takes (`kv_tile_rows`), measured on the card
+/// (SynapseAI 1.24, issue #63): the 512-row FP8 attention tile gives NaN rows once it reads more
+/// than one cache chunk (any softmax build, with or without chunk groups); 256-row tiles are
+/// correct at every chunk count.
+pub const KV8_TILE_MAX: u64 = 256;
 /// `CAST_ROUND_HALF_NE` of `ns_ConvertToFp8::Params::round_mode`.
 const CAST_ROUND_HALF_NE: u32 = 0;
 
@@ -198,12 +203,6 @@ impl PrefillOpts {
     }
 }
 
-/// [kv8] The half-width core (BF16 scores, its own V relayout of the BF16 cache) reads BF16 caches:
-/// the one place that decides whether a load may build it.
-fn half_core_allowed(spec: &ModelSpec) -> bool {
-    !crate::verified::kv_is_fp8(super::kv8::trunk_dtype(spec))
-}
-
 /// The recipe forms one model's tiles are built in ([`PrefillOpts`] resolved against the model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileForm {
@@ -246,8 +245,15 @@ impl TileForm {
         } else {
             0
         };
-        let s16 = if fastexp && dense_hybrid && half_core_allowed(spec) {
+        let s16_asked = if fastexp && dense_hybrid {
             o.s16.unwrap_or(s16_default)
+        } else {
+            0
+        };
+        // [kv8] the half-width core (BF16 scores, its own V relayout of the BF16 cache) reads
+        // BF16 caches only (`kv_half_core_taken`)
+        let s16 = if crate::verified::kv_half_core_taken(s16_asked > 0, super::kv8::trunk_dtype(spec)) {
+            s16_asked
         } else {
             0
         };
@@ -307,18 +313,21 @@ impl TileForm {
     /// Tile widths tried when the width is not fixed, widest first. The 512-row tile was
     /// measured with the tile forms only, so a model on the serial DeltaNet kernels or the
     /// plain softmax keeps the 256-row tile those recipes were validated at.
-    pub fn tile_candidates(&self, spec: &ModelSpec) -> &'static [u64] {
-        if crate::verified::kv_is_fp8(crate::engine::qwen3::kv8::trunk_dtype(&spec)) {
-            // [kv8] measured on the card (SynapseAI 1.24, issue #63): the 512-row FP8 attention
-            // tile gives NaN rows once it reads more than one cache chunk (any softmax build,
-            // with or without chunk groups); 256-row tiles are correct at every chunk count
-            return &TILE_CANDIDATES[1..];
-        }
-        if self.fastexp && (self.mme || spec.n_linear_layers() == 0) {
+    pub fn tile_candidates(&self, spec: &ModelSpec) -> Vec<u64> {
+        let form: &[u64] = if self.fastexp && (self.mme || spec.n_linear_layers() == 0) {
             &TILE_CANDIDATES
         } else {
             &TILE_CANDIDATES[1..]
-        }
+        };
+        // [kv8] each width as the trunk's cache takes it (`kv_tile_rows`: an FP8 cache at most
+        // KV8_TILE_MAX rows)
+        let d = super::kv8::trunk_dtype(spec);
+        let mut v: Vec<u64> = form
+            .iter()
+            .map(|&w| crate::verified::kv_tile_rows(w, d, KV8_TILE_MAX))
+            .collect();
+        v.dedup();
+        v
     }
 
     fn label(&self) -> String {
@@ -513,7 +522,8 @@ fn append_attn_first_tile(
 
     let ao = gb.add_persistent_tensor(format!("{lpfx}ao"), SynDataType::Float, &[dh, r, nkv]);
     // the half-width core reads BF16 caches: an FP8 layer never takes it, whatever the form
-    let s16 = form.s16 > 0 && half_core_allowed(spec);
+    // (`kv_half_core_taken`)
+    let s16 = crate::verified::kv_half_core_taken(form.s16 > 0, super::kv8::cache_dtype(spec, lpfx));
     let gsz = chunk_groups(nch, form.groups);
     if gsz.len() == 1 && !s16 {
         // one group: the plain node chain with the tile builds of the softmax and the combine
@@ -1714,7 +1724,7 @@ impl TileRt {
             opts,
             form,
             tile: if opts.tile > 0 {
-                opts.tile
+                crate::verified::kv_tile_rows(opts.tile, super::kv8::trunk_dtype(spec), KV8_TILE_MAX)
             } else {
                 form.tile_candidates(spec)[0]
             },
@@ -1971,20 +1981,22 @@ impl TileRt {
         verbose: bool,
         fits: &dyn Fn(u64, u64) -> bool,
     ) -> Result<(u64, u64), String> {
-        let widest = self.form.tile_candidates(spec)[0];
         let candidates: Vec<u64> = if self.opts.tile > 0 {
-            // [kv8] an FP8 K/V load takes no tile wider than its candidates (`tile_candidates`)
-            if crate::verified::kv_is_fp8(crate::engine::qwen3::kv8::trunk_dtype(&spec)) && self.opts.tile > widest {
+            // [kv8] a fixed width as the trunk's cache takes it (`kv_tile_rows`)
+            let t = crate::verified::kv_tile_rows(
+                self.opts.tile,
+                super::kv8::trunk_dtype(spec),
+                KV8_TILE_MAX,
+            );
+            if t != self.opts.tile {
                 eprintln!(
-                    "[gaudium] prefill tile {} -> {widest} rows: FP8 K/V prefill tiles are at most {widest} rows",
+                    "[gaudium] prefill tile {} -> {t} rows: FP8 K/V prefill tiles are at most {KV8_TILE_MAX} rows",
                     self.opts.tile
                 );
-                vec![widest]
-            } else {
-                vec![self.opts.tile]
             }
+            vec![t]
         } else {
-            self.form.tile_candidates(spec).to_vec()
+            self.form.tile_candidates(spec)
         };
         let mut chosen = None;
         for (i, &tile) in candidates.iter().enumerate() {

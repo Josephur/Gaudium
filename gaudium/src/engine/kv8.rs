@@ -122,6 +122,10 @@ pub fn resolve(
     let family = format!("{:?}", spec.family);
     check_fp8_load(&Kv8Load {
         kv_calibrate: cfg.kv_calibrate,
+        // the trunk's activation calibration. The drafter's (`--draft-fp8-calibrate`) is not a
+        // calibration load here: it reads back only the drafter's own BF16 buffers, the table it
+        // writes feeds neither K/V table (`--kv-calibrate` loads no drafter), and the FP8-K/V
+        // chain verify keeps the tokens those of FP8-K/V K=0 whatever the drafter proposes
         act_calibrate: cfg.fp8_calibrate,
         moe: spec.is_moe(),
         n_linear: spec.n_linear_layers() as u64,
@@ -259,7 +263,8 @@ impl Qwen3Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::qwen3::prefill::{build_attn_tile_graph, PrefillOpts, TileForm};
+    use crate::engine::qwen3::prefill::{build_attn_tile_graph, PrefillOpts, TileForm, KV8_TILE_MAX};
+    use crate::verified::kv_tile_rows;
 
     fn spec_27b(kv: KvDtype) -> ModelSpec {
         let cfg = r#"{
@@ -352,8 +357,14 @@ mod tests {
         let b = spec_27b(KvDtype::KvBf16);
         let form = TileForm::resolve(&PrefillOpts::default(), &f);
         assert_eq!(form.s16, 0);
-        // 256-row tiles only (the 512-row FP8 tile is wrong past one chunk on the card)
+        // 256-row tiles only (the 512-row FP8 tile is wrong past one chunk on the card): today's
+        // measured width, pinned here (the law only bounds an FP8 tile by it)
         assert_eq!(form.tile_candidates(&f), &[256]);
+        assert_eq!(KV8_TILE_MAX, 256);
+        for (asked, fp8, bf16) in [(512, 256, 512), (256, 256, 256), (128, 128, 128)] {
+            assert_eq!(kv_tile_rows(asked, KvDtype::KvFp8, KV8_TILE_MAX), fp8);
+            assert_eq!(kv_tile_rows(asked, KvDtype::KvBf16, KV8_TILE_MAX), bf16);
+        }
         assert_eq!(TileForm::resolve(&PrefillOpts::default(), &b).tile_candidates(&b)[0], 512);
         assert!(form.extra_elfs(&f).contains(&"GAUDIUM_ASOFTCX8_ELF"));
         assert!(!form.extra_elfs(&b).contains(&"GAUDIUM_ASOFTCX8_ELF"));
@@ -377,6 +388,18 @@ mod tests {
                 .iter()
                 .all(|n| n.guid != "gaudium_attn_softmax16"));
         }
+        // today a BF16 cache builds the core whenever its form asks for it (a policy, pinned
+        // here: the law only says an FP8 cache never does)
+        let mut b8w = spec_27b(KvDtype::KvBf16);
+        b8w.fp8_weights = true;
+        let bform = TileForm::resolve(&PrefillOpts::default(), &b8w);
+        assert_eq!(bform.s16, 2);
+        let att = build_attn_tile_graph(&b8w, 256, 262144, 64, &bform, &[], &[]);
+        assert!(att
+            .node_io_views()
+            .iter()
+            .any(|n| n.guid == "gaudium_attn_softmax16"));
+        assert!(crate::verified::kv_half_core_taken(true, KvDtype::KvBf16));
     }
 
     /// Every channel of a head lands on one row of the same 128-row block, for both dtypes (a
