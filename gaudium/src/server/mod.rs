@@ -2532,9 +2532,8 @@ impl TurnQueue {
                         // over once more (the verified rule a lane session's admissions use)
                         let at = self.clock(st.waiting[pos].since);
                         for w in &mut st.waiting[..pos] {
-                            if crate::core::lanes::passes_over(self.clock(w.since), at) {
-                                w.skips += 1;
-                            }
+                            let passed = crate::core::lanes::passes_over(self.clock(w.since), at);
+                            w.skips = crate::core::lanes::skips_after(w.skips, passed);
                         }
                         st.waiting.remove(pos);
                         st.busy = true;
@@ -2574,9 +2573,8 @@ impl TurnQueue {
         let at = self.clock(since);
         let mut st = self.mu.lock().unwrap();
         for w in st.waiting.iter_mut() {
-            if crate::core::lanes::passes_over(self.clock(w.since), at) {
-                w.skips += 1;
-            }
+            let passed = crate::core::lanes::passes_over(self.clock(w.since), at);
+            w.skips = crate::core::lanes::skips_after(w.skips, passed);
         }
     }
 }
@@ -2671,7 +2669,7 @@ fn drive_lanes(state: Arc<AppState>, idx: usize) {
         let st = &state;
         let mut last_busy = 1u64;
         feed.on_lanes = Some(Box::new(move |busy| {
-            let busy = busy.max(1);
+            let busy = crate::core::lanes::session_active(busy);
             if busy != last_busy {
                 last_busy = busy;
                 {

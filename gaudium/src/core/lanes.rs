@@ -273,6 +273,16 @@ pub fn next_turn_of(waiting: impl IntoIterator<Item = (bool, bool)>) -> Option<u
     best.map(|(i, _)| i)
 }
 
+/// A waiter's count of times passed over, after a turn that `passed` it over or not.
+pub fn skips_after(skips: u32, passed: bool) -> u32 {
+    u32::try_from(crate::verified::ln_skips_after(u64::from(skips), passed)).unwrap_or(u32::MAX)
+}
+
+/// The active requests a running lane session counts with `busy` lanes busy.
+pub fn session_active(busy: u64) -> u64 {
+    crate::verified::ln_session_active(busy)
+}
+
 /// Would admitting a request that arrived at `request` pass over the oldest waiter for the card
 /// (arrived at `waiter`, its turn `due`)?
 pub fn admission_blocked(due: bool, waiter: u64, request: u64) -> bool {
@@ -426,6 +436,15 @@ mod tests {
         assert_eq!(next_turn_of([(false, false), (false, true), (false, true)]), Some(1));
         assert_eq!(next_turn_of([(false, false), (false, false)]), Some(0));
         assert_eq!(next_turn_of([(true, false), (true, true)]), Some(0), "the first due one");
+    }
+
+    #[test]
+    fn skips_and_the_sessions_active_count() {
+        assert_eq!(skips_after(2, true), 3);
+        assert_eq!(skips_after(2, false), 2);
+        assert_eq!(skips_after(u32::MAX, true), u32::MAX, "saturates at the type's end");
+        assert_eq!(session_active(0), 1, "a running session counts as one request");
+        assert_eq!(session_active(3), 3);
     }
 
     #[test]

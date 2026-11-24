@@ -176,6 +176,19 @@ def turn_rank(due: Bool, loaded: Bool) -> Nat:
 def turn_better(a: Nat, b: Nat) -> Bool:
   Nat.is_gt(a, b)
 
+# A waiter's skip count after the card's turn went to a request that `passed` it over or not.
+def ln_skips_after(skips: Nat, passed: Bool) -> Nat:
+  match passed:
+    case True{}:
+      Nat.add(1n, skips)
+    case False{}:
+      skips
+
+# The active requests a running lane session counts with `busy` lanes busy: at least one while it
+# holds the card (so the card is not released under it).
+def ln_session_active(busy: Nat) -> Nat:
+  Nat.max(1n, busy)
+
 # Does a request that arrived at `request` pass over a waiter for the card that arrived at
 # `waiter` (both on one clock)? Only a waiter that arrived first is passed over.
 def ln_passes_over(waiter: Nat, request: Nat) -> Bool:
@@ -1336,3 +1349,56 @@ def turn_due_keeps_turn(d, l1, l2):
     case False{} True{} False{}: {==}
     case False{} False{} True{}: {==}
     case False{} False{} False{}: {==}
+
+def ln_gt_succ_self(+s: Nat) -> {True{} == Nat.is_gt(1n+s, s) : Bool}:
+  match s:
+    case 0n:
+      {==}
+    case 1n+p:
+      ln_gt_succ_self(p)
+
+# promise: every time a waiter for the card is passed over, it counts toward its limit.
+law ln_skips_count_pass:
+  for +s: Nat
+  {Nat.is_gt(ln_skips_after(s, True{}), s) == True{} : Bool}
+
+def ln_skips_count_pass(s):
+  %ln_gt_succ_self(s) : {_ == True{} : Bool}
+  {==}
+
+# promise: a waiter's count of times passed over never goes down while it waits.
+law ln_skips_never_drop:
+  for +s: Nat
+  for +p: Bool
+  {Nat.is_le(s, ln_skips_after(s, p)) == True{} : Bool}
+
+def ln_skips_never_drop(s, p):
+  match p:
+    case True{}:
+      L.nat_add_le_l(1n, s)
+    case False{}:
+      L.nat_le_refl(s)
+
+# promise: a waiter that was not passed over is not charged a skip.
+law ln_skips_unpassed_kept:
+  for +s: Nat
+  {Nat.is_le(ln_skips_after(s, False{}), s) == True{} : Bool}
+
+def ln_skips_unpassed_kept(s):
+  L.nat_le_refl(s)
+
+# promise: a running lane session counts as at least one active request, so the card is never released under it.
+law ln_session_active_counts:
+  for +b: Nat
+  {Nat.is_le(1n, ln_session_active(b)) == True{} : Bool}
+
+def ln_session_active_counts(b):
+  L.nat_max_ge_l(1n, b)
+
+# promise: a running lane session counts at least as many active requests as it has busy lanes.
+law ln_session_active_covers_lanes:
+  for +b: Nat
+  {Nat.is_le(b, ln_session_active(b)) == True{} : Bool}
+
+def ln_session_active_covers_lanes(b):
+  L.nat_max_ge_r(1n, b)
