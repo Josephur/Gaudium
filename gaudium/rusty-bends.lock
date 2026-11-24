@@ -612,6 +612,8 @@ e8dd4d122e82d747  kv_wv_rows_distinct_256  law kv_wv_rows_distinct_256 : for + a
 72939e08483e2782  live_write_forced_not_deferred  law live_write_forced_not_deferred : for has_writer : Bool { lw_is_defer ( live_write_route ( has_writer , True { } ) ) == False { } : Bool }
 2e68cb9c0d45b0de  live_write_no_writer_no_defer  law live_write_no_writer_no_defer : for force : Bool { lw_is_defer ( live_write_route ( False { } , force ) ) == False { } : Bool }
 37c4cba4beb87a11  live_write_off_the_caller  law live_write_off_the_caller : for force : Bool { lw_is_inline ( live_write_route ( True { } , force ) ) == False { } : Bool }
+08929c37d3de1cf5  ln_admit_stamp_latest  law ln_admit_stamp_latest : for + c : Nat for + s : Nat { Bool.or ( Nat.is_gt ( s , c ) , Nat.is_gt ( ln_admit_clock ( c ) , s ) ) == True { } : Bool }
+# promise ln_admit_stamp_latest: a lane admitted now is stamped later than every lane stamped before, so routing reads it as the most recently used.
 b0815bca45eb3881  ln_admit_takes_lane  law ln_admit_takes_lane : { ln_is_free ( ln_step ( LnFree { } , EvLnAdmit { } ) ) == False { } : Bool }
 # promise ln_admit_takes_lane: admitting a request to a free lane makes the lane busy.
 d984ec24670227e3  ln_allowed_moves  law ln_allowed_moves : for + s : LaneState for + ev : LaneEvent { ln_allows ( s , ev ) == Bool.not ( ln_eq ( ln_step ( s , ev ) , s ) ) : Bool }
@@ -624,8 +626,12 @@ c4187b93477568c1  ln_batch_lane_busy  law ln_batch_lane_busy : for + s : LaneSta
 # promise ln_batch_lane_busy: a free lane never takes part in a step.
 3f79c9a164d9c2e1  ln_busy_ignores_admit  law ln_busy_ignores_admit : for + s : LaneState { Bool.or ( ln_is_free ( s ) , ln_eq ( ln_step ( s , EvLnAdmit { } ) , s ) ) == True { } : Bool }
 # promise ln_busy_ignores_admit: a lane that holds a request is never given a second one: admission changes only a free lane.
+41b25fa839202267  ln_cursor_moves_forward  law ln_cursor_moves_forward : for + c : Nat for + e : Nat for + r : Nat { Nat.is_lt ( c , ln_lane_cursor_next ( c , 1n + e , 1n + r ) ) == True { } : Bool }
+# promise ln_cursor_moves_forward: a step that wrote and accepted a row moves the lane's cursor forward.
 4b529e672abc1446  ln_cursor_never_back  law ln_cursor_never_back : for + c : Nat for + e : Nat for + r : Nat { Nat.is_le ( c , ln_lane_cursor_next ( c , e , r ) ) == True { } : Bool }
 # promise ln_cursor_never_back: a step never moves a lane's cursor back.
+5e131b3d031fdd48  ln_cursor_never_past_emitted  law ln_cursor_never_past_emitted : for + c : Nat for + e : Nat for + r : Nat { Nat.is_le ( ln_lane_cursor_next ( c , e , r ) , Nat.add ( c , e ) ) == True { } : Bool }
+# promise ln_cursor_never_past_emitted: a step moves a lane's cursor at most over the rows it accepted.
 e6ce37735cf24bee  ln_cursor_never_past_rows  law ln_cursor_never_past_rows : for + c : Nat for + e : Nat for + r : Nat { Nat.is_le ( ln_lane_cursor_next ( c , e , r ) , Nat.add ( c , r ) ) == True { } : Bool }
 # promise ln_cursor_never_past_rows: a step moves a lane's cursor only over rows the step wrote.
 04929caaa3dc95e3  ln_drain_left_only_by_release  law ln_drain_left_only_by_release : for + ev : LaneEvent { Bool.or ( ln_ev_is_release ( ev ) , ln_is_drain ( ln_step ( LnDrain { } , ev ) ) ) == True { } : Bool }
@@ -654,8 +660,12 @@ ec1806058792e6c2  ln_next_admits_only_waiting  law ln_next_admits_only_waiting :
 # promise ln_next_admits_only_waiting: a lane session admits a request only when one waits.
 84c2c0d2b09602c1  ln_next_idle_moves  law ln_next_idle_moves : for + b : Bool { ln_sm_waits ( ln_session_next ( True { } , True { } , b ) ) == False { } : Bool }
 # promise ln_next_idle_moves: a lane session with no lane busy and a request waiting admits it or hands the card's turn back; it never sits idle.
+0354e5b4588e39c6  ln_next_idle_never_waits  law ln_next_idle_never_waits : for + w : Bool for + b : Bool { ln_sm_waits ( ln_session_next ( True { } , w , b ) ) == False { } : Bool }
+# promise ln_next_idle_never_waits: a lane session with no lane busy never sits holding the card: it ends, admits a request or hands the turn back.
 1457e46a286b70bc  ln_next_never_admits_blocked  law ln_next_never_admits_blocked : for + i : Bool for + w : Bool { ln_sm_admits ( ln_session_next ( i , w , True { } ) ) == False { } : Bool }
 # promise ln_next_never_admits_blocked: a lane session never admits a request that would pass over a waiter whose turn on the card is due.
+88c7149c0a8570f4  ln_next_never_ends_busy  law ln_next_never_ends_busy : for + w : Bool for + b : Bool { ln_sm_ends ( ln_session_next ( False { } , w , b ) ) == False { } : Bool }
+# promise ln_next_never_ends_busy: a lane session never ends while one of its lanes is busy.
 997e51c25ac0c3f7  ln_next_never_ends_waiting  law ln_next_never_ends_waiting : for + i : Bool for + b : Bool { ln_sm_ends ( ln_session_next ( i , True { } , b ) ) == False { } : Bool }
 # promise ln_next_never_ends_waiting: a lane session never ends while a request of its model waits.
 a388dd3e65dec6b0  ln_next_never_yields_busy  law ln_next_never_yields_busy : for + w : Bool for + b : Bool { ln_sm_yields ( ln_session_next ( False { } , w , b ) ) == False { } : Bool }
@@ -1055,6 +1065,8 @@ d6f5f339fd83fcd8  tool_invalid_choice_never_forces  law tool_invalid_choice_neve
 8bbd01462fd1da03  top_k_clamped_to_vocab  law top_k_clamped_to_vocab : for + k : Nat for + v : Nat { Nat.is_le ( clamp_top_k ( k , v ) , v ) == True { } : Bool }
 fb48a38269eaafac  tree_over_max_nodes_rejected  law tree_over_max_nodes_rejected : for + mn : Nat for + extra : Nat for + sp : Nat for md : Nat for tk : Nat { tree_shape_bounds_valid ( Nat.add ( mn , 1n + extra ) , sp , mn , md , tk ) == False { } : Bool }
 f438ba027c288a28  tree_self_parent_rejected  law tree_self_parent_rejected : for + i : Nat for + d : Nat for pd : Nat for r : Nat for + sp : Nat for tk : Nat { tree_node_valid ( i , i , d , pd , r , sp , tk ) == False { } : Bool }
+d38c417fe8fc6948  turn_better_strict  law turn_better_strict : for + r : Nat { turn_better ( r , r ) == False { } : Bool }
+# promise turn_better_strict: a waiter never takes the card's turn from an equally ranked waiter that arrived before it.
 de268a1486c5450c  turn_due_after_max_skips  law turn_due_after_max_skips : for + w : Nat for + mw : Nat for + ms : Nat for + e : Nat { turn_due ( w , mw , Nat.add ( ms , e ) , ms ) == True { } : Bool }
 # promise turn_due_after_max_skips: a waiter passed over its maximum number of times is due: no request passes it over any more.
 5b87da18e5435668  turn_due_after_max_wait  law turn_due_after_max_wait : for + w : Nat for + e : Nat for + s : Nat for + ms : Nat { turn_due ( Nat.add ( w , e ) , w , s , ms ) == True { } : Bool }

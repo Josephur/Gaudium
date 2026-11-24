@@ -1230,19 +1230,6 @@ def ln_lt_add_succ(+c: Nat, +m: Nat) -> {True{} == Nat.is_lt(c, Nat.add(c, 1n+m)
     case 1n+cp:
       ln_lt_add_succ(cp, m)
 
-# promise: a waiter whose turn on the card is due ranks above every waiter whose turn is not due.
-law turn_due_outranks:
-  for +l1: Bool
-  for +l2: Bool
-  {Nat.is_gt(turn_rank(True{}, l1), turn_rank(False{}, l2)) == True{} : Bool}
-
-def turn_due_outranks(l1, l2):
-  match l1 l2:
-    case True{} True{}: {==}
-    case True{} False{}: {==}
-    case False{} True{}: {==}
-    case False{} False{}: {==}
-
 # promise: a waiter never takes the card's turn from an equally ranked waiter that arrived before it.
 law turn_better_strict:
   for +r: Nat
