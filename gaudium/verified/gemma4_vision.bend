@@ -110,6 +110,22 @@ def g4v_grid_ok(+patch: Nat, +pool: Nat, +npos: Nat) -> Bool:
 def g4v_tower_ok(+layers: Nat, +inter: Nat) -> Bool:
   Bool.and(Nat.is_gt(layers, 0n), Nat.is_gt(inter, 0n))
 
+# A size the config may give (`has`): when it does, it is `want`.
+def g4v_given_eq(has: Bool, +v: Nat, +want: Nat) -> Bool:
+  match has:
+    case True{}:
+      Nat.is_eq(v, want)
+    case False{}:
+      True{}
+
+# Whether the unified embedder's sizes agree with what its graph builds: its merged patch (`mp`,
+# when the config gives one) is the processor's `pool x pool` patches of `patch` pixels a side,
+# and its projection (`proj`, when given) keeps the embedding width `hid`. Refused on overflow:
+# the sizes come from a checkpoint's config.
+# rusty-bends: total
+def g4v_unified_ok(has_mp: Bool, +mp: Nat, +patch: Nat, +pool: Nat, has_proj: Bool, +proj: Nat, +hid: Nat) -> Bool:
+  Bool.and(g4v_given_eq(has_mp, mp, Nat.mul(patch, pool)), g4v_given_eq(has_proj, proj, hid))
+
 # ============================================================================
 # 2b. Capacity of the image path (sizes the up-front plan)
 # ============================================================================
@@ -1037,3 +1053,49 @@ def g4v_pool_rows_distinct(i, nbxp, pp):
   %Equal.sym(Nat, Nat.add(Nat.mul(Nat.div(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp), 1n+nbxp), Nat.mod(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), 1n+nbxp)), Nat.div(i, Nat.mul(1n+pp, 1n+pp)), L.nat_div_mod_r(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), nbxp)) : {Nat.add(Nat.mul(_, Nat.mul(1n+pp, 1n+pp)), Nat.add(Nat.mul(Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), 1n+pp), Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp))) == i : Nat}
   %Equal.sym(Nat, Nat.add(Nat.mul(Nat.div(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp), 1n+pp), Nat.mod(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), 1n+pp)), Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), L.nat_div_mod_r(Nat.mod(i, Nat.mul(1n+pp, 1n+pp)), pp)) : {Nat.add(Nat.mul(Nat.div(i, Nat.mul(1n+pp, 1n+pp)), Nat.mul(1n+pp, 1n+pp)), _) == i : Nat}
   L.nat_div_mod_r(i, Nat.add(pp, Nat.mul(pp, 1n+pp)))
+
+# (e and g) and not e is false.
+def g4v_and_not_l(e: Bool, g: Bool) -> {Bool.and(Bool.and(e, g), Bool.not(e)) == False{} : Bool}:
+  match e:
+    case True{}:
+      g4u_and_false_r(g)
+    case False{}:
+      {==}
+
+# (m and f) and not f is false.
+def g4v_and_not_r(m: Bool, f: Bool) -> {Bool.and(Bool.and(m, f), Bool.not(f)) == False{} : Bool}:
+  match m:
+    case True{}:
+      g4v_and_not_self(f)
+    case False{}:
+      {==}
+
+# LAW G4V.22
+# promise: a unified embedder whose merged patch is not the processor's pool x pool patches is refused.
+# harm: the embedder's weights would read merged patches of another size than the processor writes.
+law g4v_unified_refuses_other_patch:
+  for +mp: Nat
+  for +p: Nat
+  for +q: Nat
+  for hp: Bool
+  for +pr: Nat
+  for +h: Nat
+  {Bool.and(g4v_unified_ok(True{}, mp, p, q, hp, pr, h), Nat.is_ne(mp, Nat.mul(p, q))) == False{} : Bool}
+
+def g4v_unified_refuses_other_patch(mp, p, q, hp, pr, h):
+  g4v_and_not_l(Nat.is_eq(mp, Nat.mul(p, q)), g4v_given_eq(hp, pr, h))
+
+# LAW G4V.23
+# promise: a unified embedder whose projection changes the embedding width is refused.
+# harm: the embedder's graph would take a projection of another width than its weights hold.
+law g4v_unified_refuses_other_width:
+  for hm: Bool
+  for +mp: Nat
+  for +p: Nat
+  for +q: Nat
+  for +pr: Nat
+  for +h: Nat
+  {Bool.and(g4v_unified_ok(hm, mp, p, q, True{}, pr, h), Nat.is_ne(pr, h)) == False{} : Bool}
+
+def g4v_unified_refuses_other_width(hm, mp, p, q, pr, h):
+  g4v_and_not_r(g4v_given_eq(hm, mp, Nat.mul(p, q)), Nat.is_eq(pr, h))

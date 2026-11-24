@@ -31,7 +31,7 @@ use crate::fp8::f32_to_bf16_rne;
 use crate::json::{parse_json, JsonValue};
 use crate::verified::{
     g4v_grid_ok, g4v_pool_count, g4v_pool_x, g4v_pool_y, g4v_size_ok, g4v_table_holds, g4v_soft_budget, g4v_target_h,
-    g4v_target_w, g4v_tokens, g4v_tower_ok, g4v_width_ok,
+    g4v_target_w, g4v_tokens, g4v_tower_ok, g4v_unified_ok, g4v_width_ok,
 };
 use crate::vision::preprocess::{resize_rgb, PreparedImage, RgbImage};
 use crate::vision::{ImageProcessor, VisionSpec};
@@ -168,12 +168,23 @@ impl G4vDims {
             Some("gemma4_unified_vision") => {
                 let patch = need("patch_size")?;
                 let pool = need("pooling_kernel_size")?;
-                if u("model_patch_size").is_some_and(|m| m != patch * pool) {
-                    return Err("vision_config.model_patch_size is not patch_size x pooling_kernel_size".into());
-                }
                 let hid = need("mm_embed_dim")?;
-                if u("output_proj_dims").is_some_and(|o| o != hid) {
-                    return Err("vision_config.output_proj_dims differs from mm_embed_dim".into());
+                // the merged patch and the projection agree with the graph (the verified guard;
+                // `None`: the sizes overflow)
+                let (mp, proj) = (u("model_patch_size"), u("output_proj_dims"));
+                let agree = g4v_unified_ok(
+                    mp.is_some(),
+                    mp.unwrap_or(0),
+                    patch,
+                    pool,
+                    proj.is_some(),
+                    proj.unwrap_or(0),
+                    hid,
+                );
+                if agree != Some(true) {
+                    return Err(format!(
+                        "vision_config: model_patch_size {mp:?} must be patch_size x pooling_kernel_size ({patch} x {pool}), output_proj_dims {proj:?} must be mm_embed_dim ({hid})"
+                    ));
                 }
                 Self {
                     kind: G4vKind::Unified,

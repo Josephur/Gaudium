@@ -78,6 +78,17 @@ fn the_two_image_paths_parse() {
     assert!(vision_spec(TOWER_31B, Some(r#"{"image_processor": {"resample": 2}}"#), None).is_err());
     let grouped = TOWER_31B.replace("\"num_key_value_heads\": 16", "\"num_key_value_heads\": 4");
     assert!(G4vDims::from_config_json(&grouped).is_err());
+    // the unified embedder's merged patch and projection must agree with its graph
+    for bad in [
+        UNIFIED_12B.replace("\"model_patch_size\": 48", "\"model_patch_size\": 32"),
+        UNIFIED_12B.replace("\"output_proj_dims\": 3840", "\"output_proj_dims\": 2560"),
+    ] {
+        assert!(G4vDims::from_config_json(&bad).is_err());
+    }
+    let unstated = UNIFIED_12B
+        .replace("\"model_patch_size\": 48, ", "")
+        .replace("\"output_proj_dims\": 3840, ", "");
+    assert!(G4vDims::from_config_json(&unstated).is_ok());
 }
 
 #[test]
