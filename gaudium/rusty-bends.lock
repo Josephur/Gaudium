@@ -954,6 +954,9 @@ fb6c210645fe5d7b  vis_plan_keeps_earlier  law vis_plan_keeps_earlier : for + p :
 # promise vis_plan_keeps_earlier: raising the tower plan for one more need never shrinks what it covered before.
 4f4494b9557ea579  vis_request_count_grows  law vis_request_count_grows : for + c : Nat for + i : Nat { Nat.is_le ( c , vis_request_tokens ( c , i ) ) == True { } : Bool }
 # promise vis_request_count_grows: counting one more image never lowers the image tokens already counted for the request.
+6008833297a9cba3  vis_request_counts_all  law vis_request_counts_all : for + c : Nat for + i : Nat { Nat.is_le ( Nat.add ( c , i ) , vis_request_tokens ( c , i ) ) == True { } : Bool }
+# promise vis_request_counts_all: a request's image-token count covers the tokens counted before plus the added image's, so it covers all of the request's images.
+# harm vis_request_counts_all: the embedding buffer could be planned for fewer rows than a multi-image request holds.
 0d8da77fa48e204f  vis_rows_full_refuses  law vis_rows_full_refuses : for + cap : Nat for + extra : Nat { vis_rows_fit ( cap , 1n + extra , cap ) == False { } : Bool }
 9c1d124ed35699fb  vis_rows_left_le_cap  law vis_rows_left_le_cap : for + used : Nat for + cap : Nat { Nat.is_le ( vis_rows_left ( used , cap ) , cap ) == True { } : Bool }
 ed5641dd62da3f42  vis_rows_take_le_cap  law vis_rows_take_le_cap : for + used : Nat for + add : Nat for + cap : Nat { Nat.is_le ( vis_rows_take ( used , add , cap ) , cap ) == True { } : Bool }
@@ -968,19 +971,50 @@ bf9e4e50104d5d6a  vis_unknown_drafter_text_only  law vis_unknown_drafter_text_on
 # promise vis_unknown_drafter_text_only: a model whose drafter is not one the vision table knows is always served text only.
 # harm vis_unknown_drafter_text_only: an unknown drafter could read image-pad embeddings and be served with images unchecked.
 bf27fed2cf696824  vit_zero_h_rejected  law vit_zero_h_rejected : for + t : Nat for + w : Nat for m : Nat { vit_grid_valid ( t , 0n , w , m ) == False { } : Bool }
+6c4d7459f601ae04  vs_default_form_is_exact  law vs_default_form_is_exact : for + m : Bool { vs_method_opt_in ( m , False { } ) == False { } : Bool }
+# promise vs_default_form_is_exact: a method whose own options select no opt-in form is never exempt from token identity to K=0, even when the suite file marks it opt-in.
+# harm vs_default_form_is_exact: a default mode labelled opt-in by mistake would be allowed to fork from K=0.
 e29b2cb7cd71d285  vs_default_method_is_exact  law vs_default_method_is_exact : { vs_identity_ok ( VsTracedTie { } , False { } ) == False { } : Bool }
 # promise vs_default_method_is_exact: a default speculative method passes only with tokens identical to the engine's own K=0 stream.
 # harm vs_default_method_is_exact: a default mode that forks from K=0 would change what users get once images are on.
+895d960153be9625  vs_fork_fails_default  law vs_fork_fails_default : for + r : Bool for + f : Bool for + t : Bool { vs_identity_ok ( vs_fork_outcome ( r , f , t ) , False { } ) == False { } : Bool }
+# promise vs_fork_fails_default: a run that diverged from K=0 never passes a default speculative method, whatever its margin trace shows.
+# harm vs_fork_fails_default: a default mode could fork from K=0 at a traced tie and still be reported as exact.
+bdce58860e39a043  vs_fork_needs_all_ties  law vs_fork_needs_all_ties : for + r : Bool for + f : Bool for + b : Bool { vs_identity_ok ( vs_fork_outcome ( r , f , False { } ) , b ) == False { } : Bool }
+# promise vs_fork_needs_all_ties: a run that diverged from K=0 never passes the suite when any traced disagreement is not a tie.
+# harm vs_fork_needs_all_ties: an opt-in mode could fork at a real difference after a first tie and still pass.
+6db8a45918c13784  vs_fork_needs_first_trace  law vs_fork_needs_first_trace : for + r : Bool for + t : Bool for + b : Bool { vs_identity_ok ( vs_fork_outcome ( r , False { } , t ) , b ) == False { } : Bool }
+# promise vs_fork_needs_first_trace: a run that diverged from K=0 never passes the suite unless its first divergence is among the traced positions.
+# harm vs_fork_needs_first_trace: the fork that changed the output could be one no trace looked at.
+4a29d5ba6bc84947  vs_fork_needs_replay  law vs_fork_needs_replay : for + f : Bool for + t : Bool for + b : Bool { vs_identity_ok ( vs_fork_outcome ( False { } , f , t ) , b ) == False { } : Bool }
+# promise vs_fork_needs_replay: a run that diverged from K=0 never passes the suite unless the replay of its whole stream on the K=0 loop completed.
+# harm vs_fork_needs_replay: a fork later in a cut-off replay would go untraced and the run would still pass.
 969a423886b513bc  vs_missing_run_fails  law vs_missing_run_fails : for b : Bool { vs_identity_ok ( VsMissing { } , b ) == False { } : Bool }
 # promise vs_missing_run_fails: a run whose identity against K=0 was never reported never passes the suite.
 # harm vs_missing_run_fails: a crashed or cut-off run would count as a pass.
 104465da19e9bad2  vs_row_needs_clean_after  law vs_row_needs_clean_after : for i : Bool for s : Bool { vs_row_ok ( i , s , False { } ) == False { } : Bool }
 # promise vs_row_needs_clean_after: a row passes only when the text request after the image requests gave a fresh engine's tokens.
 # harm vs_row_needs_clean_after: an image request that leaves state behind would go unnoticed.
+1f9e019d30660a6f  vs_row_needs_clean_exit  law vs_row_needs_clean_exit : for + c : Bool { vs_row_verdict ( c , False { } ) == False { } : Bool }
+# promise vs_row_needs_clean_exit: a row whose process ended with an error or a signal never passes, whatever its reports show.
+# harm vs_row_needs_clean_exit: a crash after the last report, with launches still queued, would go unnoticed.
 206140ba9b1c1904  vs_row_needs_identity  law vs_row_needs_identity : for s : Bool for a : Bool { vs_row_ok ( False { } , s , a ) == False { } : Bool }
 # promise vs_row_needs_identity: a row passes only when every run's identity against K=0 passed.
 d5eefbeedaf264ff  vs_row_needs_semantics  law vs_row_needs_semantics : for i : Bool for a : Bool { vs_row_ok ( i , False { } , a ) == False { } : Bool }
 # promise vs_row_needs_semantics: a row passes only when every semantic answer check passed.
+096899c23da06eba  vs_row_verdict_needs_checks  law vs_row_verdict_needs_checks : for + e : Bool { vs_row_verdict ( False { } , e ) == False { } : Bool }
+# promise vs_row_verdict_needs_checks: a row whose identity, answer or after-request checks failed never passes, even when its process exited cleanly.
+9d8aef4754ed3b48  vs_suite_needs_a_row  law vs_suite_needs_a_row : for + s : Nat for + a : Bool { vs_suite_ok ( s , 0n , a ) == False { } : Bool }
+# promise vs_suite_needs_a_row: a suite run that ran no row at all never passes.
+# harm vs_suite_needs_a_row: an empty selection (a mistyped --only) would report success.
+d89d8e29a265d77b  vs_suite_needs_every_pass  law vs_suite_needs_every_pass : for + s : Nat for + r : Nat { vs_suite_ok ( s , r , False { } ) == False { } : Bool }
+# promise vs_suite_needs_every_pass: a suite run with any failed row never passes.
+920fb466ce1f7386  vs_suite_needs_every_row  law vs_suite_needs_every_row : for + r : Nat for + k : Nat for + a : Bool { vs_suite_ok ( Nat.add ( r , 1n + k ) , r , a ) == False { } : Bool }
+# promise vs_suite_needs_every_row: a suite run that stopped before every selected row ran never passes, even when every row that ran passed.
+# harm vs_suite_needs_every_row: an interrupted run would report success for rows it never checked.
+7ea2c79c12cdc6fd  vs_unmarked_method_is_exact  law vs_unmarked_method_is_exact : for + f : Bool { vs_method_opt_in ( False { } , f ) == False { } : Bool }
+# promise vs_unmarked_method_is_exact: a method the suite file does not mark as opt-in is never exempt from token identity to K=0, whatever its options select.
+# harm vs_unmarked_method_is_exact: a speculative method could fork from K=0 without anyone having marked it as an opt-in mode.
 bda193789ce4a897  vs_untraced_fork_fails  law vs_untraced_fork_fails : for b : Bool { vs_identity_ok ( VsFork { } , b ) == False { } : Bool }
 # promise vs_untraced_fork_fails: a run that forked from K=0 anywhere but at a traced tie never passes the suite.
 # harm vs_untraced_fork_fails: an opt-in mode could fork at real differences and still be reported as passing.
