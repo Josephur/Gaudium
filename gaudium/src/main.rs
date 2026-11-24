@@ -152,13 +152,14 @@ fn print_usage() {
          \x20                       free lane where it takes over the most of its prompt for the\n\
          \x20                       least of another conversation's rows. Dense Qwen3 /\n\
          \x20                       Qwen3.5 / Qwen3.8 models without a drafter or with a DSpine\n\
-         \x20                       drafter whose verify rows are checkpointed or replayed\n\
-         \x20                       (--gdn-verify checkpoint, the default, or replay, which keeps\n\
-         \x20                       no per-row state copies: about 2 GiB less per lane on the\n\
-         \x20                       27B). With replay each lane verifies at a width of its own,\n\
-         \x20                       the narrowest or the widest --draft-k, chosen every step from\n\
-         \x20                       its own acceptance and the measured step times; with\n\
-         \x20                       checkpoint every lane steps at the narrowest. Other models are\n\
+         \x20                       drafter whose verify rows are replayed or checkpointed:\n\
+         \x20                       lanes take the replay form (no per-row state copies, about\n\
+         \x20                       2 GiB less per lane on the 27B) unless GAUDIUM_GDN_VERIFY\n\
+         \x20                       names a form. With replay each lane verifies at a width of\n\
+         \x20                       its own, the narrowest or the widest --draft-k, chosen every\n\
+         \x20                       step from its own acceptance and the measured step times;\n\
+         \x20                       with checkpoint every lane steps at the narrowest. Other\n\
+         \x20                       models are\n\
          \x20                       served with one lane (the log says why). /props total_slots\n\
          \x20                       and /slots show the lanes. Not with --cache-ram yet (the\n\
          \x20                       host-RAM tier is off for a model served with lanes)\n\
@@ -475,7 +476,7 @@ fn print_usage() {
          \x20                       several values let the engine pick a width per step from\n\
          \x20                       acceptance (mtp: every step then drafts the widest listed block;\n\
          \x20                       --parallel lanes: each lane at the narrowest or the widest\n\
-         \x20                       listed with --gdn-verify replay, else at the narrowest)\n\
+         \x20                       listed in the replay form, else at the narrowest)\n\
          \x20 --sweep-draft-k       Measurement: with several --draft-k widths, run every request once\n\
          \x20                       per listed width as a fixed-width run, then once with the width\n\
          \x20                       policy (one engine load for a whole width sweep)\n\
@@ -1230,6 +1231,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     cfg.step.draft_fp8_calibrate = draft_fp8_calibrate;
     if let Some(v) = gdn_verify {
         cfg.step.gdn_verify = v;
+        cfg.step.gdn_verify_asked = true;
     }
     if let Some(v) = k0_pipeline {
         cfg.step.k0_pipeline = v;

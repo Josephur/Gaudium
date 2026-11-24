@@ -1358,7 +1358,7 @@ impl Qwen3Engine {
             cfg.spec
                 .as_ref()
                 .map(|sc| matches!(sc.method, spec::SpecMethod::DSpine { .. })),
-            cfg.step.gdn_verify,
+            crate::engine::lane_verify(&cfg.step, cfg.lanes),
         );
         // (a calibration load: of the FP8 weights' activation sites, or of the K/V caches)
         let lanes_ok = crate::verified::ln_lanes_ok(
@@ -1368,6 +1368,13 @@ impl Qwen3Engine {
         );
         let n_lanes =
             crate::verified::ln_served_lanes(cfg.lanes, crate::engine::MAX_LANES, lanes_ok) as usize;
+        // [lanes] the verify form of the speculative steps (several lanes: the replay form unless
+        // a form was named)
+        let step_opts = {
+            let mut o = cfg.step.clone();
+            o.gdn_verify = crate::engine::lane_verify(&cfg.step, n_lanes as u64);
+            o
+        };
         if (n_lanes as u64) < cfg.lanes {
             eprintln!(
                 "[gaudium] lanes: {n_lanes} of the {} asked for (this engine, drafter or load has no batched steps for more)",
@@ -1594,8 +1601,7 @@ impl Qwen3Engine {
                         crate::core::lanes::lane_width(sc.draft_k.iter().copied()).unwrap_or(1);
                     let wide =
                         crate::core::lanes::lane_width_wide(sc.draft_k.iter().copied()).unwrap_or(narrow);
-                    let replay =
-                        cfg.step.gdn_verify == crate::engine::step_opts::GdnVerify::Replay;
+                    let replay = step_opts.gdn_verify == crate::engine::step_opts::GdnVerify::Replay;
                     let ring = crate::core::lanes::lane_ring_rows(narrow + 1, wide + 1, replay);
                     // the narrow width and the widest one the rings hold (the same one when they
                     // hold the narrow rows only)
@@ -1617,7 +1623,7 @@ impl Qwen3Engine {
                 cfg.verbose || plan_only,
                 samp.is_some(),
                 plan_only,
-                &cfg.step,
+                &step_opts,
             )?),
             None => None,
         };

@@ -2097,3 +2097,79 @@ law ln_ahead_lands_when_ended:
 
 def ln_ahead_lands_when_ended():
   {==}
+
+# ============================================================================
+# 9. The verify form of a lanes load
+# ============================================================================
+
+# The forms of a speculative step's DeltaNet verify rows: a state copy per row (checkpoint), the
+# rows' updates replayed onto the start state (replay), or the opt-in MME form, which may leave
+# the K=0 stream at a near-tie.
+type VerifyForm is Data:
+  VfCheckpoint{}
+  VfReplay{}
+  VfMme{}
+
+def ln_vf_is_mme(f: VerifyForm) -> Bool:
+  match f:
+    case VfCheckpoint{}: False{}
+    case VfReplay{}: False{}
+    case VfMme{}: True{}
+
+def ln_verify_pick(asked: Bool, many: Bool, form: VerifyForm) -> VerifyForm:
+  match asked:
+    case True{}:
+      form
+    case False{}:
+      match many:
+        case True{}:
+          VfReplay{}
+        case False{}:
+          form
+
+# The form of a load's verify rows: the one asked for (`asked`: `form` was named), else for a
+# load of several lanes (`lanes`) the replay form (its rings keep the rows' updates instead of a
+# state per row: less memory, and room for a width of its own per lane), else the default `form`.
+def ln_lane_verify(asked: Bool, form: VerifyForm, lanes: Nat) -> VerifyForm:
+  ln_verify_pick(asked, Nat.is_gt(lanes, 1n), form)
+
+# promise: a verify form that was asked for is the one a load takes.
+law ln_lane_verify_keeps_asked:
+  for f: VerifyForm
+  for +n: Nat
+  {ln_lane_verify(True{}, f, n) == f : VerifyForm}
+
+def ln_lane_verify_keeps_asked(f, n):
+  {==}
+
+# promise: a load of one lane takes the form it is given.
+law ln_lane_verify_one_lane:
+  for +a: Bool
+  for f: VerifyForm
+  {ln_lane_verify(a, f, 1n) == f : VerifyForm}
+
+def ln_lane_verify_one_lane(a, f):
+  match a:
+    case True{}: {==}
+    case False{}: {==}
+
+def ln_verify_mme_aux(a: Bool, m: Bool, +f: VerifyForm) -> {Bool.or(Bool.not(ln_vf_is_mme(ln_verify_pick(a, m, f))), ln_vf_is_mme(f)) == True{} : Bool}:
+  match a:
+    case True{}:
+      ln_or_not_self(ln_vf_is_mme(f))
+    case False{}:
+      match m:
+        case True{}:
+          {==}
+        case False{}:
+          ln_or_not_self(ln_vf_is_mme(f))
+
+# promise: a load's verify rows never take the MME form (which may leave the K=0 stream) unless that form was the one given.
+law ln_lane_verify_mme_only_given:
+  for +a: Bool
+  for +f: VerifyForm
+  for +n: Nat
+  {Bool.or(Bool.not(ln_vf_is_mme(ln_lane_verify(a, f, n))), ln_vf_is_mme(f)) == True{} : Bool}
+
+def ln_lane_verify_mme_only_given(a, f, n):
+  ln_verify_mme_aux(a, Nat.is_gt(n, 1n), f)

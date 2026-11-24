@@ -457,6 +457,24 @@ pub fn lane_drafter(
     )
 }
 
+/// The verify form of a load of `lanes` lanes with step options `opts` (the verified
+/// `ln_lane_verify`): the form asked for, else for several lanes the replay form, else the
+/// default. The engine and the server both ask this.
+pub fn lane_verify(opts: &step_opts::StepOpts, lanes: u64) -> step_opts::GdnVerify {
+    use crate::verified::VerifyForm;
+    use step_opts::GdnVerify;
+    let form = match opts.gdn_verify {
+        GdnVerify::Checkpoint => VerifyForm::VfCheckpoint,
+        GdnVerify::Replay => VerifyForm::VfReplay,
+        GdnVerify::Mme => VerifyForm::VfMme,
+    };
+    match crate::verified::ln_lane_verify(opts.gdn_verify_asked, form, lanes) {
+        VerifyForm::VfCheckpoint => GdnVerify::Checkpoint,
+        VerifyForm::VfReplay => GdnVerify::Replay,
+        VerifyForm::VfMme => GdnVerify::Mme,
+    }
+}
+
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
 pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
     use crate::core::kv_cache::check_setting_taken;
@@ -564,6 +582,18 @@ mod lane_drafter_tests {
         assert!(matches!(lane_drafter(Some(true), GdnVerify::Checkpoint), LaneDrafter::LdDSpine));
         assert!(matches!(lane_drafter(Some(true), GdnVerify::Replay), LaneDrafter::LdDSpine));
         assert!(matches!(lane_drafter(Some(true), GdnVerify::Mme), LaneDrafter::LdOther));
+    }
+
+    #[test]
+    fn lanes_take_the_replay_form_unless_a_form_was_named() {
+        use super::{lane_verify, step_opts::StepOpts};
+        let mut o = StepOpts::default();
+        assert_eq!(lane_verify(&o, 1), GdnVerify::Checkpoint);
+        assert_eq!(lane_verify(&o, 4), GdnVerify::Replay);
+        o.gdn_verify_asked = true;
+        assert_eq!(lane_verify(&o, 4), GdnVerify::Checkpoint);
+        o.gdn_verify = GdnVerify::Mme;
+        assert_eq!(lane_verify(&o, 4), GdnVerify::Mme);
         assert!(matches!(lane_drafter(Some(false), GdnVerify::Checkpoint), LaneDrafter::LdOther));
     }
 }
