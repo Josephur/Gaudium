@@ -256,6 +256,12 @@ pub fn session_ends(idle: bool, waiting: bool) -> bool {
     ln_session_ends(idle, waiting)
 }
 
+/// Byte offset of slot `j`'s cursor in the host staging buffer of a step of `b` slots (after the
+/// `b` token ids).
+pub fn stage_cursor(b: u64, j: u64) -> u64 {
+    crate::verified::ln_stage_cursor(b, j)
+}
+
 /// May a slot (`cursor`, `rows`) run in a step over `nch` chunks of a lane of `lane_chunks`?
 pub fn slot_fits(cursor: u64, rows: u64, nch: u64, chunk: u64, lane_chunks: u64) -> bool {
     ln_slot_fits(cursor, rows, nch, chunk, lane_chunks)

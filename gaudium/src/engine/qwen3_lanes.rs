@@ -870,11 +870,11 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
             run.prefill_tok_s = f.prefill_tok_s;
             run.ttft_recipe_ms = f.ttft_recipe_ms;
             run.t_decode = Some(Instant::now());
-            if run.budget.remaining() > 0 && !run.cancel.load(Ordering::Relaxed) {
+            if run.cancel.load(Ordering::Relaxed) {
+                run.stopped_by_cancel = true;
+            } else if !run.done() {
                 eng.live.first_token(Some(f.ttft_ms), 1);
                 run.emit(f.first_tok);
-            } else if run.cancel.load(Ordering::Relaxed) {
-                run.stopped_by_cancel = true;
             }
             Ok(Some(run))
         }
@@ -1074,11 +1074,20 @@ fn step(
     };
     let mut copies = vec![(0usize, 4 * lanes.len(), io_ids)];
     {
+        // token ids first, then one block per slot's cursor (`ln_stage_cursor`: never inside
+        // the ids, never overlapping each other)
+        let last = crate::core::lanes::stage_cursor(b, b.saturating_sub(1)) as usize + 4;
+        if last > eng.stage_io.len() {
+            return Err(format!(
+                "batched step: the inputs of {b} slots need {last} staging bytes, the buffer has {}",
+                eng.stage_io.len()
+            ));
+        }
         let buf = eng.stage_io.as_mut_slice();
         for (j, &l) in lanes.iter().enumerate() {
             let r = runs[l].as_ref().expect("a decoding lane runs");
             buf[4 * j..4 * j + 4].copy_from_slice(&r.cur_tok.to_le_bytes());
-            let off = 64 * (1 + j);
+            let off = crate::core::lanes::stage_cursor(b, j as u64) as usize;
             buf[off..off + 4].copy_from_slice(&(r.cursor as i32).to_le_bytes());
             copies.push((off, 4, io_cursor[j]));
         }

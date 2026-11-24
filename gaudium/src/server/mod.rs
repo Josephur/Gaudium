@@ -1199,17 +1199,18 @@ fn planned_drafter_of(
 /// have batched steps (the dense Qwen3 / Qwen3.5 / Qwen3.8 engine), else one lane, with the
 /// reason.
 fn served_lanes(cfg: &ServerConfig, id: &str, spec: &ModelSpec) -> (usize, Option<&'static str>) {
-    use crate::verified::{ln_drafter_ok, ln_served_lanes, LaneDrafter};
+    use crate::verified::{ln_lanes_ok, ln_served_lanes, LaneDrafter};
     let drafter = match planned_drafter_of(cfg, id) {
         None => LaneDrafter::LdNone,
         Some((_, "dspine", _)) => LaneDrafter::LdDSpine,
         Some(_) => LaneDrafter::LdOther,
     };
     let engine_ok = crate::engine::lanes_supported(spec);
+    // (the server never calibrates)
     let n = ln_served_lanes(
         cfg.parallel,
         crate::engine::MAX_LANES,
-        engine_ok && ln_drafter_ok(drafter),
+        ln_lanes_ok(engine_ok, drafter, false),
     ) as usize;
     let why = (cfg.parallel > 1 && n <= 1).then_some(if engine_ok {
         "its drafter has no batched steps yet"

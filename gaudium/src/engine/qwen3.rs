@@ -1287,9 +1287,11 @@ impl Qwen3Engine {
             Some(spec::SpecMethod::DSpine { .. }) => crate::verified::LaneDrafter::LdDSpine,
             Some(_) => crate::verified::LaneDrafter::LdOther,
         };
-        let lanes_ok = crate::engine::lanes_supported(&spec)
-            && crate::verified::ln_drafter_ok(lane_drafter)
-            && !cfg.fp8_calibrate;
+        let lanes_ok = crate::verified::ln_lanes_ok(
+            crate::engine::lanes_supported(&spec),
+            lane_drafter,
+            cfg.fp8_calibrate,
+        );
         let n_lanes =
             crate::verified::ln_served_lanes(cfg.lanes, crate::engine::MAX_LANES, lanes_ok) as usize;
         if (n_lanes as u64) < cfg.lanes {

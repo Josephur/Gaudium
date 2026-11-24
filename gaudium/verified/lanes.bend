@@ -143,6 +143,11 @@ def ln_run_done(eos: Bool, cancelled: Bool, +remaining: Nat) -> Bool:
 def ln_session_starts(active: Bool) -> Bool:
   Bool.not(active)
 
+# Byte offset of slot `j`'s cursor in the host staging buffer of a step of `b` slots: the
+# step's `b` token ids come first (4 bytes each), then one 64-byte block per slot.
+def ln_stage_cursor(b: Nat, j: Nat) -> Nat:
+  Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n))
+
 # Does the session end, with no lane busy (`idle`) and a request waiting or not?
 def ln_session_ends(idle: Bool, waiting: Bool) -> Bool:
   Bool.and(idle, Bool.not(waiting))
@@ -249,6 +254,11 @@ def ln_drafter_ok(d: LaneDrafter) -> Bool:
       True{}
     case _:
       False{}
+
+# Does a load get lanes? Its engine has batched steps (`engine_ok`), its drafter has, and it is
+# not a calibration load (which runs one request at a time).
+def ln_lanes_ok(engine_ok: Bool, d: LaneDrafter, calibrating: Bool) -> Bool:
+  Bool.and(engine_ok, Bool.and(ln_drafter_ok(d), Bool.not(calibrating)))
 
 # Lanes a model is served with: the lanes asked for (at least one, at most `max`, the most the
 # batched step graphs are built for) when its engine and its drafter have batched steps,
@@ -746,3 +756,98 @@ law ln_prefix_per_lane_within_grant:
 
 def ln_prefix_per_lane_within_grant(g, np):
   ln_div_mul_le(g, np)
+
+# promise: a cancelled request has ended.
+law ln_run_done_when_cancelled:
+  for +e: Bool
+  for +r: Nat
+  {ln_run_done(e, True{}, r) == True{} : Bool}
+
+def ln_run_done_when_cancelled(e, r):
+  match e:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a request that produced an end-of-sequence token has ended.
+law ln_run_done_at_eos:
+  for +c: Bool
+  for +r: Nat
+  {ln_run_done(True{}, c, r) == True{} : Bool}
+
+def ln_run_done_at_eos(c, r):
+  {==}
+
+# promise: a plan's bytes hold its shared part and all its lanes together.
+law ln_plan_counts_all:
+  for +n: Nat
+  for +lb: Nat
+  for +sh: Nat
+  {Nat.is_le(Nat.add(sh, Nat.mul(n, lb)), ln_plan_bytes(n, lb, sh)) == True{} : Bool}
+
+def ln_plan_counts_all(n, lb, sh):
+  L.nat_le_refl(Nat.add(sh, Nat.mul(n, lb)))
+
+# promise: every free lane is one routing may send a request to.
+law ln_free_lane_routable:
+  for +s: LaneState
+  {Bool.or(Bool.not(ln_is_free(s)), ln_route_eligible(s)) == True{} : Bool}
+
+def ln_free_lane_routable(s):
+  match s:
+    case LnFree{}: {==}
+    case LnPrefill{}: {==}
+    case LnDecode{}: {==}
+    case LnDrain{}: {==}
+
+# promise: a request that arrives while its model's session runs never starts a second one.
+law ln_session_once:
+  {ln_session_starts(True{}) == False{} : Bool}
+
+def ln_session_once():
+  {==}
+
+# promise: a calibration load is never given lanes.
+law ln_lanes_never_calibrating:
+  for +e: Bool
+  for +d: LaneDrafter
+  {ln_lanes_ok(e, d, True{}) == False{} : Bool}
+
+def ln_lanes_never_calibrating(e, d):
+  match e d:
+    case True{} LdNone{}: {==}
+    case True{} LdDSpine{}: {==}
+    case True{} LdOther{}: {==}
+    case False{} _: {==}
+
+# promise: an engine without batched steps is never given lanes, whatever its drafter.
+law ln_lanes_need_engine:
+  for +d: LaneDrafter
+  for +c: Bool
+  {ln_lanes_ok(False{}, d, c) == False{} : Bool}
+
+def ln_lanes_need_engine(d, c):
+  {==}
+
+# promise: a slot's cursor in the host staging buffer never lies inside the step's token ids.
+law ln_stage_cursor_after_ids:
+  for +b: Nat
+  for +j: Nat
+  {Nat.is_le(Nat.mul(b, 4n), ln_stage_cursor(b, j)) == True{} : Bool}
+
+def ln_stage_cursor_after_ids(b, j):
+  L.nat_le_trans(Nat.mul(b, 4n), Nat.mul(b, 64n), Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n)), L.nat_mul_le_mono_l(b, 4n, 64n, {==}), L.nat_add_le_r(Nat.mul(b, 64n), Nat.mul(j, 64n)))
+
+# promise: two slots' cursors in the host staging buffer never overlap.
+law ln_stage_cursors_apart:
+  for +b: Nat
+  for +j: Nat
+  {Nat.is_le(Nat.add(ln_stage_cursor(b, j), 4n), ln_stage_cursor(b, 1n+j)) == True{} : Bool}
+
+def ln_stage_cursors_apart(b, j):
+  L.nat_le_trans(
+    Nat.add(Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n)), 4n),
+    Nat.add(Nat.mul(b, 64n), Nat.add(Nat.mul(j, 64n), 4n)),
+    Nat.add(Nat.mul(b, 64n), Nat.add(64n, Nat.mul(j, 64n))),
+    L.nat_le_subst_r(Nat.add(Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n)), 4n), Nat.add(Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n)), 4n), Nat.add(Nat.mul(b, 64n), Nat.add(Nat.mul(j, 64n), 4n)), L.nat_add_assoc(Nat.mul(b, 64n), Nat.mul(j, 64n), 4n), L.nat_le_refl(Nat.add(Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n)), 4n))),
+    L.nat_add_le_mono(Nat.mul(b, 64n), Nat.mul(b, 64n), Nat.add(Nat.mul(j, 64n), 4n), Nat.add(64n, Nat.mul(j, 64n)), L.nat_le_refl(Nat.mul(b, 64n)), L.nat_le_trans(Nat.add(Nat.mul(j, 64n), 4n), Nat.add(4n, Nat.mul(j, 64n)), Nat.add(64n, Nat.mul(j, 64n)), L.nat_le_subst_r(Nat.add(Nat.mul(j, 64n), 4n), Nat.add(Nat.mul(j, 64n), 4n), Nat.add(4n, Nat.mul(j, 64n)), L.nat_add_comm(Nat.mul(j, 64n), 4n), L.nat_le_refl(Nat.add(Nat.mul(j, 64n), 4n))), L.nat_add_le_mono(4n, 64n, Nat.mul(j, 64n), Nat.mul(j, 64n), {==}, L.nat_le_refl(Nat.mul(j, 64n)))))
+  )
