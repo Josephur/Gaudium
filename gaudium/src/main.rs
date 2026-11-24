@@ -488,7 +488,8 @@ fn print_usage() {
          \x20 --kv-cache <d>        K/V cache: bf16 (default) or fp8 (FP8 q / K / V / P in the trunk's\n\
          \x20                       attention, half the K/V bytes; a precision of its own: its K=0\n\
          \x20                       stream is the reference of FP8-K/V speculation. Dense Qwen3.5 / 3.8\n\
-         \x20                       hybrids, K=0 or DSpine; needs the table from --kv-calibrate)\n\
+         \x20                       hybrids, K=0 or DSpine; needs the table from --kv-calibrate;\n\
+         \x20                       its prefill runs 256-row tiles)\n\
          \x20 --kv-scales <file>    K/V calibration the FP8 scale tables are made from (default:\n\
          \x20                       <model_dir>-gaudium-pc/kv_scales.txt)\n\
          \x20 --moe-form <f>        MoE expert execution: dense (default: one masked wide MLP per layer)\n\

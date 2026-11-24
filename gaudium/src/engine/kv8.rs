@@ -340,6 +340,9 @@ mod tests {
         let b = spec_27b(KvDtype::KvBf16);
         let form = TileForm::resolve(&PrefillOpts::default(), &f);
         assert_eq!(form.s16, 0);
+        // 256-row tiles only (the 512-row FP8 tile is wrong past one chunk on the card)
+        assert_eq!(form.tile_candidates(&f), &[256]);
+        assert_eq!(TileForm::resolve(&PrefillOpts::default(), &b).tile_candidates(&b)[0], 512);
         assert!(form.extra_elfs(&f).contains(&"GAUDIUM_ASOFTCX8_ELF"));
         assert!(!form.extra_elfs(&b).contains(&"GAUDIUM_ASOFTCX8_ELF"));
         for form in [TileForm::PLAIN, form, TileForm { s16: 2, ..form }] {

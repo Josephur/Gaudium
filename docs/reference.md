@@ -466,7 +466,8 @@ Generate options:
   --kv-cache <d>        K/V cache: bf16 (default) or fp8 (FP8 q / K / V / P in the trunk's
                         attention, half the K/V bytes; a precision of its own: its K=0
                         stream is the reference of FP8-K/V speculation. Dense Qwen3.5 / 3.8
-                        hybrids, K=0 or DSpine; needs the table from --kv-calibrate)
+                        hybrids, K=0 or DSpine; needs the table from --kv-calibrate;
+                        its prefill runs 256-row tiles)
   --kv-scales <file>    K/V calibration the FP8 scale tables are made from (default:
                         <model_dir>-gaudium-pc/kv_scales.txt)
   --moe-form <f>        MoE expert execution: dense (default: one masked wide MLP per layer)

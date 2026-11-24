@@ -1825,10 +1825,11 @@ impl Qwen3Engine {
         if cfg.verbose || plan_only {
             let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
             eprintln!(
-                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} + state rings {:.2} ({} slots) + prefix reuse {:.2} ({} kept positions) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
+                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} ({}) + state rings {:.2} ({} slots) + prefix reuse {:.2} ({} kept positions) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
                 gib(planned_total),
                 gib(weights_bytes),
                 gib(kv_bytes.saturating_sub(gdn_state_bytes)),
+                crate::core::kv_cache::kv_dtype_name(spec.kv_dtype),
                 gib(gdn_state_bytes),
                 gdn_slots,
                 gib(pfx_bytes),
@@ -2037,8 +2038,9 @@ impl Qwen3Engine {
             mem_report.set_source(
                 "target",
                 format!(
-                    "{model_name}, {} weights",
-                    if spec.fp8_weights { "FP8" } else { "BF16" }
+                    "{model_name}, {} weights, {} K/V",
+                    if spec.fp8_weights { "FP8" } else { "BF16" },
+                    if crate::verified::kv_is_fp8(spec.kv_dtype) { "FP8" } else { "BF16" }
                 ),
             );
             if let Some(sc) = cfg.spec.as_ref() {

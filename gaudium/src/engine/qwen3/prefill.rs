@@ -303,6 +303,12 @@ impl TileForm {
     /// measured with the tile forms only, so a model on the serial DeltaNet kernels or the
     /// plain softmax keeps the 256-row tile those recipes were validated at.
     pub fn tile_candidates(&self, spec: &ModelSpec) -> &'static [u64] {
+        if crate::verified::kv_is_fp8(spec.kv_dtype) {
+            // [kv8] measured on the card (SynapseAI 1.24, issue #11): the 512-row FP8 attention
+            // tile gives NaN rows once it reads more than one cache chunk (any softmax build,
+            // with or without chunk groups); 256-row tiles are correct at every chunk count
+            return &TILE_CANDIDATES[1..];
+        }
         if self.fastexp && (self.mme || spec.n_linear_layers() == 0) {
             &TILE_CANDIDATES
         } else {
@@ -1960,8 +1966,18 @@ impl TileRt {
         verbose: bool,
         fits: &dyn Fn(u64, u64) -> bool,
     ) -> Result<(u64, u64), String> {
+        let widest = self.form.tile_candidates(spec)[0];
         let candidates: Vec<u64> = if self.opts.tile > 0 {
-            vec![self.opts.tile]
+            // [kv8] an FP8 K/V load takes no tile wider than its candidates (`tile_candidates`)
+            if crate::verified::kv_is_fp8(spec.kv_dtype) && self.opts.tile > widest {
+                eprintln!(
+                    "[gaudium] prefill tile {} -> {widest} rows: FP8 K/V prefill tiles are at most {widest} rows",
+                    self.opts.tile
+                );
+                vec![widest]
+            } else {
+                vec![self.opts.tile]
+            }
         } else {
             self.form.tile_candidates(spec).to_vec()
         };
