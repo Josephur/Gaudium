@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use super::vision::graphs::build_embed_vis_graph;
 use super::*;
-use crate::verified::{ikv_feat_row, g4u_ext, g4u_final, g4u_fits, g4u_in_block, g4u_join, g4u_overlaps, g4u_unit_tiles};
+use crate::verified::{g4v_add_part, ikv_feat_row, g4u_ext, g4u_final, g4u_fits, g4u_in_block, g4u_join, g4u_overlaps, g4u_unit_tiles};
 
 /// The vision recipes of the decoder, by kind and tile rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,6 +81,19 @@ impl VisLoad {
         }
         v
     }
+}
+
+/// Arena bytes of the buffers of `extra` unit tiles beyond the first: two layer buffers of
+/// `x_bytes`, ids and extension table of `ids_bytes`, a cursor (each as its sub-allocation takes
+/// it, `g4v_add_part`).
+pub(super) fn unit_bytes(extra: u64, x_bytes: u64, ids_bytes: u64) -> u64 {
+    let mut t = 0u64;
+    for _ in 0..extra {
+        for b in [x_bytes, x_bytes, ids_bytes, 256, ids_bytes] {
+            t = g4v_add_part(t, b);
+        }
+    }
+    t
 }
 
 /// One prefill tile of an image request.

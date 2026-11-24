@@ -11,6 +11,7 @@
 import Base
 import nat_lemmas.bend as L
 import vision_budget.bend as VB
+import tensor_bounds.bend as TB
 
 # ============================================================================
 # 1. Helper lemmas (erased before Rust codegen)
@@ -125,6 +126,15 @@ def g4v_pad_cols(unified: Bool, budget: Nat) -> Nat:
       budget
     case False{}:
       0n
+
+# Device bytes one buffer of `bytes` takes in a sealed arena: at least 256, a whole number of
+# 256-byte steps (what the arena's sub-allocation consumes for it).
+def g4v_part_bytes(+bytes: Nat) -> Nat:
+  TB.align_up(Nat.max(bytes, 256n), 256n)
+
+# A plan's running total after one more buffer of `bytes`.
+def g4v_add_part(total: Nat, +bytes: Nat) -> Nat:
+  Nat.add(total, g4v_part_bytes(bytes))
 
 # ============================================================================
 # 3. Prefill units of the two-way image blocks
@@ -474,3 +484,23 @@ law g4v_soft_budget_within_pixels:
 
 def g4v_soft_budget_within_pixels(px, sp):
   g4v_div_mul_le(px, Nat.add(sp, Nat.mul(sp, 1n+sp)))
+
+# LAW G4V.7
+# promise: the bytes planned for a buffer always cover what its sub-allocation takes (the buffer, and at least 256).
+# harm: a sealed arena would run out before the last buffer of the plan.
+law g4v_part_covers_buffer:
+  for +b: Nat
+  {Nat.is_le(Nat.max(b, 256n), g4v_part_bytes(b)) == True{} : Bool}
+
+def g4v_part_covers_buffer(b):
+  TB.align_up_never_shrinks(Nat.max(b, 256n), 256n)
+
+# LAW G4V.8
+# promise: adding a buffer to a plan grows its total by at least the buffer's bytes.
+law g4v_add_part_covers:
+  for +t: Nat
+  for +b: Nat
+  {Nat.is_le(Nat.add(t, b), g4v_add_part(t, b)) == True{} : Bool}
+
+def g4v_add_part_covers(t, b):
+  L.nat_add_le_mono(t, t, b, g4v_part_bytes(b), L.nat_le_refl(t), L.nat_le_trans(b, Nat.max(b, 256n), g4v_part_bytes(b), L.nat_max_ge_l(b, 256n), TB.align_up_never_shrinks(Nat.max(b, 256n), 256n)))

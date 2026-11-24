@@ -1370,8 +1370,7 @@ impl G4Plan {
             + align256(self.pf_ple_bytes)
             + align256(self.pf_hfin_bytes)
             + self.vis.as_ref().map_or(0, |v| v.act_bytes())
-            + self.unit_extra
-                * (2 * align256(self.pf_x_bytes) + 2 * align256(self.pf_ids_bytes) + 256)
+            + units::unit_bytes(self.unit_extra, self.pf_x_bytes, self.pf_ids_bytes)
     }
 
     fn total(&self, ws_bytes: u64) -> u64 {

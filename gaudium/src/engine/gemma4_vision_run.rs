@@ -25,7 +25,7 @@ use crate::synapse::graph::{CompiledRecipe, GraphBuilder};
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
     g4_lane, ikv_feat_cols, ikv_feat_next, ikv_feat_row, ikv_feat_start, ikv_feat_write_safe,
-    g4v_image_budget, g4v_pad_cols, g4v_recipe_rows, g4v_request_tokens, ikv_rows_match,
+    g4v_add_part, g4v_image_budget, g4v_pad_cols, g4v_recipe_rows, g4v_request_tokens, ikv_rows_match,
     vis_grid_fits, vis_rows_fit,
 };
 use crate::vision::preprocess::PreparedImage;
@@ -33,10 +33,6 @@ use crate::vision::{VisionReport, VisionSpec};
 
 /// Pinned host stage for the per-image inputs (uploaded in pieces of this size).
 const STAGE_BYTES: usize = 16 * 1024 * 1024;
-
-fn align256(n: u64) -> u64 {
-    n.div_ceil(256) * 256
-}
 
 /// Sizes the image path is planned for.
 #[derive(Debug, Clone)]
@@ -151,12 +147,18 @@ pub struct G4vPlan {
 }
 
 impl G4vPlan {
+    /// Arena bytes of the weights: every buffer as its sub-allocation takes it (`g4v_add_part`).
     pub fn weights_bytes(&self) -> u64 {
-        self.weights.values().map(|&b| align256(b)).sum()
+        self.weights.values().fold(0, |t, &b| g4v_add_part(t, b))
     }
 
+    /// Arena bytes of the activations and the two chain buffers.
     pub fn act_bytes(&self) -> u64 {
-        self.acts.values().map(|&b| align256(b)).sum::<u64>() + 2 * align256(self.x_bytes)
+        let acts = self.acts.values().fold(0, |t, &b| g4v_add_part(t, b));
+        if self.x_bytes == 0 {
+            return acts;
+        }
+        g4v_add_part(g4v_add_part(acts, self.x_bytes), self.x_bytes)
     }
 }
 
