@@ -315,6 +315,12 @@ f5d2a6aa6cd5f1f7  ik_counts_apps_within  law ik_counts_apps_within : for + n : N
 9031a48cf2538754  ik_counts_window_within  law ik_counts_window_within : for + n : Nat for + ls : Nat for + le : Nat for + p : Nat for + w : Nat for + nh : Nat for + ma : Nat for + mw : Nat for + mh : Nat { Bool.and ( ik_counts_valid ( n , ls , le , p , w , nh , ma , mw , mh ) , Nat.is_lt ( mw , w ) ) == False { } : Bool }
 # promise ik_counts_window_within: a sliding window the counts guard accepts is within the limit the shell passes.
 # harm ik_counts_window_within: a window from a file could overflow the ring sizing arithmetic
+6754b11552dabd96  ik_decode_no_drafter  law ik_decode_no_drafter : for plain_asked : Bool { ik_decode_runs_drafter ( False { } , plain_asked ) == False { } : Bool }
+# promise ik_decode_no_drafter: an engine without a drafter never runs one
+# harm ik_decode_no_drafter: a request is labelled or run as speculative with no drafter loaded
+5cd93ad1429db3da  ik_decode_plain_no_drafter  law ik_decode_plain_no_drafter : for has_drafter : Bool { ik_decode_runs_drafter ( has_drafter , True { } ) == False { } : Bool }
+# promise ik_decode_plain_no_drafter: a request that asks for the plain decode loop never runs the drafter
+# harm ik_decode_plain_no_drafter: the K = 0 reference of a comparison is itself speculative
 55ee306cf4e5220d  ik_dims_guard_expert_width  law ik_dims_guard_expert_width : for + g : Nat for + nh : Nat for + kv : Nat for + e : Nat for + k : Nat for + ff : Nat for + t : Nat { Bool.and ( ik_dims_valid ( Nat.mul ( 128n , 1n + g ) , nh , kv , 128n , 16n , Nat.mul ( 128n , 1n + e ) , k , ff , t ) , Bool.not ( ik_width_whole ( ff ) ) ) == False { } : Bool }
 # promise ik_dims_guard_expert_width: a shape the guard the shell calls accepts always has an expert width of whole 128-channel blocks.
 # harm ik_dims_guard_expert_width: a later guard could drop the expert-width check and hand the expert kernels a partial block
@@ -345,6 +351,12 @@ a1ceab4457cf184e  ik_nib_partial_refused  law ik_nib_partial_refused : for + c :
 # promise ik_nib_row_consistent: a 4-bit row the geometry accepts (non-zero bytes) has two codes per byte and one scale per 16 codes, covering exactly its columns.
 d0247ecb5a368690  ik_one_pass_no_messages  law ik_one_pass_no_messages : for + p : Nat for + ls : Nat for + le : Nat for + b : Nat { Bool.and ( Nat.is_le ( p , 1n ) , Nat.is_ne ( ik_msg_states ( ik_eff_loop_start ( p , ls , b ) , ik_eff_loop_end ( p , le , b ) , b ) , 0n ) ) == False { } : Bool }
 # promise ik_one_pass_no_messages: a model of one pass has no messages (its schedule's span is empty).
+0d019c9fc4109a11  ik_phase_kept_stays  law ik_phase_kept_stays : for + p : IkPhase for to : IkPhase { ik_phase_moves ( p , to , p , True { } ) == False { } : Bool }
+# promise ik_phase_kept_stays: a phase kept apart keeps its own bytes
+# harm ik_phase_kept_stays: the readout charges the kept phase (the verify pass's readout) to the verify pass
+b9c524c22ec51e7e  ik_phase_target_stays  law ik_phase_target_stays : for + to : IkPhase for keep : IkPhase for has_keep : Bool { ik_phase_moves ( to , to , keep , has_keep ) == False { } : Bool }
+# promise ik_phase_target_stays: the phase a launch is charged as always keeps its own bytes
+# harm ik_phase_target_stays: the readout moves a phase's bytes out of the phase the launch is charged as
 006f9aa91aba2c24  ik_proj_whole_blocks  law ik_proj_whole_blocks : for + nh : Nat for + dr : Nat for + nkv : Nat for + t : Nat { Bool.and ( Nat.is_eq ( Nat.mod ( ik_qx_width ( nh , dr ) , 128n ) , 0n ) , Nat.is_eq ( Nat.mod ( ik_kx_width ( nkv , t ) , 128n ) , 0n ) ) == True { } : Bool }
 # promise ik_proj_whole_blocks: the query-side and key / value projections are whole blocks of 128 channels.
 0b9fb2eb3b0cec5a  ik_qx_holds_rel  law ik_qx_holds_rel : for + nh : Nat for + dr : Nat { Nat.is_le ( Nat.add ( ik_rel_off ( nh ) , Nat.mul ( dr , nh ) ) , ik_qx_width ( nh , dr ) ) == True { } : Bool }
@@ -363,6 +375,9 @@ f2350b24e56a3bd9  ik_ring_holds_vector  law ik_ring_holds_vector : for + w : Nat
 # promise ik_ring_within_bounded: a K / V ring the kernel-bounded sizing returns never has more slots than the chunk the softmax kernel stages.
 03fa217e4c3b12e9  ik_ring_within_is_ring  law ik_ring_within_is_ring : for + w : Nat for + rows : Nat for + mx : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , 0n ) , Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , ik_ring_slots ( w , rows ) ) ) == False { } : Bool }
 # promise ik_ring_within_is_ring: the kernel-bounded sizing returns the K / V ring itself or no ring (0), never a different, smaller one.
+243ce0e6ef0bd6e5  ik_state_positions_some  law ik_state_positions_some : for + slots : Nat for + cols : Nat for + nkv : Nat { Nat.is_lt ( 0n , ik_state_positions ( 1n + slots , cols , nkv ) ) == True { } : Bool }
+# promise ik_state_positions_some: a state tensor with at least one slot row holds at least one position
+# harm ik_state_positions_some: the readout charges a whole cache to every pass that writes one row of it
 1572ee1b0b28002d  ik_states_carry  law ik_states_carry : for + l : Nat for + bp : Nat { ik_states_attn ( 1n + l , 1n + bp ) == ik_states_mlp ( l , 1n + bp ) : Nat }
 # promise ik_states_carry: the block states a layer's attention-input mix reads are exactly the ones the previous layer's MLP-input mix read.
 7e7b86ddb68242ab  ik_states_mlp_covers_attn  law ik_states_mlp_covers_attn : for + l : Nat for + b : Nat { Nat.is_le ( ik_states_attn ( l , b ) , ik_states_mlp ( l , b ) ) == True { } : Bool }
@@ -375,8 +390,14 @@ e30d133c07832426  ik_states_within_max  law ik_states_within_max : for + n : Nat
 # promise ik_states_within_max: on a schedule the guard accepts, no layer's residual mix reads more block states than the kernels hold.
 d1a4f19a096d333c  ik_taps_nonzero  law ik_taps_nonzero : for + t : Nat { Bool.and ( ik_taps_valid ( t ) , Nat.is_eq ( t , 0n ) ) == False { } : Bool }
 # promise ik_taps_nonzero: the shape guard refuses short convolutions without taps.
+08df751e713a9d3f  ik_tile_drafter_runs_ctx  law ik_tile_drafter_runs_ctx : { ik_tile_runs_ctx ( True { } ) == True { } : Bool }
+# promise ik_tile_drafter_runs_ctx: a tile run with a drafter always runs the drafter's context pass over its rows
+# harm ik_tile_drafter_runs_ctx: the drafter drafts without the context of the tile's rows
 1020da00a9c12c67  ik_tile_holds_rows  law ik_tile_holds_rows : for + rows : Nat for + tile : Nat for + room : Nat { Nat.is_le ( rows , ik_tile_rows ( rows , tile , room ) ) == True { } : Bool }
 # promise ik_tile_holds_rows: a prefill tile never has fewer rows than the prompt rows it carries.
+8889a05d549ecadf  ik_tile_last_runs_head  law ik_tile_last_runs_head : { ik_tile_runs_head ( True { } ) == True { } : Bool }
+# promise ik_tile_last_runs_head: the last tile of a prompt always runs the head that gives the request's first token
+# harm ik_tile_last_runs_head: a prompt ends without its first token's readout, or the readout reports none
 43c5cf58b599e634  ik_tile_launches_some  law ik_tile_launches_some : for apps : Nat for drafter : Bool for last : Bool { Nat.is_lt ( 0n , ik_tile_launches ( apps , drafter , last ) ) == True { } : Bool }
 # promise ik_tile_launches_some: a prefill tile always runs at least one launch
 # harm ik_tile_launches_some: the readout reports a tile that ran nothing on the card
