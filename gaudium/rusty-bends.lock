@@ -31,6 +31,9 @@ c969518b535cece3  call_fragment_needs_header  law call_fragment_needs_header : f
 81e5f5a57090c670  call_started_never_abandoned  law call_started_never_abandoned : { call_accepts ( CpArgs { } , CeAbandon { } ) == False { } : Bool }
 8a9c1856c1d5424d  call_stopped_absorbing  law call_stopped_absorbing : for ev : CallEvent { call_step ( CpStopped { } , ev ) == CpStopped { } : CallPhase }
 6de60792641ce27a  call_stopped_accepts_nothing  law call_stopped_accepts_nothing : for ev : CallEvent { call_accepts ( CpStopped { } , ev ) == False { } : Bool }
+f63d6f88affafb04  ctx_for_prompt_admits  law ctx_for_prompt_admits : for + p : Nat for + extra : Nat { prompt_admitted ( 1n + p , Nat.add ( ctx_for_prompt ( 1n + p ) , extra ) ) == True { } : Bool }
+# promise ctx_for_prompt_admits: a capacity of at least ctx_for_prompt(p) admits a non-empty prompt of p tokens, also after it is rounded up to whole cache chunks
+# harm ctx_for_prompt_admits: a calibration load would refuse its own longest prompt after the engine had loaded
 cc2d96177d64bd71  dev_alloc_launch_disjoint  law dev_alloc_launch_disjoint : for + s : DevState { Bool.and ( dev_can_alloc ( s ) , dev_can_launch ( s ) ) == False { } : Bool }
 66013e0cb837f25a  dev_closed_absorbing  law dev_closed_absorbing : for ev : DevEvent { dev_step ( DevClosed { } , ev ) == DevClosed { } : DevState }
 ebbddef48543f39e  dev_drain_blocks_all  law dev_drain_blocks_all : for + s : DevState { Bool.or ( dev_can_alloc ( dev_drain ( s ) ) , Bool.or ( dev_can_dma ( dev_drain ( s ) ) , dev_can_launch ( dev_drain ( s ) ) ) ) == False { } : Bool }
@@ -507,6 +510,18 @@ f42d899343546720  ikv_tokens_zero_cols_refused  law ikv_tokens_zero_cols_refused
 583c506a729fb4d5  kv8_fit_never_clips  law kv8_fit_never_clips : for + a : Nat for + top : Nat for + margin : Nat for + cap : Nat { Bool.or ( Nat.is_lt ( Nat.sub ( top , margin ) , a ) , Nat.is_le ( Nat.add ( a , kv8_fit ( a , top , margin , cap ) ) , Nat.sub ( top , margin ) ) ) == True { } : Bool }
 # promise kv8_fit_never_clips: whenever a multiplier can fit, the scaled maximum stays at or below top - margin, so with a margin of one or more nothing is clipped
 # harm kv8_fit_never_clips: the largest K / V values would saturate at the format's maximum
+eea0924cfa2fa432  kv8_load_needs_decode  law kv8_load_needs_decode : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + h : Nat for + r : Nat for + s : Nat for + f : KvDecode { Bool.and ( kv8_load_taken ( kv8_load_check ( kc , ac , m , n , w , h , r , s , f ) ) , Bool.not ( kv8_decode_ok ( f ) ) ) == False { } : Bool }
+# promise kv8_load_needs_decode: a load that takes FP8 K/V always serves a decode form that may run on FP8 K/V
+# harm kv8_load_needs_decode: a drafter never checked against FP8-K/V K=0 would serve its tokens as exact
+a1c2f97bf00a530d  kv8_load_needs_family  law kv8_load_needs_family : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + h : Nat for + r : Nat for + s : Nat for + f : KvDecode { Bool.and ( kv8_load_taken ( kv8_load_check ( kc , ac , m , n , w , h , r , s , f ) ) , Bool.not ( kv8_family_ok ( m , n ) ) ) == False { } : Bool }
+# promise kv8_load_needs_family: a model whose family has not run FP8 K/V on the card never takes it
+# harm kv8_load_needs_family: graphs nothing has validated on FP8 K/V would serve tokens without a checked reference
+60800cb71d90d8da  kv8_load_needs_shape  law kv8_load_needs_shape : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + h : Nat for + r : Nat for + s : Nat for + f : KvDecode { Bool.and ( kv8_load_taken ( kv8_load_check ( kc , ac , m , n , w , h , r , s , f ) ) , Bool.not ( kv8_shape_ok ( w , h , r , s ) ) ) == False { } : Bool }
+# promise kv8_load_needs_shape: a load that takes FP8 K/V always has a head shape the FP8 attention kernels accept
+# harm kv8_load_needs_shape: the kernels would read cache rows or scale-table slots its heads do not have
+5962855c7c961a1f  kv8_load_never_calibrating  law kv8_load_never_calibrating : for + kc : Bool for + ac : Bool for + m : Bool for + n : Nat for + w : Nat for + h : Nat for + r : Nat for + s : Nat for + f : KvDecode { Bool.and ( kv8_load_taken ( kv8_load_check ( kc , ac , m , n , w , h , r , s , f ) ) , Bool.or ( kc , ac ) ) == False { } : Bool }
+# promise kv8_load_never_calibrating: a calibration load, of the K/V maxima or of the activation scales, never takes FP8 K/V
+# harm kv8_load_never_calibrating: a calibration would measure through the FP8 attention, the K/V maxima already clipped by the multipliers they are meant to choose
 4e94b3b4b28733f7  kv8_min4_within_each  law kv8_min4_within_each : for + a : Nat for + b : Nat for + c : Nat for + d : Nat { Bool.and ( Bool.and ( Nat.is_le ( kv8_min4 ( a , b , c , d ) , a ) , Nat.is_le ( kv8_min4 ( a , b , c , d ) , b ) ) , Bool.and ( Nat.is_le ( kv8_min4 ( a , b , c , d ) , c ) , Nat.is_le ( kv8_min4 ( a , b , c , d ) , d ) ) ) == True { } : Bool }
 # promise kv8_min4_within_each: a layer's one V multiplier is never larger than any of its heads' own
 # harm kv8_min4_within_each: the heads with the largest V values would be clipped
@@ -518,6 +533,12 @@ f42d899343546720  ikv_tokens_zero_cols_refused  law ikv_tokens_zero_cols_refused
 80e696ec1290a904  kv8_shape_within_slots  law kv8_shape_within_slots : for + w : Nat for + n : Nat for + r : Nat for + s : Nat { Bool.and ( kv8_shape_ok ( w , n , r , s ) , Nat.is_lt ( s , n ) ) == False { } : Bool }
 # promise kv8_shape_within_slots: a head shape the FP8 kernels accept never has more kv groups than the scale table has slots
 # harm kv8_shape_within_slots: a group past the table would read another kind's multiplier
+cbf3b034df5d5d27  kv8_table_covers_heads  law kv8_table_covers_heads : for + a : Nat for + b : Nat { Bool.and ( kv8_table_heads_ok ( a , b ) , Nat.is_lt ( a , b ) ) == False { } : Bool }
+# promise kv8_table_covers_heads: a scale table that lists fewer kv heads for a layer than the model has is refused
+# harm kv8_table_covers_heads: a head without its own measured maximum would take another head's V multiplier, and its largest values could clip
+f5cd20a46e2dd85b  kv_bf16_load_stays_bf16  law kv_bf16_load_stays_bf16 : for t : Bool { kv_layer_dtype ( t , KvBf16 { } ) == KvBf16 { } : KvDtype }
+# promise kv_bf16_load_stays_bf16: a load configured for BF16 K/V never gets an FP8 cache
+# harm kv_bf16_load_stays_bf16: a cache would be FP8 without a scale table made for it
 3ecec3b47c1c0b81  kv_elem_nonzero  law kv_elem_nonzero : for d : KvDtype { Nat.is_le ( 1n , kv_elem_bytes ( d ) ) == True { } : Bool }
 # promise kv_elem_nonzero: a cache element always takes at least one byte, so a cache row is never sized zero
 # harm kv_elem_nonzero: the host-RAM tier would lay out rows of zero bytes and copy nothing it needs

@@ -390,8 +390,6 @@ law kv_side_cache_bf16:
 def kv_side_cache_bf16(d):
   {==}
 
-# Not sealed: the reviewer's corrected form of an earlier law that pinned behaviour, waiting for a
-# second review before it enters rusty-bends.lock.
 # promise: a load configured for BF16 K/V never gets an FP8 cache
 # harm: a cache would be FP8 without a scale table made for it
 law kv_bf16_load_stays_bf16:
@@ -478,7 +476,9 @@ law kv8_plain_decode_ok:
 def kv8_plain_decode_ok():
   {==}
 
-# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
+# Not sealed: the law review found it guarantees its promise only while `kv_is_fp8` is right (with
+# `kv_is_fp8(KvFp8{})` wrong, `kv_setting_taken(False{}, KvFp8{})` is True and the law still
+# holds). Proposed instead: `kv_setting_taken(False{}, KvFp8{}) == False{}`.
 # promise: an engine without the FP8 attention kernels never takes an FP8 K/V setting
 # harm: a load asked for FP8 K/V would run, and report, BF16 caches without saying so
 law kv_fp8_needs_fp8_attention:
@@ -490,7 +490,6 @@ def kv_fp8_needs_fp8_attention(d):
     case KvBf16{}: {==}
     case KvFp8{}: {==}
 
-# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
 # promise: a calibration load, of the K/V maxima or of the activation scales, never takes FP8 K/V
 # harm: a calibration would measure through the FP8 attention, the K/V maxima already clipped by the multipliers they are meant to choose
 law kv8_load_never_calibrating:
@@ -508,7 +507,6 @@ law kv8_load_never_calibrating:
 def kv8_load_never_calibrating(kc, ac, m, n, w, h, r, s, f):
   kc_gate_calibrating(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, h, r, s), kv8_decode_ok(f))
 
-# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
 # promise: a model whose family has not run FP8 K/V on the card never takes it
 # harm: graphs nothing has validated on FP8 K/V would serve tokens without a checked reference
 law kv8_load_needs_family:
@@ -526,7 +524,6 @@ law kv8_load_needs_family:
 def kv8_load_needs_family(kc, ac, m, n, w, h, r, s, f):
   kc_gate_family(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, h, r, s), kv8_decode_ok(f))
 
-# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
 # promise: a load that takes FP8 K/V always has a head shape the FP8 attention kernels accept
 # harm: the kernels would read cache rows or scale-table slots its heads do not have
 law kv8_load_needs_shape:
@@ -544,7 +541,6 @@ law kv8_load_needs_shape:
 def kv8_load_needs_shape(kc, ac, m, n, w, h, r, s, f):
   kc_gate_shape(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, h, r, s), kv8_decode_ok(f))
 
-# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
 # promise: a load that takes FP8 K/V always serves a decode form that may run on FP8 K/V
 # harm: a drafter never checked against FP8-K/V K=0 would serve its tokens as exact
 law kv8_load_needs_decode:
@@ -562,7 +558,6 @@ law kv8_load_needs_decode:
 def kv8_load_needs_decode(kc, ac, m, n, w, h, r, s, f):
   kc_gate_decode(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, h, r, s), kv8_decode_ok(f))
 
-# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
 # promise: a scale table that lists fewer kv heads for a layer than the model has is refused
 # harm: a head without its own measured maximum would take another head's V multiplier, and its largest values could clip
 law kv8_table_covers_heads:

@@ -383,7 +383,6 @@ law top_k_clamped_to_vocab:
 def top_k_clamped_to_vocab(k, v):
   tb_min_le_r(k, v)
 
-# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
 # promise: a capacity of at least ctx_for_prompt(p) admits a non-empty prompt of p tokens, also after it is rounded up to whole cache chunks
 # harm: a calibration load would refuse its own longest prompt after the engine had loaded
 law ctx_for_prompt_admits:
