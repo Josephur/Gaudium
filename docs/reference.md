@@ -55,6 +55,10 @@ Usage:
                                             fixed images (gaudium/tests/vision_suite), one
                                             --generate process per row, one after another
                                             (this process never opens the card)
+  gaudium --trim-cache --cache-max-gb <N> [options]
+                                            Remove the least recently used recipes of the
+                                            recipe cache until it fits N GiB (host only;
+                                            safe beside a server using the directory)
   gaudium --fp8-pack --model <dir> --fp8-cache <dir>
                                             Quantise a Gemma 4 BF16 checkpoint's matrices into an
                                             FP8 cache directory (host only, no card)
@@ -72,6 +76,14 @@ Serve options:
   --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)
   --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)
   --no-cache            Disable on-disk compiled recipe cache
+  --cache-max-gb <N>    Trim the recipe cache to N GiB (decimals allowed) in the
+                        background: once the first model load is done (at start with
+                        --lazy), then every --cache-trim-every minutes, least recently
+                        used recipes first (see --trim-cache; default: never trimmed).
+                        Recipes this server has loaded or compiled are never removed
+  --cache-keep-days <D> With --cache-max-gb: recipes used within D days are kept even
+                        over the budget (default: 1; decimals allowed)
+  --cache-trim-every <M> With --cache-max-gb: minutes between trims (default: 60)
   --lazy                Start without holding Gaudi 2; load on first chat/start
   --build-cache         With --serve: compile every recipe the served models load into
                         the recipe cache and exit, without opening the card and without
@@ -566,6 +578,16 @@ lines, the largest |K| and |V| per kv head; FP8 K/V takes its V multipliers from
   --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)
   --no-cache            Disable on-disk compiled recipe cache
   --verbose             Print HBM, recipe compile, and per-layer diagnostics
+
+Cache trim options (--trim-cache; an entry is a <name>-<hash>.recipe file and its .sha256
+sidecar, removed together; every other file in the directory is left alone and not counted;
+each cache hit sets the sidecar's modification time, so recency needs no access times):
+  --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)
+  --cache-max-gb <N>    Budget: GiB of cache entries left afterwards (decimals allowed;
+                        0 = every entry outside the keep window)
+  --cache-keep-days <D> Entries used within D days stay even over the budget (default: 1;
+                        an entry dated ahead of the clock counts as just used)
+  --dry-run             Print what would be freed, remove nothing
 
 Vision suite options (a row = one model and one method of the suite file; per row the
 text request, every image case and the text request again, greedy and seeded sampled,

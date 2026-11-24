@@ -27,6 +27,7 @@ use gaudium::synapse::device::HpuDevice;
 use gaudium::synapse::ffi::{SynDataType, SynapseApi};
 use gaudium::synapse::graph::GraphBuilder;
 use gaudium::synapse::recipe_cache::RecipeCache;
+use gaudium::synapse::recipe_trim;
 use gaudium::tokenizer::{
     format_gemma4_chat, format_qwen3_chat, gemma4_template_closes_thought, StreamDecoder,
 };
@@ -81,6 +82,10 @@ fn print_usage() {
          \x20                                           fixed images (gaudium/tests/vision_suite), one\n\
          \x20                                           --generate process per row, one after another\n\
          \x20                                           (this process never opens the card)\n\
+         \x20 gaudium --trim-cache --cache-max-gb <N> [options]\n\
+         \x20                                           Remove the least recently used recipes of the\n\
+         \x20                                           recipe cache until it fits N GiB (host only;\n\
+         \x20                                           safe beside a server using the directory)\n\
          \x20 gaudium --fp8-pack --model <dir> --fp8-cache <dir>\n\
          \x20                                           Quantise a Gemma 4 BF16 checkpoint's matrices into an\n\
          \x20                                           FP8 cache directory (host only, no card)\n\
@@ -98,6 +103,14 @@ fn print_usage() {
          \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)\n\
          \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
          \x20 --no-cache            Disable on-disk compiled recipe cache\n\
+         \x20 --cache-max-gb <N>    Trim the recipe cache to N GiB (decimals allowed) in the\n\
+         \x20                       background: once the first model load is done (at start with\n\
+         \x20                       --lazy), then every --cache-trim-every minutes, least recently\n\
+         \x20                       used recipes first (see --trim-cache; default: never trimmed).\n\
+         \x20                       Recipes this server has loaded or compiled are never removed\n\
+         \x20 --cache-keep-days <D> With --cache-max-gb: recipes used within D days are kept even\n\
+         \x20                       over the budget (default: 1; decimals allowed)\n\
+         \x20 --cache-trim-every <M> With --cache-max-gb: minutes between trims (default: 60)\n\
          \x20 --lazy                Start without holding Gaudi 2; load on first chat/start\n\
          \x20 --build-cache         With --serve: compile every recipe the served models load into\n\
          \x20                       the recipe cache and exit, without opening the card and without\n\
@@ -592,6 +605,16 @@ fn print_usage() {
          \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
          \x20 --no-cache            Disable on-disk compiled recipe cache\n\
          \x20 --verbose             Print HBM, recipe compile, and per-layer diagnostics\n\
+         \n\
+         Cache trim options (--trim-cache; an entry is a <name>-<hash>.recipe file and its .sha256\n\
+         sidecar, removed together; every other file in the directory is left alone and not counted;\n\
+         each cache hit sets the sidecar's modification time, so recency needs no access times):\n\
+         \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
+         \x20 --cache-max-gb <N>    Budget: GiB of cache entries left afterwards (decimals allowed;\n\
+         \x20                       0 = every entry outside the keep window)\n\
+         \x20 --cache-keep-days <D> Entries used within D days stay even over the budget (default: 1;\n\
+         \x20                       an entry dated ahead of the clock counts as just used)\n\
+         \x20 --dry-run             Print what would be freed, remove nothing\n\
          \n\
          Vision suite options (a row = one model and one method of the suite file; per row the\n\
          text request, every image case and the text request again, greedy and seeded sampled,\n\
@@ -2207,6 +2230,56 @@ fn hpu_smoke() -> Result<(), String> {
     Ok(())
 }
 
+/// A non-negative number, decimals allowed (GiB, days).
+fn parse_amount(s: &str, flag: &str) -> Result<f64, String> {
+    s.parse()
+        .ok()
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0)
+        .ok_or_else(|| format!("invalid {flag} '{s}' (a number >= 0)"))
+}
+
+/// `gaudium --trim-cache --cache-max-gb <N> [--cache-dir <dir>] [--cache-keep-days <D>] [--dry-run]`:
+/// `Ok(false)` when a removal failed.
+fn run_trim_cache(args: &[String]) -> Result<bool, String> {
+    let mut dir: Option<PathBuf> = None;
+    let mut max_gb: Option<f64> = None;
+    let mut keep_days = recipe_trim::DEFAULT_KEEP_DAYS;
+    let mut dry_run = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let next_val = |idx: &mut usize, name: &str| -> Result<String, String> {
+            *idx += 1;
+            args.get(*idx)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match args[i].as_str() {
+            "--trim-cache" => {}
+            "--cache-dir" => dir = Some(PathBuf::from(next_val(&mut i, "--cache-dir")?)),
+            "--cache-max-gb" => {
+                max_gb = Some(parse_amount(&next_val(&mut i, "--cache-max-gb")?, "--cache-max-gb")?)
+            }
+            "--cache-keep-days" => {
+                keep_days = parse_amount(&next_val(&mut i, "--cache-keep-days")?, "--cache-keep-days")?
+            }
+            "--dry-run" => dry_run = true,
+            other => return Err(format!("unknown --trim-cache flag '{other}'")),
+        }
+        i += 1;
+    }
+    let dir = dir
+        .or_else(|| RecipeCache::from_env().root().map(Path::to_path_buf))
+        .ok_or("missing --cache-dir <dir> (or GAUDIUM_RECIPE_CACHE)")?;
+    let max_gb = max_gb.ok_or("missing --cache-max-gb <N>")?;
+    let opts = recipe_trim::TrimOptions::from_gib_days(max_gb, keep_days, dry_run)?;
+    let rep = recipe_trim::trim(&dir, &opts).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for e in &rep.errors {
+        eprintln!("{e}");
+    }
+    println!("{}", rep.summary(&dir, &opts));
+    Ok(rep.errors.is_empty())
+}
+
 fn run_serve(args: &[String]) -> Result<(), String> {
     let mut host = env::var("GAUDIUM_SERVE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let mut port: u16 = env::var("GAUDIUM_SERVE_PORT")
@@ -2250,6 +2323,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut prefix_slots = gaudium::engine::qwen3::prefix_cache::DEFAULT_SLOTS;
     let mut cache_ram_bytes: Option<u64> = None;
     let mut parallel = 1u64;
+    let mut cache_max_gb: Option<f64> = None;
+    let mut cache_keep_days: Option<f64> = None;
+    let mut cache_trim_every: Option<u64> = None;
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -2411,6 +2487,22 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             }
             "--cache-dir" => cache_dir = Some(PathBuf::from(next_val(&mut i, "--cache-dir")?)),
             "--no-cache" => no_cache = true,
+            "--cache-max-gb" => {
+                cache_max_gb = Some(parse_amount(&next_val(&mut i, "--cache-max-gb")?, "--cache-max-gb")?)
+            }
+            "--cache-keep-days" => {
+                cache_keep_days =
+                    Some(parse_amount(&next_val(&mut i, "--cache-keep-days")?, "--cache-keep-days")?)
+            }
+            "--cache-trim-every" => {
+                let s = next_val(&mut i, "--cache-trim-every")?;
+                cache_trim_every = Some(
+                    s.parse()
+                        .ok()
+                        .filter(|&m: &u64| m > 0)
+                        .ok_or_else(|| format!("invalid --cache-trim-every '{s}' (minutes, > 0)"))?,
+                );
+            }
             "--lazy" => lazy = true,
             "--build-cache" => build_cache = true,
             "--build-cache-only" => {
@@ -2509,6 +2601,35 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         }
     }
 
+    let cache_trim = match cache_max_gb {
+        None => {
+            if cache_keep_days.is_some() || cache_trim_every.is_some() {
+                return Err("--cache-keep-days and --cache-trim-every need --cache-max-gb".into());
+            }
+            None
+        }
+        Some(gb) => {
+            let dir = if no_cache {
+                None
+            } else {
+                cache_dir
+                    .clone()
+                    .or_else(|| RecipeCache::from_env().root().map(Path::to_path_buf))
+            };
+            let dir = dir.ok_or(
+                "--cache-max-gb needs the recipe cache on (--cache-dir or GAUDIUM_RECIPE_CACHE, \
+                 without --no-cache)",
+            )?;
+            let keep = cache_keep_days.unwrap_or(recipe_trim::DEFAULT_KEEP_DAYS);
+            let every = cache_trim_every.unwrap_or(recipe_trim::DEFAULT_TRIM_EVERY_MIN);
+            Some(recipe_trim::ServerTrim {
+                dir,
+                opts: recipe_trim::TrimOptions::from_gib_days(gb, keep, false)?,
+                every: std::time::Duration::from_secs(every.saturating_mul(60)),
+            })
+        }
+    };
+
     let cfg = ServerConfig {
         host,
         port,
@@ -2536,6 +2657,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         tls_key,
         cache_ram_bytes,
         parallel,
+        cache_trim,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {
@@ -2642,6 +2764,16 @@ fn main() {
             process::exit(1);
         }
         return;
+    }
+    if args.iter().any(|a| a == "--trim-cache") {
+        match run_trim_cache(&args[1..]) {
+            Ok(true) => return,
+            Ok(false) => process::exit(1),
+            Err(e) => {
+                eprintln!("TRIM CACHE FAIL: {e}");
+                process::exit(2);
+            }
+        }
     }
     let serving = args.iter().any(|a| a == "--serve");
     if !serving

@@ -317,6 +317,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             tls_key: None,
             cache_ram_bytes: Some(0),
             parallel: 1,
+            cache_trim: None,
         },
         models: vec![model("tags", chat::TEST_TEMPLATE, None)],
         slot: Mutex::new(EngineSlot {
@@ -1418,6 +1419,7 @@ fn served_engine_configuration_follows_the_server_options() {
         tls_key: None,
         cache_ram_bytes: Some(0),
         parallel: 1,
+        cache_trim: None,
     };
     // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
     let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
@@ -1971,6 +1973,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         tls_key: None,
         cache_ram_bytes: Some(0),
         parallel: 1,
+        cache_trim: None,
     };
     // plain decode and the drafters that passed the vision suite on this (dense) family: the
     // server-wide tower
