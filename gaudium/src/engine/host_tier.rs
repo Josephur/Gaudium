@@ -839,10 +839,12 @@ impl HostTier {
             rep.complete = true;
             return Ok(rep);
         }
-        // [lanes] nothing of an entry another lane rewrote since is trusted. (Defensive: the
-        // entry this save opens is cut to the tiles the prompt still shares, its clean range is
-        // clipped to them below and the rings are copied whenever `hc_ring_due` holds, so only
-        // `begin_request` acts on what this voids. It keeps every use of a record behind the check.)
+        // [lanes] nothing of an entry another lane rewrote since is trusted: this save's
+        // `note_write` marks this share's record of the entry it opens as current, which a stale
+        // record must not survive into. (Defensive today: the entry it opens is cut to the tiles
+        // the prompt still shares and its clean range is clipped to them below; and the ring
+        // record is always empty here, since `end_request` clears it before any save with work
+        // and a save sets it only after copying the rings whole, when nothing is left unsaved.)
         self.void_rewritten();
         let kept = table.held_slots();
         let (held, images) = table.held();
