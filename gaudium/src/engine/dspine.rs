@@ -2280,21 +2280,6 @@ pub(crate) mod tests {
     }
 
         #[test]
-    fn tmp_ds_fingerprints() {
-        let spec = target_27b();
-        let mut dc = DSpineCfg::from_json(CFG_27B).unwrap();
-        let fp = |g: GraphBuilder| g.fingerprint("x");
-        println!("DSFP step {}", fp(super::super::build_spec_step_graph(&spec, 4096, 1, 8, 16, Some(&dc), &[])));
-        println!("DSFP sstep {}", fp(super::super::build_spec_step_graph_as(&spec, 4096, 2, 16, 16, Some(&dc), &[], true)));
-        println!("DSFP ctx {}", fp(build_ctx_graph(&spec, &dc, 512, 4096, &[])));
-        println!("DSFP blk0 {}", fp(build_block0_graph(&spec, &dc, 4096, &[], false)));
-        println!("DSFP blk0s {}", fp(build_block0_graph(&spec, &dc, 4096, &[], true)));
-        dc.fp8 = true; dc.nvd = 98304; dc.fp8_head = true; dc.ring = 8448;
-        println!("DSFP step8 {}", fp(super::super::build_spec_step_graph(&spec, 4096, 1, 8, 16, Some(&dc), &[])));
-        println!("DSFP sstep8 {}", fp(super::super::build_spec_step_graph_as(&spec, 4096, 1, 16, 16, Some(&dc), &[], true)));
-    }
-
-    #[test]
     fn step_graph_with_drafter_shares_caches_between_context_and_block() {
         let spec = target_27b();
         let dc = DSpineCfg::from_json(CFG_27B).unwrap();
