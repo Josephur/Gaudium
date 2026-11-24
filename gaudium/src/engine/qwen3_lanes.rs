@@ -557,13 +557,10 @@ pub(super) struct LaneRt {
     timing: StepTiming,
     /// The measured step times the lanes' width choices use.
     widths: WidthCosts,
-    /// Completion events of the speculative launches (two: one may be queued behind the other),
-    /// and the one the next launch records.
-    events: Vec<crate::synapse::device::DeviceEvent>,
+    /// Timed events around the speculative launches, `(start, end)` (two pairs: one launch may
+    /// be queued behind the other), and the pair the next launch records.
+    events: Vec<(crate::synapse::device::DeviceEvent, crate::synapse::device::DeviceEvent)>,
     next_event: usize,
-    /// When the last collected launch's results were read (the next launch queued behind it
-    /// started on the device about then).
-    last_collect: Option<Instant>,
 }
 
 /// What the lanes' width choices know of a batched speculative step's time (measured,
@@ -573,6 +570,9 @@ pub(super) struct LaneRt {
 struct WidthCosts {
     narrow_ms: HashMap<(u64, u64), f64>,
     extra_ms: HashMap<u64, f64>,
+    /// Slot steps of the session at the wide width, and in all (report only).
+    wide_slots: u64,
+    slots: u64,
 }
 
 impl WidthCosts {
@@ -588,6 +588,8 @@ impl WidthCosts {
 
     /// A launch of `b` slots over `nch` chunks, `wide` of them at their wide width, took `ms`.
     fn observe(&mut self, b: u64, nch: u64, wide: u64, ms: f64) {
+        self.wide_slots += wide;
+        self.slots += b;
         if wide == 0 {
             let mut m = self.narrow_ms.get(&(b, nch)).copied();
             Self::ema(&mut m, ms);
@@ -599,12 +601,48 @@ impl WidthCosts {
         }
     }
 
+    /// What the model holds, for the session report (and a fresh count of the slot steps).
+    fn report(&mut self) -> Option<String> {
+        if self.wide_slots == 0 && self.extra_ms.is_empty() {
+            return None;
+        }
+        let mut bs: Vec<u64> = self.extra_ms.keys().copied().collect();
+        bs.sort_unstable();
+        let per_b: Vec<String> = bs
+            .iter()
+            .map(|b| {
+                format!(
+                    "{b} slots: {:.2} ms narrow, +{:.2} ms a wide slot",
+                    self.narrow_ms.get(&(*b, 1)).copied().unwrap_or(f64::NAN),
+                    self.extra_ms[b]
+                )
+            })
+            .collect();
+        let line = format!(
+            "[gaudium] lanes: widths: {} of {} slot steps wide; {}",
+            self.wide_slots,
+            self.slots,
+            per_b.join("; ")
+        );
+        self.wide_slots = 0;
+        self.slots = 0;
+        Some(line)
+    }
+
     /// `(time of the narrow step, extra time of one wide slot)` in ms for `b` slots over `nch`
-    /// chunks: `None` until the narrow step was measured; the extra time is 0 until a wide slot
-    /// was (so a lane that expects more from the wide step tries it).
+    /// chunks: `None` until the narrow step was measured. The extra time of a slot count not
+    /// measured yet is the nearest measured slot count's (a wide slot's own work hardly depends
+    /// on the others), and 0 until any was (so a lane that expects more from the wide step tries
+    /// it).
     fn estimate(&self, b: u64, nch: u64) -> Option<(f64, f64)> {
         let t0 = *self.narrow_ms.get(&(b, nch))?;
-        Some((t0, self.extra_ms.get(&b).copied().unwrap_or(0.0)))
+        let extra = self.extra_ms.get(&b).copied().or_else(|| {
+            self.extra_ms
+                .iter()
+                .min_by_key(|(&k, _)| k.abs_diff(b))
+                .map(|(_, &v)| v)
+        });
+        Some((t0, extra.unwrap_or(0.0)))
     }
 }
 
@@ -705,7 +743,6 @@ impl LaneRt {
             widths: WidthCosts::default(),
             events: Vec::new(),
             next_event: 0,
-            last_collect: None,
         }
     }
 
@@ -751,11 +788,12 @@ impl LaneRt {
             self.base.entry(k.clone()).or_insert(v);
         }
         if matches!(self.family, LaneFamily::Spec(_)) {
+            let ev = || {
+                dev.create_event(true)
+                    .map_err(|e| format!("lanes: create a step event: {e}"))
+            };
             for _ in 0..2 {
-                self.events.push(
-                    dev.create_event(false)
-                        .map_err(|e| format!("lanes: create a step event: {e}"))?,
-                );
+                self.events.push((ev()?, ev()?));
             }
         }
         Ok(())
@@ -1626,11 +1664,17 @@ fn spec_launch(
     let lk = launch_key(&key, &ids, parities);
     lane_launch_hook(eng)?;
     let rt = eng.lanes.as_mut().expect("lanes");
+    let event = rt.next_event;
+    // (the start event fires when the launch starts on the device: behind a launch queued
+    // before it, when that one ends)
+    if let Some((ev, _)) = rt.events.get(event) {
+        ev.record_compute(&eng.dev)
+            .map_err(|e| format!("record a lane step event: {e}"))?;
+    }
     rt.recipes[&key]
         .launch_prepared(&eng.dev, &rt.launches[&lk])
         .map_err(|e| format!("launch {}: {e}", rt.family.name(&key)))?;
-    let event = rt.next_event;
-    if let Some(ev) = rt.events.get(event) {
+    if let Some((_, ev)) = rt.events.get(event) {
         ev.record_compute(&eng.dev)
             .map_err(|e| format!("record a lane step event: {e}"))?;
     }
@@ -1651,7 +1695,7 @@ fn spec_collect(eng: &mut Qwen3Engine, l: &LaneLaunch) -> Result<Vec<Vec<i32>>, 
     {
         let rt = eng.lanes.as_ref().expect("lanes");
         match rt.events.get(l.event) {
-            Some(ev) => ev
+            Some((_, ev)) => ev
                 .synchronize()
                 .map_err(|e| format!("wait for a batched speculative step: {e}"))?,
             // SAFETY: the compute stream belongs to `eng.dev`.
@@ -1673,15 +1717,15 @@ fn spec_collect(eng: &mut Qwen3Engine, l: &LaneLaunch) -> Result<Vec<Vec<i32>>, 
         };
         out.push(spec::read_i32s(eng, addr, t as usize)?);
     }
-    let now = Instant::now();
     let rt = eng.lanes.as_mut().expect("lanes");
     rt.timing.end(l.t0, l.launched, synced);
-    // the launch's own time, for the lanes' width choices: from its start on the device (its
-    // enqueue, or the collection of the launch it was queued behind) to its results
-    let start = rt.last_collect.map_or(l.t0, |c| c.max(l.t0));
-    rt.last_collect = Some(now);
-    let wide = l.lanes.iter().filter(|&&(_, t)| t > rt.family.rows().0).count() as u64;
-    rt.widths.observe(l.lanes.len() as u64, l.nch, wide, (now - start).as_secs_f64() * 1e3);
+    // the launch's own device time, for the lanes' width choices
+    if let Some((a, b)) = rt.events.get(l.event) {
+        if let Ok(ns) = crate::synapse::device::DeviceEvent::elapsed_ns(a, b) {
+            let wide = l.lanes.iter().filter(|&&(_, t)| t > rt.family.rows().0).count() as u64;
+            rt.widths.observe(l.lanes.len() as u64, l.nch, wide, ns as f64 / 1e6);
+        }
+    }
     Ok(out)
 }
 
@@ -1899,6 +1943,11 @@ pub(super) fn serve(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed) -> Result<()
             eprintln!("{line}");
         }
     }
+    if let Some(line) = eng.lanes.as_mut().expect("lanes").widths.report() {
+        if eng.verbose {
+            eprintln!("{line}");
+        }
+    }
     let launched = eng.lanes.as_ref().expect("lanes").launched;
     let res = res.and(prof_rt::end_lanes(eng, launched));
     if let Err(e) = &res {
@@ -2080,9 +2129,12 @@ mod tests {
         w.observe(4, 1, 0, 30.0);
         let (t0, extra) = w.estimate(4, 1).unwrap();
         assert!((t0 - 22.0).abs() < 1e-9 && (extra - 2.0).abs() < 1e-9);
-        // other shapes are their own
+        // other shapes are their own; a slot count without a measured wide slot takes the
+        // nearest one's extra time
         assert_eq!(w.estimate(4, 2), None);
         assert_eq!(w.estimate(3, 1), None);
+        w.observe(3, 1, 0, 18.0);
+        assert_eq!(w.estimate(3, 1), Some((18.0, 2.0)));
     }
 
     fn qwen38_27b_spec() -> ModelSpec {
