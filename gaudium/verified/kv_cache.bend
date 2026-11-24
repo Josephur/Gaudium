@@ -5,7 +5,7 @@
 #   - Which caches take the configured dtype (those whose graphs have the FP8 attention kernels
 #     and a scale table: the trunk's) and which stay BF16
 #   - Which engines take an FP8 setting; which prefill cores read which caches, and the widest
-#     prefill tile an FP8 cache takes
+#     prefill tile an FP8 cache takes (never a tile of zero rows)
 #   - The block the V rows of a cache are permuted in, per dtype
 #   - Which head shapes the FP8 attention kernels take (one FP8 vector per cache row, the scale
 #     table's group slots)
@@ -17,7 +17,9 @@
 #     a decode form the FP8 attention takes; a scale table covers every kv head of the model
 #   - The row order of the V projection per dtype (the FP8 V rows follow the softmax's P bytes):
 #     every channel of a head lands on a row of that head, and no two on the same row
-#   - The calibration's read-back of a cache: every range it copies lies inside the cache
+#   - The calibration's read-back of a cache: every range it copies lies inside the cache, each
+#     copy fits the staging buffer and moves at least one byte while bytes are left, and the
+#     batches of two different (chunk, kv head) pairs never overlap
 #
 # Multipliers are powers of two, written as f32 exponent fields: a field e stands for 2^(e - 127).
 # A tensor whose largest magnitude has exponent field `a`, scaled by 2^(e - 127), has its largest
@@ -631,6 +633,19 @@ def kv_tile_rows_not_wider(t, d, m):
     case KvFp8{}:
       kc_min_le_l(t, m)
 
+# promise: a prefill tile asked for with at least one row keeps at least one row on either cache dtype, whenever the FP8 bound allows one
+# harm: a tile of zero rows would never advance through the prompt, and its prefill would hang or compile an empty graph
+law kv_tile_rows_nonzero:
+  for +t: Nat
+  for d: KvDtype
+  for +m: Nat
+  {Nat.is_lt(0n, kv_tile_rows(1n+t, d, 1n+m)) == True{} : Bool}
+
+def kv_tile_rows_nonzero(t, d, m):
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
+
 # promise: a calibration load, of the K/V maxima or of the activation scales, never takes FP8 K/V
 # harm: a calibration would measure through the FP8 attention, the K/V maxima already clipped by the multipliers they are meant to choose
 law kv8_load_never_calibrating:
@@ -1062,3 +1077,146 @@ law kv_piece_within:
 
 def kv_piece_within(done, len, piece):
   kc_fit_le(done, len, piece)
+
+# promise: a copy of the read-back never takes more bytes than the staging buffer holds
+# harm: the device-to-host copy would overrun the pinned staging buffer, or be refused and fail the calibration
+law kv_piece_fits_stage:
+  for +done: Nat
+  for +len: Nat
+  for +piece: Nat
+  {Nat.is_le(kv_piece_len(done, len, piece), piece) == True{} : Bool}
+
+def kv_piece_fits_stage(done, len, piece):
+  kc_min_le_l(piece, Nat.sub(len, done))
+
+# promise: while bytes of a read are left and the staging buffer holds at least one byte, each copy moves at least one byte
+# harm: a copy of zero bytes would leave the read where it was, and the calibration's read-back would never finish
+law kv_piece_progress:
+  for +done: Nat
+  for +len: Nat
+  for +p: Nat
+  {Bool.or(Nat.is_le(len, done), Nat.is_lt(0n, kv_piece_len(done, len, 1n+p))) == True{} : Bool}
+
+def kv_piece_progress(done, len, p):
+  match done len:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+dp 1n+lp:
+      kv_piece_progress(dp, lp, p)
+
+# Helper lemmas of the batch law below (erased before Rust codegen).
+
+def kc_or_l(+x: Bool, +y: Bool, h: {x == True{} : Bool}) -> {Bool.or(x, y) == True{} : Bool}:
+  match x:
+    case True{}:
+      {==}
+    case False{}:
+      L.bool_absurd({Bool.or(False{}, y) == True{} : Bool}, h)
+
+def kc_or_r(+x: Bool, +y: Bool, h: {y == True{} : Bool}) -> {Bool.or(x, y) == True{} : Bool}:
+  match x:
+    case True{}:
+      {==}
+    case False{}:
+      h
+
+# a < b gives a + 1 <= b
+def kc_lt_succ_le(+a: Nat, +b: Nat, h: {Nat.is_lt(a, b) == True{} : Bool}) -> {Nat.is_le(1n+a, b) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      L.bool_absurd({Nat.is_le(1n, 0n) == True{} : Bool}, h)
+    case 0n 1n+bp:
+      L.nat_le_zero(bp)
+    case 1n+ap 0n:
+      L.bool_absurd({Nat.is_le(1n+1n+ap, 0n) == True{} : Bool}, h)
+    case 1n+ap 1n+bp:
+      kc_lt_succ_le(ap, bp, h)
+
+# two numbers are equal, or one is below the other
+def kc_tri(+a: Nat, +b: Nat) -> {Bool.or(Nat.is_eq(a, b), Bool.or(Nat.is_lt(a, b), Nat.is_lt(b, a))) == True{} : Bool}:
+  match a b:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+ap 1n+bp:
+      kc_tri(ap, bp)
+
+# adding n to both sides leaves a comparison as it was
+def kc_lt_shift(+n: Nat, +a: Nat, +b: Nat, +c: Nat, +d: Nat) -> {Nat.is_lt(Nat.add(a, b), Nat.add(c, d)) == Nat.is_lt(Nat.add(Nat.add(n, a), b), Nat.add(Nat.add(n, c), d)) : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+np:
+      kc_lt_shift(np, a, b, c, d)
+
+# Two (chunk, kv head) pairs with heads below n are the same pair, or the index c * n + g of one
+# lies below the other's.
+def kc_idx_tri(+c1: Nat, +g1: Nat, +c2: Nat, +g2: Nat, +n: Nat, h1: {Nat.is_lt(g1, n) == True{} : Bool}, h2: {Nat.is_lt(g2, n) == True{} : Bool}) -> {Bool.or(Bool.and(Nat.is_eq(c1, c2), Nat.is_eq(g1, g2)), Bool.or(Nat.is_lt(Nat.add(Nat.mul(c1, n), g1), Nat.add(Nat.mul(c2, n), g2)), Nat.is_lt(Nat.add(Nat.mul(c2, n), g2), Nat.add(Nat.mul(c1, n), g1)))) == True{} : Bool}:
+  match c1 c2:
+    case 0n 0n:
+      kc_tri(g1, g2)
+    case 0n 1n+c2p:
+      kc_or_l(
+        Nat.is_lt(g1, Nat.add(Nat.add(n, Nat.mul(c2p, n)), g2)),
+        Nat.is_lt(Nat.add(Nat.add(n, Nat.mul(c2p, n)), g2), g1),
+        L.nat_lt_le_trans(g1, n, Nat.add(Nat.add(n, Nat.mul(c2p, n)), g2), h1,
+          L.nat_le_trans(n, Nat.add(n, Nat.mul(c2p, n)), Nat.add(Nat.add(n, Nat.mul(c2p, n)), g2),
+            L.nat_add_le_r(n, Nat.mul(c2p, n)), L.nat_add_le_r(Nat.add(n, Nat.mul(c2p, n)), g2))))
+    case 1n+c1p 0n:
+      kc_or_r(
+        Nat.is_lt(Nat.add(Nat.add(n, Nat.mul(c1p, n)), g1), g2),
+        Nat.is_lt(g2, Nat.add(Nat.add(n, Nat.mul(c1p, n)), g1)),
+        L.nat_lt_le_trans(g2, n, Nat.add(Nat.add(n, Nat.mul(c1p, n)), g1), h2,
+          L.nat_le_trans(n, Nat.add(n, Nat.mul(c1p, n)), Nat.add(Nat.add(n, Nat.mul(c1p, n)), g1),
+            L.nat_add_le_r(n, Nat.mul(c1p, n)), L.nat_add_le_r(Nat.add(n, Nat.mul(c1p, n)), g1))))
+    case 1n+c1p 1n+c2p:
+      %kc_lt_shift(n, Nat.mul(c1p, n), g1, Nat.mul(c2p, n), g2) : {Bool.or(Bool.and(Nat.is_eq(c1p, c2p), Nat.is_eq(g1, g2)), Bool.or(_, Nat.is_lt(Nat.add(Nat.add(n, Nat.mul(c2p, n)), g2), Nat.add(Nat.add(n, Nat.mul(c1p, n)), g1)))) == True{} : Bool}
+      %kc_lt_shift(n, Nat.mul(c2p, n), g2, Nat.mul(c1p, n), g1) : {Bool.or(Bool.and(Nat.is_eq(c1p, c2p), Nat.is_eq(g1, g2)), Bool.or(Nat.is_lt(Nat.add(Nat.mul(c1p, n), g1), Nat.add(Nat.mul(c2p, n), g2)), _)) == True{} : Bool}
+      kc_idx_tri(c1p, g1, c2p, g2, n, h1, h2)
+
+# i < j: the h bytes from i * h end at or before j * h.
+def kc_off_apart(+i: Nat, +j: Nat, +h: Nat, lt: {Nat.is_lt(i, j) == True{} : Bool}) -> {Nat.is_le(Nat.add(Nat.mul(i, h), h), Nat.mul(j, h)) == True{} : Bool}:
+  %L.nat_add_comm(h, Nat.mul(i, h)) : {Nat.is_le(_, Nat.mul(j, h)) == True{} : Bool}
+  L.nat_mul_le_mono_r(1n+i, j, h, kc_lt_succ_le(i, j, lt))
+
+# The same pair, or two indices one below the other: the same pair, or two ranges of h bytes
+# apart.
+def kc_apart_by(+e: Bool, +x: Bool, +y: Bool, +i: Nat, +j: Nat, +h: Nat, he: {Bool.or(e, Bool.or(x, y)) == True{} : Bool}, ex: {Nat.is_lt(i, j) == x : Bool}, ey: {Nat.is_lt(j, i) == y : Bool}) -> {Bool.or(e, Bool.or(Nat.is_le(Nat.add(Nat.mul(i, h), h), Nat.mul(j, h)), Nat.is_le(Nat.add(Nat.mul(j, h), h), Nat.mul(i, h)))) == True{} : Bool}:
+  match e:
+    case True{}:
+      {==}
+    case False{}:
+      match x:
+        case True{}:
+          kc_or_l(Nat.is_le(Nat.add(Nat.mul(i, h), h), Nat.mul(j, h)), Nat.is_le(Nat.add(Nat.mul(j, h), h), Nat.mul(i, h)), kc_off_apart(i, j, h, ex))
+        case False{}:
+          match y:
+            case True{}:
+              kc_or_r(Nat.is_le(Nat.add(Nat.mul(i, h), h), Nat.mul(j, h)), Nat.is_le(Nat.add(Nat.mul(j, h), h), Nat.mul(i, h)), kc_off_apart(j, i, h, ey))
+            case False{}:
+              L.bool_absurd({Bool.or(False{}, Bool.or(Nat.is_le(Nat.add(Nat.mul(i, h), h), Nat.mul(j, h)), Nat.is_le(Nat.add(Nat.mul(j, h), h), Nat.mul(i, h)))) == True{} : Bool}, he)
+
+# promise: the batches of two different (chunk, kv head) pairs of a cache never overlap, whatever order the layout puts them in
+# harm: the read-back would fold one head's or one chunk's bytes into another's maxima, measure the wrong batch without a sign, and a V multiplier could clip
+law kv_batches_apart:
+  for +c1: Nat
+  for +g1: Nat
+  for +c2: Nat
+  for +g2: Nat
+  for +n: Nat
+  for +h: Nat
+  for h1: {Nat.is_lt(g1, n) == True{} : Bool}
+  for h2: {Nat.is_lt(g2, n) == True{} : Bool}
+  {Bool.or(Bool.and(Nat.is_eq(c1, c2), Nat.is_eq(g1, g2)), Bool.or(Nat.is_le(Nat.add(kv_batch_off(c1, g1, n, h), h), kv_batch_off(c2, g2, n, h)), Nat.is_le(Nat.add(kv_batch_off(c2, g2, n, h), h), kv_batch_off(c1, g1, n, h)))) == True{} : Bool}
+
+def kv_batches_apart(c1, g1, c2, g2, n, h, h1, h2):
+  kc_apart_by(
+    Bool.and(Nat.is_eq(c1, c2), Nat.is_eq(g1, g2)),
+    Nat.is_lt(Nat.add(Nat.mul(c1, n), g1), Nat.add(Nat.mul(c2, n), g2)),
+    Nat.is_lt(Nat.add(Nat.mul(c2, n), g2), Nat.add(Nat.mul(c1, n), g1)),
+    Nat.add(Nat.mul(c1, n), g1),
+    Nat.add(Nat.mul(c2, n), g2),
+    h,
+    kc_idx_tri(c1, g1, c2, g2, n, h1, h2),
+    {==},
+    {==})

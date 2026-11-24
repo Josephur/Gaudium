@@ -234,8 +234,11 @@ impl Qwen3Engine {
                 let (base, bytes) = self.kv_addr[&format!("L{l}_{name}")];
                 for ch in 0..chunks {
                     for g in 0..nkv {
-                        // the batch's range and each copy of it (`kv_batch_off`,
-                        // `kv_range_inside`, `kv_piece_len`: every copy lies inside the cache)
+                        // the batch's range and each copy of it (`kv_batch_off`: two batches
+                        // never overlap; `kv_range_inside`, `kv_piece_len`: every copy lies
+                        // inside the cache and fits the staging buffer, and moves at least one
+                        // byte while `piece` holds one: `load_or_plan` gives `stage_io` a floor
+                        // of 4096 bytes)
                         let off = kv_batch_off(ch as u64, g as u64, nkv as u64, head_bytes as u64);
                         if !kv_range_inside(off, head_bytes as u64, bytes) {
                             return Err(format!("L{l}_{name}: chunk {ch} lies past the cache"));
