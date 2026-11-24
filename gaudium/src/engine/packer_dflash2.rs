@@ -15,9 +15,11 @@ const BLOCK: usize = 128;
 /// `[64..96)` / `[96..128)` the odd frequencies; the sine row holds `-sin` in the first half of
 /// each group and `+sin` in the second.
 ///
-/// A row is addressed by KV slot and holds the rotation of that slot's *position*. For a text
-/// request the two are equal ([`rope128_tables`]); after an image they differ, and the rows of the
-/// slots behind it are rewritten with the positions the target assigned to them.
+/// A row is addressed by KV slot. The drafters' own attention rotates both its keys (context
+/// rows) and its queries (block rows) by slot, so its relative offsets are slot distances, also
+/// after an image, where the target's own M-RoPE positions advance slower than its slots
+/// ([`rope128_tables`]: slot `i` at angle `i`). A table at other positions is built with this
+/// function; the engines load the slot tables only.
 pub fn rope128_rows(theta: f64, positions: impl Iterator<Item = u64>) -> (Vec<f32>, Vec<f32>) {
     let freq: Vec<(f64, f64)> = (0..32)
         .map(|j| {

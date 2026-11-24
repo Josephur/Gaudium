@@ -1251,7 +1251,7 @@ fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Opt
         return None;
     }
     let drafter = planned_drafter_of(cfg, id).map(|(_, kind, _)| kind);
-    if !drafter_runs_with_vision(drafter, spec.family == ModelFamily::Inkling2) {
+    if !drafter_runs_with_vision(drafter, spec.family) {
         return None;
     }
     let tokens = planned_image_tokens(
@@ -1539,11 +1539,11 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         if vision.is_none() && spec.has_vision && runs_tower && cfg.vision {
             if let Some((_, kind, _)) =
 planned_drafter_of(&cfg, &entry.id).filter(|d| {
-                    !drafter_runs_with_vision(Some(d.1), spec.family == ModelFamily::Inkling2)
+                    !drafter_runs_with_vision(Some(d.1), spec.family)
                 })
             {
                 eprintln!(
-                    "[server] model '{}': served text only: its {kind} drafter is not validated with image input (plain decode, DSpine and Inkling 2's own drafter are)",
+                    "[server] model '{}': served text only: its {kind} drafter has not passed the vision regression suite for this model family (plain decode, DSpine, a dense Qwen model's DFlash2 drafter and MTP head, and Inkling 2's own drafter have)",
                     entry.id
                 );
             }

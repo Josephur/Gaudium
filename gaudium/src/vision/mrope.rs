@@ -15,6 +15,7 @@
 //! the table by slot are right without a graph or kernel change. The causal order stays the
 //! slot order. Anything that computes rotary angles itself must use `PromptLayout::position`.
 
+use crate::verified::{vis_run_emb_off, vis_run_rows, vis_run_tile_row};
 use crate::vision::VisionSpec;
 
 /// One image's run of image-pad tokens in the prompt.
@@ -88,23 +89,27 @@ impl PromptLayout {
         self.overlaps_shifted(lo, hi, 0)
     }
 
-    /// Like `overlaps`, with every span moved `shift` slots towards the prompt start. A
-    /// drafter whose input row `r` embeds token `r + 1` (a next-token head) takes the vision
-    /// embedding of slot `r + 1`: its rows are the spans shifted by one.
+    /// Like `overlaps`, for a tile whose row `r` embeds the token at slot `r + shift` (a
+    /// next-token head such as the MTP fusion: `shift` 1). Each overlap is `(embedding row,
+    /// first tile row as a prompt row, rows)`: the rows `[first, first + rows)` take the
+    /// embeddings `[row, row + rows)`. Rows whose token would lie before slot 0 do not exist,
+    /// so a span at slot 0 loses its first `shift` rows. Where each run lands is the verified
+    /// `vis_run_*` arithmetic (`verified/vision_budget.bend`: inside the tile, inside the image).
     pub fn overlaps_shifted(
         &self,
         lo: usize,
         hi: usize,
         shift: usize,
     ) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        let (lo64, hi64, sh) = (lo as u64, hi as u64, shift as u64);
         self.spans.iter().filter_map(move |s| {
-            // rows of the span that would land before slot 0 are dropped
-            let cut = shift.saturating_sub(s.start);
-            let start = s.start.saturating_sub(shift);
-            let end = (s.end()).saturating_sub(shift);
-            let a = start.max(lo);
-            let b = end.min(hi);
-            (a < b).then(|| (s.emb_row + cut + (a - start), a, b - a))
+            let (start, len) = (s.start as u64, s.len as u64);
+            let rows = vis_run_rows(start, len, lo64, hi64, sh);
+            (rows > 0).then(|| {
+                let row = vis_run_tile_row(start, len, lo64, hi64, sh);
+                let off = vis_run_emb_off(start, len, lo64, hi64, sh);
+                (s.emb_row + off as usize, lo + row as usize, rows as usize)
+            })
         })
     }
 

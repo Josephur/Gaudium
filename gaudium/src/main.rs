@@ -71,6 +71,12 @@ fn print_usage() {
          \x20 gaudium --fp8-calibrate [options]         Measure a model's FP8 activation scales (BF16 graphs)\n\
          \x20 gaudium --kv-calibrate [options]          Measure the K/V maxima a model's FP8 K/V scale tables\n\
          \x20                                           are made from (BF16 caches, read back per prompt)\n\
+         \x20 gaudium --vision-suite <suite.json> [options] [-- <generate options>]\n\
+         \x20                                           Vision regression suite: every model and\n\
+         \x20                                           speculative method of the suite file with its\n\
+         \x20                                           fixed images (gaudium/tests/vision_suite), one\n\
+         \x20                                           --generate process per row, one after another\n\
+         \x20                                           (this process never opens the card)\n\
          \x20 gaudium --fp8-pack --model <dir> --fp8-cache <dir>\n\
          \x20                                           Quantise a Gemma 4 BF16 checkpoint's matrices into an\n\
          \x20                                           FP8 cache directory (host only, no card)\n\
@@ -378,7 +384,9 @@ fn print_usage() {
          \x20 --no-eos              Do not stop early on EOS token\n\
          \x20 --image <file>        Image input: JPEG, PNG, GIF (first frame), WebP, BMP or binary\n\
          \x20                       PPM, decoded as the server decodes a request's image;\n\
-         \x20                       repeatable, in prompt order\n\
+         \x20                       repeatable, in prompt order. An image belongs to the first\n\
+         \x20                       request, or to the further request (--also-prompt-file,\n\
+         \x20                       --also-prompt-ids-file, a repeated --prompt-ids-file) it follows\n\
          \x20 --image-raw <WxH:f>   Image input, raw RGB8 file with explicit size; repeatable\n\
          \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\
          \x20                       model's patches (default: the largest --image; Qwen3.5 / 3.8\n\
@@ -388,8 +396,11 @@ fn print_usage() {
          \x20 --dump-vision-emb <p> Write the image embeddings (tokens x hidden, raw BF16) to a file\n\
          \x20 --dump-prompt-ids     Print the final prompt token IDs to stderr and continue\n\
          \x20 --repeat <N>          Run the same request N times in one process (warm timings)\n\
-         \x20 --after-ids-file <p>  Then run a text-only request with these prompt token IDs\n\
-         \x20                       (checks that an image request leaves no state behind)\n\
+         \x20 --after-ids-file <p>  Then run a text-only request with these prompt token IDs, once\n\
+         \x20                       per sampler setting (checks that an image request leaves no\n\
+         \x20                       state behind: its AFTER TOKENS lines must equal the tokens of\n\
+         \x20                       the same request on an engine that never saw an image)\n\
+         \x20 --after-prompt-file <p>  The same with a text prompt, formatted like --prompt\n\
          \x20 --spec <method>       Speculative decoding: dspine or dflash2 (on-card block drafters),\n\
          \x20                       mtp (the target's own MTP head, hybrid Qwen3.5/3.8, dense or\n\
          \x20                       mixture-of-experts, either --moe-form), assistant (a Gemma 4\n\
@@ -550,8 +561,60 @@ fn print_usage() {
          \x20 --fp8-cache <dir>     Cache directory for the quantised FP8 matrices\n\
          \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
          \x20 --no-cache            Disable on-disk compiled recipe cache\n\
-         \x20 --verbose             Print HBM, recipe compile, and per-layer diagnostics"
+         \x20 --verbose             Print HBM, recipe compile, and per-layer diagnostics\n\
+         \n\
+         Vision suite options (a row = one model and one method of the suite file; per row the\n\
+         text request, every image case and the text request again, greedy and seeded sampled,\n\
+         each checked for token identity to its K=0 reference, a right answer, and the text\n\
+         request after the images giving the fresh engine's tokens; exit status 0 = all passed):\n\
+         \x20 --models <dir>        Directory of the suite's relative model names and of {{models}}\n\
+         \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
+         \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
+         \x20 --out <dir>           Prompts, each row's command line and logs, report.json\n\
+         \x20                       (default: a new directory under the system temp directory)\n\
+         \x20 --only <row>          Run only this model, or model/method (repeatable)\n\
+         \x20 --build-cache         Compile every selected row's recipes into the recipe cache\n\
+         \x20                       without the card (--build-cache rows) instead of running them\n\
+         \x20 -- <options>          Further --generate options for every row"
     );
+}
+
+/// `gaudium --vision-suite <suite.json> [options] [-- <generate options>]`.
+fn run_vision_suite(args: &[String]) -> Result<bool, String> {
+    use gaudium::vision::suite::{run, SuiteOptions};
+    let mut o = SuiteOptions::default();
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let next = |i: &mut usize, name: &str| -> Result<String, String> {
+            *i += 1;
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match args[i].as_str() {
+            "--vision-suite" => o.suite = PathBuf::from(next(&mut i, "--vision-suite")?),
+            "--models" => o.models_dir = Some(PathBuf::from(next(&mut i, "--models")?)),
+            "--kernels" => o.kernels = Some(PathBuf::from(next(&mut i, "--kernels")?)),
+            "--cache-dir" => o.cache_dir = Some(PathBuf::from(next(&mut i, "--cache-dir")?)),
+            "--out" => out = Some(PathBuf::from(next(&mut i, "--out")?)),
+            "--only" => o.only.push(next(&mut i, "--only")?),
+            "--build-cache" => o.build_cache = true,
+            "--" => {
+                o.extra = args[i + 1..].to_vec();
+                break;
+            }
+            other => return Err(format!("unknown --vision-suite option '{other}'")),
+        }
+        i += 1;
+    }
+    if o.suite.as_os_str().is_empty() {
+        return Err("--vision-suite <suite.json>".into());
+    }
+    o.out_dir = out.unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("gaudium-vision-suite-{}", process::id()))
+    });
+    run(&o)
 }
 
 fn inspect_model(dir: &Path) -> Result<(), String> {
@@ -601,6 +664,27 @@ fn run_tokenize(dir: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The request of the command line an `--image` belongs to: the first one, or the further
+/// token-ID / text request (`--also-prompt-ids-file`, a repeated `--prompt-ids-file`,
+/// `--also-prompt-file`) it follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliRequest {
+    First,
+    Ids(usize),
+    Text(usize),
+}
+
+impl CliRequest {
+    /// Index in the run's request list: request 0, the token-ID requests, then the text ones.
+    fn index(self, n_ids: usize) -> usize {
+        match self {
+            CliRequest::First => 0,
+            CliRequest::Ids(k) => 1 + k,
+            CliRequest::Text(k) => 1 + n_ids + k,
+        }
+    }
+}
+
 fn run_generate(args: &[String]) -> Result<(), String> {
     let mut model_dir: Option<PathBuf> = env::var_os("GAUDIUM_MODEL").map(PathBuf::from);
     let mut kernels_dir: Option<PathBuf> = env::var_os("GAUDIUM_KERNELS").map(PathBuf::from);
@@ -624,13 +708,17 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let mut moe_routed = false;
     let mut prefill_opts: Option<String> = None;
     let mut params = Qwen3GenParams::default();
-    let mut image_args: Vec<(bool, String)> = Vec::new(); // (raw RGB8?, path / WxH:path)
+    // (request, raw RGB8?, path / WxH:path): an image belongs to request 0 unless it follows a
+    // flag that adds a further request
+    let mut image_args: Vec<(CliRequest, bool, String)> = Vec::new();
+    let mut image_req = CliRequest::First;
     let mut vision_max_patches = 0u64;
     let mut dump_prompt_ids = false;
     let mut vision_gelu_bf16 = false;
     let mut dump_vision_emb: Option<String> = None;
     let mut repeat = 1usize;
     let mut after_ids_file: Option<String> = None;
+    let mut after_prompt: Option<String> = None;
     let mut spec_method: Option<String> = None;
     let mut draft_model: Option<PathBuf> = None;
     let mut draft_k: Vec<u64> = Vec::new();
@@ -686,6 +774,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                     .map_err(|e| format!("read --prompt-ids-file {path}: {e}"))?;
                 if prompt_ids_raw.is_some() {
                     extra_prompt_ids_raw.push(text);
+                    image_req = CliRequest::Ids(extra_prompt_ids_raw.len() - 1);
                 } else {
                     prompt_ids_raw = Some(text);
                 }
@@ -696,6 +785,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                     std::fs::read_to_string(&path)
                         .map_err(|e| format!("read --also-prompt-file {path}: {e}"))?,
                 );
+                image_req = CliRequest::Text(extra_prompt_texts.len() - 1);
             }
             "--also-prompt-ids-file" => {
                 let path = next_val(&mut i, "--also-prompt-ids-file")?;
@@ -703,6 +793,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                     std::fs::read_to_string(&path)
                         .map_err(|e| format!("read --also-prompt-ids-file {path}: {e}"))?,
                 );
+                image_req = CliRequest::Ids(extra_prompt_ids_raw.len() - 1);
             }
             "--chat" => chat = true,
             "--no-think" => no_think = true,
@@ -771,8 +862,8 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                     .map_err(|_| "invalid --prefill-warm".to_string())?;
             }
             "--no-eos" => params.stop_on_eos = false,
-            "--image" => image_args.push((false, next_val(&mut i, "--image")?)),
-            "--image-raw" => image_args.push((true, next_val(&mut i, "--image-raw")?)),
+            "--image" => image_args.push((image_req, false, next_val(&mut i, "--image")?)),
+            "--image-raw" => image_args.push((image_req, true, next_val(&mut i, "--image-raw")?)),
             "--vision-max-patches" => {
                 vision_max_patches = next_val(&mut i, "--vision-max-patches")?
                     .parse()
@@ -787,6 +878,13 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                     .map_err(|_| "invalid --repeat".to_string())?;
             }
             "--after-ids-file" => after_ids_file = Some(next_val(&mut i, "--after-ids-file")?),
+            "--after-prompt-file" => {
+                let path = next_val(&mut i, "--after-prompt-file")?;
+                after_prompt = Some(
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("read --after-prompt-file {path}: {e}"))?,
+                );
+            }
             "--spec" => spec_method = Some(next_val(&mut i, "--spec")?),
             "--k0-first" => compare_k0 = true,
             "--tree" => tree_spec = Some(next_val(&mut i, "--tree")?),
@@ -944,9 +1042,28 @@ fn run_generate(args: &[String]) -> Result<(), String> {
         params.extra_eos_ids.push(im_end);
     }
     // Image input: prepare on the host first, so the tower is planned for these image sizes.
-    let vision_in =
-        gaudium::vision::cli::prepare_cli_images(&model_dir, &image_args, vision_max_patches)?;
-    let prompt = match (&vision_in, prompt) {
+    // `request_images[r]`: the images of request r (request 0, the further token-ID requests in
+    // order, then the further text requests in order: the order of `all_prompts` below).
+    if after_ids_file.is_some() && after_prompt.is_some() {
+        return Err("give --after-ids-file or --after-prompt-file, not both".into());
+    }
+    let n_ids = extra_prompt_ids_raw.len();
+    let n_requests = 1 + n_ids + extra_prompt_texts.len();
+    let mut request_images: Vec<Option<gaudium::vision::cli::CliImages>> = Vec::new();
+    for r in 0..n_requests {
+        let args: Vec<(bool, String)> = image_args
+            .iter()
+            .filter(|(q, _, _)| q.index(n_ids) == r)
+            .map(|(_, raw, a)| (*raw, a.clone()))
+            .collect();
+        request_images.push(gaudium::vision::cli::prepare_cli_images(
+            &model_dir,
+            &args,
+            vision_max_patches,
+        )?);
+    }
+    let vision_in = request_images[0].as_ref();
+    let prompt = match (vision_in, prompt) {
         (Some(v), p) if prompt_ids_raw.is_none() => {
             Some(v.with_placeholders(p.as_deref().unwrap_or("Describe this image.")))
         }
@@ -990,9 +1107,22 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     // `--also-prompt-file`: more text requests for the same loaded engine
     let extra_text_ids: Vec<Vec<i32>> = extra_prompt_texts
         .into_iter()
-        .map(encode_text)
+        .enumerate()
+        .map(|(k, text)| match &request_images[1 + n_ids + k] {
+            Some(v) => encode_text(v.with_placeholders(&text)),
+            None => encode_text(text),
+        })
         .collect::<Result<_, _>>()?;
-    let prompt_ids = match &vision_in {
+    // `--after-prompt-file`: a text request after all others, formatted like --prompt
+    let after_ids: Option<Vec<i32>> = match (&after_prompt, &after_ids_file) {
+        (Some(text), _) => Some(encode_text(text.clone())?),
+        (None, Some(path)) => Some(gaudium::vision::cli::parse_ids(
+            &std::fs::read_to_string(path)
+                .map_err(|e| format!("read --after-ids-file {path}: {e}"))?,
+        )?),
+        (None, None) => None,
+    };
+    let prompt_ids = match vision_in {
         Some(v) => v.expand_prompt(&prompt_ids)?,
         None => prompt_ids,
     };
@@ -1054,8 +1184,9 @@ fn run_generate(args: &[String]) -> Result<(), String> {
         cfg.step.profile = profile_windows;
     }
     cfg.prefill = prefill_opts;
-    if let Some(v) = &vision_in {
-        v.configure(&mut cfg, vision_max_patches);
+    let with_images: Vec<&gaudium::vision::cli::CliImages> = request_images.iter().flatten().collect();
+    if !with_images.is_empty() {
+        gaudium::vision::cli::configure_requests(&with_images, &mut cfg, vision_max_patches);
         cfg.vision_gelu_bf16 = vision_gelu_bf16;
     }
     let sweep_widths: Vec<u64> = draft_k.clone();
@@ -1172,14 +1303,18 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     // Stop requests (SIGINT/SIGTERM) end generation between synced launches, never mid-launch.
     gaudium::signals::install();
     let mut engine: Box<dyn GenEngine> = load_engine(&cfg)?;
-    if let Some(v) = &vision_in {
+    if let Some(v) = vision_in {
         engine.set_request_images(v.images.clone())?;
     }
 
     // Every `--prompt-ids-file` after the first is one more request served by the same loaded engine.
     let mut all_prompts: Vec<Vec<i32>> = vec![prompt_ids];
-    for csv in &extra_prompt_ids_raw {
-        all_prompts.push(parse_ids_csv(csv)?);
+    for (k, csv) in extra_prompt_ids_raw.iter().enumerate() {
+        let ids = parse_ids_csv(csv)?;
+        all_prompts.push(match &request_images[1 + k] {
+            Some(v) => v.expand_prompt(&ids)?,
+            None => ids,
+        });
     }
     all_prompts.extend(extra_text_ids);
     // Sampler settings every request runs under (`--sampling`, else the single base setting).
@@ -1273,7 +1408,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
             // the reference is the plain K=0 loop, also for a non-speculative engine (whose
             // greedy requests otherwise decode enqueue-ahead)
             p0.k0_plain = true;
-            if let Some(v) = vision_in.as_ref().filter(|_| prompt_idx == 0) {
+            if let Some(v) = &request_images[prompt_idx] {
                 engine.set_request_images(v.images.clone())?;
             }
             // An engine that switches speculation per engine rather than per request (Gemma 4)
@@ -1307,8 +1442,8 @@ fn run_generate(args: &[String]) -> Result<(), String> {
         } else {
             None
         };
-        // the images belong to the first prompt: every run of it gets them again
-        if let Some(v) = vision_in.as_ref().filter(|_| prompt_idx == 0) {
+        // a request's images: every run of it gets them again
+        if let Some(v) = &request_images[prompt_idx] {
             engine.set_request_images(v.images.clone())?;
         }
         let mut decoder = StreamDecoder::new(&tok);
@@ -1441,7 +1576,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                         pt.max_new = i as u64 + 1;
                         pt.stop_on_eos = false;
                         pt.force_tokens = Some(got[..=i].to_vec());
-                        if let Some(v) = vision_in.as_ref().filter(|_| prompt_idx == 0) {
+                        if let Some(v) = &request_images[prompt_idx] {
                             engine.set_request_images(v.images.clone())?;
                         }
                         let rt = engine.generate_cancellable(
@@ -1469,15 +1604,15 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        // Images belong to the first request only (reported once).
-        if prompt_idx == 0 && set_idx == 0 {
+        // The vision report of each request with images (once, under its first sampler setting).
+        if set_idx == 0 && request_images[prompt_idx].is_some() {
             if let Some(v) = engine.last_vision_report() {
                 eprintln!(
                     "{}",
                     gaudium::vision::cli::format_vision_report(&v, &report)
                 );
             }
-            if let Some(path) = &dump_vision_emb {
+            if let Some(path) = dump_vision_emb.as_ref().filter(|_| prompt_idx == 0) {
                 let emb = engine.read_vision_embeddings()?;
                 std::fs::write(path, &emb)
                     .map_err(|e| format!("write --dump-vision-emb {path}: {e}"))?;
@@ -1488,14 +1623,13 @@ fn run_generate(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let params = settings[0].clone();
     gaudium::vision::cli::run_extra_requests(
         engine.as_mut(),
-        vision_in.as_ref().map(|v| v.images.as_slice()),
+        vision_in.map(|v| v.images.as_slice()),
         &all_prompts[0],
-        &params,
+        &settings,
         repeat,
-        after_ids_file.as_deref(),
+        after_ids.as_deref(),
         gaudium::signals::term_flag(),
     )?;
     Ok(())
@@ -2415,6 +2549,16 @@ fn main() {
             process::exit(1);
         }
         return;
+    }
+    if args.len() >= 3 && args[1] == "--vision-suite" {
+        match run_vision_suite(&args[1..]) {
+            Ok(true) => return,
+            Ok(false) => process::exit(1),
+            Err(e) => {
+                eprintln!("VISION SUITE FAIL: {e}");
+                process::exit(2);
+            }
+        }
     }
     if args.iter().any(|a| a == "--fp8-pack") {
         if let Err(e) = run_fp8_pack(&args[1..]) {

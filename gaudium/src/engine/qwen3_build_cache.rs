@@ -146,9 +146,14 @@ pub fn build_cache(cfg: &Qwen3Config, spec_chunks: &[u64]) -> Result<(), String>
                 false,
                 &cfg.step,
             )?;
-            // the drafter's own recipes of every chunk count (cheap; first use is inside a request)
+            // the drafter's own recipes of every chunk count (cheap; first use is inside a request),
+            // with the image forms when the load plans a vision tower
+            let image = cfg
+                .vision_max_patches
+                .max(cfg.vision_precompile.iter().copied().max().unwrap_or(0))
+                > 0;
             for nch in 1..=max_chunks {
-                for gb in rt.lazy_drafter_graphs(&spec, prefill_tile, nch) {
+                for gb in rt.lazy_drafter_graphs(&spec, prefill_tile, nch, image) {
                     one(gb)?;
                 }
             }

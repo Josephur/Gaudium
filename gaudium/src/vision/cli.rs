@@ -83,11 +83,27 @@ impl CliImages {
 
     /// Plans the tower for exactly these images (or the larger explicit patch cap).
     pub fn configure(&self, cfg: &mut EngineConfig, max_patches: u64) {
-        let ns: Vec<u64> = self.images.iter().map(|i| i.n_patches() as u64).collect();
-        cfg.vision_max_patches = max_patches.max(ns.iter().copied().max().unwrap_or(0));
-        cfg.vision_max_tokens = self.images.iter().map(|i| i.n_tokens() as u64).sum();
-        cfg.vision_precompile = ns;
+        configure_requests(&[self], cfg, max_patches);
     }
+}
+
+/// Plans the tower for the images of several requests of one run: its largest image (or the
+/// larger explicit patch cap), the image tokens of the request that holds the most, and a
+/// recipe for every image size.
+pub fn configure_requests(requests: &[&CliImages], cfg: &mut EngineConfig, max_patches: u64) {
+    let mut ns: Vec<u64> = Vec::new();
+    let mut tokens = 0u64;
+    for r in requests {
+        for i in &r.images {
+            if !ns.contains(&(i.n_patches() as u64)) {
+                ns.push(i.n_patches() as u64);
+            }
+        }
+        tokens = tokens.max(r.images.iter().map(|i| i.n_tokens() as u64).sum());
+    }
+    cfg.vision_max_patches = max_patches.max(ns.iter().copied().max().unwrap_or(0));
+    cfg.vision_max_tokens = tokens;
+    cfg.vision_precompile = ns;
 }
 
 /// One status line with the vision share of TTFT kept apart from the decoder's prefill.
@@ -135,18 +151,23 @@ fn timing_line(tag: &str, r: &GenReport) -> String {
     )
 }
 
-/// Measurement and state checks after the main request, in the same process: the same request
-/// again `repeat - 1` times (recipes and tables warm), then optionally a text-only request,
-/// which must give the tokens it gives in a process that never saw an image.
+/// Measurement and state checks after the requests, in the same process: the first request
+/// again `repeat - 1` times under the first sampler setting (recipes and tables warm), then
+/// optionally a text-only request (`after`) once per sampler setting, in setting order, which
+/// must give the tokens it gives on an engine that never saw an image. Each run prints its
+/// tokens as `REPEAT<n> TOKENS:` / `AFTER TOKENS:` lines.
 pub fn run_extra_requests(
     engine: &mut dyn GenEngine,
     images: Option<&[PreparedImage]>,
     prompt_ids: &[i32],
-    params: &GenParams,
+    settings: &[GenParams],
     repeat: usize,
-    after_ids_file: Option<&str>,
+    after: Option<&[i32]>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let Some(params) = settings.first() else {
+        return Ok(());
+    };
     for run in 1..repeat {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -161,16 +182,19 @@ pub fn run_extra_requests(
             eprintln!("{}", format_vision_report(&v, &r));
         }
     }
-    if let Some(path) = after_ids_file {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(());
+    if let Some(ids) = after {
+        for (k, p) in settings.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let r = engine.generate_cancellable(ids, p, Some(cancel), &mut |_| {})?;
+            eprintln!("AFTER TOKENS: {:?}", r.generated_tokens);
+            let tag = match k {
+                0 => "text after image".to_string(),
+                _ => format!("text after image, sampler setting {k}"),
+            };
+            eprintln!("{}", timing_line(&tag, &r));
         }
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("read --after-ids-file {path}: {e}"))?;
-        let ids = parse_ids(&text)?;
-        let r = engine.generate_cancellable(&ids, params, Some(cancel), &mut |_| {})?;
-        eprintln!("AFTER TOKENS: {:?}", r.generated_tokens);
-        eprintln!("{}", timing_line("text after image", &r));
     }
     Ok(())
 }
@@ -212,5 +236,18 @@ mod tests {
         assert_eq!(cfg.vision_precompile, vec![256, 560]);
         cli.configure(&mut cfg, 4096);
         assert_eq!(cfg.vision_max_patches, 4096);
+
+        // several requests: the largest image, the request with the most image tokens, every
+        // image size once
+        let one = CliImages {
+            spec: qwen38_vision_spec(),
+            images: vec![solid(256, 256)],
+        };
+        configure_requests(&[&one, &cli], &mut cfg, 0);
+        assert_eq!(cfg.vision_max_patches, 560);
+        assert_eq!(cfg.vision_max_tokens, 204);
+        assert_eq!(cfg.vision_precompile, vec![256, 560]);
+        configure_requests(&[&one], &mut cfg, 0);
+        assert_eq!((cfg.vision_max_patches, cfg.vision_max_tokens), (256, 64));
     }
 }

@@ -13,6 +13,13 @@
 //!   (`gaudium_ds_base`, `gaudium_ds_score` over the tables TG / TSV), and the greedy lattice walk.
 //!
 //! The drafter only proposes: the verify decides every token, so nothing here affects exactness.
+//!
+//! Vision: the context pass reads only the target's tapped residual rows, so an image position
+//! contributes what the target computed from its vision embedding (never a pad-token
+//! embedding); the block rows are generated tokens and masks. Like DFlash2's, the drafter's RoPE
+//! rows are addressed and rotated by KV slot. Checked by the vision regression suite
+//! (`--vision-suite`).
+//!
 //! Geometry (block size, taps, mask id, code size, rank, layers, window) comes from the
 //! checkpoint's `config.json`; anything the device graph does not implement fails at load.
 

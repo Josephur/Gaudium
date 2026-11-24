@@ -5,6 +5,7 @@
 //! planned vision tower, the embedding-row accounting of one request, video frame counts and
 //! indices, and mirrored indices of an orientation change.
 
+use crate::model_spec::ModelFamily;
 use crate::verified::{
     media_bytes_ok, media_canvas_ok, media_count_ok, media_source_allowed, orient_mirror,
     vid_frame_index, vid_group_frame, vid_groups, vid_keep_count, vid_pixel_budget,
@@ -85,17 +86,23 @@ pub fn check_canvas(width: usize, height: usize, max_pixels: u64) -> Result<(), 
     }
 }
 
-/// Whether a model decoded with the drafter `kind` (`None`: plain decode; else the server's
-/// drafter kinds `dspine`, `dflash2`, `mtp`) may be loaded with its vision tower. An unknown
-/// kind is treated like the strictest one. `reads_states`: the model's own drafter takes its
-/// context from the target model's hidden states (Inkling 2) instead of embedding prompt rows.
-pub fn drafter_runs_with_vision(kind: Option<&str>, reads_states: bool) -> bool {
-    vis_drafter_ok(match kind {
-        None => VisDrafter::VdNone,
-        Some("dspine") => VisDrafter::VdDSpine,
-        Some("dflash2") => VisDrafter::VdBlock,
-        Some("mtp") if reads_states => VisDrafter::VdStates,
-        Some(_) => VisDrafter::VdMtp,
+/// Whether a model of `family` decoded with the drafter `kind` (`None`: plain decode; else the
+/// server's drafter kinds `dspine`, `dflash2`, `mtp`) may be loaded with its vision tower. The
+/// kind and the family name the drafter (a Qwen model's `mtp` is its own MTP head, a Gemma 4
+/// model's is its `-assistant` checkpoint, Inkling 2's is its block drafter over the target's
+/// hidden states); the verified `vis_drafter_ok` decides. A pairing not listed here is
+/// [`VisDrafter::VdOther`], which never runs with images.
+pub fn drafter_runs_with_vision(kind: Option<&str>, family: ModelFamily) -> bool {
+    use ModelFamily as F;
+    vis_drafter_ok(match (kind, family) {
+        (None, _) => VisDrafter::VdNone,
+        (Some("dspine"), _) => VisDrafter::VdDSpine,
+        (Some("dflash2"), F::Qwen35Dense) => VisDrafter::VdBlock,
+        (Some("mtp"), F::Qwen35Dense) => VisDrafter::VdMtp,
+        (Some("mtp"), F::Qwen35Moe) => VisDrafter::VdMtpMoe,
+        (Some("mtp"), F::Inkling2) => VisDrafter::VdStates,
+        (Some("mtp"), F::Gemma4) => VisDrafter::VdAssistant,
+        _ => VisDrafter::VdOther,
     })
 }
 
@@ -243,16 +250,23 @@ mod tests {
 
     #[test]
     fn only_validated_drafters_run_with_the_tower() {
-        // today's validated set: plain decode and the DSpine drafter
-        assert!(drafter_runs_with_vision(None, false));
-        assert!(drafter_runs_with_vision(Some("dspine"), false));
-        assert!(!drafter_runs_with_vision(Some("dflash2"), false));
-        assert!(!drafter_runs_with_vision(Some("mtp"), false));
-        assert!(!drafter_runs_with_vision(Some("something new"), false));
-        // the drafter that reads the target's hidden states; no other kind gains by the flag
-        assert!(drafter_runs_with_vision(Some("mtp"), true));
-        assert!(!drafter_runs_with_vision(Some("dflash2"), true));
-        assert!(!drafter_runs_with_vision(Some("something new"), true));
+        use ModelFamily as F;
+        // today's validated set (the vision suite passed on the card): plain decode, DSpine, a
+        // dense model's DFlash2 drafter and own MTP head, Inkling 2's own drafter
+        for f in [F::Qwen3, F::Qwen35Dense, F::Qwen35Moe, F::Gemma4, F::Inkling2] {
+            assert!(drafter_runs_with_vision(None, f));
+            assert!(drafter_runs_with_vision(Some("dspine"), f));
+            assert!(!drafter_runs_with_vision(Some("something new"), f));
+        }
+        assert!(drafter_runs_with_vision(Some("dflash2"), F::Qwen35Dense));
+        assert!(drafter_runs_with_vision(Some("mtp"), F::Qwen35Dense));
+        assert!(drafter_runs_with_vision(Some("mtp"), F::Inkling2));
+        // not yet through the suite: the mixture-of-experts MTP head, Gemma 4's drafters
+        assert!(!drafter_runs_with_vision(Some("mtp"), F::Qwen35Moe));
+        assert!(!drafter_runs_with_vision(Some("mtp"), F::Gemma4));
+        assert!(!drafter_runs_with_vision(Some("dflash2"), F::Gemma4));
+        assert!(!drafter_runs_with_vision(Some("dflash2"), F::Qwen35Moe));
+        assert!(!drafter_runs_with_vision(Some("dflash2"), F::Inkling2));
     }
 
     #[test]

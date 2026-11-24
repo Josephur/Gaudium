@@ -887,15 +887,17 @@ impl SpecRuntime {
     }
 
     /// The drafter's own recipes of KV chunk count `nch` that a request compiles on first use
-    /// (device-less pre-compilation). Empty for drafters whose recipes do not depend on it here.
+    /// (device-less pre-compilation; `image`: the engine takes image input). Empty for drafters
+    /// whose recipes do not depend on it here.
     pub(super) fn lazy_drafter_graphs(
         &self,
         spec: &ModelSpec,
         prefill_tile: u64,
         nch: u64,
+        image: bool,
     ) -> Vec<GraphBuilder> {
         match &self.mtp {
-            Some(m) => m.lazy_graphs(spec, self.lmax, prefill_tile, nch, &self.elf_hashes),
+            Some(m) => m.lazy_graphs(spec, self.lmax, prefill_tile, nch, image, &self.elf_hashes),
             None => Vec::new(),
         }
     }
