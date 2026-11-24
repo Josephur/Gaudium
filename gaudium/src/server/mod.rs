@@ -2444,6 +2444,17 @@ struct TurnWaiter {
     skips: u32,
 }
 
+/// May no request pass `w` over any more (the verified `turn_due`)?
+fn waiter_due(w: &TurnWaiter, now: Instant, lim: TurnLimits) -> bool {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    crate::core::lanes::waiter_due(
+        ms(now.duration_since(w.since)),
+        ms(lim.max_wait),
+        u64::from(w.skips),
+        u64::from(lim.max_skips),
+    )
+}
+
 /// The waiter that gets the card next: its position in `waiting` (arrival order).
 fn next_turn(
     waiting: &[TurnWaiter],
@@ -2452,7 +2463,7 @@ fn next_turn(
     lim: TurnLimits,
 ) -> Option<usize> {
     let first = waiting.first()?;
-    let due = now.duration_since(first.since) >= lim.max_wait || first.skips >= lim.max_skips;
+    let due = waiter_due(first, now, lim);
     match ready {
         Some(m) if first.model != m && !due => {
             Some(waiting.iter().position(|w| w.model == m).unwrap_or(0))
@@ -2506,6 +2517,23 @@ impl TurnQueue {
             st = self.cv.wait_timeout(st, Duration::from_secs(1)).unwrap().0;
         }
     }
+
+    /// [lanes] Is the oldest waiter due (a lane session admits nothing more then)?
+    fn first_due(&self, lim: TurnLimits) -> bool {
+        let st = self.mu.lock().unwrap();
+        st.waiting
+            .first()
+            .is_some_and(|w| waiter_due(w, Instant::now(), lim))
+    }
+
+    /// [lanes] A lane session admitted a request that arrived at `since`: every older waiter was
+    /// passed over once more, as when a request of the loaded model takes the card before them.
+    fn passed_over(&self, since: Instant) {
+        let mut st = self.mu.lock().unwrap();
+        for w in st.waiting.iter_mut().filter(|w| w.since < since) {
+            w.skips += 1;
+        }
+    }
 }
 
 /// One chat request's place in the card queue: counted in `EngineSlot::waiting` from its arrival
@@ -2552,88 +2580,99 @@ impl Drop for WaitTicket<'_> {
 
 /// The lane session of model `idx` (`--parallel`): takes the card's turn, loads the model and
 /// hands the model's waiting requests to the engine's lanes until no lane is busy and nothing
-/// waits. Started by the request that found no session running (`lanes::LaneHub::submit`).
+/// waits. Started by the request that found no session running (`lanes::LaneHub::submit`). When
+/// the oldest waiter for the card becomes due, the session lets its lanes drain, hands the turn
+/// back and waits for its next one.
 fn drive_lanes(state: Arc<AppState>, idx: usize) {
-    let turn = state.turns.acquire(
-        idx,
-        || state.ready_model(),
-        || TurnLimits::read(state.cfg.queue_config.as_deref()),
-    );
-    if let Err(e) = state.ensure_loaded(idx, false) {
-        drop(turn);
-        state.lanes.fail_waiting(idx, &e);
-        return;
-    }
-    let op = state.card_op.lock().unwrap();
-    let engine = {
-        let mut s = state.slot.lock().unwrap();
-        match s.engine.take() {
-            Some(e) if s.resident_idx == Some(idx) => {
-                // the session counts as one active request while it runs (no idle release)
-                s.active_requests += 1;
-                s.last_activity = Instant::now();
-                Some(e)
-            }
-            other => {
-                s.engine = other;
-                None
-            }
+    let limits = || TurnLimits::read(state.cfg.queue_config.as_deref());
+    loop {
+        let turn = state
+            .turns
+            .acquire(idx, || state.ready_model(), limits);
+        if let Err(e) = state.ensure_loaded(idx, false) {
+            drop(turn);
+            state.lanes.fail_waiting(idx, &e);
+            return;
         }
-    };
-    let Some(mut engine) = engine else {
+        let op = state.card_op.lock().unwrap();
+        let engine = {
+            let mut s = state.slot.lock().unwrap();
+            match s.engine.take() {
+                Some(e) if s.resident_idx == Some(idx) => {
+                    // the session counts as one active request while it runs (no idle release)
+                    s.active_requests += 1;
+                    s.last_activity = Instant::now();
+                    Some(e)
+                }
+                other => {
+                    s.engine = other;
+                    None
+                }
+            }
+        };
+        let Some(mut engine) = engine else {
+            drop(op);
+            drop(turn);
+            state
+                .lanes
+                .fail_waiting(idx, "model unloaded concurrently; retry request");
+            return;
+        };
+        state.publish_engine_event();
+        let mut feed = state.lanes.feed(idx);
+        let st = &state;
+        let mut last_busy = 1u64;
+        feed.on_lanes = Some(Box::new(move |busy| {
+            let busy = busy.max(1);
+            if busy != last_busy {
+                last_busy = busy;
+                {
+                    let mut s = st.slot.lock().unwrap();
+                    s.active_requests = busy;
+                    s.last_activity = Instant::now();
+                }
+                st.publish_engine_event();
+            }
+        }));
+        feed.turn_due = Some(Box::new(move || st.turns.first_due(limits())));
+        feed.on_admit = Some(Box::new(move |since| st.turns.passed_over(since)));
+        let res = engine.serve_lanes(&mut feed);
+        let (ended, yielded) = (feed.ended, feed.yielded);
+        drop(feed);
+        let prefix = engine.prefix_stats();
+        let host_tier = engine.host_tier_facts();
+        {
+            let mut s = state.slot.lock().unwrap();
+            s.engine = Some(engine);
+            s.prefix = prefix;
+            s.host_tier = host_tier;
+            s.idle_due = state.host_cache.is_some();
+            s.active_requests = 0;
+            s.last_activity = Instant::now();
+        }
         drop(op);
         drop(turn);
-        state
-            .lanes
-            .fail_waiting(idx, "model unloaded concurrently; retry request");
-        return;
-    };
-    state.publish_engine_event();
-    let mut feed = state.lanes.feed(idx);
-    let st = &state;
-    let mut last_busy = 1u64;
-    feed.on_lanes = Some(Box::new(move |busy| {
-        let busy = busy.max(1);
-        if busy != last_busy {
-            last_busy = busy;
-            {
-                let mut s = st.slot.lock().unwrap();
-                s.active_requests = busy;
-                s.last_activity = Instant::now();
-            }
-            st.publish_engine_event();
+        if let Err(e) = &res {
+            eprintln!(
+                "[server] lane session of '{}' failed: {e}",
+                state.models[idx].id
+            );
         }
-    }));
-    let res = engine.serve_lanes(&mut feed);
-    let ended = feed.ended;
-    drop(feed);
-    let prefix = engine.prefix_stats();
-    let host_tier = engine.host_tier_facts();
-    {
-        let mut s = state.slot.lock().unwrap();
-        s.engine = Some(engine);
-        s.prefix = prefix;
-        s.host_tier = host_tier;
-        s.idle_due = state.host_cache.is_some();
-        s.active_requests = 0;
-        s.last_activity = Instant::now();
+        state.publish_engine_event();
+        if res.is_ok() && yielded {
+            // the oldest waiter takes the card; this session's requests wait for its next turn
+            continue;
+        }
+        if !ended {
+            // the engine stopped before its feed ended the session: what still waits fails
+            let why = res
+                .err()
+                .unwrap_or_else(|| "the lane session ended".to_string());
+            state.lanes.fail_waiting(idx, &why);
+            state.publish_engine_event();
+        }
+        return;
     }
-    drop(op);
-    drop(turn);
-    if let Err(e) = &res {
-        eprintln!(
-            "[server] lane session of '{}' failed: {e}",
-            state.models[idx].id
-        );
-    }
-    if !ended {
-        // the engine stopped before its feed ended the session: what still waits fails
-        let why = res
-            .err()
-            .unwrap_or_else(|| "the lane session ended".to_string());
-        state.lanes.fail_waiting(idx, &why);
-    }
-    state.publish_engine_event();
 }
 
 fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
@@ -4018,6 +4057,35 @@ mod tests {
             "inside the wait limit"
         );
         assert_eq!(next_turn(&[], Some(0), now, lim), None);
+    }
+
+    #[test]
+    fn lane_admissions_pass_over_older_waiters_until_one_is_due() {
+        let q = TurnQueue::default();
+        let lim = TurnLimits::default();
+        let t0 = Instant::now();
+        {
+            let mut st = q.mu.lock().unwrap();
+            st.waiting = waiters(&[1], t0);
+        }
+        assert!(!q.first_due(lim), "a fresh waiter is not due");
+        // a request that arrived before the waiter does not pass it over
+        q.passed_over(t0 - Duration::from_secs(1));
+        assert_eq!(q.mu.lock().unwrap().waiting[0].skips, 0);
+        for k in 1..=lim.max_skips {
+            q.passed_over(t0 + Duration::from_millis(u64::from(k)));
+        }
+        assert_eq!(q.mu.lock().unwrap().waiting[0].skips, lim.max_skips);
+        assert!(q.first_due(lim), "passed over as often as the limit allows");
+        q.mu.lock().unwrap().waiting[0] = TurnWaiter {
+            id: 0,
+            model: 1,
+            since: t0 - lim.max_wait,
+            skips: 0,
+        };
+        assert!(q.first_due(lim), "waited as long as the limit allows");
+        q.mu.lock().unwrap().waiting.clear();
+        assert!(!q.first_due(lim), "nobody waits");
     }
 
     #[test]

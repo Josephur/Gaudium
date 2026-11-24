@@ -5,9 +5,15 @@
 //! A session starts when a request arrives and none runs for its model, and ends when no lane is
 //! busy and nothing waits; both decisions are made under the queue's lock, so a request either
 //! joins the running session or starts the next one, never neither.
+//!
+//! A session's admissions pass over the older waiters of the card's turn queue (requests of other
+//! models), as a request of the loaded model does there. Once the oldest of them is due, the
+//! session admits nothing more, lets its lanes drain, hands the card's turn back and waits for
+//! its next one, its requests staying queued.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::engine::{FeedHead, LaneDone, LaneFeed, LaneJob, LaneOut, LaneView};
 
@@ -15,7 +21,8 @@ use crate::engine::{FeedHead, LaneDone, LaneFeed, LaneJob, LaneOut, LaneView};
 struct ModelLanes {
     /// A session runs for this model (its driver holds, or waits for, the card's turn).
     active: bool,
-    queue: VecDeque<LaneJob>,
+    /// Waiting requests with their arrival.
+    queue: VecDeque<(Instant, LaneJob)>,
     /// The lanes as the running session last reported them (empty: no session ran yet).
     view: Vec<LaneView>,
 }
@@ -37,7 +44,7 @@ impl LaneHub {
     pub fn submit(&self, idx: usize, job: LaneJob) -> bool {
         let mut g = self.mu.lock().unwrap();
         let m = &mut g[idx];
-        m.queue.push_back(job);
+        m.queue.push_back((Instant::now(), job));
         let start = crate::core::lanes::session_starts(m.active);
         m.active = true;
         start
@@ -56,7 +63,7 @@ impl LaneHub {
             let m = &mut g[idx];
             m.active = false;
             m.view.iter_mut().for_each(|v| *v = LaneView::free());
-            m.queue.drain(..).collect()
+            m.queue.drain(..).map(|(_, j)| j).collect()
         };
         for mut j in jobs {
             (j.out)(LaneOut::Done(Box::new(LaneDone {
@@ -74,7 +81,10 @@ impl LaneHub {
             hub: self,
             idx,
             ended: false,
+            yielded: false,
             on_lanes: None,
+            turn_due: None,
+            on_admit: None,
         }
     }
 }
@@ -94,15 +104,25 @@ pub(super) struct HubFeed<'a> {
     idx: usize,
     /// The feed ended the session (`FeedHead::End`): from then on it hands out nothing.
     pub ended: bool,
+    /// The feed stopped the session to hand the card's turn back (`FeedHead::End` with requests
+    /// still queued): the session's driver waits for its next turn and serves them then.
+    pub yielded: bool,
     /// Called after the lanes changed, outside the queue's lock: the busy lanes.
     pub on_lanes: Option<Box<dyn FnMut(u64) + 'a>>,
+    /// Is the oldest waiter for the card due? (None: nothing else waits for the card.)
+    pub turn_due: Option<Box<dyn Fn() -> bool + 'a>>,
+    /// Called after a request is admitted, outside the queue's lock, with its arrival: the older
+    /// waiters for the card were passed over once more.
+    pub on_admit: Option<Box<dyn FnMut(Instant) + 'a>>,
 }
 
 impl LaneFeed for HubFeed<'_> {
     fn head(&mut self, idle: bool) -> FeedHead {
-        if self.ended {
+        if self.ended || self.yielded {
             return FeedHead::End;
         }
+        // (the turn queue's lock is never taken under the hub's)
+        let due = self.turn_due.as_ref().is_some_and(|f| f());
         let mut g = self.hub.mu.lock().unwrap();
         let m = &mut g[self.idx];
         let waiting = !m.queue.is_empty();
@@ -111,8 +131,15 @@ impl LaneFeed for HubFeed<'_> {
             self.ended = true;
             return FeedHead::End;
         }
+        if crate::core::lanes::session_yields(idle, due) {
+            self.yielded = true;
+            return FeedHead::End;
+        }
+        if !crate::core::lanes::session_admits(due) {
+            return FeedHead::Empty;
+        }
         match m.queue.front() {
-            Some(j) => FeedHead::Job {
+            Some((_, j)) => FeedHead::Job {
                 exclusive: j.exclusive(),
             },
             None => FeedHead::Empty,
@@ -120,10 +147,14 @@ impl LaneFeed for HubFeed<'_> {
     }
 
     fn take(&mut self) -> Option<LaneJob> {
-        if self.ended {
+        if self.ended || self.yielded {
             return None;
         }
-        self.hub.mu.lock().unwrap()[self.idx].queue.pop_front()
+        let (since, job) = self.hub.mu.lock().unwrap()[self.idx].queue.pop_front()?;
+        if let Some(f) = self.on_admit.as_mut() {
+            f(since);
+        }
+        Some(job)
     }
 
     fn lanes(&mut self, view: &[LaneView]) {
@@ -178,6 +209,39 @@ mod tests {
         assert_eq!(feed.head(true), FeedHead::End, "an ended feed stays ended");
         let (c, _rc) = job(3, false);
         assert!(hub.submit(0, c), "after the end, a new session");
+    }
+
+    #[test]
+    fn a_session_hands_the_turn_back_once_a_waiter_is_due_and_keeps_its_requests() {
+        use std::cell::{Cell, RefCell};
+        let hub = LaneHub::new(1);
+        let (a, _ra) = job(1, false);
+        let (b, _rb) = job(2, false);
+        assert!(hub.submit(0, a));
+        let due = Cell::new(false);
+        let admitted = RefCell::new(Vec::new());
+        let mut feed = hub.feed(0);
+        feed.turn_due = Some(Box::new(|| due.get()));
+        feed.on_admit = Some(Box::new(|since| admitted.borrow_mut().push(since)));
+        assert_eq!(feed.head(true), FeedHead::Job { exclusive: false });
+        assert_eq!(feed.take().map(|j| j.id), Some(1));
+        assert_eq!(admitted.borrow().len(), 1, "an admission passes the older waiters over");
+        assert!(!hub.submit(0, b), "the second request joins the running session");
+        due.set(true);
+        assert_eq!(
+            feed.head(false),
+            FeedHead::Empty,
+            "a due waiter stops admissions; the busy lane keeps the turn"
+        );
+        assert_eq!(feed.head(true), FeedHead::End, "drained: the turn goes back");
+        assert!(feed.yielded && !feed.ended);
+        assert!(feed.take().is_none());
+        drop(feed);
+        let (c, _rc) = job(3, false);
+        assert!(!hub.submit(0, c), "the yielded session still runs: no second one");
+        let mut next = hub.feed(0);
+        assert_eq!(next.head(true), FeedHead::Job { exclusive: false });
+        assert_eq!(next.take().map(|j| j.id), Some(2), "its queue kept the arrival order");
     }
 
     #[test]

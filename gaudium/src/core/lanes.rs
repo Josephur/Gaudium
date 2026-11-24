@@ -8,8 +8,8 @@
 use crate::verified::{
     lane_can_admit, ln_allows, ln_batch_chunks, ln_in_batch, ln_is_drain, ln_is_free, ln_lanes_fit,
     ln_plan_bytes, ln_plan_fits, ln_plan_shortfall, ln_prefix_per_lane, ln_route_better,
-    ln_route_eligible, ln_run_done, ln_session_ends, ln_session_starts, ln_slot_fits, ln_step,
-    ln_step_chunks, LaneEvent, LaneState,
+    ln_route_eligible, ln_run_done, ln_session_admits, ln_session_ends, ln_session_starts,
+    ln_session_yields, ln_slot_fits, ln_step, ln_step_chunks, turn_due, LaneEvent, LaneState,
 };
 
 /// What a free lane offers a request (routing).
@@ -244,6 +244,24 @@ pub fn prefix_per_lane(granted: u64, n: u64) -> u64 {
 /// Has a lane's request ended (end-of-sequence token, cancelled, or no budget left)?
 pub fn run_done(eos: bool, cancelled: bool, remaining: u64) -> bool {
     ln_run_done(eos, cancelled, remaining)
+}
+
+/// Does a running lane session admit a waiting request while the oldest waiter for the card is
+/// `due`?
+pub fn session_admits(due: bool) -> bool {
+    ln_session_admits(due)
+}
+
+/// Does a lane session with its lanes `idle` hand the card's turn back, the oldest waiter being
+/// `due`?
+pub fn session_yields(idle: bool, due: bool) -> bool {
+    ln_session_yields(idle, due)
+}
+
+/// Is a waiter for the card due (no request passes it over any more)? `waited` / `max_wait` in
+/// ms, `skips` / `max_skips` = times passed over.
+pub fn waiter_due(waited: u64, max_wait: u64, skips: u64, max_skips: u64) -> bool {
+    turn_due(waited, max_wait, skips, max_skips)
 }
 
 /// A request arrives for a model whose lane session is `active` or not: does it start one?

@@ -152,6 +152,22 @@ def ln_stage_cursor(b: Nat, j: Nat) -> Nat:
 def ln_session_ends(idle: Bool, waiting: Bool) -> Bool:
   Bool.and(idle, Bool.not(waiting))
 
+# Is a waiter for the card's turn due, so that no request may pass it over any more? It has waited
+# `waited` (ms) against at most `max_wait`, and been passed over `skips` times against at most
+# `max_skips`.
+def turn_due(waited: Nat, max_wait: Nat, skips: Nat, max_skips: Nat) -> Bool:
+  Bool.or(Nat.is_ge(waited, max_wait), Nat.is_ge(skips, max_skips))
+
+# Does a running session admit a waiting request of its model while the oldest waiter for the
+# card is `due` (a request of another model, which the session's admissions pass over)?
+def ln_session_admits(due: Bool) -> Bool:
+  Bool.not(due)
+
+# Does a session hand the card's turn back now, with no lane busy (`idle`), because the oldest
+# waiter for the card is `due`? It waits for its next turn then, keeping its requests queued.
+def ln_session_yields(idle: Bool, due: Bool) -> Bool:
+  Bool.and(idle, due)
+
 # ============================================================================
 # 2. Routing a request to a lane
 # ============================================================================
@@ -870,3 +886,65 @@ def ln_stage_cursors_apart(b, j):
     L.nat_le_subst_r(Nat.add(Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n)), 4n), Nat.add(Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n)), 4n), Nat.add(Nat.mul(b, 64n), Nat.add(Nat.mul(j, 64n), 4n)), L.nat_add_assoc(Nat.mul(b, 64n), Nat.mul(j, 64n), 4n), L.nat_le_refl(Nat.add(Nat.add(Nat.mul(b, 64n), Nat.mul(j, 64n)), 4n))),
     L.nat_add_le_mono(Nat.mul(b, 64n), Nat.mul(b, 64n), Nat.add(Nat.mul(j, 64n), 4n), Nat.add(64n, Nat.mul(j, 64n)), L.nat_le_refl(Nat.mul(b, 64n)), L.nat_le_trans(Nat.add(Nat.mul(j, 64n), 4n), Nat.add(4n, Nat.mul(j, 64n)), Nat.add(64n, Nat.mul(j, 64n)), L.nat_le_subst_r(Nat.add(Nat.mul(j, 64n), 4n), Nat.add(Nat.mul(j, 64n), 4n), Nat.add(4n, Nat.mul(j, 64n)), L.nat_add_comm(Nat.mul(j, 64n), 4n), L.nat_le_refl(Nat.add(Nat.mul(j, 64n), 4n))), L.nat_add_le_mono(4n, 64n, Nat.mul(j, 64n), Nat.mul(j, 64n), {==}, L.nat_le_refl(Nat.mul(j, 64n)))))
   )
+
+def ln_ge_add_true(+w: Nat, +e: Nat) -> {True{} == Nat.is_ge(Nat.add(w, e), w) : Bool}:
+  match w:
+    case 0n:
+      match e:
+        case 0n:
+          {==}
+        case 1n+p:
+          {==}
+    case 1n+wp:
+      ln_ge_add_true(wp, e)
+
+def ln_or_true_r(b: Bool) -> {Bool.or(b, True{}) == True{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a waiter that has waited its maximum wait is due: no request passes it over any more.
+law turn_due_after_max_wait:
+  for +w: Nat
+  for +e: Nat
+  for +s: Nat
+  for +ms: Nat
+  {turn_due(Nat.add(w, e), w, s, ms) == True{} : Bool}
+
+def turn_due_after_max_wait(w, e, s, ms):
+  %ln_ge_add_true(w, e) : {Bool.or(_, Nat.is_ge(s, ms)) == True{} : Bool}
+  {==}
+
+# promise: a waiter passed over its maximum number of times is due: no request passes it over any more.
+law turn_due_after_max_skips:
+  for +w: Nat
+  for +mw: Nat
+  for +ms: Nat
+  for +e: Nat
+  {turn_due(w, mw, Nat.add(ms, e), ms) == True{} : Bool}
+
+def turn_due_after_max_skips(w, mw, ms, e):
+  %ln_ge_add_true(ms, e) : {Bool.or(Nat.is_ge(w, mw), _) == True{} : Bool}
+  ln_or_true_r(Nat.is_ge(w, mw))
+
+# promise: a lane session admits no request while the oldest waiter for the card is due.
+law ln_session_admits_none_when_due:
+  {ln_session_admits(True{}) == False{} : Bool}
+
+def ln_session_admits_none_when_due():
+  {==}
+
+# promise: a lane session never hands the card's turn back while one of its lanes is busy.
+law ln_session_keeps_busy_lanes:
+  for +d: Bool
+  {ln_session_yields(False{}, d) == False{} : Bool}
+
+def ln_session_keeps_busy_lanes(d):
+  {==}
+
+# promise: a lane session with no lane busy hands the card's turn to a waiter that is due.
+law ln_session_yields_when_due:
+  {ln_session_yields(True{}, True{}) == True{} : Bool}
+
+def ln_session_yields_when_due():
+  {==}

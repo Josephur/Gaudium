@@ -135,7 +135,9 @@ Serve options:
                         state dir). Keys: group_max_wait_min (default 45), group_max_skips
                         (default 3): a request for the loaded model may run ahead of older
                         requests until the oldest has waited that long or been passed over
-                        that many times
+                        that many times (a request a --parallel lane session admits
+                        counts too: the session then lets its lanes drain and hands
+                        the card on)
   --draft-model <id=dir> Drafter checkpoint for model <id>: speculative decoding, output
                         token-identical to K=0 (repeatable, one per model). The kind
                         follows the directory name: a block drafter when it contains
