@@ -15,7 +15,9 @@
 #   - Which decode forms may run on FP8 K/V (the non-speculative K=0 form always may)
 #   - Which loads take FP8 K/V: never a calibration load, and only with a family, a head shape and
 #     a decode form the FP8 attention takes; a scale table covers every kv head of the model
-#   - The row order of the V projection per dtype (the FP8 V rows follow the softmax's P bytes)
+#   - The row order of the V projection per dtype (the FP8 V rows follow the softmax's P bytes):
+#     every channel of a head lands on a row of that head, and no two on the same row
+#   - The calibration's read-back of a cache: every range it copies lies inside the cache
 #
 # Multipliers are powers of two, written as f32 exponent fields: a field e stands for 2^(e - 127).
 # A tensor whose largest magnitude has exponent field `a`, scaled by 2^(e - 127), has its largest
@@ -781,3 +783,282 @@ law kv8_accepted_decode:
 
 def kv8_accepted_decode(kc, ac, m, n, w, k, r, s, f, ok):
   kc_none_decode(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, k, r, s), kv8_decode_ok(f), ok)
+
+# ============================================================================
+# 8. The V row order is a permutation of each head's rows
+# ============================================================================
+
+# The channel of device row r of a head's V projection: `kv_wv_row` undone (rows of 128- and
+# 256-channel heads).
+def kv_unlane128_if(+s: Nat, low: Bool) -> Nat:
+  match low:
+    case True{}:
+      Nat.mul(2n, s)
+    case False{}:
+      Nat.add(Nat.mul(2n, Nat.sub(s, 64n)), 1n)
+
+def kv_unlane128(+r: Nat) -> Nat:
+  kv_unlane128_if(Nat.mod(r, 128n), Nat.is_lt(Nat.mod(r, 128n), 64n))
+
+def kv_unlane256(+r: Nat) -> Nat:
+  Nat.add(Nat.mul(Nat.div(r, 128n), 128n), kv_unlane128(r))
+
+def kv_unvpos128_if(+s: Nat, low: Bool) -> Nat:
+  match low:
+    case True{}:
+      Nat.add(Nat.mul(4n, Nat.div(s, 2n)), Nat.mod(s, 2n))
+    case False{}:
+      Nat.add(Nat.mul(4n, Nat.div(Nat.sub(s, 64n), 2n)), Nat.add(2n, Nat.mod(Nat.sub(s, 64n), 2n)))
+
+def kv_unvpos(+r: Nat) -> Nat:
+  Nat.add(Nat.mul(Nat.div(r, 128n), 128n), kv_unvpos128_if(Nat.mod(r, 128n), Nat.is_lt(Nat.mod(r, 128n), 64n)))
+
+def kv_wv_chan_if(+r: Nat, narrow: Bool, d: KvDtype) -> Nat:
+  match narrow d:
+    case True{} _:
+      kv_unlane128(r)
+    case False{} KvBf16{}:
+      kv_unlane256(r)
+    case False{} KvFp8{}:
+      kv_unlane256(kv_unvpos(r))
+
+def kv_wv_chan(+r: Nat, +head_dim: Nat, d: KvDtype) -> Nat:
+  kv_wv_chan_if(r, Nat.is_eq(head_dim, 128n), d)
+
+# What the laws on the V row order state for channel c of a head of hd channels: its row lies in
+# the head, and `kv_wv_chan` gives c back. `kc_wv_from` checks it for k channels from c on (proof
+# helpers: the proofs below evaluate them).
+def kc_wv_ok(+c: Nat, +hd: Nat, +d: KvDtype) -> Bool:
+  Bool.and(Nat.is_lt(kv_wv_row(c, hd, d), hd), Nat.is_eq(kv_wv_chan(kv_wv_row(c, hd, d), hd, d), c))
+
+def kc_wv_from(+k: Nat, +c: Nat, +hd: Nat, +d: KvDtype) -> Bool:
+  match k:
+    case 0n:
+      True{}
+    case 1n+kp:
+      Bool.and(kc_wv_ok(c, hd, d), kc_wv_from(kp, 1n+c, hd, d))
+
+def kc_and_l(+x: Bool, +y: Bool, h: {Bool.and(x, y) == True{} : Bool}) -> {x == True{} : Bool}:
+  match x:
+    case True{}:
+      {==}
+    case False{}:
+      L.bool_absurd({False{} == True{} : Bool}, h)
+
+def kc_and_r(+x: Bool, +y: Bool, h: {Bool.and(x, y) == True{} : Bool}) -> {y == True{} : Bool}:
+  match x:
+    case True{}:
+      h
+    case False{}:
+      L.bool_absurd({y == True{} : Bool}, h)
+
+def kc_eq_of_is_eq(+a: Nat, +b: Nat, h: {Nat.is_eq(a, b) == True{} : Bool}) -> {a == b : Nat}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      L.bool_absurd({0n == 1n+bp : Nat}, h)
+    case 1n+ap 0n:
+      L.bool_absurd({1n+ap == 0n : Nat}, h)
+    case 1n+ap 1n+bp:
+      %kc_eq_of_is_eq(ap, bp, h) : {1n+ap == 1n+_ : Nat}
+      {==}
+
+# The check of k channels from c on covers channel x + c for every x < k.
+def kc_wv_at(+x: Nat, +k: Nat, +c: Nat, +hd: Nat, +d: KvDtype, all: {kc_wv_from(k, c, hd, d) == True{} : Bool}, lt: {Nat.is_lt(x, k) == True{} : Bool}) -> {kc_wv_ok(Nat.add(x, c), hd, d) == True{} : Bool}:
+  match x k:
+    case 0n 0n:
+      L.bool_absurd({kc_wv_ok(c, hd, d) == True{} : Bool}, lt)
+    case 1n+xp 0n:
+      L.bool_absurd({kc_wv_ok(1n+Nat.add(xp, c), hd, d) == True{} : Bool}, lt)
+    case 0n 1n+kp:
+      kc_and_l(kc_wv_ok(c, hd, d), kc_wv_from(kp, 1n+c, hd, d), all)
+    case 1n+xp 1n+kp:
+      %L.nat_add_succ_r(xp, c) : {kc_wv_ok(_, hd, d) == True{} : Bool}
+      kc_wv_at(xp, kp, 1n+c, hd, d, kc_and_r(kc_wv_ok(c, hd, d), kc_wv_from(kp, 1n+c, hd, d), all), lt)
+
+def kc_wv_in(+c: Nat, +hd: Nat, +d: KvDtype, all: {kc_wv_from(hd, 0n, hd, d) == True{} : Bool}, lt: {Nat.is_lt(c, hd) == True{} : Bool}) -> {kc_wv_ok(c, hd, d) == True{} : Bool}:
+  %L.nat_add_zero_r(c) : {kc_wv_ok(_, hd, d) == True{} : Bool}
+  kc_wv_at(c, hd, 0n, hd, d, all, lt)
+
+def kc_and_intro(+x: Bool, +y: Bool, hx: {x == True{} : Bool}, hy: {y == True{} : Bool}) -> {Bool.and(x, y) == True{} : Bool}:
+  match x:
+    case True{}:
+      hy
+    case False{}:
+      L.bool_absurd({False{} == True{} : Bool}, hx)
+
+def kc_add_succ_l(+a: Nat, +b: Nat) -> {1n+Nat.add(a, b) == Nat.add(a, 1n+b) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %kc_add_succ_l(ap, b) : {1n+1n+Nat.add(ap, b) == 1n+_ : Nat}
+      {==}
+
+def kc_wv_shift(+b: Nat, +a: Nat, +c: Nat, +hd: Nat, +d: KvDtype, h: {kc_wv_from(b, 1n+Nat.add(a, c), hd, d) == True{} : Bool}) -> {kc_wv_from(b, Nat.add(a, 1n+c), hd, d) == True{} : Bool}:
+  %kc_add_succ_l(a, c) : {kc_wv_from(b, _, hd, d) == True{} : Bool}
+  h
+
+# Two checks of consecutive channel ranges make the check of both.
+def kc_wv_cat(+a: Nat, +b: Nat, +c: Nat, +hd: Nat, +d: KvDtype, +ha: {kc_wv_from(a, c, hd, d) == True{} : Bool}, hb: {kc_wv_from(b, Nat.add(a, c), hd, d) == True{} : Bool}) -> {kc_wv_from(Nat.add(a, b), c, hd, d) == True{} : Bool}:
+  match a:
+    case 0n:
+      hb
+    case 1n+ap:
+      kc_and_intro(
+        kc_wv_ok(c, hd, d),
+        kc_wv_from(Nat.add(ap, b), 1n+c, hd, d),
+        kc_and_l(kc_wv_ok(c, hd, d), kc_wv_from(ap, 1n+c, hd, d), ha),
+        kc_wv_cat(ap, b, 1n+c, hd, d, kc_and_r(kc_wv_ok(c, hd, d), kc_wv_from(ap, 1n+c, hd, d), ha), kc_wv_shift(b, ap, c, hd, d, hb))
+      )
+
+# The check over every channel, by evaluation (in ranges of 64 channels, which the kernel's
+# evaluation budget takes).
+def kc_wv256_q0(+d: KvDtype) -> {kc_wv_from(64n, 0n, 256n, d) == True{} : Bool}:
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
+
+def kc_wv256_q1(+d: KvDtype) -> {kc_wv_from(64n, 64n, 256n, d) == True{} : Bool}:
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
+
+def kc_wv256_q2(+d: KvDtype) -> {kc_wv_from(64n, 128n, 256n, d) == True{} : Bool}:
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
+
+def kc_wv256_q3(+d: KvDtype) -> {kc_wv_from(64n, 192n, 256n, d) == True{} : Bool}:
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
+
+def kc_wv256_all(+d: KvDtype) -> {kc_wv_from(256n, 0n, 256n, d) == True{} : Bool}:
+  kc_wv_cat(128n, 128n, 0n, 256n, d,
+    kc_wv_cat(64n, 64n, 0n, 256n, d, kc_wv256_q0(d), kc_wv256_q1(d)),
+    kc_wv_cat(64n, 64n, 128n, 256n, d, kc_wv256_q2(d), kc_wv256_q3(d)))
+
+def kc_wv128_all(+d: KvDtype) -> {kc_wv_from(128n, 0n, 128n, d) == True{} : Bool}:
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
+
+# What the check gives for one channel of each head width: its row lies in the head, and
+# `kv_wv_chan` gives the channel back.
+def kc_wv_in_head(+c: Nat, +hd: Nat, +d: KvDtype, all: {kc_wv_from(hd, 0n, hd, d) == True{} : Bool}, lt: {Nat.is_lt(c, hd) == True{} : Bool}) -> {Nat.is_lt(kv_wv_row(c, hd, d), hd) == True{} : Bool}:
+  kc_and_l(Nat.is_lt(kv_wv_row(c, hd, d), hd), Nat.is_eq(kv_wv_chan(kv_wv_row(c, hd, d), hd, d), c), kc_wv_in(c, hd, d, all, lt))
+
+def kc_wv_inverse(+c: Nat, +hd: Nat, +d: KvDtype, all: {kc_wv_from(hd, 0n, hd, d) == True{} : Bool}, lt: {Nat.is_lt(c, hd) == True{} : Bool}) -> {kv_wv_chan(kv_wv_row(c, hd, d), hd, d) == c : Nat}:
+  kc_eq_of_is_eq(kv_wv_chan(kv_wv_row(c, hd, d), hd, d), c, kc_and_r(Nat.is_lt(kv_wv_row(c, hd, d), hd), Nat.is_eq(kv_wv_chan(kv_wv_row(c, hd, d), hd, d), c), kc_wv_in(c, hd, d, all, lt)))
+
+# Two channels whose rows are the same are the same channel (`kv_wv_chan` undoes `kv_wv_row`).
+def kc_wv_distinct(+a: Nat, +b: Nat, +hd: Nat, +d: KvDtype, +all: {kc_wv_from(hd, 0n, hd, d) == True{} : Bool}, ha: {Nat.is_lt(a, hd) == True{} : Bool}, hb: {Nat.is_lt(b, hd) == True{} : Bool}, e: {kv_wv_row(a, hd, d) == kv_wv_row(b, hd, d) : Nat}) -> {a == b : Nat}:
+  %kc_wv_inverse(b, hd, d, all, hb) : {a == _ : Nat}
+  %e : {a == kv_wv_chan(_, hd, d) : Nat}
+  %kc_wv_inverse(a, hd, d, all, ha) : {_ == kv_wv_chan(kv_wv_row(a, hd, d), hd, d) : Nat}
+  {==}
+
+# promise: every channel of a 256-channel head lands on a row of that head in its V projection
+# harm: a V channel would be packed outside its head, over another head's rows or past the weight
+law kv_wv_row_in_head_256:
+  for +c: Nat
+  for +d: KvDtype
+  for ok: {Nat.is_lt(c, 256n) == True{} : Bool}
+  {Nat.is_lt(kv_wv_row(c, 256n, d), 256n) == True{} : Bool}
+
+def kv_wv_row_in_head_256(c, d, ok):
+  kc_wv_in_head(c, 256n, d, kc_wv256_all(d), ok)
+
+# promise: every channel of a 128-channel head lands on a row of that head in its V projection
+# harm: a V channel would be packed outside its head, over another head's rows or past the weight
+law kv_wv_row_in_head_128:
+  for +c: Nat
+  for +d: KvDtype
+  for ok: {Nat.is_lt(c, 128n) == True{} : Bool}
+  {Nat.is_lt(kv_wv_row(c, 128n, d), 128n) == True{} : Bool}
+
+def kv_wv_row_in_head_128(c, d, ok):
+  kc_wv_in_head(c, 128n, d, kc_wv128_all(d), ok)
+
+# promise: two channels of a 256-channel head never land on the same row of its V projection
+# harm: one V channel would overwrite another in the packed weight, and the attention output would lose it
+law kv_wv_rows_distinct_256:
+  for +a: Nat
+  for +b: Nat
+  for +d: KvDtype
+  for ha: {Nat.is_lt(a, 256n) == True{} : Bool}
+  for hb: {Nat.is_lt(b, 256n) == True{} : Bool}
+  for e: {kv_wv_row(a, 256n, d) == kv_wv_row(b, 256n, d) : Nat}
+  {a == b : Nat}
+
+def kv_wv_rows_distinct_256(a, b, d, ha, hb, e):
+  kc_wv_distinct(a, b, 256n, d, kc_wv256_all(d), ha, hb, e)
+
+# promise: two channels of a 128-channel head never land on the same row of its V projection
+# harm: one V channel would overwrite another in the packed weight, and the attention output would lose it
+law kv_wv_rows_distinct_128:
+  for +a: Nat
+  for +b: Nat
+  for +d: KvDtype
+  for ha: {Nat.is_lt(a, 128n) == True{} : Bool}
+  for hb: {Nat.is_lt(b, 128n) == True{} : Bool}
+  for e: {kv_wv_row(a, 128n, d) == kv_wv_row(b, 128n, d) : Nat}
+  {a == b : Nat}
+
+def kv_wv_rows_distinct_128(a, b, d, ha, hb, e):
+  kc_wv_distinct(a, b, 128n, d, kc_wv128_all(d), ha, hb, e)
+
+# ============================================================================
+# 9. The calibration's read-back of a cache
+# ============================================================================
+
+# Byte offset of kv head g's batch in chunk ch of a cache laid out chunk by chunk, `nkv` batches
+# of `head` bytes per chunk.
+def kv_batch_off(+ch: Nat, +g: Nat, +nkv: Nat, +head: Nat) -> Nat:
+  Nat.mul(Nat.add(Nat.mul(ch, nkv), g), head)
+
+# A read of `len` bytes at offset `off` lies inside an allocation of `bytes` bytes (written so
+# that it cannot overflow).
+def kv_range_inside(+off: Nat, +len: Nat, +bytes: Nat) -> Bool:
+  Bool.and(Nat.is_le(off, bytes), Nat.is_le(len, Nat.sub(bytes, off)))
+
+# The bytes of the next copy of a read of `len` bytes with `done` of them copied, through a
+# staging buffer of `piece` bytes.
+def kv_piece_len(+done: Nat, +len: Nat, +piece: Nat) -> Nat:
+  Nat.min(piece, Nat.sub(len, done))
+
+def kc_inside(+o: Nat, +n: Nat, +b: Nat, ok: {kv_range_inside(o, n, b) == True{} : Bool}) -> {Nat.is_le(Nat.add(o, n), b) == True{} : Bool}:
+  match o b:
+    case 0n 0n:
+      ok
+    case 0n 1n+bp:
+      ok
+    case 1n+op 0n:
+      L.bool_absurd({Nat.is_le(1n+Nat.add(op, n), 0n) == True{} : Bool}, ok)
+    case 1n+op 1n+bp:
+      kc_inside(op, n, bp, ok)
+
+# promise: a range the read-back admits ends inside the cache allocation it reads
+# harm: a device-to-host copy would read past the cache, from another buffer or an unmapped address
+law kv_range_inside_ends_inside:
+  for +o: Nat
+  for +n: Nat
+  for +b: Nat
+  for ok: {kv_range_inside(o, n, b) == True{} : Bool}
+  {Nat.is_le(Nat.add(o, n), b) == True{} : Bool}
+
+def kv_range_inside_ends_inside(o, n, b, ok):
+  kc_inside(o, n, b, ok)
+
+# promise: each copy of a read ends inside the range being read, whatever the staging buffer's size
+# harm: the last copy of a head's batch would read past the batch, and past the cache for the last one
+law kv_piece_within:
+  for +done: Nat
+  for +len: Nat
+  for +piece: Nat
+  {Bool.or(Nat.is_lt(len, done), Nat.is_le(Nat.add(done, kv_piece_len(done, len, piece)), len)) == True{} : Bool}
+
+def kv_piece_within(done, len, piece):
+  kc_fit_le(done, len, piece)

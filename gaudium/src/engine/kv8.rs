@@ -19,7 +19,9 @@ use crate::core::kv_cache::{
     check_fp8_load, check_table_heads, default_table_path, kv_dtype_name, Kv8Layer, Kv8Load,
     KvCalibration, KvDecode, KV8_TABLE_LEN,
 };
-use crate::verified::{kv_is_fp8, kv_layer_dtype, KvDtype};
+use crate::verified::{
+    kv_batch_off, kv_is_fp8, kv_layer_dtype, kv_piece_len, kv_range_inside, KvDtype,
+};
 
 /// Layer suffix of a scale table: `L<l>_kv8` (the prefill's generic `L_kv8`).
 pub const KV8_SUFFIX: &str = "kv8";
@@ -232,13 +234,15 @@ impl Qwen3Engine {
                 let (base, bytes) = self.kv_addr[&format!("L{l}_{name}")];
                 for ch in 0..chunks {
                     for g in 0..nkv {
-                        let off = ((ch * nkv + g) * head_bytes) as u64;
-                        if off + head_bytes as u64 > bytes {
+                        // the batch's range and each copy of it (`kv_batch_off`,
+                        // `kv_range_inside`, `kv_piece_len`: every copy lies inside the cache)
+                        let off = kv_batch_off(ch as u64, g as u64, nkv as u64, head_bytes as u64);
+                        if !kv_range_inside(off, head_bytes as u64, bytes) {
                             return Err(format!("L{l}_{name}: chunk {ch} lies past the cache"));
                         }
                         let mut done = 0usize;
                         while done < head_bytes {
-                            let n = piece.min(head_bytes - done);
+                            let n = kv_piece_len(done as u64, head_bytes as u64, piece as u64) as usize;
                             self.dev
                                 .copy_d2h_pinned_sync(base + off + done as u64, &mut self.stage_io, n)
                                 .map_err(|e| format!("read back L{l}_{name}: {e}"))?;
@@ -426,6 +430,13 @@ mod tests {
         for c in 0..256u64 {
             assert_eq!(kv_wv_row(c, 256, KvDtype::KvFp8), kv8_vpos(lane256(c)));
             assert_eq!(kv_wv_row(c, 256, KvDtype::KvBf16), lane256(c));
+            // the inverse the laws are proved through
+            for d in [KvDtype::KvBf16, KvDtype::KvFp8] {
+                assert_eq!(crate::verified::kv_wv_chan(kv_wv_row(c, 256, d), 256, d), c);
+                if c < 128 {
+                    assert_eq!(crate::verified::kv_wv_chan(kv_wv_row(c, 128, d), 128, d), c);
+                }
+            }
         }
     }
 
