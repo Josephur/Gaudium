@@ -124,6 +124,10 @@ pub struct Qwen3Config {
     /// [kv8] Calibration load (`gaudium --kv-calibrate`): BF16 caches, read back after every
     /// prefill for their per-head maxima.
     pub kv_calibrate: bool,
+
+    /// Requests served at once (`--parallel`): lanes with their own K/V rows, recurrent state
+    /// and prefix table, decoded together in batched steps. 1 = one request at a time.
+    pub lanes: u64,
 }
 
 impl Qwen3Config {
@@ -156,6 +160,8 @@ impl Qwen3Config {
             kv_dtype: crate::verified::KvDtype::KvBf16,
             kv_scales: None,
             kv_calibrate: false,
+
+            lanes: 1,
         }
     }
 }

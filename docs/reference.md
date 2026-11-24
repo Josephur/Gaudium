@@ -94,6 +94,19 @@ Serve options:
                         are resumed while the bounded rings still hold what the rest
                         of the prompt reads, and a copy of the rings taken when each
                         prompt is in, 0.6 GiB, covers a long generation after it)
+  --parallel <N>        Requests a model runs at once (default: 1; at most 16): each in a
+                        lane of its own (its own K/V rows, recurrent state and prefix
+                        reuse), the decoding lanes stepped together in one launch that
+                        reads the weights once. Every stream is token-identical to the
+                        same request run alone. Further requests wait in arrival order;
+                        a request with images runs alone. Each lane holds the full
+                        context (--max-ctx / --model-ctx): a load that cannot plan N
+                        lanes of it is refused with the numbers. A request goes to the
+                        free lane that holds the most of its prompt. Dense Qwen3 /
+                        Qwen3.5 / Qwen3.8 models without a drafter; other models are
+                        served with one lane (the log says why). /props total_slots
+                        and /slots show the lanes. Not with --cache-ram yet (the
+                        host-RAM tier is off for a model served with lanes)
   --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a
                         conversation: after another conversation, another model, or
                         the idle release (--idle-park). What a request could resume

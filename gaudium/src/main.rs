@@ -116,6 +116,19 @@ fn print_usage() {
          \x20                       are resumed while the bounded rings still hold what the rest\n\
          \x20                       of the prompt reads, and a copy of the rings taken when each\n\
          \x20                       prompt is in, 0.6 GiB, covers a long generation after it)\n\
+         \x20 --parallel <N>        Requests a model runs at once (default: 1; at most 16): each in a\n\
+         \x20                       lane of its own (its own K/V rows, recurrent state and prefix\n\
+         \x20                       reuse), the decoding lanes stepped together in one launch that\n\
+         \x20                       reads the weights once. Every stream is token-identical to the\n\
+         \x20                       same request run alone. Further requests wait in arrival order;\n\
+         \x20                       a request with images runs alone. Each lane holds the full\n\
+         \x20                       context (--max-ctx / --model-ctx): a load that cannot plan N\n\
+         \x20                       lanes of it is refused with the numbers. A request goes to the\n\
+         \x20                       free lane that holds the most of its prompt. Dense Qwen3 /\n\
+         \x20                       Qwen3.5 / Qwen3.8 models without a drafter; other models are\n\
+         \x20                       served with one lane (the log says why). /props total_slots\n\
+         \x20                       and /slots show the lanes. Not with --cache-ram yet (the\n\
+         \x20                       host-RAM tier is off for a model served with lanes)\n\
          \x20 --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a\n\
          \x20                       conversation: after another conversation, another model, or\n\
          \x20                       the idle release (--idle-park). What a request could resume\n\
@@ -2217,6 +2230,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut vision_max_tokens = gaudium::server::DEFAULT_VISION_MAX_TOKENS;
     let mut prefix_slots = gaudium::engine::qwen3::prefix_cache::DEFAULT_SLOTS;
     let mut cache_ram_bytes: Option<u64> = None;
+    let mut parallel = 1u64;
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -2396,6 +2410,19 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("invalid --prefix-cache '{s}'"))?;
             }
+            "--parallel" => {
+                let s = next_val(&mut i, "--parallel")?;
+                parallel = s
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=gaudium::engine::MAX_LANES).contains(n))
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid --parallel '{s}' (1 to {} lanes)",
+                            gaudium::engine::MAX_LANES
+                        )
+                    })?;
+            }
             "--cache-ram" => {
                 // GiB, whole or decimal ("8", "0.5"); 0 turns the host tier off
                 let s = next_val(&mut i, "--cache-ram")?;
@@ -2485,6 +2512,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         tls_cert,
         tls_key,
         cache_ram_bytes,
+        parallel,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {

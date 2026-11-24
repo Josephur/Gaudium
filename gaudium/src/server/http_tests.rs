@@ -267,6 +267,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             gen_defaults: SamplerDefaults::FALLBACK,
             vision: None,
             n_ctx_train: None,
+            lanes: 1,
         }
     };
     let replies = Arc::new(Mutex::new(VecDeque::new()));
@@ -315,6 +316,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             tls_cert: None,
             tls_key: None,
             cache_ram_bytes: Some(0),
+            parallel: 1,
         },
         models: vec![model("tags", chat::TEST_TEMPLATE, None)],
         slot: Mutex::new(EngineSlot {
@@ -348,6 +350,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
         proxy: proxy::McpProxy::disabled(),
         tls: None,
         host_cache,
+        lanes: lanes::LaneHub::new(1),
     });
     let _ = model; // (one resident model per harness)
     Harness {
@@ -384,6 +387,7 @@ fn model_harness(id: &str, template: &str, config: Option<&str>, spec: Option<&s
         gen_defaults: m.gen_defaults,
         vision: None,
         n_ctx_train: None,
+        lanes: 1,
     };
     let engine = h.state.slot.lock().unwrap().engine.take();
     let state = Arc::new(AppState {
@@ -420,6 +424,7 @@ fn model_harness(id: &str, template: &str, config: Option<&str>, spec: Option<&s
         proxy: proxy::McpProxy::disabled(),
         tls: None,
         host_cache: None,
+        lanes: lanes::LaneHub::new(1),
     });
     Harness {
         state,
@@ -500,6 +505,7 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
             VisionServe::new(vs, max_patches, max_tokens, MediaLimits::default()).unwrap(),
         ),
         n_ctx_train: None,
+        lanes: 1,
     };
     let engine = h.state.slot.lock().unwrap().engine.take();
     let state = Arc::new(AppState {
@@ -536,6 +542,7 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
         proxy: proxy::McpProxy::disabled(),
         tls: None,
         host_cache: None,
+        lanes: lanes::LaneHub::new(1),
     });
     Harness {
         state,
@@ -1410,6 +1417,7 @@ fn served_engine_configuration_follows_the_server_options() {
         tls_cert: None,
         tls_key: None,
         cache_ram_bytes: Some(0),
+        parallel: 1,
     };
     // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
     let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
@@ -1962,6 +1970,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         tls_cert: None,
         tls_key: None,
         cache_ram_bytes: Some(0),
+        parallel: 1,
     };
     // plain decode and the drafters that passed the vision suite on this (dense) family: the
     // server-wide tower
@@ -2489,4 +2498,122 @@ fn the_https_listener_starts_only_with_both_files_and_says_why_not() {
     let e = start_tls(&cfg).err().unwrap();
     assert!(e.contains("private key file"), "{e}");
     assert!(!e.contains("BEGIN") && !e.contains("MII"), "{e}");
+}
+
+/// The harness with its model served with `n` lanes (`--parallel`).
+fn lane_harness(n: usize) -> Harness {
+    let h = harness();
+    let m = &h.state.models[0];
+    let (chat, _) = ChatTemplate::from_parts(chat::TEST_TEMPLATE, None).unwrap();
+    let model = RegisteredModel {
+        id: m.id.clone(),
+        dir: m.dir.clone(),
+        spec: m.spec.clone(),
+        format: m.format.clone(),
+        chat: Some(chat),
+        tokenizer: Arc::clone(&m.tokenizer),
+        extra_eos_ids: m.extra_eos_ids.clone(),
+        max_ctx: m.max_ctx,
+        gemma_closes_thought: false,
+        gen_defaults: m.gen_defaults,
+        vision: None,
+        n_ctx_train: None,
+        lanes: n,
+    };
+    let engine = h.state.slot.lock().unwrap().engine.take();
+    let mut cfg = h.state.cfg.clone();
+    cfg.parallel = n as u64;
+    let state = Arc::new(AppState {
+        cfg,
+        models: vec![model],
+        slot: Mutex::new(EngineSlot {
+            engine,
+            resident_idx: Some(0),
+            lifecycle: Lifecycle::Ready(0),
+            detail: String::new(),
+            since: Instant::now(),
+            last_activity: Instant::now(),
+            admin_parked: false,
+            hold: false,
+            active_requests: 0,
+            waiting: vec![0],
+            switches: 0,
+            last_switch_s: None,
+            last_warmup_s: None,
+            last_live_json: None,
+            last_request_json: None,
+            hbm_bytes: None,
+            facts: None,
+            prefix: None,
+            host_tier: None,
+            idle_due: false,
+        }),
+        card_op: Mutex::new(()),
+        cancels: Mutex::new(HashMap::new()),
+        next_req_id: AtomicU64::new(1),
+        hub: EventHub::new(),
+        dtypes: Mutex::new(HashMap::new()),
+        turns: TurnQueue::default(),
+        proxy: proxy::McpProxy::disabled(),
+        tls: None,
+        host_cache: None,
+        lanes: lanes::LaneHub::new(1),
+    });
+    Harness { state, ..h }
+}
+
+/// A model served with lanes: concurrent requests go through the model's lane session (here an
+/// engine without batched steps, which runs them one at a time), each gets its own reply, the
+/// lanes are advertised, and the session gives the engine back when nothing is left.
+#[test]
+fn lane_requests_run_through_the_lane_session() {
+    let h = Arc::new(lane_harness(3));
+    let replies = ["Alpha.", "Bravo.", "Charlie."];
+    for r in replies {
+        h.script(r);
+    }
+    let threads: Vec<_> = (0..3)
+        .map(|_| {
+            let h = Arc::clone(&h);
+            thread::spawn(move || h.chat(""))
+        })
+        .collect();
+    let mut got: Vec<String> = threads
+        .into_iter()
+        .map(|t| {
+            let (status, v) = t.join().unwrap();
+            assert_eq!(status, 200, "{}", v.dump());
+            // (the test template opens a reasoning block)
+            s(&v, &["choices", "0", "message", "reasoning_content"]).to_string()
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, replies.map(str::to_string));
+    let props = json::parse_json(&h.state.props_json(0, true)).unwrap();
+    assert_eq!(at(&props, &["total_slots"]).as_u64(), Some(3));
+    let (status, slots) = h.get("/slots");
+    assert_eq!(status, 200);
+    let slots = json::parse_json(&slots).unwrap();
+    assert_eq!(slots.as_array().map(|a| a.len()), Some(3));
+    // the session ends once nothing waits: the engine is back in the slot
+    let t0 = Instant::now();
+    loop {
+        let back = {
+            let s = h.state.slot.lock().unwrap();
+            s.engine.is_some() && s.active_requests == 0
+        };
+        if back {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(5), "the session never ended");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // and a request after it starts the next session
+    h.script("Delta.");
+    let (status, v) = h.chat("");
+    assert_eq!(status, 200, "{}", v.dump());
+    assert_eq!(
+        s(&v, &["choices", "0", "message", "reasoning_content"]),
+        "Delta."
+    );
 }

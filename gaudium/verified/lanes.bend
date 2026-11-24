@@ -145,6 +145,33 @@ def ln_slot_fits(+cursor: Nat, +rows: Nat, +nch: Nat, +chunk: Nat, +lane_chunks:
   Bool.and(Nat.is_le(nch, lane_chunks), Nat.is_le(Nat.add(cursor, rows), Nat.mul(nch, chunk)))
 
 # ============================================================================
+# 4b. Which models are served with lanes
+# ============================================================================
+
+# How a model decodes: plainly, with a DSpine drafter, or with another drafter.
+type LaneDrafter is Data:
+  LdNone{}
+  LdDSpine{}
+  LdOther{}
+
+# Which kinds of decode have batched steps for several lanes.
+def ln_drafter_ok(d: LaneDrafter) -> Bool:
+  match d:
+    case LdNone{}:
+      True{}
+    case _:
+      False{}
+
+# Lanes a model is served with: the lanes asked for (at least one) when its engine and its
+# drafter have batched steps, otherwise one.
+def ln_served_lanes(+requested: Nat, ok: Bool) -> Nat:
+  match ok:
+    case True{}:
+      Nat.max(1n, requested)
+    case False{}:
+      1n
+
+# ============================================================================
 # 5. Helper lemmas (erased before Rust codegen)
 # ============================================================================
 
@@ -403,3 +430,41 @@ law ln_slot_fits_covered:
 
 def ln_slot_fits_covered(c, r, n, ch, lc):
   ln_fit_covered(c, r, n, ch, Nat.is_le(n, lc), Nat.is_le(Nat.add(c, r), Nat.mul(n, ch)), {==})
+
+# promise: a model that decodes without a drafter can always be served with several lanes.
+law ln_plain_decode_lanes_ok:
+  {ln_drafter_ok(LdNone{}) == True{} : Bool}
+
+def ln_plain_decode_lanes_ok():
+  {==}
+
+# promise: a model is always served with at least one lane.
+law ln_served_lanes_at_least_one:
+  for +r: Nat
+  for +ok: Bool
+  {Nat.is_le(1n, ln_served_lanes(r, ok)) == True{} : Bool}
+
+def ln_served_lanes_at_least_one(r, ok):
+  match ok:
+    case True{}:
+      L.nat_max_ge_l(1n, r)
+    case False{}:
+      {==}
+
+# promise: a model is never served with more lanes than were asked for.
+law ln_served_lanes_within_request:
+  for +r: Nat
+  for +ok: Bool
+  {Nat.is_le(ln_served_lanes(1n+r, ok), 1n+r) == True{} : Bool}
+
+def ln_served_lanes_within_request(r, ok):
+  match r:
+    case 0n:
+      match ok:
+        case True{}: {==}
+        case False{}: {==}
+    case 1n+rp:
+      match ok:
+        case True{}:
+          L.nat_le_refl(1n+1n+rp)
+        case False{}: {==}

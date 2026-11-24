@@ -36,7 +36,7 @@ use crate::core::lifecycle::{can_switch_resident_model, RequestGuard};
 use crate::core::tool_calls::{finish_reason_name, generation_end, stop_reason_name, GenEnd};
 use crate::core::vision::{drafter_runs_with_vision, planned_image_tokens, MediaLimits};
 use crate::engine::qwen3::{Qwen3Config, Qwen3GenParams, KV_CHUNK};
-use crate::engine::{load_engine, GenEngine};
+use crate::engine::{load_engine, GenEngine, LaneDone, LaneJob, LaneOut};
 use crate::json::{self, JsonValue};
 use crate::model_spec::{ModelFamily, ModelSpec};
 use crate::model_text::ModelText;
@@ -50,6 +50,7 @@ mod anthropic;
 mod chat;
 mod conn;
 mod jinja;
+mod lanes;
 mod outparse;
 mod proxy;
 mod readout;
@@ -122,6 +123,9 @@ pub struct ServerConfig {
     /// Budget of the host-RAM tier of prefix reuse in bytes (`--cache-ram`): `None` = a share
     /// of the host memory available at start, `Some(0)` = off.
     pub cache_ram_bytes: Option<u64>,
+    /// Requests a model runs at once (`--parallel`): lanes of their own, decoded together.
+    /// Models whose engine or drafter has no batched steps are served with one lane.
+    pub parallel: u64,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -178,6 +182,8 @@ struct RegisteredModel {
     vision: Option<VisionServe>,
     /// The model's own context limit (`ModelText::max_positions`), read once at registration.
     n_ctx_train: Option<u64>,
+    /// Lanes the model is served with (`--parallel`; 1 = one request at a time).
+    lanes: usize,
 }
 
 /// Sampler settings a request falls back to (temperature, top-k, top-p).
@@ -362,6 +368,8 @@ struct AppState {
     /// The host-RAM tier of prefix reuse (`--cache-ram`): entries outlive the engine that made
     /// them (another model, the idle release). `None`: off.
     host_cache: Option<Arc<crate::cache_ram::SharedCache>>,
+    /// The lane queues of models served with `--parallel` lanes.
+    lanes: lanes::LaneHub,
 }
 
 impl AppState {
@@ -702,7 +710,8 @@ impl AppState {
         out
     }
 
-    /// The one slot of this server: whether it is busy, and what the resident model runs as.
+    /// The slots of the resident model: one per lane (`--parallel`), each with its state and its
+    /// request, and what the model runs as.
     fn slots_json(&self) -> String {
         let (active, idx) = {
             let s = self.slot.lock().unwrap();
@@ -711,18 +720,55 @@ impl AppState {
         let m = &self.models[idx];
         let facts = self.run_facts(idx);
         let (greedy, sampled, _, _) = readout::method_set(facts.drafter.as_ref());
-        format!(
-            "[{{\"id\":0,\"is_processing\":{},\"model\":{},\"n_ctx\":{},\"speculative\":{},\
-             \"precision\":{},\"greedy\":{},\"sampled\":{},\"loaded\":{}}}]",
-            active > 0,
-            jq(&m.id),
-            m.max_ctx,
-            facts.drafter.is_some(),
-            jq(readout::precision_word(&facts)),
-            jq(&greedy),
-            jq(&sampled),
-            facts.from_engine,
-        )
+        let view = if m.lanes > 1 {
+            self.lanes.view(idx)
+        } else {
+            Vec::new()
+        };
+        let mut out = String::from("[");
+        for lane in 0..m.lanes.max(1) {
+            if lane > 0 {
+                out.push(',');
+            }
+            let v = view.get(lane);
+            let state = v.map_or(
+                if m.lanes <= 1 && active > 0 {
+                    "busy"
+                } else {
+                    "free"
+                },
+                |v| v.state,
+            );
+            let processing = if m.lanes > 1 {
+                state != "free"
+            } else {
+                active > 0
+            };
+            out.push_str(&format!(
+                "{{\"id\":{lane},\"is_processing\":{processing},\"state\":{},\"model\":{},\"n_ctx\":{},\
+                 \"speculative\":{},\"precision\":{},\"greedy\":{},\"sampled\":{},\"loaded\":{}",
+                jq(state),
+                jq(&m.id),
+                m.max_ctx,
+                facts.drafter.is_some(),
+                jq(readout::precision_word(&facts)),
+                jq(&greedy),
+                jq(&sampled),
+                facts.from_engine,
+            ));
+            if let Some(v) = v.filter(|v| v.job.is_some()) {
+                out.push_str(&format!(
+                    ",\"job\":{},\"prompt_tokens\":{},\"reused_tokens\":{},\"generated\":{}",
+                    v.job.unwrap_or(0),
+                    v.prompt_tokens,
+                    v.reused,
+                    v.generated
+                ));
+            }
+            out.push('}');
+        }
+        out.push(']');
+        out
     }
 
     /// Publishes a `request` event and keeps it for `/gaudium/live`.
@@ -821,7 +867,7 @@ impl AppState {
              \"top_k\":{d_top_k},\"top_p\":{d_top_p},\"min_p\":0.0,\"max_tokens\":-1,\"n_predict\":-1,\"stream\":false,\
              \"timings_per_token\":false,\"reasoning_format\":\"auto\",\"speculative\":{speculative},\
              \"samplers\":[\"top_k\",\"top_p\",\"min_p\",\"temperature\"]}}}},\
-             \"total_slots\":1,\"model_alias\":{},\"model_path\":{},\
+             \"total_slots\":{},\"model_alias\":{},\"model_path\":{},\
              \"modalities\":{{\"vision\":{vision},\"audio\":false,\"video\":{video}}},\
              \"vision\":{vision_limits},\
              \"endpoint_slots\":true,\"endpoint_props\":false,\"endpoint_metrics\":false,\"ui\":{},\
@@ -833,6 +879,7 @@ impl AppState {
              \"bos_token\":{},\"eos_token\":{},\"build_info\":{},\"is_sleeping\":false,\
              \"cors_proxy_enabled\":{},\"a2ui\":{}",
             m.max_ctx,
+            m.lanes.max(1),
             jq(&m.id),
             jq(&m.dir.display().to_string()),
             self.cfg.ui_dir.is_some(),
@@ -1148,6 +1195,38 @@ fn planned_drafter_of(
     Some((Some(dir.clone()), kind, draft_k))
 }
 
+/// Lanes the configuration serves model `id` with (`--parallel`): its engine and its drafter must
+/// have batched steps (the dense Qwen3 / Qwen3.5 / Qwen3.8 engine), else one lane, with the
+/// reason.
+fn served_lanes(cfg: &ServerConfig, id: &str, spec: &ModelSpec) -> (usize, Option<&'static str>) {
+    use crate::verified::{ln_drafter_ok, ln_served_lanes, LaneDrafter};
+    let drafter = match planned_drafter_of(cfg, id) {
+        None => LaneDrafter::LdNone,
+        Some((_, "dspine", _)) => LaneDrafter::LdDSpine,
+        Some(_) => LaneDrafter::LdOther,
+    };
+    let engine_ok = crate::engine::lanes_supported(spec);
+    let n = ln_served_lanes(cfg.parallel, engine_ok && ln_drafter_ok(drafter)) as usize;
+    let why = (cfg.parallel > 1 && n <= 1).then_some(if engine_ok {
+        "its drafter has no batched steps yet"
+    } else {
+        "its engine has no batched steps"
+    });
+    (n, why)
+}
+
+/// [`served_lanes`] at registration, saying why a model asked for lanes gets one.
+fn lanes_of(cfg: &ServerConfig, id: &str, spec: &ModelSpec) -> usize {
+    let (n, why) = served_lanes(cfg, id, spec);
+    if let Some(why) = why {
+        eprintln!(
+            "[server] model '{id}': served with one lane (--parallel {}: {why})",
+            cfg.parallel
+        );
+    }
+    n
+}
+
 /// Drafts per launch of a model's own MTP drafter (`--draft-model <id>=mtp`): the widths that
 /// measured best on the card. Inkling 2's block drafter fills a block of 7 drafts in one launch
 /// that costs about 3% of a verify pass, so it runs at the full block.
@@ -1298,6 +1377,9 @@ fn engine_config_of(
     qcfg.no_cache = cfg.no_cache;
     qcfg.verbose = cfg.verbose;
     qcfg.prefix_slots = cfg.prefix_slots;
+    qcfg.lanes = ModelText::open(dir)
+        .and_then(|t| t.spec())
+        .map_or(1, |spec| served_lanes(cfg, id, &spec).0 as u64);
     if let Some((patches, tokens)) = vision_plan_of(cfg, id, dir, max_ctx) {
         // The tower's buffers are planned for the largest image. Its recipes are compiled at
         // load for that size (so the shared workspace covers them); other image sizes compile
@@ -1558,6 +1640,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
                 v.max_tokens,
             );
         }
+        let lanes = lanes_of(&cfg, &entry.id, &spec);
         models.push(RegisteredModel {
             id: entry.id.clone(),
             dir: entry.dir.clone(),
@@ -1577,6 +1660,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
                 .map(|t| crate::tokenizer::gemma4_template_closes_thought(&t))
                 .unwrap_or(false),
             n_ctx_train: text.max_positions(),
+            lanes,
         });
     }
 
@@ -1625,6 +1709,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
         proxy,
         tls,
         host_cache,
+        lanes: lanes::LaneHub::new(n_models),
     });
 
     // Optional eager warm-up in a background thread so HTTP/UI responds immediately!
@@ -2460,6 +2545,92 @@ impl Drop for WaitTicket<'_> {
     }
 }
 
+/// The lane session of model `idx` (`--parallel`): takes the card's turn, loads the model and
+/// hands the model's waiting requests to the engine's lanes until no lane is busy and nothing
+/// waits. Started by the request that found no session running (`lanes::LaneHub::submit`).
+fn drive_lanes(state: Arc<AppState>, idx: usize) {
+    let turn = state.turns.acquire(
+        idx,
+        || state.ready_model(),
+        || TurnLimits::read(state.cfg.queue_config.as_deref()),
+    );
+    if let Err(e) = state.ensure_loaded(idx, false) {
+        drop(turn);
+        state.lanes.fail_waiting(idx, &e);
+        return;
+    }
+    let op = state.card_op.lock().unwrap();
+    let engine = {
+        let mut s = state.slot.lock().unwrap();
+        match s.engine.take() {
+            Some(e) if s.resident_idx == Some(idx) => {
+                // the session counts as one active request while it runs (no idle release)
+                s.active_requests += 1;
+                s.last_activity = Instant::now();
+                Some(e)
+            }
+            other => {
+                s.engine = other;
+                None
+            }
+        }
+    };
+    let Some(mut engine) = engine else {
+        drop(op);
+        drop(turn);
+        state
+            .lanes
+            .fail_waiting(idx, "model unloaded concurrently; retry request");
+        return;
+    };
+    state.publish_engine_event();
+    let mut feed = state.lanes.feed(idx);
+    let st = &state;
+    let mut last_busy = 1u64;
+    feed.on_lanes = Some(Box::new(move |busy| {
+        let busy = busy.max(1);
+        if busy != last_busy {
+            last_busy = busy;
+            {
+                let mut s = st.slot.lock().unwrap();
+                s.active_requests = busy;
+                s.last_activity = Instant::now();
+            }
+            st.publish_engine_event();
+        }
+    }));
+    let res = engine.serve_lanes(&mut feed);
+    let ended = feed.ended;
+    drop(feed);
+    let prefix = engine.prefix_stats();
+    let host_tier = engine.host_tier_facts();
+    {
+        let mut s = state.slot.lock().unwrap();
+        s.engine = Some(engine);
+        s.prefix = prefix;
+        s.host_tier = host_tier;
+        s.idle_due = state.host_cache.is_some();
+        s.active_requests = 0;
+        s.last_activity = Instant::now();
+    }
+    drop(op);
+    drop(turn);
+    if let Err(e) = &res {
+        eprintln!(
+            "[server] lane session of '{}' failed: {e}",
+            state.models[idx].id
+        );
+    }
+    if !ended {
+        // the engine stopped before its feed ended the session: what still waits fails
+        let why = res
+            .err()
+            .unwrap_or_else(|| "the lane session ended".to_string());
+        state.lanes.fail_waiting(idx, &why);
+    }
+    state.publish_engine_event();
+}
+
 fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
@@ -2589,7 +2760,7 @@ fn tokenize_prompt(
     Ok((ids, Some(media)))
 }
 
-fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
+fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
@@ -2599,7 +2770,7 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Con
 }
 
 /// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path.
-fn handle_messages(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
+fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let api = Api::Messages {
         show_thinking: true,
     };
@@ -2660,7 +2831,7 @@ fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut Conn)
 /// Runs one chat request: prompt, card turn, generation, and the reply in the shape of `api`.
 /// `ignored`: request fields the caller already found accepted but not applied.
 fn run_chat(
-    state: &AppState,
+    state: &Arc<AppState>,
     val: &JsonValue,
     stream: &mut Conn,
     api: Api,
@@ -2799,16 +2970,24 @@ fn run_chat(
     state.publish_request(format!("{{{}}}", req_base("queued", 0.0)));
     // Counts this request in the card queue until it holds the card; any early return leaves it.
     let mut ticket = WaitTicket::enter(state, idx);
+    // A model served with lanes: the request joins the model's lane session, which takes the
+    // card's turn and loads the model (`drive_lanes`). Otherwise the request takes them itself.
+    let lane_mode = m.lanes > 1;
     // One turn covers the model load and the generation, so no request for another model can swap the card
     // between them; a request for the model already on the card may go ahead of older ones (TurnQueue).
-    let turn = state.turns.acquire(
-        idx,
-        || state.ready_model(),
-        || TurnLimits::read(state.cfg.queue_config.as_deref()),
-    );
+    let turn = (!lane_mode).then(|| {
+        state.turns.acquire(
+            idx,
+            || state.ready_model(),
+            || TurnLimits::read(state.cfg.queue_config.as_deref()),
+        )
+    });
 
     // Ensure target model is loaded on Gaudi 2 before starting generation.
-    if let Err(e) = state.ensure_loaded(idx, false) {
+    if let Err(e) = (!lane_mode)
+        .then(|| state.ensure_loaded(idx, false))
+        .unwrap_or(Ok(()))
+    {
         state.publish_request(format!(
             "{{{},\"message\":{}}}",
             req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
@@ -2853,22 +3032,82 @@ fn run_chat(
         ..Qwen3GenParams::default()
     };
 
-    // Acquire card op lock for exclusive Gaudi 2 execution.
-    let _op = state.card_op.lock().unwrap();
-    {
-        let mut s = state.slot.lock().unwrap();
-        s.active_requests += 1;
-        ticket.leave(&mut s);
-        s.last_activity = Instant::now();
-    }
-    state.publish_engine_event();
-    let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
+    // The engine takes the request: alone (the engine out of the slot for this request), or in
+    // a lane of the model's lane session.
+    let mut media = media;
+    let mut lane_rx: Option<std::sync::mpsc::Receiver<LaneOut>> = None;
+    let mut _op = None;
+    let (mut engine, hbm_bytes) = if lane_mode {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = LaneJob {
+            id: req_num,
+            prompt: prompt_ids.clone(),
+            params: params.clone(),
+            images: media.take().map(|md| md.into_tower_inputs()),
+            cancel: Arc::clone(&cancel_flag),
+            out: Box::new(move |ev| {
+                let _ = tx.send(ev);
+            }),
+        };
+        if state.lanes.submit(idx, job) {
+            let st = Arc::clone(state);
+            if let Err(e) = thread::Builder::new()
+                .name("gaudium-lanes".into())
+                .spawn(move || drive_lanes(st, idx))
+            {
+                state
+                    .lanes
+                    .fail_waiting(idx, &format!("start the lane session: {e}"));
+            }
+        }
+        // the request waits for a lane; a session that cannot start ends it here
+        let err = match rx.recv() {
+            Ok(LaneOut::Started { .. }) => None,
+            Ok(LaneOut::Done(d)) => Some(d.report.err().unwrap_or_default()),
+            Ok(LaneOut::Token(_)) | Err(_) => Some("the lane session ended".to_string()),
+        };
+        if let Some(e) = err {
+            state.cancels.lock().unwrap().remove(&req_id);
+            let _ = rguard.apply(ReqEvent::EvReqFail);
+            state.publish_request(format!(
+                "{{{},\"message\":{}}}",
+                req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
+                jq(&e)
+            ));
+            if stream_mode {
+                let _ = write_sse_chunk(stream, api.stream_error(503, &e).as_bytes());
+                write_sse_end(stream);
+            } else {
+                api.error(stream, 503, "unavailable_error", &e);
+            }
+            return;
+        }
+        let hbm = {
+            let mut s = state.slot.lock().unwrap();
+            ticket.leave(&mut s);
+            s.last_activity = Instant::now();
+            s.hbm_bytes
+        };
+        state.publish_engine_event();
+        let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
+        lane_rx = Some(rx);
+        (None, hbm)
+    } else {
+        // Acquire card op lock for exclusive Gaudi 2 execution.
+        _op = Some(state.card_op.lock().unwrap());
+        {
+            let mut s = state.slot.lock().unwrap();
+            s.active_requests += 1;
+            ticket.leave(&mut s);
+            s.last_activity = Instant::now();
+        }
+        state.publish_engine_event();
+        let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
 
-    // Take engine temporarily out of slot so status endpoints never block while generating!
-    let (mut engine, hbm_bytes) = {
+        // Take engine temporarily out of slot so status endpoints never block while generating!
         let mut s = state.slot.lock().unwrap();
         match s.engine.take() {
-            Some(e) if s.resident_idx == Some(idx) => (e, s.hbm_bytes),
+            Some(e) if s.resident_idx == Some(idx) => (Some(e), s.hbm_bytes),
             other => {
                 s.engine = other;
                 s.active_requests = s.active_requests.saturating_sub(1);
@@ -2921,7 +3160,11 @@ fn run_chat(
         .unwrap_or(false);
 
     // The engine's launch feed and profile block (both measured by the engine's own reporter).
-    let live = engine.live_profile().filter(|h| h.is_live());
+    // (lanes: the engine's launch feed belongs to the whole session, not to one request)
+    let live = engine
+        .as_ref()
+        .and_then(|e| e.live_profile())
+        .filter(|h| h.is_live());
     let out_stream = if stream_mode {
         stream.try_clone().ok()
     } else {
@@ -2970,13 +3213,9 @@ fn run_chat(
     }
 
     let mut last_live_pub = Instant::now();
-    // The request's tower inputs go to the engine first; it runs the tower inside its prefill.
-    let images_set = match media {
-        Some(md) => engine.set_request_images(md.into_tower_inputs()),
-        None => Ok(()),
-    };
-    let report = images_set.and_then(|()| {
-        engine.generate_cancellable(&prompt_ids, &params, Some(&cancel_flag), &mut |tok_id| {
+    let mut lane_done: Option<Box<LaneDone>> = None;
+    let report = {
+        let mut on_token = |tok_id: i32| {
             let piece = if tok_ref.is_special(tok_id) {
                 // a special token is text only when it is part of the family's tags
                 let text = String::from_utf8_lossy(tok_ref.token_bytes(tok_id)).into_owned();
@@ -3027,18 +3266,62 @@ fn run_chat(
                 ));
                 }
             }
-        })
-    });
+        };
+        match engine.as_mut() {
+            Some(engine) => {
+                // The request's tower inputs go to the engine first; it runs the tower inside
+                // its prefill.
+                let images_set = match media.take() {
+                    Some(md) => engine.set_request_images(md.into_tower_inputs()),
+                    None => Ok(()),
+                };
+                images_set.and_then(|()| {
+                    engine.generate_cancellable(
+                        &prompt_ids,
+                        &params,
+                        Some(&cancel_flag),
+                        &mut on_token,
+                    )
+                })
+            }
+            None => {
+                // a lane: tokens and the end come from the lane session
+                let rx = lane_rx.take().expect("a lane request has its channel");
+                loop {
+                    match rx.recv() {
+                        Ok(LaneOut::Token(t)) => on_token(t),
+                        Ok(LaneOut::Started { .. }) => {}
+                        Ok(LaneOut::Done(mut d)) => {
+                            let r = std::mem::replace(&mut d.report, Err(String::new()));
+                            lane_done = Some(d);
+                            break r;
+                        }
+                        Err(_) => break Err("the lane session ended".to_string()),
+                    }
+                }
+            }
+        }
+    };
     if let Some(h) = &live {
         h.set_launch_sink(None);
     }
     // the tower's own timings of this request (kept apart from the decoder's prefill)
-    let vision_report = engine.last_vision_report().filter(|_| n_images > 0);
-    let prefix_stats = engine.prefix_stats();
-    let host_tier = engine.host_tier_facts();
+    let (vision_report, prefix_stats, host_tier) = match (engine.as_ref(), lane_done.as_ref()) {
+        (Some(e), _) => (
+            e.last_vision_report().filter(|_| n_images > 0),
+            e.prefix_stats(),
+            e.host_tier_facts(),
+        ),
+        (None, Some(d)) => (
+            d.vision.clone().filter(|_| n_images > 0),
+            d.prefix,
+            d.host_tier,
+        ),
+        (None, None) => (None, None, None),
+    };
 
-    // Return engine cleanly to slot & decrement active counter!
-    {
+    if let Some(engine) = engine.take() {
+        // Return engine cleanly to slot & decrement active counter!
         let mut s = state.slot.lock().unwrap();
         s.engine = Some(engine);
         s.prefix = prefix_stats;
@@ -3046,6 +3329,12 @@ fn run_chat(
         // once this connection is closed, the engine gets its idle time (`AppState::idle_work`)
         s.idle_due = state.host_cache.is_some();
         s.active_requests = s.active_requests.saturating_sub(1);
+        s.last_activity = Instant::now();
+    } else {
+        let mut s = state.slot.lock().unwrap();
+        if prefix_stats.is_some() {
+            s.prefix = prefix_stats;
+        }
         s.last_activity = Instant::now();
     }
     drop(turn);
