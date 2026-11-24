@@ -8,8 +8,9 @@
 use crate::verified::{
     lane_can_admit, ln_allows, ln_batch_chunks, ln_in_batch, ln_is_drain, ln_is_free, ln_lanes_fit,
     ln_plan_bytes, ln_plan_fits, ln_plan_shortfall, ln_prefix_per_lane, ln_route_better,
-    ln_route_eligible, ln_run_done, ln_session_admits, ln_session_ends, ln_session_starts,
-    ln_session_yields, ln_slot_fits, ln_step, ln_step_chunks, turn_due, LaneEvent, LaneState,
+    ln_admission_blocked, ln_passes_over, ln_route_eligible, ln_run_done, ln_session_ends,
+    ln_session_next, ln_session_starts, ln_slot_fits, ln_step, ln_step_chunks, turn_due, LaneEvent,
+    LaneState, SessionMove,
 };
 
 /// What a free lane offers a request (routing).
@@ -246,16 +247,22 @@ pub fn run_done(eos: bool, cancelled: bool, remaining: u64) -> bool {
     ln_run_done(eos, cancelled, remaining)
 }
 
-/// Does a running lane session admit a waiting request while the oldest waiter for the card is
-/// `due`?
-pub fn session_admits(due: bool) -> bool {
-    ln_session_admits(due)
+/// What a running lane session does next: no lane busy (`idle`), a request `waiting`, its next
+/// admission `blocked` (it would pass over a waiter for the card whose turn is due).
+pub fn session_next(idle: bool, waiting: bool, blocked: bool) -> SessionMove {
+    ln_session_next(idle, waiting, blocked)
 }
 
-/// Does a lane session with its lanes `idle` hand the card's turn back, the oldest waiter being
-/// `due`?
-pub fn session_yields(idle: bool, due: bool) -> bool {
-    ln_session_yields(idle, due)
+/// Does a request that arrived at `request` pass over a waiter for the card that arrived at
+/// `waiter` (both on one clock)?
+pub fn passes_over(waiter: u64, request: u64) -> bool {
+    ln_passes_over(waiter, request)
+}
+
+/// Would admitting a request that arrived at `request` pass over the oldest waiter for the card
+/// (arrived at `waiter`, its turn `due`)?
+pub fn admission_blocked(due: bool, waiter: u64, request: u64) -> bool {
+    ln_admission_blocked(due, waiter, request)
 }
 
 /// Is a waiter for the card due (no request passes it over any more)? `waited` / `max_wait` in

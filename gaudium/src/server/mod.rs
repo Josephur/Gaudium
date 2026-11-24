@@ -2424,10 +2424,21 @@ impl TurnLimits {
 /// reloaded between them. The model index is the whole configuration: every load option is fixed per model
 /// at startup, and per-request settings (sampling, method) never reload the card. The oldest request is
 /// never passed over beyond the `TurnLimits` of the settings file.
-#[derive(Default)]
 struct TurnQueue {
     mu: Mutex<TurnState>,
     cv: Condvar,
+    /// The clock the verified turn rules compare arrivals on (ns since this instant).
+    epoch: Instant,
+}
+
+impl Default for TurnQueue {
+    fn default() -> Self {
+        Self {
+            mu: Mutex::default(),
+            cv: Condvar::new(),
+            epoch: Instant::now(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2491,15 +2502,31 @@ impl TurnQueue {
         ready: impl Fn() -> Option<usize>,
         limits: impl Fn() -> TurnLimits,
     ) -> Turn<'_> {
+        self.acquire_from(model, Instant::now(), ready, limits)
+    }
+
+    /// [`Self::acquire`] for a waiter that has waited since `since` (a lane session queues at its
+    /// oldest request's arrival): it takes its place in arrival order.
+    fn acquire_from(
+        &self,
+        model: usize,
+        since: Instant,
+        ready: impl Fn() -> Option<usize>,
+        limits: impl Fn() -> TurnLimits,
+    ) -> Turn<'_> {
         let mut st = self.mu.lock().unwrap();
         let id = st.next_id;
         st.next_id += 1;
-        st.waiting.push(TurnWaiter {
-            id,
-            model,
-            since: Instant::now(),
-            skips: 0,
-        });
+        let at = st.waiting.partition_point(|w| w.since <= since);
+        st.waiting.insert(
+            at,
+            TurnWaiter {
+                id,
+                model,
+                since,
+                skips: 0,
+            },
+        );
         loop {
             if !st.busy {
                 if let Some(pos) = next_turn(&st.waiting, ready(), Instant::now(), limits()) {
@@ -2518,20 +2545,34 @@ impl TurnQueue {
         }
     }
 
-    /// [lanes] Is the oldest waiter due (a lane session admits nothing more then)?
-    fn first_due(&self, lim: TurnLimits) -> bool {
-        let st = self.mu.lock().unwrap();
-        st.waiting
-            .first()
-            .is_some_and(|w| waiter_due(w, Instant::now(), lim))
+    /// An arrival on the clock the verified turn rules compare (ns since the queue began).
+    fn clock(&self, t: Instant) -> u64 {
+        u64::try_from(t.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// [lanes] A lane session admitted a request that arrived at `since`: every older waiter was
-    /// passed over once more, as when a request of the loaded model takes the card before them.
+    /// [lanes] Would admitting a request that arrived at `since` pass over the oldest waiter,
+    /// whose turn is due? (A lane session admits nothing more then.)
+    fn blocks(&self, since: Instant, lim: TurnLimits) -> bool {
+        let st = self.mu.lock().unwrap();
+        st.waiting.first().is_some_and(|w| {
+            crate::core::lanes::admission_blocked(
+                waiter_due(w, Instant::now(), lim),
+                self.clock(w.since),
+                self.clock(since),
+            )
+        })
+    }
+
+    /// [lanes] A lane session admitted a request that arrived at `since`: every waiter it passes
+    /// over (one that arrived first) was passed over once more, as when a request of the loaded
+    /// model takes the card before them.
     fn passed_over(&self, since: Instant) {
+        let at = self.clock(since);
         let mut st = self.mu.lock().unwrap();
-        for w in st.waiting.iter_mut().filter(|w| w.since < since) {
-            w.skips += 1;
+        for w in st.waiting.iter_mut() {
+            if crate::core::lanes::passes_over(self.clock(w.since), at) {
+                w.skips += 1;
+            }
         }
     }
 }
@@ -2586,9 +2627,12 @@ impl Drop for WaitTicket<'_> {
 fn drive_lanes(state: Arc<AppState>, idx: usize) {
     let limits = || TurnLimits::read(state.cfg.queue_config.as_deref());
     loop {
+        // queued at the arrival of the oldest request it serves, so a session that handed the
+        // card back keeps its requests' place in line
+        let since = state.lanes.oldest(idx).unwrap_or_else(Instant::now);
         let turn = state
             .turns
-            .acquire(idx, || state.ready_model(), limits);
+            .acquire_from(idx, since, || state.ready_model(), limits);
         if let Err(e) = state.ensure_loaded(idx, false) {
             drop(turn);
             state.lanes.fail_waiting(idx, &e);
@@ -2634,7 +2678,7 @@ fn drive_lanes(state: Arc<AppState>, idx: usize) {
                 st.publish_engine_event();
             }
         }));
-        feed.turn_due = Some(Box::new(move || st.turns.first_due(limits())));
+        feed.blocks = Some(Box::new(move |since| st.turns.blocks(since, limits())));
         feed.on_admit = Some(Box::new(move |since| st.turns.passed_over(since)));
         let res = engine.serve_lanes(&mut feed);
         let (ended, yielded) = (feed.ended, feed.yielded);
@@ -4064,28 +4108,57 @@ mod tests {
         let q = TurnQueue::default();
         let lim = TurnLimits::default();
         let t0 = Instant::now();
-        {
-            let mut st = q.mu.lock().unwrap();
-            st.waiting = waiters(&[1], t0);
-        }
-        assert!(!q.first_due(lim), "a fresh waiter is not due");
+        let later = |ms: u64| t0 + Duration::from_millis(ms);
+        q.mu.lock().unwrap().waiting = waiters(&[1], t0);
+        assert!(!q.blocks(later(5), lim), "a fresh waiter blocks nothing");
         // a request that arrived before the waiter does not pass it over
-        q.passed_over(t0 - Duration::from_secs(1));
+        q.passed_over(q.epoch);
         assert_eq!(q.mu.lock().unwrap().waiting[0].skips, 0);
         for k in 1..=lim.max_skips {
-            q.passed_over(t0 + Duration::from_millis(u64::from(k)));
+            q.passed_over(later(u64::from(k)));
         }
         assert_eq!(q.mu.lock().unwrap().waiting[0].skips, lim.max_skips);
-        assert!(q.first_due(lim), "passed over as often as the limit allows");
+        assert!(q.blocks(later(10), lim), "due: a younger request may not pass it over");
+        assert!(
+            !q.blocks(t0, lim),
+            "a request that arrived with it (or before) is not blocked by it"
+        );
         q.mu.lock().unwrap().waiting[0] = TurnWaiter {
             id: 0,
             model: 1,
-            since: t0 - lim.max_wait,
+            since: t0,
             skips: 0,
         };
-        assert!(q.first_due(lim), "waited as long as the limit allows");
+        let mut st = q.mu.lock().unwrap();
+        st.waiting[0].since = Instant::now() - lim.max_wait;
+        let w0 = st.waiting[0].since;
+        drop(st);
+        assert!(q.blocks(Instant::now(), lim), "waited as long as the limit allows");
+        assert!(!q.blocks(w0, lim));
         q.mu.lock().unwrap().waiting.clear();
-        assert!(!q.first_due(lim), "nobody waits");
+        assert!(!q.blocks(later(10), lim), "nobody waits");
+    }
+
+    #[test]
+    fn a_lane_waiter_queued_from_an_earlier_arrival_takes_its_place_in_line() {
+        let q = TurnQueue::default();
+        let t0 = Instant::now();
+        {
+            let mut st = q.mu.lock().unwrap();
+            st.waiting = waiters(&[1, 2], t0 + Duration::from_millis(10));
+            st.waiting[1].since = t0 + Duration::from_millis(30);
+            st.next_id = 2;
+        }
+        let lim = TurnLimits::default();
+        // model 0 is loaded, so its waiter goes ahead; it stood between the two, so it passes
+        // over only the one that arrived before it
+        let turn = q.acquire_from(0, t0 + Duration::from_millis(20), || Some(0), || lim);
+        {
+            let st = q.mu.lock().unwrap();
+            assert_eq!(st.waiting.iter().map(|w| w.model).collect::<Vec<_>>(), vec![1, 2]);
+            assert_eq!(st.waiting.iter().map(|w| w.skips).collect::<Vec<_>>(), vec![1, 0]);
+        }
+        drop(turn);
     }
 
     #[test]

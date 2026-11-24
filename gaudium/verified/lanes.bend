@@ -158,15 +158,89 @@ def ln_session_ends(idle: Bool, waiting: Bool) -> Bool:
 def turn_due(waited: Nat, max_wait: Nat, skips: Nat, max_skips: Nat) -> Bool:
   Bool.or(Nat.is_ge(waited, max_wait), Nat.is_ge(skips, max_skips))
 
-# Does a running session admit a waiting request of its model while the oldest waiter for the
-# card is `due` (a request of another model, which the session's admissions pass over)?
-def ln_session_admits(due: Bool) -> Bool:
-  Bool.not(due)
+# Does a request that arrived at `request` pass over a waiter for the card that arrived at
+# `waiter` (both on one clock)? Only a waiter that arrived first is passed over.
+def ln_passes_over(waiter: Nat, request: Nat) -> Bool:
+  Nat.is_lt(waiter, request)
 
-# Does a session hand the card's turn back now, with no lane busy (`idle`), because the oldest
-# waiter for the card is `due`? It waits for its next turn then, keeping its requests queued.
-def ln_session_yields(idle: Bool, due: Bool) -> Bool:
-  Bool.and(idle, due)
+# Would admitting a session's next request (arrived at `request`) pass over the oldest waiter for
+# the card (arrived at `waiter`), whose turn is `due`?
+def ln_admission_blocked(due: Bool, waiter: Nat, request: Nat) -> Bool:
+  Bool.and(due, ln_passes_over(waiter, request))
+
+# Does a running session admit its next request, the admission being `blocked` or not?
+def ln_session_admits(blocked: Bool) -> Bool:
+  Bool.not(blocked)
+
+# Does a session hand the card's turn back now, with no lane busy (`idle`), its next admission
+# being `blocked`? It waits for its next turn then, keeping its requests queued.
+def ln_session_yields(idle: Bool, blocked: Bool) -> Bool:
+  Bool.and(idle, blocked)
+
+# What a running lane session does next.
+type SessionMove is Data:
+  SmEnd{}
+  SmYield{}
+  SmWait{}
+  SmAdmit{}
+
+def ln_session_move(ends: Bool, yields: Bool, admits: Bool, waiting: Bool) -> SessionMove:
+  match ends:
+    case True{}:
+      SmEnd{}
+    case False{}:
+      match yields:
+        case True{}:
+          SmYield{}
+        case False{}:
+          match admits:
+            case True{}:
+              match waiting:
+                case True{}:
+                  SmAdmit{}
+                case False{}:
+                  SmWait{}
+            case False{}:
+              SmWait{}
+
+# What a lane session does next, with no lane busy (`idle`) or not, a request `waiting` or not,
+# and its next admission `blocked` (it would pass over a due waiter for the card) or not: end,
+# hand the card's turn back, wait for its lanes, or admit the next request.
+def ln_session_next(+idle: Bool, +waiting: Bool, +blocked: Bool) -> SessionMove:
+  ln_session_move(
+    ln_session_ends(idle, waiting),
+    ln_session_yields(idle, blocked),
+    ln_session_admits(blocked),
+    waiting
+  )
+
+def ln_sm_ends(m: SessionMove) -> Bool:
+  match m:
+    case SmEnd{}: True{}
+    case SmYield{}: False{}
+    case SmWait{}: False{}
+    case SmAdmit{}: False{}
+
+def ln_sm_yields(m: SessionMove) -> Bool:
+  match m:
+    case SmEnd{}: False{}
+    case SmYield{}: True{}
+    case SmWait{}: False{}
+    case SmAdmit{}: False{}
+
+def ln_sm_waits(m: SessionMove) -> Bool:
+  match m:
+    case SmEnd{}: False{}
+    case SmYield{}: False{}
+    case SmWait{}: True{}
+    case SmAdmit{}: False{}
+
+def ln_sm_admits(m: SessionMove) -> Bool:
+  match m:
+    case SmEnd{}: False{}
+    case SmYield{}: False{}
+    case SmWait{}: False{}
+    case SmAdmit{}: True{}
 
 # ============================================================================
 # 2. Routing a request to a lane
@@ -934,3 +1008,132 @@ law ln_session_keeps_busy_lanes:
 
 def ln_session_keeps_busy_lanes(d):
   {==}
+
+def ln_lt_add_false(+r: Nat, +e: Nat) -> {False{} == Nat.is_lt(Nat.add(r, e), r) : Bool}:
+  match r:
+    case 0n:
+      match e:
+        case 0n:
+          {==}
+        case 1n+p:
+          {==}
+    case 1n+rp:
+      ln_lt_add_false(rp, e)
+
+def ln_lt_succ_add(+w: Nat, +e: Nat) -> {True{} == Nat.is_lt(w, 1n+Nat.add(w, e)) : Bool}:
+  match w:
+    case 0n:
+      {==}
+    case 1n+wp:
+      ln_lt_succ_add(wp, e)
+
+def ln_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a request never counts as passing over a waiter for the card that arrived after it.
+law ln_never_passes_younger:
+  for +r: Nat
+  for +e: Nat
+  {ln_passes_over(Nat.add(r, e), r) == False{} : Bool}
+
+def ln_never_passes_younger(r, e):
+  %ln_lt_add_false(r, e) : {_ == False{} : Bool}
+  {==}
+
+# promise: a waiter whose turn is due and who arrived before a session's next request blocks its admission.
+law ln_due_older_waiter_blocks:
+  for +w: Nat
+  for +e: Nat
+  {ln_admission_blocked(True{}, w, Nat.add(1n+w, e)) == True{} : Bool}
+
+def ln_due_older_waiter_blocks(w, e):
+  %ln_lt_succ_add(w, e) : {Bool.and(True{}, _) == True{} : Bool}
+  {==}
+
+# promise: a waiter that arrived after a session's next request never blocks its admission.
+law ln_younger_waiter_never_blocks:
+  for +d: Bool
+  for +r: Nat
+  for +e: Nat
+  {ln_admission_blocked(d, Nat.add(r, e), r) == False{} : Bool}
+
+def ln_younger_waiter_never_blocks(d, r, e):
+  %ln_lt_add_false(r, e) : {Bool.and(d, _) == False{} : Bool}
+  ln_and_false_r(d)
+
+# promise: a lane session never admits a request that would pass over a waiter whose turn on the card is due.
+law ln_next_never_admits_blocked:
+  for +i: Bool
+  for +w: Bool
+  {ln_sm_admits(ln_session_next(i, w, True{})) == False{} : Bool}
+
+def ln_next_never_admits_blocked(i, w):
+  match i w:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a lane session never hands the card's turn back while one of its lanes is busy.
+law ln_next_never_yields_busy:
+  for +w: Bool
+  for +b: Bool
+  {ln_sm_yields(ln_session_next(False{}, w, b)) == False{} : Bool}
+
+def ln_next_never_yields_busy(w, b):
+  match w b:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a lane session hands the card's turn back only when its next admission would pass over a due waiter.
+law ln_next_never_yields_unblocked:
+  for +i: Bool
+  for +w: Bool
+  {ln_sm_yields(ln_session_next(i, w, False{})) == False{} : Bool}
+
+def ln_next_never_yields_unblocked(i, w):
+  match i w:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a lane session never ends while a request of its model waits.
+law ln_next_never_ends_waiting:
+  for +i: Bool
+  for +b: Bool
+  {ln_sm_ends(ln_session_next(i, True{}, b)) == False{} : Bool}
+
+def ln_next_never_ends_waiting(i, b):
+  match i b:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a lane session with no lane busy and a request waiting admits it or hands the card's turn back; it never sits idle.
+law ln_next_idle_moves:
+  for +b: Bool
+  {ln_sm_waits(ln_session_next(True{}, True{}, b)) == False{} : Bool}
+
+def ln_next_idle_moves(b):
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a lane session admits a request only when one waits.
+law ln_next_admits_only_waiting:
+  for +i: Bool
+  for +b: Bool
+  {ln_sm_admits(ln_session_next(i, False{}, b)) == False{} : Bool}
+
+def ln_next_admits_only_waiting(i, b):
+  match i b:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}

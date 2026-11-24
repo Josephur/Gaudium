@@ -7,15 +7,17 @@
 //! joins the running session or starts the next one, never neither.
 //!
 //! A session's admissions pass over the older waiters of the card's turn queue (requests of other
-//! models), as a request of the loaded model does there. Once the oldest of them is due, the
-//! session admits nothing more, lets its lanes drain, hands the card's turn back and waits for
-//! its next one, its requests staying queued.
+//! models), as a request of the loaded model does there. Once its next admission would pass over
+//! a waiter whose turn is due, the session admits nothing more, lets its lanes drain, hands the
+//! card's turn back and waits for its next one (queued at its oldest request's arrival), its
+//! requests staying queued. What a session does next is the verified `ln_session_next`.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::engine::{FeedHead, LaneDone, LaneFeed, LaneJob, LaneOut, LaneView};
+use crate::verified::SessionMove;
 
 #[derive(Default)]
 struct ModelLanes {
@@ -48,6 +50,11 @@ impl LaneHub {
         let start = crate::core::lanes::session_starts(m.active);
         m.active = true;
         start
+    }
+
+    /// Arrival of model `idx`'s oldest waiting request.
+    pub fn oldest(&self, idx: usize) -> Option<Instant> {
+        self.mu.lock().unwrap()[idx].queue.front().map(|(t, _)| *t)
     }
 
     /// The lanes of model `idx` as its session last reported them.
@@ -83,7 +90,7 @@ impl LaneHub {
             ended: false,
             yielded: false,
             on_lanes: None,
-            turn_due: None,
+            blocks: None,
             on_admit: None,
         }
     }
@@ -109,8 +116,9 @@ pub(super) struct HubFeed<'a> {
     pub yielded: bool,
     /// Called after the lanes changed, outside the queue's lock: the busy lanes.
     pub on_lanes: Option<Box<dyn FnMut(u64) + 'a>>,
-    /// Is the oldest waiter for the card due? (None: nothing else waits for the card.)
-    pub turn_due: Option<Box<dyn Fn() -> bool + 'a>>,
+    /// Would admitting a request that arrived then pass over a waiter for the card whose turn is
+    /// due? (None: never.)
+    pub blocks: Option<Box<dyn Fn(Instant) -> bool + 'a>>,
     /// Called after a request is admitted, outside the queue's lock, with its arrival: the older
     /// waiters for the card were passed over once more.
     pub on_admit: Option<Box<dyn FnMut(Instant) + 'a>>,
@@ -121,28 +129,36 @@ impl LaneFeed for HubFeed<'_> {
         if self.ended || self.yielded {
             return FeedHead::End;
         }
-        // (the turn queue's lock is never taken under the hub's)
-        let due = self.turn_due.as_ref().is_some_and(|f| f());
-        let mut g = self.hub.mu.lock().unwrap();
-        let m = &mut g[self.idx];
-        let waiting = !m.queue.is_empty();
-        if crate::core::lanes::session_ends(idle, waiting) {
-            m.active = false;
-            self.ended = true;
-            return FeedHead::End;
-        }
-        if crate::core::lanes::session_yields(idle, due) {
-            self.yielded = true;
-            return FeedHead::End;
-        }
-        if !crate::core::lanes::session_admits(due) {
-            return FeedHead::Empty;
-        }
-        match m.queue.front() {
-            Some((_, j)) => FeedHead::Job {
-                exclusive: j.exclusive(),
-            },
-            None => FeedHead::Empty,
+        loop {
+            // the turn queue's lock is never taken under the hub's: the front request's arrival
+            // is read first, then whether admitting it is blocked, then the decision is made on
+            // the same front (a request that arrived in between is decided on the next round)
+            let front = self.hub.oldest(self.idx);
+            let blocked = front.is_some_and(|t| self.blocks.as_ref().is_some_and(|f| f(t)));
+            let mut g = self.hub.mu.lock().unwrap();
+            let m = &mut g[self.idx];
+            let now_front = m.queue.front().map(|(t, _)| *t);
+            if now_front != front {
+                continue;
+            }
+            return match crate::core::lanes::session_next(idle, front.is_some(), blocked) {
+                SessionMove::SmEnd => {
+                    m.active = false;
+                    self.ended = true;
+                    FeedHead::End
+                }
+                SessionMove::SmYield => {
+                    self.yielded = true;
+                    FeedHead::End
+                }
+                SessionMove::SmWait => FeedHead::Empty,
+                SessionMove::SmAdmit => match m.queue.front() {
+                    Some((_, j)) => FeedHead::Job {
+                        exclusive: j.exclusive(),
+                    },
+                    None => FeedHead::Empty,
+                },
+            };
         }
     }
 
@@ -221,7 +237,7 @@ mod tests {
         let due = Cell::new(false);
         let admitted = RefCell::new(Vec::new());
         let mut feed = hub.feed(0);
-        feed.turn_due = Some(Box::new(|| due.get()));
+        feed.blocks = Some(Box::new(|_| due.get()));
         feed.on_admit = Some(Box::new(|since| admitted.borrow_mut().push(since)));
         assert_eq!(feed.head(true), FeedHead::Job { exclusive: false });
         assert_eq!(feed.take().map(|j| j.id), Some(1));
