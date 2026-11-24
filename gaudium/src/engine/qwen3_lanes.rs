@@ -829,8 +829,12 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
     } else {
         format!("K=0 {wprec} greedy")
     };
-    eng.live.begin_request(prompt.len() as u64, &label, "");
-    eng.live.prefill_progress(0);
+    // the live record follows the lane session: it begins with the first busy lane (a request
+    // admitted beside others must not reset what they report) and ends with the last
+    if live_alone(eng) {
+        eng.live.begin_request(prompt.len() as u64, &label, "");
+        eng.live.prefill_progress(0);
+    }
     let t_start = Instant::now();
     let is_cancelled = || cancel.load(Ordering::Relaxed);
     let pre = eng.run_prefill(&prompt, &params, &mut budget, &is_cancelled, true);
@@ -861,7 +865,9 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
     };
     match pre {
         Err(e) => {
-            eng.live.end_request();
+            if live_alone(eng) {
+                eng.live.end_request();
+            }
             fail(eng, &mut run.out, e);
             Ok(None)
         }
@@ -894,6 +900,11 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
             Ok(Some(run))
         }
     }
+}
+
+/// Is the lane being started or ended the only busy one (the live record's lifecycle)?
+fn live_alone(eng: &Qwen3Engine) -> bool {
+    eng.lanes.as_ref().is_none_or(|rt| rt.table.busy() <= 1)
 }
 
 /// Ends lane `lane`'s request: its report goes out and the lane keeps what it wrote.
@@ -948,7 +959,9 @@ fn end_lane(eng: &mut Qwen3Engine, lane: usize, mut run: Run) {
         r.prefix_common = common;
         r
     });
-    eng.live.end_request();
+    if live_alone(eng) {
+        eng.live.end_request();
+    }
     let ev = done_event(res, eng, run.exclusive);
     (run.out)(ev);
 }

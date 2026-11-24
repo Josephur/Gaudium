@@ -20,6 +20,8 @@ on a lane server). `--turns` checks routing after the concurrent runs: every lon
 turn (its reply and one more user message) must take over rows of the lane that held it.
 
 Only the Python standard library is used. Results go to stdout and, with `--out`, to a JSON file.
+The exit status is 1 when a check fails (a mismatching or failed stream, a next turn that reused
+nothing), else 0.
 """
 
 import argparse
@@ -258,7 +260,9 @@ def main():
     if a.out:
         with open(a.out, "w") as f:
             json.dump(out, f, indent=1)
+    # a failed check (a mismatching or failed stream, a next turn that reused nothing) fails
+    return 1 if out.get("mismatches") else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
