@@ -856,8 +856,30 @@ mod tests {
                 assert_eq!(k.opt_in_forks, k.name == "mtp-tree", "{}", k.name);
             }
         }
-        // a case whose image span crosses the 512-row prefill tile: two images in one request
-        assert!(s.cases.iter().any(|c| c.images.len() >= 2));
+        // a case whose second image span crosses the first 512-row prefill tile (and the MTP
+        // row 511, which embeds slot 512): with a few template tokens in front, the first image
+        // ends well before row 512 and the second one well after it
+        let two = s.cases.iter().find(|c| c.images.len() == 2).unwrap();
+        let vs = crate::vision::test_util::qwen38_vision_spec();
+        let tokens: Vec<usize> = two
+            .images
+            .iter()
+            .map(|p| {
+                let bytes = std::fs::read(s.image_path(p)).unwrap();
+                let limits = crate::vision::decode::DecodeLimits {
+                    max_pixels: 64_000_000,
+                };
+                let rgb = crate::vision::decode::decode_image(&bytes, &limits).unwrap();
+                crate::vision::preprocess::prepare_image(&rgb, &vs)
+                    .unwrap()
+                    .n_tokens()
+            })
+            .collect();
+        assert_eq!(tokens, vec![300, 300]);
+        // `<|im_start|>user\n<|vision_start|>` before the first, `<|vision_end|><|vision_start|>`
+        // between them: the second span starts near row 306
+        let start2 = 4 + tokens[0] + 2;
+        assert!(start2 + 32 < 512 && start2 + tokens[1] > 512 + 32);
     }
 
     #[test]

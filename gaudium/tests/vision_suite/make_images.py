@@ -7,7 +7,7 @@ Run it from any directory; it writes the files next to itself:
   no text (the answer needs the picture itself);
 - number.png: the number 4271 in large yellow digits on a dark blue ground (reading text).
 
-Both are 640 x 400: 20 x 13 merged patches (260 image tokens) for a Qwen3.5 / 3.8 tower, so in
+Both are 640 x 480: 20 x 15 merged patches (300 image tokens) for a Qwen3.5 / 3.8 tower, so in
 the suite's two-image case the second image's span crosses the first 512-row prefill tile.
 The digits are drawn with the first bold sans-serif font found (DejaVu Sans Bold on most Linux
 systems, or the path given as the first argument); the files in the repository were made with it.
@@ -18,7 +18,7 @@ import sys
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-W, H = 640, 400
+W, H = 640, 480
 FONTS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
@@ -29,8 +29,8 @@ FONTS = [
 def shapes():
     img = Image.new("RGB", (W, H), (248, 248, 242))
     d = ImageDraw.Draw(img)
-    d.rectangle([50, 70, 290, 310], fill=(200, 30, 30))
-    d.ellipse([370, 70, 610, 310], fill=(30, 60, 200))
+    d.rectangle([50, 120, 290, 360], fill=(200, 30, 30))
+    d.ellipse([370, 120, 610, 360], fill=(30, 60, 200))
     return img
 
 
