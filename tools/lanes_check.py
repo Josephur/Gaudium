@@ -82,12 +82,15 @@ IMAGE_MARK = "<image>"
 FOLLOW_UP = "Now list them in ascending order."
 
 
-def wait_parked(base, timeout):
+def wait_parked(base, timeout, api_key=None):
     """Waits until the server has released the card (its engine state is `parked`)."""
     t0 = time.monotonic()
+    req = urllib.request.Request(base.rstrip("/") + "/gaudium/engine")
+    if api_key:
+        req.add_header("Authorization", "Bearer " + api_key)
     while time.monotonic() - t0 < timeout:
         try:
-            with urllib.request.urlopen(base.rstrip("/") + "/gaudium/engine", timeout=5) as r:
+            with urllib.request.urlopen(req, timeout=5) as r:
                 if json.loads(r.read()).get("state") == "parked":
                     print(f"server parked after {time.monotonic() - t0:.1f}s", flush=True)
                     return True
@@ -354,7 +357,7 @@ def main():
                 content = r1["content"]
                 hist = [{"role": "user", "content": PROMPTS[i]}, {"role": "assistant", "content": content}]
                 turns.append((i, hist))
-            if a.park and not wait_parked(a.base, a.park):
+            if a.park and not wait_parked(a.base, a.park, a.api_key):
                 # a host restore alone does not show the card was released: a conversation a
                 # lane let go of comes back from host memory too, with the engine loaded
                 bad += 1
