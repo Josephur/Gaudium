@@ -1119,11 +1119,12 @@ pub(super) fn launch_one_row(
     for (k, &(v, _)) in &eng.kv_addr {
         pool.insert(k.clone(), v);
     }
+    let next = crate::verified::ln_lane_parity_next(parity as u64) as usize;
     for (&l, st) in &eng.gdn_state {
         pool.insert(format!("L{l}_S_in"), st.s[parity]);
-        pool.insert(format!("L{l}_S_out"), st.s[1 - parity]);
+        pool.insert(format!("L{l}_S_out"), st.s[next]);
         pool.insert(format!("L{l}_cs_in"), st.cs[parity]);
-        pool.insert(format!("L{l}_cs_out"), st.cs[1 - parity]);
+        pool.insert(format!("L{l}_cs_out"), st.cs[next]);
     }
     if sampled {
         let ms = samp_rt::ensure_step(eng, 1)?;

@@ -1710,7 +1710,7 @@ impl SpecRuntime {
         for (k, &v) in &self.addr {
             pool.insert(k.clone(), v);
         }
-        let q = 1 - p;
+        let q = crate::verified::ln_lane_parity_next(p as u64) as usize;
         pool.insert("ids".into(), self.addr[&format!("sp_ids{p}")]);
         pool.insert("next_ids".into(), self.addr[&format!("sp_ids{q}")]);
         pool.insert("cursor".into(), self.addr[&format!("sp_cur{p}")]);
