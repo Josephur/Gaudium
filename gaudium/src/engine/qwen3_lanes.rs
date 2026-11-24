@@ -363,7 +363,7 @@ impl LanePlan {
             }
             act_specs.insert(name, bytes);
         }
-        let io_bytes = IO_SCALAR * io_names(n).len() as u64;
+        let io_bytes = crate::verified::ln_lane_io_bytes(io_names(n).len() as u64, IO_SCALAR);
         let mut keys: Vec<(u64, u64, bool)> = Vec::new();
         let fams: &[bool] = if sampler { &[false, true] } else { &[false] };
         for &sm in fams {
@@ -422,7 +422,9 @@ impl LanePlan {
                 "[gaudium] lanes: {n} lanes, batched step recipes {hits} from the cache, {built} compiled ({:.1}s); largest workspace {:.2} MiB; step buffers {:.2} GiB",
                 t0.elapsed().as_secs_f64(),
                 max_ws as f64 / (1024.0 * 1024.0),
-                act_specs.values().map(|&b| align_up(b.max(256), 256)).sum::<u64>() as f64
+                act_specs
+                    .values()
+                    .fold(0, |acc, &b| crate::verified::ln_lane_bufs_add(acc, b)) as f64
                     / (1024.0 * 1024.0 * 1024.0)
             );
         }
@@ -439,11 +441,10 @@ impl LanePlan {
 
     /// Bytes of the step buffers and the io, as the act arena allocates them.
     pub fn act_bytes(&self) -> u64 {
+        // (the io first, then every step buffer as the arena allocates it)
         self.act_specs
             .values()
-            .map(|&b| align_up(b.max(256), 256))
-            .sum::<u64>()
-            + self.io_bytes
+            .fold(self.io_bytes, |acc, &b| crate::verified::ln_lane_bufs_add(acc, b))
     }
 }
 

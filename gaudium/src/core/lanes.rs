@@ -501,6 +501,16 @@ mod tests {
     }
 
     #[test]
+    fn the_batched_steps_buffers_as_the_arena_allocates_them() {
+        use crate::verified::{ln_lane_buf_bytes, ln_lane_bufs_add, ln_lane_io_bytes};
+        assert_eq!(ln_lane_buf_bytes(1), 256);
+        assert_eq!(ln_lane_buf_bytes(256), 256);
+        assert_eq!(ln_lane_buf_bytes(257), 512);
+        assert_eq!(ln_lane_bufs_add(1000, 300), 1512);
+        assert_eq!(ln_lane_io_bytes(3, 256), 768);
+    }
+
+    #[test]
     fn skips_and_the_sessions_active_count() {
         assert_eq!(skips_after(2, true), 3);
         assert_eq!(skips_after(2, false), 2);

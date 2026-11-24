@@ -12,6 +12,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import tensor_bounds.bend as TB
 
 # ============================================================================
 # 1. Lane lifecycle
@@ -370,6 +371,19 @@ def ln_lane_pfx_bytes(per_lane: Nat, slot: Nat, n: Nat) -> Nat:
 # Kept prefix positions a load asks the plan for: `wanted` in each of `n` lanes.
 def ln_lane_pfx_ask(wanted: Nat, n: Nat) -> Nat:
   Nat.mul(n, wanted)
+
+# Bytes the activation arena gives one buffer of the batched steps (`bytes`): at least 256,
+# rounded up to 256 (the arena's allocation unit).
+def ln_lane_buf_bytes(bytes: Nat) -> Nat:
+  TB.align_up(Nat.max(bytes, 256n), 256n)
+
+# The total of the batched steps' buffers so far (`acc`), with one more buffer of `bytes`.
+def ln_lane_bufs_add(acc: Nat, bytes: Nat) -> Nat:
+  Nat.add(acc, ln_lane_buf_bytes(bytes))
+
+# Bytes of the batched steps' io scalars: `count` of `each` bytes.
+def ln_lane_io_bytes(count: Nat, each: Nat) -> Nat:
+  Nat.mul(count, each)
 
 # The device arena of the lanes' caches and state (`arena`) and their kept positions (`pfx`).
 def ln_kv_arena_total(arena: Nat, pfx: Nat) -> Nat:
@@ -1582,3 +1596,29 @@ law ln_after_ended_done:
 
 def ln_after_ended_done(o, y):
   {==}
+
+# promise: the activation arena gives every buffer of the batched steps at least the bytes it needs.
+law ln_lane_buf_holds_it:
+  for +b: Nat
+  {Nat.is_le(b, ln_lane_buf_bytes(b)) == True{} : Bool}
+
+def ln_lane_buf_holds_it(b):
+  L.nat_le_trans(b, Nat.max(b, 256n), TB.align_up(Nat.max(b, 256n), 256n), L.nat_max_ge_l(b, 256n), TB.align_up_never_shrinks(Nat.max(b, 256n), 256n))
+
+# promise: the batched steps' buffer total counts everything so far and the next buffer.
+law ln_lane_bufs_add_counts:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_le(Nat.add(a, b), ln_lane_bufs_add(a, b)) == True{} : Bool}
+
+def ln_lane_bufs_add_counts(a, b):
+  L.nat_add_le_mono(a, a, b, ln_lane_buf_bytes(b), L.nat_le_refl(a), ln_lane_buf_holds_it(b))
+
+# promise: the plan counts every io scalar of the batched steps.
+law ln_lane_io_counts_each:
+  for +c: Nat
+  for +e: Nat
+  {Nat.is_le(Nat.mul(c, e), ln_lane_io_bytes(c, e)) == True{} : Bool}
+
+def ln_lane_io_counts_each(c, e):
+  L.nat_le_refl(Nat.mul(c, e))
