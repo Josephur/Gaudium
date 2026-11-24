@@ -8,6 +8,7 @@ pub mod hbm;
 pub mod inkling2;
 pub mod kv_cache;
 pub mod kv_pool;
+pub mod lanes;
 pub mod lifecycle;
 pub mod listener;
 pub mod proxy;
