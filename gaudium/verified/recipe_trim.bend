@@ -39,6 +39,18 @@ def rt_evict_before(a_used: Nat, b_used: Nat) -> Bool:
 def rt_should_evict(+held: Nat, target: Nat, protected: Bool) -> Bool:
   Bool.and(Bool.not(protected), Nat.is_lt(target, held))
 
+# Bytes of an entry: its recipe file and its sidecar (a missing file counts 0); `None` past 64
+# bits.
+# rusty-bends: total
+def rt_entry_bytes(recipe_bytes: Nat, meta_bytes: Nat) -> Nat:
+  Nat.add(recipe_bytes, meta_bytes)
+
+# The count of held bytes (or of freed bytes) with one more entry of `bytes` bytes. `None` when
+# the count would not fit 64 bits: the shell then refuses to trim rather than guess.
+# rusty-bends: total
+def rt_count_add(held: Nat, bytes: Nat) -> Nat:
+  Nat.add(held, bytes)
+
 # Bytes still held after an entry of `bytes` bytes was (`removed`) or was not removed.
 def rt_after(+held: Nat, bytes: Nat, removed: Bool) -> Nat:
   match removed:
@@ -221,6 +233,43 @@ law rt_removed_frees_its_bytes:
 
 def rt_removed_frees_its_bytes(h, b):
   L.nat_add_sub_cancel_r(h, b)
+
+# promise: an entry's size covers its recipe file.
+law rt_entry_bytes_covers_recipe:
+  for +r: Nat
+  for +m: Nat
+  {Nat.is_le(r, rt_entry_bytes(r, m)) == True{} : Bool}
+
+def rt_entry_bytes_covers_recipe(r, m):
+  L.nat_add_le_r(r, m)
+
+# promise: an entry's size covers its sidecar.
+law rt_entry_bytes_covers_meta:
+  for +r: Nat
+  for +m: Nat
+  {Nat.is_le(m, rt_entry_bytes(r, m)) == True{} : Bool}
+
+def rt_entry_bytes_covers_meta(r, m):
+  L.nat_add_le_l(r, m)
+
+# promise: counting an entry in and then removing it gives back the count before it, so the count a trim starts from is the sum the removals take apart.
+# harm: the starting count could disagree with what the removals free and the trim would stop over or under budget
+law rt_count_then_remove_returns:
+  for +h: Nat
+  for +b: Nat
+  {rt_after(rt_count_add(h, b), b, True{}) == h : Nat}
+
+def rt_count_then_remove_returns(h, b):
+  L.nat_add_sub_cancel_r(h, b)
+
+# promise: counting an entry in never lowers the count.
+law rt_count_never_shrinks:
+  for +h: Nat
+  for +b: Nat
+  {Nat.is_le(h, rt_count_add(h, b)) == True{} : Bool}
+
+def rt_count_never_shrinks(h, b):
+  L.nat_add_le_r(h, b)
 
 # promise: the count of held bytes never grows during a trim.
 law rt_after_never_grows:

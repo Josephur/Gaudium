@@ -29,7 +29,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::synapse::recipe_cache::{in_use_registry, refresh_recency, RECIPE_EXT, SHA256_EXT};
-use crate::verified::{rt_after, rt_evict_before, rt_last_used, rt_protected, rt_should_evict};
+use crate::verified::{
+    rt_after, rt_count_add, rt_entry_bytes, rt_evict_before, rt_last_used, rt_protected,
+    rt_should_evict,
+};
 
 /// Default keep window of `--cache-keep-days`, in days.
 pub const DEFAULT_KEEP_DAYS: f64 = 1.0;
@@ -276,8 +279,19 @@ pub(crate) fn trim_at(
             a.0.cmp(b.0)
         }
     });
-    let size = |e: &Entry| e.recipe.map_or(0, |f| f.bytes) + e.sidecar.map_or(0, |f| f.bytes);
-    let mut held: u64 = scan.entries.values().map(size).sum();
+    let overflow = || io::Error::new(io::ErrorKind::InvalidData, "cache sizes overflow 64 bits");
+    let add = |count: u64, bytes: u64| rt_count_add(count, bytes).ok_or_else(overflow);
+    let size = |e: &Entry| {
+        rt_entry_bytes(
+            e.recipe.map_or(0, |f| f.bytes),
+            e.sidecar.map_or(0, |f| f.bytes),
+        )
+        .ok_or_else(overflow)
+    };
+    let mut held = 0u64;
+    for e in scan.entries.values() {
+        held = add(held, size(e)?)?;
+    }
     rep.bytes_before = held;
 
     let registry = in_use_registry();
@@ -307,10 +321,10 @@ pub(crate) fn trim_at(
             continue;
         }
         if opts.dry_run {
-            let bytes = size(seen);
+            let bytes = size(seen)?;
             held = rt_after(held, bytes, true);
             rep.evicted += 1;
-            rep.freed_bytes += bytes;
+            rep.freed_bytes = add(rep.freed_bytes, bytes)?;
             continue;
         }
         // sidecar first: from here on the entry is not a hit for anyone
@@ -321,7 +335,7 @@ pub(crate) fn trim_at(
             match remove_file(path) {
                 Ok(gone) => {
                     held = rt_after(held, stat.bytes, gone);
-                    freed += stat.bytes;
+                    freed = add(freed, stat.bytes)?;
                 }
                 Err(e) => {
                     held = rt_after(held, stat.bytes, false);
@@ -332,7 +346,7 @@ pub(crate) fn trim_at(
             }
         }
         drop(held_set);
-        rep.freed_bytes += freed;
+        rep.freed_bytes = add(rep.freed_bytes, freed)?;
         if whole {
             rep.evicted += 1;
         }
