@@ -351,6 +351,8 @@ pub(super) struct LaneBufs {
     pub spec: Option<spec::SpecLane>,
     /// Where that share was allocated (until the runtime is finished and `spec` is made).
     spec_addr: BTreeMap<String, u64>,
+    /// The lane's share of the host-RAM tier of prefix reuse (`--cache-ram`).
+    host: Option<host_tier::HostTier>,
 }
 
 impl LaneBufs {
@@ -366,6 +368,7 @@ impl LaneBufs {
             prefix_images: Vec::new(),
             spec: None,
             spec_addr: BTreeMap::new(),
+            host: None,
         }
     }
 }
@@ -877,9 +880,23 @@ pub(super) fn allocate_lanes(
             prefix_images: Vec::new(),
             spec: None,
             spec_addr,
+            host: None,
         });
     }
     Ok(out)
+}
+
+/// The host-tier saves of every lane while the card is idle (`waiting`: requests that wait for
+/// the card; the saves give way to one).
+pub(super) fn idle_work(eng: &mut Qwen3Engine, waiting: &dyn Fn() -> u64) {
+    let n = eng.lanes.as_ref().map_or(1, |rt| rt.lanes());
+    for lane in 0..n {
+        if !crate::verified::hc_idle_may_run(waiting()) {
+            return;
+        }
+        activate(eng, lane);
+        eng.idle_save(waiting);
+    }
 }
 
 /// Swaps the engine's own lane fields with `b`.
@@ -891,13 +908,14 @@ fn swap_fields(eng: &mut Qwen3Engine, b: &mut LaneBufs) {
     std::mem::swap(&mut eng.prefix_slots, &mut b.prefix_slots);
     std::mem::swap(&mut eng.prefix_plan, &mut b.prefix_plan);
     std::mem::swap(&mut eng.prefix_images, &mut b.prefix_images);
+    std::mem::swap(&mut eng.host, &mut b.host);
     if let (Some(sd), Some(sl)) = (eng.specdec.as_mut(), b.spec.as_mut()) {
         sd.swap_lane(sl);
     }
 }
 
 /// Makes `lane` the engine's active lane (its buffers become the engine's own fields).
-fn activate(eng: &mut Qwen3Engine, lane: usize) {
+pub(super) fn activate(eng: &mut Qwen3Engine, lane: usize) {
     let Some(mut rt) = eng.lanes.take() else {
         return;
     };
@@ -1326,9 +1344,12 @@ fn end_lane(eng: &mut Qwen3Engine, lane: usize, mut run: Run) {
     });
     eng.prefix.request_end(true, written_end);
     let (reused, common) = (eng.prefix_plan.resume, eng.prefix_plan.lcp);
+    // the lane's share of the host tier: what it wrote is no longer saved, what it left is to be
+    let tier_report = host_tier::end_request(eng, &res, reused, written_end);
     let res = res.map(|mut r| {
         r.reused_tokens = reused;
         r.prefix_common = common;
+        r.host_tier = tier_report;
         r
     });
     if live_alone(eng) {
@@ -1971,6 +1992,8 @@ pub(super) fn serve(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed) -> Result<()
                 let r: Result<Qwen3GenReport, String> = Err(e.clone());
                 request_reset::end_request(eng, run.prompt_len, &r);
                 eng.prefix.request_end(false, 0);
+                let reused = eng.prefix_plan.resume;
+                let _ = host_tier::end_request(eng, &r, reused, 0);
                 let ev = done_event(r, eng, run.exclusive);
                 (run.out)(ev);
             }

@@ -435,6 +435,11 @@ pub struct HostTier {
     last_reused: u64,
     /// The entry a save that a request cut short was writing.
     partial: Option<u64>,
+    /// Write counts of the entries, shared by every lane's share of the tier (`--parallel`):
+    /// each save into an entry raises its count.
+    writes: Arc<std::sync::Mutex<Map<u64, u64>>>,
+    /// The write count of each entry this share's `clean` range or `ring_owner` was recorded at.
+    seen: Map<u64, u64>,
     verbose: bool,
 }
 
@@ -466,6 +471,8 @@ impl HostTier {
             restored: false,
             last_reused: 0,
             partial: None,
+            writes: Arc::new(std::sync::Mutex::new(Map::new())),
+            seen: Map::new(),
             verbose,
         }
     }
@@ -477,6 +484,55 @@ impl HostTier {
     /// The device may hold kept positions host memory lacks.
     pub fn has_unsaved(&self) -> bool {
         self.unsaved
+    }
+
+    /// [lanes] This share with the entries' write counts of `other`'s (every lane's share of one
+    /// engine counts the same writes).
+    pub fn sharing_writes_of(mut self, other: &HostTier) -> Self {
+        self.writes = Arc::clone(&other.writes);
+        self
+    }
+
+    /// Forgets what this share recorded of an entry another share has written since (the
+    /// verified `ln_tier_record_trusted`): its clean tiles and its ring image.
+    fn void_rewritten(&mut self) {
+        let writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        let count = |id: &u64| writes.get(id).copied().unwrap_or(0);
+        let stale: Vec<u64> = self
+            .clean
+            .keys()
+            .chain(self.ring_owner.iter())
+            .copied()
+            .filter(|id| {
+                !crate::verified::ln_tier_record_trusted(
+                    self.seen.get(id).copied().unwrap_or(0),
+                    count(id),
+                )
+            })
+            .collect();
+        drop(writes);
+        for id in stale {
+            self.clean.remove(&id);
+            if self.ring_owner == Some(id) {
+                self.ring_owner = None;
+            }
+            self.seen.remove(&id);
+        }
+    }
+
+    /// This share writes entry `id`: its count goes up (the verified `ln_tier_write_count`), and
+    /// this share's record is of the new one.
+    fn note_write(&mut self, id: u64) {
+        let mut writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        let c = writes.entry(id).or_insert(0);
+        *c = crate::verified::ln_tier_write_count(*c);
+        self.seen.insert(id, *c);
+    }
+
+    /// The device now holds entry `id` as it stands: this share's record is of its current count.
+    fn note_read(&mut self, id: u64) {
+        let writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        self.seen.insert(id, writes.get(&id).copied().unwrap_or(0));
     }
 
     pub fn set_rates(&mut self, rates: Rates) {
@@ -560,6 +616,8 @@ impl HostTier {
     ) -> Result<Option<(u64, u64)>, String> {
         self.last = TierReport::default();
         self.restored = false;
+        // [lanes] nothing of an entry another lane rewrote since is trusted
+        self.void_rewritten();
         if rows_zeroed {
             // the reset zeroed the K/V rows: nothing on the device equals anything saved
             self.clean.clear();
@@ -595,6 +653,12 @@ impl HostTier {
         let cache = Arc::clone(&self.cache);
         let mut store = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.clean.retain(|id, _| store.contains(*id));
+        self.seen.retain(|id, _| store.contains(*id));
+        // (the store first, then the write counts: the order every share takes the two locks in)
+        self.writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, _| store.contains(*id));
         let Some(found) = store.find(self.id, tile, prompt, images, wanted, table.enabled()) else {
             return Ok(None);
         };
@@ -690,6 +754,7 @@ impl HostTier {
                 } else if self.ring_owner != Some(found.entry) {
                     self.ring_owner = None;
                 }
+                self.note_read(found.entry);
                 Self::note_rate(&mut self.rates.to_device, &st);
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 let s = store.stats_mut();
@@ -774,6 +839,13 @@ impl HostTier {
             rep.complete = true;
             return Ok(rep);
         }
+        // [lanes] nothing of an entry another lane rewrote since is trusted: this save's
+        // `note_write` marks this share's record of the entry it opens as current, which a stale
+        // record must not survive into. (Defensive today: the entry it opens is cut to the tiles
+        // the prompt still shares and its clean range is clipped to them below; and the ring
+        // record is always empty here, since `end_request` clears it before any save with work
+        // and a save sets it only after copying the rings whole, when nothing is left unsaved.)
+        self.void_rewritten();
         let kept = table.held_slots();
         let (held, images) = table.held();
         let tile = self.rows.tile;
@@ -792,6 +864,12 @@ impl HostTier {
         let cache = Arc::clone(&self.cache);
         let mut store = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.clean.retain(|id, _| store.contains(*id));
+        self.seen.retain(|id, _| store.contains(*id));
+        // (the store first, then the write counts: the order every share takes the two locks in)
+        self.writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, _| store.contains(*id));
         // the store charges the save for what it adds to the entry it continues, and for
         // nothing that entry keeps
         let kept_tiles: Vec<u64> = kept.iter().map(|&(k, _)| k).collect();
@@ -814,6 +892,8 @@ impl HostTier {
             return Ok(rep);
         };
         let entry = target.entry;
+        // [lanes] the entry changes: every other lane's record of it is void from now on
+        self.note_write(entry);
         // an entry cut to the tiles the prompt shares: its tiles past them are gone
         if let Some(iv) = self.clean.get_mut(&entry) {
             *iv = (
@@ -1170,47 +1250,12 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         }
         return Ok(());
     }
-    // the trunk K/V caches: one size, chunk-major, `n_kv_heads` heads of BF16 rows
-    let cache_names: Vec<String> = eng.kv_addr.keys().cloned().collect();
-    let caches: Vec<u64> = eng.kv_addr.values().map(|&(a, _)| a).collect();
-    let cache_bytes = eng.kv_addr.values().next().map_or(0, |&(_, b)| b);
-    if eng.kv_addr.values().any(|&(_, b)| b != cache_bytes) {
-        eprintln!("[cache-ram] off for this engine: its K/V caches differ in size");
-        return Ok(());
-    }
-    // [kv8] one head's row of one position in the caches' own dtype, and its V block
-    let kv_dt = super::kv8::trunk_dtype(&eng.spec);
-    let rows = match RowLayout::with_block(
-        caches,
-        cache_bytes,
-        eng.max_chunks,
-        KV_CHUNK,
-        eng.spec.n_kv_heads,
-        crate::core::kv_cache::row_bytes(1, eng.spec.head_dim, kv_dt),
-        eng.prefill_tile,
-        crate::verified::kv_vperm_rows(kv_dt),
-    ) {
-        Ok(r) => r,
+    let (cache_names, rows, slots, ring) = match layout_of_active(eng) {
+        Ok(l) => l,
         Err(why) => {
             eprintln!("[cache-ram] off for this engine: {why}");
             return Ok(());
         }
-    };
-    let slots: Vec<Vec<(u64, u64)>> = eng
-        .prefix_slots
-        .iter()
-        .map(|m| {
-            m.iter()
-                .flat_map(|(l, &(s, cs))| {
-                    let st = &eng.gdn_state[l];
-                    [(s, st.s_bytes), (cs, st.cs_bytes)]
-                })
-                .collect()
-        })
-        .collect();
-    let ring: Vec<(u64, u64)> = match eng.specdec.as_ref() {
-        Some(sd) if sd.context_rows() > 0 => sd.cache_regions(),
-        _ => Vec::new(),
     };
     // the identity never holds a device address (`layout_fingerprint`)
     let layout = layout_fingerprint(
@@ -1219,6 +1264,37 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         slots.first().map_or(&[][..], |s| s.as_slice()),
         &ring,
     );
+    // [lanes] every other lane's share of the tier: its own device addresses, the same layout
+    // (and so the same identity: an entry one lane saved is restored into any lane)
+    let n_lanes = eng.lanes.as_ref().map_or(1, |rt| rt.lanes());
+    let mut others = Vec::with_capacity(n_lanes.saturating_sub(1));
+    for lane in 1..n_lanes {
+        super::lanes_rt::activate(eng, lane);
+        let l = layout_of_active(eng).and_then(|(names, rows, slots, ring)| {
+            let same = layout_fingerprint(
+                &names,
+                &rows,
+                slots.first().map_or(&[][..], |s| s.as_slice()),
+                &ring,
+            ) == layout;
+            if same {
+                Ok((rows, slots, ring))
+            } else {
+                Err(format!("lane {lane}'s device layout differs from lane 0's"))
+            }
+        });
+        others.push(l);
+    }
+    if n_lanes > 1 {
+        super::lanes_rt::activate(eng, 0);
+    }
+    let others = match others.into_iter().collect::<Result<Vec<_>, String>>() {
+        Ok(o) => o,
+        Err(why) => {
+            eprintln!("[cache-ram] off for this engine: {why}");
+            return Ok(());
+        }
+    };
     let id = identity_of(&engine_text(cfg, eng), &layout);
     // The ring: a few buffers of untouched memory, each mapped for the device on its own (the
     // one pinned host memory of the tier, planned when the server started). An engine that
@@ -1300,9 +1376,102 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
             gib(tier.rates.to_device),
         );
     }
+    let rates = tier.facts().rates;
     eng.xfer = Some(xfer);
     eng.host = Some(tier);
+    let first = eng.host.as_ref().expect("lane 0's share");
+    let shares: Vec<HostTier> = others
+        .into_iter()
+        .map(|(rows, slots, ring)| {
+            let mut t = HostTier::new(Arc::clone(&cache), id, rows, slots, ring, cfg.verbose)
+                .sharing_writes_of(first);
+            t.set_rates(rates);
+            t
+        })
+        .collect();
+    for (i, t) in shares.into_iter().enumerate() {
+        super::lanes_rt::activate(eng, i + 1);
+        eng.host = Some(t);
+    }
+    if n_lanes > 1 {
+        super::lanes_rt::activate(eng, 0);
+        if cfg.verbose {
+            eprintln!("[cache-ram] every one of the {n_lanes} lanes saves and restores through the tier");
+        }
+    }
     Ok(())
+}
+
+/// The device layout the host tier copies for the active lane: the trunk K/V cache names and rows,
+/// the kept positions' state ranges and the drafter's context rings.
+#[allow(clippy::type_complexity)]
+fn layout_of_active(
+    eng: &Qwen3Engine,
+) -> Result<(Vec<String>, RowLayout, Vec<Vec<(u64, u64)>>, Vec<(u64, u64)>), String> {
+    // the trunk K/V caches: one size, chunk-major, `n_kv_heads` heads of BF16 rows
+    let cache_names: Vec<String> = eng.kv_addr.keys().cloned().collect();
+    let caches: Vec<u64> = eng.kv_addr.values().map(|&(a, _)| a).collect();
+    let cache_bytes = eng.kv_addr.values().next().map_or(0, |&(_, b)| b);
+    if eng.kv_addr.values().any(|&(_, b)| b != cache_bytes) {
+        return Err("its K/V caches differ in size".into());
+    }
+    // [kv8] one head's row of one position in the caches' own dtype, and its V block
+    let kv_dt = super::kv8::trunk_dtype(&eng.spec);
+    let rows = RowLayout::with_block(
+        caches,
+        cache_bytes,
+        eng.max_chunks,
+        KV_CHUNK,
+        eng.spec.n_kv_heads,
+        crate::core::kv_cache::row_bytes(1, eng.spec.head_dim, kv_dt),
+        eng.prefill_tile,
+        crate::verified::kv_vperm_rows(kv_dt),
+    )?;
+    let slots: Vec<Vec<(u64, u64)>> = eng
+        .prefix_slots
+        .iter()
+        .map(|m| {
+            m.iter()
+                .flat_map(|(l, &(s, cs))| {
+                    let st = &eng.gdn_state[l];
+                    [(s, st.s_bytes), (cs, st.cs_bytes)]
+                })
+                .collect()
+        })
+        .collect();
+    let ring: Vec<(u64, u64)> = match eng.specdec.as_ref() {
+        Some(sd) if sd.context_rows() > 0 => sd.cache_regions(),
+        _ => Vec::new(),
+    };
+    Ok((cache_names, rows, slots, ring))
+}
+
+/// The end of the engine's request on the active lane: what it wrote no longer equals anything
+/// saved; what it left is to be saved (after the response: `idle_work`). Returns the tier's report
+/// of the request.
+pub(super) fn end_request(
+    eng: &mut Qwen3Engine,
+    res: &Result<Qwen3GenReport, String>,
+    reused: u64,
+    written_end: u64,
+) -> Option<TierReport> {
+    let tier = eng.host.as_mut()?;
+    let (prefilled, secs) = res.as_ref().map_or((0, 0.0), |r| {
+        (
+            (r.prompt_tokens as u64).saturating_sub(reused),
+            // the restore is inside the prefill clock, not part of the prefill itself
+            (r.ttft_ms - tier.last().restore_ms - tier.last().save_ms).max(0.0) / 1e3,
+        )
+    });
+    let cancelled = res.as_ref().is_ok_and(|r| r.stopped_by_cancel);
+    tier.end_request(
+        res.is_ok(),
+        reused,
+        written_end,
+        if cancelled { 0 } else { prefilled },
+        secs,
+    );
+    Some(tier.last())
 }
 
 /// [`HostTier::begin_request`] for the engine's request.
@@ -1616,6 +1785,43 @@ mod tests {
                 .expect("a slot holds the resume position");
             self.dev.state_of(slot)
         }
+    }
+
+    #[test]
+    fn a_lane_never_trusts_its_record_of_an_entry_another_lane_rewrote() {
+        // two lanes' shares of one store (one engine): lane B's save cuts and rewrites the entry
+        // lane A's device still matches in part
+        let cache = Arc::new(SharedCache::new(256 << 20, 0, false, false));
+        let mut a = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        let mut b = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        b.tier = std::mem::replace(
+            &mut b.tier,
+            HostTier::new(Arc::clone(&cache), [7, 7], b.dev.layout.clone(), b.dev.slots.clone(), Vec::new(), false),
+        )
+        .sharing_writes_of(&a.tier);
+        let p = prompt(8 * 512 + 100, 1);
+        a.request(&p, true);
+        assert!(a.idle().complete);
+        // B's conversation shares P's first four tiles, then differs
+        let mut q = p[..4 * 512].to_vec();
+        q.extend(prompt(4 * 512 + 100, 2));
+        b.request(&q, true);
+        assert!(b.idle().complete);
+        assert_eq!(cache.stats().entries, 1, "B's save continued and cut the entry A saved");
+        // Q's next turn lands on lane A, whose device still holds P's rows past the fourth tile
+        let mut q2 = q.clone();
+        q2.extend(prompt(300, 3));
+        let restored = a
+            .tier
+            .begin_request(&mut a.table, &mut a.dev, &q2, &[], true, false)
+            .unwrap();
+        assert!(restored.is_some());
+        let plan = a.table.plan_from(&q2, &[], true, false, restored);
+        assert!(plan.resume > 4 * 512, "the entry gives Q's rows back past the shared ones");
+        // the rows A resumes from are Q's, as a cold prefill of Q leaves them
+        let (rows, state) = Rig::cold(&q2, plan.resume, 4);
+        assert!(a.dev.rows_of(0, plan.resume) == rows);
+        assert!(a.resume_state(plan.resume) == state);
     }
 
     #[test]

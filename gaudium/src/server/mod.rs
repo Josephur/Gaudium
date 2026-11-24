@@ -2748,7 +2748,12 @@ fn drive_lanes(state: Arc<AppState>, idx: usize) {
                 state.publish_engine_event();
                 return;
             }
-            crate::verified::SessionAfter::SaDone => return,
+            crate::verified::SessionAfter::SaDone => {
+                // the session's connections ended while it held the card: the host-RAM tier's
+                // save of every lane gets its idle time now
+                state.idle_work();
+                return;
+            }
         }
     }
 }

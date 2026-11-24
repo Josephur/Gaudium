@@ -161,8 +161,9 @@ fn print_usage() {
          \x20                       with checkpoint every lane steps at the narrowest. Other\n\
          \x20                       models are\n\
          \x20                       served with one lane (the log says why). /props total_slots\n\
-         \x20                       and /slots show the lanes. Not with --cache-ram yet (the\n\
-         \x20                       host-RAM tier is off for a model served with lanes)\n\
+         \x20                       and /slots show the lanes. With --cache-ram every lane saves\n\
+         \x20                       to and restores from the one host-RAM store (an entry one\n\
+         \x20                       lane saved is restored into any lane)\n\
          \x20 --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a\n\
          \x20                       conversation: after another conversation, another model, or\n\
          \x20                       the idle release (--idle-park). What a request could resume\n\

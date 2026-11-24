@@ -948,6 +948,10 @@ cd5590e07b5dcccf  ln_step_rows_in_ring  law ln_step_rows_in_ring : for + g : Boo
 # promise ln_step_rows_is_asked: a lane verifies at the narrow or at the wide width asked for, never at another.
 ad3088743b14ce44  ln_step_rows_unchosen_narrow  law ln_step_rows_unchosen_narrow : for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { ln_lane_step_rows ( False { } , n , w , r , c , m ) == n : Nat }
 # promise ln_step_rows_unchosen_narrow: a lane not chosen to go wide verifies at the narrow width.
+29a0d191c7382a25  ln_tier_record_void_after_write  law ln_tier_record_void_after_write : for + m : Nat for + e : Nat { ln_tier_record_trusted ( m , Nat.add ( m , 1n + e ) ) == False { } : Bool }
+# promise ln_tier_record_void_after_write: a lane never trusts its record of a host-RAM entry that was written again after it recorded it.
+2afe0b633b18c224  ln_tier_write_voids_earlier  law ln_tier_write_voids_earlier : for + m : Nat for + e : Nat { ln_tier_record_trusted ( m , ln_tier_write_count ( Nat.add ( m , e ) ) ) == False { } : Bool }
+# promise ln_tier_write_voids_earlier: a write into a host-RAM entry voids every lane's record of the entry taken before it.
 6fee86abb8400a0c  ln_unbatched_verify_no_lanes  law ln_unbatched_verify_no_lanes : for + d : Bool { ln_drafter_ok ( ln_lane_drafter_of ( True { } , d , False { } ) ) == False { } : Bool }
 # promise ln_unbatched_verify_no_lanes: a load whose drafter verifies its rows in a form the batched speculative steps are not built for never gets lanes.
 1d47a3ea1689a045  ln_wide_held_in_ring  law ln_wide_held_in_ring : for + n : Nat for + w : Nat for + r : Nat { Bool.or ( Nat.is_gt ( Nat.add ( n , 1n ) , r ) , Nat.is_le ( Nat.add ( ln_lane_wide_held ( n , w , r ) , 1n ) , r ) ) == True { } : Bool }

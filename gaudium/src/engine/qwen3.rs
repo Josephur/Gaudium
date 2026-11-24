@@ -2828,8 +2828,8 @@ impl Qwen3Engine {
             dev,
         };
         eng.warm_prefill_tiles(cfg.prefill_warm_rows, cfg.verbose)?;
-        // (the host tier keeps one prefix cache, not one per lane)
-        if crate::verified::ln_host_tier_ok(n_lanes as u64, false) {
+        // (the host tier keeps one share of its state per lane, swapped in with the lane)
+        if crate::verified::ln_host_tier_ok(n_lanes as u64, true) {
             host_tier::attach(&mut eng, cfg)?;
         } else if cfg.host_cache.is_some() {
             eprintln!(
@@ -2908,6 +2908,16 @@ impl Qwen3Engine {
     /// stops between pieces once one does and goes on at the next call. An error is a failed
     /// device copy: the entry it wrote is gone, the engine goes on.
     pub fn idle_work(&mut self, waiting: &dyn Fn() -> u64) {
+        // [lanes] every lane's share of the tier, one after another
+        if self.lanes.as_ref().is_some_and(|rt| rt.lanes() > 1) {
+            return lanes_rt::idle_work(self, waiting);
+        }
+        self.idle_save(waiting);
+    }
+
+    /// The host-tier save of the active lane while the card is idle (`waiting`: requests that
+    /// wait for the card; a save gives way to one).
+    pub(super) fn idle_save(&mut self, waiting: &dyn Fn() -> u64) {
         if !self.host.as_ref().is_some_and(|t| t.has_unsaved()) {
             return;
         }
@@ -2930,8 +2940,15 @@ impl Qwen3Engine {
     /// Before the card is released (idle release, another model, shutdown): everything the
     /// device holds for its prompt goes to the host-RAM tier, and every stream is drained.
     pub fn before_release(&mut self) {
-        if let Err(e) = host_tier::save(self, &mut || false) {
-            eprintln!("[cache-ram] save before the release failed: {e}");
+        // [lanes] every lane's share of the tier
+        let n = self.lanes.as_ref().map_or(1, |rt| rt.lanes());
+        for lane in 0..n {
+            if n > 1 {
+                lanes_rt::activate(self, lane);
+            }
+            if let Err(e) = host_tier::save(self, &mut || false) {
+                eprintln!("[cache-ram] save before the release failed: {e}");
+            }
         }
         let _ = self.dev.sync_all();
     }
@@ -3183,26 +3200,7 @@ impl Qwen3Engine {
         });
         self.prefix.request_end(res.is_ok(), written_end);
         let (reused, common) = (self.prefix_plan.resume, self.prefix_plan.lcp);
-        // host tier: what the request wrote no longer equals anything saved; what it left is
-        // to be saved (after the response: `idle_work`)
-        if let Some(tier) = self.host.as_mut() {
-            let (prefilled, secs) = res.as_ref().map_or((0, 0.0), |r| {
-                (
-                    (r.prompt_tokens as u64).saturating_sub(reused),
-                    // the restore is inside the prefill clock, not part of the prefill itself
-                    (r.ttft_ms - tier.last().restore_ms - tier.last().save_ms).max(0.0) / 1e3,
-                )
-            });
-            let cancelled = res.as_ref().is_ok_and(|r| r.stopped_by_cancel);
-            tier.end_request(
-                res.is_ok(),
-                reused,
-                written_end,
-                if cancelled { 0 } else { prefilled },
-                secs,
-            );
-        }
-        let tier_report = self.host.as_ref().map(|t| t.last());
+        let tier_report = host_tier::end_request(self, &res, reused, written_end);
         let res = res.map(|mut r| {
             r.reused_tokens = reused;
             r.prefix_common = common;

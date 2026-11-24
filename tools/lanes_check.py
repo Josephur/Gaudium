@@ -17,12 +17,15 @@ seed per prompt): a seeded sampled stream must equal its reference as exactly as
 Options add prompts: `--long 6000,10000` long prompts of about that many words (their streams
 cover several KV chunks), `--image` one prompt with a generated PNG (an image request runs alone
 on a lane server), `--suite <suite.json>` the image cases of a vision suite file (its images and
-prompts; an answer without the case's expected words fails the check). `--turns` checks routing after the concurrent runs: every long prompt's next
-turn (its reply and one more user message) must take over rows of the lane that held it.
+prompts; an answer without the case's expected words fails the check). `--turns` checks routing
+after the concurrent runs: every long prompt's next turn (its reply and one more user message)
+must take over rows of the lane that held it and equal its reference; with `--park S` the card is
+released first (a server with a short `--idle-park`), and the rows must come back from the host-RAM
+tier (`--cache-ram`).
 
 Only the Python standard library is used. Results go to stdout and, with `--out`, to a JSON file.
 The exit status is 1 when a check fails (a mismatching or failed stream, a next turn that reused
-nothing), else 0.
+nothing, a `--park` wait the server never answered by releasing the card), else 0.
 """
 
 import argparse
@@ -75,6 +78,27 @@ def png_data_url(w=96, h=96):
 
 
 IMAGE_MARK = "<image>"
+# the next user message of a long prompt's conversation (`--turns`)
+FOLLOW_UP = "Now list them in ascending order."
+
+
+def wait_parked(base, timeout, api_key=None):
+    """Waits until the server has released the card (its engine state is `parked`)."""
+    t0 = time.monotonic()
+    req = urllib.request.Request(base.rstrip("/") + "/gaudium/engine")
+    if api_key:
+        req.add_header("Authorization", "Bearer " + api_key)
+    while time.monotonic() - t0 < timeout:
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                if json.loads(r.read()).get("state") == "parked":
+                    print(f"server parked after {time.monotonic() - t0:.1f}s", flush=True)
+                    return True
+        except Exception:  # noqa: BLE001 (the server may be busy releasing)
+            pass
+        time.sleep(1)
+    print(f"server not parked after {timeout}s", flush=True)
+    return False
 # image prompts of a vision suite file (`--suite`): prompt -> (data URLs, expected word groups)
 SUITE_IMAGES = {}
 
@@ -150,6 +174,7 @@ def chat(base, model, prompt, mode, seed, max_tokens, api_key, timeout, history=
         "tokens": g.get("tokens", []),
         "content": msg.get("content") or "",
         "reused": g.get("prefix", {}).get("reused_tokens", 0),
+        "tier": g.get("prefix", {}).get("tier", ""),
         "wall_s": wall,
         "prefill_ms": t.get("prompt_ms", 0.0),
         "decode_ms": t.get("predicted_ms", 0.0),
@@ -190,7 +215,8 @@ def main():
     ap.add_argument("--long", default="", help="extra long prompts of about these many words")
     ap.add_argument("--image", action="store_true", help="one extra prompt with an image")
     ap.add_argument("--suite", default="", help="a vision suite file: its image cases as extra prompts, each answer checked for its expected words")
-    ap.add_argument("--turns", action="store_true", help="next turns of the long prompts must reuse rows")
+    ap.add_argument("--turns", action="store_true", help="next turns of the long prompts must reuse rows (and equal their references)")
+    ap.add_argument("--park", type=float, default=0, help="with --turns: wait up to this many seconds for the server to release the card before the next turns, which must then come back from host memory (--cache-ram)")
     ap.add_argument("--serial", action="store_true", help="with --check: every prompt alone, one after another")
     a = ap.parse_args()
     modes = [m for m in a.modes.split(",") if m]
@@ -220,6 +246,15 @@ def main():
                     sem = ", expected words " + ("found" if expect_ok(PROMPTS[i], r["content"]) else "MISSING")
                 print(f"ref prompt {i:2d} {m:7s}: {r['n']:4d} tokens, decode {r['n'] / max(r['decode_ms'], 1e-9) * 1e3:7.1f} tok/s, "
                       f"prefill {r['prefill_ms']:7.1f} ms ({r['method']}){sem}", flush=True)
+        if a.turns:
+            # each long prompt's first turn and next turn, one request at a time
+            for i in long_idx:
+                first = chat(a.base, a.model, PROMPTS[i], "greedy", a.seed + i, a.max_tokens, a.api_key, a.timeout)
+                hist = [{"role": "user", "content": PROMPTS[i]}, {"role": "assistant", "content": first["content"]}]
+                nxt = chat(a.base, a.model, FOLLOW_UP, "greedy", a.seed, 32, a.api_key, a.timeout, history=hist)
+                ref[f"turn1:{i}"] = first
+                ref[f"turn2:{i}"] = nxt
+                print(f"ref turns of long prompt {i}: {first['n']} + {nxt['n']} tokens", flush=True)
         with open(a.write_ref, "w") as f:
             json.dump(ref, f)
         out["ref"] = ref
@@ -300,27 +335,60 @@ def main():
         out["runs"] = runs
         out["mismatches"] = bad
         print(f"mismatching streams: {bad}")
-        if a.turns and long_idx:
+        missing = [i for i in long_idx if f"turn1:{i}" not in ref or f"turn2:{i}" not in ref] if a.turns else []
+        if missing:
+            # a next turn is only checked against references of both its turns
+            print(f"--turns: the reference file has no turn references for long prompt(s) {missing}; "
+                  "write it again with --write-ref ... --turns (same prompts and --long)", flush=True)
+            bad += len(missing)
+            out["mismatches"] = bad
+        elif a.turns and long_idx:
             # each long prompt again with its reply and one more message: the lane that holds the
-            # conversation takes its rows over (the other long prompts ran in between)
+            # conversation takes its rows over (the other long prompts ran in between), or with
+            # --park the host-RAM tier gives them back after the card was released
             turns = []
             for i in long_idx:
                 first = chat(a.base, a.model, PROMPTS[i], "greedy", a.seed + i, a.max_tokens, a.api_key, a.timeout)
-                hist = [{"role": "user", "content": PROMPTS[i]}, {"role": "assistant", "content": first["content"]}]
+                r1 = ref[f"turn1:{i}"]
+                if first_diff(first["tokens"], r1["tokens"]) is not None:
+                    bad += 1
+                    print(f"turn 1 of long prompt {i}: DIFF against its reference", flush=True)
+                # the history of the reference's first turn, so that the next turn's prompt is its
+                content = r1["content"]
+                hist = [{"role": "user", "content": PROMPTS[i]}, {"role": "assistant", "content": content}]
                 turns.append((i, hist))
-            for i, hist in turns:
-                nxt = chat(a.base, a.model, "Now list them in ascending order.", "greedy", a.seed, 32,
-                           a.api_key, a.timeout, history=hist)
-                ok = nxt["reused"] > 0
-                bad += 0 if ok else 1
-                print(f"turn 2 of long prompt {i}: {nxt['reused']} prompt rows taken over ({'ok' if ok else 'NONE'})", flush=True)
-                out.setdefault("turns", []).append({"prompt": i, "reused": nxt["reused"]})
+            if a.park and not wait_parked(a.base, a.park, a.api_key):
+                # a host restore alone does not show the card was released: a conversation a
+                # lane let go of comes back from host memory too, with the engine loaded
+                bad += 1
+                out["park_timeout"] = True
+            res2 = [None] * len(turns)
+
+            def turn2(j):
+                i, hist = turns[j]
+                res2[j] = chat(a.base, a.model, FOLLOW_UP, "greedy", a.seed, 32, a.api_key, a.timeout, history=hist)
+
+            th = [threading.Thread(target=turn2, args=(j,)) for j in range(len(turns))]
+            for t in th:
+                t.start()
+            for t in th:
+                t.join()
+            for (i, _), nxt in zip(turns, res2):
+                want = a.park and "host" or None
+                ok = nxt is not None and nxt["reused"] > 0 and (want is None or nxt["tier"] == want)
+                r2 = ref[f"turn2:{i}"]
+                same = nxt is not None and first_diff(nxt["tokens"], r2["tokens"]) is None
+                bad += (0 if ok else 1) + (0 if same else 1)
+                print(f"turn 2 of long prompt {i}: {nxt and nxt['reused']} prompt rows taken over from {nxt and nxt['tier']} "
+                      f"({'ok' if ok else 'NONE'}), {'identical to' if same else 'DIFF against'} its reference", flush=True)
+                out.setdefault("turns", []).append({"prompt": i, "reused": nxt and nxt["reused"], "tier": nxt and nxt["tier"], "identical": same})
             out["mismatches"] = bad
 
     if a.out:
         with open(a.out, "w") as f:
             json.dump(out, f, indent=1)
-    # a failed check (a mismatching or failed stream, a next turn that reused nothing) fails
+    # a failed check (a mismatching or failed stream, a next turn that reused nothing, a card
+    # never released for --park) fails
     return 1 if out.get("mismatches") else 0
 
 

@@ -2336,3 +2336,47 @@ law ln_cost_own_taken:
 def ln_cost_own_taken(b, c):
   %ln_eq_refl_true(b) : {ln_cost_takes_of(Nat.is_eq(c, b), _, Nat.is_lt(ln_cost_dist(b, b), ln_cost_dist(b, c))) == Bool.not(Nat.is_eq(c, b)) : Bool}
   ln_cost_own_aux(Nat.is_eq(c, b), Nat.is_lt(ln_cost_dist(b, b), ln_cost_dist(b, c)))
+
+# ============================================================================
+# 12. Lanes sharing the host-RAM tier
+# ============================================================================
+#
+# With `--cache-ram`, every lane keeps its own record of which of its device tiles still equal an
+# entry of the one store, and whether its drafter rings equal an entry's. Any lane may rewrite an
+# entry; every write raises the entry's write count (`ln_tier_write_count`). A lane trusts its
+# record of an entry only at the write count it recorded it at (`mine`); a later write by another
+# lane (`now`) voids it.
+
+# May a lane trust its record of an entry it recorded at write count `mine`, now at `now`?
+def ln_tier_record_trusted(mine: Nat, now: Nat) -> Bool:
+  Nat.is_eq(mine, now)
+
+# promise: a lane never trusts its record of a host-RAM entry that was written again after it recorded it.
+law ln_tier_record_void_after_write:
+  for +m: Nat
+  for +e: Nat
+  {ln_tier_record_trusted(m, Nat.add(m, 1n+e)) == False{} : Bool}
+
+def ln_tier_record_void_after_write(m, e):
+  match m:
+    case 0n:
+      {==}
+    case 1n+p:
+      ln_tier_record_void_after_write(p, e)
+
+# The write count of an entry after one more write into it, from its count `now`.
+def ln_tier_write_count(now: Nat) -> Nat:
+  1n+now
+
+# promise: a write into a host-RAM entry voids every lane's record of the entry taken before it.
+law ln_tier_write_voids_earlier:
+  for +m: Nat
+  for +e: Nat
+  {ln_tier_record_trusted(m, ln_tier_write_count(Nat.add(m, e))) == False{} : Bool}
+
+def ln_tier_write_voids_earlier(m, e):
+  match m:
+    case 0n:
+      {==}
+    case 1n+p:
+      ln_tier_write_voids_earlier(p, e)
