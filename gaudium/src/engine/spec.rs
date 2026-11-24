@@ -825,6 +825,16 @@ impl SpecRuntime {
         self.weight_specs.contains_key(name)
     }
 
+    /// [lanes] The runtime's weights and tables (drafter weights, the step tables), which every
+    /// slot of a batched step binds the same way.
+    pub(super) fn weight_addrs(&self) -> Vec<(String, u64)> {
+        self.addr
+            .iter()
+            .filter(|(n, _)| self.is_weight(n) && n.as_str() != "df_nofix")
+            .map(|(n, &a)| (n.clone(), a))
+            .collect()
+    }
+
     /// [lanes] What the batched steps at the lanes' width are built from.
     pub(super) fn lane_graph(&self) -> lanes::SpecLaneGraph {
         lanes::SpecLaneGraph {
@@ -2139,6 +2149,40 @@ pub(super) fn write_i32s(eng: &mut Qwen3Engine, writes: &[(u64, &[i32])]) -> Res
     eng.dev
         .copy_h2d_pinned_batch_sync(&eng.stage_io, &transfers)
         .map_err(|e| format!("spec H2D: {e}"))
+}
+
+/// [lanes] One single-row step of the active lane over `nch` chunks with its step buffers of
+/// parity `p` (the narrowest step, which drafts nothing), as a single stream steps near the end
+/// of its context. `samp` = the lane's sampler parameters `(samp_f, samp_i)`. Returns the emitted
+/// tokens (a negative value ends the list).
+pub(super) fn lane_single_row_step(
+    eng: &mut Qwen3Engine,
+    sampled: bool,
+    p: usize,
+    nch: u64,
+    samp: (u64, u64),
+) -> Result<Vec<i32>, String> {
+    ensure_step_as(eng, sampled, 1, nch)?;
+    {
+        let rt = eng.specdec.as_ref().expect("spec runtime");
+        let mut pool = rt.step_pool(p, &eng.weights_addr, &eng.kv_addr, &eng.gdn_state);
+        pool.insert(crate::engine::sampler::SAMP_F.into(), samp.0);
+        pool.insert(crate::engine::sampler::SAMP_I.into(), samp.1);
+        let step = if sampled {
+            &rt.ssteps[&(1, nch)]
+        } else {
+            &rt.steps[&(1, nch)]
+        };
+        let exact = select_exact_bindings(&step.recipe, &pool)?;
+        step.recipe
+            .launch_checked(&eng.dev, &exact)
+            .map_err(|e| format!("launch spec step (lane, T=1, C={nch}): {e}"))?;
+    }
+    // SAFETY: the compute stream belongs to `eng.dev`.
+    unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
+        .map_err(|e| format!("sync spec step (lane, T=1): {e}"))?;
+    let addr = eng.specdec.as_ref().expect("spec runtime").addr[&format!("sp_emit{p}")];
+    read_i32s(eng, addr, 1)
 }
 
 pub(super) fn read_i32s(eng: &mut Qwen3Engine, addr: u64, n: usize) -> Result<Vec<i32>, String> {

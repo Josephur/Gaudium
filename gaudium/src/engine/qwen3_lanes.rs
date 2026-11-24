@@ -32,7 +32,7 @@
 
 use super::*;
 use crate::core::lanes::{
-    batch_chunks, slot_fits, step_chunk_counts, step_chunks, LaneTable, Offer,
+    batch_chunks, slot_fits, spec_batched, step_chunk_counts, step_chunks, LaneTable, Offer,
 };
 use crate::engine::{FeedHead, LaneDone, LaneFeed, LaneJob, LaneOut, LaneView};
 
@@ -277,11 +277,7 @@ pub(super) enum LaneFamily {
 
 impl LaneFamily {
     /// The plain family's kernel hashes: the trunk's, and the sampler's when it is there.
-    pub fn k0(
-        trunk: &[(String, String)],
-        kenv: &KernelEnv,
-        sampler: bool,
-    ) -> Result<Self, String> {
+    pub fn k0(trunk: &[(String, String)], kenv: &KernelEnv, sampler: bool) -> Result<Self, String> {
         let mut hashes = trunk.to_vec();
         if sampler {
             for (k, h) in kenv.fingerprint_hashes(crate::engine::sampler::SAMPLER_ELFS)? {
@@ -574,6 +570,10 @@ impl LaneRt {
     /// After the speculative runtime is finished: every lane's share of it (lane 0's is the
     /// runtime's own). Returns the context bound buffers of lanes `1..n`, which start as loaded.
     pub fn attach_spec(&mut self, sd: &spec::SpecRuntime) -> Vec<u64> {
+        // the drafter's weights and the step tables: bound the same way in every slot
+        for (n, a) in sd.weight_addrs() {
+            self.base.entry(n).or_insert(a);
+        }
         let mut bounds = Vec::new();
         let names: BTreeMap<String, u64> =
             sd.lane_buffers().into_iter().map(|(n, _)| (n, 0)).collect();
@@ -1015,10 +1015,7 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
                     sd.step_addr(&format!("sp_cur{p}")),
                     sd.step_addr(&format!("sp_ids{p}")),
                 );
-                spec::write_i32s(
-                    eng,
-                    &[(a, &[0]), (c, &[run.cursor as i32]), (i, &ids)],
-                )?;
+                spec::write_i32s(eng, &[(a, &[0]), (c, &[run.cursor as i32]), (i, &ids)])?;
             }
             Ok(Some(run))
         }
@@ -1102,7 +1099,11 @@ fn end_lane(eng: &mut Qwen3Engine, lane: usize, mut run: Run) {
 
 /// The single-row step of a one-row prompt on the active lane (its caches and states bound at
 /// the launch). Returns the ms a first use of the sampled step took.
-pub(super) fn launch_one_row(eng: &mut Qwen3Engine, parity: usize, sampled: bool) -> Result<f64, String> {
+pub(super) fn launch_one_row(
+    eng: &mut Qwen3Engine,
+    parity: usize,
+    sampled: bool,
+) -> Result<f64, String> {
     let mut pool = eng.step_base.clone();
     for (k, &(v, _)) in &eng.kv_addr {
         pool.insert(k.clone(), v);
@@ -1207,10 +1208,7 @@ fn prepare(
             // the lane's step buffers alternate by parity: read `p`, write `q`
             let own = |name: &str| -> u64 {
                 if rt.active == lane {
-                    eng.specdec
-                        .as_ref()
-                        .expect("spec runtime")
-                        .step_addr(name)
+                    eng.specdec.as_ref().expect("spec runtime").step_addr(name)
                 } else {
                     rt.bufs[lane].spec.as_ref().expect("lane spec buffers").addr[name]
                 }
@@ -1427,6 +1425,26 @@ fn spec_step(
     Ok(out)
 }
 
+/// One single-row step of speculative lane `lane` (near the end of its context): its emitted
+/// tokens.
+fn single_row_step(
+    eng: &mut Qwen3Engine,
+    lane: usize,
+    runs: &[Option<Run>],
+) -> Result<Vec<i32>, String> {
+    let run = runs[lane].as_ref().expect("a decoding lane runs");
+    let nch = step_chunks(batch_chunks(&[(run.cursor, 1)], KV_CHUNK), eng.max_chunks);
+    if !slot_fits(run.cursor, 1, nch, KV_CHUNK, eng.max_chunks) {
+        return Err(format!(
+            "single-row step: lane {lane} (row {}) does not fit {nch} chunks of a lane of {} chunks",
+            run.cursor, eng.max_chunks
+        ));
+    }
+    activate(eng, lane);
+    let samp = eng.lanes.as_ref().expect("lanes").samp_bufs[lane];
+    spec::lane_single_row_step(eng, run.sampled, run.parity, nch, samp)
+}
+
 /// Serves the requests of `feed` in the engine's lanes until the feed ends the session.
 pub(super) fn serve(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed) -> Result<(), String> {
     let n = eng.lanes.as_ref().expect("lanes").n;
@@ -1533,30 +1551,24 @@ fn serve_loop(
                 continue;
             }
             if eng.specdec.is_some() {
-                // a lane that has no room left for a step's rows ends at the context's end
+                // a lane without room in its context for a batched step's rows takes single-row
+                // steps to the end of its request, as a single stream does
                 let t = eng.lanes.as_ref().expect("lanes").family.rows();
                 let max_ctx = eng.max_ctx;
-                let mut stepping = Vec::with_capacity(group.len());
-                for &lane in &group {
-                    let run = runs[lane].as_mut().expect("a decoding lane runs");
-                    if run.cursor + t > max_ctx {
-                        let left = run.budget.remaining();
-                        run.budget.record_emitted(left);
-                        eng.lanes
-                            .as_mut()
-                            .expect("lanes")
-                            .table
-                            .finish(lane)
-                            .map_err(|e| format!("lanes: {e}"))?;
-                    } else {
-                        stepping.push(lane);
-                    }
+                let (stepping, single): (Vec<usize>, Vec<usize>) =
+                    group.iter().copied().partition(|&l| {
+                        let run = runs[l].as_ref().expect("a decoding lane runs");
+                        spec_batched(run.cursor, t, max_ctx)
+                    });
+                let mut emitted: Vec<(usize, u64, Vec<i32>)> = Vec::with_capacity(group.len());
+                if !stepping.is_empty() {
+                    let em = spec_step(eng, &stepping, runs, sampled)?;
+                    emitted.extend(stepping.iter().zip(em).map(|(&l, e)| (l, t, e)));
                 }
-                if stepping.is_empty() {
-                    continue;
+                for &lane in &single {
+                    emitted.push((lane, 1, single_row_step(eng, lane, runs)?));
                 }
-                let emitted = spec_step(eng, &stepping, runs, sampled)?;
-                for (&lane, em) in stepping.iter().zip(emitted) {
+                for (lane, rows, em) in emitted {
                     let run = runs[lane].as_mut().expect("a decoding lane runs");
                     let n_emit = em.iter().take_while(|&&v| v >= 0).count();
                     if n_emit == 0 {
@@ -1568,17 +1580,14 @@ fn serve_loop(
                     run.parity ^= 1;
                     run.cursor += n_emit as u64;
                     run.steps += 1;
-                    run.drafted += t - 1;
+                    run.drafted += rows - 1;
                     run.accepted += n_emit as u64 - 1;
-                    if run.cancel.load(Ordering::Relaxed) {
-                        run.stopped_by_cancel = true;
-                    } else {
-                        for &tok in &em[..n_emit] {
-                            if run.done() {
-                                break;
-                            }
-                            run.emit(tok);
+                    run.observe_cancel();
+                    for &tok in &em[..n_emit] {
+                        if run.done() {
+                            break;
                         }
+                        run.emit(tok);
                     }
                     if run.done() {
                         eng.lanes
@@ -1589,7 +1598,7 @@ fn serve_loop(
                             .map_err(|e| format!("lanes: {e}"))?;
                     }
                 }
-                eng.live.step(stepping.len() as u64, 0, 0);
+                eng.live.step(group.len() as u64, 0, 0);
                 continue;
             }
             let toks = step(eng, &group, runs, sampled)?;

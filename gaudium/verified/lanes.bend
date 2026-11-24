@@ -471,6 +471,12 @@ def ln_drafter_ok(d: LaneDrafter) -> Bool:
     case LdOther{}:
       False{}
 
+# Does a speculative lane whose next row is `cursor` take the batched step of `rows` rows, in a
+# context of `max_ctx` rows? Otherwise it takes single-row steps, which draft nothing, to the
+# end of its request (as a single stream does near the end of its context).
+def ln_spec_batched(cursor: Nat, rows: Nat, max_ctx: Nat) -> Bool:
+  Nat.is_le(Nat.add(cursor, rows), max_ctx)
+
 # Does a load get lanes? Its engine has batched steps (`engine_ok`), its drafter has, and it is
 # not a calibration load (which runs one request at a time).
 def ln_lanes_ok(engine_ok: Bool, d: LaneDrafter, calibrating: Bool) -> Bool:
@@ -1103,6 +1109,11 @@ def ln_or_true_r(b: Bool) -> {Bool.or(b, True{}) == True{} : Bool}:
     case True{}: {==}
     case False{}: {==}
 
+def ln_or_not_self(b: Bool) -> {Bool.or(Bool.not(b), b) == True{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
 # promise: a waiter that has waited its maximum wait is due: no request passes it over any more.
 law turn_due_after_max_wait:
   for +w: Nat
@@ -1642,3 +1653,15 @@ law ln_sa_done_of_done:
 
 def ln_sa_done_of_done():
   {==}
+
+  L.nat_le_refl(Nat.mul(c, e))
+
+# promise: a speculative lane takes a batched step only when all the step's rows fit in its context.
+law ln_spec_batched_fits:
+  for +c: Nat
+  for +r: Nat
+  for +m: Nat
+  {Bool.or(Bool.not(ln_spec_batched(c, r, m)), Nat.is_le(Nat.add(c, r), m)) == True{} : Bool}
+
+def ln_spec_batched_fits(c, r, m):
+  ln_or_not_self(Nat.is_le(Nat.add(c, r), m))
