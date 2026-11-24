@@ -190,19 +190,26 @@ fn the_rotary_tables_follow_the_reference_axial_layout() {
 
 #[test]
 fn the_rotate_half_weight_is_the_reference_rotate_half_of_each_half() {
-    // the reference: split the head into its two axis halves, rotate each as cat(-x2, x1)
+    // the reference: split the head into its two axis halves, rotate each as cat(-x2, x1);
+    // applied to every basis vector, so each column of the weight is checked and the whole
+    // matrix is the reference's operation
     let bf = crate::fp8::bf16_to_f32;
+    let rotate_half = |v: &[f32]| -> Vec<f32> {
+        let mut out = Vec::with_capacity(v.len());
+        for part in v.chunks(v.len() / 2) {
+            let (x1, x2) = part.split_at(part.len() / 2);
+            out.extend(x2.iter().map(|a| -a));
+            out.extend_from_slice(x1);
+        }
+        out
+    };
     for dh in [4usize, 8, 64, 72] {
         let w: Vec<f32> = super::run::rot_weight(dh as u64).into_iter().map(bf).collect();
-        let v: Vec<f32> = (0..dh).map(|i| (i as f32 + 1.0) * if i % 3 == 0 { -0.5 } else { 0.25 }).collect();
-        let mut want = Vec::with_capacity(dh);
-        for part in v.chunks(dh / 2) {
-            let (x1, x2) = part.split_at(dh / 4);
-            want.extend(x2.iter().map(|a| -a));
-            want.extend_from_slice(x1);
+        for i in 0..dh {
+            let e: Vec<f32> = (0..dh).map(|k| f32::from(u8::from(k == i))).collect();
+            let col: Vec<f32> = (0..dh).map(|o| w[o * dh + i]).collect();
+            assert_eq!(col, rotate_half(&e), "dh {dh} column {i}");
         }
-        let got: Vec<f32> = (0..dh).map(|o| (0..dh).map(|i| w[o * dh + i] * v[i]).sum()).collect();
-        assert_eq!(got, want, "dh {dh}");
     }
 }
 
