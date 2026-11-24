@@ -346,3 +346,150 @@ law effort_offered_advertised:
 
 def effort_offered_advertised(s, r):
   effort_kept_with(s, r, effort_has(s, r))
+
+
+# ============================================================================
+# 7. Reasoning off, and an effort given as a number
+# ============================================================================
+
+# A template that does not read the reasoning flag (`enable_thinking`) can still be told to reason
+# no more through its own off level (`reasoning_effort` "none"). The off level is given when the
+# request turns reasoning off (`off`) and names no effort of its own (`effort_set` false), the
+# template accepts that level (`has_off`), and it does not read the flag (`reads_flag` false).
+def effort_off_by_level(off: Bool, effort_set: Bool, has_off: Bool, reads_flag: Bool) -> Bool:
+  Bool.and(off, Bool.and(Bool.not(effort_set), Bool.and(has_off, Bool.not(reads_flag))))
+
+# What a `reasoning_effort` given as a number does.
+type EffortNumber is Data:
+  EnPass{thinks: Bool}  # the template is given the number; reasoning on unless it is zero
+  EnRefuse{}            # refused: the template takes no number
+
+def effort_number_plan(accepts: Bool, zero: Bool) -> EffortNumber:
+  match accepts:
+    case True{}:
+      EnPass{Bool.not(zero)}
+    case False{}:
+      EnRefuse{}
+
+def effort_number_passes(p: EffortNumber) -> Bool:
+  match p:
+    case EnPass{t}:
+      True{}
+    case EnRefuse{}:
+      False{}
+
+def effort_number_thinks(p: EffortNumber) -> Bool:
+  match p:
+    case EnPass{t}:
+      t
+    case EnRefuse{}:
+      False{}
+
+# promise: the off level is given only to a template that accepts it
+# harm: a template that raises on the off level would refuse every request with reasoning off
+law effort_off_level_accepted:
+  for off: Bool
+  for effort_set: Bool
+  for +has_off: Bool
+  for reads_flag: Bool
+  {Bool.or(has_off, Bool.not(effort_off_by_level(off, effort_set, has_off, reads_flag))) == True{} : Bool}
+
+def effort_off_level_accepted(off, effort_set, has_off, reads_flag):
+  match off effort_set has_off reads_flag:
+    case True{} True{} True{} True{}: {==}
+    case True{} True{} True{} False{}: {==}
+    case True{} True{} False{} True{}: {==}
+    case True{} True{} False{} False{}: {==}
+    case True{} False{} True{} True{}: {==}
+    case True{} False{} True{} False{}: {==}
+    case True{} False{} False{} True{}: {==}
+    case True{} False{} False{} False{}: {==}
+    case False{} True{} True{} True{}: {==}
+    case False{} True{} True{} False{}: {==}
+    case False{} True{} False{} True{}: {==}
+    case False{} True{} False{} False{}: {==}
+    case False{} False{} True{} True{}: {==}
+    case False{} False{} True{} False{}: {==}
+    case False{} False{} False{} True{}: {==}
+    case False{} False{} False{} False{}: {==}
+
+# promise: the off level is given only when the request turns reasoning off
+law effort_off_level_only_when_off:
+  for +off: Bool
+  for effort_set: Bool
+  for has_off: Bool
+  for reads_flag: Bool
+  {Bool.or(off, Bool.not(effort_off_by_level(off, effort_set, has_off, reads_flag))) == True{} : Bool}
+
+def effort_off_level_only_when_off(off, effort_set, has_off, reads_flag):
+  match off effort_set has_off reads_flag:
+    case True{} True{} True{} True{}: {==}
+    case True{} True{} True{} False{}: {==}
+    case True{} True{} False{} True{}: {==}
+    case True{} True{} False{} False{}: {==}
+    case True{} False{} True{} True{}: {==}
+    case True{} False{} True{} False{}: {==}
+    case True{} False{} False{} True{}: {==}
+    case True{} False{} False{} False{}: {==}
+    case False{} True{} True{} True{}: {==}
+    case False{} True{} True{} False{}: {==}
+    case False{} True{} False{} True{}: {==}
+    case False{} True{} False{} False{}: {==}
+    case False{} False{} True{} True{}: {==}
+    case False{} False{} True{} False{}: {==}
+    case False{} False{} False{} True{}: {==}
+    case False{} False{} False{} False{}: {==}
+
+# promise: reasoning off always reaches a template that can only be told so by its off level
+# harm: a request with reasoning off would silently reason at the template's default
+law effort_off_reaches_template:
+  for +off: Bool
+  for +effort_set: Bool
+  for +has_off: Bool
+  for +reads_flag: Bool
+  {Bool.or(reads_flag, Bool.or(Bool.not(has_off), Bool.or(effort_set, Bool.or(Bool.not(off), effort_off_by_level(off, effort_set, has_off, reads_flag))))) == True{} : Bool}
+
+def effort_off_reaches_template(off, effort_set, has_off, reads_flag):
+  match off effort_set has_off reads_flag:
+    case True{} True{} True{} True{}: {==}
+    case True{} True{} True{} False{}: {==}
+    case True{} True{} False{} True{}: {==}
+    case True{} True{} False{} False{}: {==}
+    case True{} False{} True{} True{}: {==}
+    case True{} False{} True{} False{}: {==}
+    case True{} False{} False{} True{}: {==}
+    case True{} False{} False{} False{}: {==}
+    case False{} True{} True{} True{}: {==}
+    case False{} True{} True{} False{}: {==}
+    case False{} True{} False{} True{}: {==}
+    case False{} True{} False{} False{}: {==}
+    case False{} False{} True{} True{}: {==}
+    case False{} False{} True{} False{}: {==}
+    case False{} False{} False{} True{}: {==}
+    case False{} False{} False{} False{}: {==}
+
+# promise: a number is given to the template only when the template takes numbers
+law effort_number_needs_template:
+  for zero: Bool
+  {effort_number_passes(effort_number_plan(False{}, zero)) == False{} : Bool}
+
+def effort_number_needs_template(zero):
+  {==}
+
+# promise: an effort of zero never turns reasoning on
+law effort_number_zero_never_thinks:
+  for accepts: Bool
+  {effort_number_thinks(effort_number_plan(accepts, True{})) == False{} : Bool}
+
+def effort_number_zero_never_thinks(accepts):
+  match accepts:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a number the template takes is never refused
+law effort_number_taken:
+  for zero: Bool
+  {effort_number_passes(effort_number_plan(True{}, zero)) == True{} : Bool}
+
+def effort_number_taken(zero):
+  {==}

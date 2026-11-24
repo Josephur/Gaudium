@@ -87,12 +87,14 @@ pub fn check_canvas(width: usize, height: usize, max_pixels: u64) -> Result<(), 
 
 /// Whether a model decoded with the drafter `kind` (`None`: plain decode; else the server's
 /// drafter kinds `dspine`, `dflash2`, `mtp`) may be loaded with its vision tower. An unknown
-/// kind is treated like the strictest one.
-pub fn drafter_runs_with_vision(kind: Option<&str>) -> bool {
+/// kind is treated like the strictest one. `reads_states`: the model's own drafter takes its
+/// context from the target model's hidden states (Inkling 2) instead of embedding prompt rows.
+pub fn drafter_runs_with_vision(kind: Option<&str>, reads_states: bool) -> bool {
     vis_drafter_ok(match kind {
         None => VisDrafter::VdNone,
         Some("dspine") => VisDrafter::VdDSpine,
         Some("dflash2") => VisDrafter::VdBlock,
+        Some("mtp") if reads_states => VisDrafter::VdStates,
         Some(_) => VisDrafter::VdMtp,
     })
 }
@@ -242,11 +244,15 @@ mod tests {
     #[test]
     fn only_validated_drafters_run_with_the_tower() {
         // today's validated set: plain decode and the DSpine drafter
-        assert!(drafter_runs_with_vision(None));
-        assert!(drafter_runs_with_vision(Some("dspine")));
-        assert!(!drafter_runs_with_vision(Some("dflash2")));
-        assert!(!drafter_runs_with_vision(Some("mtp")));
-        assert!(!drafter_runs_with_vision(Some("something new")));
+        assert!(drafter_runs_with_vision(None, false));
+        assert!(drafter_runs_with_vision(Some("dspine"), false));
+        assert!(!drafter_runs_with_vision(Some("dflash2"), false));
+        assert!(!drafter_runs_with_vision(Some("mtp"), false));
+        assert!(!drafter_runs_with_vision(Some("something new"), false));
+        // the drafter that reads the target's hidden states; no other kind gains by the flag
+        assert!(drafter_runs_with_vision(Some("mtp"), true));
+        assert!(!drafter_runs_with_vision(Some("dflash2"), true));
+        assert!(!drafter_runs_with_vision(Some("something new"), true));
     }
 
     #[test]

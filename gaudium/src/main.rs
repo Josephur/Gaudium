@@ -28,7 +28,7 @@ use gaudium::synapse::ffi::{SynDataType, SynapseApi};
 use gaudium::synapse::graph::GraphBuilder;
 use gaudium::synapse::recipe_cache::RecipeCache;
 use gaudium::tokenizer::{
-    format_gemma4_chat, format_qwen3_chat, gemma4_template_closes_thought, StreamDecoder, Tokenizer,
+    format_gemma4_chat, format_qwen3_chat, gemma4_template_closes_thought, StreamDecoder,
 };
 use gaudium::verified::{DevEvent, HbmCat, ReqEvent};
 
@@ -48,8 +48,12 @@ fn print_usage() {
          \n\
          Usage:\n\
          \x20 gaudium                                   Run verified-core self-check\n\
-         \x20 gaudium --inspect-model <dir>             Validate config.json & Safetensors\n\
+         \x20 gaudium --inspect-model <dir|file.gguf>   Validate config.json & Safetensors, or a GGUF\n\
+         \x20                                           model (a .gguf file, any shard of a split one,\n\
+         \x20                                           or a directory of them without config.json):\n\
+         \x20                                           metadata, tensors and weights per type\n\
          \x20 gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json\n\
+         \x20                                           (or a GGUF model's tokenizer metadata)\n\
          \x20 gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test\n\
          \x20 gaudium --probe-copy [GiB]                Measure copies between the card and host memory\n\
          \x20                                           (both directions, through the pinned transfer ring\n\
@@ -57,7 +61,8 @@ fn print_usage() {
          \x20                                           default: 2 GiB of device memory)\n\
          \x20 gaudium --apply-template <model_dir> <request.json|->\n\
          \x20                                           Print the prompt a chat request renders to with\n\
-         \x20                                           the model's own chat template (host only)\n\
+         \x20                                           the model's own chat template (host only; a GGUF\n\
+         \x20                                           model: its tokenizer.chat_template)\n\
          \x20 gaudium --generate [options]              Run live Gaudi 2 LLM generation\n\
          \x20 gaudium --build-cache [generate options]  Compile every recipe of that configuration into\n\
          \x20                                           the recipe cache and print its exact HBM plan,\n\
@@ -73,7 +78,9 @@ fn print_usage() {
          Serve options:\n\
          \x20 --host <addr>         Bind address (or GAUDIUM_SERVE_HOST; default: 0.0.0.0)\n\
          \x20 --port <N>            Bind port (or GAUDIUM_SERVE_PORT; default: 8090)\n\
-         \x20 --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap)\n\
+         \x20 --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap); a GGUF\n\
+         \x20                       file (or a directory of one GGUF model) serves its own tokenizer,\n\
+         \x20                       chat template, context limit and sampling defaults from its metadata\n\
          \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
          \x20 --ui-dir <dir>        Gaudium Web UI bundle directory (or GAUDIUM_UI_DIR)\n\
          \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)\n\
@@ -97,6 +104,10 @@ fn print_usage() {
          \x20                       it and says so. A request with cache_prompt: false prefills\n\
          \x20                       its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a\n\
          \x20                       drafter or with DSpine\n\
+         \x20                       (N positions), and Inkling 2 (any N > 0: the rows on the card\n\
+         \x20                       are resumed while the bounded rings still hold what the rest\n\
+         \x20                       of the prompt reads, and a copy of the rings taken when each\n\
+         \x20                       prompt is in, 0.6 GiB, covers a long generation after it)\n\
          \x20 --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a\n\
          \x20                       conversation: after another conversation, another model, or\n\
          \x20                       the idle release (--idle-park). What a request could resume\n\
@@ -132,7 +143,8 @@ fn print_usage() {
          \x20                       dflash (7 drafts per launch), a model's own drafter when it\n\
          \x20                       ends in -assistant (4 drafts), otherwise DSpine. <id>=mtp\n\
          \x20                       drafts with the model's own MTP head (no checkpoint; 4 drafts,\n\
-         \x20                       3 in the routed mixture-of-experts form)\n\
+         \x20                       3 in the routed mixture-of-experts form; an Inkling 2 model:\n\
+         \x20                       its block drafter, 7 drafts, as --spec mtp finds it)\n\
          \x20 --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster\n\
          \x20                       decode, more device memory, its own token stream)\n\
          \x20 --model-ctx <id=N>    Context size for model <id> instead of --max-ctx\n\
@@ -149,12 +161,17 @@ fn print_usage() {
          \x20                       a model whose checkpoint has a vision tower takes images (JPEG,\n\
          \x20                       PNG, GIF, WebP, BMP as data: URLs) and videos (an animated GIF /\n\
          \x20                       WebP, or a list of frames with their rate) in chat requests.\n\
+         \x20                       A GGUF model's tower is a projector file (mmproj*.gguf) beside\n\
+         \x20                       it; with none there it is served text only.\n\
          \x20                       A model drafted by a block or an MTP drafter is served text\n\
-         \x20                       only (plain decode and DSpine run with image input)\n\
-         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in 16x16\n\
-         \x20                       patches (default: 4096 = 1024x1024 pixels). Larger images are\n\
-         \x20                       resized down to it; the tower's device memory grows with N^2\n\
-         \x20                       (160 bytes x N^2: 2.5 GiB at 4096, 10 GiB at 8192)\n\
+         \x20                       only (plain decode, DSpine and Inkling 2's own drafter run\n\
+         \x20                       with image input)\n\
+         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\
+         \x20                       model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:\n\
+         \x20                       1024x1024 pixels, larger images are resized down to it; 20x20\n\
+         \x20                       for Inkling 2, which never resizes: an image of more than N/4\n\
+         \x20                       tiles of 40x40 pixels is refused). The tower's device memory\n\
+         \x20                       grows with N^2 (about 160 bytes x N^2: 2.5 GiB at 4096)\n\
          \x20 --vision-max-tokens <N>  Image tokens one request may hold, all images and video\n\
          \x20                       frames together (default: 16384; 10 KiB of device memory each)\n\
          \x20 --model-vision <id=N|off>  The vision tower of model <id> instead of the two options\n\
@@ -281,8 +298,24 @@ fn print_usage() {
          \x20                       per-layer inputs, else vendor). Changes compiled graphs; streams may\n\
          \x20                       differ between settings at exact BF16 logit ties.\n\
          \n\
+         Inkling 2 environment variables (debugging; none changes a served stream unless noted):\n\
+         \x20 GAUDIUM_IK_AMAX_BF16  1: decode the 4-bit expert matrices with their per-expert scale terms\n\
+         \x20                       rounded to BF16 first, as the publisher's reference loader ends up\n\
+         \x20                       doing (for comparisons with it; changes the weights slightly)\n\
+         \x20 GAUDIUM_IK_APPS       Load and run only the first N layer applications (kernel checks)\n\
+         \x20 GAUDIUM_IK_STEP_PREFILL  1: prefill the prompt one row at a time with the decode step\n\
+         \x20 GAUDIUM_IK_DUMP       Directory: after the prompt, every tensor of the one-row decode step and\n\
+         \x20                       the head of every K / V state is written there as <name>.bin\n\
+         \x20 GAUDIUM_IK_VERIFY_CHECK  N (2..64): after a greedy request its tokens are run again in passes\n\
+         \x20                       of N rows and every row's logits are compared with the one-row step's\n\
+         \x20 GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first image\n\
+         \x20                       request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence rows x 1024)\n\
+         \x20                       and img<k>_feat (tokens x 2304) as raw BF16 (it syncs after each one)\n\
+         \x20 GAUDIUM_IK_MTP_DUMP   Directory: after the first block of the drafter (--spec mtp), every\n\
+         \x20                       drafter activation and the head of its context state as <name>.bin\n\
+         \n\
          Generate options:\n\
-         \x20 --model <dir>         Model directory (or GAUDIUM_MODEL)\n\
+         \x20 --model <dir>         Model directory (or GAUDIUM_MODEL); or a GGUF file (Inkling 2)\n\
          \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
          \x20 --prompt <text>       Input prompt text\n\
          \x20 --prompt-ids <csv>    Raw comma-separated prompt token IDs (skips tokenizer)\n\
@@ -292,7 +325,8 @@ fn print_usage() {
          \x20 --also-prompt-ids-file <p>  Same as a further --prompt-ids-file\n\
          \x20 --also-prompt-file <p>  One more text request on the same loaded engine (repeatable;\n\
          \x20                       formatted like --prompt, after the token-ID requests)\n\
-         \x20 --chat                Wrap --prompt in the model's chat template (Qwen3 ChatML / Gemma 4 turns)\n\
+         \x20 --chat                Wrap --prompt in the model's chat template (Qwen3 ChatML / Gemma 4 turns;\n\
+         \x20                       other families: the model's own template, reasoning off with --no-think)\n\
          \x20 --no-think            Disable thinking block (with --chat)\n\
          \x20 --system <text>       System prompt (with --chat)\n\
          \x20 --max-new <N>         Maximum tokens to generate (default: 64)\n\
@@ -338,9 +372,9 @@ fn print_usage() {
          \x20                       PPM, decoded as the server decodes a request's image;\n\
          \x20                       repeatable, in prompt order\n\
          \x20 --image-raw <WxH:f>   Image input, raw RGB8 file with explicit size; repeatable\n\
-         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in\n\
-         \x20                       16x16 patches (default: the largest --image; larger images\n\
-         \x20                       are resized down to fit)\n\
+         \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\
+         \x20                       model's patches (default: the largest --image; Qwen3.5 / 3.8\n\
+         \x20                       resize larger images down to fit, Inkling 2 refuses them)\n\
          \x20 --vision-gelu-bf16    Evaluate the vision tower's GELU in BF16 (default: F32);\n\
          \x20                       slightly faster, slightly less accurate image embeddings\n\
          \x20 --dump-vision-emb <p> Write the image embeddings (tokens x hidden, raw BF16) to a file\n\
@@ -356,6 +390,11 @@ fn print_usage() {
          \x20                       A Gemma 4 model reads the drafter kind from the checkpoint:\n\
          \x20                       --spec dflash2 --draft-model <dir> runs a DFlashDraftModel\n\
          \x20                       block drafter (one --draft-k width, default 7).\n\
+         \x20                       An Inkling 2 model: mtp drafts with the checkpoint's block\n\
+         \x20                       drafter (mtp.safetensors beside the model; up to 7 drafts per\n\
+         \x20                       block, pass --draft-k 7 for all of them). A GGUF model reads\n\
+         \x20                       it from a drafter GGUF beside the model file or in a dspark/\n\
+         \x20                       directory there (BF16 before Q8_0 when several match).\n\
          \x20                       Chain modes are token-identical to K=0 (sampled: same seed)\n\
          \x20 --draft-model <dir>   Drafter checkpoint directory (with --spec dspine / dflash2;\n\
          \x20                       assistant: default <model_dir>-assistant)\n\
@@ -484,6 +523,10 @@ fn print_usage() {
 }
 
 fn inspect_model(dir: &Path) -> Result<(), String> {
+    if gaudium::gguf::looks_like_gguf(dir) {
+        println!("{}", gaudium::gguf::inspect::inspect(dir).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
     let cfg_path = dir.join("config.json");
     let spec = ModelSpec::from_config_file(&cfg_path).map_err(|e| e.to_string())?;
     spec.validate().map_err(|e| e.to_string())?;
@@ -506,8 +549,18 @@ fn inspect_model(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The families whose `--generate --chat` prompt has a built-in form (the others render the
+/// model's own chat template).
+fn has_builtin_chat_form(family: gaudium::model_spec::ModelFamily) -> bool {
+    use gaudium::model_spec::ModelFamily as F;
+    match family {
+        F::Qwen3 | F::Qwen35Dense | F::Qwen35Moe | F::Gemma4 | F::Gemma4Assistant => true,
+        F::Inkling2 => false,
+    }
+}
+
 fn run_tokenize(dir: &Path, text: &str) -> Result<(), String> {
-    let tok = Tokenizer::from_model_dir(dir).map_err(|e| e.to_string())?;
+    let tok = gaudium::model_text::ModelText::open(dir)?.tokenizer()?;
     let ids = tok.encode(text, true);
     let decoded = tok.decode(&ids, false);
     println!("vocab={} tokens={}", tok.vocab_size(), ids.len());
@@ -828,7 +881,25 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let kernels_dir = kernels_dir
         .ok_or_else(|| "missing --kernels <dir> (or GAUDIUM_KERNELS env var)".to_string())?;
 
-    let tok = Tokenizer::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+    // the model's text resources: a checkpoint directory or a GGUF file
+    let text = gaudium::model_text::ModelText::open(&model_dir)?;
+    let tok = text.tokenizer()?;
+    // `--chat`: the family's built-in chat form, or the model's own template (`mt_cli_chat`)
+    let builtin_chat = text.spec().map_or(true, |s| has_builtin_chat_form(s.family));
+    let one_turn = if gaudium::verified::mt_cli_wants_template(chat, builtin_chat) {
+        gaudium::server::OneTurnTemplate::load(&text)?
+    } else {
+        None
+    };
+    let chat_form = gaudium::verified::mt_cli_chat(
+        tok.token_id("<|turn>").is_some(),
+        builtin_chat,
+        one_turn.is_some(),
+    );
+    let gemma_closes = text
+        .chat_template_source()
+        .is_some_and(|t| gemma4_template_closes_thought(&t));
+    drop(text);
     if let Some(im_end) = tok.token_id("<|im_end|>") {
         params.extra_eos_ids.push(im_end);
     }
@@ -851,31 +922,36 @@ fn run_generate(args: &[String]) -> Result<(), String> {
             })
             .collect::<Result<Vec<_>, _>>()
     };
-    // a text prompt as token ids, through the chat template when `--chat` is given
-    let encode_text = |raw_prompt: String| -> Vec<i32> {
-        let formatted = if chat && tok.token_id("<|turn>").is_some() {
-            let template =
-                std::fs::read_to_string(model_dir.join("chat_template.jinja")).unwrap_or_default();
-            format_gemma4_chat(
-                &raw_prompt,
-                system_prompt.as_deref(),
-                !no_think,
-                gemma4_template_closes_thought(&template),
-            )
-        } else if chat {
-            format_qwen3_chat(&raw_prompt, system_prompt.as_deref(), !no_think)
-        } else {
-            raw_prompt
+    // a text prompt as token ids, through the chat form when `--chat` is given
+    let encode_text = |raw_prompt: String| -> Result<Vec<i32>, String> {
+        use gaudium::verified::MtChatForm;
+        let sys = system_prompt.as_deref();
+        let formatted = match (chat, chat_form) {
+            (false, _) => raw_prompt,
+            (true, MtChatForm::MtChatGemma) => {
+                format_gemma4_chat(&raw_prompt, sys, !no_think, gemma_closes)
+            }
+            (true, MtChatForm::MtChatChatml) => format_qwen3_chat(&raw_prompt, sys, !no_think),
+            (true, MtChatForm::MtChatTemplate) => one_turn
+                .as_ref()
+                .ok_or("--chat: the model's chat template was not loaded")?
+                .render(&raw_prompt, sys, !no_think)?,
+            (true, MtChatForm::MtChatNone) => {
+                return Err("--chat: the model has no chat template".into())
+            }
         };
-        tok.encode(&formatted, true)
+        Ok(tok.encode(&formatted, true))
     };
     let prompt_ids: Vec<i32> = if let Some(csv) = prompt_ids_raw {
         parse_ids_csv(&csv)?
     } else {
-        encode_text(prompt.unwrap_or_else(|| "The capital of France is".to_string()))
+        encode_text(prompt.unwrap_or_else(|| "The capital of France is".to_string()))?
     };
     // `--also-prompt-file`: more text requests for the same loaded engine
-    let extra_text_ids: Vec<Vec<i32>> = extra_prompt_texts.into_iter().map(encode_text).collect();
+    let extra_text_ids: Vec<Vec<i32>> = extra_prompt_texts
+        .into_iter()
+        .map(encode_text)
+        .collect::<Result<_, _>>()?;
     let prompt_ids = match &vision_in {
         Some(v) => v.expand_prompt(&prompt_ids)?,
         None => prompt_ids,
@@ -1518,7 +1594,7 @@ fn run_fp8_calibrate(args: &[String]) -> Result<(), String> {
         prompts.push((path.clone(), ids));
     }
     if !text_files.is_empty() {
-        let tok = Tokenizer::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+        let tok = gaudium::model_text::ModelText::open(&model_dir)?.tokenizer()?;
         for path in &text_files {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("read --prompt-file {path}: {e}"))?;

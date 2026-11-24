@@ -1,4 +1,6 @@
-//! Image and video input for the Qwen3.5/3.8 vision-language family on Intel Gaudi 2.
+//! Image and video input for the Qwen3.5/3.8 vision-language family on Intel Gaudi 2, and the
+//! model-independent parts (decoders, request media, budgets) that the Inkling 2 family's tower
+//! (`engine::inkling2::vision`, `ImageProcessor::Tiles`) shares.
 //!
 //! - `decode`: the crate's own image file decoders (JPEG, PNG, GIF, WebP, BMP), bit-exact with
 //!   the reference image processor's decoder; animations as frames.
@@ -33,9 +35,24 @@ pub mod vit;
 pub use mrope::{ImageSpan, PromptLayout};
 pub use preprocess::{PreparedImage, RgbImage};
 
+/// How a checkpoint's image processor turns a picture into tower inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageProcessor {
+    /// Resized to a pixel budget (`preprocess::smart_resize`), temporal frames per patch row,
+    /// patch rows laid out channel, frame, y, x (the Qwen3.5 / 3.8 family).
+    Resize,
+    /// Never resized: padded at the bottom and right to whole `patch * merge` tiles, one token
+    /// per tile, patch rows laid out y, x, channel (the Inkling 2 family,
+    /// `engine::inkling2::vision`).
+    Tiles,
+}
+
 /// Vision tower geometry, special token IDs and image-processor settings of one checkpoint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisionSpec {
+    pub processor: ImageProcessor,
+    /// The chat template's text for one image (its pad is expanded to the image's tokens).
+    pub image_block: String,
     pub depth: u64,
     pub hidden: u64,
     pub n_heads: u64,
@@ -157,14 +174,34 @@ fn obj_f64x3(o: &JsonValue, key: &str) -> Option<[f64; 3]> {
     Some([a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?])
 }
 
+/// The spec of the model at `path` when it has a vision tower: a checkpoint whose `config.json`
+/// has one, or a GGUF model with a projector file beside it (which file, and whether it fits the
+/// model, is decided when its spec is read: [`VisionSpec::from_model_dir`]).
+pub fn model_with_tower(path: &Path) -> Option<crate::model_spec::ModelSpec> {
+    if crate::gguf::looks_like_gguf(path) {
+        return crate::engine::inkling2::vision::gguf_tower::model_spec_with_tower(path);
+    }
+    crate::model_spec::ModelSpec::from_config_file(path.join("config.json"))
+        .ok()
+        .filter(|s| s.has_vision)
+}
+
 impl VisionSpec {
     /// Reads `config.json` (required), `preprocessor_config.json` (optional) and
     /// `video_preprocessor_config.json` (optional: without it, or without a video pad token,
     /// the checkpoint takes no video) of a model dir.
     pub fn from_model_dir(dir: &Path) -> Result<Self, String> {
+        // a GGUF model's tower is its projector file beside it
+        if crate::gguf::looks_like_gguf(dir) {
+            return crate::engine::inkling2::vision::gguf_tower::model_vision_spec(dir);
+        }
         let cfg = std::fs::read_to_string(dir.join("config.json"))
             .map_err(|e| format!("read config.json: {e}"))?;
         let pre = std::fs::read_to_string(dir.join("preprocessor_config.json")).ok();
+        if crate::engine::inkling2::vision::is_inkling2_vision(&cfg) {
+            let proc = std::fs::read_to_string(dir.join("processor_config.json")).ok();
+            return crate::engine::inkling2::vision::vision_spec(&cfg, proc.as_deref());
+        }
         let mut s = Self::from_json(&cfg, pre.as_deref())?;
         if s.video_token_id >= 0 {
             if let Ok(text) = std::fs::read_to_string(dir.join("video_preprocessor_config.json")) {
@@ -175,6 +212,9 @@ impl VisionSpec {
     }
 
     pub fn from_json(config_json: &str, preprocessor_json: Option<&str>) -> Result<Self, String> {
+        if crate::engine::inkling2::vision::is_inkling2_vision(config_json) {
+            return crate::engine::inkling2::vision::vision_spec(config_json, preprocessor_json);
+        }
         let root = parse_json(config_json).map_err(|e| format!("config.json: {e}"))?;
         let vc = root
             .get("vision_config")
@@ -221,6 +261,8 @@ impl VisionSpec {
         }
 
         let mut s = Self {
+            processor: ImageProcessor::Resize,
+            image_block: media::IMAGE_BLOCK.to_string(),
             depth: need("depth")?,
             hidden: need("hidden_size")?,
             n_heads: need("num_heads")?,
@@ -309,6 +351,14 @@ impl VisionSpec {
             return Err(
                 "vision_config: patch sizes must be positive and in_channels must be 3".into(),
             );
+        }
+        if self.processor == ImageProcessor::Tiles {
+            // no resize and no M-RoPE: the tile rule and the plain token positions of the
+            // decoder need neither the pixel budget nor the frequency sections
+            if self.temporal != 1 {
+                return Err("a tiled image processor takes one frame per patch".into());
+            }
+            return Ok(());
         }
         let side = self.pos_side();
         if side * side != self.n_pos || side < 2 {

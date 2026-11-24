@@ -800,3 +800,92 @@ def slice_bound_in_range(from_end, mag, len):
       tc_sub_le_self(len, mag)
     case False{}:
       tc_min_le_r(mag, len)
+
+
+# ============================================================================
+# 8. Placing a forced call
+# ============================================================================
+
+# Where a forced call's opening goes.
+type ForcePlace is Data:
+  FpNone{}      # nothing is forced
+  FpPlace{}     # the call's opening ends the prompt
+  FpInReasoning{}  # forced, but the prompt ends inside the reasoning: noted as not applied
+  FpCannotWrite{}  # forced, but the format cannot write the opening: noted as not applied
+
+# A forced call's opening ends the prompt, unless the prompt ends inside the model's reasoning or
+# the model's format cannot write the opening (`can_place` false, e.g. a call without a name).
+def tool_force_place(forces: Bool, reasoning_open: Bool, can_place: Bool) -> ForcePlace:
+  match forces:
+    case False{}:
+      FpNone{}
+    case True{}:
+      match reasoning_open:
+        case True{}:
+          FpInReasoning{}
+        case False{}:
+          match can_place:
+            case True{}:
+              FpPlace{}
+            case False{}:
+              FpCannotWrite{}
+
+def force_is_placed(p: ForcePlace) -> Bool:
+  match p:
+    case FpPlace{}:
+      True{}
+    case _:
+      False{}
+
+def force_is_none(p: ForcePlace) -> Bool:
+  match p:
+    case FpNone{}:
+      True{}
+    case _:
+      False{}
+
+# promise: a call's opening is put into the prompt only when the call is forced, the prompt is not inside reasoning, and the format can write it
+# harm: an opening placed inside reasoning or in a form the model cannot continue would garble the reply
+law force_placed_only_when_possible:
+  for +f: Bool
+  for +r: Bool
+  for +c: Bool
+  {Bool.or(Bool.not(force_is_placed(tool_force_place(f, r, c))), Bool.and(f, Bool.and(Bool.not(r), c))) == True{} : Bool}
+
+def force_placed_only_when_possible(f, r, c):
+  match f r c:
+    case True{} True{} True{}: {==}
+    case True{} True{} False{}: {==}
+    case True{} False{} True{}: {==}
+    case True{} False{} False{}: {==}
+    case False{} True{} True{}: {==}
+    case False{} True{} False{}: {==}
+    case False{} False{} True{}: {==}
+    case False{} False{} False{}: {==}
+
+# promise: a forced call is either placed or reported as not applied, never silently dropped
+law force_never_silently_dropped:
+  for +f: Bool
+  for r: Bool
+  for c: Bool
+  {Bool.or(Bool.not(f), Bool.not(force_is_none(tool_force_place(f, r, c)))) == True{} : Bool}
+
+def force_never_silently_dropped(f, r, c):
+  match f r c:
+    case True{} True{} True{}: {==}
+    case True{} True{} False{}: {==}
+    case True{} False{} True{}: {==}
+    case True{} False{} False{}: {==}
+    case False{} True{} True{}: {==}
+    case False{} True{} False{}: {==}
+    case False{} False{} True{}: {==}
+    case False{} False{} False{}: {==}
+
+# promise: nothing is placed or noted when no call is forced
+law force_none_when_not_forced:
+  for r: Bool
+  for c: Bool
+  {tool_force_place(False{}, r, c) == FpNone{} : ForcePlace}
+
+def force_none_when_not_forced(r, c):
+  {==}

@@ -575,3 +575,30 @@ $(KDIR)/ds_softr_gaudi2.o: $(TPC_SRC)/ds_softr_gaudi2.c | $(KDIR)
 KERNEL_OBJS += $(KDIR)/ds_softr_gaudi2.o
 $(KDIR)/libgaudium_st.so: $(GLUE_SRC)/st_glue.cpp $(GLUE_SRC)/elf_record.inc | $(KDIR)
 	$(CXX) -O2 -std=c++17 -fPIC -shared -I$(HABANA_INC) $< -o $@
+
+# ---- Inkling 2 (looped MoE decoder without rotary positions): block-residual mix, message gates, short convolutions with their
+# position rings, clipped / position-scaled queries, biased softmax with a sink, sigmoid router, soft-capped expert activation.
+# Their glue is libgaudium_ik.so, a plugin of its own beside the other glue libraries.
+IK_KERNELS := ik_mix:ik_mix_gaudi2.c: ik_mixf:ik_mix_gaudi2.c:-DPF32 ik_gin:ik_gin_gaudi2.c: ik_mgate:ik_mgate_gaudi2.c: ik_mgatef:ik_mgate_gaudi2.c:-DFG_F32 \
+  ik_norm:ik_norm_gaudi2.c: ik_save:ik_save_gaudi2.c: ik_conva:ik_conv_gaudi2.c: ik_convm:ik_conv_gaudi2.c:-DMLP ik_qprep:ik_qprep_gaudi2.c: \
+  ik_kvprep:ik_kvprep_gaudi2.c: ik_softmax:ik_softmax_gaudi2.c: ik_combine:ik_combine_gaudi2.c: ik_route:ik_route_gaudi2.c: ik_moe_act:ik_moe_act_gaudi2.c: \
+  ik_argmax:ik_argmax_gaudi2.c:
+# $(1) object stem, $(2) source, $(3) variant flags
+define IK_RULE
+$$(KDIR)/$(1)_gaudi2.o: $$(TPC_SRC)/$(2) $$(TPC_SRC)/ik_common.h | $$(KDIR)
+	cd $$(TPC_SRC) && $$(TPC_CC) -march=gaudi2 -O2 $(3) -x c++ -c $(2) -o $$@
+KERNEL_OBJS += $$(KDIR)/$(1)_gaudi2.o
+endef
+$(foreach k,$(IK_KERNELS),$(eval $(call IK_RULE,$(word 1,$(subst :, ,$(k))),$(word 2,$(subst :, ,$(k))),$(word 3,$(subst :, ,$(k))))))
+# The Inkling 2 block drafter (mtp.safetensors): context mixes, context / block heads with rotary positions, a two-set softmax over the
+# context state and the block, the merge, a plain SwiGLU, the recurrent head's step and its arg-max. Same glue library.
+IKD_KERNELS := ik_dmix:ik_dmix_gaudi2.c: ik_dkv:ik_dkv_gaudi2.c: ik_dqprep:ik_dqprep_gaudi2.c: ik_dsoft:ik_dsoft_gaudi2.c: \
+  ik_dcomb:ik_dcomb_gaudi2.c: ik_dswiglu:ik_dswiglu_gaudi2.c: ik_mstep:ik_mstep_gaudi2.c: ik_margmax:ik_margmax_gaudi2.c:
+define IKD_RULE
+$$(KDIR)/$(1)_gaudi2.o: $$(TPC_SRC)/$(2) $$(TPC_SRC)/ik_common.h $$(TPC_SRC)/ik_mtp.h | $$(KDIR)
+	cd $$(TPC_SRC) && $$(TPC_CC) -march=gaudi2 -O2 $(3) -x c++ -c $(2) -o $$@
+KERNEL_OBJS += $$(KDIR)/$(1)_gaudi2.o
+endef
+$(foreach k,$(IKD_KERNELS),$(eval $(call IKD_RULE,$(word 1,$(subst :, ,$(k))),$(word 2,$(subst :, ,$(k))),$(word 3,$(subst :, ,$(k))))))
+$(KDIR)/libgaudium_ik.so: $(GLUE_SRC)/ik_glue.cpp $(GLUE_SRC)/elf_record.inc | $(KDIR)
+	$(CXX) -O2 -std=c++17 -fPIC -shared -I$(HABANA_INC) $< -o $@

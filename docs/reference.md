@@ -26,8 +26,12 @@ Gaudium — Intel Gaudi 2 Inference Engine (RustyBends v1)
 
 Usage:
   gaudium                                   Run verified-core self-check
-  gaudium --inspect-model <dir>             Validate config.json & Safetensors
+  gaudium --inspect-model <dir|file.gguf>   Validate config.json & Safetensors, or a GGUF
+                                            model (a .gguf file, any shard of a split one,
+                                            or a directory of them without config.json):
+                                            metadata, tensors and weights per type
   gaudium --tokenize <model_dir> <text>     Encode & round-trip decode via tokenizer.json
+                                            (or a GGUF model's tokenizer metadata)
   gaudium --hpu-smoke                       Run live Gaudi 2 BF16 add smoke test
   gaudium --probe-copy [GiB]                Measure copies between the card and host memory
                                             (both directions, through the pinned transfer ring
@@ -35,7 +39,8 @@ Usage:
                                             default: 2 GiB of device memory)
   gaudium --apply-template <model_dir> <request.json|->
                                             Print the prompt a chat request renders to with
-                                            the model's own chat template (host only)
+                                            the model's own chat template (host only; a GGUF
+                                            model: its tokenizer.chat_template)
   gaudium --generate [options]              Run live Gaudi 2 LLM generation
   gaudium --build-cache [generate options]  Compile every recipe of that configuration into
                                             the recipe cache and print its exact HBM plan,
@@ -51,7 +56,9 @@ Usage:
 Serve options:
   --host <addr>         Bind address (or GAUDIUM_SERVE_HOST; default: 0.0.0.0)
   --port <N>            Bind port (or GAUDIUM_SERVE_PORT; default: 8090)
-  --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap)
+  --model <dir|id=dir>  Model directory (repeatable for multi-model hot-swap); a GGUF
+                        file (or a directory of one GGUF model) serves its own tokenizer,
+                        chat template, context limit and sampling defaults from its metadata
   --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)
   --ui-dir <dir>        Gaudium Web UI bundle directory (or GAUDIUM_UI_DIR)
   --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)
@@ -75,6 +82,10 @@ Serve options:
                         it and says so. A request with cache_prompt: false prefills
                         its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a
                         drafter or with DSpine
+                        (N positions), and Inkling 2 (any N > 0: the rows on the card
+                        are resumed while the bounded rings still hold what the rest
+                        of the prompt reads, and a copy of the rings taken when each
+                        prompt is in, 0.6 GiB, covers a long generation after it)
   --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a
                         conversation: after another conversation, another model, or
                         the idle release (--idle-park). What a request could resume
@@ -110,7 +121,8 @@ Serve options:
                         dflash (7 drafts per launch), a model's own drafter when it
                         ends in -assistant (4 drafts), otherwise DSpine. <id>=mtp
                         drafts with the model's own MTP head (no checkpoint; 4 drafts,
-                        3 in the routed mixture-of-experts form)
+                        3 in the routed mixture-of-experts form; an Inkling 2 model:
+                        its block drafter, 7 drafts, as --spec mtp finds it)
   --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster
                         decode, more device memory, its own token stream)
   --model-ctx <id=N>    Context size for model <id> instead of --max-ctx
@@ -127,12 +139,17 @@ Serve options:
                         a model whose checkpoint has a vision tower takes images (JPEG,
                         PNG, GIF, WebP, BMP as data: URLs) and videos (an animated GIF /
                         WebP, or a list of frames with their rate) in chat requests.
+                        A GGUF model's tower is a projector file (mmproj*.gguf) beside
+                        it; with none there it is served text only.
                         A model drafted by a block or an MTP drafter is served text
-                        only (plain decode and DSpine run with image input)
-  --vision-max-patches <N>  Largest image the vision tower is planned for, in 16x16
-                        patches (default: 4096 = 1024x1024 pixels). Larger images are
-                        resized down to it; the tower's device memory grows with N^2
-                        (160 bytes x N^2: 2.5 GiB at 4096, 10 GiB at 8192)
+                        only (plain decode, DSpine and Inkling 2's own drafter run
+                        with image input)
+  --vision-max-patches <N>  Largest image the vision tower is planned for, in the
+                        model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:
+                        1024x1024 pixels, larger images are resized down to it; 20x20
+                        for Inkling 2, which never resizes: an image of more than N/4
+                        tiles of 40x40 pixels is refused). The tower's device memory
+                        grows with N^2 (about 160 bytes x N^2: 2.5 GiB at 4096)
   --vision-max-tokens <N>  Image tokens one request may hold, all images and video
                         frames together (default: 16384; 10 KiB of device memory each)
   --model-vision <id=N|off>  The vision tower of model <id> instead of the two options
@@ -259,8 +276,24 @@ Gemma 4 environment variables:
                         per-layer inputs, else vendor). Changes compiled graphs; streams may
                         differ between settings at exact BF16 logit ties.
 
+Inkling 2 environment variables (debugging; none changes a served stream unless noted):
+  GAUDIUM_IK_AMAX_BF16  1: decode the 4-bit expert matrices with their per-expert scale terms
+                        rounded to BF16 first, as the publisher's reference loader ends up
+                        doing (for comparisons with it; changes the weights slightly)
+  GAUDIUM_IK_APPS       Load and run only the first N layer applications (kernel checks)
+  GAUDIUM_IK_STEP_PREFILL  1: prefill the prompt one row at a time with the decode step
+  GAUDIUM_IK_DUMP       Directory: after the prompt, every tensor of the one-row decode step and
+                        the head of every K / V state is written there as <name>.bin
+  GAUDIUM_IK_VERIFY_CHECK  N (2..64): after a greedy request its tokens are run again in passes
+                        of N rows and every row's logits are compared with the one-row step's
+  GAUDIUM_IKV_DUMP      Directory: the vision tower writes, per image k of the first image
+                        request, img<k>_emb / _pre / _l00 / _l11 / _l22 (sequence rows x 1024)
+                        and img<k>_feat (tokens x 2304) as raw BF16 (it syncs after each one)
+  GAUDIUM_IK_MTP_DUMP   Directory: after the first block of the drafter (--spec mtp), every
+                        drafter activation and the head of its context state as <name>.bin
+
 Generate options:
-  --model <dir>         Model directory (or GAUDIUM_MODEL)
+  --model <dir>         Model directory (or GAUDIUM_MODEL); or a GGUF file (Inkling 2)
   --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)
   --prompt <text>       Input prompt text
   --prompt-ids <csv>    Raw comma-separated prompt token IDs (skips tokenizer)
@@ -270,7 +303,8 @@ Generate options:
   --also-prompt-ids-file <p>  Same as a further --prompt-ids-file
   --also-prompt-file <p>  One more text request on the same loaded engine (repeatable;
                         formatted like --prompt, after the token-ID requests)
-  --chat                Wrap --prompt in the model's chat template (Qwen3 ChatML / Gemma 4 turns)
+  --chat                Wrap --prompt in the model's chat template (Qwen3 ChatML / Gemma 4 turns;
+                        other families: the model's own template, reasoning off with --no-think)
   --no-think            Disable thinking block (with --chat)
   --system <text>       System prompt (with --chat)
   --max-new <N>         Maximum tokens to generate (default: 64)
@@ -316,9 +350,9 @@ Generate options:
                         PPM, decoded as the server decodes a request's image;
                         repeatable, in prompt order
   --image-raw <WxH:f>   Image input, raw RGB8 file with explicit size; repeatable
-  --vision-max-patches <N>  Largest image the vision tower is planned for, in
-                        16x16 patches (default: the largest --image; larger images
-                        are resized down to fit)
+  --vision-max-patches <N>  Largest image the vision tower is planned for, in the
+                        model's patches (default: the largest --image; Qwen3.5 / 3.8
+                        resize larger images down to fit, Inkling 2 refuses them)
   --vision-gelu-bf16    Evaluate the vision tower's GELU in BF16 (default: F32);
                         slightly faster, slightly less accurate image embeddings
   --dump-vision-emb <p> Write the image embeddings (tokens x hidden, raw BF16) to a file
@@ -334,6 +368,11 @@ Generate options:
                         A Gemma 4 model reads the drafter kind from the checkpoint:
                         --spec dflash2 --draft-model <dir> runs a DFlashDraftModel
                         block drafter (one --draft-k width, default 7).
+                        An Inkling 2 model: mtp drafts with the checkpoint's block
+                        drafter (mtp.safetensors beside the model; up to 7 drafts per
+                        block, pass --draft-k 7 for all of them). A GGUF model reads
+                        it from a drafter GGUF beside the model file or in a dspark/
+                        directory there (BF16 before Q8_0 when several match).
                         Chain modes are token-identical to K=0 (sampled: same seed)
   --draft-model <dir>   Drafter checkpoint directory (with --spec dspine / dflash2;
                         assistant: default <model_dir>-assistant)
@@ -470,9 +509,12 @@ or reads it to rewrite a file.
 
 | Variable | Read by | Meaning |
 |---|---|---|
+| `GAUDIUM_INKLING2_DIR` | `tokenizer::tests::inkling2_ids_match_the_reference`, `server::chat::tests::inkling2_template_renders_like_jinja2`, `server::chat::tests::inkling2_requests_render_through_the_model_template`, `engine::inkling2::vision::tests::pos_rows_match_the_reference` (`--ignored`) | An Inkling 2 model directory: its `tokenizer.json` must encode and decode the cases of `gaudium/tests/data/tokenizer/inkling2_cases.json` exactly, its `chat_template.jinja` must render the contexts of `gaudium/tests/data/chat/inkling2_renders.json` as Jinja2 does, and the vision tower's position rows and class row resampled from its checkpoint must match `gaudium/tests/data/vision/inkling2/fixture.json` bit for bit (all written by the generator scripts next to them). |
 | `GAUDIUM_IMAGE_REF_DIR` | the decoder tests in `src/vision/decode/` (`--ignored`) | A directory of image files with the raw RGB dump the reference image library wrote for each; every file must decode to the same bytes. |
 | `GAUDIUM_IMAGE_PIPELINE_REF_DIR` | `vision::media::tests::reference_pipeline_records_match_bit_for_bit` (`--ignored`) | A directory written by `gaudium/tests/data/vision/make_pipeline_refs.py`: image files with the patch rows of the checkpoint's own image processor, which must match bit for bit. |
 | `GAUDIUM_VISION_REF_DIR` | `vision::tests::reference_prompt_records_match_bit_for_bit` (`--ignored`) | A directory of reference prompt records (token ids, image grids, positions, patch rows) that the prompt layout and the image preprocessing must reproduce. |
+| `GAUDIUM_GGUF_REF_DIR` | `gguf::tests::reference_gguf_files_open_and_decode` (`--ignored`) | A directory of published GGUF files (and its `dspark/` subdirectory): every file must open, the Inkling 2 Mini model must have its 744 tensors with architecture `inkling2_loop` and NVFP4 weights, every NVFP4 tensor its per-expert `.scale`, and one row of every type must decode to finite numbers. |
+| `GAUDIUM_INKLING2_GGUF` | `engine::inkling2::gguf_source::tests::gguf_and_checkpoint_pack_the_same_device_tensors`, `tokenizer::gguf::tests::inkling2_gguf_tokenizer_matches_the_checkpoint`, `server::chat::tests::inkling2_gguf_renders_like_the_checkpoint`, `engine::inkling2::vision::gguf_tower::tests::projector_and_checkpoint_pack_the_same_tower` (`--ignored`, with `GAUDIUM_INKLING2_DIR`) | A GGUF file of the same Inkling 2 model as the checkpoint directory `GAUDIUM_INKLING2_DIR`: both must pack byte-identical device tensors, the tokenizer built from the file's metadata must equal the one of `tokenizer.json` (every token, every merge, the fixture cases), and the file's chat template must render the Jinja2 fixture contexts and a set of chat requests to the same prompts and ids as the checkpoint's. The projector file beside it must give the checkpoint's tower geometry, image spec and every tower device tensor byte for byte. |
 | `GAUDIUM_UPDATE_REFERENCE` | `tests/reference_docs.rs` | `1` = rewrite the copy of the help text on this page from the binary instead of failing when it differs. |
 
 <!-- test-variables:end -->

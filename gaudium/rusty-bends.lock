@@ -45,6 +45,20 @@ d64aa69324dcf18f  ds_window_rows_split  law ds_window_rows_split : for + nv : Na
 a09474b00bc19d2b  effective_max_new_le_room  law effective_max_new_le_room : for unb : Bool for + req : Nat for + p : Nat for + lmax : Nat { Nat.is_le ( effective_max_new ( unb , req , p , lmax ) , prompt_room ( p , lmax ) ) == True { } : Bool }
 c5c794aed8b5d9a9  effort_level_ask_thinks  law effort_level_ask_thinks : for + s : EffortSet for + r : Nat { effort_plan_is_off ( effort_plan ( s , EaLevel { r } ) ) == False { } : Bool }
 e793ca3caadd0e8e  effort_no_levels_no_level  law effort_no_levels_no_level : for + s : EffortSet for + q : EffortAsk { Bool.or ( effort_any ( s ) , Bool.not ( effort_plan_is_level ( effort_plan ( s , q ) ) ) ) == True { } : Bool }
+3954a413478e8ac1  effort_number_needs_template  law effort_number_needs_template : for zero : Bool { effort_number_passes ( effort_number_plan ( False { } , zero ) ) == False { } : Bool }
+# promise effort_number_needs_template: a number is given to the template only when the template takes numbers
+2a5805d79ca39b6c  effort_number_taken  law effort_number_taken : for zero : Bool { effort_number_passes ( effort_number_plan ( True { } , zero ) ) == True { } : Bool }
+# promise effort_number_taken: a number the template takes is never refused
+fcf8761a23076251  effort_number_zero_never_thinks  law effort_number_zero_never_thinks : for accepts : Bool { effort_number_thinks ( effort_number_plan ( accepts , True { } ) ) == False { } : Bool }
+# promise effort_number_zero_never_thinks: an effort of zero never turns reasoning on
+b29de26ce32b1379  effort_off_level_accepted  law effort_off_level_accepted : for off : Bool for effort_set : Bool for + has_off : Bool for reads_flag : Bool { Bool.or ( has_off , Bool.not ( effort_off_by_level ( off , effort_set , has_off , reads_flag ) ) ) == True { } : Bool }
+# promise effort_off_level_accepted: the off level is given only to a template that accepts it
+# harm effort_off_level_accepted: a template that raises on the off level would refuse every request with reasoning off
+c22eb054f974c9d2  effort_off_level_only_when_off  law effort_off_level_only_when_off : for + off : Bool for effort_set : Bool for has_off : Bool for reads_flag : Bool { Bool.or ( off , Bool.not ( effort_off_by_level ( off , effort_set , has_off , reads_flag ) ) ) == True { } : Bool }
+# promise effort_off_level_only_when_off: the off level is given only when the request turns reasoning off
+f8f987d72d37193c  effort_off_reaches_template  law effort_off_reaches_template : for + off : Bool for + effort_set : Bool for + has_off : Bool for + reads_flag : Bool { Bool.or ( reads_flag , Bool.or ( Bool.not ( has_off ) , Bool.or ( effort_set , Bool.or ( Bool.not ( off ) , effort_off_by_level ( off , effort_set , has_off , reads_flag ) ) ) ) ) == True { } : Bool }
+# promise effort_off_reaches_template: reasoning off always reaches a template that can only be told so by its off level
+# harm effort_off_reaches_template: a request with reasoning off would silently reason at the template's default
 fa1947f576425c2e  effort_offered_advertised  law effort_offered_advertised : for + s : EffortSet for + r : Nat { Bool.or ( Bool.not ( effort_has ( s , r ) ) , effort_advertised ( s , r ) ) == True { } : Bool }
 32771468a14c3e13  effort_offered_kept  law effort_offered_kept : for + s : EffortSet for + r : Nat { Bool.or ( Bool.not ( effort_has ( s , r ) ) , effort_plan_is ( effort_plan ( s , EaLevel { r } ) , r ) ) == True { } : Bool }
 cec5eb19c9afc9c6  effort_plan_offered  law effort_plan_offered : for + s : EffortSet for + a : EffortAsk { effort_plan_ok ( s , effort_plan ( s , a ) ) == True { } : Bool }
@@ -52,6 +66,13 @@ b8a418606825f53b  empty_prompt_rejected  law empty_prompt_rejected : for lmax : 
 0a0dc9c6c90582ef  finish_calls_reported_unless_cancelled  law finish_calls_reported_unless_cancelled : for + e : GenEnd { Bool.xor ( fr_is_tool_calls ( finish_reason ( e , True { } ) ) , ge_is_cancelled ( e ) ) == True { } : Bool }
 67a57dc6c58cd39b  finish_cancel_absorbs  law finish_cancel_absorbs : for c : Bool { finish_reason ( GeCancelled { } , c ) == FrCancelled { } : FinishReason }
 dddba7034d4e4514  finish_tool_calls_need_calls  law finish_tool_calls_need_calls : for e : GenEnd { fr_is_tool_calls ( finish_reason ( e , False { } ) ) == False { } : Bool }
+d90e3694749c46e8  force_never_silently_dropped  law force_never_silently_dropped : for + f : Bool for r : Bool for c : Bool { Bool.or ( Bool.not ( f ) , Bool.not ( force_is_none ( tool_force_place ( f , r , c ) ) ) ) == True { } : Bool }
+# promise force_never_silently_dropped: a forced call is either placed or reported as not applied, never silently dropped
+f6771bf6b09c4e0c  force_none_when_not_forced  law force_none_when_not_forced : for r : Bool for c : Bool { tool_force_place ( False { } , r , c ) == FpNone { } : ForcePlace }
+# promise force_none_when_not_forced: nothing is placed or noted when no call is forced
+75fd49693051a595  force_placed_only_when_possible  law force_placed_only_when_possible : for + f : Bool for + r : Bool for + c : Bool { Bool.or ( Bool.not ( force_is_placed ( tool_force_place ( f , r , c ) ) ) , Bool.and ( f , Bool.and ( Bool.not ( r ) , c ) ) ) == True { } : Bool }
+# promise force_placed_only_when_possible: a call's opening is put into the prompt only when the call is forced, the prompt is not inside reasoning, and the format can write it
+# harm force_placed_only_when_possible: an opening placed inside reasoning or in a form the model cannot continue would garble the reply
 9334163f983bbf1f  g4_31b_heads_valid  law g4_31b_heads_valid : { Bool.and ( g4_heads_valid ( 16n , 8n , 256n , 128n ) , g4_heads_valid ( 16n , 4n , 512n , 128n ) ) == True { } : Bool }
 c74c47153e6fb0be  g4_audio_zero_left_rejected  law g4_audio_zero_left_rejected : for ar : Nat { g4_audio_ctx_valid ( 0n , ar ) == False { } : Bool }
 6bc6fbd345acaeea  g4_heads_zero_dh_rejected  law g4_heads_zero_dh_rejected : for + nh : Nat for + nkv : Nat for + p : Nat { g4_heads_valid ( nh , nkv , 0n , p ) == False { } : Bool }
@@ -63,6 +84,48 @@ c53430ffbf275392  g4_ple_off_always_valid  law g4_ple_off_always_valid : for pv 
 5e31df0d7e1ee34b  gen_end_call_limit_not_cancel  law gen_end_call_limit_not_cancel : for eos : Bool for cancelled : Bool { gen_end ( False { } , True { } , eos , cancelled ) == GeCallLimit { } : GenEnd }
 701a333557e52866  gen_end_no_flag_is_length  law gen_end_no_flag_is_length : { gen_end ( False { } , False { } , False { } , False { } ) == GeLength { } : GenEnd }
 e067e43cfe4436bc  gen_end_stop_string_wins  law gen_end_stop_string_wins : for limit : Bool for eos : Bool for cancelled : Bool { gen_end ( True { } , limit , eos , cancelled ) == GeStopString { } : GenEnd }
+0e08ef76a069f71c  gg_alignment_nonzero  law gg_alignment_nonzero : for + a : Nat for + c : Nat { Bool.and ( gg_alignment_ok ( a , c ) , Nat.is_eq ( a , 0n ) ) == False { } : Bool }
+# promise gg_alignment_nonzero: an alignment the reader accepts is never zero.
+# harm gg_alignment_nonzero: a zero alignment would divide by zero when the data section is placed.
+4fac618c2745c470  gg_count_within  law gg_count_within : for + n : Nat for + e : Nat for + a : Nat { Bool.and ( gg_count_fits ( n , e , a ) , Nat.is_lt ( a , Nat.mul ( n , e ) ) ) == False { } : Bool }
+# promise gg_count_within: n elements of e bytes that the count check accepts never need more than the available bytes.
+# harm gg_count_within: a hostile count could make the reader walk past the end of the file.
+6c9e022c537b1272  gg_dim_within  law gg_dim_within : for + acc : Nat for + d : Nat for + lim : Nat { Bool.and ( gg_dim_ok ( acc , d , lim ) , Nat.is_lt ( lim , gg_dim_step ( acc , d ) ) ) == False { } : Bool }
+# promise gg_dim_within: a dimension the reader accepts never makes the element count exceed its limit.
+f868fed7f5a05ddc  gg_limit_within  law gg_limit_within : for + x : Nat for + m : Nat { Bool.and ( gg_limit_ok ( x , m ) , Nat.is_lt ( m , x ) ) == False { } : Bool }
+# promise gg_limit_within: a count the limit check accepts never exceeds the limit.
+a34a0d3c5cf51834  gg_nbytes_within  law gg_nbytes_within : for + r : Nat for + n : Nat for + bw : Nat for + bb : Nat for + lim : Nat { Bool.and ( gg_nbytes_ok ( r , n , bw , bb , lim ) , Nat.is_lt ( lim , gg_nbytes ( n , bw , bb ) ) ) == False { } : Bool }
+# promise gg_nbytes_within: a tensor size the reader accepts never exceeds the limit it was checked against.
+# harm gg_nbytes_within: a tensor could claim more bytes than the file holds.
+71d35a49153340b8  gg_nbytes_zero_block_refused  law gg_nbytes_zero_block_refused : for + r : Nat for + n : Nat for + bb : Nat for + lim : Nat { gg_nbytes_ok ( r , n , 0n , bb , lim ) == False { } : Bool }
+# promise gg_nbytes_zero_block_refused: a type whose block holds no weights is always refused, so no size is ever divided by zero.
+b2637b06d1a88d8e  gg_pad_below_alignment  law gg_pad_below_alignment : for + x : Nat for + ap : Nat { Nat.is_lt ( gg_pad ( x , 1n + ap ) , 1n + ap ) == True { } : Bool }
+# promise gg_pad_below_alignment: the padding to the next multiple of a nonzero alignment is always smaller than the alignment.
+a0eaded73c915892  gg_part_lo_within  law gg_part_lo_within : for + i : Nat for + rows : Nat for + c : Nat { Nat.is_le ( gg_part_lo ( i , rows , c ) , rows ) == True { } : Bool }
+# promise gg_part_lo_within: the first row of a decode part never lies past the last row.
+1a8db2eb57538a4b  gg_place_within  law gg_place_within : for + o : Nat for + l : Nat for + a : Nat for + v : Nat { Bool.and ( gg_place_ok ( o , l , a , v ) , Nat.is_lt ( v , Nat.add ( o , l ) ) ) == False { } : Bool }
+# promise gg_place_within: a tensor the reader places in the data section never ends past the end of that section.
+# harm gg_place_within: tensor bytes could be read from outside the file mapping.
+17d4eb452322f7ac  gg_rows_within  law gg_rows_within : for + r0 : Nat for + r1 : Nat for + rb : Nat for + nb : Nat { Bool.and ( gg_rows_ok ( r0 , r1 , rb , nb ) , Nat.is_lt ( nb , Nat.mul ( r1 , rb ) ) ) == False { } : Bool }
+# promise gg_rows_within: a run of rows the reader accepts never ends past the end of the tensor's bytes.
+# harm gg_rows_within: a row decode could read the next tensor or past the mapping.
+5feb7336f87de360  gg_shard_in_set_count  law gg_shard_in_set_count : for + no : Nat for + own : Nat for + k : Nat for + c : Nat { Bool.and ( gg_shard_in_set ( no , own , k , c ) , Nat.is_ne ( own , c ) ) == False { } : Bool }
+# promise gg_shard_in_set_count: every shard the reader accepts into a split model declares the same shard count as the first one.
+# harm gg_shard_in_set_count: shards of two different splits could be stitched into one model
+328a995cd35d9fbe  gg_shard_in_set_index  law gg_shard_in_set_index : for + no : Nat for + own : Nat for + k : Nat for + c : Nat { Bool.and ( gg_shard_in_set ( no , own , k , c ) , Nat.is_le ( c , k ) ) == False { } : Bool }
+# promise gg_shard_in_set_index: a shard the reader accepts into a split model has an index below the shard count.
+61026601e4875fcc  gg_shard_index_within  law gg_shard_index_within : for + no : Nat for + k : Nat for + c : Nat { Bool.and ( gg_shard_ok ( no , k , c ) , Nat.is_le ( c , k ) ) == False { } : Bool }
+# promise gg_shard_index_within: a shard the split check accepts always has an index below the shard count.
+aa7c431c38b0b723  gg_span_within  law gg_span_within : for + o : Nat for + l : Nat for + s : Nat { Bool.and ( gg_span_ok ( o , l , s ) , Nat.is_lt ( s , Nat.add ( o , l ) ) ) == False { } : Bool }
+# promise gg_span_within: a span the reader accepts never ends past the end of the buffer.
+# harm gg_span_within: an accepted span could read outside the file mapping.
+a84855f9f8cf8e53  gg_split_empty_refused  law gg_split_empty_refused : for + c : Nat { gg_split_complete ( 0n , c ) == False { } : Bool }
+# promise gg_split_empty_refused: a model with no shards at all is never taken as a complete split model.
+5c969ee207403248  gg_tensor_total_matches  law gg_tensor_total_matches : for + d : Nat for + t : Nat { Bool.and ( gg_tensor_total_ok ( d , t ) , Nat.is_ne ( d , t ) ) == False { } : Bool }
+# promise gg_tensor_total_matches: a split model is accepted only when its shards hold the tensor count its first shard declares.
+# harm gg_tensor_total_matches: a missing or duplicated shard's tensors would go unnoticed
+2598539dc1c69f9c  gg_vhead_lead_fixed  law gg_vhead_lead_fixed : for + i : Nat for + p : Nat for + hk : Nat for + r : Nat for + d : Nat { gg_vhead_src ( i , Nat.add ( i , 1n + p ) , hk , r , d ) == i : Nat }
+# promise gg_vhead_lead_fixed: the leading entries before the value heads keep their place in any head reordering.
 53fe9947235719b6  gqa_zero_kv_rejected  law gqa_zero_kv_rejected : for + nh : Nat for + dh : Nat { gqa_dims_valid ( nh , 0n , dh ) == False { } : Bool }
 22d66bf5996db2a1  greedy_request_always_admitted  law greedy_request_always_admitted : for cap : Bool { sampling_request_admitted ( cap , False { } ) == True { } : Bool }
 517d5b7e787fa37f  hbm_fit_partition_exact  law hbm_fit_partition_exact : for + p : Nat for + u : Nat { hbm_fit_reconstruct_lhs ( hbm_check_fit ( p , u ) , p , u ) == hbm_fit_reconstruct_rhs ( hbm_check_fit ( p , u ) , p , u ) : Nat }
@@ -223,6 +286,197 @@ d21532af3aa140c6  hold_conserved  law hold_conserved : for + b : Nat for + t : N
 06a1321d4cd0be64  hold_empty_tag_holds_nothing  law hold_empty_tag_holds_nothing : for b : Nat { hold_max ( b , 0n ) == 0n : Nat }
 ecd414a23b12f2c1  hold_max_le_buf  law hold_max_le_buf : for + b : Nat for t : Nat { Nat.is_le ( hold_max ( b , t ) , b ) == True { } : Bool }
 ae08a33bfac2b3cc  hold_max_lt_tag  law hold_max_lt_tag : for b : Nat for + t : Nat { Nat.is_lt ( hold_max ( b , 1n + t ) , 1n + t ) == True { } : Bool }
+aca5cff341d0c466  ik_app_layer_in_model  law ik_app_layer_in_model : for + n : Nat for + ls : Nat for + le : Nat for + p : Nat for + b : Nat for + mx : Nat for + a : Nat { Bool.and ( ik_schedule_valid ( n , ls , le , p , b , mx ) , Bool.and ( Nat.is_lt ( a , ik_apps ( n , ls , le , p ) ) , Nat.is_le ( n , ik_app_layer ( a , ls , le , p ) ) ) ) == False { } : Bool }
+# promise ik_app_layer_in_model: on a schedule the guard accepts, every layer application runs the weights of a layer the model has.
+8eabdbe75a0c2324  ik_app_msgs_looped  law ik_app_msgs_looped : for + a : Nat for + ls : Nat for + le : Nat for + p : Nat { Bool.and ( ik_app_msgs ( a , ls , le , p ) , Bool.not ( ik_layer_looped ( ik_app_layer ( a , ls , le , p ) , ls , le ) ) ) == False { } : Bool }
+# promise ik_app_msgs_looped: an application that receives messages of a previous pass runs a layer of the looped span.
+444bd665a913298d  ik_app_pass_below_passes  law ik_app_pass_below_passes : for + a : Nat for + ls : Nat for + le : Nat for + pp : Nat { Nat.is_lt ( ik_app_pass ( a , ls , le , 1n + pp ) , 1n + pp ) == True { } : Bool }
+# promise ik_app_pass_below_passes: every layer application belongs to one of the passes the model runs (its pass is below the pass count).
+1e56d626c8a72153  ik_bias_block_in_table  law ik_bias_block_in_table : for + e : Nat for + dd : Nat { Nat.is_le ( Nat.add ( Nat.sub ( ik_bias_off ( e ) , dd ) , 64n ) , ik_bias_width ( e ) ) == True { } : Bool }
+# promise ik_bias_block_in_table: the 64 bias channels a softmax block loads for any first-key distance up to the table's offset stay inside one head's table.
+b1535cefc222c670  ik_bias_distance_channel  law ik_bias_distance_channel : for + e : Nat for + d : Nat { Bool.and ( Nat.is_lt ( d , e ) , Nat.is_ne ( ik_bias_src ( e , Nat.sub ( ik_bias_off ( e ) , d ) ) , d ) ) == False { } : Bool }
+# promise ik_bias_distance_channel: every distance below the bias extent has its bias in the channel the softmax kernel reads for it (the table's offset less the distance).
+eff8eedd48be3b61  ik_bias_far_block_unbiased  law ik_bias_far_block_unbiased : for + e : Nat for + dd : Nat { Bool.and ( Nat.is_lt ( ik_bias_off ( e ) , dd ) , Nat.is_lt ( Nat.sub ( dd , 63n ) , e ) ) == False { } : Bool }
+# promise ik_bias_far_block_unbiased: a softmax block whose first key is further than the table's offset holds no key within the bias extent, so skipping its bias load drops no bias.
+cf0d76684265a165  ik_bias_inside_ring  law ik_bias_inside_ring : for + w : Nat for + e : Nat for + rows : Nat { Bool.and ( ik_attn_geom_valid ( w , e ) , Bool.and ( Nat.is_ne ( ik_ring_slots ( w , rows ) , 0n ) , Nat.is_le ( ik_ring_slots ( w , rows ) , ik_bias_off ( e ) ) ) ) == False { } : Bool }
+# promise ik_bias_inside_ring: with a window and extent the guard accepts, every first-key distance the softmax kernel biases lies inside the K / V ring, so a wrapped slot is never biased as a near key.
+a7f858cbc6d4fa2b  ik_bias_src_bounded  law ik_bias_src_bounded : for + e : Nat for + x : Nat { Nat.is_le ( ik_bias_src ( e , x ) , e ) == True { } : Bool }
+# promise ik_bias_src_bounded: a bias table channel holds a distance below the extent or the no-bias value (the extent), never a distance beyond it.
+e4c4d952f0f9d1a7  ik_bias_src_channel  law ik_bias_src_channel : for + e : Nat for + x : Nat { Bool.and ( Nat.is_lt ( ik_bias_src ( e , x ) , e ) , Nat.is_ne ( Nat.add ( ik_bias_src ( e , x ) , x ) , ik_bias_off ( e ) ) ) == False { } : Bool }
+# promise ik_bias_src_channel: a channel that holds a distance below the extent is the channel the softmax kernel reads for that distance (the table's offset less the distance).
+fd94a0cde8628ff5  ik_buf_reuse_safe  law ik_buf_reuse_safe : for + lu : Nat for + a : Nat for + bs : Nat for + bo : Nat for + s : Nat { Bool.and ( ik_buf_reusable ( lu , a ) , ik_buf_clobbers ( bs , bo , s , a , lu ) ) == False { } : Bool }
+# promise ik_buf_reuse_safe: a buffer the reuse rule hands to an application never holds a source that application or a later one still reads.
+f5d2a6aa6cd5f1f7  ik_counts_apps_within  law ik_counts_apps_within : for + n : Nat for + ls : Nat for + le : Nat for + p : Nat for + w : Nat for + nh : Nat for + ma : Nat for + mw : Nat for + mh : Nat { Bool.and ( ik_counts_valid ( n , ls , le , p , w , nh , ma , mw , mh ) , Nat.is_lt ( ma , ik_apps ( n , ls , le , p ) ) ) == False { } : Bool }
+# promise ik_counts_apps_within: a model the counts guard accepts runs no more layer applications per token than the limit the shell passes.
+# harm ik_counts_apps_within: a pass count from a file could make the schedule overflow or allocate without bound
+3e5f977699f513c7  ik_counts_heads_within  law ik_counts_heads_within : for + n : Nat for + ls : Nat for + le : Nat for + p : Nat for + w : Nat for + nh : Nat for + ma : Nat for + mw : Nat for + mh : Nat { Bool.and ( ik_counts_valid ( n , ls , le , p , w , nh , ma , mw , mh ) , Nat.is_lt ( mh , nh ) ) == False { } : Bool }
+# promise ik_counts_heads_within: a query-head count the counts guard accepts is within the limit the shell passes.
+# harm ik_counts_heads_within: a head count from a file could overflow the projection width arithmetic
+9031a48cf2538754  ik_counts_window_within  law ik_counts_window_within : for + n : Nat for + ls : Nat for + le : Nat for + p : Nat for + w : Nat for + nh : Nat for + ma : Nat for + mw : Nat for + mh : Nat { Bool.and ( ik_counts_valid ( n , ls , le , p , w , nh , ma , mw , mh ) , Nat.is_lt ( mw , w ) ) == False { } : Bool }
+# promise ik_counts_window_within: a sliding window the counts guard accepts is within the limit the shell passes.
+# harm ik_counts_window_within: a window from a file could overflow the ring sizing arithmetic
+55ee306cf4e5220d  ik_dims_guard_expert_width  law ik_dims_guard_expert_width : for + g : Nat for + nh : Nat for + kv : Nat for + e : Nat for + k : Nat for + ff : Nat for + t : Nat { Bool.and ( ik_dims_valid ( Nat.mul ( 128n , 1n + g ) , nh , kv , 128n , 16n , Nat.mul ( 128n , 1n + e ) , k , ff , t ) , Bool.not ( ik_width_whole ( ff ) ) ) == False { } : Bool }
+# promise ik_dims_guard_expert_width: a shape the guard the shell calls accepts always has an expert width of whole 128-channel blocks.
+# harm ik_dims_guard_expert_width: a later guard could drop the expert-width check and hand the expert kernels a partial block
+6ad0798cb1a44800  ik_dims_guard_heads_router_taps  law ik_dims_guard_heads_router_taps : for + g : Nat for + nh : Nat for + kv : Nat for + e : Nat for + k : Nat for + f : Nat for + t : Nat { Bool.and ( ik_dims_valid ( Nat.mul ( 128n , 1n + g ) , nh , kv , 128n , 16n , Nat.mul ( 128n , 1n + e ) , k , Nat.mul ( 128n , 1n + f ) , t ) , Bool.not ( Bool.and ( ik_head_groups_valid ( nh , kv ) , Bool.and ( ik_top_k_valid ( k , Nat.mul ( 128n , 1n + e ) ) , ik_taps_valid ( t ) ) ) ) ) == False { } : Bool }
+# promise ik_dims_guard_heads_router_taps: a shape the guard the shell calls accepts always has grouped heads, a router selection within the experts and non-zero convolution taps.
+# harm ik_dims_guard_heads_router_taps: a later guard could drop one of these checks and hand the kernels heads, experts or taps they do not cover
+53c02d60d9f5b244  ik_dims_guard_hidden  law ik_dims_guard_hidden : for + h : Nat for + nh : Nat for + kv : Nat for + e : Nat for + k : Nat for + f : Nat for + t : Nat { Bool.and ( ik_dims_valid ( h , nh , kv , 128n , 16n , Nat.mul ( 128n , 1n + e ) , k , Nat.mul ( 128n , 1n + f ) , t ) , Bool.not ( ik_width_whole ( h ) ) ) == False { } : Bool }
+# promise ik_dims_guard_hidden: a shape the guard the shell calls accepts always has a hidden size of whole 128-channel blocks.
+# harm ik_dims_guard_hidden: a later guard could drop the hidden-width check and hand the kernels a partial block
+bc1f7df6f51f5e7d  ik_f8_row_consistent  law ik_f8_row_consistent : for + c : Nat { Bool.and ( ik_f8_row_ok ( c ) , Bool.not ( Nat.is_eq ( Nat.mul ( 32n , ik_f8_row_scales ( c ) ) , c ) ) ) == False { } : Bool }
+# promise ik_f8_row_consistent: an 8-bit-float expert row the geometry accepts has one scale per 32 values, covering exactly its columns.
+# harm ik_f8_row_consistent: the packer would read a row's scales past its last value or leave values without a scale
+2f0a5a72e42eac5c  ik_heads_grouped  law ik_heads_grouped : for + nh : Nat for + kv : Nat { Bool.and ( ik_head_groups_valid ( nh , kv ) , Nat.is_ne ( Nat.mod ( nh , kv ) , 0n ) ) == False { } : Bool }
+# promise ik_heads_grouped: heads the shape guard accepts come in whole groups of query heads per key / value head (so a model without key / value heads is refused).
+0a69c8b0b4cd4c0f  ik_heads_nonzero  law ik_heads_nonzero : for + nh : Nat for + kv : Nat { Bool.and ( ik_head_groups_valid ( nh , kv ) , Nat.is_eq ( nh , 0n ) ) == False { } : Bool }
+# promise ik_heads_nonzero: the shape guard refuses a model without query heads.
+1828978c1a420a05  ik_hist_holds_pass  law ik_hist_holds_pass : for + rows : Nat for + taps : Nat { Bool.and ( Nat.is_ne ( ik_hist_rows ( rows , taps ) , 0n ) , Nat.is_lt ( ik_hist_rows ( rows , taps ) , Nat.sub ( Nat.add ( rows , taps ) , 1n ) ) ) == False { } : Bool }
+# promise ik_hist_holds_pass: a convolution history ring the sizing returns (non-zero) holds the rows of the widest pass and the taps before its first row.
+00b353ee561b3b4c  ik_hist_pow2  law ik_hist_pow2 : for + rows : Nat for + taps : Nat { Bool.and ( Nat.is_ne ( ik_hist_rows ( rows , taps ) , 0n ) , Bool.not ( ik_is_pow2 ( ik_hist_rows ( rows , taps ) ) ) ) == False { } : Bool }
+# promise ik_hist_pow2: a convolution history ring the sizing returns (non-zero) has a power-of-two number of rows, so the kernels' row mask is the position modulo the ring.
+4ec4924f0fd09712  ik_kx_holds_heads  law ik_kx_holds_heads : for + nkv : Nat for + t : Nat { Nat.is_le ( Nat.add ( Nat.mul ( 128n , nkv ) , Nat.mul ( t , nkv ) ) , ik_kx_width ( nkv , t ) ) == True { } : Bool }
+# promise ik_kx_holds_heads: the key / value projection holds every key / value head and every head's convolution taps.
+d2d5d2eb2cd72386  ik_loop_index_in_span  law ik_loop_index_in_span : for + layer : Nat for + ls : Nat for + le : Nat { Bool.and ( ik_layer_looped ( layer , ls , le ) , Nat.is_le ( ik_span ( ls , le ) , ik_loop_index ( layer , ls ) ) ) == False { } : Bool }
+# promise ik_loop_index_in_span: a looped layer's position inside the span is below the span's length (its message-gate tables have a row for it).
+a1ceab4457cf184e  ik_nib_partial_refused  law ik_nib_partial_refused : for + c : Nat { Bool.and ( Nat.is_ne ( Nat.mod ( c , 16n ) , 0n ) , Nat.is_ne ( ik_nib_row_bytes ( c ) , 0n ) ) == False { } : Bool }
+# promise ik_nib_partial_refused: a column count that is not a whole number of 16-code scale blocks gets no 4-bit row geometry (0 bytes).
+3de4bb83cf27e220  ik_nib_row_consistent  law ik_nib_row_consistent : for + c : Nat { Bool.and ( Nat.is_ne ( ik_nib_row_bytes ( c ) , 0n ) , Bool.not ( Bool.and ( Nat.is_eq ( Nat.mul ( 2n , ik_nib_row_bytes ( c ) ) , c ) , Nat.is_eq ( Nat.mul ( 16n , ik_nib_row_scales ( c ) ) , c ) ) ) ) == False { } : Bool }
+# promise ik_nib_row_consistent: a 4-bit row the geometry accepts (non-zero bytes) has two codes per byte and one scale per 16 codes, covering exactly its columns.
+d0247ecb5a368690  ik_one_pass_no_messages  law ik_one_pass_no_messages : for + p : Nat for + ls : Nat for + le : Nat for + b : Nat { Bool.and ( Nat.is_le ( p , 1n ) , Nat.is_ne ( ik_msg_states ( ik_eff_loop_start ( p , ls , b ) , ik_eff_loop_end ( p , le , b ) , b ) , 0n ) ) == False { } : Bool }
+# promise ik_one_pass_no_messages: a model of one pass has no messages (its schedule's span is empty).
+006f9aa91aba2c24  ik_proj_whole_blocks  law ik_proj_whole_blocks : for + nh : Nat for + dr : Nat for + nkv : Nat for + t : Nat { Bool.and ( Nat.is_eq ( Nat.mod ( ik_qx_width ( nh , dr ) , 128n ) , 0n ) , Nat.is_eq ( Nat.mod ( ik_kx_width ( nkv , t ) , 128n ) , 0n ) ) == True { } : Bool }
+# promise ik_proj_whole_blocks: the query-side and key / value projections are whole blocks of 128 channels.
+0b9fb2eb3b0cec5a  ik_qx_holds_rel  law ik_qx_holds_rel : for + nh : Nat for + dr : Nat { Nat.is_le ( Nat.add ( ik_rel_off ( nh ) , Nat.mul ( dr , nh ) ) , ik_qx_width ( nh , dr ) ) == True { } : Bool }
+# promise ik_qx_holds_rel: the relative states of every head end inside the query-side projection's width.
+7051f6bffbeebc77  ik_qx_parts_ordered  law ik_qx_parts_ordered : for + nh : Nat { Bool.and ( Nat.is_le ( ik_heads_width ( nh ) , ik_gate_off ( nh ) ) , Nat.is_le ( Nat.add ( ik_gate_off ( nh ) , ik_heads_width ( nh ) ) , ik_rel_off ( nh ) ) ) == True { } : Bool }
+# promise ik_qx_parts_ordered: the query-side projection places the query heads before the output gate and the gate before the relative states, so no two parts share a channel.
+ea52b3ff7df72c1b  ik_ring_holds_pass  law ik_ring_holds_pass : for + w : Nat for + rows : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots ( w , rows ) , 0n ) , Nat.is_lt ( ik_ring_slots ( w , rows ) , Nat.add ( w , Nat.sub ( rows , 1n ) ) ) ) == False { } : Bool }
+# promise ik_ring_holds_pass: a K / V ring the sizing returns (non-zero) holds the window beside the rows of the widest pass, so no row sees the slots the rows ahead of it wrote.
+f2350b24e56a3bd9  ik_ring_holds_vector  law ik_ring_holds_vector : for + w : Nat for + rows : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots ( w , rows ) , 0n ) , Nat.is_lt ( ik_ring_slots ( w , rows ) , Nat.add ( w , 64n ) ) ) == False { } : Bool }
+# promise ik_ring_holds_vector: a K / V ring the sizing returns (non-zero) holds the window beside one vector of 64 slots, so a vector's wrapped lanes stay outside a row's window.
+81076508f973e02a  ik_ring_min_slots  law ik_ring_min_slots : for + w : Nat for + rows : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots ( w , rows ) , 0n ) , Nat.is_lt ( ik_ring_slots ( w , rows ) , 128n ) ) == False { } : Bool }
+# promise ik_ring_min_slots: a K / V ring the sizing returns (non-zero) has at least 128 slots (whole blocks of the softmax kernel's keys).
+9dfbadeee8be8277  ik_ring_pow2  law ik_ring_pow2 : for + w : Nat for + rows : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots ( w , rows ) , 0n ) , Bool.not ( ik_is_pow2 ( ik_ring_slots ( w , rows ) ) ) ) == False { } : Bool }
+# promise ik_ring_pow2: a K / V ring the sizing returns (non-zero) has a power-of-two number of slots, so the kernels' slot mask is the position modulo the ring.
+47f1177ebabbda28  ik_ring_within_bounded  law ik_ring_within_bounded : for + w : Nat for + rows : Nat for + mx : Nat { Nat.is_le ( ik_ring_slots_within ( w , rows , mx ) , mx ) == True { } : Bool }
+# promise ik_ring_within_bounded: a K / V ring the kernel-bounded sizing returns never has more slots than the chunk the softmax kernel stages.
+03fa217e4c3b12e9  ik_ring_within_is_ring  law ik_ring_within_is_ring : for + w : Nat for + rows : Nat for + mx : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , 0n ) , Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , ik_ring_slots ( w , rows ) ) ) == False { } : Bool }
+# promise ik_ring_within_is_ring: the kernel-bounded sizing returns the K / V ring itself or no ring (0), never a different, smaller one.
+1572ee1b0b28002d  ik_states_carry  law ik_states_carry : for + l : Nat for + bp : Nat { ik_states_attn ( 1n + l , 1n + bp ) == ik_states_mlp ( l , 1n + bp ) : Nat }
+# promise ik_states_carry: the block states a layer's attention-input mix reads are exactly the ones the previous layer's MLP-input mix read.
+7e7b86ddb68242ab  ik_states_mlp_covers_attn  law ik_states_mlp_covers_attn : for + l : Nat for + b : Nat { Nat.is_le ( ik_states_attn ( l , b ) , ik_states_mlp ( l , b ) ) == True { } : Bool }
+# promise ik_states_mlp_covers_attn: a layer's MLP-input mix reads every block state its attention-input mix reads.
+# harm ik_states_mlp_covers_attn: a state the attention mix used would be missing from the MLP mix of the same layer
+cb2c7a55605638d0  ik_states_mlp_within_opened  law ik_states_mlp_within_opened : for + l : Nat for + b : Nat { Nat.is_le ( ik_states_mlp ( l , b ) , Nat.add ( ik_states_attn ( l , b ) , Bool.pick ( Nat , ik_opens_block ( l , b ) , 1n , 0n ) ) ) == True { } : Bool }
+# promise ik_states_mlp_within_opened: a layer's MLP-input mix reads at most one block state more than its attention-input mix, and that one only when the layer opens a block.
+# harm ik_states_mlp_within_opened: a mix would read a block state no layer has added yet
+e30d133c07832426  ik_states_within_max  law ik_states_within_max : for + n : Nat for + ls : Nat for + le : Nat for + p : Nat for + b : Nat for + mx : Nat for + l : Nat { Bool.and ( ik_schedule_valid ( n , ls , le , p , b , mx ) , Bool.and ( Nat.is_lt ( l , n ) , Nat.is_lt ( mx , ik_states_mlp ( l , b ) ) ) ) == False { } : Bool }
+# promise ik_states_within_max: on a schedule the guard accepts, no layer's residual mix reads more block states than the kernels hold.
+d1a4f19a096d333c  ik_taps_nonzero  law ik_taps_nonzero : for + t : Nat { Bool.and ( ik_taps_valid ( t ) , Nat.is_eq ( t , 0n ) ) == False { } : Bool }
+# promise ik_taps_nonzero: the shape guard refuses short convolutions without taps.
+1020da00a9c12c67  ik_tile_holds_rows  law ik_tile_holds_rows : for + rows : Nat for + tile : Nat for + room : Nat { Nat.is_le ( rows , ik_tile_rows ( rows , tile , room ) ) == True { } : Bool }
+# promise ik_tile_holds_rows: a prefill tile never has fewer rows than the prompt rows it carries.
+ee1eabf3467cbedc  ik_tile_readout_inside  law ik_tile_readout_inside : for + rp : Nat for + tile : Nat for + room : Nat { Nat.is_lt ( ik_tile_last_row ( 1n + rp ) , ik_tile_rows ( 1n + rp , tile , room ) ) == True { } : Bool }
+# promise ik_tile_readout_inside: the row the prefill readout reads is a row of the last tile (its last prompt row).
+ab05c1840659a1e2  ik_tile_take_bounded  law ik_tile_take_bounded : for + left : Nat for + tile : Nat { Bool.and ( Nat.is_le ( ik_tile_take ( left , tile ) , left ) , Nat.is_le ( ik_tile_take ( left , tile ) , tile ) ) == True { } : Bool }
+# promise ik_tile_take_bounded: the next prefill tile carries no more prompt rows than are left and than the planned tile holds.
+13402497225cc894  ik_tile_take_progress  law ik_tile_take_progress : for + lp : Nat for + tp : Nat { Nat.is_gt ( ik_tile_take ( 1n + lp , 1n + tp ) , 0n ) == True { } : Bool }
+# promise ik_tile_take_progress: while prompt rows are left and the planned tile is not empty, the next prefill tile carries at least one row (prefill makes progress).
+c1b79be3fde2096a  ik_tile_within_plan  law ik_tile_within_plan : for + rows : Nat for + tile : Nat for + room : Nat { Bool.and ( Nat.is_lt ( tile , ik_tile_rows ( rows , tile , room ) ) , Nat.is_ne ( ik_tile_rows ( rows , tile , room ) , rows ) ) == False { } : Bool }
+# promise ik_tile_within_plan: a prefill tile has more rows than the planned tile only when it is exactly the prompt rows it carries (no padding past the plan).
+02d5e2152b555dac  ik_tile_within_room  law ik_tile_within_room : for + rows : Nat for + tile : Nat for + room : Nat { Bool.and ( Nat.is_le ( rows , room ) , Nat.is_lt ( room , ik_tile_rows ( rows , tile , room ) ) ) == False { } : Bool }
+# promise ik_tile_within_room: a prefill tile of prompt rows that fit the room left in the context never has more rows than that room.
+8b600dfcf3fc8007  ik_top_k_within_experts  law ik_top_k_within_experts : for + k : Nat for + ne : Nat { Bool.and ( ik_top_k_valid ( k , ne ) , Bool.not ( Bool.and ( Nat.is_ge ( k , 1n ) , Nat.is_le ( k , ne ) ) ) ) == False { } : Bool }
+# promise ik_top_k_within_experts: a router selection the shape guard accepts takes at least one expert and never more experts than the model has.
+8f0f2c9c7c33b30a  ik_vocab_within_embedding  law ik_vocab_within_embedding : for + u : Nat for + v : Nat { Bool.and ( ik_vocab_valid ( u , v ) , Nat.is_lt ( v , u ) ) == False { } : Bool }
+# promise ik_vocab_within_embedding: a vocabulary the guard accepts emits only tokens that are rows of the embedding.
+978d3dbd32f776f1  ik_width_whole_blocks  law ik_width_whole_blocks : for + x : Nat { Bool.and ( ik_width_whole ( x ) , Bool.not ( Bool.and ( Nat.is_gt ( x , 0n ) , Nat.is_eq ( Nat.mod ( x , 128n ) , 0n ) ) ) ) == False { } : Bool }
+# promise ik_width_whole_blocks: a width the shape guard accepts is a non-zero whole number of 128-channel blocks.
+8c61d3bfc44aabdb  ikr_cap_last_runs  law ikr_cap_last_runs : for + common : Nat for + n : Nat { Nat.is_lt ( ikr_cap ( common , 1n + n ) , 1n + n ) == True { } : Bool }
+# promise ikr_cap_last_runs: the rows taken over from a prompt of at least one row leave its last row to run
+# harm ikr_cap_last_runs: a request has no row left to compute and no first token
+0a6dc7945b2916df  ikr_cap_le_common  law ikr_cap_le_common : for + common : Nat for + rows : Nat { Nat.is_le ( ikr_cap ( common , rows ) , common ) == True { } : Bool }
+# promise ikr_cap_le_common: the rows taken over never exceed the rows that equal the rows held
+# harm ikr_cap_le_common: a resume takes over rows the prompt does not share with the state
+eeb923f22479560a  ikr_holds_at  law ikr_holds_at : for + r : Nat for + slack : Nat { ikr_holds ( r , r , slack ) == True { } : Bool }
+# promise ikr_holds_at: rings written exactly up to a resume point still hold everything a resume there reads
+# harm ikr_holds_at: a state that is intact is never resumed and every request prefills from position 0
+c28833d53a19448b  ikr_holds_within  law ikr_holds_within : for + hi : Nat for + r : Nat for + slack : Nat { Bool.or ( Bool.not ( ikr_holds ( hi , r , slack ) ) , Nat.is_le ( hi , Nat.add ( r , slack ) ) ) == True { } : Bool }
+# promise ikr_holds_within: rings that hold what a resume at `r` reads were written no further than `r` plus the slack
+# harm ikr_holds_within: a resume is taken over rows a ring has already overwritten
+7cbfcd49cf40fdbd  ikr_live_holds  law ikr_live_holds : for + r_live : Nat for + hi_live : Nat for + r_snap : Nat for + hi_snap : Nat for + slack : Nat { Bool.or ( Bool.not ( ikr_is_live ( ikr_pick ( r_live , hi_live , r_snap , hi_snap , slack ) ) ) , ikr_holds ( hi_live , ikr_start ( IrLive { } , r_live , r_snap ) , slack ) ) == True { } : Bool }
+# promise ikr_live_holds: a resume of the live rings starts only where they still hold every row the pass reads from before its start
+# harm ikr_live_holds: a resumed prefill reads overwritten ring rows and its tokens differ from a prefill from position 0
+0c1f43564a23b074  ikr_live_start_le_live  law ikr_live_start_le_live : for + r_live : Nat for + r_snap : Nat { Nat.is_le ( ikr_start ( IrLive { } , r_live , r_snap ) , r_live ) == True { } : Bool }
+# promise ikr_live_start_le_live: a resume of the live rings never starts past the rows of the prompt that equal the rows on the card
+# harm ikr_live_start_le_live: a resume skips rows the global caches do not hold for this prompt
+fb9a30bfa5e3fa76  ikr_pick_none_fresh  law ikr_pick_none_fresh : for + hi_live : Nat for + r_snap : Nat for + hi_snap : Nat for + slack : Nat { ikr_pick ( 0n , hi_live , r_snap , hi_snap , slack ) == IrFresh { } : IkResume }
+# promise ikr_pick_none_fresh: a prompt with no row equal to the rows on the card resumes no state
+# harm ikr_pick_none_fresh: a state is resumed for a prompt that shares none of its rows
+441252dd96d7b49b  ikr_slack_le_hist  law ikr_slack_le_hist : for + ring : Nat for + window : Nat for + hist : Nat for + taps : Nat { Nat.is_le ( ikr_slack ( ring , window , hist , taps ) , Nat.sub ( hist , taps ) ) == True { } : Bool }
+# promise ikr_slack_le_hist: the slack never exceeds the rows of a history ring beyond the taps a pass reads
+# harm ikr_slack_le_hist: a resume is allowed after the history rings overwrote rows a convolution reads
+47942124d756e345  ikr_slack_le_ring  law ikr_slack_le_ring : for + ring : Nat for + window : Nat for + hist : Nat for + taps : Nat { Nat.is_le ( ikr_slack ( ring , window , hist , taps ) , Nat.sub ( ring , window ) ) == True { } : Bool }
+# promise ikr_slack_le_ring: the slack never exceeds the slots of a sliding ring beyond the window a pass reads
+# harm ikr_slack_le_ring: a resume is allowed after the sliding rings overwrote rows a pass reads
+e4f005d85d96755f  ikr_slack_with_le_main  law ikr_slack_with_le_main : for + slack : Nat for + ring : Nat for + window : Nat { Nat.is_le ( ikr_slack_with ( slack , ring , window ) , slack ) == True { } : Bool }
+# promise ikr_slack_with_le_main: a drafter never widens the slack of the main model's rings
+# harm ikr_slack_with_le_main: a resume is allowed after the main model's rings overwrote rows a pass reads
+3afb34d376e80062  ikr_slack_with_le_ring  law ikr_slack_with_le_ring : for + slack : Nat for + ring : Nat for + window : Nat { Nat.is_le ( ikr_slack_with ( slack , ring , window ) , Nat.sub ( ring , window ) ) == True { } : Bool }
+# promise ikr_slack_with_le_ring: with a drafter the slack never exceeds the slots of its context rings beyond their window
+# harm ikr_slack_with_le_ring: a resume is allowed after the drafter's rings overwrote context a block reads
+85173e78980d33ed  ikr_snap_holds  law ikr_snap_holds : for + r_live : Nat for + hi_live : Nat for + r_snap : Nat for + hi_snap : Nat for + slack : Nat { Bool.or ( Bool.not ( ikr_is_snap ( ikr_pick ( r_live , hi_live , r_snap , hi_snap , slack ) ) ) , ikr_holds ( hi_snap , ikr_start ( IrSnap { } , r_live , r_snap ) , slack ) ) == True { } : Bool }
+# promise ikr_snap_holds: a resume of the ring snapshot starts only where the snapshot still holds every row the pass reads from before its start
+# harm ikr_snap_holds: a resumed prefill reads overwritten snapshot rows and its tokens differ from a prefill from position 0
+856de39d8576fbb4  ikr_snap_start_le_live  law ikr_snap_start_le_live : for + r_live : Nat for + r_snap : Nat { Nat.is_le ( ikr_start ( IrSnap { } , r_live , r_snap ) , r_live ) == True { } : Bool }
+# promise ikr_snap_start_le_live: a resume of the ring snapshot never starts past the rows of the prompt that equal the rows on the card
+# harm ikr_snap_start_le_live: a resume skips rows the global caches do not hold for this prompt
+01e330fc2a38a2b3  ikr_start_fresh  law ikr_start_fresh : for + r_live : Nat for + r_snap : Nat { ikr_start ( IrFresh { } , r_live , r_snap ) == 0n : Nat }
+# promise ikr_start_fresh: a prefill that resumes no state starts at position 0
+# harm ikr_start_fresh: a request takes over rows without a state that holds them
+8e21c174dbb63e89  ikr_start_le_snap  law ikr_start_le_snap : for + r_live : Nat for + r_snap : Nat { Nat.is_le ( ikr_start ( IrSnap { } , r_live , r_snap ) , r_snap ) == True { } : Bool }
+# promise ikr_start_le_snap: a resume of the snapshot never starts past the rows of the prompt that equal the snapshot's rows
+# harm ikr_start_le_snap: a resume skips rows the snapshot's rings do not hold for this prompt
+bd5a94fbca115f8c  ikv_bucket_holds_image  law ikv_bucket_holds_image : for + need : Nat for + rung : Nat for + cap : Nat { Bool.and ( Nat.is_le ( need , cap ) , Nat.is_lt ( ikv_bucket ( need , rung , cap ) , need ) ) == False { } : Bool }
+# promise ikv_bucket_holds_image: an image the tower was planned for gets a bucket that holds all of its tokens.
+f0ee609570565192  ikv_bucket_le_cap  law ikv_bucket_le_cap : for + need : Nat for + rung : Nat for + cap : Nat { Nat.is_le ( ikv_bucket ( need , rung , cap ) , cap ) == True { } : Bool }
+# promise ikv_bucket_le_cap: the tower's bucket for an image never exceeds the planned largest image.
+09a0bb4142906249  ikv_class_key_live  law ikv_class_key_live : for t : Nat for p : Nat { ikv_key_live ( 0n , t , p ) == True { } : Bool }
+# promise ikv_class_key_live: every query attends the class row of its image.
+a6b6d5b138e1c419  ikv_extra_placeholders_refused  law ikv_extra_placeholders_refused : for + f : Nat for + e : Nat { ikv_rows_match ( Nat.add ( 1n + f , e ) , f ) == False { } : Bool }
+# promise ikv_extra_placeholders_refused: a prompt with more image placeholders than its images have tokens is refused.
+e493c15dd69a2b43  ikv_feat_next_past  law ikv_feat_next_past : for + off : Nat for + t : Nat { Nat.is_le ( Nat.add ( off , t ) , ikv_feat_next ( off , t ) ) == True { } : Bool }
+# promise ikv_feat_next_past: the next image's features start behind every column of the current image's tokens, so two images' tokens never share a column.
+# harm ikv_feat_next_past: an image's features would overwrite the tokens of the image before it
+f4b9b01bb0fc0620  ikv_image_row_in_range  law ikv_image_row_in_range : for + r : Nat for + mt : Nat for + cap : Nat { Bool.and ( Nat.is_lt ( r , mt ) , Bool.not ( Nat.is_lt ( ikv_feat_row ( True { } , r ) , ikv_feat_cols ( mt , cap ) ) ) ) == False { } : Bool }
+# promise ikv_image_row_in_range: an image row whose rank is inside the request's tokens reads a column inside the feature buffer.
+# harm ikv_image_row_in_range: the prefill's gather would read past the feature buffer
+feaf84cebca747f9  ikv_merge_skips_text_col  law ikv_merge_skips_text_col : for + off : Nat for + b : Nat for + cols : Nat for + r : Nat { Bool.and ( ikv_feat_write_safe ( off , b , cols ) , Bool.and ( Nat.is_le ( off , ikv_feat_row ( False { } , r ) ) , Nat.is_lt ( ikv_feat_row ( False { } , r ) , Nat.add ( off , b ) ) ) ) == False { } : Bool }
+# promise ikv_merge_skips_text_col: a merger write the shell's check accepts never covers the column text rows read.
+# harm ikv_merge_skips_text_col: an image's features would overwrite the embedding every text row reads
+aa03135346f4ef3d  ikv_merge_write_in_buffer  law ikv_merge_write_in_buffer : for + off : Nat for + b : Nat for + cols : Nat { Bool.and ( ikv_feat_write_safe ( off , b , cols ) , Nat.is_lt ( cols , Nat.add ( off , b ) ) ) == False { } : Bool }
+# promise ikv_merge_write_in_buffer: a merger write the shell's check accepts ends inside the feature buffer.
+# harm ikv_merge_write_in_buffer: the merger would write past the feature buffer into another tensor
+73c505e7ca516ae7  ikv_missing_placeholders_refused  law ikv_missing_placeholders_refused : for + f : Nat for + e : Nat { ikv_rows_match ( f , Nat.add ( 1n + f , e ) ) == False { } : Bool }
+# promise ikv_missing_placeholders_refused: a prompt with fewer image placeholders than its images have tokens is refused.
+40d9d5d64717e4be  ikv_padding_key_dead  law ikv_padding_key_dead : for + t : Nat for + p : Nat for + e : Nat { ikv_key_live ( Nat.add ( ikv_seq_rows ( t , p ) , e ) , t , p ) == False { } : Bool }
+# promise ikv_padding_key_dead: no query attends a padding row behind the image's patches.
+a0365e0400358592  ikv_patches_behind_class  law ikv_patches_behind_class : for + t : Nat for + p : Nat { Nat.is_lt ( Nat.mul ( t , p ) , ikv_seq_rows ( t , p ) ) == True { } : Bool }
+# promise ikv_patches_behind_class: the patches of an image fit behind the class row of its sequence.
+42a6928a2817193d  ikv_side_covers  law ikv_side_covers : for + px : Nat for + tp : Nat { Nat.is_le ( px , Nat.mul ( ikv_side ( px , 1n + tp ) , 1n + tp ) ) == True { } : Bool }
+# promise ikv_side_covers: the tiles along an image axis hold every pixel of that axis.
+51870919a18079e9  ikv_side_tight  law ikv_side_tight : for + px : Nat for + tp : Nat { Nat.is_lt ( Nat.mul ( ikv_side ( px , 1n + tp ) , 1n + tp ) , Nat.add ( px , 1n + tp ) ) == True { } : Bool }
+# promise ikv_side_tight: the tiles along an image axis reach less than one tile past its last pixel, so no token is padding only.
+7eef7cd8dd55849f  ikv_text_image_rows_apart  law ikv_text_image_rows_apart : for + r1 : Nat for + r2 : Nat { Nat.is_eq ( ikv_feat_row ( True { } , r1 ) , ikv_feat_row ( False { } , r2 ) ) == False { } : Bool }
+# promise ikv_text_image_rows_apart: a text row never reads a column an image row reads.
+# harm ikv_text_image_rows_apart: a text row would take an image's features as its embedding
+e6d2c9266532af2c  ikv_token_cap_within_patches  law ikv_token_cap_within_patches : for + mp : Nat for + pp : Nat { Nat.is_le ( Nat.mul ( ikv_token_cap ( mp , 1n + pp ) , 1n + pp ) , mp ) == True { } : Bool }
+# promise ikv_token_cap_within_patches: the per-image token cap never needs more patches than the tower was planned for.
+74fc6d28ae320050  ikv_tokens_within_limit  law ikv_tokens_within_limit : for + rows : Nat for + cols : Nat for + m : Nat { Bool.and ( ikv_tokens_fit ( rows , cols , m ) , Nat.is_lt ( m , Nat.mul ( cols , rows ) ) ) == False { } : Bool }
+# promise ikv_tokens_within_limit: an image whose tile grid the token check accepts never has more tokens than the limit.
+f42d899343546720  ikv_tokens_zero_cols_refused  law ikv_tokens_zero_cols_refused : for + rows : Nat for m : Nat { ikv_tokens_fit ( rows , 0n , m ) == False { } : Bool }
+# promise ikv_tokens_zero_cols_refused: an image with no tile column is refused.
 ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat for + k : Nat for + b : Nat for + lmax : Nat { Nat.is_le ( kv_high_water ( p , c , k , b , lmax ) , lmax ) == True { } : Bool }
 3ddfe8a0a0c54651  lane_busy_blocks_exclusive  law lane_busy_blocks_exclusive : for b : Nat for max_lanes : Nat { lane_can_admit ( 1n + b , max_lanes , False { } , True { } ) == False { } : Bool }
 3f71bff599d5e309  lane_exclusive_blocks_all  law lane_exclusive_blocks_all : for busy : Nat for max_lanes : Nat for want_excl : Bool { lane_can_admit ( busy , max_lanes , True { } , want_excl ) == False { } : Bool }
@@ -241,6 +495,52 @@ d7ddac32019087d5  ls_start_cert_alone_never_serves  law ls_start_cert_alone_neve
 3dab07e66c425e4f  ls_start_needs_library  law ls_start_needs_library : for + c : Bool for + k : Bool for f : Bool { ls_start_serves_tls ( ls_start ( c , k , False { } , f ) ) == False { } : Bool }
 a07804e4088df0fd  ls_start_off_without_files  law ls_start_off_without_files : for l : Bool for f : Bool { ls_start ( False { } , False { } , l , f ) == LsStOff { } : LsStart }
 6342ac690f2c6c42  ls_start_serve_xor_refuse  law ls_start_serve_xor_refuse : for + s : LsStart { Bool.and ( ls_start_serves_tls ( s ) , ls_start_refuses ( s ) ) == False { } : Bool }
+45e9542dfddbb97c  mb_call_closes_at_marker  law mb_call_closes_at_marker : for + s : MbState for + e : MbEvent for + split : Bool { Bool.or ( Bool.not ( mb_is_call ( s ) ) , Bool.or ( mb_is_words ( e ) , mb_closes_call ( mb_act ( s , e , split ) ) ) ) == True { } : Bool }
+# promise mb_call_closes_at_marker: every marker that arrives inside a tool-call block closes that call (it is read or dropped, never left open)
+# harm mb_call_closes_at_marker: a call would stay open across a new block and swallow its text
+bee16f5f77cefa27  mb_call_entered_fresh  law mb_call_entered_fresh : for + s : MbState for + e : MbEvent { Bool.and ( Bool.and ( Bool.not ( mb_is_call ( s ) ) , mb_is_call ( mb_next ( s , e ) ) ) , Bool.not ( mb_fresh_is_call ( mb_fresh ( s , e ) ) ) ) == False { } : Bool }
+# promise mb_call_entered_fresh: a tool-call block the reader enters always starts with empty call text and a new call.
+# harm mb_call_entered_fresh: a call would carry text of an earlier block, or arrive without its opening in the stream
+7d5f0d69a8d191f2  mb_call_fresh_only_on_open  law mb_call_fresh_only_on_open : for + s : MbState for + e : MbEvent { Bool.and ( mb_fresh_is_call ( mb_fresh ( s , e ) ) , Bool.not ( Bool.and ( mb_is_open_call ( e ) , mb_is_call ( mb_next ( s , e ) ) ) ) ) == False { } : Bool }
+# promise mb_call_fresh_only_on_open: a new call (its text started empty, a call opened in the reply's lifecycle) begins only at the call marker, and the reader is then inside the call.
+# harm mb_call_fresh_only_on_open: plain text or another block would open a tool call in the client's stream
+5ded362825b66de2  mb_call_opens_by_marker  law mb_call_opens_by_marker : for + s : MbState for + e : MbEvent { Bool.or ( mb_is_call ( s ) , Bool.or ( Bool.not ( mb_is_call ( mb_next ( s , e ) ) ) , mb_is_open_call ( e ) ) ) == True { } : Bool }
+# promise mb_call_opens_by_marker: a tool-call block is entered only through its own content-type marker, never by text
+# harm mb_call_opens_by_marker: plain text would be parsed as a tool call
+7e40a71aa1f2f45b  mb_call_text_hidden  law mb_call_text_hidden : for + s : MbState for + e : MbEvent for + split : Bool { Bool.and ( mb_is_call ( s ) , mb_shows ( mb_act ( s , e , split ) ) ) == False { } : Bool }
+# promise mb_call_text_hidden: text inside an open tool-call block is never shown to the client as content, reasoning or a name
+# harm mb_call_text_hidden: a partial call's JSON would leak into the visible reply
+9dc3575f1fac6d22  mb_done_absorbs  law mb_done_absorbs : for e : MbEvent { mb_next ( MsDone { } , e ) == MsDone { } : MbState }
+# promise mb_done_absorbs: once the reply is over nothing more is read from it, whatever arrives
+914cb2b71adc2ba4  mb_done_silent  law mb_done_silent : for e : MbEvent for split : Bool { mb_act ( MsDone { } , e , split ) == MaNone { } : MbAct }
+# promise mb_done_silent: once the reply is over no text is routed anywhere
+e8e241e14fcc4fd9  mb_finish_ends  law mb_finish_ends : for s : MbState { mb_next ( s , MeFinish { } ) == MsDone { } : MbState }
+# promise mb_finish_ends: the end of generation always ends the reply
+e915827970aebdf8  mb_finish_idempotent  law mb_finish_idempotent : for + s : MbState for split : Bool { mb_is_none ( mb_act ( mb_next ( s , MeFinish { } ) , MeFinish { } , split ) ) == True { } : Bool }
+# promise mb_finish_idempotent: finishing twice is the same as finishing once: the second finish routes nothing
+871cce5d11643d0b  mb_name_entered_fresh  law mb_name_entered_fresh : for + s : MbState for + e : MbEvent { Bool.and ( Bool.and ( Bool.not ( mb_is_header ( s ) ) , mb_is_header ( mb_next ( s , e ) ) ) , Bool.not ( mb_fresh_is_name ( mb_fresh ( s , e ) ) ) ) == False { } : Bool }
+# promise mb_name_entered_fresh: a block header the reader enters always starts with an empty name.
+# harm mb_name_entered_fresh: a call would be named with the name of an earlier block
+bd7d332b386fd286  mb_name_fresh_only_on_header  law mb_name_fresh_only_on_header : for + s : MbState for + e : MbEvent { Bool.and ( mb_fresh_is_name ( mb_fresh ( s , e ) ) , Bool.not ( mb_is_header ( mb_next ( s , e ) ) ) ) == False { } : Bool }
+# promise mb_name_fresh_only_on_header: a block's name is started empty only when the reader enters a header.
+# harm mb_name_fresh_only_on_header: the name of the open block would be lost in the middle of the block
+62b91186a180e15c  mb_no_tools_no_call  law mb_no_tools_no_call : { mb_is_open_call ( mb_call_event ( False { } ) ) == False { } : Bool }
+# promise mb_no_tools_no_call: without offered tools no block is ever read as a tool call
+# harm mb_no_tools_no_call: a reply to a request without tools would lose text into a call nobody asked for
+6a18abfd03008560  mb_reasoning_needs_split  law mb_reasoning_needs_split : for + s : MbState for + e : MbEvent for + split : Bool { Bool.or ( Bool.not ( mb_is_reasoning ( mb_act ( s , e , split ) ) ) , split ) == True { } : Bool }
+# promise mb_reasoning_needs_split: reasoning is reported as reasoning only when the request splits reasoning out
+af8bac3948149de7  mb_start_open  law mb_start_open : for + r : Bool { Bool.or ( mb_is_call ( mb_start ( r ) ) , mb_is_done ( mb_start ( r ) ) ) == False { } : Bool }
+# promise mb_start_open: the reader never starts inside a tool call or after the end of the reply.
+# harm mb_start_open: the first words of a reply would be read as a call, or dropped as if the reply were over
+9eae7fa1b6aa4a23  mb_start_reasoning_not_content  law mb_start_reasoning_not_content : for + r : Bool { Bool.and ( r , mb_is_content ( mb_act ( mb_start ( r ) , MeWords { } , True { } ) ) ) == False { } : Bool }
+# promise mb_start_reasoning_not_content: when the prompt ends inside reasoning and the request splits reasoning out, the reply's first words are never shown as content.
+# harm mb_start_reasoning_not_content: hidden reasoning would leak into the visible reply
+d636288ec72836e9  mb_stop_ends  law mb_stop_ends : for s : MbState { mb_next ( s , MeStop { } ) == MsDone { } : MbState }
+# promise mb_stop_ends: the end of the reply (its final marker or another role's header) always ends the reply
+16c8d36d53760b48  mb_tools_call_opens  law mb_tools_call_opens : { mb_call_event ( True { } ) == MeOpenCall { } : MbEvent }
+# promise mb_tools_call_opens: with offered tools the call marker always opens a tool call
+9ae35e810404bc43  mb_words_never_close_call  law mb_words_never_close_call : for + s : MbState for + e : MbEvent for + split : Bool { Bool.and ( mb_is_words ( e ) , mb_closes_call ( mb_act ( s , e , split ) ) ) == False { } : Bool }
+# promise mb_words_never_close_call: ordinary text never closes a tool call (a call is read only at a marker or at the end)
 52451ba3c6d0be64  media_canvas_within_limit  law media_canvas_within_limit : for + w : Nat for + h : Nat for + m : Nat { Bool.and ( media_canvas_ok ( w , h , m ) , Nat.is_lt ( m , Nat.mul ( w , h ) ) ) == False { } : Bool }
 # promise media_canvas_within_limit: a canvas the media check accepts never has more pixels (width times height) than the limit.
 9c50354edb3ef860  media_count_over_refused  law media_count_over_refused : for + m : Nat for + extra : Nat { media_count_ok ( Nat.add ( 1n + m , extra ) , m ) == False { } : Bool }
@@ -250,7 +550,99 @@ d9c2a2fe466391df  media_oversized_refused  law media_oversized_refused : for + m
 25c6c5b940cf3cbe  media_remote_follows_setting  law media_remote_follows_setting : for a : Bool { media_source_allowed ( MsRemote { } , a ) == a : Bool }
 ef45a806ccc81bf8  media_zero_height_refused  law media_zero_height_refused : for + w : Nat for m : Nat { media_canvas_ok ( w , 0n , m ) == False { } : Bool }
 61de762b8557772c  media_zero_width_refused  law media_zero_width_refused : for h : Nat for m : Nat { media_canvas_ok ( 0n , h , m ) == False { } : Bool }
+0afeee2dd389f4cb  mmp_choice_is_candidate  law mmp_choice_is_candidate : for ok : Bool for best : MmpPick for + i : Nat for + rank : Nat { mmp_index_from ( mmp_step ( ok , best , i , rank ) , best , i ) == True { } : Bool }
+# promise mmp_choice_is_candidate: the chosen projector file is always the file just seen or the earlier choice, so it is always one of the candidates
+# harm mmp_choice_is_candidate: an index past the candidate list would name no file or another one
+5ba9275418602246  mmp_match_chooses  law mmp_match_chooses : for best : MmpPick for + i : Nat for + rank : Nat { mmp_some ( mmp_step ( True { } , best , i , rank ) ) == True { } : Bool }
+# promise mmp_match_chooses: after a matching projector file has been seen, some file is always chosen
+# harm mmp_match_chooses: a GGUF model with a usable projector beside it would be served text only
+cc6c701e78a98421  mmp_match_rank_bound  law mmp_match_rank_bound : for best : MmpPick for + i : Nat for + rank : Nat { mmp_rank_le ( mmp_step ( True { } , best , i , rank ) , rank ) == True { } : Bool }
+# promise mmp_match_rank_bound: after a matching projector file has been seen, the chosen file's rank is never worse than that file's
+# harm mmp_match_rank_bound: a lossy projector file could be preferred over an exact one beside it
+70bf1cc03dab7397  mmp_narrower_never_matches  law mmp_narrower_never_matches : for family : Bool for + hidden : Nat for + e : Nat { mmp_matches ( family , hidden , Nat.add ( 1n + hidden , e ) ) == False { } : Bool }
+# promise mmp_narrower_never_matches: a projector file whose projection is narrower than the model's hidden size never matches
+# harm mmp_narrower_never_matches: image features of the wrong width would be written into the prompt rows
+f5bea87b0aaf55ba  mmp_never_worse  law mmp_never_worse : for ok : Bool for best : MmpPick for + i : Nat for + rank : Nat { mmp_no_worse ( mmp_step ( ok , best , i , rank ) , best ) == True { } : Bool }
+# promise mmp_never_worse: folding in another projector file never makes the chosen file's rank worse
+# harm mmp_never_worse: a later, worse file in name order could displace a better earlier choice
+77d627c4156f44ad  mmp_other_type_never_matches  law mmp_other_type_never_matches : for + proj : Nat for + hidden : Nat { mmp_matches ( False { } , proj , hidden ) == False { } : Bool }
+# promise mmp_other_type_never_matches: a projector file of another projector type never matches the model
+# harm mmp_other_type_never_matches: a tower of another architecture would be run on this model's images
+bf2525e5de65e5a6  mmp_unmatched_keeps  law mmp_unmatched_keeps : for best : MmpPick for + i : Nat for + rank : Nat { mmp_step ( False { } , best , i , rank ) == best : MmpPick }
+# promise mmp_unmatched_keeps: a projector file that does not match the model leaves the choice exactly as it was, so it is never chosen and nothing is chosen when no file matches
+# harm mmp_unmatched_keeps: a tower of another model (wrong width or type) would be loaded and fed to the text model
+1d0d21fa164e60aa  mmp_wider_never_matches  law mmp_wider_never_matches : for family : Bool for + hidden : Nat for + e : Nat { mmp_matches ( family , Nat.add ( 1n + hidden , e ) , hidden ) == False { } : Bool }
+# promise mmp_wider_never_matches: a projector file whose projection is wider than the model's hidden size never matches
+# harm mmp_wider_never_matches: image features of the wrong width would be written into the prompt rows
 ba223807cabf30d6  moe_zero_experts_rejected  law moe_zero_experts_rejected : for + ek : Nat for + ef : Nat { moe_dims_valid ( 0n , ek , ef ) == False { } : Bool }
+c27d0e7e0a739cda  mt_chat_template_needs_one  law mt_chat_template_needs_one : for + g : Bool for + b : Bool { mt_chat_is_template ( mt_cli_chat ( g , b , False { } ) ) == False { } : Bool }
+# promise mt_chat_template_needs_one: the command line never renders a chat prompt through a template the model does not have.
+4fa2d57c6e33a109  mt_checkpoint_never_file  law mt_checkpoint_never_file : for + f : Bool for + d : Bool { mt_is_file ( mt_source ( False { } , f , d ) ) == False { } : Bool }
+# promise mt_checkpoint_never_file: a checkpoint directory never takes a resource from GGUF metadata.
+7566b430fce2f094  mt_cli_loads_used_template  law mt_cli_loads_used_template : for + g : Bool for + b : Bool { Bool.and ( mt_chat_is_template ( mt_cli_chat ( g , b , True { } ) ) , Bool.not ( mt_cli_wants_template ( True { } , b ) ) ) == False { } : Bool }
+# promise mt_cli_loads_used_template: with --chat on, a template the command-line chat form would render through is always loaded first.
+# harm mt_cli_loads_used_template: the chat form would pick the model's template and find none loaded, or render without it
+16ee78885b6d26f1  mt_cli_no_chat_no_template  law mt_cli_no_chat_no_template : for + b : Bool { mt_cli_wants_template ( False { } , b ) == False { } : Bool }
+# promise mt_cli_no_chat_no_template: the command line never loads a chat template when --chat is off.
+653c55a506916066  mt_dir_needs_file  law mt_dir_needs_file : for + g : Bool for + f : Bool { mt_is_dir ( mt_source ( g , f , False { } ) ) == False { } : Bool }
+# promise mt_dir_needs_file: a resource is taken from the directory only when the directory has it.
+de65bf930a4e1923  mt_file_needs_key  law mt_file_needs_key : for + g : Bool for + d : Bool { mt_is_file ( mt_source ( g , False { } , d ) ) == False { } : Bool }
+# promise mt_file_needs_key: a resource is taken from the file's metadata only when the metadata carries it.
+64338bf0ab2e81b7  mt_id_within  law mt_id_within : for + id : Nat for + n : Nat { Bool.and ( mt_id_ok ( id , n ) , Nat.is_le ( n , id ) ) == False { } : Bool }
+# promise mt_id_within: a token id the reader accepts always names a token inside the vocabulary.
+# harm mt_id_within: an end-of-sequence or padding id past the vocabulary would index outside the token tables.
+5e7015532282b750  mt_normal_not_added  law mt_normal_not_added : { mt_tok_added ( MtTokNormal { } ) == False { } : Bool }
+# promise mt_normal_not_added: an ordinary vocabulary entry is never matched as an added token.
+6862430f2282c5fc  mt_special_is_added  law mt_special_is_added : for + k : MtTokKind { Bool.and ( mt_tok_special ( k ) , Bool.not ( mt_tok_added ( k ) ) ) == False { } : Bool }
+# promise mt_special_is_added: a special token is always an added token, matched whole and never built by merges.
+0d2efdb4f46dc7eb  mt_vocab_nonempty  law mt_vocab_nonempty : for + t : Nat for + lim : Nat { mt_vocab_ok ( 0n , t , lim ) == False { } : Bool }
+# promise mt_vocab_nonempty: an empty vocabulary is never accepted.
+1749afe402ddc20e  mt_vocab_within  law mt_vocab_within : for + n : Nat for + t : Nat for + lim : Nat { Bool.and ( mt_vocab_ok ( n , t , lim ) , Nat.is_lt ( lim , n ) ) == False { } : Bool }
+# promise mt_vocab_within: a vocabulary the reader accepts never has more tokens than the limit it was checked against.
+# harm mt_vocab_within: a hostile token count could overflow the 32-bit token ids or exhaust host memory.
+b4a6b681bc295164  mtp_ctx_chunks_some  law mtp_ctx_chunks_some : for + p : Nat for + c : Nat { Nat.is_le ( 1n , mtp_ctx_chunks ( p , c ) ) == True { } : Bool }
+# promise mtp_ctx_chunks_some: a block always reads at least one chunk of the global layer's cache.
+29355ae428fb6250  mtp_ctx_seen_before_anchor  law mtp_ctx_seen_before_anchor : for + p : Nat for + w : Nat for + b : Bool { Nat.is_le ( mtp_ctx_seen ( p , w , b ) , p ) == True { } : Bool }
+# promise mtp_ctx_seen_before_anchor: a block never reads more context positions than lie before its anchor, so it never reads the anchor's own position or a later one.
+# harm mtp_ctx_seen_before_anchor: the drafter would attend rows of rejected drafts or stale rows of an earlier request.
+1a08ebf1dc5f18da  mtp_ctx_seen_in_window  law mtp_ctx_seen_in_window : for + p : Nat for + w : Nat { Nat.is_le ( mtp_ctx_seen ( p , w , True { } ) , w ) == True { } : Bool }
+# promise mtp_ctx_seen_in_window: a windowed layer never reads more context positions than its window.
+d7874225d04023c5  mtp_draft_count_in_block  law mtp_draft_count_in_block : for + b : Nat for + k : Nat { Nat.is_le ( mtp_draft_count ( b , k ) , Nat.sub ( b , 1n ) ) == True { } : Bool }
+# promise mtp_draft_count_in_block: a block never yields more drafts than it has mask rows.
+98e5c5f9e324eb8d  mtp_draft_count_in_pass  law mtp_draft_count_in_pass : for + b : Nat for + k : Nat { Nat.is_le ( mtp_draft_count ( b , k ) , k ) == True { } : Bool }
+# promise mtp_draft_count_in_pass: a block never yields more drafts than the verify pass has rows for.
+d5b501b0c2c5ee3b  mtp_frnn_row_in_pass  law mtp_frnn_row_in_pass : for + r : Nat for + n : Nat { Nat.is_lt ( mtp_frnn_row ( r , 1n + n ) , 1n + n ) == True { } : Bool }
+# promise mtp_frnn_row_in_pass: the recurrent head's context row is always a row the last context pass wrote.
+884d4cac92212815  mtp_ring_ok_holds  law mtp_ring_ok_holds : for + r : Nat for + w : Nat for + a : Nat { Bool.and ( mtp_ring_ok ( r , w , a ) , Nat.is_lt ( r , Nat.add ( w , a ) ) ) == False { } : Bool }
+# promise mtp_ring_ok_holds: a ring the check accepts always holds the window beside every row a context pass writes ahead of the anchor.
+# harm mtp_ring_ok_holds: a row written ahead would overwrite a context position the block still reads.
+86e2fe57525a5ec7  mtpf_choice_is_candidate  law mtpf_choice_is_candidate : for drafter : Bool for + hid : Nat for + model_hid : Nat for + vocab : Nat for + model_vocab : Nat for best : MmpPick for + i : Nat for + rank : Nat { mmp_index_from ( mtpf_step ( drafter , hid , model_hid , vocab , model_vocab , best , i , rank ) , best , i ) == True { } : Bool }
+# promise mtpf_choice_is_candidate: the chosen drafter file is always the file just seen or the earlier choice, so it is always one of the candidates
+# harm mtpf_choice_is_candidate: an index past the candidate list would name no file or another one
+3448a9fc595d8992  mtpf_less_vocab_keeps  law mtpf_less_vocab_keeps : for drafter : Bool for + hid : Nat for + model_hid : Nat for + vocab : Nat for + e : Nat for best : MmpPick for + i : Nat for + rank : Nat { mtpf_step ( drafter , hid , model_hid , vocab , Nat.add ( 1n + vocab , e ) , best , i , rank ) == best : MmpPick }
+# promise mtpf_less_vocab_keeps: a drafter file with a smaller vocabulary than the model's leaves the choice exactly as it was, so it is never chosen
+# harm mtpf_less_vocab_keeps: the drafter of another tokenizer would propose ids that mean other text
+a6e42a07de382d3e  mtpf_long_never_fits  law mtpf_long_never_fits : for + need : Nat for + cap : Nat for + e : Nat { mtpf_rows_fit ( Nat.add ( 1n + cap , e ) , need , cap ) == False { } : Bool }
+# promise mtpf_long_never_fits: a stored table with more rows than the device tensor holds is never taken
+# harm mtpf_long_never_fits: the upload would write past the device tensor into the next one
+6b9d72f310d9f094  mtpf_match_chooses  law mtpf_match_chooses : for + hid : Nat for + vocab : Nat for best : MmpPick for + i : Nat for + rank : Nat { mmp_some ( mtpf_step ( True { } , hid , hid , vocab , vocab , best , i , rank ) ) == True { } : Bool }
+# promise mtpf_match_chooses: after a drafter file that matches the model has been seen, some file is always chosen
+# harm mtpf_match_chooses: a GGUF model with a usable drafter beside it would refuse speculative decoding
+95e37b7b7075f756  mtpf_more_vocab_keeps  law mtpf_more_vocab_keeps : for drafter : Bool for + hid : Nat for + model_hid : Nat for + model_vocab : Nat for + e : Nat for best : MmpPick for + i : Nat for + rank : Nat { mtpf_step ( drafter , hid , model_hid , Nat.add ( 1n + model_vocab , e ) , model_vocab , best , i , rank ) == best : MmpPick }
+# promise mtpf_more_vocab_keeps: a drafter file with a larger vocabulary than the model's leaves the choice exactly as it was, so it is never chosen
+# harm mtpf_more_vocab_keeps: the drafter of another tokenizer would propose ids that mean other text
+6b2e35850819afe1  mtpf_narrower_keeps  law mtpf_narrower_keeps : for drafter : Bool for + hid : Nat for + e : Nat for + vocab : Nat for + model_vocab : Nat for best : MmpPick for + i : Nat for + rank : Nat { mtpf_step ( drafter , hid , Nat.add ( 1n + hid , e ) , vocab , model_vocab , best , i , rank ) == best : MmpPick }
+# promise mtpf_narrower_keeps: a drafter file narrower than the model's hidden size leaves the choice exactly as it was, so it is never chosen
+# harm mtpf_narrower_keeps: the drafter of another model would read the model's states with the wrong width
+624a5bf8b0620e8c  mtpf_other_layout_keeps  law mtpf_other_layout_keeps : for + hid : Nat for + model_hid : Nat for + vocab : Nat for + model_vocab : Nat for best : MmpPick for + i : Nat for + rank : Nat { mtpf_step ( False { } , hid , model_hid , vocab , model_vocab , best , i , rank ) == best : MmpPick }
+# promise mtpf_other_layout_keeps: a file that is not a block drafter of the family's layout leaves the choice exactly as it was, so it is never chosen
+# harm mtpf_other_layout_keeps: a projector, a main model or another kind of drafter would be loaded as the block drafter's weights
+39534d0d89436ae5  mtpf_short_never_fits  law mtpf_short_never_fits : for + rows : Nat for + e : Nat for + cap : Nat { mtpf_rows_fit ( rows , Nat.add ( 1n + rows , e ) , cap ) == False { } : Bool }
+# promise mtpf_short_never_fits: a stored table with fewer rows than the drafter reads is never taken
+# harm mtpf_short_never_fits: the recurrent head would read token rows past the end of the stored table
+1f6cbcbb1f671314  mtpf_wider_keeps  law mtpf_wider_keeps : for drafter : Bool for + model_hid : Nat for + e : Nat for + vocab : Nat for + model_vocab : Nat for best : MmpPick for + i : Nat for + rank : Nat { mtpf_step ( drafter , Nat.add ( 1n + model_hid , e ) , model_hid , vocab , model_vocab , best , i , rank ) == best : MmpPick }
+# promise mtpf_wider_keeps: a drafter file wider than the model's hidden size leaves the choice exactly as it was, so it is never chosen
+# harm mtpf_wider_keeps: the drafter of another model would read the model's states with the wrong width
 7d7f156c04961994  orient_mirror_in_range  law orient_mirror_in_range : for + i : Nat for + p : Nat { Nat.is_le ( orient_mirror ( i , 1n + p ) , p ) == True { } : Bool }
 1b6bb5e0fe9aa632  oversized_prompt_rejected  law oversized_prompt_rejected : for + lmax : Nat for + extra : Nat { prompt_admitted ( Nat.add ( served_ctx ( lmax ) , extra ) , lmax ) == False { } : Bool }
 b90e1722fbf1d3b6  pc_abort_leaves_nothing  law pc_abort_leaves_nothing : for + s : PcSlot for + t : Nat { pc_abort ( pc_begin_write ( s , t ) ) == PcEmpty { } : PcSlot }

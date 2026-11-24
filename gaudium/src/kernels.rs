@@ -181,6 +181,32 @@ const STATIC_ELF_VARS: &[(&str, &str)] = &[
     ("GAUDIUM_ASOFTCX4Q_ELF", "attn_softmax_chunkx4q_gaudi2.o"),
     ("GAUDIUM_ASOFTC8Q_ELF", "attn_softmax_chunk8q_gaudi2.o"),
     ("GAUDIUM_ASOFTCX8Q_ELF", "attn_softmax_chunkx8q_gaudi2.o"),
+    // Inkling 2 kernels (libgaudium_ik.so)
+    ("GAUDIUM_IKMIX_ELF", "ik_mix_gaudi2.o"),
+    ("GAUDIUM_IKMIXF_ELF", "ik_mixf_gaudi2.o"),
+    ("GAUDIUM_IKGIN_ELF", "ik_gin_gaudi2.o"),
+    ("GAUDIUM_IKMGATE_ELF", "ik_mgate_gaudi2.o"),
+    ("GAUDIUM_IKMGATEF_ELF", "ik_mgatef_gaudi2.o"),
+    ("GAUDIUM_IKNORM_ELF", "ik_norm_gaudi2.o"),
+    ("GAUDIUM_IKSAVE_ELF", "ik_save_gaudi2.o"),
+    ("GAUDIUM_IKCONVA_ELF", "ik_conva_gaudi2.o"),
+    ("GAUDIUM_IKCONVM_ELF", "ik_convm_gaudi2.o"),
+    ("GAUDIUM_IKQPREP_ELF", "ik_qprep_gaudi2.o"),
+    ("GAUDIUM_IKKVPREP_ELF", "ik_kvprep_gaudi2.o"),
+    ("GAUDIUM_IKSOFT_ELF", "ik_softmax_gaudi2.o"),
+    ("GAUDIUM_IKCOMB_ELF", "ik_combine_gaudi2.o"),
+    ("GAUDIUM_IKROUTE_ELF", "ik_route_gaudi2.o"),
+    ("GAUDIUM_IKACT_ELF", "ik_moe_act_gaudi2.o"),
+    ("GAUDIUM_IKARGMAX_ELF", "ik_argmax_gaudi2.o"),
+    // Inkling 2 block drafter kernels (libgaudium_ik.so)
+    ("GAUDIUM_IKDMIX_ELF", "ik_dmix_gaudi2.o"),
+    ("GAUDIUM_IKDKV_ELF", "ik_dkv_gaudi2.o"),
+    ("GAUDIUM_IKDQPREP_ELF", "ik_dqprep_gaudi2.o"),
+    ("GAUDIUM_IKDSOFT_ELF", "ik_dsoft_gaudi2.o"),
+    ("GAUDIUM_IKDCOMB_ELF", "ik_dcomb_gaudi2.o"),
+    ("GAUDIUM_IKDSWIGLU_ELF", "ik_dswiglu_gaudi2.o"),
+    ("GAUDIUM_IKMSTEP_ELF", "ik_mstep_gaudi2.o"),
+    ("GAUDIUM_IKMARGMAX_ELF", "ik_margmax_gaudi2.o"),
     // Gemma 4 kernels (libgaudium_ga.so)
     ("GAUDIUM_GAPREP_ELF", "ga_prep_gaudi2.o"),
     ("GAUDIUM_GAPREPK_ELF", "ga_prepk_gaudi2.o"),
@@ -307,6 +333,9 @@ pub fn all_elf_mappings() -> Vec<(String, String)> {
 /// Glue plugin of the step kernels added after the first kernel set (`kernels/glue/st_glue.cpp`).
 pub const STEP_GLUE: &str = "libgaudium_st.so";
 
+/// Glue plugin of the Inkling 2 kernels (`kernels/glue/ik_glue.cpp`).
+pub const INKLING2_GLUE: &str = "libgaudium_ik.so";
+
 /// Resolved kernel & glue environment for a Gaudium run.
 #[derive(Debug, Clone)]
 pub struct KernelEnv {
@@ -346,6 +375,10 @@ impl KernelEnv {
         let st_glue = kernels_dir.join(STEP_GLUE);
         if st_glue.is_file() {
             gc_parts.push(st_glue.to_string_lossy().into_owned());
+        }
+        let ik_glue = kernels_dir.join(INKLING2_GLUE);
+        if ik_glue.is_file() {
+            gc_parts.push(ik_glue.to_string_lossy().into_owned());
         }
         if let Ok(existing) = std::env::var("GC_KERNEL_PATH") {
             for part in existing.split(':').filter(|s| !s.is_empty()) {
@@ -408,6 +441,16 @@ impl KernelEnv {
                 .map(|raw| (STEP_GLUE.to_string(), sha256_hex(&raw)))
                 .map_err(|e| format!("read {}: {e}", p.display()))
         })
+    }
+
+    /// Hash of one glue library of the kernels directory, for the fingerprints of the recipes that
+    /// use its kernels. A family's own library is not part of [`Self::fingerprint_hashes`], so the
+    /// other families' recipes keep their keys when it changes.
+    pub fn glue_hash(&self, name: &str) -> Result<(String, String), String> {
+        let p = self.kernels_dir.join(name);
+        std::fs::read(&p)
+            .map(|raw| (name.to_string(), sha256_hex(&raw)))
+            .map_err(|e| format!("read {}: {e}", p.display()))
     }
 
     /// Computes normalized SHA-256 hashes for the glue `.so`(s) and every requested `GAUDIUM_*_ELF`

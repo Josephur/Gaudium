@@ -9,6 +9,7 @@ pub mod fp8_pack;
 pub mod gemma4;
 pub mod gemma4_fp8;
 pub mod gemma4_packer;
+pub mod inkling2;
 pub mod mem_report;
 pub mod moe;
 pub mod packer;
@@ -198,8 +199,62 @@ impl GenEngine for gemma4::Gemma4Engine {
     }
 }
 
+impl GenEngine for inkling2::Inkling2Engine {
+    fn spec(&self) -> &ModelSpec {
+        inkling2::Inkling2Engine::spec(self)
+    }
+    fn max_ctx(&self) -> u64 {
+        inkling2::Inkling2Engine::max_ctx(self)
+    }
+    fn hbm_bytes(&self) -> [u64; 5] {
+        inkling2::Inkling2Engine::hbm_bytes(self)
+    }
+    fn generate_cancellable(
+        &mut self,
+        prompt_ids: &[i32],
+        params: &GenParams,
+        cancel: Option<&AtomicBool>,
+        on_token: &mut dyn FnMut(i32),
+    ) -> Result<GenReport, String> {
+        inkling2::Inkling2Engine::generate_cancellable(self, prompt_ids, params, cancel, on_token)
+    }
+    fn live_profile(&self) -> Option<crate::live_report::ProfileHandle> {
+        Some(inkling2::Inkling2Engine::live_profile(self))
+    }
+    fn prefix_stats(&self) -> Option<qwen3::prefix_cache::PrefixStats> {
+        inkling2::Inkling2Engine::prefix_stats(self)
+    }
+    fn vision_spec(&self) -> Option<&crate::vision::VisionSpec> {
+        inkling2::Inkling2Engine::vision_spec(self)
+    }
+    fn set_request_images(
+        &mut self,
+        images: Vec<crate::vision::PreparedImage>,
+    ) -> Result<(), String> {
+        inkling2::Inkling2Engine::set_request_images(self, images)
+    }
+    fn last_vision_report(&self) -> Option<crate::vision::VisionReport> {
+        inkling2::Inkling2Engine::last_vision_report(self)
+    }
+    fn read_vision_embeddings(&self) -> Result<Vec<u8>, String> {
+        inkling2::Inkling2Engine::read_vision_embeddings(self)
+    }
+}
+
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
 pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
+    if crate::gguf::looks_like_gguf(&cfg.model_dir) {
+        // a GGUF file names its family in its metadata
+        let g = crate::gguf::Gguf::open(&cfg.model_dir).map_err(|e| format!("open GGUF: {e}"))?;
+        if inkling2::gguf_source::is_family(&g) {
+            drop(g);
+            return Ok(Box::new(inkling2::Inkling2Engine::load(cfg)?));
+        }
+        return Err(format!(
+            "no live Gaudi 2 engine loads a GGUF file of architecture '{}' yet",
+            g.arch()
+        ));
+    }
     let spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
         .map_err(|e| format!("load config.json: {e}"))?;
     match spec.family {
@@ -207,6 +262,7 @@ pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
             Ok(Box::new(qwen3::Qwen3Engine::load(cfg)?))
         }
         ModelFamily::Gemma4 => Ok(Box::new(gemma4::Gemma4Engine::load(cfg)?)),
+        ModelFamily::Inkling2 => Ok(Box::new(inkling2::Inkling2Engine::load(cfg)?)),
         other => Err(format!(
             "no live Gaudi 2 engine is wired up for model family {other:?} yet"
         )),
@@ -229,14 +285,12 @@ pub fn build_cache(cfg: &EngineConfig) -> Result<(), String> {
 }
 
 /// The model's own context limit (`max_position_embeddings` in `config.json`, looked up in
-/// `text_config` for multimodal checkpoints); `None` when the config does not state one.
+/// `text_config` for multimodal checkpoints, or a GGUF file's `<arch>.context_length`); `None`
+/// when the model does not state one (`ModelText::max_positions`).
 pub fn model_max_positions(model_dir: &std::path::Path) -> Option<u64> {
-    let txt = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
-    let root = crate::json::parse_json(&txt).ok()?;
-    let tc = root.get("text_config").unwrap_or(&root);
-    tc.get("max_position_embeddings")
-        .and_then(crate::json::JsonValue::as_u64)
-        .filter(|&n| n > 0)
+    crate::model_text::ModelText::open(model_dir)
+        .ok()?
+        .max_positions()
 }
 
 /// Clamps a requested context capacity to what the model supports, in whole KV chunks

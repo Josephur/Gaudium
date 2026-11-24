@@ -267,6 +267,8 @@ pub struct MediaCounts {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestMedia {
     pub items: Vec<MediaItem>,
+    /// The template's text for one image (`VisionSpec::image_block`; empty: `IMAGE_BLOCK`).
+    pub image_block: String,
     /// Host time spent decoding and preparing (ms).
     pub host_ms: f64,
 }
@@ -337,17 +339,24 @@ fn prepare_one_image(
     serve: &VisionServe,
     with_pixels: bool,
 ) -> Result<PreparedImage, String> {
-    let img = if with_pixels {
+    let (rgb, width, height) = if with_pixels {
         let rgb = decode::decode_image(bytes, &serve.decode_limits())?;
-        prepare_image(&rgb, &serve.spec)?
+        let (w, h) = (rgb.width, rgb.height);
+        (Some(rgb), w, h)
     } else {
         let p = decode::probe(bytes)?;
         serve.decode_limits().check_canvas(p.width, p.height)?;
-        let (rh, rw) = image_target_size(p.width, p.height, &serve.spec)?;
-        PreparedImage::sized((p.width, p.height), rw, rh, &serve.spec)
+        (None, p.width, p.height)
     };
-    check_tower_fit(&img, serve)?;
-    Ok(img)
+    // the tower's budget is checked on the sizes, before any patch row is made: a model whose
+    // processor pads to whole tiles never resizes, so its patch rows can be far beyond the tower
+    let (rh, rw) = image_target_size(width, height, &serve.spec)?;
+    let sized = PreparedImage::sized((width, height), rw, rh, &serve.spec);
+    check_tower_fit(&sized, serve)?;
+    match rgb {
+        Some(rgb) => prepare_image(&rgb, &serve.spec),
+        None => Ok(sized),
+    }
 }
 
 /// Where a video's frames come from, after the request's references are resolved.
@@ -592,6 +601,7 @@ impl RequestMedia {
         }
         Ok(Self {
             items,
+            image_block: serve.spec.image_block.clone(),
             host_ms: t0.elapsed().as_secs_f64() * 1000.0,
         })
     }
@@ -635,15 +645,20 @@ impl RequestMedia {
     /// block per temporal patch with its time in front. Image blocks stay as they are. The
     /// blocks in the text must be this request's media, in order.
     pub fn expand_text(&self, prompt: &str) -> Result<String, String> {
+        let image_block = if self.image_block.is_empty() {
+            IMAGE_BLOCK
+        } else {
+            self.image_block.as_str()
+        };
         let mut out = String::with_capacity(prompt.len());
         let mut rest = prompt;
         for it in &self.items {
             let (block, what) = match it {
-                MediaItem::Image(_) => (IMAGE_BLOCK, "image"),
+                MediaItem::Image(_) => (image_block, "image"),
                 MediaItem::Video(_) => (VIDEO_BLOCK, "video"),
             };
             // the next block of either kind must be this item's
-            let next = [IMAGE_BLOCK, VIDEO_BLOCK]
+            let next = [image_block, VIDEO_BLOCK]
                 .iter()
                 .filter_map(|b| rest.find(b).map(|at| (at, *b)))
                 .min();
@@ -659,7 +674,7 @@ impl RequestMedia {
             }
             out.push_str(&rest[..at]);
             match it {
-                MediaItem::Image(_) => out.push_str(IMAGE_BLOCK),
+                MediaItem::Image(_) => out.push_str(image_block),
                 MediaItem::Video(v) => {
                     for &t in &v.times {
                         out.push_str(&time_label(t));
@@ -669,7 +684,7 @@ impl RequestMedia {
             }
             rest = &rest[at + block.len()..];
         }
-        if rest.contains(IMAGE_BLOCK) || rest.contains(VIDEO_BLOCK) {
+        if rest.contains(image_block) || rest.contains(VIDEO_BLOCK) {
             return Err(
                 "the prompt has more image or video placeholders than the conversation has images and videos".into(),
             );
@@ -771,6 +786,24 @@ mod tests {
         let mut f = format!("P6\n{w} {h}\n255\n").into_bytes();
         f.extend_from_slice(data);
         format!("data:image/x-portable-pixmap;base64,{}", base64(&f))
+    }
+
+    /// A model whose processor pads to whole tiles never resizes: an image beyond the tower is
+    /// refused on its sizes, before its patch rows are made.
+    #[test]
+    fn a_tiled_image_beyond_the_tower_is_refused_on_its_sizes() {
+        let mut spec = qwen38_vision_spec();
+        spec.processor = crate::vision::ImageProcessor::Tiles;
+        let serve = VisionServe::new(spec, 1024, 16384, MediaLimits::default()).unwrap();
+        // 40000 x 1 pixels: 1250 tiles of 2 x 2 patches, 5000 patches for a tower of 1024
+        let (w, h) = (40_000usize, 1usize);
+        let mut f = format!("P6\n{w} {h}\n255\n").into_bytes();
+        f.extend(std::iter::repeat_n(7u8, w * h * 3));
+        let e = prepare_one_image(&f, &serve, true).unwrap_err();
+        assert!(e.contains("planned for 1024"), "{e}");
+        // the same image without its pixels gives the same refusal
+        let e2 = prepare_one_image(&f, &serve, false).unwrap_err();
+        assert_eq!(e, e2);
     }
 
     fn serve(max_patches: u64, max_tokens: u64) -> VisionServe {
