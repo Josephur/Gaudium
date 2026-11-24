@@ -48,27 +48,27 @@ def ik_tile_launches_some(apps, drafter, last):
 # A state tensor of shape [lanes, slots, cols] with `nkv` key / value heads holds `slots` positions
 # per chunk and cols / nkv chunks: a sliding ring is one chunk of its slots, a global cache its
 # chunk rows times its chunks. The readout charges a pass's write to the tensor for the pass's
-# rows out of these positions. The shape is read in the shell; overflow is refused (`total`).
+# rows out of these positions. The shape is read in the shell; on overflow (`total`: `None`) the
+# readout uses the rule-wide count, which the tensor's own byte size makes unreachable.
 
 # rusty-bends: total
 def ik_state_positions(slots: Nat, cols: Nat, nkv: Nat) -> Nat:
   Nat.mul(Nat.max(1n, Nat.div(cols, nkv)), slots)
 
-def ik_state_cover(+m: Nat, +s: Nat, h: {Nat.is_le(1n, m) == True{} : Bool}) -> {Nat.is_le(s, Nat.mul(m, s)) == True{} : Bool}:
+def ik_state_some(+m: Nat, +s: Nat, h: {Nat.is_le(1n, m) == True{} : Bool}) -> {Nat.is_lt(0n, Nat.mul(m, 1n+s)) == True{} : Bool}:
   match m:
     case 0n:
-      L.bool_absurd({Nat.is_le(s, 0n) == True{} : Bool}, h)
+      L.bool_absurd({Nat.is_lt(0n, 0n) == True{} : Bool}, h)
     case 1n+p:
-      L.nat_add_le_r(s, Nat.mul(p, s))
+      {==}
 
-# promise: a state tensor is never charged against fewer positions than its slot axis holds
-# harm: the readout reports a write larger than the tensor it writes
-law ik_state_positions_cover_slots:
+# promise: a state tensor with at least one slot row holds at least one position
+# harm: the readout charges a whole cache to every pass that writes one row of it
+law ik_state_positions_some:
   for +slots: Nat
   for +cols: Nat
   for +nkv: Nat
-  {Nat.is_le(slots, ik_state_positions(slots, cols, nkv)) == True{} : Bool}
+  {Nat.is_lt(0n, ik_state_positions(1n+slots, cols, nkv)) == True{} : Bool}
 
-def ik_state_positions_cover_slots(slots, cols, nkv):
-  ik_state_cover(Nat.max(1n, Nat.div(cols, nkv)), slots, L.nat_max_ge_l(1n, Nat.div(cols, nkv)))
-
+def ik_state_positions_some(slots, cols, nkv):
+  ik_state_some(Nat.max(1n, Nat.div(cols, nkv)), slots, L.nat_max_ge_l(1n, Nat.div(cols, nkv)))

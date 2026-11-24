@@ -47,7 +47,8 @@ fn kv_positions_of(name: &str, dims: &[u64], nkv: u64) -> Option<u64> {
     if !(is_kv_name(name) || name.starts_with("mts_")) || dims.len() != 3 {
         return None;
     }
-    // the count is the verified one (`verified/inkling2_readout.bend`); `None` on overflow
+    // the count is the verified one (`verified/inkling2_readout.bend`); on overflow (`None`) the
+    // caller uses the rule-wide count, unreachable while the tensor's byte size fits
     crate::verified::ik_state_positions(dims[1], dims[2], nkv)
 }
 
@@ -145,22 +146,20 @@ pub(super) fn prefill_tile(
     last: bool,
 ) -> Traffic {
     let mut tr = charge(&build_embed_graph(d, t, &[]), t, nch, d.nkv);
-    let mut kinds: Vec<(IkKind, f64)> = Vec::new();
+    // every application adds the traffic of its own launch; the four graph kinds are built once
+    let mut built: Vec<(IkKind, Traffic)> = Vec::new();
     for app in d.run_apps() {
         let k = IkKind {
             sliding: app.sliding,
             msgs: app.msgs,
         };
-        match kinds.iter_mut().find(|(c, _)| *c == k) {
-            Some(e) => e.1 += 1.0,
-            None => kinds.push((k, 1.0)),
+        if !built.iter().any(|(c, _)| *c == k) {
+            let gb = build_app_graph(d, k, t, lmax, nch, &[]);
+            built.push((k, charge(&gb, t, nch, d.nkv)));
         }
-    }
-    for (k, n) in kinds {
-        tr.add(
-            &charge(&build_app_graph(d, k, t, lmax, nch, &[]), t, nch, d.nkv),
-            n,
-        );
+        if let Some((_, app_tr)) = built.iter().find(|(c, _)| *c == k) {
+            tr.add(app_tr, 1.0);
+        }
     }
     let fin = charge(&build_final_graph(d, t, &[]), t, nch, d.nkv);
     if let Some(g) = drafter {
@@ -290,7 +289,10 @@ mod tests {
         assert_eq!(kv_positions_of("L7_W_gate", &[128, 4096, 16], d.nkv), None);
         // today's arithmetic, pinned here: chunks = cols / nkv (at least one), a ring is one
         assert_eq!(kv_positions_of("A0_kring", &[128, 2048, 8], 8), Some(2048));
-        assert_eq!(kv_positions_of("A5_kcache", &[128, 4096, 24], 8), Some(3 * 4096));
+        assert_eq!(
+            kv_positions_of("A5_kcache", &[128, 4096, 24], 8),
+            Some(3 * 4096)
+        );
         assert_eq!(kv_positions_of("A0_kring", &[128, 2048, 8], 0), Some(2048));
         assert_eq!(kv_positions_of("A5_kcache", &[128, u64::MAX, 16], 8), None);
         // the drafter: a local layer's ring, the global layer's chunks
