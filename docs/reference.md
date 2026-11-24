@@ -85,7 +85,8 @@ Serve options:
                         the one before it prefills only the rest, with the same output
                         as a whole prefill. N = positions of the previous prompt whose
                         recurrent state is kept on the card to resume from (default: 8;
-                        0 = off; 0.15 GiB each for a 48-layer DeltaNet model). The
+                        0 = off; at most 4096; 0.15 GiB each for a 48-layer DeltaNet
+                        model). The
                         context is planned first: a load keeps as many as fit beside
                         it and says so. A request with cache_prompt: false prefills
                         its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a
@@ -94,6 +95,20 @@ Serve options:
                         are resumed while the bounded rings still hold what the rest
                         of the prompt reads, and a copy of the rings taken when each
                         prompt is in, 0.6 GiB, covers a long generation after it)
+  --parallel <N>        Requests a model runs at once (default: 1; at most 16): each in a
+                        lane of its own (its own K/V rows, recurrent state and prefix
+                        reuse), the decoding lanes stepped together in one launch that
+                        reads the weights once. Every stream is token-identical to the
+                        same request run alone. Further requests wait in arrival order;
+                        a request with images runs alone. Each lane holds the full
+                        context (--max-ctx / --model-ctx): a load that cannot plan N
+                        lanes of it is refused with the numbers. A request goes to the
+                        free lane where it takes over the most of its prompt for the
+                        least of another conversation's rows. Dense Qwen3 /
+                        Qwen3.5 / Qwen3.8 models without a drafter; other models are
+                        served with one lane (the log says why). /props total_slots
+                        and /slots show the lanes. Not with --cache-ram yet (the
+                        host-RAM tier is off for a model served with lanes)
   --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a
                         conversation: after another conversation, another model, or
                         the idle release (--idle-park). What a request could resume
@@ -121,8 +136,10 @@ Serve options:
                         default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock
                         state dir). Keys: group_max_wait_min (default 45), group_max_skips
                         (default 3): a request for the loaded model may run ahead of older
-                        requests until the oldest has waited that long or been passed over
-                        that many times
+                        requests until one of them has waited that long or been passed over
+                        that many times (a request a --parallel lane session admits
+                        counts too: the session then lets its lanes drain and hands
+                        the card on)
   --draft-model <id=dir> Drafter checkpoint for model <id>: speculative decoding, output
                         token-identical to K=0 (repeatable, one per model). The kind
                         follows the directory name: a block drafter when it contains

@@ -124,6 +124,10 @@ pub struct Qwen3Config {
     /// [kv8] Calibration load (`gaudium --kv-calibrate`): BF16 caches, read back after every
     /// prefill for their per-head maxima.
     pub kv_calibrate: bool,
+
+    /// Requests served at once (`--parallel`): lanes with their own K/V rows, recurrent state
+    /// and prefix table, decoded together in batched steps. 1 = one request at a time.
+    pub lanes: u64,
 }
 
 impl Qwen3Config {
@@ -156,6 +160,8 @@ impl Qwen3Config {
             kv_dtype: crate::verified::KvDtype::KvBf16,
             kv_scales: None,
             kv_calibrate: false,
+
+            lanes: 1,
         }
     }
 }
@@ -277,6 +283,30 @@ pub struct ForkRecord {
     pub forced_logit: f32,
 }
 
+/// What a request's prefill left (`Qwen3Engine::run_prefill`).
+pub(super) enum Prefilled {
+    /// The first token is read out.
+    First(PrefillFirst),
+    /// The request was cancelled during its prefill (its report).
+    Cancelled(Qwen3GenReport),
+    /// A one-row prompt left to its first decode step.
+    OneRow { gdn_parity: usize, ttft_recipe_ms: f64 },
+}
+
+/// The end of a prefill that read out the first token.
+pub(super) struct PrefillFirst {
+    /// The token as the readout gave it (before any teacher forcing).
+    pub first_tok: i32,
+    pub first_logits_hbm: u64,
+    pub ttft_ms: f64,
+    pub prefill_tok_s: f64,
+    pub ttft_recipe_ms: f64,
+    /// Ping-pong buffer the recurrent state is in after the prefill.
+    pub gdn_parity: usize,
+    /// A sampled request with the on-card sampler.
+    pub samp_on: bool,
+}
+
 #[path = "qwen3_samp.rs"]
 mod samp_rt;
 #[path = "spec.rs"]
@@ -299,6 +329,9 @@ mod wave_rt;
 // [step] enqueue-ahead greedy K=0 decode (token fed back on the card)
 #[path = "qwen3_k0pipe.rs"]
 mod k0pipe;
+// [lanes] several requests at once, batched steps (`--parallel`)
+#[path = "qwen3_lanes.rs"]
+pub mod lanes_rt;
 
 /// Required kernel ELFs for plain Qwen3 (`DH=128, NKV=8, GQ=4`).
 const QWEN3_G8Q4_ELFS: &[&str] = &[
@@ -522,31 +555,36 @@ fn append_attn_layer(
 ) -> (TensorId, Option<TensorId>) {
     let hid = spec.hidden;
     let nh = spec.n_heads;
-    let nkv = spec.n_kv_heads;
     let dh = spec.head_dim;
+    gb.set_fp8_weights(spec.fp8_weights); // [fp8 hook]
+    let (qg, k, v) = append_attn_proj(gb, spec, x, h_pre, lpfx, t);
+    let core = append_attn_core(gb, spec, qg, k, v, cursor, rope_c, rope_s, lpfx, lpfx, t, nch);
+    let attn = add_linear_bf16(
+        gb,
+        core,
+        &format!("{lpfx}W_o"),
+        nh * dh,
+        hid,
+        t,
+        &format!("{lpfx}attn"),
+    );
+
+    append_post_and_mlp(gb, spec, x, attn, lpfx, t, fused_anorm, wnext_norm)
+}
+
+/// The input norm (unless fused into the previous layer: `h_pre`) and the q / K / V projections
+/// of a full-attention layer over `t` rows: `(qg {qg_dim, t}, k {kv_dim, t}, v {kv_dim, t})`.
+pub(crate) fn append_attn_proj(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    x: TensorId,
+    h_pre: Option<TensorId>,
+    lpfx: &str,
+    t: u64,
+) -> (TensorId, TensorId, TensorId) {
+    let hid = spec.hidden;
     let qg_dim = spec.qg_dim();
     let kvd = spec.kv_dim();
-    let gq = nh / nkv;
-    let r = gq * t;
-    let b = nkv * nch;
-    gb.set_fp8_weights(spec.fp8_weights); // [fp8 hook]
-
-    let g_aprep = if dh == 128 {
-        "gaudium_attn128_prep"
-    } else {
-        "gaudium_attn_prep"
-    };
-    let g_acomb = if dh == 128 {
-        "gaudium_attn128_combine"
-    } else {
-        "gaudium_attn_combine"
-    };
-    let g_apost = if dh == 128 {
-        "gaudium_attn128_post"
-    } else {
-        "gaudium_attn_post_f32"
-    };
-
     let h = match h_pre {
         Some(h_in) => h_in,
         None => add_rmsnorm(gb, spec, x, &format!("{lpfx}w_in"), &format!("{lpfx}h"), t),
@@ -579,72 +617,107 @@ fn append_attn_layer(
         t,
         &format!("{lpfx}v"),
     );
+    (qg, k, v)
+}
 
-    let qn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}qn_w"), SynDataType::Float, &[dh]);
-    let kn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}kn_w"), SynDataType::Float, &[dh]);
-    // [kv8] the cache dtype of this layer (q block, caches and P) and its scale table
-    let kv = kv8::AttnKv::of(gb, spec, lpfx);
-    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), kv.dt, &[dh, r, b]);
+/// The attention core of a full-attention layer over `t` rows at `cursor`: q / K / V preparation
+/// (K and V written into the cache), the chunked scores over `nch` chunks, softmax, PV, the
+/// combine of the chunk partials and the output gate -> `core {nh * dh, t}`. `wpfx` names the
+/// layer's weights; `spfx` the core's own tensors and nodes (the cache among them): the layer's
+/// prefix for one stream, one prefix per lane in a batched step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_attn_core(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    qg: TensorId,
+    k: TensorId,
+    v: TensorId,
+    cursor: TensorId,
+    rope_c: TensorId,
+    rope_s: TensorId,
+    wpfx: &str,
+    spfx: &str,
+    t: u64,
+    nch: u64,
+) -> TensorId {
+    let nh = spec.n_heads;
+    let nkv = spec.n_kv_heads;
+    let dh = spec.head_dim;
+    let gq = nh / nkv;
+    let r = gq * t;
+    let b = nkv * nch;
+
+    let g_aprep = if dh == 128 {
+        "gaudium_attn128_prep"
+    } else {
+        "gaudium_attn_prep"
+    };
+    let g_acomb = if dh == 128 {
+        "gaudium_attn128_combine"
+    } else {
+        "gaudium_attn_combine"
+    };
+    let g_apost = if dh == 128 {
+        "gaudium_attn128_post"
+    } else {
+        "gaudium_attn_post_f32"
+    };
+
+    let qn_w = gb.get_or_add_persistent_tensor(format!("{wpfx}qn_w"), SynDataType::Float, &[dh]);
+    let kn_w = gb.get_or_add_persistent_tensor(format!("{wpfx}kn_w"), SynDataType::Float, &[dh]);
+    // [kv8] the cache dtype of this layer (q block, caches and P) and its scale table (the
+    // layer's, shared by every slot)
+    let kv = kv8::AttnKv::of(gb, spec, wpfx);
+    let qb = gb.add_persistent_tensor(format!("{spfx}qb"), kv.dt, &[dh, r, b]);
     let kcache =
-        gb.add_persistent_tensor(format!("{lpfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
+        gb.add_persistent_tensor(format!("{spfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
     let vcache =
-        gb.add_persistent_tensor(format!("{lpfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
+        gb.add_persistent_tensor(format!("{spfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
     let prep_params = u32_params(&[0u32]); // coff = 0
     gb.add_node(
         g_aprep,
-        format!("{lpfx}attn_prep"),
+        format!("{spfx}attn_prep"),
         &kv.inputs(&[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor]),
         &[qb, kcache, vcache],
         &prep_params,
     );
 
     let scores = gb.add_persistent_tensor(
-        format!("{lpfx}scores"),
+        format!("{spfx}scores"),
         SynDataType::Float,
         &[KV_CHUNK, r, b],
     );
-    gb.op_batch_gemm(format!("{lpfx}qk"), qb, kcache, scores, false, true);
+    gb.op_batch_gemm(format!("{spfx}qk"), qb, kcache, scores, false, true);
 
-    let pm = gb.add_persistent_tensor(format!("{lpfx}P"), kv.dt, &[KV_CHUNK, r, b]);
+    let pm = gb.add_persistent_tensor(format!("{spfx}P"), kv.dt, &[KV_CHUNK, r, b]);
     let stats =
-        gb.add_persistent_tensor(format!("{lpfx}stats"), SynDataType::Float, &[64, 2, r, b]);
+        gb.add_persistent_tensor(format!("{spfx}stats"), SynDataType::Float, &[64, 2, r, b]);
     let sm_params = u32_params(&[t as u32, nch as u32, 0u32, 0u32]);
     gb.add_node(
         "gaudium_attn_softmax_chunk",
-        format!("{lpfx}softmax"),
+        format!("{spfx}softmax"),
         &kv.inputs(&[scores, cursor]),
         &[pm, stats],
         &sm_params,
     );
 
     let ao_part =
-        gb.add_persistent_tensor(format!("{lpfx}ao_part"), SynDataType::Float, &[dh, r, b]);
-    gb.op_batch_gemm(format!("{lpfx}pv"), pm, vcache, ao_part, false, false);
+        gb.add_persistent_tensor(format!("{spfx}ao_part"), SynDataType::Float, &[dh, r, b]);
+    gb.op_batch_gemm(format!("{spfx}pv"), pm, vcache, ao_part, false, false);
 
-    let ao = gb.add_persistent_tensor(format!("{lpfx}ao"), SynDataType::Float, &[dh, r, nkv]);
+    let ao = gb.add_persistent_tensor(format!("{spfx}ao"), SynDataType::Float, &[dh, r, nkv]);
     let comb_params = u32_params(&[nch as u32]);
     gb.add_node(
         g_acomb,
-        format!("{lpfx}combine"),
+        format!("{spfx}combine"),
         &[ao_part, stats],
         &[ao],
         &comb_params,
     );
 
-    let core = gb.add_persistent_tensor(format!("{lpfx}core"), SynDataType::Bf16, &[nh * dh, t]);
-    gb.add_node(g_apost, format!("{lpfx}attn_post"), &[ao, qg], &[core], &[]);
-
-    let attn = add_linear_bf16(
-        gb,
-        core,
-        &format!("{lpfx}W_o"),
-        nh * dh,
-        hid,
-        t,
-        &format!("{lpfx}attn"),
-    );
-
-    append_post_and_mlp(gb, spec, x, attn, lpfx, t, fused_anorm, wnext_norm)
+    let core = gb.add_persistent_tensor(format!("{spfx}core"), SynDataType::Bf16, &[nh * dh, t]);
+    gb.add_node(g_apost, format!("{spfx}attn_post"), &[ao, qg], &[core], &[]);
+    core
 }
 
 /// Appends one Gated DeltaNet (`linear_attention`) layer (`Qwen3.5/3.8`).
@@ -663,12 +736,35 @@ fn append_linear_layer(
     let hid = spec.hidden;
     let hv = spec.gdn_v_heads;
     let dl = spec.gdn_v_dim;
-    let qkv = spec.gdn_qkv_dim();
-    let qkvz_dim = spec.gdn_qkvz_dim();
-    let hvp = spec.gdn_hvp();
-    let ba_dim = spec.gdn_ba_dim();
     gb.set_fp8_weights(spec.fp8_weights); // [fp8 hook]
+    let (qkvz, ba) = append_linear_proj(gb, spec, x, h_pre, lpfx, t);
+    let core = append_gdn_core(gb, spec, qkvz, ba, slot, lpfx, lpfx, t);
+    let attn = add_linear_bf16(
+        gb,
+        core,
+        &format!("{lpfx}W_o"),
+        hv * dl,
+        hid,
+        t,
+        &format!("{lpfx}attn"),
+    );
 
+    append_post_and_mlp(gb, spec, x, attn, lpfx, t, fused_anorm, wnext_norm)
+}
+
+/// The input norm (unless fused into the previous layer: `h_pre`) and the input projections of a
+/// Gated DeltaNet layer over `t` rows: `(qkvz {qkvz_dim, t}, ba {ba_dim, t})`.
+pub(crate) fn append_linear_proj(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    x: TensorId,
+    h_pre: Option<TensorId>,
+    lpfx: &str,
+    t: u64,
+) -> (TensorId, TensorId) {
+    let hid = spec.hidden;
+    let qkvz_dim = spec.gdn_qkvz_dim();
+    let ba_dim = spec.gdn_ba_dim();
     let h = match h_pre {
         Some(h_in) => h_in,
         None => add_rmsnorm(gb, spec, x, &format!("{lpfx}w_in"), &format!("{lpfx}h"), t),
@@ -692,81 +788,93 @@ fn append_linear_layer(
         t,
         &format!("{lpfx}ba"),
     );
+    (qkvz, ba)
+}
+
+/// The recurrence of a Gated DeltaNet layer over `t` rows: the causal conv (its state `cs_in` ->
+/// `cs_out`), the gates, the gated delta rule (state `S_in` -> `S_out`, both read and written at
+/// checkpoint slot `slot`) and the gated norm -> `core {hv * dl, t}`. `wpfx` names the layer's
+/// weights; `spfx` the core's own tensors and nodes (the states among them): the layer's prefix
+/// for one stream, one prefix per lane in a batched step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_gdn_core(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    qkvz: TensorId,
+    ba: TensorId,
+    slot: TensorId,
+    wpfx: &str,
+    spfx: &str,
+    t: u64,
+) -> TensorId {
+    let hv = spec.gdn_v_heads;
+    let dl = spec.gdn_v_dim;
+    let qkv = spec.gdn_qkv_dim();
+    let hvp = spec.gdn_hvp();
 
     let conv_w =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}conv_w"), SynDataType::Float, &[qkv, 4]);
+        gb.get_or_add_persistent_tensor(format!("{wpfx}conv_w"), SynDataType::Float, &[qkv, 4]);
     let conv_b =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}conv_b"), SynDataType::Float, &[qkv]);
-    let cs_in = gb.add_persistent_tensor(format!("{lpfx}cs_in"), SynDataType::Float, &[qkv, 3, 1]);
-    let cs_out = gb.add_persistent_tensor(format!("{lpfx}cs_out"), SynDataType::Float, &[qkv, 3]);
+        gb.get_or_add_persistent_tensor(format!("{wpfx}conv_b"), SynDataType::Float, &[qkv]);
+    let cs_in = gb.add_persistent_tensor(format!("{spfx}cs_in"), SynDataType::Float, &[qkv, 3, 1]);
+    let cs_out = gb.add_persistent_tensor(format!("{spfx}cs_out"), SynDataType::Float, &[qkv, 3]);
     let cs_ckpt =
-        gb.add_persistent_tensor(format!("{lpfx}cs_ckpt"), SynDataType::Float, &[qkv, 3, 1]);
+        gb.add_persistent_tensor(format!("{spfx}cs_ckpt"), SynDataType::Float, &[qkv, 3, 1]);
 
-    let q = gb.add_persistent_tensor(format!("{lpfx}q"), SynDataType::Float, &[dl, hv, t]);
-    let k = gb.add_persistent_tensor(format!("{lpfx}k"), SynDataType::Float, &[dl, hv, t]);
-    let v = gb.add_persistent_tensor(format!("{lpfx}v"), SynDataType::Float, &[dl, hv, t]);
+    let q = gb.add_persistent_tensor(format!("{spfx}q"), SynDataType::Float, &[dl, hv, t]);
+    let k = gb.add_persistent_tensor(format!("{spfx}k"), SynDataType::Float, &[dl, hv, t]);
+    let v = gb.add_persistent_tensor(format!("{spfx}v"), SynDataType::Float, &[dl, hv, t]);
     let zero_flag = u32_params(&[0u32]);
     gb.add_node(
         "gaudium_gdn_prep",
-        format!("{lpfx}gdn_prep"),
+        format!("{spfx}gdn_prep"),
         &[qkvz, conv_w, cs_in, conv_b, slot],
         &[q, k, v, cs_out, cs_ckpt],
         &zero_flag,
     );
 
-    let a_log = gb.get_or_add_persistent_tensor(format!("{lpfx}A_log"), SynDataType::Float, &[hvp]);
+    let a_log = gb.get_or_add_persistent_tensor(format!("{wpfx}A_log"), SynDataType::Float, &[hvp]);
     let dt_bias =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}dt_bias"), SynDataType::Float, &[hvp]);
-    let eg = gb.add_persistent_tensor(format!("{lpfx}eg"), SynDataType::Float, &[hvp, t]);
-    let beta = gb.add_persistent_tensor(format!("{lpfx}beta"), SynDataType::Float, &[hvp, t]);
+        gb.get_or_add_persistent_tensor(format!("{wpfx}dt_bias"), SynDataType::Float, &[hvp]);
+    let eg = gb.add_persistent_tensor(format!("{spfx}eg"), SynDataType::Float, &[hvp, t]);
+    let beta = gb.add_persistent_tensor(format!("{spfx}beta"), SynDataType::Float, &[hvp, t]);
     gb.add_node(
         "gaudium_gdn_gate",
-        format!("{lpfx}gdn_gate"),
+        format!("{spfx}gdn_gate"),
         &[ba, a_log, dt_bias],
         &[eg, beta],
         &[],
     );
 
     let s_in =
-        gb.add_persistent_tensor(format!("{lpfx}S_in"), SynDataType::Float, &[64, 256, hv, 1]);
+        gb.add_persistent_tensor(format!("{spfx}S_in"), SynDataType::Float, &[64, 256, hv, 1]);
     let s_out =
-        gb.add_persistent_tensor(format!("{lpfx}S_out"), SynDataType::Float, &[64, 256, hv]);
+        gb.add_persistent_tensor(format!("{spfx}S_out"), SynDataType::Float, &[64, 256, hv]);
     let s_ckpt = gb.add_persistent_tensor(
-        format!("{lpfx}S_ckpt"),
+        format!("{spfx}S_ckpt"),
         SynDataType::Float,
         &[64, 256, hv, 1],
     );
-    let o = gb.add_persistent_tensor(format!("{lpfx}o"), SynDataType::Float, &[dl, hv, t]);
+    let o = gb.add_persistent_tensor(format!("{spfx}o"), SynDataType::Float, &[dl, hv, t]);
     gb.add_node(
         "gaudium_gdn_f32",
-        format!("{lpfx}gdn"),
+        format!("{spfx}gdn"),
         &[s_in, q, k, v, eg, beta, slot],
         &[o, s_out, s_ckpt],
         &zero_flag,
     );
 
     let norm_w =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}norm_w"), SynDataType::Float, &[dl]);
-    let core = gb.add_persistent_tensor(format!("{lpfx}core"), SynDataType::Bf16, &[hv * dl, t]);
+        gb.get_or_add_persistent_tensor(format!("{wpfx}norm_w"), SynDataType::Float, &[dl]);
+    let core = gb.add_persistent_tensor(format!("{spfx}core"), SynDataType::Bf16, &[hv * dl, t]);
     gb.add_node(
         "gaudium_gdn_post",
-        format!("{lpfx}gdn_post"),
+        format!("{spfx}gdn_post"),
         &[o, qkvz, norm_w],
         &[core],
         &zero_flag,
     );
-
-    let attn = add_linear_bf16(
-        gb,
-        core,
-        &format!("{lpfx}W_o"),
-        hv * dl,
-        hid,
-        t,
-        &format!("{lpfx}attn"),
-    );
-
-    append_post_and_mlp(gb, spec, x, attn, lpfx, t, fused_anorm, wnext_norm)
+    core
 }
 
 /// Builds the embedding gather graph `g_qwen_embed_T{t}`: `ids {T}` -> `x0 {HID, T}`.
@@ -1077,6 +1185,9 @@ pub struct Qwen3Engine {
     kv8_id: String,
     /// [step] device-trace windows (`--profile-steps`)
     prof: Option<prof_rt::ProfRt>,
+    /// [lanes] the lanes of an engine loaded with `--parallel N > 1` (owns recipes: must drop
+    /// before `dev`); `None`: one request at a time.
+    lanes: Option<lanes_rt::LaneRt>,
 
     // Device handle (dropped LAST!)
     dev: HpuDevice,
@@ -1169,6 +1280,27 @@ impl Qwen3Engine {
 
         let has_gdn = spec.n_linear_layers() > 0;
         let reset_mode = request_reset::ResetMode::from_config(cfg.request_reset.as_deref())?;
+        // [lanes] several requests at once: lanes need batched steps for this engine and its
+        // drafter (the verified choice the server makes too); a calibration load has one lane
+        let lane_drafter = match cfg.spec.as_ref().map(|sc| &sc.method) {
+            None => crate::verified::LaneDrafter::LdNone,
+            Some(spec::SpecMethod::DSpine { .. }) => crate::verified::LaneDrafter::LdDSpine,
+            Some(_) => crate::verified::LaneDrafter::LdOther,
+        };
+        // (a calibration load: of the FP8 weights' activation sites, or of the K/V caches)
+        let lanes_ok = crate::verified::ln_lanes_ok(
+            crate::engine::lanes_supported(&spec),
+            lane_drafter,
+            cfg.fp8_calibrate || cfg.kv_calibrate,
+        );
+        let n_lanes =
+            crate::verified::ln_served_lanes(cfg.lanes, crate::engine::MAX_LANES, lanes_ok) as usize;
+        if (n_lanes as u64) < cfg.lanes {
+            eprintln!(
+                "[gaudium] lanes: {n_lanes} of the {} asked for (this engine, drafter or load has no batched steps for more)",
+                cfg.lanes
+            );
+        }
         let max_ctx = align_up(cfg.max_ctx.max(KV_CHUNK), KV_CHUNK);
         let max_chunks = max_ctx / KV_CHUNK;
         let pf_opts = prefill::PrefillOpts::from_config(cfg)?;
@@ -1400,6 +1532,28 @@ impl Qwen3Engine {
         if let Some(sd) = &specdec {
             max_ws = max_ws.max(sd.max_ws());
         }
+        // [lanes] the batched step recipes and their buffers
+        let lane_plan = if n_lanes > 1 {
+            let p = lanes_rt::LanePlan::prepare(
+                n_lanes,
+                &spec,
+                max_ctx,
+                max_chunks,
+                &elf_hashes,
+                &kenv,
+                samp.is_some(),
+                &|name| weight_specs.contains_key(name) || is_weight_or_table(name),
+                &api,
+                &cache,
+                &driver_version,
+                cfg.verbose || plan_only,
+                plan_only,
+            )?;
+            max_ws = max_ws.max(p.max_ws);
+            Some(p)
+        } else {
+            None
+        };
         let recipes_s = t_comp.elapsed().as_secs_f64();
         if cfg.verbose || plan_only {
             eprintln!(
@@ -1458,6 +1612,10 @@ impl Qwen3Engine {
         let cs_ring_bytes = cs_one_bytes * gdn_slots;
         let gdn_state_bytes = n_lin * (2 * align256(s_ring_bytes) + 2 * align256(cs_ring_bytes));
         let kv_bytes: u64 = kv_specs.values().map(|&b| align256(b)).sum::<u64>() + gdn_state_bytes;
+        // [lanes] every lane holds what lane 0 holds (its caches and state rings), and the
+        // batched steps have buffers of their own
+        let kv_all = crate::verified::ln_lane_arena_bytes(kv_bytes, 0, n_lanes as u64);
+        let lane_act_bytes = lane_plan.as_ref().map_or(0, |p| p.act_bytes());
 
         let pf_x_bytes = align256(spec.hidden * prefill_tile * 2);
         let pf_ids_bytes = align256(prefill_tile * 4);
@@ -1477,7 +1635,8 @@ impl Qwen3Engine {
             + pf_wave_bytes
             + head_act_specs.values().map(|&b| align256(b)).sum::<u64>()
             + step_act_specs.values().map(|&b| align256(b)).sum::<u64>()
-            + vis_act_bytes;
+            + vis_act_bytes
+            + lane_act_bytes;
         let spec_bytes = specdec.as_ref().map_or([0u64; 3], |sd| sd.planned_bytes());
         let headroom = 512 * 1024 * 1024;
 
@@ -1485,7 +1644,7 @@ impl Qwen3Engine {
         // that width's full-tile recipes (their workspaces are part of the plan)
         let (pf_scratch_bytes, pf_ws) = {
             let other = weights_bytes
-                .saturating_add(kv_bytes)
+                .saturating_add(kv_all)
                 .saturating_add(act_fixed_bytes)
                 .saturating_add(spec_bytes.iter().sum());
             let fits = |scratch: u64, ws: u64| {
@@ -1621,7 +1780,7 @@ impl Qwen3Engine {
         let ws_bytes = align256(max_ws.max(MIN_SHARED_WORKSPACE_BYTES));
 
         let base_total = weights_bytes
-            .saturating_add(kv_bytes)
+            .saturating_add(kv_all)
             .saturating_add(act_bytes)
             .saturating_add(ws_bytes)
             .saturating_add(prof_bytes)
@@ -1648,18 +1807,45 @@ impl Qwen3Engine {
         } else {
             0
         };
+        // [lanes] N lanes of the requested context fit, or the load is refused with the numbers
+        // (the context of every lane is planned before anything that gives way to it)
+        if n_lanes > 1 && dev_opt.is_some() {
+            use crate::core::hbm::usable_hbm_bytes;
+            let usable = usable_hbm_bytes(total_hbm, total_hbm.saturating_sub(free_hbm), headroom);
+            let shared = crate::verified::ln_plan_shared(base_total, n_lanes as u64, kv_bytes);
+            if let Err(short) =
+                crate::core::lanes::plan_check(n_lanes as u64, kv_bytes, shared, usable)
+            {
+                let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                let fit = crate::core::lanes::lanes_fit(kv_bytes, shared, usable);
+                return Err(format!(
+                    "--parallel {n_lanes} at {max_ctx} tokens per lane does not fit: each lane needs {:.2} GiB (K/V caches and DeltaNet state), the shared part (weights, step buffers, workspace) {:.2} GiB, together {:.2} GiB of the {:.2} GiB the card has usable, {:.2} GiB short. At this context {fit} lane(s) fit; or lower the context per lane (--max-ctx / --model-ctx)",
+                    gib(kv_bytes),
+                    gib(shared),
+                    gib(shared.saturating_add(kv_all)),
+                    gib(usable),
+                    gib(short),
+                ));
+            }
+        }
+        // prefix reuse: the same count of kept positions in every lane
+        let lanes_u = n_lanes as u64;
         let pfx_granted = match &dev_opt {
             Some(_) => {
                 use crate::core::hbm::{grant_prefix_slots, usable_hbm_bytes};
                 let usable =
                     usable_hbm_bytes(total_hbm, total_hbm.saturating_sub(free_hbm), headroom);
-                let fit = grant_prefix_slots(pfx_wanted, pfx_slot_bytes, base_total, usable);
-                let granted =
-                    crate::verified::pc_grant_checked(fit, pfx_slot_bytes, base_total, usable);
+                let all = crate::verified::ln_lane_pfx_ask(pfx_wanted, lanes_u);
+                let fit = grant_prefix_slots(all, pfx_slot_bytes, base_total, usable);
+                let granted = crate::core::lanes::prefix_per_lane(
+                    crate::verified::pc_grant_checked(fit, pfx_slot_bytes, base_total, usable),
+                    lanes_u,
+                );
                 if granted < pfx_wanted {
                     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
                     eprintln!(
-                        "[gaudium] prefix reuse: {granted} of {pfx_wanted} kept positions fit beside the context ({:.2} GiB each; the rest of the plan takes {:.2} of the {:.2} GiB the card has usable){}",
+                        "[gaudium] prefix reuse: {granted} of {pfx_wanted} kept positions{} fit beside the context ({:.2} GiB each; the rest of the plan takes {:.2} of the {:.2} GiB the card has usable){}",
+                        if n_lanes > 1 { " per lane" } else { "" },
                         gib(pfx_slot_bytes),
                         gib(base_total),
                         gib(usable),
@@ -1678,7 +1864,8 @@ impl Qwen3Engine {
         if let Some(why) = pfx_why_not.filter(|_| cfg.prefix_slots > 0) {
             eprintln!("[gaudium] prefix reuse: off ({why})");
         }
-        let pfx_bytes = pfx_granted.saturating_mul(pfx_slot_bytes);
+        let pfx_bytes = crate::verified::ln_lane_pfx_bytes(pfx_granted, pfx_slot_bytes, lanes_u);
+        let kv_arena_bytes = crate::verified::ln_kv_arena_total(kv_all, pfx_bytes);
         let planned_total = base_total.saturating_add(pfx_bytes);
         // [live] the same plan, buffer by buffer under named parts (the live record's
         // `hbm_detail`, and the lines below the plan total)
@@ -1686,20 +1873,33 @@ impl Qwen3Engine {
             use crate::engine::mem_report::{trunk_weight_part, MemReport};
             let mut r = MemReport::new();
             r.add_map(HbmCat::CatWeights, &weight_specs, trunk_weight_part);
-            r.add_map(HbmCat::CatKv, &kv_specs, |_| "kv-target");
-            r.add(
-                HbmCat::CatCheckpoints,
-                "rings",
-                "DeltaNet state rings",
-                n_lin * 2 * align256(s_ring_bytes),
-            );
-            r.add(
-                HbmCat::CatCheckpoints,
-                "conv-rings",
-                "DeltaNet conv-state rings",
-                n_lin * 2 * align256(cs_ring_bytes),
-            );
-            for _ in 0..pfx_granted {
+            // [lanes] every lane's caches and rings (lane 0 first)
+            for _ in 0..n_lanes {
+                r.add_map(HbmCat::CatKv, &kv_specs, |_| "kv-target");
+                r.add(
+                    HbmCat::CatCheckpoints,
+                    "rings",
+                    "DeltaNet state rings",
+                    n_lin * 2 * align256(s_ring_bytes),
+                );
+                r.add(
+                    HbmCat::CatCheckpoints,
+                    "conv-rings",
+                    "DeltaNet conv-state rings",
+                    n_lin * 2 * align256(cs_ring_bytes),
+                );
+            }
+            if let Some(lp) = lane_plan.as_ref() {
+                r.add_map(HbmCat::CatOther, &lp.act_specs, |_| "lanes");
+                r.add(HbmCat::CatOther, "lanes", "step inputs and outputs", lp.io_bytes);
+                r.set_source(
+                    "lanes",
+                    format!(
+                        "{n_lanes} lanes: the batched decode step's buffers ({n_lanes} slots at {max_ctx} tokens)"
+                    ),
+                );
+            }
+            for _ in 0..pfx_granted * lanes_u {
                 r.add(
                     HbmCat::CatCheckpoints,
                     "prefix",
@@ -1825,15 +2025,20 @@ impl Qwen3Engine {
         if cfg.verbose || plan_only {
             let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
             eprintln!(
-                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} ({}) + state rings {:.2} ({} slots) + prefix reuse {:.2} ({} kept positions) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
+                "[gaudium] HBM plan: total {:.2} GiB = trunk weights {:.2} + trunk KV {:.2} ({}) + state rings {:.2} ({} slots) + prefix reuse {:.2} ({} kept positions{}) + trunk activations {:.2} + drafter weights {:.2} + drafter caches {:.2} + drafter/verify activations {:.2} + workspace {:.2}{}",
                 gib(planned_total),
                 gib(weights_bytes),
-                gib(kv_bytes.saturating_sub(gdn_state_bytes)),
+                gib(kv_all.saturating_sub(gdn_state_bytes * lanes_u)),
                 crate::core::kv_cache::kv_dtype_name(kv8::trunk_dtype(&spec)),
-                gib(gdn_state_bytes),
+                gib(gdn_state_bytes * lanes_u),
                 gdn_slots,
                 gib(pfx_bytes),
                 pfx_granted,
+                if n_lanes > 1 {
+                    format!(" per lane; {n_lanes} lanes")
+                } else {
+                    String::new()
+                },
                 gib(act_bytes),
                 gib(spec_bytes[0]),
                 gib(spec_bytes[1]),
@@ -1883,7 +2088,7 @@ impl Qwen3Engine {
             eprintln!(
                 "[gaudium] HBM plan fits: weights={:.2} GiB, kv+state={:.2} GiB, acts={:.2} MiB, ws={:.2} MiB",
                 weights_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                (kv_bytes + pfx_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
+                kv_arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 act_bytes as f64 / (1024.0 * 1024.0),
                 ws_bytes as f64 / (1024.0 * 1024.0),
             );
@@ -1903,7 +2108,7 @@ impl Qwen3Engine {
             .alloc_arena(weights_bytes, HbmCat::CatWeights, "weights_arena")
             .map_err(|e| format!("alloc weights arena: {e}"))?;
         let mut kv_arena = dev
-            .alloc_arena(kv_bytes + pfx_bytes, HbmCat::CatKv, "kv_state_arena")
+            .alloc_arena(kv_arena_bytes, HbmCat::CatKv, "kv_state_arena")
             .map_err(|e| format!("alloc kv/state arena: {e}"))?;
         let mut act_arena = dev
             .alloc_arena(act_bytes, HbmCat::CatScratch, "act_arena")
@@ -1957,6 +2162,35 @@ impl Qwen3Engine {
             prefix_slots.push(m);
         }
 
+        // [lanes] lanes 1..N: the same buffers as lane 0's, each with its own prefix table
+        let other_lanes = if n_lanes > 1 {
+            let ctx_rows = specdec.as_ref().map_or(0, |sd| sd.context_rows());
+            let mut sa = |bytes: u64| suballoc(&mut kv_arena, bytes);
+            lanes_rt::allocate_lanes(
+                n_lanes,
+                &spec,
+                &kv_specs,
+                s_ring_bytes,
+                s_one_bytes,
+                cs_ring_bytes,
+                cs_one_bytes,
+                pfx_granted,
+                &|| {
+                    prefix_cache::PrefixCache::new(
+                        prefill_tile,
+                        pfx_granted,
+                        pfx_slot_bytes,
+                        pfx_why_not.is_none(),
+                        ctx_rows,
+                    )
+                },
+                &|| request_reset::ResetState::new(reset_mode, cfg.verbose),
+                &mut sa,
+            )?
+        } else {
+            Vec::new()
+        };
+
         let pf_x0 = suballoc(&mut act_arena, pf_x_bytes)?;
         let pf_x1 = suballoc(&mut act_arena, pf_x_bytes)?;
         let pf_ids = suballoc(&mut act_arena, pf_ids_bytes)?;
@@ -1982,6 +2216,24 @@ impl Qwen3Engine {
         for (name, &bytes) in &step_act_specs {
             step_act_addr.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
         }
+        // [lanes] the batched step's buffers and its inputs / outputs
+        let lane_alloc = match lane_plan.as_ref() {
+            Some(lp) => {
+                let mut act = BTreeMap::new();
+                // (each buffer as the plan counts it: `ln_lane_buf_bytes`)
+                for (name, &bytes) in &lp.act_specs {
+                    let b = crate::verified::ln_lane_buf_bytes(bytes);
+                    act.insert(name.clone(), suballoc(&mut act_arena, b)?);
+                }
+                let mut io = BTreeMap::new();
+                let io_b = crate::verified::ln_lane_buf_bytes(lanes_rt::IO_SCALAR);
+                for name in lanes_rt::io_names(lp.n) {
+                    io.insert(name, suballoc(&mut act_arena, io_b)?);
+                }
+                Some((act, io))
+            }
+            None => None,
+        };
         if let Some(v) = vision.as_mut() {
             v.allocate(&mut weights_arena, &mut act_arena)?;
         }
@@ -2015,18 +2267,18 @@ impl Qwen3Engine {
         // Every K/V cache and state ring starts as zeros (a masked row must be finite): filled
         // on the device while the weights upload, ahead of any launch on the compute stream.
         let t_zero = Instant::now();
-        let mut zero_regions = vec![(kv_arena.base(), kv_bytes + pfx_bytes)];
+        let mut zero_regions = vec![(kv_arena.base(), kv_arena_bytes)];
         if let Some(sd) = &specdec {
             zero_regions.extend(sd.cache_regions());
         }
         let zeroed_bytes = request_reset::enqueue_load_zero(&dev, &zero_regions)?;
         let zero_enqueue_s = t_zero.elapsed().as_secs_f64();
 
-        let kv_only_bytes = kv_bytes.saturating_sub(gdn_state_bytes);
+        let kv_only_bytes = kv_all.saturating_sub(gdn_state_bytes * n_lanes as u64);
         let hbm_bytes = [
             weights_bytes + spec_bytes[0],
             kv_only_bytes + spec_bytes[1],
-            gdn_state_bytes + pfx_bytes,
+            gdn_state_bytes * n_lanes as u64 + pfx_bytes,
             act_bytes + spec_bytes[2],
             ws_bytes,
         ];
@@ -2205,6 +2457,20 @@ impl Qwen3Engine {
             &mut stage_upload,
         )
         .map_err(|e| format!("upload samp_rsel: {e}"))?;
+        // [lanes] the batched steps bind the weights as the single-stream steps do
+        let mut lane_rt = match (lane_plan, lane_alloc) {
+            (Some(lp), Some((act, io))) => Some(lanes_rt::LaneRt::new(
+                lp,
+                other_lanes,
+                act,
+                &io,
+                reset_mode,
+            )),
+            _ => None,
+        };
+        if let Some(rt) = lane_rt.as_mut() {
+            rt.finish(&dev, &weights_addr)?;
+        }
         let t_spec_fin = Instant::now();
         if let Some(sd) = &mut specdec {
             sd.finish(
@@ -2413,10 +2679,18 @@ impl Qwen3Engine {
                 .as_ref()
                 .map_or_else(|| "none".to_string(), |(c, _)| c.id()),
             prof: prof.map(prof_rt::ProfRt::new),
+            lanes: lane_rt,
             dev,
         };
         eng.warm_prefill_tiles(cfg.prefill_warm_rows, cfg.verbose)?;
-        host_tier::attach(&mut eng, cfg)?;
+        // (the host tier keeps one prefix cache, not one per lane)
+        if crate::verified::ln_host_tier_ok(n_lanes as u64, false) {
+            host_tier::attach(&mut eng, cfg)?;
+        } else if cfg.host_cache.is_some() {
+            eprintln!(
+                "[gaudium] host-RAM tier of prefix reuse: off for an engine with {n_lanes} lanes (each lane keeps its prefixes on the card)"
+            );
+        }
         Ok(Some(eng))
     }
 
@@ -2521,6 +2795,21 @@ impl Qwen3Engine {
     /// (`None`: this engine has none).
     pub fn host_tier_facts(&self) -> Option<host_tier::TierFacts> {
         self.host.as_ref().map(|t| t.facts())
+    }
+
+    /// Requests this engine runs at once (`--parallel`).
+    pub fn lanes(&self) -> usize {
+        self.lanes.as_ref().map_or(1, |rt| rt.lanes())
+    }
+
+    /// Serves the requests of `feed` in the engine's lanes (`lanes_rt`); an engine loaded with
+    /// one lane runs them one at a time.
+    pub fn serve_lanes(&mut self, feed: &mut dyn crate::engine::LaneFeed) -> Result<(), String> {
+        if self.lanes.is_some() {
+            lanes_rt::serve(self, feed)
+        } else {
+            crate::engine::serve_lanes_serially(self, feed)
+        }
     }
 
     /// A recipe that was not ready when a request needed it: the request waited for it.
@@ -2783,15 +3072,17 @@ impl Qwen3Engine {
         res
     }
 
-    fn run_generate_inner(
+    /// The prefill of a request: the per-request reset, the prefix plan, the image tower, every
+    /// prefill tile and the readout of the first token. `defer_one_row`: a one-row prompt is not
+    /// run here (a lane runs it as its first decode step, `Prefilled::OneRow`).
+    pub(super) fn run_prefill(
         &mut self,
         prompt_ids: &[i32],
         params: &Qwen3GenParams,
         budget: &mut SequenceBudget,
-        is_eos: &impl Fn(i32) -> bool,
-        is_cancelled: &impl Fn() -> bool,
-        on_token: &mut impl FnMut(i32),
-    ) -> Result<Qwen3GenReport, String> {
+        is_cancelled: &dyn Fn() -> bool,
+        defer_one_row: bool,
+    ) -> Result<Prefilled, String> {
         // (before the reset: whether it zeroes K/V rows decides what the request may take over)
         let rows_zeroed = self.reset.zeroes_rows();
         self.prefix_plan = prefix_cache::Plan::default();
@@ -2858,13 +3149,19 @@ impl Qwen3Engine {
         // text-only request, which launches exactly what it did before.
         let vis_layout =
             self.vision_begin_request(vis_prepared, prompt_ids.len(), budget.max_new(), resume)?;
-        let mut generated = Vec::with_capacity(budget.max_new() as usize);
-        let mut stopped_by_eos = false;
+        let generated: Vec<i32> = Vec::new();
         let mut stopped_by_cancel = false;
-        let mut forks: Vec<ForkRecord> = Vec::new();
         let mut first_logits_hbm = self.step_logits;
 
         // ---- PREFILL PHASE ----
+        if prompt_ids.len() == 1 && defer_one_row {
+            // a one-row prompt runs as a decode step: nothing of it is a prefill tile's row
+            self.prefix.prefill_end(prompt_ids, &self.prefix_images, 0);
+            return Ok(Prefilled::OneRow {
+                gdn_parity,
+                ttft_recipe_ms,
+            });
+        }
         let first_tok: i32 = if prompt_ids.len() == 1 {
             self.write_step_inputs(prompt_ids[0], 0)?;
             if samp_on {
@@ -3198,7 +3495,7 @@ impl Qwen3Engine {
                 .prefill_end(prompt_ids, &self.prefix_images, pos as u64);
             if stopped_by_cancel {
                 let ttft_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-                return Ok(Qwen3GenReport {
+                return Ok(Prefilled::Cancelled(Qwen3GenReport {
                     prompt_tokens: prompt_ids.len(),
                     generated_tokens: generated,
                     ttft_ms,
@@ -3214,7 +3511,7 @@ impl Qwen3Engine {
                     method: String::new(),
                     accept_per_pos: Vec::new(),
                     ..Qwen3GenReport::default()
-                });
+                }));
             }
 
             // Launch shared head_T1 directly on the last prompt token's hidden row!
@@ -3275,6 +3572,46 @@ impl Qwen3Engine {
         if prompt_ids.len() > 1 {
             self.pf.report(prefilled, ttft_ms); // [prefill] profile / stats runs only
         }
+        Ok(Prefilled::First(PrefillFirst {
+            first_tok,
+            first_logits_hbm,
+            ttft_ms,
+            prefill_tok_s,
+            ttft_recipe_ms,
+            gdn_parity,
+            samp_on,
+        }))
+    }
+
+    fn run_generate_inner(
+        &mut self,
+        prompt_ids: &[i32],
+        params: &Qwen3GenParams,
+        budget: &mut SequenceBudget,
+        is_eos: &impl Fn(i32) -> bool,
+        is_cancelled: &impl Fn() -> bool,
+        on_token: &mut impl FnMut(i32),
+    ) -> Result<Qwen3GenReport, String> {
+        let pf = match self.run_prefill(prompt_ids, params, budget, is_cancelled, false)? {
+            Prefilled::First(f) => f,
+            Prefilled::Cancelled(rep) => return Ok(rep),
+            Prefilled::OneRow { .. } => {
+                return Err("internal: a deferred one-row prompt outside a lane".into())
+            }
+        };
+        let PrefillFirst {
+            first_tok,
+            first_logits_hbm,
+            ttft_ms,
+            prefill_tok_s,
+            ttft_recipe_ms,
+            mut gdn_parity,
+            samp_on,
+        } = pf;
+        let mut generated = Vec::with_capacity(budget.max_new() as usize);
+        let mut stopped_by_eos = false;
+        let mut stopped_by_cancel = false;
+        let mut forks: Vec<ForkRecord> = Vec::new();
         let first_tok = self.apply_force(params, 0, first_tok, first_logits_hbm, &mut forks)?;
 
         if budget.remaining() > 0 && !is_cancelled() {

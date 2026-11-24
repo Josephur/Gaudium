@@ -36,7 +36,7 @@ use crate::core::lifecycle::{can_switch_resident_model, RequestGuard};
 use crate::core::tool_calls::{finish_reason_name, generation_end, stop_reason_name, GenEnd};
 use crate::core::vision::{drafter_runs_with_vision, planned_image_tokens, MediaLimits};
 use crate::engine::qwen3::{Qwen3Config, Qwen3GenParams, KV_CHUNK};
-use crate::engine::{load_engine, GenEngine};
+use crate::engine::{load_engine, GenEngine, LaneDone, LaneJob, LaneOut};
 use crate::json::{self, JsonValue};
 use crate::model_spec::{ModelFamily, ModelSpec};
 use crate::model_text::ModelText;
@@ -50,6 +50,7 @@ mod anthropic;
 mod chat;
 mod conn;
 mod jinja;
+mod lanes;
 mod outparse;
 mod proxy;
 mod readout;
@@ -122,6 +123,9 @@ pub struct ServerConfig {
     /// Budget of the host-RAM tier of prefix reuse in bytes (`--cache-ram`): `None` = a share
     /// of the host memory available at start, `Some(0)` = off.
     pub cache_ram_bytes: Option<u64>,
+    /// Requests a model runs at once (`--parallel`): lanes of their own, decoded together.
+    /// Models whose engine or drafter has no batched steps are served with one lane.
+    pub parallel: u64,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -178,6 +182,8 @@ struct RegisteredModel {
     vision: Option<VisionServe>,
     /// The model's own context limit (`ModelText::max_positions`), read once at registration.
     n_ctx_train: Option<u64>,
+    /// Lanes the model is served with (`--parallel`; 1 = one request at a time).
+    lanes: usize,
 }
 
 /// Sampler settings a request falls back to (temperature, top-k, top-p).
@@ -362,6 +368,8 @@ struct AppState {
     /// The host-RAM tier of prefix reuse (`--cache-ram`): entries outlive the engine that made
     /// them (another model, the idle release). `None`: off.
     host_cache: Option<Arc<crate::cache_ram::SharedCache>>,
+    /// The lane queues of models served with `--parallel` lanes.
+    lanes: lanes::LaneHub,
 }
 
 impl AppState {
@@ -702,7 +710,8 @@ impl AppState {
         out
     }
 
-    /// The one slot of this server: whether it is busy, and what the resident model runs as.
+    /// The slots of the resident model: one per lane (`--parallel`), each with its state and its
+    /// request, and what the model runs as.
     fn slots_json(&self) -> String {
         let (active, idx) = {
             let s = self.slot.lock().unwrap();
@@ -711,18 +720,55 @@ impl AppState {
         let m = &self.models[idx];
         let facts = self.run_facts(idx);
         let (greedy, sampled, _, _) = readout::method_set(facts.drafter.as_ref());
-        format!(
-            "[{{\"id\":0,\"is_processing\":{},\"model\":{},\"n_ctx\":{},\"speculative\":{},\
-             \"precision\":{},\"greedy\":{},\"sampled\":{},\"loaded\":{}}}]",
-            active > 0,
-            jq(&m.id),
-            m.max_ctx,
-            facts.drafter.is_some(),
-            jq(readout::precision_word(&facts)),
-            jq(&greedy),
-            jq(&sampled),
-            facts.from_engine,
-        )
+        let view = if m.lanes > 1 {
+            self.lanes.view(idx)
+        } else {
+            Vec::new()
+        };
+        let mut out = String::from("[");
+        for lane in 0..m.lanes.max(1) {
+            if lane > 0 {
+                out.push(',');
+            }
+            let v = view.get(lane);
+            let state = v.map_or(
+                if m.lanes <= 1 && active > 0 {
+                    "busy"
+                } else {
+                    "free"
+                },
+                |v| v.state,
+            );
+            let processing = if m.lanes > 1 {
+                state != "free"
+            } else {
+                active > 0
+            };
+            out.push_str(&format!(
+                "{{\"id\":{lane},\"is_processing\":{processing},\"state\":{},\"model\":{},\"n_ctx\":{},\
+                 \"speculative\":{},\"precision\":{},\"greedy\":{},\"sampled\":{},\"loaded\":{}",
+                jq(state),
+                jq(&m.id),
+                m.max_ctx,
+                facts.drafter.is_some(),
+                jq(readout::precision_word(&facts)),
+                jq(&greedy),
+                jq(&sampled),
+                facts.from_engine,
+            ));
+            if let Some(v) = v.filter(|v| v.job.is_some()) {
+                out.push_str(&format!(
+                    ",\"job\":{},\"prompt_tokens\":{},\"reused_tokens\":{},\"generated\":{}",
+                    v.job.unwrap_or(0),
+                    v.prompt_tokens,
+                    v.reused,
+                    v.generated
+                ));
+            }
+            out.push('}');
+        }
+        out.push(']');
+        out
     }
 
     /// Publishes a `request` event and keeps it for `/gaudium/live`.
@@ -821,7 +867,7 @@ impl AppState {
              \"top_k\":{d_top_k},\"top_p\":{d_top_p},\"min_p\":0.0,\"max_tokens\":-1,\"n_predict\":-1,\"stream\":false,\
              \"timings_per_token\":false,\"reasoning_format\":\"auto\",\"speculative\":{speculative},\
              \"samplers\":[\"top_k\",\"top_p\",\"min_p\",\"temperature\"]}}}},\
-             \"total_slots\":1,\"model_alias\":{},\"model_path\":{},\
+             \"total_slots\":{},\"model_alias\":{},\"model_path\":{},\
              \"modalities\":{{\"vision\":{vision},\"audio\":false,\"video\":{video}}},\
              \"vision\":{vision_limits},\
              \"endpoint_slots\":true,\"endpoint_props\":false,\"endpoint_metrics\":false,\"ui\":{},\
@@ -833,6 +879,7 @@ impl AppState {
              \"bos_token\":{},\"eos_token\":{},\"build_info\":{},\"is_sleeping\":false,\
              \"cors_proxy_enabled\":{},\"a2ui\":{}",
             m.max_ctx,
+            m.lanes.max(1),
             jq(&m.id),
             jq(&m.dir.display().to_string()),
             self.cfg.ui_dir.is_some(),
@@ -1148,6 +1195,43 @@ fn planned_drafter_of(
     Some((Some(dir.clone()), kind, draft_k))
 }
 
+/// Lanes the configuration serves model `id` with (`--parallel`): its engine and its drafter must
+/// have batched steps (the dense Qwen3 / Qwen3.5 / Qwen3.8 engine), else one lane, with the
+/// reason.
+fn served_lanes(cfg: &ServerConfig, id: &str, spec: &ModelSpec) -> (usize, Option<&'static str>) {
+    use crate::verified::{ln_lanes_ok, ln_served_lanes, LaneDrafter};
+    let drafter = match planned_drafter_of(cfg, id) {
+        None => LaneDrafter::LdNone,
+        Some((_, "dspine", _)) => LaneDrafter::LdDSpine,
+        Some(_) => LaneDrafter::LdOther,
+    };
+    let engine_ok = crate::engine::lanes_supported(spec);
+    // (the server never calibrates)
+    let n = ln_served_lanes(
+        cfg.parallel,
+        crate::engine::MAX_LANES,
+        ln_lanes_ok(engine_ok, drafter, false),
+    ) as usize;
+    let why = (cfg.parallel > 1 && n <= 1).then_some(if engine_ok {
+        "its drafter has no batched steps yet"
+    } else {
+        "its engine has no batched steps"
+    });
+    (n, why)
+}
+
+/// [`served_lanes`] at registration, saying why a model asked for lanes gets one.
+fn lanes_of(cfg: &ServerConfig, id: &str, spec: &ModelSpec) -> usize {
+    let (n, why) = served_lanes(cfg, id, spec);
+    if let Some(why) = why {
+        eprintln!(
+            "[server] model '{id}': served with one lane (--parallel {}: {why})",
+            cfg.parallel
+        );
+    }
+    n
+}
+
 /// Drafts per launch of a model's own MTP drafter (`--draft-model <id>=mtp`): the widths that
 /// measured best on the card. Inkling 2's block drafter fills a block of 7 drafts in one launch
 /// that costs about 3% of a verify pass, so it runs at the full block.
@@ -1298,6 +1382,9 @@ fn engine_config_of(
     qcfg.no_cache = cfg.no_cache;
     qcfg.verbose = cfg.verbose;
     qcfg.prefix_slots = cfg.prefix_slots;
+    qcfg.lanes = ModelText::open(dir)
+        .and_then(|t| t.spec())
+        .map_or(1, |spec| served_lanes(cfg, id, &spec).0 as u64);
     if let Some((patches, tokens)) = vision_plan_of(cfg, id, dir, max_ctx) {
         // The tower's buffers are planned for the largest image. Its recipes are compiled at
         // load for that size (so the shared workspace covers them); other image sizes compile
@@ -1558,6 +1645,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
                 v.max_tokens,
             );
         }
+        let lanes = lanes_of(&cfg, &entry.id, &spec);
         models.push(RegisteredModel {
             id: entry.id.clone(),
             dir: entry.dir.clone(),
@@ -1577,6 +1665,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
                 .map(|t| crate::tokenizer::gemma4_template_closes_thought(&t))
                 .unwrap_or(false),
             n_ctx_train: text.max_positions(),
+            lanes,
         });
     }
 
@@ -1625,6 +1714,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
         proxy,
         tls,
         host_cache,
+        lanes: lanes::LaneHub::new(n_models),
     });
 
     // Optional eager warm-up in a background thread so HTTP/UI responds immediately!
@@ -2283,8 +2373,8 @@ fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     );
 }
 
-/// How far a request for the loaded model may jump the queue: the oldest request is never passed over once
-/// it has waited `max_wait` or been passed over `max_skips` times. Read from the card-queue settings file
+/// How far a request for the loaded model may jump the queue: no request is passed over once it has waited
+/// `max_wait` or been passed over `max_skips` times. Read from the card-queue settings file
 /// (`queue.conf`, keys `group_max_wait_min` and `group_max_skips`), the same file the card lock reads.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TurnLimits {
@@ -2332,12 +2422,23 @@ impl TurnLimits {
 /// The chat server's card queue. Requests get the card in arrival order, except that a request for the
 /// model already loaded goes ahead of older requests for another model, so the card is not unloaded and
 /// reloaded between them. The model index is the whole configuration: every load option is fixed per model
-/// at startup, and per-request settings (sampling, method) never reload the card. The oldest request is
-/// never passed over beyond the `TurnLimits` of the settings file.
-#[derive(Default)]
+/// at startup, and per-request settings (sampling, method) never reload the card. No request is passed over
+/// beyond the `TurnLimits` of the settings file (the verified `turn_rank`: a due waiter goes first).
 struct TurnQueue {
     mu: Mutex<TurnState>,
     cv: Condvar,
+    /// The clock the verified turn rules compare arrivals on (ns since this instant).
+    epoch: Instant,
+}
+
+impl Default for TurnQueue {
+    fn default() -> Self {
+        Self {
+            mu: Mutex::default(),
+            cv: Condvar::new(),
+            epoch: Instant::now(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2354,6 +2455,17 @@ struct TurnWaiter {
     skips: u32,
 }
 
+/// May no request pass `w` over any more (the verified `turn_due`)?
+fn waiter_due(w: &TurnWaiter, now: Instant, lim: TurnLimits) -> bool {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    crate::core::lanes::waiter_due(
+        ms(now.duration_since(w.since)),
+        ms(lim.max_wait),
+        u64::from(w.skips),
+        u64::from(lim.max_skips),
+    )
+}
+
 /// The waiter that gets the card next: its position in `waiting` (arrival order).
 fn next_turn(
     waiting: &[TurnWaiter],
@@ -2361,14 +2473,11 @@ fn next_turn(
     now: Instant,
     lim: TurnLimits,
 ) -> Option<usize> {
-    let first = waiting.first()?;
-    let due = now.duration_since(first.since) >= lim.max_wait || first.skips >= lim.max_skips;
-    match ready {
-        Some(m) if first.model != m && !due => {
-            Some(waiting.iter().position(|w| w.model == m).unwrap_or(0))
-        }
-        _ => Some(0),
-    }
+    crate::core::lanes::next_turn_of(
+        waiting
+            .iter()
+            .map(|w| (waiter_due(w, now, lim), ready == Some(w.model))),
+    )
 }
 
 /// Holding the card: dropping it hands the card to the next waiter.
@@ -2390,21 +2499,44 @@ impl TurnQueue {
         ready: impl Fn() -> Option<usize>,
         limits: impl Fn() -> TurnLimits,
     ) -> Turn<'_> {
+        self.acquire_from(model, Instant::now(), ready, limits)
+    }
+
+    /// [`Self::acquire`] for a waiter that has waited since `since` (a lane session queues at its
+    /// oldest request's arrival): it takes its place in arrival order.
+    fn acquire_from(
+        &self,
+        model: usize,
+        since: Instant,
+        ready: impl Fn() -> Option<usize>,
+        limits: impl Fn() -> TurnLimits,
+    ) -> Turn<'_> {
         let mut st = self.mu.lock().unwrap();
         let id = st.next_id;
         st.next_id += 1;
-        st.waiting.push(TurnWaiter {
-            id,
-            model,
-            since: Instant::now(),
-            skips: 0,
-        });
+        let at = st.waiting.partition_point(|w| w.since <= since);
+        st.waiting.insert(
+            at,
+            TurnWaiter {
+                id,
+                model,
+                since,
+                skips: 0,
+            },
+        );
         loop {
             if !st.busy {
                 if let Some(pos) = next_turn(&st.waiting, ready(), Instant::now(), limits()) {
                     if st.waiting[pos].id == id {
-                        for w in &mut st.waiting[..pos] {
-                            w.skips += 1;
+                        // the waiters it takes the card before, that arrived first, were passed
+                        // over once more (the verified rule a lane session's admissions use)
+                        let at = self.clock(st.waiting[pos].since);
+                        for (i, w) in st.waiting.iter_mut().enumerate() {
+                            if i != pos {
+                                let passed =
+                                    crate::core::lanes::passes_over(self.clock(w.since), at);
+                                w.skips = crate::core::lanes::skips_after(w.skips, passed);
+                            }
                         }
                         st.waiting.remove(pos);
                         st.busy = true;
@@ -2414,6 +2546,38 @@ impl TurnQueue {
             }
             // a timed wait, so a waiter that becomes due by waiting is noticed without a release
             st = self.cv.wait_timeout(st, Duration::from_secs(1)).unwrap().0;
+        }
+    }
+
+    /// An arrival on the clock the verified turn rules compare (ns since the queue began).
+    fn clock(&self, t: Instant) -> u64 {
+        u64::try_from(t.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// [lanes] Would admitting a request that arrived at `since` pass over a waiter whose turn
+    /// is due? (A lane session admits nothing more then.) Every waiter counts, not only the
+    /// first: a lane session that queued again stands among them in arrival order.
+    fn blocks(&self, since: Instant, lim: TurnLimits) -> bool {
+        let st = self.mu.lock().unwrap();
+        let now = Instant::now();
+        st.waiting.iter().any(|w| {
+            crate::core::lanes::admission_blocked(
+                waiter_due(w, now, lim),
+                self.clock(w.since),
+                self.clock(since),
+            )
+        })
+    }
+
+    /// [lanes] A lane session admitted a request that arrived at `since`: every waiter it passes
+    /// over (one that arrived first) was passed over once more, as when a request of the loaded
+    /// model takes the card before them.
+    fn passed_over(&self, since: Instant) {
+        let at = self.clock(since);
+        let mut st = self.mu.lock().unwrap();
+        for w in st.waiting.iter_mut() {
+            let passed = crate::core::lanes::passes_over(self.clock(w.since), at);
+            w.skips = crate::core::lanes::skips_after(w.skips, passed);
         }
     }
 }
@@ -2456,6 +2620,109 @@ impl Drop for WaitTicket<'_> {
             self.leave(&mut s);
             drop(s);
             self.state.publish_engine_event();
+        }
+    }
+}
+
+/// The lane session of model `idx` (`--parallel`): takes the card's turn, loads the model and
+/// hands the model's waiting requests to the engine's lanes until no lane is busy and nothing
+/// waits. Started by the request that found no session running (`lanes::LaneHub::submit`). When
+/// the oldest waiter for the card becomes due, the session lets its lanes drain, hands the turn
+/// back and waits for its next one.
+fn drive_lanes(state: Arc<AppState>, idx: usize) {
+    let limits = || TurnLimits::read(state.cfg.queue_config.as_deref());
+    loop {
+        // queued at the arrival of the oldest request it serves, so a session that handed the
+        // card back keeps its requests' place in line
+        let since = state.lanes.oldest(idx).unwrap_or_else(Instant::now);
+        let turn = state
+            .turns
+            .acquire_from(idx, since, || state.ready_model(), limits);
+        if let Err(e) = state.ensure_loaded(idx, false) {
+            drop(turn);
+            state.lanes.fail_waiting(idx, &e);
+            return;
+        }
+        let op = state.card_op.lock().unwrap();
+        let engine = {
+            let mut s = state.slot.lock().unwrap();
+            match s.engine.take() {
+                Some(e) if s.resident_idx == Some(idx) => {
+                    // the session counts as an active request while it runs (no idle release)
+                    s.active_requests = crate::core::lanes::session_active(0);
+                    s.last_activity = Instant::now();
+                    Some(e)
+                }
+                other => {
+                    s.engine = other;
+                    None
+                }
+            }
+        };
+        let Some(mut engine) = engine else {
+            drop(op);
+            drop(turn);
+            state
+                .lanes
+                .fail_waiting(idx, "model unloaded concurrently; retry request");
+            return;
+        };
+        state.publish_engine_event();
+        let mut feed = state.lanes.feed(idx);
+        let st = &state;
+        let mut last_busy = crate::core::lanes::session_active(0);
+        feed.on_lanes = Some(Box::new(move |busy| {
+            let busy = crate::core::lanes::session_active(busy);
+            if busy != last_busy {
+                last_busy = busy;
+                {
+                    let mut s = st.slot.lock().unwrap();
+                    s.active_requests = busy;
+                    s.last_activity = Instant::now();
+                }
+                st.publish_engine_event();
+            }
+        }));
+        // the queue settings are read once per turn, like the turn queue's own
+        let lim = limits();
+        feed.blocks = Some(Box::new(move |since| st.turns.blocks(since, lim)));
+        feed.on_admit = Some(Box::new(move |since| st.turns.passed_over(since)));
+        let res = engine.serve_lanes(&mut feed);
+        let (ended, yielded) = (feed.ended, feed.yielded);
+        drop(feed);
+        let prefix = engine.prefix_stats();
+        let host_tier = engine.host_tier_facts();
+        {
+            let mut s = state.slot.lock().unwrap();
+            s.engine = Some(engine);
+            s.prefix = prefix;
+            s.host_tier = host_tier;
+            s.idle_due = state.host_cache.is_some();
+            s.active_requests = 0;
+            s.last_activity = Instant::now();
+        }
+        drop(op);
+        drop(turn);
+        if let Err(e) = &res {
+            eprintln!(
+                "[server] lane session of '{}' failed: {e}",
+                state.models[idx].id
+            );
+        }
+        state.publish_engine_event();
+        match crate::verified::ln_session_after(res.is_ok(), yielded, ended) {
+            // the waiter that is due takes the card; this session's requests wait for its next turn
+            crate::verified::SessionAfter::SaAgain => continue,
+            // the engine stopped before its feed ended the session: what still waits fails
+            crate::verified::SessionAfter::SaFail => {
+                let why = res
+                    .err()
+                    .unwrap_or_else(|| "the lane session ended".to_string());
+                state.lanes.fail_waiting(idx, &why);
+                state.publish_engine_event();
+                return;
+            }
+            crate::verified::SessionAfter::SaDone => return,
         }
     }
 }
@@ -2589,7 +2856,7 @@ fn tokenize_prompt(
     Ok((ids, Some(media)))
 }
 
-fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
+fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
@@ -2599,7 +2866,7 @@ fn handle_chat_completions(state: &AppState, req: &HttpRequest, stream: &mut Con
 }
 
 /// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path.
-fn handle_messages(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
+fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let api = Api::Messages {
         show_thinking: true,
     };
@@ -2660,7 +2927,7 @@ fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut Conn)
 /// Runs one chat request: prompt, card turn, generation, and the reply in the shape of `api`.
 /// `ignored`: request fields the caller already found accepted but not applied.
 fn run_chat(
-    state: &AppState,
+    state: &Arc<AppState>,
     val: &JsonValue,
     stream: &mut Conn,
     api: Api,
@@ -2799,16 +3066,24 @@ fn run_chat(
     state.publish_request(format!("{{{}}}", req_base("queued", 0.0)));
     // Counts this request in the card queue until it holds the card; any early return leaves it.
     let mut ticket = WaitTicket::enter(state, idx);
+    // A model served with lanes: the request joins the model's lane session, which takes the
+    // card's turn and loads the model (`drive_lanes`). Otherwise the request takes them itself.
+    let lane_mode = m.lanes > 1;
     // One turn covers the model load and the generation, so no request for another model can swap the card
     // between them; a request for the model already on the card may go ahead of older ones (TurnQueue).
-    let turn = state.turns.acquire(
-        idx,
-        || state.ready_model(),
-        || TurnLimits::read(state.cfg.queue_config.as_deref()),
-    );
+    let turn = (!lane_mode).then(|| {
+        state.turns.acquire(
+            idx,
+            || state.ready_model(),
+            || TurnLimits::read(state.cfg.queue_config.as_deref()),
+        )
+    });
 
     // Ensure target model is loaded on Gaudi 2 before starting generation.
-    if let Err(e) = state.ensure_loaded(idx, false) {
+    if let Err(e) = (!lane_mode)
+        .then(|| state.ensure_loaded(idx, false))
+        .unwrap_or(Ok(()))
+    {
         state.publish_request(format!(
             "{{{},\"message\":{}}}",
             req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
@@ -2853,22 +3128,82 @@ fn run_chat(
         ..Qwen3GenParams::default()
     };
 
-    // Acquire card op lock for exclusive Gaudi 2 execution.
-    let _op = state.card_op.lock().unwrap();
-    {
-        let mut s = state.slot.lock().unwrap();
-        s.active_requests += 1;
-        ticket.leave(&mut s);
-        s.last_activity = Instant::now();
-    }
-    state.publish_engine_event();
-    let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
+    // The engine takes the request: alone (the engine out of the slot for this request), or in
+    // a lane of the model's lane session.
+    let mut media = media;
+    let mut lane_rx: Option<std::sync::mpsc::Receiver<LaneOut>> = None;
+    let mut _op = None;
+    let (mut engine, hbm_bytes) = if lane_mode {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = LaneJob {
+            id: req_num,
+            prompt: prompt_ids.clone(),
+            params: params.clone(),
+            images: media.take().map(|md| md.into_tower_inputs()),
+            cancel: Arc::clone(&cancel_flag),
+            out: Box::new(move |ev| {
+                let _ = tx.send(ev);
+            }),
+        };
+        if state.lanes.submit(idx, job) {
+            let st = Arc::clone(state);
+            if let Err(e) = thread::Builder::new()
+                .name("gaudium-lanes".into())
+                .spawn(move || drive_lanes(st, idx))
+            {
+                state
+                    .lanes
+                    .fail_waiting(idx, &format!("start the lane session: {e}"));
+            }
+        }
+        // the request waits for a lane; a session that cannot start ends it here
+        let err = match rx.recv() {
+            Ok(LaneOut::Started { .. }) => None,
+            Ok(LaneOut::Done(d)) => Some(d.report.err().unwrap_or_default()),
+            Ok(LaneOut::Token(_)) | Err(_) => Some("the lane session ended".to_string()),
+        };
+        if let Some(e) = err {
+            state.cancels.lock().unwrap().remove(&req_id);
+            let _ = rguard.apply(ReqEvent::EvReqFail);
+            state.publish_request(format!(
+                "{{{},\"message\":{}}}",
+                req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
+                jq(&e)
+            ));
+            if stream_mode {
+                let _ = write_sse_chunk(stream, api.stream_error(503, &e).as_bytes());
+                write_sse_end(stream);
+            } else {
+                api.error(stream, 503, "unavailable_error", &e);
+            }
+            return;
+        }
+        let hbm = {
+            let mut s = state.slot.lock().unwrap();
+            ticket.leave(&mut s);
+            s.last_activity = Instant::now();
+            s.hbm_bytes
+        };
+        state.publish_engine_event();
+        let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
+        lane_rx = Some(rx);
+        (None, hbm)
+    } else {
+        // Acquire card op lock for exclusive Gaudi 2 execution.
+        _op = Some(state.card_op.lock().unwrap());
+        {
+            let mut s = state.slot.lock().unwrap();
+            s.active_requests += 1;
+            ticket.leave(&mut s);
+            s.last_activity = Instant::now();
+        }
+        state.publish_engine_event();
+        let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
 
-    // Take engine temporarily out of slot so status endpoints never block while generating!
-    let (mut engine, hbm_bytes) = {
+        // Take engine temporarily out of slot so status endpoints never block while generating!
         let mut s = state.slot.lock().unwrap();
         match s.engine.take() {
-            Some(e) if s.resident_idx == Some(idx) => (e, s.hbm_bytes),
+            Some(e) if s.resident_idx == Some(idx) => (Some(e), s.hbm_bytes),
             other => {
                 s.engine = other;
                 s.active_requests = s.active_requests.saturating_sub(1);
@@ -2921,7 +3256,11 @@ fn run_chat(
         .unwrap_or(false);
 
     // The engine's launch feed and profile block (both measured by the engine's own reporter).
-    let live = engine.live_profile().filter(|h| h.is_live());
+    // (lanes: the engine's launch feed belongs to the whole session, not to one request)
+    let live = engine
+        .as_ref()
+        .and_then(|e| e.live_profile())
+        .filter(|h| h.is_live());
     let out_stream = if stream_mode {
         stream.try_clone().ok()
     } else {
@@ -2970,13 +3309,9 @@ fn run_chat(
     }
 
     let mut last_live_pub = Instant::now();
-    // The request's tower inputs go to the engine first; it runs the tower inside its prefill.
-    let images_set = match media {
-        Some(md) => engine.set_request_images(md.into_tower_inputs()),
-        None => Ok(()),
-    };
-    let report = images_set.and_then(|()| {
-        engine.generate_cancellable(&prompt_ids, &params, Some(&cancel_flag), &mut |tok_id| {
+    let mut lane_done: Option<Box<LaneDone>> = None;
+    let report = {
+        let mut on_token = |tok_id: i32| {
             let piece = if tok_ref.is_special(tok_id) {
                 // a special token is text only when it is part of the family's tags
                 let text = String::from_utf8_lossy(tok_ref.token_bytes(tok_id)).into_owned();
@@ -3027,18 +3362,62 @@ fn run_chat(
                 ));
                 }
             }
-        })
-    });
+        };
+        match engine.as_mut() {
+            Some(engine) => {
+                // The request's tower inputs go to the engine first; it runs the tower inside
+                // its prefill.
+                let images_set = match media.take() {
+                    Some(md) => engine.set_request_images(md.into_tower_inputs()),
+                    None => Ok(()),
+                };
+                images_set.and_then(|()| {
+                    engine.generate_cancellable(
+                        &prompt_ids,
+                        &params,
+                        Some(&cancel_flag),
+                        &mut on_token,
+                    )
+                })
+            }
+            None => {
+                // a lane: tokens and the end come from the lane session
+                let rx = lane_rx.take().expect("a lane request has its channel");
+                loop {
+                    match rx.recv() {
+                        Ok(LaneOut::Token(t)) => on_token(t),
+                        Ok(LaneOut::Started { .. }) => {}
+                        Ok(LaneOut::Done(mut d)) => {
+                            let r = std::mem::replace(&mut d.report, Err(String::new()));
+                            lane_done = Some(d);
+                            break r;
+                        }
+                        Err(_) => break Err("the lane session ended".to_string()),
+                    }
+                }
+            }
+        }
+    };
     if let Some(h) = &live {
         h.set_launch_sink(None);
     }
     // the tower's own timings of this request (kept apart from the decoder's prefill)
-    let vision_report = engine.last_vision_report().filter(|_| n_images > 0);
-    let prefix_stats = engine.prefix_stats();
-    let host_tier = engine.host_tier_facts();
+    let (vision_report, prefix_stats, host_tier) = match (engine.as_ref(), lane_done.as_ref()) {
+        (Some(e), _) => (
+            e.last_vision_report().filter(|_| n_images > 0),
+            e.prefix_stats(),
+            e.host_tier_facts(),
+        ),
+        (None, Some(d)) => (
+            d.vision.clone().filter(|_| n_images > 0),
+            d.prefix,
+            d.host_tier,
+        ),
+        (None, None) => (None, None, None),
+    };
 
-    // Return engine cleanly to slot & decrement active counter!
-    {
+    if let Some(engine) = engine.take() {
+        // Return engine cleanly to slot & decrement active counter!
         let mut s = state.slot.lock().unwrap();
         s.engine = Some(engine);
         s.prefix = prefix_stats;
@@ -3046,6 +3425,12 @@ fn run_chat(
         // once this connection is closed, the engine gets its idle time (`AppState::idle_work`)
         s.idle_due = state.host_cache.is_some();
         s.active_requests = s.active_requests.saturating_sub(1);
+        s.last_activity = Instant::now();
+    } else {
+        let mut s = state.slot.lock().unwrap();
+        if prefix_stats.is_some() {
+            s.prefix = prefix_stats;
+        }
         s.last_activity = Instant::now();
     }
     drop(turn);
@@ -3724,6 +4109,109 @@ mod tests {
             "inside the wait limit"
         );
         assert_eq!(next_turn(&[], Some(0), now, lim), None);
+    }
+
+    #[test]
+    fn lane_admissions_pass_over_older_waiters_until_one_is_due() {
+        let q = TurnQueue::default();
+        let lim = TurnLimits::default();
+        let t0 = Instant::now();
+        let later = |ms: u64| t0 + Duration::from_millis(ms);
+        q.mu.lock().unwrap().waiting = waiters(&[1], t0);
+        assert!(!q.blocks(later(5), lim), "a fresh waiter blocks nothing");
+        // a request that arrived before the waiter does not pass it over
+        q.passed_over(q.epoch);
+        assert_eq!(q.mu.lock().unwrap().waiting[0].skips, 0);
+        for k in 1..=lim.max_skips {
+            q.passed_over(later(u64::from(k)));
+        }
+        assert_eq!(q.mu.lock().unwrap().waiting[0].skips, lim.max_skips);
+        assert!(q.blocks(later(10), lim), "due: a younger request may not pass it over");
+        assert!(
+            !q.blocks(t0, lim),
+            "a request that arrived with it (or before) is not blocked by it"
+        );
+        q.mu.lock().unwrap().waiting[0] = TurnWaiter {
+            id: 0,
+            model: 1,
+            since: t0,
+            skips: 0,
+        };
+        let mut st = q.mu.lock().unwrap();
+        st.waiting[0].since = Instant::now() - lim.max_wait;
+        let w0 = st.waiting[0].since;
+        drop(st);
+        assert!(q.blocks(Instant::now(), lim), "waited as long as the limit allows");
+        assert!(!q.blocks(w0, lim));
+        q.mu.lock().unwrap().waiting.clear();
+        assert!(!q.blocks(later(10), lim), "nobody waits");
+    }
+
+    #[test]
+    fn a_due_waiter_behind_one_that_is_not_due_is_never_passed_over() {
+        let now = Instant::now();
+        let lim = TurnLimits::default();
+        // a lane session queued again (model 0, no skips yet) stands before a waiter that is due
+        let mut w = waiters(&[0, 1], now);
+        w[1].skips = lim.max_skips;
+        assert_eq!(next_turn(&w, Some(0), now, lim), Some(1), "the due waiter goes first");
+        assert_eq!(next_turn(&w, None, now, lim), Some(1));
+        w[1].skips = 0;
+        assert_eq!(next_turn(&w, Some(1), now, lim), Some(1), "then the loaded model");
+        assert_eq!(next_turn(&w, Some(2), now, lim), Some(0), "then arrival order");
+        let q = TurnQueue::default();
+        let t0 = Instant::now();
+        {
+            let mut st = q.mu.lock().unwrap();
+            st.waiting = waiters(&[0, 1], t0);
+            st.waiting[1].since = t0 + Duration::from_millis(5);
+            st.waiting[1].skips = lim.max_skips;
+        }
+        assert!(q.blocks(t0 + Duration::from_millis(9), lim), "a due waiter second in line blocks");
+        assert!(!q.blocks(t0 + Duration::from_millis(5), lim), "not a request as old as it");
+    }
+
+    #[test]
+    fn taking_the_turn_charges_only_the_waiters_that_arrived_first() {
+        let q = TurnQueue::default();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        {
+            let mut st = q.mu.lock().unwrap();
+            st.waiting = waiters(&[1, 2], t0);
+            st.waiting[1].since = t1;
+            st.next_id = 2;
+        }
+        let lim = TurnLimits::default();
+        // the loaded model's waiter arrives with the second one: it passes over the first only
+        let turn = q.acquire_from(0, t1, || Some(0), || lim);
+        {
+            let st = q.mu.lock().unwrap();
+            assert_eq!(st.waiting.iter().map(|w| w.skips).collect::<Vec<_>>(), vec![1, 0]);
+        }
+        drop(turn);
+    }
+
+    #[test]
+    fn a_lane_waiter_queued_from_an_earlier_arrival_takes_its_place_in_line() {
+        let q = TurnQueue::default();
+        let t0 = Instant::now();
+        {
+            let mut st = q.mu.lock().unwrap();
+            st.waiting = waiters(&[1, 2], t0 + Duration::from_millis(10));
+            st.waiting[1].since = t0 + Duration::from_millis(30);
+            st.next_id = 2;
+        }
+        let lim = TurnLimits::default();
+        // model 0 is loaded, so its waiter goes ahead; it stood between the two, so it passes
+        // over only the one that arrived before it
+        let turn = q.acquire_from(0, t0 + Duration::from_millis(20), || Some(0), || lim);
+        {
+            let st = q.mu.lock().unwrap();
+            assert_eq!(st.waiting.iter().map(|w| w.model).collect::<Vec<_>>(), vec![1, 2]);
+            assert_eq!(st.waiting.iter().map(|w| w.skips).collect::<Vec<_>>(), vec![1, 0]);
+        }
+        drop(turn);
     }
 
     #[test]

@@ -32,6 +32,10 @@ use gaudium::tokenizer::{
 };
 use gaudium::verified::{DevEvent, HbmCat, ReqEvent};
 
+/// Most kept prefix positions `--prefix-cache` accepts (a lane plan multiplies them by the lanes
+/// and the slot size in checked arithmetic; far more than any card holds).
+const MAX_PREFIX_SLOTS: u64 = 4096;
+
 /// The line `gaudium --version` prints: the crate version, then the commit the binary was built
 /// from when the build was given one in `GAUDIUM_BUILD_COMMIT`.
 fn version_line() -> String {
@@ -107,7 +111,8 @@ fn print_usage() {
          \x20                       the one before it prefills only the rest, with the same output\n\
          \x20                       as a whole prefill. N = positions of the previous prompt whose\n\
          \x20                       recurrent state is kept on the card to resume from (default: 8;\n\
-         \x20                       0 = off; 0.15 GiB each for a 48-layer DeltaNet model). The\n\
+         \x20                       0 = off; at most 4096; 0.15 GiB each for a 48-layer DeltaNet\n\
+         \x20                       model). The\n\
          \x20                       context is planned first: a load keeps as many as fit beside\n\
          \x20                       it and says so. A request with cache_prompt: false prefills\n\
          \x20                       its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a\n\
@@ -116,6 +121,20 @@ fn print_usage() {
          \x20                       are resumed while the bounded rings still hold what the rest\n\
          \x20                       of the prompt reads, and a copy of the rings taken when each\n\
          \x20                       prompt is in, 0.6 GiB, covers a long generation after it)\n\
+         \x20 --parallel <N>        Requests a model runs at once (default: 1; at most 16): each in a\n\
+         \x20                       lane of its own (its own K/V rows, recurrent state and prefix\n\
+         \x20                       reuse), the decoding lanes stepped together in one launch that\n\
+         \x20                       reads the weights once. Every stream is token-identical to the\n\
+         \x20                       same request run alone. Further requests wait in arrival order;\n\
+         \x20                       a request with images runs alone. Each lane holds the full\n\
+         \x20                       context (--max-ctx / --model-ctx): a load that cannot plan N\n\
+         \x20                       lanes of it is refused with the numbers. A request goes to the\n\
+         \x20                       free lane where it takes over the most of its prompt for the\n\
+         \x20                       least of another conversation's rows. Dense Qwen3 /\n\
+         \x20                       Qwen3.5 / Qwen3.8 models without a drafter; other models are\n\
+         \x20                       served with one lane (the log says why). /props total_slots\n\
+         \x20                       and /slots show the lanes. Not with --cache-ram yet (the\n\
+         \x20                       host-RAM tier is off for a model served with lanes)\n\
          \x20 --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a\n\
          \x20                       conversation: after another conversation, another model, or\n\
          \x20                       the idle release (--idle-park). What a request could resume\n\
@@ -143,8 +162,10 @@ fn print_usage() {
          \x20                       default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock\n\
          \x20                       state dir). Keys: group_max_wait_min (default 45), group_max_skips\n\
          \x20                       (default 3): a request for the loaded model may run ahead of older\n\
-         \x20                       requests until the oldest has waited that long or been passed over\n\
-         \x20                       that many times\n\
+         \x20                       requests until one of them has waited that long or been passed over\n\
+         \x20                       that many times (a request a --parallel lane session admits\n\
+         \x20                       counts too: the session then lets its lanes drain and hands\n\
+         \x20                       the card on)\n\
          \x20 --draft-model <id=dir> Drafter checkpoint for model <id>: speculative decoding, output\n\
          \x20                       token-identical to K=0 (repeatable, one per model). The kind\n\
          \x20                       follows the directory name: a block drafter when it contains\n\
@@ -987,7 +1008,11 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                 let s = next_val(&mut i, "--prefix-cache")?;
                 prefix_slots = s
                     .parse()
-                    .map_err(|_| format!("invalid --prefix-cache '{s}'"))?;
+                    .ok()
+                    .filter(|&n| n <= MAX_PREFIX_SLOTS)
+                    .ok_or_else(|| {
+                        format!("invalid --prefix-cache '{s}' (0..={MAX_PREFIX_SLOTS} positions)")
+                    })?;
             }
             "--prefill" => {
                 let s = next_val(&mut i, "--prefill")?;
@@ -2217,6 +2242,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut vision_max_tokens = gaudium::server::DEFAULT_VISION_MAX_TOKENS;
     let mut prefix_slots = gaudium::engine::qwen3::prefix_cache::DEFAULT_SLOTS;
     let mut cache_ram_bytes: Option<u64> = None;
+    let mut parallel = 1u64;
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -2394,7 +2420,24 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 let s = next_val(&mut i, "--prefix-cache")?;
                 prefix_slots = s
                     .parse()
-                    .map_err(|_| format!("invalid --prefix-cache '{s}'"))?;
+                    .ok()
+                    .filter(|&n| n <= MAX_PREFIX_SLOTS)
+                    .ok_or_else(|| {
+                        format!("invalid --prefix-cache '{s}' (0..={MAX_PREFIX_SLOTS} positions)")
+                    })?;
+            }
+            "--parallel" => {
+                let s = next_val(&mut i, "--parallel")?;
+                parallel = s
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=gaudium::engine::MAX_LANES).contains(n))
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid --parallel '{s}' (1 to {} lanes)",
+                            gaudium::engine::MAX_LANES
+                        )
+                    })?;
             }
             "--cache-ram" => {
                 // GiB, whole or decimal ("8", "0.5"); 0 turns the host tier off
@@ -2485,6 +2528,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         tls_cert,
         tls_key,
         cache_ram_bytes,
+        parallel,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {

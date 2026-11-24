@@ -287,7 +287,7 @@ pub(super) fn run(
     resume: usize,
     gdn_parity: usize,
     vis_layout: Option<&PromptLayout>,
-    is_cancelled: &impl Fn() -> bool,
+    is_cancelled: &(impl Fn() -> bool + ?Sized),
     pf_launch: &mut u64,
 ) -> Result<Option<WaveEnd>, String> {
     let t = eng.prefill_tile;

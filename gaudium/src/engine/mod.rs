@@ -1,6 +1,7 @@
 //! Model weight packers and Intel Gaudi 2 execution engines.
 
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::model_spec::{ModelFamily, ModelSpec};
 
@@ -24,6 +25,139 @@ pub type EngineConfig = qwen3::Qwen3Config;
 pub type GenParams = qwen3::Qwen3GenParams;
 /// Engine-independent generation report (prefill and decode timings kept separate).
 pub type GenReport = qwen3::Qwen3GenReport;
+
+/// One request handed to an engine's lanes (`GenEngine::serve_lanes`).
+pub struct LaneJob {
+    /// Caller's id of the request (shown per lane in `/slots`).
+    pub id: u64,
+    pub prompt: Vec<i32>,
+    pub params: GenParams,
+    /// Tower inputs of a request with images, in prompt order (such a request runs alone).
+    pub images: Option<Vec<crate::vision::PreparedImage>>,
+    /// Set by the caller to stop the request; checked between synced launches.
+    pub cancel: Arc<AtomicBool>,
+    /// Receives this request's events, on the engine's thread: it must not block.
+    pub out: Box<dyn FnMut(LaneOut) + Send>,
+}
+
+impl LaneJob {
+    /// The request must run alone (it has images).
+    pub fn exclusive(&self) -> bool {
+        self.images.as_ref().is_some_and(|v| !v.is_empty())
+    }
+}
+
+/// What an engine tells one lane request.
+pub enum LaneOut {
+    /// The request entered lane `lane`: its prefill starts now.
+    Started { lane: usize },
+    /// A generated token, in order.
+    Token(i32),
+    /// The request is over (the last event it gets).
+    Done(Box<LaneDone>),
+}
+
+/// The end of a lane request: its report, and what the engine knew about it then.
+pub struct LaneDone {
+    pub report: Result<GenReport, String>,
+    /// The tower's timings of a request with images.
+    pub vision: Option<crate::vision::VisionReport>,
+    /// Prefix reuse of the lane the request ran in, as of its end.
+    pub prefix: Option<qwen3::prefix_cache::PrefixStats>,
+    /// The engine's host-RAM tier as of the request's end.
+    pub host_tier: Option<qwen3::host_tier::TierFacts>,
+}
+
+/// What `LaneFeed::head` sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedHead {
+    /// The oldest waiting request; `exclusive`: it must run alone.
+    Job { exclusive: bool },
+    /// Nothing waits (the engine goes on with its busy lanes).
+    Empty,
+    /// Nothing waits and no lane is busy: the session is over, `serve_lanes` returns.
+    End,
+}
+
+/// One lane as `/slots` shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaneView {
+    /// `free`, `prefill`, `decode` or `done` (`core::lanes::LaneTable::state_name`).
+    pub state: &'static str,
+    /// Id of the request in the lane (`LaneJob::id`).
+    pub job: Option<u64>,
+    pub prompt_tokens: u64,
+    pub generated: u64,
+    /// Prompt rows the lane's request took over from what the lane held.
+    pub reused: u64,
+    /// The lane holds a request (`core::lanes::LaneTable::is_busy`).
+    pub busy: bool,
+}
+
+/// Where an engine's lanes take their requests from, in arrival order.
+pub trait LaneFeed {
+    /// The oldest waiting request. `idle`: no lane of the engine is busy; with nothing waiting
+    /// the feed then ends the session (`FeedHead::End`, atomically with new arrivals, which
+    /// start a new session from then on).
+    fn head(&mut self, idle: bool) -> FeedHead;
+    /// Takes the oldest waiting request.
+    fn take(&mut self) -> Option<LaneJob>;
+    /// The lanes changed (state, request, progress).
+    fn lanes(&mut self, view: &[LaneView]);
+}
+
+/// Serves the requests of `feed` one at a time with `generate_cancellable`: the lane loop of an
+/// engine without batched steps (one lane).
+pub fn serve_lanes_serially(
+    eng: &mut (impl GenEngine + ?Sized),
+    feed: &mut dyn LaneFeed,
+) -> Result<(), String> {
+    loop {
+        match feed.head(true) {
+            FeedHead::End => return Ok(()),
+            FeedHead::Empty => continue,
+            FeedHead::Job { .. } => {}
+        }
+        let Some(job) = feed.take() else { continue };
+        let LaneJob {
+            id,
+            prompt,
+            params,
+            images,
+            cancel,
+            mut out,
+        } = job;
+        let had_images = images.as_ref().is_some_and(|v| !v.is_empty());
+        feed.lanes(&[LaneView {
+            state: "prefill",
+            job: Some(id),
+            prompt_tokens: prompt.len() as u64,
+            busy: true,
+            ..LaneView::default()
+        }]);
+        out(LaneOut::Started { lane: 0 });
+        let set = match images {
+            Some(im) => eng.set_request_images(im),
+            None => Ok(()),
+        };
+        let report = set.and_then(|()| {
+            eng.generate_cancellable(&prompt, &params, Some(&cancel), &mut |t| {
+                out(LaneOut::Token(t))
+            })
+        });
+        let done = LaneDone {
+            report,
+            vision: eng.last_vision_report().filter(|_| had_images),
+            prefix: eng.prefix_stats(),
+            host_tier: eng.host_tier_facts(),
+        };
+        out(LaneOut::Done(Box::new(done)));
+        feed.lanes(&[LaneView {
+            state: "free",
+            ..LaneView::default()
+        }]);
+    }
+}
 
 /// Common interface of every live Gaudi 2 text-generation engine, so the CLI and the server
 /// dispatch on the model family instead of naming a concrete engine type.
@@ -113,6 +247,16 @@ pub trait GenEngine: Send {
     fn host_tier_facts(&self) -> Option<qwen3::host_tier::TierFacts> {
         None
     }
+    /// Requests the engine runs at once (its lanes, `--parallel`).
+    fn lanes(&self) -> usize {
+        1
+    }
+    /// Serves the requests of `feed` until it ends the session: each request in a lane of its
+    /// own, the decoding lanes stepped together. An engine without batched steps runs them one
+    /// at a time. Every request taken gets its `Done`, also when this returns an error.
+    fn serve_lanes(&mut self, feed: &mut dyn LaneFeed) -> Result<(), String> {
+        serve_lanes_serially(self, feed)
+    }
 }
 
 impl GenEngine for qwen3::Qwen3Engine {
@@ -178,6 +322,16 @@ impl GenEngine for qwen3::Qwen3Engine {
     }
     fn host_tier_facts(&self) -> Option<qwen3::host_tier::TierFacts> {
         qwen3::Qwen3Engine::host_tier_facts(self)
+    }
+    fn lanes(&self) -> usize {
+        qwen3::Qwen3Engine::lanes(self)
+    }
+    fn serve_lanes(&mut self, feed: &mut dyn LaneFeed) -> Result<(), String> {
+        if qwen3::Qwen3Engine::lanes(self) > 1 {
+            qwen3::Qwen3Engine::serve_lanes(self, feed)
+        } else {
+            serve_lanes_serially(self, feed)
+        }
     }
 }
 
@@ -257,6 +411,16 @@ impl GenEngine for inkling2::Inkling2Engine {
     fn read_vision_embeddings(&self) -> Result<Vec<u8>, String> {
         inkling2::Inkling2Engine::read_vision_embeddings(self)
     }
+}
+
+/// Most lanes an engine is loaded with (`--parallel`): the batched step graphs carry one
+/// attention and recurrence subgraph per lane.
+pub const MAX_LANES: u64 = 16;
+
+/// Does the engine of this model have batched steps for several lanes (`--parallel`)? The dense
+/// Qwen3 / Qwen3.5 / Qwen3.8 engine does; the others run one request at a time.
+pub fn lanes_supported(spec: &ModelSpec) -> bool {
+    matches!(spec.family, ModelFamily::Qwen3 | ModelFamily::Qwen35Dense) && !spec.is_moe()
 }
 
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
