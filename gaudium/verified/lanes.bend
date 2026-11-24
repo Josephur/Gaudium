@@ -1634,7 +1634,7 @@ law ln_lane_io_counts_rounded:
 def ln_lane_io_counts_rounded(c, e):
   L.nat_le_refl(Nat.mul(c, ln_lane_buf_bytes(e)))
 
-# promise: a driver's outcome counts as stopping exactly when it is the stop outcome.
+# promise: the stop outcome of a lane session's driver counts as stopping.
 law ln_sa_done_of_done:
   {ln_sa_done(SaDone{}) == True{} : Bool}
 
