@@ -2052,13 +2052,39 @@ fn serve_loop(
             publish(eng, feed, runs);
         }
 
-        // 2. one step of every decoding lane, greedy and sampled lanes in their own launches
+        // 2. one step of every decoding lane, greedy and sampled lanes in their own launches.
+        // A step queued ahead belongs to the lanes it was launched for: when the batch is no
+        // longer exactly those lanes (a request joined meanwhile), it lands first, so the groups
+        // below are formed from what the lanes hold now.
+        if let Some(a) = ahead.take() {
+            let mut queued: Vec<usize> = a.lanes.iter().map(|&(l, _)| l).collect();
+            queued.sort_unstable();
+            let mut now = eng.lanes.as_ref().expect("lanes").table.batch();
+            now.sort_unstable();
+            if queued == now {
+                ahead = Some(a);
+            } else {
+                let em = spec_collect(eng, &a)?;
+                let live = a
+                    .lanes
+                    .iter()
+                    .zip(em)
+                    .filter(|((l, _), _)| runs[*l].as_ref().is_some_and(|r| !r.done()))
+                    .map(|(&(l, t), e)| (l, t, e))
+                    .collect();
+                apply_spec(eng, runs, live)?;
+            }
+        }
         let batch = eng.lanes.as_ref().expect("lanes").table.batch();
         for sampled in [false, true] {
             let group: Vec<usize> = batch
                 .iter()
                 .copied()
-                .filter(|&l| runs[l].as_ref().is_some_and(|r| r.sampled == sampled))
+                .filter(|&l| {
+                    runs[l]
+                        .as_ref()
+                        .is_some_and(|r| r.sampled == sampled && !r.done())
+                })
                 .collect();
             if group.is_empty() {
                 continue;

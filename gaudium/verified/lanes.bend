@@ -2153,3 +2153,90 @@ law ln_lane_verify_mme_only_given:
 
 def ln_lane_verify_mme_only_given(a, f, n):
   ln_verify_mme_aux(a, Nat.is_gt(n, 1n), f)
+
+# ============================================================================
+# 10. The calls of the DeltaNet output norm in a batched step
+# ============================================================================
+#
+# The output norm of a batched step's DeltaNet layers runs over consecutive slots' rows, in calls
+# of at most `limit` rows (the rows the kernel's decode build takes). Slots are taken in order; a
+# slot opens a new call when its rows would take the open call (`acc` rows so far) past the limit.
+
+# Does a slot of `w` rows open a new call, after the open call took `acc` rows?
+def ln_post_call_opens(acc: Nat, w: Nat, limit: Nat) -> Bool:
+  Nat.is_gt(Nat.add(acc, w), limit)
+
+def ln_post_call_rows_of(opens: Bool, acc: Nat, w: Nat) -> Nat:
+  match opens:
+    case True{}:
+      w
+    case False{}:
+      Nat.add(acc, w)
+
+# The rows of the call a slot of `w` rows lands in, after the open call took `acc`.
+def ln_post_call_rows(+acc: Nat, +w: Nat, limit: Nat) -> Nat:
+  ln_post_call_rows_of(ln_post_call_opens(acc, w, limit), acc, w)
+
+# promise: a slot joins the open call of the output norm only when the call's rows stay within the limit.
+law ln_post_call_joins_within:
+  for +a: Nat
+  for +w: Nat
+  for +l: Nat
+  {Bool.or(ln_post_call_opens(a, w, l), Nat.is_le(Nat.add(a, w), l)) == True{} : Bool}
+
+def ln_post_call_joins_within(a, w, l):
+  ln_gt_or_le(Nat.add(a, w), l)
+
+def ln_post_rows_aux(+a: Nat, +w: Nat, +l: Nat, b: Bool, e: {b == Nat.is_gt(Nat.add(a, w), l) : Bool}) -> {Bool.or(Nat.is_gt(Nat.add(a, w), l), Nat.is_le(ln_post_call_rows_of(b, a, w), l)) == True{} : Bool}:
+  match b:
+    case True{}:
+      %e : {Bool.or(_, Nat.is_le(w, l)) == True{} : Bool}
+      {==}
+    case False{}:
+      ln_gt_or_le(Nat.add(a, w), l)
+
+# promise: a call of the output norm that a slot joined never holds more rows than the limit.
+law ln_post_call_rows_within:
+  for +a: Nat
+  for +w: Nat
+  for +l: Nat
+  {Bool.or(ln_post_call_opens(a, w, l), Nat.is_le(ln_post_call_rows(a, w, l), l)) == True{} : Bool}
+
+def ln_post_call_rows_within(a, w, l):
+  ln_post_rows_aux(a, w, l, Nat.is_gt(Nat.add(a, w), l), {==})
+
+def ln_post_opens_aux(b: Bool, +a: Nat, +w: Nat) -> {Bool.or(Bool.not(b), Nat.is_eq(ln_post_call_rows_of(b, a, w), w)) == True{} : Bool}:
+  match b:
+    case True{}:
+      %ln_eq_refl_true(w) : {Bool.or(False{}, _) == True{} : Bool}
+      {==}
+    case False{}:
+      {==}
+
+# promise: a call of the output norm that a slot opens holds exactly that slot's rows.
+law ln_post_call_opens_with_slot:
+  for +a: Nat
+  for +w: Nat
+  for +l: Nat
+  {Bool.or(Bool.not(ln_post_call_opens(a, w, l)), Nat.is_eq(ln_post_call_rows(a, w, l), w)) == True{} : Bool}
+
+def ln_post_call_opens_with_slot(a, w, l):
+  ln_post_opens_aux(Nat.is_gt(Nat.add(a, w), l), a, w)
+
+def ln_post_joins_aux(b: Bool, +a: Nat, +w: Nat) -> {Bool.or(b, Nat.is_eq(ln_post_call_rows_of(b, a, w), Nat.add(a, w))) == True{} : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      %ln_eq_refl_true(Nat.add(a, w)) : {Bool.or(False{}, _) == True{} : Bool}
+      {==}
+
+# promise: a slot that joins a call of the output norm adds exactly its rows to it (every slot's rows are in exactly one call).
+law ln_post_call_joins_adds_slot:
+  for +a: Nat
+  for +w: Nat
+  for +l: Nat
+  {Bool.or(ln_post_call_opens(a, w, l), Nat.is_eq(ln_post_call_rows(a, w, l), Nat.add(a, w))) == True{} : Bool}
+
+def ln_post_call_joins_adds_slot(a, w, l):
+  ln_post_joins_aux(Nat.is_gt(Nat.add(a, w), l), a, w)

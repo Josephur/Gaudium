@@ -525,17 +525,18 @@ pub(crate) fn append_gdn_post_groups(
     let dl = spec.gdn_v_dim;
     let f32t = SynDataType::Float;
     let rows: u64 = widths.iter().sum();
-    // consecutive slots, as many as the call's rows allow
+    // consecutive slots, as many as a call's rows allow (the verified rule: which slot opens a
+    // new call, and the rows of the call it lands in)
     let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
     let mut start = 0usize;
     let mut acc = 0u64;
     for (j, &w) in widths.iter().enumerate() {
-        if j > start && acc + w > GDN_POST_ROWS {
+        // (before the first slot there is no call to close)
+        if j > 0 && crate::verified::ln_post_call_opens(acc, w, GDN_POST_ROWS) {
             groups.push(start..j);
             start = j;
-            acc = 0;
         }
-        acc += w;
+        acc = crate::verified::ln_post_call_rows(acc, w, GDN_POST_ROWS);
     }
     groups.push(start..widths.len());
     let norm_w = gb.get_or_add_persistent_tensor(format!("{wpfx}norm_w"), f32t, &[dl]);
