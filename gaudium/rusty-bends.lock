@@ -696,6 +696,8 @@ a388dd3e65dec6b0  ln_next_never_yields_busy  law ln_next_never_yields_busy : for
 # promise ln_next_never_yields_busy: a lane session never hands the card's turn back while one of its lanes is busy.
 555750e9182df8c0  ln_next_never_yields_unblocked  law ln_next_never_yields_unblocked : for + i : Bool for + w : Bool { ln_sm_yields ( ln_session_next ( i , w , False { } ) ) == False { } : Bool }
 # promise ln_next_never_yields_unblocked: a lane session hands the card's turn back only when its next admission would pass over a due waiter.
+575524d345a31039  ln_other_drafter_no_lanes  law ln_other_drafter_no_lanes : { ln_drafter_ok ( LdOther { } ) == False { } : Bool }
+# promise ln_other_drafter_no_lanes: a drafter without batched steps (any kind other than plain decode and DSpine with checkpointed verify rows) never gets lanes.
 29f0b746463b60c9  ln_parity_alternates  law ln_parity_alternates : for + p : Nat { Bool.or ( Nat.is_gt ( p , 1n ) , Nat.is_ne ( ln_lane_parity_next ( p ) , p ) ) == True { } : Bool }
 # promise ln_parity_alternates: a lane's next step reads the recurrent-state buffer the step before it wrote, never the one it read.
 da2684c09ec42ceb  ln_parity_in_range  law ln_parity_in_range : for + p : Nat { Nat.is_le ( ln_lane_parity_next ( p ) , 1n ) == True { } : Bool }
