@@ -199,6 +199,13 @@ def g4v_pool_y(+i: Nat, +nbx: Nat, +pool: Nat) -> Nat:
 def g4v_pool_x(+i: Nat, +nbx: Nat, +pool: Nat) -> Nat:
   Nat.add(Nat.mul(Nat.mod(Nat.div(i, Nat.mul(pool, pool)), nbx), pool), Nat.mod(Nat.mod(i, Nat.mul(pool, pool)), pool))
 
+# The pooling GEMM's 0 / 1 weight, `h` output channels by `h pool^2` input columns: the input
+# column `c` of a soft token is channel `c % h` of its patch `c / h` (the token's `pool^2`
+# consecutive rows of the pooling order, viewed as one column of `h pool^2` values). Entry `(o, c)`
+# is one when that channel is `o`.
+def g4v_pool_w_one(+o: Nat, +c: Nat, +h: Nat) -> Bool:
+  Nat.is_eq(Nat.mod(c, h), o)
+
 # Rows of the pooling order of `nby x nbx` whole blocks.
 def g4v_pool_count(nby: Nat, nbx: Nat, +pool: Nat) -> Nat:
   Nat.mul(Nat.mul(nby, nbx), Nat.mul(pool, pool))
@@ -1099,3 +1106,45 @@ law g4v_unified_refuses_other_width:
 
 def g4v_unified_refuses_other_width(hm, mp, p, q, pr, h):
   g4v_and_not_r(g4v_given_eq(hm, mp, Nat.mul(p, q)), Nat.is_eq(pr, h))
+
+# x == x.
+def g4v_is_eq_refl(+x: Nat) -> {Nat.is_eq(x, x) == True{} : Bool}:
+  match x:
+    case 0n:
+      {==}
+    case 1n+xp:
+      g4v_is_eq_refl(xp)
+
+# LAW G4V.24
+# promise: the pooling GEMM never mixes channels: an output channel takes only the same channel of the token's patches.
+# harm: a soft token would average one channel of its patches into another.
+law g4v_pool_w_keeps_channel:
+  for +o: Nat
+  for +c: Nat
+  for +hp: Nat
+  {Bool.and(g4v_pool_w_one(o, c, 1n+hp), Nat.is_ne(Nat.mod(c, 1n+hp), o)) == False{} : Bool}
+
+def g4v_pool_w_keeps_channel(o, c, hp):
+  g4v_and_not_self(Nat.is_eq(Nat.mod(c, 1n+hp), o))
+
+# The completeness law once the channel is known to be below the width (b says it is).
+def g4v_pool_w_every_go(+o: Nat, +j: Nat, +hp: Nat, b: Bool, e: {Nat.is_le(o, hp) == b : Bool}) -> {Bool.and(b, Bool.not(g4v_pool_w_one(o, Nat.add(Nat.mul(j, 1n+hp), o), 1n+hp))) == False{} : Bool}:
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      %Equal.sym(Nat, Nat.mod(Nat.add(Nat.mul(j, 1n+hp), o), 1n+hp), o, g4v_mod_qr(j, hp, o, e)) : {Bool.not(Nat.is_eq(_, o)) == False{} : Bool}
+      %Equal.sym(Bool, Nat.is_eq(o, o), True{}, g4v_is_eq_refl(o)) : {Bool.not(_) == False{} : Bool}
+      {==}
+
+# LAW G4V.25
+# promise: the pooling GEMM takes every patch of a soft token's block: each output channel sums that channel of all its patches.
+# harm: a soft token's mean would miss a patch of its block.
+law g4v_pool_w_takes_every_patch:
+  for +o: Nat
+  for +j: Nat
+  for +hp: Nat
+  {Bool.and(Nat.is_le(o, hp), Bool.not(g4v_pool_w_one(o, Nat.add(Nat.mul(j, 1n+hp), o), 1n+hp))) == False{} : Bool}
+
+def g4v_pool_w_takes_every_patch(o, j, hp):
+  g4v_pool_w_every_go(o, j, hp, Nat.is_le(o, hp), {==})

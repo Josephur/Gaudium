@@ -25,7 +25,7 @@ use crate::synapse::graph::{CompiledRecipe, GraphBuilder};
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
     g4_lane, ikv_feat_cols, ikv_feat_next, ikv_feat_row, ikv_feat_start, ikv_feat_write_safe,
-    g4v_add_part, g4v_image_budget, g4v_pad_cols, g4v_recipe_rows, g4v_request_tokens, ikv_rows_match,
+    g4v_add_part, g4v_image_budget, g4v_pad_cols, g4v_pool_w_one, g4v_recipe_rows, g4v_request_tokens, ikv_rows_match,
     vis_grid_fits, vis_rows_fit,
 };
 use crate::vision::preprocess::PreparedImage;
@@ -255,6 +255,15 @@ fn lanes(vals: &[u16]) -> Vec<f32> {
     out
 }
 
+/// The pooling GEMM's `{h x h ppt}` 0 / 1 weight (`one` its BF16 one), row by row: the verified
+/// `g4v_pool_w_one` places every one.
+pub(crate) fn pool_weight(h: u64, ppt: u64, one: u16) -> Vec<u16> {
+    let cols = h * ppt;
+    (0..h)
+        .flat_map(|o| (0..cols).map(move |c| if g4v_pool_w_one(o, c, h) { one } else { 0 }))
+        .collect()
+}
+
 /// Device bytes of the image-path weight `name` (`expected` bytes, from the plan).
 pub fn pack_weight(store: &SafetensorsStore, geo: &G4vGeo, name: &str) -> Result<Vec<u8>, String> {
     let d = &geo.d;
@@ -278,16 +287,7 @@ pub fn pack_weight(store: &SafetensorsStore, geo: &G4vGeo, name: &str) -> Result
             }
             u16_bytes(w.into_iter())
         }
-        "V_pool_W" => {
-            let p2 = d.ppt();
-            let mut w = vec![0u16; (h * p2 * h) as usize];
-            for o in 0..h {
-                for j in 0..p2 {
-                    w[(o * (h * p2) + j * h + o) as usize] = one;
-                }
-            }
-            u16_bytes(w.into_iter())
-        }
+        "V_pool_W" => u16_bytes(pool_weight(h, d.ppt(), one).into_iter()),
         "V_pool_s" => f32_bytes(std::iter::once(1.0 / d.ppt() as f32)),
         "V_root" => f32_bytes(std::iter::once((h as f64).sqrt() as f32)),
         "V_std_nb" => f32_bytes(bf16_vals(&bf16_of(store, &format!("{vt}std_bias"), h)?).map(|v| -bf16_to_f32(v))),

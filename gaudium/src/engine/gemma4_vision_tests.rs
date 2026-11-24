@@ -158,6 +158,23 @@ fn the_position_tables_refuse_grids_past_their_rows() {
 }
 
 #[test]
+fn the_pooling_weight_sums_each_channel_of_a_token_s_patches() {
+    // entry (o, j h + c) is one exactly when c == o: output channel o sums channel o of each of
+    // the token's patches j, nothing else
+    for (h, p2) in [(1u64, 1u64), (4, 9), (7, 4), (128, 9)] {
+        let w = super::run::pool_weight(h, p2, 1);
+        assert_eq!(w.len() as u64, h * h * p2);
+        for o in 0..h {
+            for j in 0..p2 {
+                for c in 0..h {
+                    assert_eq!(w[(o * h * p2 + j * h + c) as usize], u16::from(c == o), "h {h} p2 {p2} o {o} j {j} c {c}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn pooling_order_is_a_permutation_of_whole_blocks() {
     for (gh, gw) in [(3, 3), (39, 60), (48, 48), (3, 501), (60, 39)] {
         let o = pooling_order(gh, gw, 3);
