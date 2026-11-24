@@ -762,6 +762,16 @@ c4187b93477568c1  ln_batch_lane_busy  law ln_batch_lane_busy : for + s : LaneSta
 # promise ln_batch_lane_busy: a free lane never takes part in a step.
 3f79c9a164d9c2e1  ln_busy_ignores_admit  law ln_busy_ignores_admit : for + s : LaneState { Bool.or ( ln_is_free ( s ) , ln_eq ( ln_step ( s , EvLnAdmit { } ) , s ) ) == True { } : Bool }
 # promise ln_busy_ignores_admit: a lane that holds a request is never given a second one: admission changes only a free lane.
+cac00c761b09ef1b  ln_cost_extra_needs_narrow  law ln_cost_extra_needs_narrow : for + w : Nat { ln_cost_measures_extra ( False { } , w ) == False { } : Bool }
+# promise ln_cost_extra_needs_narrow: a wide slot's extra time is measured only against a measured narrow step of the same shape.
+912f909f195604b3  ln_cost_extra_needs_wide  law ln_cost_extra_needs_wide : for + k : Bool { ln_cost_measures_extra ( k , 0n ) == False { } : Bool }
+# promise ln_cost_extra_needs_wide: a launch with no wide slot never measures a wide slot's extra time (nothing to divide by).
+5c5b9131773f59ad  ln_cost_narrow_has_no_wide  law ln_cost_narrow_has_no_wide : for + w : Nat { ln_cost_measures_narrow ( 1n + w ) == False { } : Bool }
+# promise ln_cost_narrow_has_no_wide: a launch with a wide slot is never taken as the time of the narrow step.
+c385df6ef65fb240  ln_cost_own_kept  law ln_cost_own_kept : for + b : Nat for + c : Nat { ln_cost_takes ( b , c , b ) == False { } : Bool }
+# promise ln_cost_own_kept: a slot count's own measured extra time is never replaced by another slot count's.
+88ea5004f642144a  ln_cost_own_taken  law ln_cost_own_taken : for + b : Nat for + c : Nat { ln_cost_takes ( b , b , c ) == Bool.not ( Nat.is_eq ( c , b ) ) : Bool }
+# promise ln_cost_own_taken: a slot count's own measured extra time replaces the one of any other slot count.
 41b25fa839202267  ln_cursor_moves_forward  law ln_cursor_moves_forward : for + c : Nat for + e : Nat for + r : Nat { Nat.is_lt ( c , ln_lane_cursor_next ( c , 1n + e , 1n + r ) ) == True { } : Bool }
 # promise ln_cursor_moves_forward: a step that wrote and accepted a row moves the lane's cursor forward.
 4b529e672abc1446  ln_cursor_never_back  law ln_cursor_never_back : for + c : Nat for + e : Nat for + r : Nat { Nat.is_le ( c , ln_lane_cursor_next ( c , e , r ) ) == True { } : Bool }
