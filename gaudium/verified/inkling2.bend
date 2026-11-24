@@ -472,6 +472,10 @@ def ik_states_mlp_if(n: Nat, opens: Bool) -> Nat:
 def ik_states_mlp(+layer: Nat, +block: Nat) -> Nat:
   ik_states_mlp_if(ik_states_attn(layer, block), ik_opens_block(layer, block))
 
+# Block states the final mix (behind the last layer) reads.
+def ik_states_final(+n_layers: Nat, +block: Nat) -> Nat:
+  ik_states_mlp(Nat.sub(n_layers, 1n), block)
+
 # Block states a message of the previous pass is mixed from: the blocks the span opened, less its first.
 def ik_msg_states(loop_start: Nat, loop_end: Nat, block: Nat) -> Nat:
   Nat.sub(Nat.div(ik_span(loop_start, loop_end), block), 1n)
@@ -717,15 +721,29 @@ def ikp_mlp_split(+n: Nat, o: Bool) -> {ik_states_mlp_if(n, o) == Nat.add(n, Boo
     case False{}:
       Equal.sym(Nat, Nat.add(n, 0n), n, L.nat_add_zero_r(n))
 
-# LAW IK.6
-# promise: a layer's MLP-input mix reads the block states of its attention-input mix plus one exactly when the layer opens a block.
-law ik_states_mlp_adds_opened:
+# LAW IK.6a
+# promise: a layer's MLP-input mix reads every block state its attention-input mix reads.
+# harm: a state the attention mix used would be missing from the MLP mix of the same layer
+law ik_states_mlp_covers_attn:
   for +l: Nat
   for +b: Nat
-  {ik_states_mlp(l, b) == Nat.add(ik_states_attn(l, b), Bool.pick(Nat, ik_opens_block(l, b), 1n, 0n)) : Nat}
+  {Nat.is_le(ik_states_attn(l, b), ik_states_mlp(l, b)) == True{} : Bool}
 
-def ik_states_mlp_adds_opened(l, b):
-  ikp_mlp_split(ik_states_attn(l, b), ik_opens_block(l, b))
+def ik_states_mlp_covers_attn(l, b):
+  %Equal.sym(Nat, ik_states_mlp(l, b), Nat.add(ik_states_attn(l, b), Bool.pick(Nat, ik_opens_block(l, b), 1n, 0n)), ikp_mlp_split(ik_states_attn(l, b), ik_opens_block(l, b))) : {Nat.is_le(ik_states_attn(l, b), _) == True{} : Bool}
+  L.nat_add_le_r(ik_states_attn(l, b), Bool.pick(Nat, ik_opens_block(l, b), 1n, 0n))
+
+# LAW IK.6b
+# promise: a layer's MLP-input mix reads at most one block state more than its attention-input mix, and that one only when the layer opens a block.
+# harm: a mix would read a block state no layer has added yet
+law ik_states_mlp_within_opened:
+  for +l: Nat
+  for +b: Nat
+  {Nat.is_le(ik_states_mlp(l, b), Nat.add(ik_states_attn(l, b), Bool.pick(Nat, ik_opens_block(l, b), 1n, 0n))) == True{} : Bool}
+
+def ik_states_mlp_within_opened(l, b):
+  %Equal.sym(Nat, ik_states_mlp(l, b), Nat.add(ik_states_attn(l, b), Bool.pick(Nat, ik_opens_block(l, b), 1n, 0n)), ikp_mlp_split(ik_states_attn(l, b), ik_opens_block(l, b))) : {Nat.is_le(_, Nat.add(ik_states_attn(l, b), Bool.pick(Nat, ik_opens_block(l, b), 1n, 0n))) == True{} : Bool}
+  L.nat_le_refl(Nat.add(ik_states_attn(l, b), Bool.pick(Nat, ik_opens_block(l, b), 1n, 0n)))
 
 def ikp_mlp_case(+q: Nat, +r: Nat, c: Bool) -> {ik_states_mlp_if(Nat.add(q, 1n), Nat.is_eq(Pair.snd(Nat, Nat, Bool.pick(Nat & Nat, c, (1n+q, 0n), (q, 1n+r))), 0n)) == Nat.add(Pair.fst(Nat, Nat, Bool.pick(Nat & Nat, c, (1n+q, 0n), (q, 1n+r))), 1n) : Nat}:
   match c:
@@ -1220,6 +1238,11 @@ def ik_bias_distance_channel(e, d):
 def ik_align128(x: Nat) -> Nat:
   Nat.mul(Nat.div(Nat.add(x, 127n), 128n), 128n)
 
+# Channels of the query heads (128 per head): the head part of the query-side projection and the
+# width of the attention output the output projection reads.
+def ik_heads_width(n_heads: Nat) -> Nat:
+  Nat.mul(128n, n_heads)
+
 # Channels of the query-side projection: the query heads, the output gate, the relative states (16 per
 # head), padded to whole blocks of 128.
 def ik_gate_off(n_heads: Nat) -> Nat:
@@ -1279,7 +1302,7 @@ def ikp_gate_rel(+nh: Nat) -> {Nat.is_le(Nat.add(ik_gate_off(nh), Nat.mul(128n, 
 # promise: the query-side projection places the query heads before the output gate and the gate before the relative states, so no two parts share a channel.
 law ik_qx_parts_ordered:
   for +nh: Nat
-  {Bool.and(Nat.is_le(Nat.mul(128n, nh), ik_gate_off(nh)), Nat.is_le(Nat.add(ik_gate_off(nh), Nat.mul(128n, nh)), ik_rel_off(nh))) == True{} : Bool}
+  {Bool.and(Nat.is_le(ik_heads_width(nh), ik_gate_off(nh)), Nat.is_le(Nat.add(ik_gate_off(nh), ik_heads_width(nh)), ik_rel_off(nh))) == True{} : Bool}
 
 def ik_qx_parts_ordered(nh):
   ikp_and_tt(Nat.is_le(Nat.mul(128n, nh), ik_gate_off(nh)), Nat.is_le(Nat.add(ik_gate_off(nh), Nat.mul(128n, nh)), ik_rel_off(nh)), L.nat_le_refl(Nat.mul(128n, nh)), ikp_gate_rel(nh))
@@ -1368,6 +1391,40 @@ law ik_nib_partial_refused:
 def ik_nib_partial_refused(c):
   ikp_nib_partial(c, Bool.and(Nat.is_gt(c, 0n), Nat.is_eq(Nat.mod(c, 16n), 0n)), {==})
 
+# A row of `cols` 8-bit floats with one scale per 32 values (the second stored expert form): usable when
+# `cols` is a non-zero whole number of 32-value scale blocks; the row's bytes are its values.
+def ik_f8_row_ok(+cols: Nat) -> Bool:
+  Bool.and(Nat.is_gt(cols, 0n), Nat.is_eq(Nat.mod(cols, 32n), 0n))
+
+def ik_f8_row_scales(cols: Nat) -> Nat:
+  Nat.div(cols, 32n)
+
+def ikp_whole32(+c: Nat, hm: {Nat.mod(c, 32n) == 0n : Nat}) -> {Nat.mul(Nat.div(c, 32n), 32n) == c : Nat}:
+  %hm : {Nat.add(_, Nat.mul(Nat.div(c, 32n), 32n)) == c : Nat}
+  L.nat_div_mod(c, 31n)
+
+def ikp_f8_32(+c: Nat, +hm: {Nat.mod(c, 32n) == 0n : Nat}) -> {Nat.is_eq(Nat.mul(32n, Nat.div(c, 32n)), c) == True{} : Bool}:
+  %L.nat_mul_comm(Nat.div(c, 32n), 32n) : {Nat.is_eq(_, c) == True{} : Bool}
+  %Equal.sym(Nat, Nat.mul(Nat.div(c, 32n), 32n), c, ikp_whole32(c, hm)) : {Nat.is_eq(_, c) == True{} : Bool}
+  ikp_eq_refl(c)
+
+def ikp_f8_ok(+c: Nat, w: Bool, +hw: {Bool.and(Nat.is_gt(c, 0n), Nat.is_eq(Nat.mod(c, 32n), 0n)) == w : Bool}) -> {Bool.and(w, Bool.not(Nat.is_eq(Nat.mul(32n, ik_f8_row_scales(c)), c))) == False{} : Bool}:
+  match w:
+    case False{}:
+      {==}
+    case True{}:
+      ikp_not_t(Nat.is_eq(Nat.mul(32n, Nat.div(c, 32n)), c), ikp_f8_32(c, ikp_eq_of(Nat.mod(c, 32n), 0n, ikp_and_r(Nat.is_gt(c, 0n), Nat.is_eq(Nat.mod(c, 32n), 0n), hw))))
+
+# LAW IK.27a
+# promise: an 8-bit-float expert row the geometry accepts has one scale per 32 values, covering exactly its columns.
+# harm: the packer would read a row's scales past its last value or leave values without a scale
+law ik_f8_row_consistent:
+  for +c: Nat
+  {Bool.and(ik_f8_row_ok(c), Bool.not(Nat.is_eq(Nat.mul(32n, ik_f8_row_scales(c)), c))) == False{} : Bool}
+
+def ik_f8_row_consistent(c):
+  ikp_f8_ok(c, Bool.and(Nat.is_gt(c, 0n), Nat.is_eq(Nat.mod(c, 32n), 0n)), {==})
+
 # ============================================================================
 # 6. Shape guard
 # ============================================================================
@@ -1425,6 +1482,27 @@ def ik_attn_geom_valid(+window: Nat, +extent: Nat) -> Bool:
 # The emitted vocabulary: at least one token, and every emitted token a row of the embedding.
 def ik_vocab_valid(+unpadded: Nat, +vocab: Nat) -> Bool:
   Bool.and(Nat.is_gt(unpadded, 0n), Nat.is_le(unpadded, vocab))
+
+# Layer applications of one token fit `max_apps` (the plans hold one entry per application). The
+# check divides instead of forming passes x span, so a pass count from a file cannot overflow it.
+def ik_apps_fit_if(+span: Nat, +passes: Nat, +room: Nat) -> Bool:
+  match span:
+    case 0n:
+      True{}
+    case 1n+sp:
+      Nat.is_le(Nat.sub(passes, 1n), Nat.div(room, 1n+sp))
+
+def ik_apps_fit(+n_layers: Nat, +loop_start: Nat, +loop_end: Nat, +passes: Nat, +max_apps: Nat) -> Bool:
+  Bool.and(Nat.is_le(n_layers, max_apps), ik_apps_fit_if(ik_span(loop_start, loop_end), passes, Nat.sub(max_apps, n_layers)))
+
+# The counts a model file sets that the sizing arithmetic multiplies or adds to: the layer
+# applications of one token, the sliding window and the query heads, each within a limit the shell
+# passes. Checked before any schedule, ring or projection width is computed from them.
+def ik_counts_valid(+n_layers: Nat, +loop_start: Nat, +loop_end: Nat, +passes: Nat, +window: Nat, +n_heads: Nat, +max_apps: Nat, +max_window: Nat, +max_heads: Nat) -> Bool:
+  Bool.and(
+    ik_apps_fit(n_layers, loop_start, loop_end, passes, max_apps),
+    Bool.and(Nat.is_le(window, max_window), Nat.is_le(n_heads, max_heads))
+  )
 
 # ----------------------------------------------------------------------------
 # 6b. Laws of the guards
@@ -1510,6 +1588,249 @@ def ik_taps_nonzero(t):
       {==}
     case 1n+tp:
       ikp_and_fr(ik_taps_valid(1n+tp), Nat.is_eq(1n+tp, 0n), {==})
+
+# The parts of the shape guard, as Bool facts: an accepted conjunction a & (b & (c & (e & (f & (g & t)))))
+# holds each part.
+def ikp_conj7_a(a: Bool, b: Bool, c: Bool, e: Bool, f: Bool, g: Bool, t: Bool) -> {Bool.and(Bool.and(a, Bool.and(b, Bool.and(c, Bool.and(e, Bool.and(f, Bool.and(g, t)))))), Bool.not(a)) == False{} : Bool}:
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      match b:
+        case False{}:
+          {==}
+        case True{}:
+          match c:
+            case False{}:
+              {==}
+            case True{}:
+              match e:
+                case False{}:
+                  {==}
+                case True{}:
+                  match f:
+                    case False{}:
+                      {==}
+                    case True{}:
+                      match g:
+                        case False{}:
+                          {==}
+                        case True{}:
+                          match t:
+                            case False{}:
+                              {==}
+                            case True{}:
+                              {==}
+
+def ikp_conj7_g(a: Bool, b: Bool, c: Bool, e: Bool, f: Bool, g: Bool, t: Bool) -> {Bool.and(Bool.and(a, Bool.and(b, Bool.and(c, Bool.and(e, Bool.and(f, Bool.and(g, t)))))), Bool.not(g)) == False{} : Bool}:
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      match b:
+        case False{}:
+          {==}
+        case True{}:
+          match c:
+            case False{}:
+              {==}
+            case True{}:
+              match e:
+                case False{}:
+                  {==}
+                case True{}:
+                  match f:
+                    case False{}:
+                      {==}
+                    case True{}:
+                      match g:
+                        case False{}:
+                          {==}
+                        case True{}:
+                          match t:
+                            case False{}:
+                              {==}
+                            case True{}:
+                              {==}
+
+def ikp_conj7_cft(a: Bool, b: Bool, c: Bool, e: Bool, f: Bool, g: Bool, t: Bool) -> {Bool.and(Bool.and(a, Bool.and(b, Bool.and(c, Bool.and(e, Bool.and(f, Bool.and(g, t)))))), Bool.not(Bool.and(c, Bool.and(f, t)))) == False{} : Bool}:
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      match b:
+        case False{}:
+          {==}
+        case True{}:
+          match c:
+            case False{}:
+              {==}
+            case True{}:
+              match e:
+                case False{}:
+                  {==}
+                case True{}:
+                  match f:
+                    case False{}:
+                      {==}
+                    case True{}:
+                      match g:
+                        case False{}:
+                          {==}
+                        case True{}:
+                          match t:
+                            case False{}:
+                              {==}
+                            case True{}:
+                              {==}
+
+# The three laws below tie the guard the shell calls (`ik_dims_valid`) to its part guards, so a
+# later guard cannot drop a part. Each leaves the arguments of the parts it names free and fixes
+# only the arguments of the other conjuncts to accepted values (head dim 128, 16 relative states,
+# whole-block widths and expert counts), so that the sampled law tests reach accepted shapes.
+
+# LAW IK.32a
+# promise: a shape the guard the shell calls accepts always has a hidden size of whole 128-channel blocks.
+# harm: a later guard could drop the hidden-width check and hand the kernels a partial block
+law ik_dims_guard_hidden:
+  for +h: Nat
+  for +nh: Nat
+  for +kv: Nat
+  for +e: Nat
+  for +k: Nat
+  for +f: Nat
+  for +t: Nat
+  {Bool.and(ik_dims_valid(h, nh, kv, 128n, 16n, Nat.mul(128n, 1n+e), k, Nat.mul(128n, 1n+f), t), Bool.not(ik_width_whole(h))) == False{} : Bool}
+
+def ik_dims_guard_hidden(h, nh, kv, e, k, f, t):
+  ikp_conj7_a(ik_width_whole(h), Bool.and(Nat.is_eq(128n, 128n), Nat.is_eq(16n, 16n)), ik_head_groups_valid(nh, kv), Bool.and(Nat.is_gt(Nat.mul(128n, 1n+e), 0n), Bool.and(Nat.is_eq(Nat.mod(Nat.mul(128n, 1n+e), 128n), 0n), Nat.is_le(Nat.mul(128n, 1n+e), 512n))), ik_top_k_valid(k, Nat.mul(128n, 1n+e)), ik_width_whole(Nat.mul(128n, 1n+f)), ik_taps_valid(t))
+
+# LAW IK.32b
+# promise: a shape the guard the shell calls accepts always has an expert width of whole 128-channel blocks.
+# harm: a later guard could drop the expert-width check and hand the expert kernels a partial block
+law ik_dims_guard_expert_width:
+  for +g: Nat
+  for +nh: Nat
+  for +kv: Nat
+  for +e: Nat
+  for +k: Nat
+  for +ff: Nat
+  for +t: Nat
+  {Bool.and(ik_dims_valid(Nat.mul(128n, 1n+g), nh, kv, 128n, 16n, Nat.mul(128n, 1n+e), k, ff, t), Bool.not(ik_width_whole(ff))) == False{} : Bool}
+
+def ik_dims_guard_expert_width(g, nh, kv, e, k, ff, t):
+  ikp_conj7_g(ik_width_whole(Nat.mul(128n, 1n+g)), Bool.and(Nat.is_eq(128n, 128n), Nat.is_eq(16n, 16n)), ik_head_groups_valid(nh, kv), Bool.and(Nat.is_gt(Nat.mul(128n, 1n+e), 0n), Bool.and(Nat.is_eq(Nat.mod(Nat.mul(128n, 1n+e), 128n), 0n), Nat.is_le(Nat.mul(128n, 1n+e), 512n))), ik_top_k_valid(k, Nat.mul(128n, 1n+e)), ik_width_whole(ff), ik_taps_valid(t))
+
+# LAW IK.32c
+# promise: a shape the guard the shell calls accepts always has grouped heads, a router selection within the experts and non-zero convolution taps.
+# harm: a later guard could drop one of these checks and hand the kernels heads, experts or taps they do not cover
+law ik_dims_guard_heads_router_taps:
+  for +g: Nat
+  for +nh: Nat
+  for +kv: Nat
+  for +e: Nat
+  for +k: Nat
+  for +f: Nat
+  for +t: Nat
+  {Bool.and(ik_dims_valid(Nat.mul(128n, 1n+g), nh, kv, 128n, 16n, Nat.mul(128n, 1n+e), k, Nat.mul(128n, 1n+f), t), Bool.not(Bool.and(ik_head_groups_valid(nh, kv), Bool.and(ik_top_k_valid(k, Nat.mul(128n, 1n+e)), ik_taps_valid(t))))) == False{} : Bool}
+
+def ik_dims_guard_heads_router_taps(g, nh, kv, e, k, f, t):
+  ikp_conj7_cft(ik_width_whole(Nat.mul(128n, 1n+g)), Bool.and(Nat.is_eq(128n, 128n), Nat.is_eq(16n, 16n)), ik_head_groups_valid(nh, kv), Bool.and(Nat.is_gt(Nat.mul(128n, 1n+e), 0n), Bool.and(Nat.is_eq(Nat.mod(Nat.mul(128n, 1n+e), 128n), 0n), Nat.is_le(Nat.mul(128n, 1n+e), 512n))), ik_top_k_valid(k, Nat.mul(128n, 1n+e)), ik_width_whole(Nat.mul(128n, 1n+f)), ik_taps_valid(t))
+
+# (q / (1 + sp)) * (1 + sp) never exceeds q.
+def ikp_divmul_le(+x: Nat, +sp: Nat) -> {Nat.is_le(Nat.mul(Nat.div(x, 1n+sp), 1n+sp), x) == True{} : Bool}:
+  %L.nat_div_mod_r(x, sp) : {Nat.is_le(Nat.mul(Nat.div(x, 1n+sp), 1n+sp), _) == True{} : Bool}
+  L.nat_add_le_r(Nat.mul(Nat.div(x, 1n+sp), 1n+sp), Nat.mod(x, 1n+sp))
+
+def ikp_fit_le_s(+n: Nat, +sp: Nat, +p: Nat, +mx: Nat, hn: {Nat.is_le(n, mx) == True{} : Bool}, hq: {Nat.is_le(Nat.sub(p, 1n), Nat.div(Nat.sub(mx, n), 1n+sp)) == True{} : Bool}) -> {Nat.is_le(Nat.add(n, Nat.mul(Nat.sub(p, 1n), 1n+sp)), mx) == True{} : Bool}:
+  %L.nat_sub_add_cancel(mx, n, hn) : {Nat.is_le(Nat.add(n, Nat.mul(Nat.sub(p, 1n), 1n+sp)), _) == True{} : Bool}
+  %L.nat_add_comm(n, Nat.sub(mx, n)) : {Nat.is_le(Nat.add(n, Nat.mul(Nat.sub(p, 1n), 1n+sp)), _) == True{} : Bool}
+  L.nat_add_le_mono(n, n, Nat.mul(Nat.sub(p, 1n), 1n+sp), Nat.sub(mx, n), L.nat_le_refl(n), L.nat_le_trans(Nat.mul(Nat.sub(p, 1n), 1n+sp), Nat.mul(Nat.div(Nat.sub(mx, n), 1n+sp), 1n+sp), Nat.sub(mx, n), L.nat_mul_le_mono_r(Nat.sub(p, 1n), Nat.div(Nat.sub(mx, n), 1n+sp), 1n+sp, hq), ikp_divmul_le(Nat.sub(mx, n), sp)))
+
+# An accepted application count is n + (p - 1) * s <= mx.
+def ikp_fit_le(+n: Nat, +s: Nat, +p: Nat, +mx: Nat, +h: {Bool.and(Nat.is_le(n, mx), ik_apps_fit_if(s, p, Nat.sub(mx, n))) == True{} : Bool}) -> {Nat.is_le(Nat.add(n, Nat.mul(Nat.sub(p, 1n), s)), mx) == True{} : Bool}:
+  match s:
+    case 0n:
+      %Equal.sym(Nat, Nat.mul(Nat.sub(p, 1n), 0n), 0n, L.nat_mul_zero_r(Nat.sub(p, 1n))) : {Nat.is_le(Nat.add(n, _), mx) == True{} : Bool}
+      %Equal.sym(Nat, Nat.add(n, 0n), n, L.nat_add_zero_r(n)) : {Nat.is_le(_, mx) == True{} : Bool}
+      ikp_and_l(Nat.is_le(n, mx), True{}, h)
+    case 1n+sp:
+      ikp_fit_le_s(n, sp, p, mx, ikp_and_l(Nat.is_le(n, mx), Nat.is_le(Nat.sub(p, 1n), Nat.div(Nat.sub(mx, n), 1n+sp)), h), ikp_and_r(Nat.is_le(n, mx), Nat.is_le(Nat.sub(p, 1n), Nat.div(Nat.sub(mx, n), 1n+sp)), h))
+
+def ikp_counts_apps(+n: Nat, +ls: Nat, +le: Nat, +p: Nat, +w: Nat, +nh: Nat, +ma: Nat, +mw: Nat, +mh: Nat, v: Bool, hv: {ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh) == v : Bool}) -> {Bool.and(v, Nat.is_lt(ma, ik_apps(n, ls, le, p))) == False{} : Bool}:
+  match v:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_le_lt_false(ma, ik_apps(n, ls, le, p), ikp_fit_le(n, ik_span(ls, le), p, ma, ikp_and_l(ik_apps_fit(n, ls, le, p, ma), Bool.and(Nat.is_le(w, mw), Nat.is_le(nh, mh)), hv)))
+
+# LAW IK.32b
+# promise: a model the counts guard accepts runs no more layer applications per token than the limit the shell passes.
+# harm: a pass count from a file could make the schedule overflow or allocate without bound
+law ik_counts_apps_within:
+  for +n: Nat
+  for +ls: Nat
+  for +le: Nat
+  for +p: Nat
+  for +w: Nat
+  for +nh: Nat
+  for +ma: Nat
+  for +mw: Nat
+  for +mh: Nat
+  {Bool.and(ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh), Nat.is_lt(ma, ik_apps(n, ls, le, p))) == False{} : Bool}
+
+def ik_counts_apps_within(n, ls, le, p, w, nh, ma, mw, mh):
+  ikp_counts_apps(n, ls, le, p, w, nh, ma, mw, mh, ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh), {==})
+
+def ikp_counts_window(+n: Nat, +ls: Nat, +le: Nat, +p: Nat, +w: Nat, +nh: Nat, +ma: Nat, +mw: Nat, +mh: Nat, v: Bool, hv: {ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh) == v : Bool}) -> {Bool.and(v, Nat.is_lt(mw, w)) == False{} : Bool}:
+  match v:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_le_lt_false(mw, w, ikp_and_l(Nat.is_le(w, mw), Nat.is_le(nh, mh), ikp_and_r(ik_apps_fit(n, ls, le, p, ma), Bool.and(Nat.is_le(w, mw), Nat.is_le(nh, mh)), hv)))
+
+# LAW IK.32c
+# promise: a sliding window the counts guard accepts is within the limit the shell passes.
+# harm: a window from a file could overflow the ring sizing arithmetic
+law ik_counts_window_within:
+  for +n: Nat
+  for +ls: Nat
+  for +le: Nat
+  for +p: Nat
+  for +w: Nat
+  for +nh: Nat
+  for +ma: Nat
+  for +mw: Nat
+  for +mh: Nat
+  {Bool.and(ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh), Nat.is_lt(mw, w)) == False{} : Bool}
+
+def ik_counts_window_within(n, ls, le, p, w, nh, ma, mw, mh):
+  ikp_counts_window(n, ls, le, p, w, nh, ma, mw, mh, ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh), {==})
+
+def ikp_counts_heads(+n: Nat, +ls: Nat, +le: Nat, +p: Nat, +w: Nat, +nh: Nat, +ma: Nat, +mw: Nat, +mh: Nat, v: Bool, hv: {ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh) == v : Bool}) -> {Bool.and(v, Nat.is_lt(mh, nh)) == False{} : Bool}:
+  match v:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_le_lt_false(mh, nh, ikp_and_r(Nat.is_le(w, mw), Nat.is_le(nh, mh), ikp_and_r(ik_apps_fit(n, ls, le, p, ma), Bool.and(Nat.is_le(w, mw), Nat.is_le(nh, mh)), hv)))
+
+# LAW IK.32d
+# promise: a query-head count the counts guard accepts is within the limit the shell passes.
+# harm: a head count from a file could overflow the projection width arithmetic
+law ik_counts_heads_within:
+  for +n: Nat
+  for +ls: Nat
+  for +le: Nat
+  for +p: Nat
+  for +w: Nat
+  for +nh: Nat
+  for +ma: Nat
+  for +mw: Nat
+  for +mh: Nat
+  {Bool.and(ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh), Nat.is_lt(mh, nh)) == False{} : Bool}
+
+def ik_counts_heads_within(n, ls, le, p, w, nh, ma, mw, mh):
+  ikp_counts_heads(n, ls, le, p, w, nh, ma, mw, mh, ik_counts_valid(n, ls, le, p, w, nh, ma, mw, mh), {==})
 
 def ikp_geom_vec(+w: Nat, +rows: Nat, hc: {Nat.is_ne(ik_ring_slots(w, rows), 0n) == True{} : Bool}) -> {Nat.is_lt(ik_ring_slots(w, rows), Nat.add(w, 64n)) == False{} : Bool}:
   %hc : {Bool.and(_, Nat.is_lt(ik_ring_slots(w, rows), Nat.add(w, 64n))) == False{} : Bool}

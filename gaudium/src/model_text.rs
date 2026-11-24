@@ -99,7 +99,8 @@ impl ModelText {
     /// Where one resource comes from: `in_file`, the GGUF metadata carries it; `in_dir`, the
     /// directory has it.
     fn source(&self, in_file: bool, in_dir: bool) -> MtSource {
-        v::mt_source(self.gguf.is_some(), self.gguf.is_some() && in_file, in_dir)
+        // without a GGUF file `in_file` is ignored (law `mt_checkpoint_never_file`)
+        v::mt_source(self.gguf.is_some(), in_file, in_dir)
     }
 
     fn read_dir_file(&self, name: &str) -> Option<String> {
@@ -349,6 +350,17 @@ mod tests {
             kvs.push(("tokenizer.chat_template".into(), Kv::Str(t.into())));
         }
         kvs
+    }
+
+    #[test]
+    fn the_files_own_metadata_wins_over_the_directory() {
+        // today's precedence (pinned here, not sealed: a corrected file beside the model may win
+        // one day); the bounds behind it are the laws `mt_file_needs_key` / `mt_dir_needs_file`
+        for in_dir in [false, true] {
+            assert_eq!(v::mt_source(true, true, in_dir), MtSource::MtFromFile);
+        }
+        assert_eq!(v::mt_source(true, false, true), MtSource::MtFromDir);
+        assert_eq!(v::mt_source(false, true, true), MtSource::MtFromDir);
     }
 
     #[test]

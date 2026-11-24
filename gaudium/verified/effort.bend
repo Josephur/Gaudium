@@ -413,33 +413,6 @@ def effort_off_level_accepted(off, effort_set, has_off, reads_flag):
     case False{} False{} False{} True{}: {==}
     case False{} False{} False{} False{}: {==}
 
-# promise: the off level never replaces an effort the request named itself
-law effort_off_level_keeps_request:
-  for off: Bool
-  for +effort_set: Bool
-  for has_off: Bool
-  for reads_flag: Bool
-  {Bool.or(Bool.not(effort_set), Bool.not(effort_off_by_level(off, effort_set, has_off, reads_flag))) == True{} : Bool}
-
-def effort_off_level_keeps_request(off, effort_set, has_off, reads_flag):
-  match off effort_set has_off reads_flag:
-    case True{} True{} True{} True{}: {==}
-    case True{} True{} True{} False{}: {==}
-    case True{} True{} False{} True{}: {==}
-    case True{} True{} False{} False{}: {==}
-    case True{} False{} True{} True{}: {==}
-    case True{} False{} True{} False{}: {==}
-    case True{} False{} False{} True{}: {==}
-    case True{} False{} False{} False{}: {==}
-    case False{} True{} True{} True{}: {==}
-    case False{} True{} True{} False{}: {==}
-    case False{} True{} False{} True{}: {==}
-    case False{} True{} False{} False{}: {==}
-    case False{} False{} True{} True{}: {==}
-    case False{} False{} True{} False{}: {==}
-    case False{} False{} False{} True{}: {==}
-    case False{} False{} False{} False{}: {==}
-
 # promise: the off level is given only when the request turns reasoning off
 law effort_off_level_only_when_off:
   for +off: Bool

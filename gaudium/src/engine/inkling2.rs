@@ -62,8 +62,8 @@ use crate::synapse::graph::{CompiledRecipe, GraphBuilder, PreparedLaunch, Tensor
 use crate::synapse::ops::u32_params;
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
-    align_up, ik_bias_off, ik_bias_width, ik_gate_off, ik_kx_width, ik_qx_width, ik_rel_off,
-    ik_tile_last_row, ik_tile_rows, ik_tile_take, HbmCat,
+    align_up, ik_bias_off, ik_bias_width, ik_gate_off, ik_heads_width, ik_kx_width, ik_qx_width,
+    ik_rel_off, ik_tile_last_row, ik_tile_rows, ik_tile_take, HbmCat,
 };
 
 #[path = "inkling2_packer.rs"]
@@ -615,7 +615,7 @@ fn append_ik_app(
     );
     let ao_part = gb.add_persistent_tensor(format!("{a}ao_part"), f32t, &[128, r, b]);
     gb.op_batch_gemm(format!("{a}pv"), pm, vc, ao_part, false, false);
-    let core = gb.add_persistent_tensor(format!("{a}core"), bf, &[128 * d.nh, t]);
+    let core = gb.add_persistent_tensor(format!("{a}core"), bf, &[ik_heads_width(d.nh), t]);
     gb.add_node(
         "gaudium_ik_combine",
         format!("{a}combine"),
@@ -623,7 +623,7 @@ fn append_ik_app(
         &[core],
         &u32_params(&[nchx as u32, ik_gate_off(d.nh) as u32]),
     );
-    let attn = ik_linear(gb, core, &format!("{l}W_o"), 128 * d.nh, hid, t, &format!("{a}attn"));
+    let attn = ik_linear(gb, core, &format!("{l}W_o"), ik_heads_width(d.nh), hid, t, &format!("{a}attn"));
 
     // convolution over the attention output, and the f32 residual stream
     let isd = ((d.taps + 1) as f32).powf(-0.5);
@@ -2492,7 +2492,7 @@ impl Inkling2Engine {
             // `tv` prompt rows run as a tile of `t` rows (a ladder of sizes: the rows past the prompt
             // are computed, written past the cursor and never read; the next pass writes them again)
             let tv = ik_tile_take((prompt_ids.len() - pos) as u64, self.prefill_tile);
-            let t = ik_tile_rows(tv, self.prefill_tile, self.max_ctx - pos as u64);
+            let t = ik_tile_rows(tv, self.prefill_tile, self.max_ctx.saturating_sub(pos as u64));
             let end_pos = pos as u64 + t;
             let nch = step_bucket(end_pos.div_ceil(IK_CHUNK), self.max_chunks);
             self.reuse.will_write(end_pos);

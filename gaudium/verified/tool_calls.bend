@@ -810,7 +810,8 @@ def slice_bound_in_range(from_end, mag, len):
 type ForcePlace is Data:
   FpNone{}      # nothing is forced
   FpPlace{}     # the call's opening ends the prompt
-  FpIgnored{}   # forced, but the opening cannot be placed: the request notes it as not applied
+  FpInReasoning{}  # forced, but the prompt ends inside the reasoning: noted as not applied
+  FpCannotWrite{}  # forced, but the format cannot write the opening: noted as not applied
 
 # A forced call's opening ends the prompt, unless the prompt ends inside the model's reasoning or
 # the model's format cannot write the opening (`can_place` false, e.g. a call without a name).
@@ -821,13 +822,13 @@ def tool_force_place(forces: Bool, reasoning_open: Bool, can_place: Bool) -> For
     case True{}:
       match reasoning_open:
         case True{}:
-          FpIgnored{}
+          FpInReasoning{}
         case False{}:
           match can_place:
             case True{}:
               FpPlace{}
             case False{}:
-              FpIgnored{}
+              FpCannotWrite{}
 
 def force_is_placed(p: ForcePlace) -> Bool:
   match p:

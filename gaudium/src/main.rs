@@ -883,7 +883,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let tok = text.tokenizer()?;
     // `--chat`: the family's built-in chat form, or the model's own template (`mt_cli_chat`)
     let builtin_chat = text.spec().map_or(true, |s| has_builtin_chat_form(s.family));
-    let one_turn = if chat && !builtin_chat {
+    let one_turn = if gaudium::verified::mt_cli_wants_template(chat, builtin_chat) {
         gaudium::server::OneTurnTemplate::load(&text)?
     } else {
         None

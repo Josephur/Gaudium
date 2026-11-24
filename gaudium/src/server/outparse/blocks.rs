@@ -11,7 +11,9 @@
 use super::{partial_suffix, CallStyle, Delta, OutputFormat, OutputParser};
 use crate::core::tool_calls::{release_len, CallEvent};
 use crate::json::{parse_json, JsonValue};
-use crate::verified::{mb_act, mb_call_event, mb_next, MbAct, MbEvent, MbState};
+use crate::verified::{
+    mb_act, mb_call_event, mb_fresh, mb_next, mb_start, MbAct, MbEvent, MbFresh, MbState,
+};
 
 /// A model block's header.
 pub(super) const HEADER: &str = "<|message_model|>";
@@ -95,11 +97,7 @@ pub(super) fn forced_call_prefix(name: &str) -> String {
 impl OutputParser {
     /// The reader's state when the prompt ends inside a reasoning block, or between blocks.
     pub(super) fn block_start(reasoning_open: bool) -> MbState {
-        if reasoning_open {
-            MbState::MsThink
-        } else {
-            MbState::MsOutside
-        }
+        mb_start(reasoning_open)
     }
 
     pub(super) fn route_blocks(&mut self, text: &str, d: &mut Delta, last: bool) {
@@ -149,6 +147,7 @@ impl OutputParser {
 
     fn block_event(&mut self, e: MbEvent, words: &str, d: &mut Delta) {
         let act = mb_act(self.mb, e, self.split);
+        let fresh = mb_fresh(self.mb, e);
         self.mb = mb_next(self.mb, e);
         match act {
             MbAct::MaNone => {}
@@ -166,12 +165,13 @@ impl OutputParser {
             MbAct::MaCutCall => self.read_block_call(d, false),
         }
         // a new block's own text starts empty
-        if e == MbEvent::MeHeader && self.mb == MbState::MsHeader {
-            self.mb_name.clear();
-        }
-        if e == MbEvent::MeOpenCall && self.mb == MbState::MsCall {
-            self.mb_call.clear();
-            self.stream.apply(CallEvent::CeOpen);
+        match fresh {
+            MbFresh::MfNone => {}
+            MbFresh::MfName => self.mb_name.clear(),
+            MbFresh::MfCall => {
+                self.mb_call.clear();
+                self.stream.apply(CallEvent::CeOpen);
+            }
         }
     }
 

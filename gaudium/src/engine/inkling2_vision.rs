@@ -61,8 +61,9 @@ use crate::synapse::graph::{CompiledRecipe, GraphBuilder, PreparedLaunch, Tensor
 use crate::synapse::ops::{as_param_bytes, TransposeParams};
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
-    align_up, ikv_bucket, ikv_feat_cols, ikv_feat_row, ikv_feat_write_ok, ikv_key_live, ikv_round,
-    ikv_rows_match, ikv_seq_rows, ikv_side, ikv_token_cap, ikv_tokens_fit, HbmCat,
+    align_up, ikv_bucket, ikv_feat_cols, ikv_feat_next, ikv_feat_row, ikv_feat_start,
+    ikv_feat_write_safe, ikv_key_live, ikv_round, ikv_rows_match, ikv_seq_rows, ikv_side,
+    ikv_token_cap, ikv_tokens_fit, HbmCat,
 };
 use crate::vision::preprocess::{PreparedImage, RgbImage};
 use crate::vision::{ImageProcessor, VisionReport, VisionSpec};
@@ -963,8 +964,12 @@ impl IkvPlan {
             ));
         }
         let max_tokens = max_tokens.max(cap);
-        let max_rows = ikv_seq_rows(cap, d.ppt());
-        let feat_cols = ikv_feat_cols(max_tokens, cap);
+        let max_rows = ikv_seq_rows(cap, d.ppt()).ok_or_else(|| {
+            format!("--vision-max-patches {max_patches}: the tower sequence overflows")
+        })?;
+        let feat_cols = ikv_feat_cols(max_tokens, cap).ok_or_else(|| {
+            format!("--vision-max-tokens {max_tokens}: the feature buffer overflows")
+        })?;
         let mut plan = Self {
             d,
             cap,
@@ -1291,12 +1296,17 @@ impl IkVision {
             cfg.vision_max_tokens,
             super::IK_MAX_PREFILL_TILE,
         )?;
-        let mut pre: Vec<u64> = cfg
-            .vision_precompile
-            .iter()
-            .map(|&p| ikv_bucket(p / d.ppt(), ikv_round(p / d.ppt()), plan.cap))
-            .filter(|&b| b > 0)
-            .collect();
+        let mut pre: Vec<u64> = Vec::with_capacity(cfg.vision_precompile.len() + 1);
+        for &p in &cfg.vision_precompile {
+            let need = p / d.ppt();
+            let rung = ikv_round(need).ok_or_else(|| {
+                format!("--vision-precompile {p}: no bucket holds that many patches")
+            })?;
+            let b = ikv_bucket(need, rung, plan.cap);
+            if b > 0 {
+                pre.push(b);
+            }
+        }
         pre.push(plan.cap);
         pre.sort_unstable();
         pre.dedup();
@@ -1367,7 +1377,7 @@ impl IkVision {
         verbose: bool,
     ) -> Result<(CompiledRecipe, CompiledRecipe, CompiledRecipe), String> {
         let d = &self.plan.d;
-        let n = ikv_seq_rows(b, d.ppt());
+        let n = ikv_seq_rows(b, d.ppt()).ok_or("vision bucket: the tower sequence overflows")?;
         let mut out = Vec::with_capacity(3);
         for gb in [
             build_embed_graph(d, n),
@@ -1519,7 +1529,7 @@ impl IkVision {
                     k + 1,
                     im.src_width,
                     im.src_height,
-                    tr * tc,
+                    tr.saturating_mul(tc),
                     d.tile(),
                     self.plan.cap,
                     self.plan.cap * d.ppt()
@@ -1742,19 +1752,22 @@ impl Inkling2Engine {
         let mut report = VisionReport::default();
         report.images = req.images.len();
         report.image_tokens = req.tokens;
-        let mut off = 1u64; // column 0 stays zero
+        // the first image's features start behind the column text rows read
+        let mut off = ikv_feat_start();
         for (k, im) in req.images.iter().enumerate() {
             let vis = self.vision.as_ref().expect("vision tower");
             let d = vis.plan.d;
             let m = d.merge as usize;
             let tokens = ((im.grid_h / m) * (im.grid_w / m)) as u64;
-            let b = ikv_bucket(tokens, ikv_round(tokens), vis.plan.cap);
-            let n = ikv_seq_rows(b, d.ppt());
-            if !ikv_feat_write_ok(off, b, vis.plan.feat_cols) {
+            let rung = ikv_round(tokens).ok_or("vision bucket: no rung holds the image")?;
+            let b = ikv_bucket(tokens, rung, vis.plan.cap);
+            let n =
+                ikv_seq_rows(b, d.ppt()).ok_or("vision bucket: the tower sequence overflows")?;
+            if !ikv_feat_write_safe(off, b, vis.plan.feat_cols) {
                 return Err(format!(
                     "image {}: its features (columns {off}..{}) do not fit the feature buffer of {} columns",
                     k + 1,
-                    off + b,
+                    off.saturating_add(b),
                     vis.plan.feat_cols
                 ));
             }
@@ -1892,7 +1905,7 @@ impl Inkling2Engine {
                     im.src_height
                 );
             }
-            off += tokens;
+            off = ikv_feat_next(off, tokens);
         }
         let vis = self.vision.as_mut().expect("vision tower");
         vis.last_tokens = req.tokens;

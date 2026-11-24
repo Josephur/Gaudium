@@ -193,6 +193,8 @@ mod tests {
             reads_flag: false,
         };
         assert!(levels_only.off_by_level(true, false));
+        // today's order (pinned here, not sealed): an effort the request named wins over the off
+        // level, even when reasoning off was asked for (e.g. by a forced tool call)
         assert!(!levels_only.off_by_level(true, true) && !levels_only.off_by_level(false, false));
         // one that reads the flag keeps using it
         let flag = EffortForm {

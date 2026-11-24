@@ -160,6 +160,73 @@ def mb_is_none(a: MbAct) -> Bool:
       False{}
 
 # ============================================================================
+# 3a. Start state and fresh buffers
+# ============================================================================
+
+# The reader's state when the prompt ends inside a reasoning block (`reasoning_open`), or between blocks.
+def mb_start(reasoning_open: Bool) -> MbState:
+  match reasoning_open:
+    case True{}:
+      MsThink{}
+    case False{}:
+      MsOutside{}
+
+# What a transition starts empty: nothing, the block's name, or the call's text (and a new call
+# in the reply's call lifecycle).
+type MbFresh is Data:
+  MfNone{}
+  MfName{}
+  MfCall{}
+
+def mb_fresh_of(e: MbEvent, next: MbState) -> MbFresh:
+  match e next:
+    case MeHeader{} MsHeader{}:
+      MfName{}
+    case MeOpenCall{} MsCall{}:
+      MfCall{}
+    case _ _:
+      MfNone{}
+
+# What the event `e` read in state `s` starts empty.
+def mb_fresh(+s: MbState, +e: MbEvent) -> MbFresh:
+  mb_fresh_of(e, mb_next(s, e))
+
+def mb_fresh_is_call(f: MbFresh) -> Bool:
+  match f:
+    case MfCall{}:
+      True{}
+    case _:
+      False{}
+
+def mb_fresh_is_name(f: MbFresh) -> Bool:
+  match f:
+    case MfName{}:
+      True{}
+    case _:
+      False{}
+
+def mb_is_header(s: MbState) -> Bool:
+  match s:
+    case MsHeader{}:
+      True{}
+    case _:
+      False{}
+
+def mb_is_done(s: MbState) -> Bool:
+  match s:
+    case MsDone{}:
+      True{}
+    case _:
+      False{}
+
+def mb_is_content(a: MbAct) -> Bool:
+  match a:
+    case MaContent{}:
+      True{}
+    case _:
+      False{}
+
+# ============================================================================
 # 4. Laws
 # ============================================================================
 
@@ -631,7 +698,7 @@ def mb_call_event(tools_on: Bool) -> MbEvent:
 # promise: without offered tools no block is ever read as a tool call
 # harm: a reply to a request without tools would lose text into a call nobody asked for
 law mb_no_tools_no_call:
-  {mb_call_event(False{}) == MeOpenText{} : MbEvent}
+  {mb_is_open_call(mb_call_event(False{})) == False{} : Bool}
 
 def mb_no_tools_no_call():
   {==}
@@ -642,3 +709,309 @@ law mb_tools_call_opens:
 
 def mb_tools_call_opens():
   {==}
+
+# ----------------------------------------------------------------------------
+# Laws of the start state and the fresh buffers
+# ----------------------------------------------------------------------------
+
+# promise: a new call (its text started empty, a call opened in the reply's lifecycle) begins only at the call marker, and the reader is then inside the call.
+# harm: plain text or another block would open a tool call in the client's stream
+law mb_call_fresh_only_on_open:
+  for +s: MbState
+  for +e: MbEvent
+  {Bool.and(mb_fresh_is_call(mb_fresh(s, e)), Bool.not(Bool.and(mb_is_open_call(e), mb_is_call(mb_next(s, e))))) == False{} : Bool}
+
+def mb_call_fresh_only_on_open(s, e):
+  match s:
+    case MsOutside{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsHeader{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsThink{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsText{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsCall{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsDone{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+
+# promise: a tool-call block the reader enters always starts with empty call text and a new call.
+# harm: a call would carry text of an earlier block, or arrive without its opening in the stream
+law mb_call_entered_fresh:
+  for +s: MbState
+  for +e: MbEvent
+  {Bool.and(Bool.and(Bool.not(mb_is_call(s)), mb_is_call(mb_next(s, e))), Bool.not(mb_fresh_is_call(mb_fresh(s, e)))) == False{} : Bool}
+
+def mb_call_entered_fresh(s, e):
+  match s:
+    case MsOutside{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsHeader{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsThink{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsText{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsCall{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsDone{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+
+# promise: a block header the reader enters always starts with an empty name.
+# harm: a call would be named with the name of an earlier block
+law mb_name_entered_fresh:
+  for +s: MbState
+  for +e: MbEvent
+  {Bool.and(Bool.and(Bool.not(mb_is_header(s)), mb_is_header(mb_next(s, e))), Bool.not(mb_fresh_is_name(mb_fresh(s, e)))) == False{} : Bool}
+
+def mb_name_entered_fresh(s, e):
+  match s:
+    case MsOutside{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsHeader{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsThink{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsText{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsCall{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsDone{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+
+# promise: a block's name is started empty only when the reader enters a header.
+# harm: the name of the open block would be lost in the middle of the block
+law mb_name_fresh_only_on_header:
+  for +s: MbState
+  for +e: MbEvent
+  {Bool.and(mb_fresh_is_name(mb_fresh(s, e)), Bool.not(mb_is_header(mb_next(s, e)))) == False{} : Bool}
+
+def mb_name_fresh_only_on_header(s, e):
+  match s:
+    case MsOutside{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsHeader{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsThink{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsText{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsCall{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsDone{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+
+# promise: the reader never starts inside a tool call or after the end of the reply.
+# harm: the first words of a reply would be read as a call, or dropped as if the reply were over
+law mb_start_open:
+  for +r: Bool
+  {Bool.or(mb_is_call(mb_start(r)), mb_is_done(mb_start(r))) == False{} : Bool}
+
+def mb_start_open(r):
+  match r:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: when the prompt ends inside reasoning and the request splits reasoning out, the reply's first words are never shown as content.
+# harm: hidden reasoning would leak into the visible reply
+law mb_start_reasoning_not_content:
+  for +r: Bool
+  {Bool.and(r, mb_is_content(mb_act(mb_start(r), MeWords{}, True{}))) == False{} : Bool}
+
+def mb_start_reasoning_not_content(r):
+  match r:
+    case True{}: {==}
+    case False{}: {==}

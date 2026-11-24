@@ -860,7 +860,7 @@ impl Gguf {
             for (k, f) in files.iter().enumerate() {
                 let no = f.get_u64("split.no").unwrap_or(u64::MAX);
                 let c = f.get_u64("split.count").unwrap_or(0);
-                if !v::gg_shard_ok(no, k as u64, count) || c != count {
+                if !v::gg_shard_in_set(no, c, k as u64, count) {
                     return Err(err(
                         &f.path.display().to_string(),
                         "split.no / split.count do not form one set with the other shards",
@@ -884,7 +884,7 @@ impl Gguf {
         }
         if count > 0 {
             if let Some(want) = files[0].kv("split.tensors.count").and_then(|v| v.as_u64()) {
-                if want != total {
+                if !v::gg_tensor_total_ok(want, total) {
                     return Err(err(
                         &where_,
                         format!("split.tensors.count is {want}, the shards hold {total}"),
