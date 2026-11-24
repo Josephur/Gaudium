@@ -1613,7 +1613,7 @@ impl Qwen3Engine {
         let kv_bytes: u64 = kv_specs.values().map(|&b| align256(b)).sum::<u64>() + gdn_state_bytes;
         // [lanes] every lane holds what lane 0 holds (its caches and state rings), and the
         // batched steps have buffers of their own
-        let kv_all = kv_bytes.saturating_mul(n_lanes as u64);
+        let kv_all = crate::verified::ln_lane_arena_bytes(kv_bytes, 0, n_lanes as u64);
         let lane_act_bytes = lane_plan.as_ref().map_or(0, |p| p.act_bytes());
 
         let pf_x_bytes = align256(spec.hidden * prefill_tile * 2);
@@ -1811,7 +1811,7 @@ impl Qwen3Engine {
         if n_lanes > 1 && dev_opt.is_some() {
             use crate::core::hbm::usable_hbm_bytes;
             let usable = usable_hbm_bytes(total_hbm, total_hbm.saturating_sub(free_hbm), headroom);
-            let shared = base_total.saturating_sub(kv_all);
+            let shared = crate::verified::ln_plan_shared(base_total, n_lanes as u64, kv_bytes);
             if let Err(short) =
                 crate::core::lanes::plan_check(n_lanes as u64, kv_bytes, shared, usable)
             {

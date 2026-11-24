@@ -322,6 +322,17 @@ def ln_plan_bytes(n: Nat, lane_bytes: Nat, shared: Nat) -> Nat:
 def ln_plan_fits(n: Nat, lane_bytes: Nat, shared: Nat, usable: Nat) -> Bool:
   Nat.is_le(ln_plan_bytes(n, lane_bytes, shared), usable)
 
+# Bytes of the lanes' own caches in the device plan: `n` lanes of `kv` bytes (K/V caches and
+# recurrent state), and `spec` bytes of speculative step buffers for every lane but the first
+# (the first lane's are the speculative runtime's own, planned with it).
+def ln_lane_arena_bytes(kv: Nat, spec: Nat, +n: Nat) -> Nat:
+  Nat.add(Nat.mul(n, kv), Nat.mul(Nat.sub(n, 1n), spec))
+
+# The shared part of a device plan of `total` bytes holding `n` lanes of `lane_bytes`: what the
+# lane plan check is given beside the lanes.
+def ln_plan_shared(total: Nat, +n: Nat, +lane_bytes: Nat) -> Nat:
+  Nat.sub(total, Nat.mul(n, lane_bytes))
+
 # Lanes of `lane_bytes` that fit beside `shared` bytes in `usable` bytes (the refusal says it).
 def ln_lanes_fit(lane_bytes: Nat, shared: Nat, usable: Nat) -> Nat:
   Nat.div(Nat.sub(usable, shared), lane_bytes)
@@ -1402,3 +1413,45 @@ law ln_session_active_covers_lanes:
 
 def ln_session_active_covers_lanes(b):
   L.nat_max_ge_r(1n, b)
+
+def ln_sub_add_ge(+t: Nat, +m: Nat) -> {Nat.is_le(t, Nat.add(Nat.sub(t, m), m)) == True{} : Bool}:
+  match t:
+    case 0n:
+      L.nat_le_zero(Nat.add(Nat.sub(0n, m), m))
+    case 1n+tp:
+      match m:
+        case 0n:
+          L.nat_add_le_r(1n+tp, 0n)
+        case 1n+mp:
+          %Equal.sym(Nat, Nat.add(Nat.sub(tp, mp), 1n+mp), 1n+Nat.add(Nat.sub(tp, mp), mp), L.nat_add_succ_r(Nat.sub(tp, mp), mp)) : {Nat.is_le(1n+tp, _) == True{} : Bool}
+          ln_sub_add_ge(tp, mp)
+
+# promise: the device plan counts the caches and recurrent state of every lane.
+law ln_arena_counts_lane_caches:
+  for +kv: Nat
+  for +sp: Nat
+  for +n: Nat
+  {Nat.is_le(Nat.mul(n, kv), ln_lane_arena_bytes(kv, sp, n)) == True{} : Bool}
+
+def ln_arena_counts_lane_caches(kv, sp, n):
+  L.nat_add_le_r(Nat.mul(n, kv), Nat.mul(Nat.sub(n, 1n), sp))
+
+# promise: the device plan counts the speculative step buffers of every lane but the first.
+law ln_arena_counts_other_spec:
+  for +kv: Nat
+  for +sp: Nat
+  for +n: Nat
+  {Nat.is_le(Nat.mul(Nat.sub(n, 1n), sp), ln_lane_arena_bytes(kv, sp, n)) == True{} : Bool}
+
+def ln_arena_counts_other_spec(kv, sp, n):
+  L.nat_add_le_l(Nat.mul(n, kv), Nat.mul(Nat.sub(n, 1n), sp))
+
+# promise: the lane plan check is never given less than the whole device plan.
+law ln_plan_check_sees_whole_plan:
+  for +t: Nat
+  for +n: Nat
+  for +lb: Nat
+  {Nat.is_le(t, ln_plan_bytes(n, lb, ln_plan_shared(t, n, lb))) == True{} : Bool}
+
+def ln_plan_check_sees_whole_plan(t, n, lb):
+  ln_sub_add_ge(t, Nat.mul(n, lb))

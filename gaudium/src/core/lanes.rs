@@ -439,6 +439,15 @@ mod tests {
     }
 
     #[test]
+    fn the_lanes_arena_and_the_plans_shared_part() {
+        use crate::verified::{ln_lane_arena_bytes, ln_plan_shared};
+        assert_eq!(ln_lane_arena_bytes(10, 0, 8), 80, "8 lanes of caches");
+        assert_eq!(ln_lane_arena_bytes(10, 3, 4), 49, "and lanes 1..4's step buffers");
+        assert_eq!(ln_lane_arena_bytes(10, 3, 1), 10, "one lane: the runtime's own buffers");
+        assert_eq!(ln_plan_shared(100, 4, 10), 60);
+    }
+
+    #[test]
     fn skips_and_the_sessions_active_count() {
         assert_eq!(skips_after(2, true), 3);
         assert_eq!(skips_after(2, false), 2);
