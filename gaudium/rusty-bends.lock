@@ -83,6 +83,14 @@ d556bde2ff41c207  g4_heads_zero_kv_rejected  law g4_heads_zero_kv_rejected : for
 b92e3f940df9aed8  g4_kv_share_all_rejected  law g4_kv_share_all_rejected : for + nl : Nat for + extra : Nat { g4_kv_share_valid ( nl , Nat.add ( nl , extra ) ) == False { } : Bool }
 c53430ffbf275392  g4_ple_off_always_valid  law g4_ple_off_always_valid : for pv : Nat for v : Nat { g4_ple_valid ( 0n , pv , v ) == True { } : Bool }
 629829a88fd02c54  g4_rope_vecs_boundary  law g4_rope_vecs_boundary : { Bool.and ( Nat.is_eq ( g4_rope_vecs ( 0n ) , 0n ) , Nat.is_eq ( g4_rope_vecs ( 128n ) , 1n ) ) == True { } : Bool }
+7abfa6b6fe57928a  g4u_ext_within_unit  law g4u_ext_within_unit : for b : Bool for + p : Nat for + e : Nat for + k : Nat { Nat.is_lt ( Nat.add ( p , g4u_ext ( b , p , e , 1n + Nat.add ( p , k ) ) ) , 1n + Nat.add ( p , k ) ) == True { } : Bool }
+# promise g4u_ext_within_unit: a prefill row in a sliding layer never attends a position past the end of the keys its unit has written.
+# harm g4u_ext_within_unit: it would read a ring slot that holds a stale or foreign key.
+e8092380d5d2675c  g4u_fits_within_ring  law g4u_fits_within_ring : for + r : Nat for + w : Nat for + n : Nat { Bool.and ( g4u_fits ( r , w , n ) , Nat.is_lt ( 1n + r , Nat.add ( n , w ) ) ) == False { } : Bool }
+# promise g4u_fits_within_ring: a prefill unit the ring is said to fit keeps its rows and the window of its first row inside the ring (rows + window <= ring + 1).
+# harm g4u_fits_within_ring: a later tile's keys would overwrite keys an earlier tile's rows still attend.
+cce1a244d6e57d79  g4u_join_within_buffers  law g4u_join_within_buffers : for c : Bool for + n : Nat for + m : Nat { Bool.and ( g4u_join ( c , n , m ) , Nat.is_le ( m , n ) ) == False { } : Bool }
+# promise g4u_join_within_buffers: a unit never takes a tile beyond the tile buffers the plan holds for it.
 13a2fa8783059771  gdn_zero_k_rejected  law gdn_zero_k_rejected : for + vh : Nat for ck : Nat { gdn_dims_valid ( 0n , vh , ck ) == False { } : Bool }
 5e31df0d7e1ee34b  gen_end_call_limit_not_cancel  law gen_end_call_limit_not_cancel : for eos : Bool for cancelled : Bool { gen_end ( False { } , True { } , eos , cancelled ) == GeCallLimit { } : GenEnd }
 701a333557e52866  gen_end_no_flag_is_length  law gen_end_no_flag_is_length : { gen_end ( False { } , False { } , False { } , False { } ) == GeLength { } : GenEnd }
