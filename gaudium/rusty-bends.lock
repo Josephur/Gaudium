@@ -618,6 +618,10 @@ b0815bca45eb3881  ln_admit_takes_lane  law ln_admit_takes_lane : { ln_is_free ( 
 # promise ln_admit_takes_lane: admitting a request to a free lane makes the lane busy.
 d984ec24670227e3  ln_allowed_moves  law ln_allowed_moves : for + s : LaneState for + ev : LaneEvent { ln_allows ( s , ev ) == Bool.not ( ln_eq ( ln_step ( s , ev ) , s ) ) : Bool }
 # promise ln_allowed_moves: an event the lane lifecycle allows always moves the lane to another state, and one it refuses leaves the lane as it was.
+12c99bee3423d523  ln_arena_counts_lane_caches  law ln_arena_counts_lane_caches : for + kv : Nat for + sp : Nat for + n : Nat { Nat.is_le ( Nat.mul ( n , kv ) , ln_lane_arena_bytes ( kv , sp , n ) ) == True { } : Bool }
+# promise ln_arena_counts_lane_caches: the device plan counts the caches and recurrent state of every lane.
+28b7f3c70ba23a58  ln_arena_counts_other_spec  law ln_arena_counts_other_spec : for + kv : Nat for + sp : Nat for + n : Nat { Nat.is_le ( Nat.mul ( Nat.sub ( n , 1n ) , sp ) , ln_lane_arena_bytes ( kv , sp , n ) ) == True { } : Bool }
+# promise ln_arena_counts_other_spec: the device plan counts the speculative step buffers of every lane but the first.
 8a1e3739fbfd4ef9  ln_batch_chunks_covers_slot  law ln_batch_chunks_covers_slot : for + acc : Nat for + c : Nat for + r : Nat for + ch : Nat { Nat.is_le ( ln_slot_chunks ( c , r , ch ) , ln_batch_chunks ( acc , c , r , ch ) ) == True { } : Bool }
 # promise ln_batch_chunks_covers_slot: a batched step covers at least the chunks of every slot folded into it.
 d4405ae2492f5dd0  ln_batch_chunks_keeps_acc  law ln_batch_chunks_keeps_acc : for + acc : Nat for + c : Nat for + r : Nat for + ch : Nat { Nat.is_le ( acc , ln_batch_chunks ( acc , c , r , ch ) ) == True { } : Bool }
@@ -676,6 +680,8 @@ a388dd3e65dec6b0  ln_next_never_yields_busy  law ln_next_never_yields_busy : for
 # promise ln_parity_alternates: a lane's next step reads the recurrent-state buffer the step before it wrote, never the one it read.
 da2684c09ec42ceb  ln_parity_in_range  law ln_parity_in_range : for + p : Nat { Nat.is_le ( ln_lane_parity_next ( p ) , 1n ) == True { } : Bool }
 # promise ln_parity_in_range: a lane's next step reads one of its two recurrent-state buffers.
+5df90855617e3558  ln_plan_check_sees_whole_plan  law ln_plan_check_sees_whole_plan : for + t : Nat for + n : Nat for + lb : Nat { Nat.is_le ( t , ln_plan_bytes ( n , lb , ln_plan_shared ( t , n , lb ) ) ) == True { } : Bool }
+# promise ln_plan_check_sees_whole_plan: the lane plan check is never given less than the whole device plan.
 4ee286db60615584  ln_plan_counts_all  law ln_plan_counts_all : for + n : Nat for + lb : Nat for + sh : Nat { Nat.is_le ( Nat.add ( sh , Nat.mul ( n , lb ) ) , ln_plan_bytes ( n , lb , sh ) ) == True { } : Bool }
 # promise ln_plan_counts_all: a plan's bytes hold its shared part and all its lanes together.
 49d2f13787d5755f  ln_plan_counts_every_lane  law ln_plan_counts_every_lane : for + n : Nat for + lb : Nat for + sh : Nat { Nat.is_le ( Nat.mul ( n , lb ) , ln_plan_bytes ( n , lb , sh ) ) == True { } : Bool }
@@ -706,6 +712,10 @@ b154f53da1686da6  ln_served_lanes_within_max  law ln_served_lanes_within_max : f
 # promise ln_served_lanes_within_max: a model is never served with more lanes than the batched step graphs are built for.
 e72d1ee9144841c2  ln_served_lanes_within_request  law ln_served_lanes_within_request : for + r : Nat for + m : Nat for + ok : Bool { Nat.is_le ( ln_served_lanes ( 1n + r , m , ok ) , 1n + r ) == True { } : Bool }
 # promise ln_served_lanes_within_request: a model is never served with more lanes than were asked for.
+bf9856e20aa1a89f  ln_session_active_counts  law ln_session_active_counts : for + b : Nat { Nat.is_le ( 1n , ln_session_active ( b ) ) == True { } : Bool }
+# promise ln_session_active_counts: a running lane session counts as at least one active request, so the card is never released under it.
+dd8859b2c302f08e  ln_session_active_covers_lanes  law ln_session_active_covers_lanes : for + b : Nat { Nat.is_le ( b , ln_session_active ( b ) ) == True { } : Bool }
+# promise ln_session_active_covers_lanes: a running lane session counts at least as many active requests as it has busy lanes.
 61d68b15d279d63c  ln_session_keeps_busy_lanes  law ln_session_keeps_busy_lanes : for + d : Bool { ln_session_yields ( False { } , d ) == False { } : Bool }
 # promise ln_session_keeps_busy_lanes: a lane session never hands the card's turn back while one of its lanes is busy.
 2f00db09731c6af6  ln_session_never_neither  law ln_session_never_neither : for + a : Bool { Bool.or ( a , ln_session_starts ( a ) ) == True { } : Bool }
@@ -716,6 +726,12 @@ e72d1ee9144841c2  ln_served_lanes_within_request  law ln_served_lanes_within_req
 # promise ln_session_waits_for_lanes: a lane session never ends while a lane is busy.
 d4b7d09914eb7e0f  ln_session_waits_for_queue  law ln_session_waits_for_queue : for + i : Bool { ln_session_ends ( i , True { } ) == False { } : Bool }
 # promise ln_session_waits_for_queue: a lane session never ends while a request waits.
+f6359c44f5f5b85b  ln_skips_count_pass  law ln_skips_count_pass : for + s : Nat { Nat.is_gt ( ln_skips_after ( s , True { } ) , s ) == True { } : Bool }
+# promise ln_skips_count_pass: every time a waiter for the card is passed over, it counts toward its limit.
+71de21616c2d2bf4  ln_skips_never_drop  law ln_skips_never_drop : for + s : Nat for + p : Bool { Nat.is_le ( s , ln_skips_after ( s , p ) ) == True { } : Bool }
+# promise ln_skips_never_drop: a waiter's count of times passed over never goes down while it waits.
+02ea77ba27252827  ln_skips_unpassed_kept  law ln_skips_unpassed_kept : for + s : Nat { Nat.is_le ( ln_skips_after ( s , False { } ) , s ) == True { } : Bool }
+# promise ln_skips_unpassed_kept: a waiter that was not passed over is not charged a skip.
 5cac3d5c38d24219  ln_slot_fits_covered  law ln_slot_fits_covered : for + c : Nat for + r : Nat for + n : Nat for + ch : Nat for + lc : Nat { Bool.and ( ln_slot_fits ( c , r , n , ch , lc ) , Nat.is_lt ( Nat.mul ( n , ch ) , Nat.add ( c , r ) ) ) == False { } : Bool }
 # promise ln_slot_fits_covered: a slot the batch check accepts never writes a row past the chunks the step covers.
 4cc5ec693cf7c8ee  ln_slot_fits_within_lane  law ln_slot_fits_within_lane : for + c : Nat for + r : Nat for + n : Nat for + ch : Nat for + lc : Nat { Bool.and ( ln_slot_fits ( c , r , n , ch , lc ) , Nat.is_lt ( Nat.mul ( lc , ch ) , Nat.add ( c , r ) ) ) == False { } : Bool }
