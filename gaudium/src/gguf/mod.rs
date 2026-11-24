@@ -732,17 +732,25 @@ fn parse(b: &[u8], file: &str) -> Result<Parsed, GgufError> {
     Ok((version, alignment, data_start, kvs, tensors))
 }
 
-/// `<stem>-00002-of-00003.gguf` -> (stem, 2, 3).
+/// `<stem>-00002-of-00003.gguf` -> (stem, 2, 3). Read on the name's bytes, so a name whose
+/// last 20 bytes cut a multi-byte character is an ordinary unsplit file, never a panic.
 fn split_name(path: &Path) -> Option<(String, u32, u32)> {
     let s = path.to_str()?;
-    let tail = s.get(s.len().checked_sub(20)?..)?; // -NNNNN-of-NNNNN.gguf
-    let b = tail.as_bytes();
-    if b[0] != b'-' || &tail[6..10] != "-of-" || &tail[15..] != ".gguf" {
+    let b = s.as_bytes();
+    let tail = b.get(b.len().checked_sub(20)?..)?; // -NNNNN-of-NNNNN.gguf
+    if tail[0] != b'-' || &tail[6..10] != b"-of-" || &tail[15..] != b".gguf" {
         return None;
     }
-    let no: u32 = tail[1..6].parse().ok()?;
-    let count: u32 = tail[10..15].parse().ok()?;
-    Some((s[..s.len() - 20].to_owned(), no, count))
+    let number = |d: &[u8]| -> Option<u32> {
+        if !d.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(d).ok()?.parse().ok()
+    };
+    let no = number(&tail[1..6])?;
+    let count = number(&tail[10..15])?;
+    // every byte of the tail is ASCII now, so the stem ends on a character boundary
+    Some((s.get(..s.len() - 20)?.to_owned(), no, count))
 }
 
 fn is_gguf_name(p: &Path) -> bool {
@@ -779,7 +787,8 @@ pub struct Gguf {
     /// The model's shards in split order (one entry for an unsplit file).
     pub files: Vec<GgufFile>,
     /// Other GGUF files of a directory that are not part of the model: projector files
-    /// (`general.architecture` `clip`, or `general.type` `mmproj`). Not opened.
+    /// (`general.architecture` `clip`, or `general.type` `mmproj`) and block-drafter files
+    /// (`general.architecture` `dflash`), which a model's loader finds beside it. Not opened.
     pub side_files: Vec<PathBuf>,
     by_name: BTreeMap<String, (usize, usize)>,
 }
@@ -796,7 +805,8 @@ impl fmt::Debug for Gguf {
 
 impl Gguf {
     /// Opens a `.gguf` file (a shard of a split finds its siblings) or a directory of them.
-    /// In a directory the projector files are set aside; more than one other model is refused.
+    /// In a directory the companion files (projectors, block drafters) are set aside; more than
+    /// one other model is refused.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, GgufError> {
         let path = path.as_ref();
         let where_ = path.display().to_string();
@@ -814,7 +824,7 @@ impl Gguf {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let ty = f.kv("general.type").and_then(|v| v.as_str()).unwrap_or("");
-                if arch == "clip" || ty == "mmproj" {
+                if arch == "clip" || ty == "mmproj" || arch == "dflash" {
                     side_files.push(c);
                 } else {
                     files.push(f);
@@ -823,7 +833,7 @@ impl Gguf {
             if files.is_empty() {
                 return Err(err(
                     &where_,
-                    "holds only projector (mmproj) files, no model",
+                    "holds only companion files (projectors, block drafters), no model",
                 ));
             }
         } else if let Some((stem, _, count)) = split_name(path) {

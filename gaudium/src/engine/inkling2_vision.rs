@@ -51,6 +51,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::{select_exact_bindings, IkDims, Inkling2Engine};
+use crate::core::hbm::HbmLedgerGuard;
 use crate::core::vision::EmbRows;
 use crate::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use crate::json::{parse_json, JsonValue};
@@ -1010,18 +1011,33 @@ impl IkvPlan {
         Ok(plan)
     }
 
+    /// Records every buffer in the verified ledger: weights (`CatWeights`), activations
+    /// (`CatScratch`: the named ones, the two ping-pong row buffers, the feature buffer).
+    pub fn record(&self, l: &mut HbmLedgerGuard) {
+        super::record_map(l, HbmCat::CatWeights, &self.weights);
+        super::record_map(l, HbmCat::CatScratch, &self.acts);
+        for _ in 0..2 {
+            l.record(HbmCat::CatScratch, align256(self.xbuf_bytes));
+        }
+        l.record(HbmCat::CatScratch, align256(self.feat_bytes));
+    }
+
+    fn ledger(&self) -> HbmLedgerGuard {
+        let mut l = HbmLedgerGuard::new();
+        self.record(&mut l);
+        l
+    }
+
     pub fn weights_bytes(&self) -> u64 {
-        self.weights.values().map(|&b| align256(b)).sum()
+        self.ledger().breakdown().0
     }
 
     pub fn act_bytes(&self) -> u64 {
-        self.acts.values().map(|&b| align256(b)).sum::<u64>()
-            + 2 * align256(self.xbuf_bytes)
-            + align256(self.feat_bytes)
+        self.ledger().breakdown().3
     }
 
     pub fn total(&self) -> u64 {
-        self.weights_bytes() + self.act_bytes()
+        self.ledger().total_bytes()
     }
 }
 
@@ -1340,6 +1356,11 @@ impl IkVision {
 
     pub fn plan_bytes(&self) -> (u64, u64) {
         (self.plan.weights_bytes(), self.plan.act_bytes())
+    }
+
+    /// The tower's buffers in the load's verified ledger.
+    pub fn record_plan(&self, l: &mut HbmLedgerGuard) {
+        self.plan.record(l);
     }
 
     /// Compiles the recipes of the planned buckets (the largest image among them), so the shared

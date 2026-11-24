@@ -339,17 +339,24 @@ fn prepare_one_image(
     serve: &VisionServe,
     with_pixels: bool,
 ) -> Result<PreparedImage, String> {
-    let img = if with_pixels {
+    let (rgb, width, height) = if with_pixels {
         let rgb = decode::decode_image(bytes, &serve.decode_limits())?;
-        prepare_image(&rgb, &serve.spec)?
+        let (w, h) = (rgb.width, rgb.height);
+        (Some(rgb), w, h)
     } else {
         let p = decode::probe(bytes)?;
         serve.decode_limits().check_canvas(p.width, p.height)?;
-        let (rh, rw) = image_target_size(p.width, p.height, &serve.spec)?;
-        PreparedImage::sized((p.width, p.height), rw, rh, &serve.spec)
+        (None, p.width, p.height)
     };
-    check_tower_fit(&img, serve)?;
-    Ok(img)
+    // the tower's budget is checked on the sizes, before any patch row is made: a model whose
+    // processor pads to whole tiles never resizes, so its patch rows can be far beyond the tower
+    let (rh, rw) = image_target_size(width, height, &serve.spec)?;
+    let sized = PreparedImage::sized((width, height), rw, rh, &serve.spec);
+    check_tower_fit(&sized, serve)?;
+    match rgb {
+        Some(rgb) => prepare_image(&rgb, &serve.spec),
+        None => Ok(sized),
+    }
 }
 
 /// Where a video's frames come from, after the request's references are resolved.
@@ -779,6 +786,24 @@ mod tests {
         let mut f = format!("P6\n{w} {h}\n255\n").into_bytes();
         f.extend_from_slice(data);
         format!("data:image/x-portable-pixmap;base64,{}", base64(&f))
+    }
+
+    /// A model whose processor pads to whole tiles never resizes: an image beyond the tower is
+    /// refused on its sizes, before its patch rows are made.
+    #[test]
+    fn a_tiled_image_beyond_the_tower_is_refused_on_its_sizes() {
+        let mut spec = qwen38_vision_spec();
+        spec.processor = crate::vision::ImageProcessor::Tiles;
+        let serve = VisionServe::new(spec, 1024, 16384, MediaLimits::default()).unwrap();
+        // 40000 x 1 pixels: 1250 tiles of 2 x 2 patches, 5000 patches for a tower of 1024
+        let (w, h) = (40_000usize, 1usize);
+        let mut f = format!("P6\n{w} {h}\n255\n").into_bytes();
+        f.extend(std::iter::repeat_n(7u8, w * h * 3));
+        let e = prepare_one_image(&f, &serve, true).unwrap_err();
+        assert!(e.contains("planned for 1024"), "{e}");
+        // the same image without its pixels gives the same refusal
+        let e2 = prepare_one_image(&f, &serve, false).unwrap_err();
+        assert_eq!(e, e2);
     }
 
     fn serve(max_patches: u64, max_tokens: u64) -> VisionServe {

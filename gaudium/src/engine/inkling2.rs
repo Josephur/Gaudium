@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::core::budget::SequenceBudget;
+use crate::core::hbm::HbmLedgerGuard;
 use crate::core::inkling2::{
     final_states, hist_rows, msg_states, ring_slots, schedule, source_buffers_keep, wiring, IkApp,
     IkWire, IK_MAX_STATES,
@@ -981,6 +982,44 @@ fn align256(n: u64) -> u64 {
     align_up(n.max(256), 256)
 }
 
+/// Records every buffer of `m` (each sub-allocated 256-aligned, at least 256 bytes) under `cat`
+/// of the verified five-category ledger: plan sums are ledger totals (law
+/// `hbm_ledger_add_conserved`), never shell additions.
+pub(crate) fn record_map(l: &mut HbmLedgerGuard, cat: HbmCat, m: &BTreeMap<String, u64>) {
+    for &b in m.values() {
+        l.record(cat, align256(b));
+    }
+}
+
+/// The whole device-memory plan of one load in the verified five-category ledger: weights and
+/// tables of the model, the tower and the drafter (`CatWeights`), global K / V caches and the
+/// drafter's context (`CatKv`), the bounded rings and, with prefix reuse, their copy
+/// (`CatCheckpoints`), activations (`CatScratch`), the shared recipe workspace (`CatOther`).
+fn load_ledger(
+    p: &IkPlan,
+    ws: u64,
+    vision: Option<&vision::IkVision>,
+    drafter: Option<(&mtp::MtpPlan, &mtp::MtpGeom)>,
+    ring_copy: bool,
+) -> HbmLedgerGuard {
+    let mut l = p.ledger();
+    l.record(HbmCat::CatOther, ws);
+    if let Some(v) = vision {
+        v.record_plan(&mut l);
+    }
+    if let Some((mp, _)) = drafter {
+        mp.record(&mut l);
+    }
+    // reuse: the copy of the rings is as large as the rings
+    if ring_copy {
+        p.record_ring_copy(&mut l);
+        if let Some((mp, g)) = drafter {
+            mp.record_ring_copy(g, &mut l);
+        }
+    }
+    l
+}
+
 fn gib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0 * 1024.0)
 }
@@ -1077,35 +1116,53 @@ impl IkPlan {
     }
 
     fn sum(m: &BTreeMap<String, u64>) -> u64 {
-        m.values().map(|&b| align256(b)).sum()
+        let mut l = HbmLedgerGuard::new();
+        record_map(&mut l, HbmCat::CatOther, m);
+        l.total_bytes()
+    }
+
+    /// Records every buffer of the plan in the verified ledger: weights and tables
+    /// (`CatWeights`), global K / V caches (`CatKv`), the bounded rings (`CatCheckpoints`),
+    /// activations (`CatScratch`: the step's, the prefill scratch, the prefill row buffers one by
+    /// one, the prefill ids and the cursor).
+    fn record(&self, l: &mut HbmLedgerGuard) {
+        record_map(l, HbmCat::CatWeights, &self.weights);
+        record_map(l, HbmCat::CatKv, &self.kv);
+        record_map(l, HbmCat::CatCheckpoints, &self.rings);
+        record_map(l, HbmCat::CatScratch, &self.step_acts);
+        record_map(l, HbmCat::CatScratch, &self.pf_scratch);
+        for _ in 0..self.pf_bufs + PF_DUMMIES + 1 {
+            l.record(HbmCat::CatScratch, align256(self.pf_x_bytes));
+        }
+        l.record(HbmCat::CatScratch, align256(self.pf_ids_bytes));
+        l.record(HbmCat::CatScratch, 256);
+    }
+
+    /// The copy of the bounded rings prefix reuse keeps (`CatCheckpoints`).
+    fn record_ring_copy(&self, l: &mut HbmLedgerGuard) {
+        record_map(l, HbmCat::CatCheckpoints, &self.rings);
+    }
+
+    fn ledger(&self) -> HbmLedgerGuard {
+        let mut l = HbmLedgerGuard::new();
+        self.record(&mut l);
+        l
     }
 
     fn weights_bytes(&self) -> u64 {
-        Self::sum(&self.weights)
+        self.ledger().breakdown().0
     }
 
     fn kv_bytes(&self) -> u64 {
-        Self::sum(&self.kv)
+        self.ledger().breakdown().1
     }
 
     fn ring_bytes(&self) -> u64 {
-        Self::sum(&self.rings)
+        self.ledger().breakdown().2
     }
 
     fn act_bytes(&self) -> u64 {
-        Self::sum(&self.step_acts)
-            + Self::sum(&self.pf_scratch)
-            + (self.pf_bufs + PF_DUMMIES + 1) as u64 * align256(self.pf_x_bytes)
-            + align256(self.pf_ids_bytes)
-            + 256
-    }
-
-    fn total(&self, ws_bytes: u64) -> u64 {
-        self.weights_bytes()
-            .saturating_add(self.kv_bytes())
-            .saturating_add(self.ring_bytes())
-            .saturating_add(self.act_bytes())
-            .saturating_add(ws_bytes)
+        self.ledger().breakdown().3
     }
 }
 
@@ -1117,18 +1174,8 @@ pub fn hbm_plan_bytes(spec: &ModelSpec, max_ctx: u64, prefill_tile: u64) -> Resu
     let tile = prefill_tile.clamp(1, IK_MAX_PREFILL_TILE);
     let d = IkDims::from_spec(spec, tile)?;
     let p = IkPlan::build(&d, max_ctx, max_ctx / IK_CHUNK, tile, 1);
-    Ok([p.weights_bytes(), p.kv_bytes(), p.ring_bytes(), p.act_bytes()])
-}
-
-/// Bytes of the copy of a drafter's context rings (prefix reuse; 0 without a drafter).
-fn mtp_ring_copy(
-    plan: &Option<mtp::MtpPlan>,
-    geo: &Option<(mtp::MtpGeom, [mtp::MtpTap; 4])>,
-) -> u64 {
-    match (plan, geo) {
-        (Some(p), Some((g, _))) => p.rings(g).iter().map(|(_, b)| b).sum(),
-        _ => 0,
-    }
+    let (w, kv, rings, acts, _) = p.ledger().breakdown();
+    Ok([w, kv, rings, acts])
 }
 
 fn select_exact_bindings(
@@ -1420,7 +1467,6 @@ impl Inkling2Engine {
             &IkDims::from_spec(&spec, IK_MAX_PREFILL_TILE)?,
             gguf.as_deref(),
         )?;
-        let vis_bytes = vision.as_ref().map_or(0, |v| v.plan_bytes().0 + v.plan_bytes().1);
 
         // reuse: on with `--prefix-cache` > 0 (the debug modes that write rows out of order
         // keep it off)
@@ -1452,11 +1498,14 @@ impl Inkling2Engine {
             let p = IkPlan::build(&d, max_ctx, max_chunks, tile, step_rows);
             let mp = mtp_geo.as_ref().map(|(g, _)| mtp::MtpPlan::build(g));
             let mtp_bytes = mp.as_ref().map_or(0, mtp::MtpPlan::total);
-            // reuse: the copy of the rings is as large as the rings
-            let total = p.total(MIN_SHARED_WORKSPACE_BYTES)
-                + vis_bytes
-                + mtp_bytes
-                + if reuse_on { p.ring_bytes() + mtp_ring_copy(&mp, &mtp_geo) } else { 0 };
+            let total = load_ledger(
+                &p,
+                MIN_SHARED_WORKSPACE_BYTES,
+                vision.as_ref(),
+                mp.as_ref().zip(mtp_geo.as_ref().map(|(g, _)| g)),
+                reuse_on,
+            )
+            .total_bytes();
             match dev.check_plan_fits(total, HBM_HEADROOM_BYTES) {
                 Ok(_) => break (d, p, mtp_geo, mp),
                 Err(e) if tile <= IK_MIN_PREFILL_TILE => {
@@ -1551,14 +1600,18 @@ impl Inkling2Engine {
         let weights_bytes = plan.weights_bytes();
         let kv_bytes = plan.kv_bytes();
         let ring_bytes = plan.ring_bytes();
-        let snap_bytes = if reuse_on {
-            ring_bytes + mtp_ring_copy(&mtp_plan, &mtp_geo)
-        } else {
-            0
-        };
         let act_bytes = plan.act_bytes();
-        let mtp_bytes = mtp_plan.as_ref().map_or(0, mtp::MtpPlan::total);
-        let planned_total = plan.total(ws_bytes) + vis_bytes + snap_bytes + mtp_bytes;
+        // the whole load in the verified ledger: what the fit check, the ring arena (rings and
+        // their copy) and the live report use
+        let ledger = load_ledger(
+            &plan,
+            ws_bytes,
+            vision.as_ref(),
+            mtp_plan.as_ref().zip(mtp_geo.as_ref().map(|(g, _)| g)),
+            reuse_on,
+        );
+        let planned_total = ledger.total_bytes();
+        let (_, _, ring_arena_bytes, _, _) = ledger.breakdown();
         dev.check_plan_fits(planned_total, HBM_HEADROOM_BYTES)
             .map_err(|e| format!("HBM plan check failed: {e}"))?;
         if cfg.verbose {
@@ -1568,7 +1621,7 @@ impl Inkling2Engine {
                 gib(free_hbm),
                 gib(weights_bytes),
                 gib(kv_bytes),
-                gib(ring_bytes + snap_bytes),
+                gib(ring_arena_bytes),
                 gib(act_bytes),
                 mib(IkPlan::sum(&plan.step_acts)),
                 mib(IkPlan::sum(&plan.pf_scratch)),
@@ -1583,7 +1636,7 @@ impl Inkling2Engine {
             .alloc_arena(kv_bytes.max(256), HbmCat::CatKv, "ik_global_kv_arena")
             .map_err(|e| format!("alloc global KV arena: {e}"))?;
         let mut ring_arena = dev
-            .alloc_arena((ring_bytes + snap_bytes).max(256), HbmCat::CatKv, "ik_ring_arena")
+            .alloc_arena(ring_arena_bytes.max(256), HbmCat::CatKv, "ik_ring_arena")
             .map_err(|e| format!("alloc ring arena: {e}"))?;
         let mut act_arena = dev
             .alloc_arena(act_bytes, HbmCat::CatScratch, "ik_act_arena")
@@ -1685,9 +1738,6 @@ impl Inkling2Engine {
                 reuse.bind(st.addr(&name), bytes, suballoc(&mut ring_arena, bytes)?);
             }
         }
-        let (mtp_w, mtp_s, mtp_a) = mtp_state.as_ref().map_or((0, 0, 0), |st| {
-            (st.plan.weights_bytes(), st.plan.state_bytes(), st.plan.act_bytes())
-        });
         if let Some(v) = vision.as_mut() {
             v.allocate(&mut dev)?;
         }
@@ -1695,14 +1745,9 @@ impl Inkling2Engine {
         dev.seal_with_shared_workspace(ws_bytes)
             .map_err(|e| format!("seal HBM allocations: {e}"))?;
 
-        let (vis_w, vis_a) = vision.as_ref().map_or((0, 0), |v| v.plan_bytes());
-        let hbm_bytes = [
-            weights_bytes + vis_w + mtp_w,
-            kv_bytes + mtp_s,
-            ring_bytes + snap_bytes,
-            act_bytes + vis_a + mtp_a,
-            ws_bytes,
-        ];
+        // the five ledger categories: weights, global K / V, rings, activations, workspace
+        let (lw, lkv, lck, lsc, lot) = ledger.breakdown();
+        let hbm_bytes = [lw, lkv, lck, lsc, lot];
         live.set_hbm_bytes(
             hbm_bytes[0],
             hbm_bytes[1],
@@ -2687,8 +2732,10 @@ impl Inkling2Engine {
         // reuse: the prompt is in (after the first token left, so the copy is not in its time)
         self.reuse_prompt_in()?;
 
-        // ---- DECODE, speculative: an engine loaded with a drafter ----
+        // ---- DECODE, speculative: an engine loaded with a drafter, unless the request asks
+        // for the plain loop (the K = 0 reference of `--compare-k0`) ----
         if self.draft.is_some()
+            && !params.non_speculative
             && !stopped_by_eos
             && !stopped_by_cancel
             && !generated.is_empty()
@@ -2731,6 +2778,10 @@ impl Inkling2Engine {
             });
         }
         self.requests += 1;
+        // reuse: a drafter gets no context for the rows the plain loop feeds
+        if self.mtp.is_some() {
+            self.reuse.hold_before(prompt_ids.len());
+        }
 
         // ---- DECODE: one monolithic launch per token ----
         // a bucket compiled on first use is not decode time: build the first one before the clock

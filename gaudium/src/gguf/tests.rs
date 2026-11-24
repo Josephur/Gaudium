@@ -471,6 +471,14 @@ fn split_models_and_directories() {
     let gd = Gguf::open(&dir).unwrap();
     assert_eq!(gd.tensor_count(), 2);
     assert_eq!(gd.side_files.len(), 1);
+    // a block drafter beside it is set aside too (its model's loader finds it there)
+    let mut drafter = Builder::new();
+    drafter.kv_str("general.architecture", "dflash");
+    fs::write(dir.join("drafter.gguf"), drafter.build()).unwrap();
+    let gd = Gguf::open(&dir).unwrap();
+    assert_eq!(gd.tensor_count(), 2);
+    assert_eq!(gd.side_files.len(), 2);
+    fs::remove_file(dir.join("drafter.gguf")).unwrap();
     assert!(looks_like_gguf(&dir));
     // a wrong total, a missing shard, a duplicate name, two unrelated models
     fs::write(dir.join("m-00001-of-00002.gguf"), mk(0, 2, 3, "a", true)).unwrap();
@@ -974,4 +982,17 @@ fn qwen35_map_gives_the_packer_names() {
     fs::write(&p, o.build()).unwrap();
     assert!(qwen35::dims(&Gguf::open(&p).unwrap()).is_err());
     fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn split_names_are_read_on_bytes() {
+    // a shard name, and names that only look like one
+    let p = |s: &str| split_name(Path::new(s));
+    assert_eq!(p("m-00002-of-00003.gguf"), Some(("m".to_string(), 2, 3)));
+    assert_eq!(p("dir/é-00001-of-00001.gguf"), Some(("dir/é".to_string(), 1, 1)));
+    assert_eq!(p("m-0000x-of-00003.gguf"), None);
+    assert_eq!(p("m-+0001-of-00003.gguf"), None);
+    // the last 20 bytes start with '-' but cut the 'é' characters: an unsplit file, no panic
+    assert_eq!(p("-aaaaééabcdef.gguf"), None);
+    assert_eq!(p("short.gguf"), None);
 }

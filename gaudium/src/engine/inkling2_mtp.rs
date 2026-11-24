@@ -708,7 +708,24 @@ impl MtpPlan {
     }
 
     fn sum(m: &BTreeMap<String, u64>) -> u64 {
-        m.values().map(|&b| align256(b)).sum()
+        let mut l = HbmLedgerGuard::new();
+        super::record_map(&mut l, HbmCat::CatOther, m);
+        l.total_bytes()
+    }
+
+    /// Records every buffer in the verified ledger: weights (`CatWeights`), the context state
+    /// (`CatKv`), activations (`CatScratch`).
+    pub fn record(&self, l: &mut HbmLedgerGuard) {
+        super::record_map(l, HbmCat::CatWeights, &self.weights);
+        super::record_map(l, HbmCat::CatKv, &self.state);
+        super::record_map(l, HbmCat::CatScratch, &self.acts);
+    }
+
+    /// The copy of the context rings prefix reuse keeps (`CatCheckpoints`).
+    pub fn record_ring_copy(&self, g: &MtpGeom, l: &mut HbmLedgerGuard) {
+        for (_, b) in self.rings(g) {
+            l.record(HbmCat::CatCheckpoints, b);
+        }
     }
 
     pub fn weights_bytes(&self) -> u64 {
@@ -724,7 +741,9 @@ impl MtpPlan {
     }
 
     pub fn total(&self) -> u64 {
-        self.weights_bytes() + self.state_bytes() + self.act_bytes()
+        let mut l = HbmLedgerGuard::new();
+        self.record(&mut l);
+        l.total_bytes()
     }
 
     /// The context rings of the windowed layers, `(name, bytes)`: the bounded part of the
