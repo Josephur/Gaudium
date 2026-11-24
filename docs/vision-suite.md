@@ -35,7 +35,9 @@ when all of these hold:
 The verdict itself is verified code (`gaudium/verified/vision_suite.bend`): no fork passes a
 default method, an untraced fork or a missing report never passes, a diverged run passes an
 opt-in method only when its replay completed, traced the first divergence and found only ties,
-and no failed check is outweighed by the others.
+a method is opt-in only when the suite file marks it and its options select an opt-in form, no
+failed check is outweighed by the others, a row whose process did not exit cleanly fails, and
+the suite passes only when every selected row ran and passed.
 
 ## Running it
 

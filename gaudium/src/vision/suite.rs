@@ -32,7 +32,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::json::{parse_json, quote_json, JsonValue};
-use crate::verified::{vs_fork_outcome, vs_identity_ok, vs_row_ok, VsIdentity};
+use crate::verified::{
+    vs_fork_outcome, vs_identity_ok, vs_method_opt_in, vs_row_ok, vs_row_verdict, vs_suite_ok,
+    VsIdentity,
+};
 
 /// Pause between two rows: the next child opens the card only after the previous one exited
 /// and the driver has finished releasing the device.
@@ -63,14 +66,15 @@ pub struct Method {
 impl Method {
     /// The method counts as opt-in only when the suite file marks it so AND its own options
     /// select an opt-in form (a draft tree, or the DeltaNet verify on the MME): a default mode
-    /// labelled opt-in by mistake is still held to exact identity.
+    /// labelled opt-in by mistake is still held to exact identity. The shell reads the form off
+    /// the options; the rule is the verified `vs_method_opt_in` (`verified/vision_suite.bend`).
     pub fn opt_in(&self) -> bool {
         let tree = self.args.iter().any(|a| a == "--tree");
         let mme = self
             .args
             .windows(2)
             .any(|w| w[0] == "--gdn-verify" && w[1] == "mme");
-        self.opt_in_forks && (tree || mme)
+        vs_method_opt_in(self.opt_in_forks, tree || mme)
     }
 }
 
@@ -806,8 +810,8 @@ pub fn run(opts: &SuiteOptions) -> Result<bool, String> {
         r.model = row.name.clone();
         r.exit = exit;
         r.seconds = t0.elapsed().as_secs_f64();
+        r.pass = vs_row_verdict(r.pass, exit == Some(0));
         if exit != Some(0) {
-            r.pass = false;
             let tail: Vec<&str> = stderr.lines().rev().take(6).collect();
             r.forks.push(format!(
                 "the row's process ended with {}: {}",
@@ -824,7 +828,11 @@ pub fn run(opts: &SuiteOptions) -> Result<bool, String> {
     if opts.build_cache {
         return Ok(!crate::signals::term_requested());
     }
-    let all = !results.is_empty() && results.len() == rows.len() && results.iter().all(|r| r.pass);
+    let all = vs_suite_ok(
+        rows.len() as u64,
+        results.len() as u64,
+        results.iter().all(|r| r.pass),
+    );
     let mut out = std::io::stdout().lock();
     let _ = writeln!(
         out,
@@ -1012,6 +1020,15 @@ AFTER TOKENS: [1, 2, 4]
         );
         assert_eq!(classify(Some(&IdentityLine::LengthDiffers)), VsIdentity::VsFork);
         assert_eq!(classify(None), VsIdentity::VsMissing);
+    }
+
+    #[test]
+    fn the_verified_verdicts_pass_when_everything_held() {
+        // the laws seal only what never passes; these pin today's passing cases
+        assert!(vs_method_opt_in(true, true));
+        assert!(vs_row_verdict(true, true));
+        assert!(vs_suite_ok(3, 3, true));
+        assert!(!vs_suite_ok(3, 2, true) && !vs_suite_ok(0, 0, true));
     }
 
     #[test]
