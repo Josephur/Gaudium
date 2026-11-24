@@ -51,7 +51,7 @@ use crate::synapse::ffi::{SynDataType, SynapseApi};
 use crate::synapse::graph::{CompiledRecipe, GraphBuilder, PreparedLaunch, TensorId};
 use crate::synapse::ops::{as_param_bytes, u32_params, TransposeParams};
 use crate::synapse::recipe_cache::RecipeCache;
-use crate::verified::{align_up, HbmCat};
+use crate::verified::{align_up, g4v_arena_step, g4v_part_bytes, HbmCat};
 
 #[path = "gemma4_spec.rs"]
 pub mod spec;
@@ -1226,9 +1226,18 @@ fn is_prefill_special(name: &str) -> bool {
     )
 }
 
-fn align256(n: u64) -> u64 {
-    align_up(n.max(256), 256)
+/// One buffer of `bytes` out of a sealed arena: it starts on the arena's step and takes at least
+/// one step (`g4v_arena_step`), which is what the plan counts for it (`g4v_part_bytes`).
+fn arena_take(arena: &mut HbmArena, bytes: u64) -> Result<u64, String> {
+    let step = g4v_arena_step();
+    let (addr, _off) = arena
+        .suballoc(bytes.max(step), step)
+        .map_err(|e| format!("arena suballoc: {e}"))?;
+    Ok(addr)
 }
+
+/// Bytes of the prefill cursor buffer (one `i32`, given a whole buffer).
+const PF_CURSOR_BYTES: u64 = 256;
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -1346,7 +1355,7 @@ impl G4Plan {
     }
 
     fn sum(m: &BTreeMap<String, u64>) -> u64 {
-        m.values().map(|&b| align256(b)).sum()
+        m.values().map(|&b| g4v_part_bytes(b)).sum()
     }
 
     fn weights_bytes(&self) -> u64 {
@@ -1364,11 +1373,11 @@ impl G4Plan {
     fn act_bytes(&self) -> u64 {
         Self::sum(&self.step_acts)
             + Self::sum(&self.pf_scratch)
-            + 2 * align256(self.pf_x_bytes)
-            + align256(self.pf_ids_bytes)
-            + 256
-            + align256(self.pf_ple_bytes)
-            + align256(self.pf_hfin_bytes)
+            + 2 * g4v_part_bytes(self.pf_x_bytes)
+            + g4v_part_bytes(self.pf_ids_bytes)
+            + g4v_part_bytes(PF_CURSOR_BYTES)
+            + g4v_part_bytes(self.pf_ple_bytes)
+            + g4v_part_bytes(self.pf_hfin_bytes)
             + self.vis.as_ref().map_or(0, |v| v.act_bytes())
             + units::unit_bytes(self.unit_extra, self.pf_x_bytes, self.pf_ids_bytes)
     }
@@ -1834,7 +1843,7 @@ impl Gemma4Engine {
         }
 
         // ---- Exact arena sizes, final fit check, allocation, seal ----
-        let ws_bytes = align256(max_ws.max(MIN_SHARED_WORKSPACE_BYTES));
+        let ws_bytes = align_up(max_ws.max(MIN_SHARED_WORKSPACE_BYTES), 256);
         let weights_bytes = plan.weights_bytes();
         let kv_bytes = plan.kv_bytes();
         let ring_bytes = plan.ring_bytes();
@@ -1875,57 +1884,50 @@ impl Gemma4Engine {
             .alloc_arena(act_bytes, HbmCat::CatScratch, "g4_act_arena")
             .map_err(|e| format!("alloc act arena: {e}"))?;
 
-        let suballoc = |arena: &mut HbmArena, bytes: u64| -> Result<u64, String> {
-            let (addr, _off) = arena
-                .suballoc(bytes.max(256), 256)
-                .map_err(|e| format!("arena suballoc: {e}"))?;
-            Ok(addr)
-        };
-
         let mut weights_addr = BTreeMap::new();
         for (name, &bytes) in &plan.weights {
-            weights_addr.insert(name.clone(), suballoc(&mut weights_arena, bytes)?);
+            weights_addr.insert(name.clone(), arena_take(&mut weights_arena, bytes)?);
         }
         let mut kv_addr = BTreeMap::new();
         for (name, &bytes) in &plan.kv {
-            kv_addr.insert(name.clone(), (suballoc(&mut kv_arena, bytes)?, bytes));
+            kv_addr.insert(name.clone(), (arena_take(&mut kv_arena, bytes)?, bytes));
         }
         if let Some(arena) = ring_arena.as_mut() {
             for (name, &bytes) in &plan.rings {
-                kv_addr.insert(name.clone(), (suballoc(arena, bytes)?, bytes));
+                kv_addr.insert(name.clone(), (arena_take(arena, bytes)?, bytes));
             }
         }
         let mut step_act_addr = BTreeMap::new();
         for (name, &bytes) in &plan.step_acts {
-            step_act_addr.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
+            step_act_addr.insert(name.clone(), arena_take(&mut act_arena, bytes)?);
         }
         let mut pf_scratch = BTreeMap::new();
         for (name, &bytes) in &plan.pf_scratch {
-            pf_scratch.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
+            pf_scratch.insert(name.clone(), arena_take(&mut act_arena, bytes)?);
         }
         let pf_x = [
-            suballoc(&mut act_arena, plan.pf_x_bytes)?,
-            suballoc(&mut act_arena, plan.pf_x_bytes)?,
+            arena_take(&mut act_arena, plan.pf_x_bytes)?,
+            arena_take(&mut act_arena, plan.pf_x_bytes)?,
         ];
-        let pf_ids = suballoc(&mut act_arena, plan.pf_ids_bytes)?;
-        let pf_cursor = suballoc(&mut act_arena, 256)?;
-        let pf_ple = suballoc(&mut act_arena, plan.pf_ple_bytes)?;
-        let pf_hfin = suballoc(&mut act_arena, plan.pf_hfin_bytes)?;
+        let pf_ids = arena_take(&mut act_arena, plan.pf_ids_bytes)?;
+        let pf_cursor = arena_take(&mut act_arena, PF_CURSOR_BYTES)?;
+        let pf_ple = arena_take(&mut act_arena, plan.pf_ple_bytes)?;
+        let pf_hfin = arena_take(&mut act_arena, plan.pf_hfin_bytes)?;
         // image input: the image path's weights and buffers, the unit tiles' buffers
         let mut vis_w_addr = BTreeMap::new();
         let mut vis_act_addr = BTreeMap::new();
         let mut vis_x = [0u64; 2];
         if let Some(vp) = plan.vis.as_ref() {
             for (name, &bytes) in &vp.weights {
-                vis_w_addr.insert(name.clone(), suballoc(&mut weights_arena, bytes)?);
+                vis_w_addr.insert(name.clone(), arena_take(&mut weights_arena, bytes)?);
             }
             for (name, &bytes) in &vp.acts {
-                vis_act_addr.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
+                vis_act_addr.insert(name.clone(), arena_take(&mut act_arena, bytes)?);
             }
             if vp.x_bytes > 0 {
                 vis_x = [
-                    suballoc(&mut act_arena, vp.x_bytes)?,
-                    suballoc(&mut act_arena, vp.x_bytes)?,
+                    arena_take(&mut act_arena, vp.x_bytes)?,
+                    arena_take(&mut act_arena, vp.x_bytes)?,
                 ];
             }
         }
@@ -1933,12 +1935,12 @@ impl Gemma4Engine {
         for _ in 0..plan.unit_extra {
             pf_unit.push(units::TileBufs {
                 x: [
-                    suballoc(&mut act_arena, plan.pf_x_bytes)?,
-                    suballoc(&mut act_arena, plan.pf_x_bytes)?,
+                    arena_take(&mut act_arena, plan.pf_x_bytes)?,
+                    arena_take(&mut act_arena, plan.pf_x_bytes)?,
                 ],
-                ids: suballoc(&mut act_arena, plan.pf_ids_bytes)?,
-                cursor: suballoc(&mut act_arena, 256)?,
-                ext: suballoc(&mut act_arena, plan.pf_ids_bytes)?,
+                ids: arena_take(&mut act_arena, plan.pf_ids_bytes)?,
+                cursor: arena_take(&mut act_arena, PF_CURSOR_BYTES)?,
+                ext: arena_take(&mut act_arena, plan.pf_ids_bytes)?,
             });
         }
 
@@ -2937,6 +2939,41 @@ pub(crate) mod tests {
             "vocab_size_per_layer_input": 262144, "num_kv_shared_layers": 0,
             "use_double_wide_mlp": false"#;
         ModelSpec::from_config_json(&spec_json(tc, 60, 6)).unwrap()
+    }
+
+    #[test]
+    fn the_plan_covers_what_the_arena_takes() {
+        use crate::verified::g4v_add_part;
+        // two 257-byte buffers: the second starts on the next step, so with today's 256-byte
+        // step the arena needs 769 bytes, which an unaligned count (514) would miss
+        let plan = g4v_add_part(g4v_add_part(0, 257), 257);
+        let mut a = HbmArena::new(0, plan);
+        arena_take(&mut a, 257).unwrap();
+        assert_eq!(arena_take(&mut a, 257).unwrap(), 2 * g4v_arena_step());
+        assert_eq!(a.used(), 769);
+        // sequences of sizes around the step, empty buffers included: an arena of exactly the
+        // plan's bytes holds every buffer of the plan
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..200 {
+            let sizes: Vec<u64> = (0..1 + round % 17)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let s = g4v_arena_step();
+                    match (seed >> 60) % 4 {
+                        0 => (seed >> 20) % 4,
+                        1 => s - 2 + (seed >> 20) % 4,
+                        2 => (seed >> 20) % (8 * s),
+                        _ => (seed >> 20) % (1 << 22),
+                    }
+                })
+                .collect();
+            let plan = sizes.iter().fold(0, |t, &b| g4v_add_part(t, b));
+            let mut a = HbmArena::new(0, plan);
+            for &b in &sizes {
+                arena_take(&mut a, b).unwrap_or_else(|e| panic!("{sizes:?}: {e}"));
+            }
+            assert!(a.used() <= plan);
+        }
     }
 
     #[test]

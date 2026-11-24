@@ -6,12 +6,18 @@
 #   - A prefill unit (a tile and the later tiles its image blocks reach into) joins a tile only
 #     while it still fits the sliding ring beside the window
 #   - A unit that fits keeps every row's window and its block's extension inside the ring
-#   - A prefill row of an image block never attends a key the unit has not written
+#   - A prefill row of an image block never attends a key the unit has not written, and attends
+#     the whole of its block that the unit has written
+#   - A unit takes a later tile only while one exists, always when a block runs into it, and a
+#     unit of several tiles always runs the two-way form
+#   - The bytes planned for a buffer hold it, at least one arena step, and whole steps only, so
+#     the plan covers what the arena's sub-allocation consumes for any step
 
 import Base
 import nat_lemmas.bend as L
 import vision_budget.bend as VB
 import tensor_bounds.bend as TB
+import inkling2.bend as IK
 
 # ============================================================================
 # 1. Helper lemmas (erased before Rust codegen)
@@ -152,10 +158,16 @@ def g4v_whole_token_patches(p: Nat, +ppt: Nat) -> Nat:
 def g4v_table_holds(+gh: Nat, +gw: Nat, +npos: Nat) -> Bool:
   Bool.and(Nat.is_le(gh, npos), Nat.is_le(gw, npos))
 
-# Device bytes one buffer of `bytes` takes in a sealed arena: at least 256, a whole number of
-# 256-byte steps (what the arena's sub-allocation consumes for it).
+# The step of the Gemma 4 engine's sealed arenas: every buffer starts a whole number of steps from
+# the arena's start and takes at least one step (the Rust sub-allocation, `arena_take`, takes this
+# value for both).
+def g4v_arena_step() -> Nat:
+  256n
+
+# Device bytes one buffer of `bytes` takes in a sealed arena: at least one step, a whole number
+# of steps (what the arena's sub-allocation consumes for it).
 def g4v_part_bytes(+bytes: Nat) -> Nat:
-  TB.align_up(Nat.max(bytes, 256n), 256n)
+  TB.align_up(Nat.max(bytes, g4v_arena_step()), g4v_arena_step())
 
 # A plan's running total after one more buffer of `bytes`.
 def g4v_add_part(total: Nat, +bytes: Nat) -> Nat:
@@ -197,6 +209,19 @@ def g4u_final(two_way: Bool, +end: Nat, u: Nat) -> Bool:
 # either way or the prefill refuses (`g4u_final`).
 def g4u_unit_tiles(+t: Nat, +b: Nat) -> Nat:
   Nat.max(1n, Nat.div(Nat.add(Nat.add(Nat.sub(t, 1n), b), Nat.sub(t, 1n)), t))
+
+# Whether a unit takes the tile after its last tile (`next`, of the prompt's `n` tiles): in a size
+# whose image blocks attend both ways, an image block over the unit's last row runs past the
+# unit's rows, which end at `end` (`be`: the largest end of the blocks over that row, 0 without
+# one).
+def g4u_cross(bidir: Bool, +next: Nat, +n: Nat, +be: Nat, +end: Nat) -> Bool:
+  Bool.and(bidir, Bool.and(Nat.is_lt(next, n), Nat.is_lt(end, be)))
+
+# Whether a unit runs the two-way form: a size whose image blocks attend both ways, with an image
+# block over one of the unit's tiles (`be`: the largest end of the blocks over its tiles, 0
+# without one).
+def g4u_two_way(bidir: Bool, +be: Nat) -> Bool:
+  Bool.and(bidir, Nat.is_lt(0n, be))
 
 # Whether row `p` lies in the image block of `n` rows from row `s`.
 def g4u_in_block(+s: Nat, +n: Nat, +p: Nat) -> Bool:
@@ -510,15 +535,60 @@ law g4v_soft_budget_within_pixels:
 def g4v_soft_budget_within_pixels(px, sp):
   g4v_div_mul_le(px, Nat.add(sp, Nat.mul(sp, 1n+sp)))
 
-# LAW G4V.7
-# promise: the bytes planned for a buffer always cover what its sub-allocation takes (the buffer, and at least 256).
+# LAW G4V.7a
+# promise: the bytes planned for a buffer always hold the buffer.
 # harm: a sealed arena would run out before the last buffer of the plan.
-law g4v_part_covers_buffer:
+law g4v_part_holds_buffer:
   for +b: Nat
-  {Nat.is_le(Nat.max(b, 256n), g4v_part_bytes(b)) == True{} : Bool}
+  {Nat.is_le(b, g4v_part_bytes(b)) == True{} : Bool}
 
-def g4v_part_covers_buffer(b):
-  TB.align_up_never_shrinks(Nat.max(b, 256n), 256n)
+def g4v_part_holds_buffer(b):
+  L.nat_le_trans(b, Nat.max(b, g4v_arena_step()), g4v_part_bytes(b), L.nat_max_ge_l(b, g4v_arena_step()), TB.align_up_never_shrinks(Nat.max(b, g4v_arena_step()), g4v_arena_step()))
+
+# LAW G4V.7b
+# promise: the bytes planned for a buffer hold at least one step of the arena, an empty buffer's included.
+# harm: the arena takes a step for every buffer, so a plan of small buffers would count less than it consumes.
+law g4v_part_holds_a_step:
+  for +b: Nat
+  {Nat.is_le(g4v_arena_step(), g4v_part_bytes(b)) == True{} : Bool}
+
+def g4v_part_holds_a_step(b):
+  L.nat_le_trans(g4v_arena_step(), Nat.max(b, g4v_arena_step()), g4v_part_bytes(b), L.nat_max_ge_r(b, g4v_arena_step()), TB.align_up_never_shrinks(Nat.max(b, g4v_arena_step()), g4v_arena_step()))
+
+# (1 + rp + m) + (sp - rp) == 1 + sp + m when rp <= sp.
+def g4v_add_rest(+rp: Nat, +sp: Nat, +m: Nat, h: {Nat.is_le(rp, sp) == True{} : Bool}) -> {Nat.add(Nat.add(1n+rp, m), Nat.sub(sp, rp)) == Nat.add(1n+sp, m) : Nat}:
+  %Equal.sym(Nat, Nat.add(Nat.add(rp, m), Nat.sub(sp, rp)), Nat.add(rp, Nat.add(m, Nat.sub(sp, rp))), L.nat_add_assoc(rp, m, Nat.sub(sp, rp))) : {1n+_ == Nat.add(1n+sp, m) : Nat}
+  %L.nat_add_comm(Nat.sub(sp, rp), m) : {1n+Nat.add(rp, _) == Nat.add(1n+sp, m) : Nat}
+  %L.nat_add_assoc(rp, Nat.sub(sp, rp), m) : {1n+_ == Nat.add(1n+sp, m) : Nat}
+  %L.nat_add_comm(Nat.sub(sp, rp), rp) : {1n+Nat.add(_, m) == Nat.add(1n+sp, m) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.sub(sp, rp), rp), sp, L.nat_sub_add_cancel(sp, rp, h)) : {1n+Nat.add(_, m) == Nat.add(1n+sp, m) : Nat}
+  {==}
+
+# x % (1 + sp) == r: rounding x up past its remainder r leaves whole multiples of 1 + sp.
+def g4v_align_rem_whole(+x: Nat, +sp: Nat, +r: Nat, e: {Nat.mod(x, 1n+sp) == r : Nat}, lt: {Nat.is_lt(r, 1n+sp) == True{} : Bool}) -> {Nat.mod(TB.align_up_rem_if(x, 1n+sp, r, Nat.is_eq(r, 0n)), 1n+sp) == 0n : Nat}:
+  match r:
+    case 0n:
+      e
+    case 1n+rp:
+      %L.nat_div_mod(x, sp) : {Nat.mod(Nat.add(_, Nat.sub(sp, rp)), 1n+sp) == 0n : Nat}
+      %Equal.sym(Nat, Nat.mod(x, 1n+sp), 1n+rp, e) : {Nat.mod(Nat.add(Nat.add(_, Nat.mul(Nat.div(x, 1n+sp), 1n+sp)), Nat.sub(sp, rp)), 1n+sp) == 0n : Nat}
+      %Equal.sym(Nat, Nat.add(Nat.add(1n+rp, Nat.mul(Nat.div(x, 1n+sp), 1n+sp)), Nat.sub(sp, rp)), Nat.add(1n+sp, Nat.mul(Nat.div(x, 1n+sp), 1n+sp)), g4v_add_rest(rp, sp, Nat.mul(Nat.div(x, 1n+sp), 1n+sp), L.nat_lt_imp_le(rp, sp, lt))) : {Nat.mod(_, 1n+sp) == 0n : Nat}
+      IK.ikp_mod_mul(1n+Nat.div(x, 1n+sp), sp)
+
+# Rounding x up to a positive step 1 + sp leaves a whole number of steps.
+def g4v_align_up_whole(+x: Nat, +sp: Nat) -> {Nat.mod(TB.align_up(x, 1n+sp), 1n+sp) == 0n : Nat}:
+  g4v_align_rem_whole(x, sp, Nat.mod(x, 1n+sp), {==}, L.nat_mod_lt(x, sp))
+
+# LAW G4V.7c
+# promise: the bytes planned for a buffer are whole steps of the arena, so the next buffer starts where the plan counts it.
+# harm: the arena would move the next buffer to a step boundary past the plan's count, and run out before the plan's last buffer.
+law g4v_part_whole_steps:
+  for +b: Nat
+  {Nat.mod(g4v_part_bytes(b), g4v_arena_step()) == 0n : Nat}
+
+# The step, 256, is 1 + 255: the proof holds for every positive step written there.
+def g4v_part_whole_steps(b):
+  g4v_align_up_whole(Nat.max(b, g4v_arena_step()), 255n)
 
 # LAW G4V.8
 # promise: adding a buffer to a plan grows its total by at least the buffer's bytes.
@@ -528,7 +598,7 @@ law g4v_add_part_covers:
   {Nat.is_le(Nat.add(t, b), g4v_add_part(t, b)) == True{} : Bool}
 
 def g4v_add_part_covers(t, b):
-  L.nat_add_le_mono(t, t, b, g4v_part_bytes(b), L.nat_le_refl(t), L.nat_le_trans(b, Nat.max(b, 256n), g4v_part_bytes(b), L.nat_max_ge_l(b, 256n), TB.align_up_never_shrinks(Nat.max(b, 256n), 256n)))
+  L.nat_add_le_mono(t, t, b, g4v_part_bytes(b), L.nat_le_refl(t), L.nat_le_trans(b, Nat.max(b, g4v_arena_step()), g4v_part_bytes(b), L.nat_max_ge_l(b, g4v_arena_step()), TB.align_up_never_shrinks(Nat.max(b, g4v_arena_step()), g4v_arena_step())))
 
 # LAW G4V.9
 # promise: an empty width is never taken by the row kernels.
@@ -586,4 +656,181 @@ law g4v_table_refuses_tall_grid:
 
 def g4v_table_refuses_tall_grid(n, k, w):
   %Equal.sym(Bool, Nat.is_le(1n+Nat.add(n, k), n), False{}, g4v_past_not_le(n, k)) : {Bool.and(_, Nat.is_le(w, n)) == False{} : Bool}
+  {==}
+
+# LAW G4V.14
+# promise: a grid wider than the position table is refused.
+# harm: the host would read a column's position row from the table's rows axis: wrong positions and no error.
+law g4v_table_refuses_wide_grid:
+  for +h: Nat
+  for +n: Nat
+  for +k: Nat
+  {g4v_table_holds(h, 1n+Nat.add(n, k), n) == False{} : Bool}
+
+def g4v_table_refuses_wide_grid(h, n, k):
+  %Equal.sym(Bool, Nat.is_le(1n+Nat.add(n, k), n), False{}, g4v_past_not_le(n, k)) : {Bool.and(Nat.is_le(h, n), _) == False{} : Bool}
+  g4u_and_false_r(Nat.is_le(h, n))
+
+# LAW G4V.15
+# promise: flooring a patch count to whole tokens leaves a whole number of tokens.
+# harm: the last token's pooling block would take patches of no token.
+law g4v_whole_token_patches_whole:
+  for +p: Nat
+  for +kp: Nat
+  {Nat.mod(g4v_whole_token_patches(p, 1n+kp), 1n+kp) == 0n : Nat}
+
+def g4v_whole_token_patches_whole(p, kp):
+  IK.ikp_mod_mul(Nat.div(p, 1n+kp), kp)
+
+# LAW G4U.11
+# promise: a row before an image block is not in it.
+# harm: a text row before an image would attend into the image.
+law g4u_block_row_before_outside:
+  for +p: Nat
+  for +k: Nat
+  for +n: Nat
+  {g4u_in_block(1n+Nat.add(p, k), n, p) == False{} : Bool}
+
+def g4u_block_row_before_outside(p, k, n):
+  %Equal.sym(Bool, Nat.is_le(1n+Nat.add(p, k), p), False{}, g4u_past_not_le(p, k)) : {Bool.and(_, Nat.is_lt(p, Nat.add(1n+Nat.add(p, k), n))) == False{} : Bool}
+  {==}
+
+# LAW G4U.12
+# promise: an image block that starts at or after the end of some rows has no row among them.
+# harm: a unit would count a later block as its own, and join or refuse tiles for no reason.
+law g4u_block_after_rows_outside:
+  for +b: Nat
+  for +k: Nat
+  for +n: Nat
+  for +a: Nat
+  {g4u_overlaps(Nat.add(b, k), n, a, b) == False{} : Bool}
+
+def g4u_block_after_rows_outside(b, k, n, a):
+  %Equal.sym(Bool, Nat.is_lt(Nat.add(b, k), b), False{}, g4u_add_lt_false(b, k)) : {Bool.and(_, Nat.is_lt(a, Nat.add(Nat.add(b, k), n))) == False{} : Bool}
+  {==}
+
+# x <= p + (x - p).
+def g4u_le_add_sub(+p: Nat, +x: Nat) -> {Nat.is_le(x, Nat.add(p, Nat.sub(x, p))) == True{} : Bool}:
+  match p:
+    case 0n:
+      match x:
+        case 0n:
+          {==}
+        case 1n+xp:
+          L.nat_le_refl(1n+xp)
+    case 1n+pp:
+      match x:
+        case 0n:
+          {==}
+        case 1n+xp:
+          g4u_le_add_sub(pp, xp)
+
+# x <= 1 + p + (x - (1 + p)).
+def g4u_le_succ_add_sub(+p: Nat, +x: Nat) -> {Nat.is_le(x, 1n+Nat.add(p, Nat.sub(x, 1n+p))) == True{} : Bool}:
+  match x:
+    case 0n:
+      {==}
+    case 1n+xp:
+      g4u_le_add_sub(p, xp)
+
+# LAW G4U.13
+# promise: a row of an image block attends at least to the end of its block, or to the end of the unit's keys when they end sooner.
+# harm: the row would miss part of its image that the reference attends.
+law g4u_ext_reaches_block_end:
+  for +p: Nat
+  for +e: Nat
+  for +u: Nat
+  {Nat.is_le(Nat.min(e, u), 1n+Nat.add(p, g4u_ext(True{}, p, e, u))) == True{} : Bool}
+
+def g4u_ext_reaches_block_end(p, e, u):
+  g4u_le_succ_add_sub(p, Nat.min(e, u))
+
+# LAW G4U.14
+# promise: a unit never takes a tile past the prompt's last tile.
+# harm: the prefill would index a tile that does not exist.
+law g4u_cross_within_tiles:
+  for b: Bool
+  for +n: Nat
+  for +k: Nat
+  for +be: Nat
+  for +e: Nat
+  {g4u_cross(b, Nat.add(n, k), n, be, e) == False{} : Bool}
+
+def g4u_cross_within_tiles(b, n, k, be, e):
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      %Equal.sym(Bool, Nat.is_lt(Nat.add(n, k), n), False{}, g4u_add_lt_false(n, k)) : {Bool.and(_, Nat.is_lt(e, be)) == False{} : Bool}
+      {==}
+
+# x < 1 + x + k.
+def g4u_lt_succ_add(+x: Nat, +k: Nat) -> {Nat.is_lt(x, 1n+Nat.add(x, k)) == True{} : Bool}:
+  Equal.trans(Bool, Nat.is_lt(x, 1n+Nat.add(x, k)), Nat.is_le(x, Nat.add(x, k)), True{}, L.nat_lt_succ_eq_le(x, Nat.add(x, k)), L.nat_add_le_r(x, k))
+
+# LAW G4U.15
+# promise: in a size whose image blocks attend both ways, a block that runs past a unit's last tile into a later tile always takes that tile into the unit.
+# harm: an image over a tile boundary would be refused although the plan holds the tiles it needs.
+law g4u_cross_into_block:
+  for +i: Nat
+  for +k: Nat
+  for +e: Nat
+  for +j: Nat
+  {g4u_cross(True{}, i, 1n+Nat.add(i, k), 1n+Nat.add(e, j), e) == True{} : Bool}
+
+def g4u_cross_into_block(i, k, e, j):
+  %Equal.sym(Bool, Nat.is_lt(i, 1n+Nat.add(i, k)), True{}, g4u_lt_succ_add(i, k)) : {Bool.and(_, Nat.is_lt(e, 1n+Nat.add(e, j))) == True{} : Bool}
+  g4u_lt_succ_add(e, j)
+
+# x < 0 never holds.
+def g4u_lt_zero_false(+x: Nat) -> {Nat.is_lt(x, 0n) == False{} : Bool}:
+  match x:
+    case 0n:
+      {==}
+    case 1n+_:
+      {==}
+
+# LAW G4U.16
+# promise: a unit that takes a later tile always runs the two-way form, whatever further blocks its other tiles hold.
+# harm: the causal path prefills only a unit's first tile and moves past the rest, which would leave their rows unwritten.
+law g4u_joined_unit_two_way:
+  for b: Bool
+  for +i: Nat
+  for +n: Nat
+  for +be: Nat
+  for +e: Nat
+  for +k: Nat
+  {Bool.and(g4u_cross(b, i, n, be, e), Bool.not(g4u_two_way(b, Nat.add(be, k)))) == False{} : Bool}
+
+def g4u_joined_unit_two_way(b, i, n, be, e, k):
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      match be:
+        case 0n:
+          %Equal.sym(Bool, Nat.is_lt(e, 0n), False{}, g4u_lt_zero_false(e)) : {Bool.and(Bool.and(Nat.is_lt(i, n), _), Bool.not(Nat.is_lt(0n, k))) == False{} : Bool}
+          %Equal.sym(Bool, Bool.and(Nat.is_lt(i, n), False{}), False{}, g4u_and_false_r(Nat.is_lt(i, n))) : {Bool.and(_, Bool.not(Nat.is_lt(0n, k))) == False{} : Bool}
+          {==}
+        case 1n+bp:
+          g4u_and_false_r(Bool.and(Nat.is_lt(i, n), Nat.is_lt(e, 1n+bp)))
+
+# LAW G4U.17
+# promise: a size whose reference keeps image rows causal never runs a unit in the two-way form.
+# harm: its image rows would attend positions after their own, unlike the reference.
+law g4u_two_way_needs_bidir:
+  for +be: Nat
+  {g4u_two_way(False{}, be) == False{} : Bool}
+
+def g4u_two_way_needs_bidir(be):
+  {==}
+
+# LAW G4U.18
+# promise: in a size whose image blocks attend both ways, a unit with an image block always runs the two-way form.
+# harm: its image rows would attend causally, unlike the reference.
+law g4u_two_way_with_block:
+  for +be: Nat
+  {g4u_two_way(True{}, 1n+be) == True{} : Bool}
+
+def g4u_two_way_with_block(be):
   {==}

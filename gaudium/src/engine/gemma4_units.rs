@@ -22,7 +22,10 @@ use std::time::Instant;
 
 use super::vision::graphs::build_embed_vis_graph;
 use super::*;
-use crate::verified::{g4v_add_part, ikv_feat_row, g4u_ext, g4u_final, g4u_fits, g4u_in_block, g4u_join, g4u_overlaps, g4u_unit_tiles};
+use crate::verified::{
+    g4u_cross, g4u_ext, g4u_final, g4u_fits, g4u_in_block, g4u_join, g4u_overlaps, g4u_two_way, g4u_unit_tiles, g4v_add_part,
+    ikv_feat_row,
+};
 
 /// The vision recipes of the decoder, by kind and tile rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,7 +92,7 @@ impl VisLoad {
 pub(super) fn unit_bytes(extra: u64, x_bytes: u64, ids_bytes: u64) -> u64 {
     let mut t = 0u64;
     for _ in 0..extra {
-        for b in [x_bytes, x_bytes, ids_bytes, 256, ids_bytes] {
+        for b in [x_bytes, x_bytes, ids_bytes, PF_CURSOR_BYTES, ids_bytes] {
             t = g4v_add_part(t, b);
         }
     }
@@ -142,9 +145,10 @@ pub(super) struct Unit {
 }
 
 /// The unit that starts at tile `i`: the tile, and the later tiles an image block runs into
-/// (while the plan holds buffers for them, `g4u_join`); the next unit starts at the first of its
-/// tiles that is not final (`g4u_final`), else behind it. Refused when even the first tile is
-/// not final (a block longer than a unit reaches).
+/// (`g4u_cross`, while the plan holds buffers for them, `g4u_join`); it runs the two-way form
+/// when a block lies over one of its tiles (`g4u_two_way`). The next unit starts at the first of
+/// its tiles that is not final (`g4u_final`), else behind it. Refused when even the first tile
+/// is not final (a block longer than a unit reaches).
 pub(super) fn plan_unit(
     tiles: &[Tile],
     blocks: &[(usize, usize)],
@@ -153,21 +157,22 @@ pub(super) fn plan_unit(
     max_tiles: u64,
 ) -> Result<Unit, String> {
     let mut unit = vec![i];
-    if bidir {
-        while let Some(&last) = unit.last() {
-            let end = tiles[last].end();
-            let cross = last + 1 < tiles.len() && block_end(blocks, end - 1, end) > end;
-            if !g4u_join(cross, unit.len() as u64, max_tiles) {
-                break;
-            }
-            unit.push(last + 1);
+    while let Some(&last) = unit.last() {
+        let end = tiles[last].end();
+        // the blocks over the unit's last row (a tile holds at least one row)
+        let cross = g4u_cross(bidir, last as u64 + 1, tiles.len() as u64, block_end(blocks, end - 1, end), end);
+        if !g4u_join(cross, unit.len() as u64, max_tiles) {
+            break;
         }
+        unit.push(last + 1);
     }
     let end = tiles[*unit.last().expect("one tile")].end();
-    let two_way = bidir
-        && unit
-            .iter()
-            .any(|&j| block_end(blocks, tiles[j].pos, tiles[j].end()) > 0);
+    let over = unit
+        .iter()
+        .map(|&j| block_end(blocks, tiles[j].pos, tiles[j].end()))
+        .max()
+        .unwrap_or(0);
+    let two_way = g4u_two_way(bidir, over);
     let next = unit
         .iter()
         .copied()
@@ -518,20 +523,22 @@ mod tests {
     #[test]
     fn causal_sizes_move_tile_by_tile_over_a_block_boundary() {
         // a size whose image rows attend causally: one tile per unit, every tile final, also
-        // when an image block runs over the tile's end
+        // when an image block runs over the tile's end, and whatever tile buffers are planned
         let tiles = split_tiles(700, 256);
         let blocks = [(200, 280)];
-        let mut i = 0;
-        let mut seen = 0;
-        while i < tiles.len() {
-            let u = plan_unit(&tiles, &blocks, i, false, 1).unwrap();
-            assert_eq!(u.tiles, vec![i]);
-            assert!(!u.two_way);
-            assert_eq!(u.next, i + 1);
-            i = u.next;
-            seen += 1;
+        for max_tiles in [1, 3] {
+            let mut i = 0;
+            let mut seen = 0;
+            while i < tiles.len() {
+                let u = plan_unit(&tiles, &blocks, i, false, max_tiles).unwrap();
+                assert_eq!(u.tiles, vec![i]);
+                assert!(!u.two_way);
+                assert_eq!(u.next, i + 1);
+                i = u.next;
+                seen += 1;
+            }
+            assert_eq!(seen, tiles.len());
         }
-        assert_eq!(seen, tiles.len());
     }
 
     #[test]

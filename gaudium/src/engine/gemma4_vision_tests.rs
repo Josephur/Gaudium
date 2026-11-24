@@ -111,6 +111,23 @@ fn target_sizes_match_the_reference_processor() {
 }
 
 #[test]
+fn the_position_tables_refuse_grids_past_their_rows() {
+    // a table of 4 rows per axis: a grid of 4 columns or rows fits, a fifth is refused on
+    // either axis (a fifth column of the tower's table would read the rows axis)
+    let (npos, hid) = (4usize, 2usize);
+    let tower: Vec<u16> = (0..2 * npos * hid).map(|v| v as u16).collect();
+    assert!(tower_positions(&tower, npos, hid, 3, npos, 1).is_ok());
+    assert!(tower_positions(&tower, npos, hid, npos, 3, 1).is_ok());
+    assert!(tower_positions(&tower, npos, hid, 3, npos + 1, 1).is_err());
+    assert!(tower_positions(&tower, npos, hid, npos + 1, 3, 1).is_err());
+    let merged: Vec<u16> = (0..npos * 2 * hid).map(|v| v as u16).collect();
+    assert!(merged_positions(&merged, npos, hid, 3, npos).is_ok());
+    assert!(merged_positions(&merged, npos, hid, npos, 3).is_ok());
+    assert!(merged_positions(&merged, npos, hid, 3, npos + 1).is_err());
+    assert!(merged_positions(&merged, npos, hid, npos + 1, 3).is_err());
+}
+
+#[test]
 fn pooling_order_is_a_permutation_of_whole_blocks() {
     for (gh, gw) in [(3, 3), (39, 60), (48, 48), (3, 501), (60, 39)] {
         let o = pooling_order(gh, gw, 3);
