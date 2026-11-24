@@ -1,0 +1,55 @@
+{
+  "about": "Vision regression suite (gaudium --vision-suite). Each model x method row is one engine load that serves the text request, every image case, then the text request again, each under every sampler setting and each against its own K=0 reference. A further model family or drafter is one more models / methods entry here (Gemma 4 and its -assistant drafter: issue #5). Paths: relative model names and {models} resolve in --models <dir>; images are relative to this file.",
+  "args": ["--chat", "--no-think", "--max-new", "48"],
+  "samplings": ["0", "0.7:20:0.95:0:7"],
+  "text": {
+    "prompt": "What is the capital of France? Answer in one short sentence.",
+    "expect": [["paris"]]
+  },
+  "cases": [
+    {
+      "name": "shapes",
+      "images": ["shapes.png"],
+      "prompt": "What shapes are in this picture, and what colour is each? Answer in one sentence.",
+      "expect": [["red"], ["blue"], ["square", "rectangle"], ["circle"]]
+    },
+    {
+      "name": "number",
+      "images": ["number.png"],
+      "prompt": "What number is written in this picture? Answer with the number only.",
+      "expect": [["4271", "4,271"]]
+    },
+    {
+      "name": "two-images",
+      "images": ["shapes.png", "number.png"],
+      "prompt": "What colour is the circle in the first picture, and what number is written in the second? Answer in one sentence.",
+      "expect": [["blue"], ["4271", "4,271"]]
+    }
+  ],
+  "models": [
+    {
+      "name": "qwen3.8-27b-bf16",
+      "model": "Qwen3.8-27B",
+      "args": ["--precision", "bf16"],
+      "methods": [
+        {"name": "k0", "args": []},
+        {"name": "dspine", "args": ["--spec", "dspine", "--draft-model", "{models}/Qwen3.8-27B-DSpine-b16", "--draft-k", "7,15"]},
+        {"name": "dflash2", "args": ["--spec", "dflash2", "--draft-model", "{models}/Qwen3.8-27B-DFlash2"]},
+        {"name": "mtp-chain", "args": ["--spec", "mtp", "--draft-k", "4"]},
+        {"name": "mtp-tree", "args": ["--spec", "mtp", "--tree", "4:1-2@2"], "opt_in_forks": true}
+      ]
+    },
+    {
+      "name": "qwen3.8-27b-fp8",
+      "model": "Qwen3.8-27B",
+      "args": ["--precision", "fp8", "--fp8-act", "{models}/Qwen3.8-27B-FP8-gaudium-pc/act_scales_lc.txt", "--fp8-cache", "{models}/Qwen3.8-27B-gaudium-pc"],
+      "methods": [
+        {"name": "k0", "args": []},
+        {"name": "dspine", "args": ["--spec", "dspine", "--draft-model", "{models}/Qwen3.8-27B-DSpine-b16", "--draft-k", "7,15"]},
+        {"name": "dflash2", "args": ["--spec", "dflash2", "--draft-model", "{models}/Qwen3.8-27B-DFlash2"]},
+        {"name": "mtp-chain", "args": ["--spec", "mtp", "--draft-k", "4"]},
+        {"name": "mtp-tree", "args": ["--spec", "mtp", "--tree", "4:1-2@2"], "opt_in_forks": true}
+      ]
+    }
+  ]
+}

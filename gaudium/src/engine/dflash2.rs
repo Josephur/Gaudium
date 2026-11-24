@@ -20,8 +20,9 @@
 //!
 //! Vision: the context is the target's residual stream, so an image position contributes what the
 //! target computed from its vision embedding (never a pad-token embedding), and the block ids are
-//! generated tokens and masks only. RoPE rows are addressed by KV slot and hold the rotation of
-//! the slot's position (`packer_dflash2::rope128_rows`); a text request has slot = position.
+//! generated tokens and masks only. The drafter's RoPE rows are addressed and rotated by KV slot
+//! on both sides of its attention (`packer_dflash2::rope128_rows`), so its offsets are slot
+//! distances, also behind an image. Checked by the vision regression suite (`--vision-suite`).
 //!
 //! Geometry (block size, taps, mask id, conv layout, selector rank, window) comes from the
 //! checkpoint's `config.json`; anything the device graph does not implement fails at load.

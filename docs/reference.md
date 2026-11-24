@@ -49,6 +49,12 @@ Usage:
   gaudium --fp8-calibrate [options]         Measure a model's FP8 activation scales (BF16 graphs)
   gaudium --kv-calibrate [options]          Measure the K/V maxima a model's FP8 K/V scale tables
                                             are made from (BF16 caches, read back per prompt)
+  gaudium --vision-suite <suite.json> [options] [-- <generate options>]
+                                            Vision regression suite: every model and
+                                            speculative method of the suite file with its
+                                            fixed images (gaudium/tests/vision_suite), one
+                                            --generate process per row, one after another
+                                            (this process never opens the card)
   gaudium --fp8-pack --model <dir> --fp8-cache <dir>
                                             Quantise a Gemma 4 BF16 checkpoint's matrices into an
                                             FP8 cache directory (host only, no card)
@@ -340,7 +346,9 @@ Generate options:
   --compare-k0          Run every request first on the plain non-speculative K=0 loop
                         of the same engine (same seed and sampler settings), then as
                         configured (speculatively with --spec, enqueue-ahead K=0
-                        without), and report identity or the first divergence
+                        without), and report identity or the first divergence (greedy:
+                        with both tokens' logits at every position of the run's stream
+                        where K=0 would have chosen otherwise, from a teacher-forced replay)
   --profile-steps <[p]A-B[@R][:file]>  Device trace of decode launches A..B (0-based; with
                         a leading p: of prefill launches A..B, counted over the tile
                         loop's embed and layer launches) of
@@ -356,7 +364,9 @@ Generate options:
   --no-eos              Do not stop early on EOS token
   --image <file>        Image input: JPEG, PNG, GIF (first frame), WebP, BMP or binary
                         PPM, decoded as the server decodes a request's image;
-                        repeatable, in prompt order
+                        repeatable, in prompt order. An image belongs to the first
+                        request, or to the further request (--also-prompt-file,
+                        --also-prompt-ids-file, a repeated --prompt-ids-file) it follows
   --image-raw <WxH:f>   Image input, raw RGB8 file with explicit size; repeatable
   --vision-max-patches <N>  Largest image the vision tower is planned for, in the
                         model's patches (default: the largest --image; Qwen3.5 / 3.8
@@ -366,8 +376,11 @@ Generate options:
   --dump-vision-emb <p> Write the image embeddings (tokens x hidden, raw BF16) to a file
   --dump-prompt-ids     Print the final prompt token IDs to stderr and continue
   --repeat <N>          Run the same request N times in one process (warm timings)
-  --after-ids-file <p>  Then run a text-only request with these prompt token IDs
-                        (checks that an image request leaves no state behind)
+  --after-ids-file <p>  Then run a text-only request with these prompt token IDs, once
+                        per sampler setting (checks that an image request leaves no
+                        state behind: its AFTER TOKENS lines must equal the tokens of
+                        the same request on an engine that never saw an image)
+  --after-prompt-file <p>  The same with a text prompt, formatted like --prompt
   --spec <method>       Speculative decoding: dspine or dflash2 (on-card block drafters),
                         mtp (the target's own MTP head, hybrid Qwen3.5/3.8, dense or
                         mixture-of-experts, either --moe-form), assistant (a Gemma 4
@@ -529,6 +542,20 @@ lines, the largest |K| and |V| per kv head; FP8 K/V takes its V multipliers from
   --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)
   --no-cache            Disable on-disk compiled recipe cache
   --verbose             Print HBM, recipe compile, and per-layer diagnostics
+
+Vision suite options (a row = one model and one method of the suite file; per row the
+text request, every image case and the text request again, greedy and seeded sampled,
+each checked for token identity to its K=0 reference, a right answer, and the text
+request after the images giving the fresh engine's tokens; exit status 0 = all passed):
+  --models <dir>        Directory of the suite's relative model names and of {models}
+  --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)
+  --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)
+  --out <dir>           Prompts, each row's command line and logs, report.json
+                        (default: a new directory under the system temp directory)
+  --only <row>          Run only this model, or model/method (repeatable)
+  --build-cache         Compile every selected row's recipes into the recipe cache
+                        without the card (--build-cache rows) instead of running them
+  -- <options>          Further --generate options for every row
 ```
 <!-- help:end -->
 

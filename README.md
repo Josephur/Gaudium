@@ -23,7 +23,8 @@ What the Rust engine does today:
   models, and Qwen3.6 MoE) and Gemma 4, in BF16 or FP8 weights.
 - Speculative decoding with several drafter kinds (DSpine, a block drafter, a model's
   own MTP head or assistant drafter), always token-identical to the non-speculative run.
-- Image input for vision-language checkpoints.
+- Image input for vision-language checkpoints, also under the speculative methods that
+  passed the vision regression suite ([`docs/vision-suite.md`](docs/vision-suite.md)).
 - Long contexts (up to 256K on the models that support it), planned against HBM at load
   time: a context that does not fit is refused at start with the exact shortfall.
 - An FP8 K/V cache for the Qwen3.5 / 3.8 hybrids (`--kv-cache fp8`, scale tables from
@@ -104,7 +105,9 @@ gaudium --serve --model <model_dir> --kernels <kernel_build_dir> --ui-dir ui \
 ```
 
 [`docs/reference.md`](docs/reference.md) has the full `--help` text and every environment
-variable; [`docs/mcp-proxy-https.md`](docs/mcp-proxy-https.md) covers the MCP proxy and HTTPS.
+variable; [`docs/mcp-proxy-https.md`](docs/mcp-proxy-https.md) covers the MCP proxy and HTTPS;
+[`docs/vision-suite.md`](docs/vision-suite.md) the vision regression suite
+(`gaudium --vision-suite`).
 
 Only one process may open the card at a time.
 

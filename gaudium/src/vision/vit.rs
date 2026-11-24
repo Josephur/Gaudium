@@ -27,7 +27,7 @@ use crate::synapse::ffi::{SynDataType, SynapseApi};
 use crate::synapse::graph::{CompiledRecipe, GraphBuilder, PreparedLaunch, TensorId};
 use crate::synapse::ops::{as_param_bytes, TransposeParams};
 use crate::synapse::recipe_cache::RecipeCache;
-use crate::verified::align_up;
+use crate::verified::{align_up, vis_plan_raise};
 use crate::vision::mrope::{mrope_rows, PromptLayout};
 use crate::vision::packer::{pos_embed, vit_rope_tables, VisionPacker};
 use crate::vision::preprocess::PreparedImage;
@@ -488,7 +488,8 @@ impl VisionTower {
                 "vision max patches {max_patches} must be a positive multiple of {ppt}"
             ));
         }
-        let max_tokens = max_tokens.max(max_patches / ppt);
+        // The token rows also cover the largest image alone (verified `vis_plan_raise`).
+        let max_tokens = vis_plan_raise(max_tokens, max_patches / ppt);
         let mut pre: Vec<u64> = precompile.to_vec();
         pre.sort_unstable();
         pre.dedup();

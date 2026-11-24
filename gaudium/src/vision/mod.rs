@@ -30,6 +30,7 @@ pub mod media;
 pub mod mrope;
 pub mod packer;
 pub mod preprocess;
+pub mod suite;
 pub mod vit;
 
 pub use mrope::{ImageSpan, PromptLayout};
