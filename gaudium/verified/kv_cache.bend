@@ -11,6 +11,8 @@
 #     below the format's top binade (nothing is clipped), and it never exceeds its cap
 #   - The one V multiplier of a layer: never above what any of its heads allows
 #   - Which decode forms may run on FP8 K/V (the non-speculative K=0 form always may)
+#   - Which loads take FP8 K/V: never a calibration load, and only with a family, a head shape and
+#     a decode form the FP8 attention takes; a scale table covers every kv head of the model
 #   - The row order of the V projection per dtype (the FP8 V rows follow the softmax's P bytes)
 #
 # Multipliers are powers of two, written as f32 exponent fields: a field e stands for 2^(e - 127).
@@ -84,6 +86,15 @@ def kc_and4(+w: Bool, +x: Bool, +y: Bool, +z: Bool, hw: {w == True{} : Bool}, hx
             case True{}:
               hz
 
+# a == b and a < b never hold together
+def kc_eq_lt_excl(+a: Nat, +b: Nat) -> {Bool.and(Nat.is_eq(a, b), Nat.is_lt(a, b)) == False{} : Bool}:
+  match a b:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+_ 0n: {==}
+    case 1n+ap 1n+bp:
+      kc_eq_lt_excl(ap, bp)
+
 # a + min(c, u - a) <= u whenever a <= u
 def kc_fit_le(+a: Nat, +u: Nat, +c: Nat) -> {Bool.or(Nat.is_lt(u, a), Nat.is_le(Nat.add(a, Nat.min(c, Nat.sub(u, a))), u)) == True{} : Bool}:
   match a u:
@@ -135,6 +146,16 @@ def kv_layer_dtype(fp8_reader: Bool, cfg: KvDtype) -> KvDtype:
     case False{}:
       KvBf16{}
 
+# Whether an engine takes a load's K/V setting: BF16 always, FP8 only an engine whose graphs have
+# the FP8 attention kernels and scale tables (`fp8_attention`: today the Qwen3.5 / 3.8 engine's).
+# Any other engine refuses an FP8 setting instead of running BF16 caches under it.
+def kv_setting_taken(fp8_attention: Bool, cfg: KvDtype) -> Bool:
+  match fp8_attention:
+    case True{}:
+      True{}
+    case False{}:
+      Bool.not(kv_is_fp8(cfg))
+
 # Rows of the blocks a cache's V rows are permuted in: the BF16 caches inside 128-row blocks (the
 # softmax's interleaving BF16 conversion of P), the FP8 caches inside 256-row blocks (one FP8
 # vector of P per 256 positions). A copy of whole rows ranges (the host-RAM tier) moves whole
@@ -154,6 +175,11 @@ def kv_vperm_rows(d: KvDtype) -> Nat:
 # the scale table keeps `slots` entries per kind, one per kv group: 1 <= nkv <= slots.
 def kv8_shape_ok(+head_dim: Nat, +nkv: Nat, +row: Nat, +slots: Nat) -> Bool:
   Bool.and(Nat.is_eq(head_dim, row), Bool.and(Nat.is_gt(nkv, 0n), Nat.is_le(nkv, slots)))
+
+# A calibration lists the V maxima of `listed` kv heads for a layer whose model has `nkv`: the
+# table is the model's when they are the same count.
+def kv8_table_heads_ok(+listed: Nat, +nkv: Nat) -> Bool:
+  Nat.is_eq(listed, nkv)
 
 # ============================================================================
 # 4. Power-of-two multipliers
@@ -197,6 +223,117 @@ def kv8_decode_ok(f: KvDecode) -> Bool:
       False{}
     case KdOther{}:
       False{}
+
+# ============================================================================
+# 5b. Which loads take FP8 K/V
+# ============================================================================
+
+# Whether a model's family has run FP8 K/V on the card: the dense hybrids (DeltaNet layers
+# between the full-attention ones, no routed experts). A policy, like `kv8_decode_ok`: a family
+# joins once its FP8-K/V K=0 and its drafters have run on the card.
+def kv8_family_ok(moe: Bool, +n_linear: Nat) -> Bool:
+  Bool.and(Bool.not(moe), Nat.is_gt(n_linear, 0n))
+
+# Why a load configured for FP8 K/V is refused, or `KrNone{}` when it takes it.
+type Kv8Refusal is Data:
+  KrNone{}
+  KrCalibration{}
+  KrFamily{}
+  KrShape{}
+  KrDecode{}
+
+def kv8_refusal(calibrating: Bool, family: Bool, shape: Bool, decode: Bool) -> Kv8Refusal:
+  match calibrating:
+    case True{}:
+      KrCalibration{}
+    case False{}:
+      match family:
+        case False{}:
+          KrFamily{}
+        case True{}:
+          match shape:
+            case False{}:
+              KrShape{}
+            case True{}:
+              match decode:
+                case False{}:
+                  KrDecode{}
+                case True{}:
+                  KrNone{}
+
+# A load configured for FP8 K/V. A calibration load (`kv_cal`: the K/V maxima, `act_cal`: the
+# activation scales) measures the BF16 graphs its table is defined on; otherwise the model's
+# family, its heads (`kv8_shape_ok` with the kernels' `row` and the table's `slots`) and the
+# decode form it serves (`kv8_decode_ok`) decide.
+def kv8_load_check(kv_cal: Bool, act_cal: Bool, moe: Bool, +n_linear: Nat, +head_dim: Nat, +nkv: Nat, +row: Nat, +slots: Nat, f: KvDecode) -> Kv8Refusal:
+  kv8_refusal(Bool.or(kv_cal, act_cal), kv8_family_ok(moe, n_linear), kv8_shape_ok(head_dim, nkv, row, slots), kv8_decode_ok(f))
+
+# The load takes FP8 K/V.
+def kv8_load_taken(r: Kv8Refusal) -> Bool:
+  match r:
+    case KrNone{}:
+      True{}
+    case KrCalibration{}:
+      False{}
+    case KrFamily{}:
+      False{}
+    case KrShape{}:
+      False{}
+    case KrDecode{}:
+      False{}
+
+# What a refusal rules out, one lemma per condition (erased before Rust codegen).
+def kc_gate_calibrating(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool) -> {Bool.and(kv8_load_taken(kv8_refusal(c, fa, sh, dc)), c) == False{} : Bool}:
+  match c:
+    case True{}:
+      {==}
+    case False{}:
+      kc_and_false_r(kv8_load_taken(kv8_refusal(False{}, fa, sh, dc)))
+
+def kc_gate_family(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool) -> {Bool.and(kv8_load_taken(kv8_refusal(c, fa, sh, dc)), Bool.not(fa)) == False{} : Bool}:
+  match c:
+    case True{}:
+      {==}
+    case False{}:
+      match fa:
+        case False{}:
+          {==}
+        case True{}:
+          kc_and_false_r(kv8_load_taken(kv8_refusal(False{}, True{}, sh, dc)))
+
+def kc_gate_shape(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool) -> {Bool.and(kv8_load_taken(kv8_refusal(c, fa, sh, dc)), Bool.not(sh)) == False{} : Bool}:
+  match c:
+    case True{}:
+      {==}
+    case False{}:
+      match fa:
+        case False{}:
+          {==}
+        case True{}:
+          match sh:
+            case False{}:
+              {==}
+            case True{}:
+              kc_and_false_r(kv8_load_taken(kv8_refusal(False{}, True{}, True{}, dc)))
+
+def kc_gate_decode(+c: Bool, +fa: Bool, +sh: Bool, +dc: Bool) -> {Bool.and(kv8_load_taken(kv8_refusal(c, fa, sh, dc)), Bool.not(dc)) == False{} : Bool}:
+  match c:
+    case True{}:
+      {==}
+    case False{}:
+      match fa:
+        case False{}:
+          {==}
+        case True{}:
+          match sh:
+            case False{}:
+              {==}
+            case True{}:
+              match dc:
+                case False{}:
+                  {==}
+                case True{}:
+                  {==}
 
 # ============================================================================
 # 6. Row order of the V projection
@@ -340,3 +477,98 @@ law kv8_plain_decode_ok:
 
 def kv8_plain_decode_ok():
   {==}
+
+# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
+# promise: an engine without the FP8 attention kernels never takes an FP8 K/V setting
+# harm: a load asked for FP8 K/V would run, and report, BF16 caches without saying so
+law kv_fp8_needs_fp8_attention:
+  for +d: KvDtype
+  {Bool.and(kv_setting_taken(False{}, d), kv_is_fp8(d)) == False{} : Bool}
+
+def kv_fp8_needs_fp8_attention(d):
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
+
+# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
+# promise: a calibration load, of the K/V maxima or of the activation scales, never takes FP8 K/V
+# harm: a calibration would measure through the FP8 attention, the K/V maxima already clipped by the multipliers they are meant to choose
+law kv8_load_never_calibrating:
+  for +kc: Bool
+  for +ac: Bool
+  for +m: Bool
+  for +n: Nat
+  for +w: Nat
+  for +h: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: KvDecode
+  {Bool.and(kv8_load_taken(kv8_load_check(kc, ac, m, n, w, h, r, s, f)), Bool.or(kc, ac)) == False{} : Bool}
+
+def kv8_load_never_calibrating(kc, ac, m, n, w, h, r, s, f):
+  kc_gate_calibrating(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, h, r, s), kv8_decode_ok(f))
+
+# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
+# promise: a model whose family has not run FP8 K/V on the card never takes it
+# harm: graphs nothing has validated on FP8 K/V would serve tokens without a checked reference
+law kv8_load_needs_family:
+  for +kc: Bool
+  for +ac: Bool
+  for +m: Bool
+  for +n: Nat
+  for +w: Nat
+  for +h: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: KvDecode
+  {Bool.and(kv8_load_taken(kv8_load_check(kc, ac, m, n, w, h, r, s, f)), Bool.not(kv8_family_ok(m, n))) == False{} : Bool}
+
+def kv8_load_needs_family(kc, ac, m, n, w, h, r, s, f):
+  kc_gate_family(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, h, r, s), kv8_decode_ok(f))
+
+# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
+# promise: a load that takes FP8 K/V always has a head shape the FP8 attention kernels accept
+# harm: the kernels would read cache rows or scale-table slots its heads do not have
+law kv8_load_needs_shape:
+  for +kc: Bool
+  for +ac: Bool
+  for +m: Bool
+  for +n: Nat
+  for +w: Nat
+  for +h: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: KvDecode
+  {Bool.and(kv8_load_taken(kv8_load_check(kc, ac, m, n, w, h, r, s, f)), Bool.not(kv8_shape_ok(w, h, r, s))) == False{} : Bool}
+
+def kv8_load_needs_shape(kc, ac, m, n, w, h, r, s, f):
+  kc_gate_shape(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, h, r, s), kv8_decode_ok(f))
+
+# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
+# promise: a load that takes FP8 K/V always serves a decode form that may run on FP8 K/V
+# harm: a drafter never checked against FP8-K/V K=0 would serve its tokens as exact
+law kv8_load_needs_decode:
+  for +kc: Bool
+  for +ac: Bool
+  for +m: Bool
+  for +n: Nat
+  for +w: Nat
+  for +h: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: KvDecode
+  {Bool.and(kv8_load_taken(kv8_load_check(kc, ac, m, n, w, h, r, s, f)), Bool.not(kv8_decode_ok(f))) == False{} : Bool}
+
+def kv8_load_needs_decode(kc, ac, m, n, w, h, r, s, f):
+  kc_gate_decode(Bool.or(kc, ac), kv8_family_ok(m, n), kv8_shape_ok(w, h, r, s), kv8_decode_ok(f))
+
+# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
+# promise: a scale table that lists fewer kv heads for a layer than the model has is refused
+# harm: a head without its own measured maximum would take another head's V multiplier, and its largest values could clip
+law kv8_table_covers_heads:
+  for +a: Nat
+  for +b: Nat
+  {Bool.and(kv8_table_heads_ok(a, b), Nat.is_lt(a, b)) == False{} : Bool}
+
+def kv8_table_covers_heads(a, b):
+  kc_eq_lt_excl(a, b)

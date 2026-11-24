@@ -520,7 +520,8 @@ lines, the largest |K| and |V| per kv head; FP8 K/V takes its V multipliers from
   --prompt-ids-file <p> Calibration prompt as token IDs (repeatable)
   --prompt-file <path>  Calibration prompt as text (repeatable)
   --out <file>          Table to write (default: <model_dir>-gaudium-pc/kv_scales.txt)
-  --max-ctx <N>         Context capacity, multiple of 4096 (default: the longest prompt)
+  --max-ctx <N>         Context capacity, multiple of 4096 (default and least: what the
+                        longest prompt needs, with the engine's reserve)
   --precision <p>       Weight precision of the measuring load, as the served one: auto
                         (default), bf16 or fp8
   --fp8-act <file>      FP8 activation-scale table of an fp8 load

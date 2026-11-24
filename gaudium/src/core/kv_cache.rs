@@ -39,9 +39,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub use crate::verified::{KvDecode, KvDtype};
+pub use crate::verified::{Kv8Refusal, KvDecode, KvDtype};
 use crate::verified::{
-    kv8_decode_ok, kv8_fit, kv8_min4, kv8_shape_ok, kv_elem_bytes, kv_is_fp8, kv_row_bytes,
+    kv8_fit, kv8_load_check, kv8_min4, kv8_shape_ok, kv8_table_heads_ok, kv_elem_bytes, kv_is_fp8,
+    kv_row_bytes, kv_setting_taken,
 };
 const _: () = assert!(KV8_ROW == 256, "the attention scale below assumes 256-channel rows");
 
@@ -100,24 +101,90 @@ pub fn row_bytes(heads: u64, head_dim: u64, d: KvDtype) -> u64 {
     kv_row_bytes(heads, head_dim, d)
 }
 
+/// An engine whose graphs have no FP8 attention (`fp8_attention == false`) refuses an FP8 K/V
+/// setting (`kv_setting_taken`) instead of running BF16 caches under it.
+pub fn check_setting_taken(fp8_attention: bool, d: KvDtype, engine: &str) -> Result<(), String> {
+    if kv_setting_taken(fp8_attention, d) {
+        Ok(())
+    } else {
+        Err(format!(
+            "--kv-cache {}: the {engine} engine has no FP8 K/V (dense Qwen3.5 / 3.8 hybrids only)",
+            kv_dtype_name(d)
+        ))
+    }
+}
+
+fn shape_refusal(head_dim: u64, n_kv_heads: u64) -> String {
+    format!(
+        "FP8 K/V needs {KV8_ROW}-channel heads and 1..={KV8_SLOTS} kv heads (this model: {head_dim}-channel heads, {n_kv_heads} kv heads)"
+    )
+}
+
 /// The FP8 attention kernels take this head shape.
 pub fn check_fp8_shape(head_dim: u64, n_kv_heads: u64) -> Result<(), String> {
     if kv8_shape_ok(head_dim, n_kv_heads, KV8_ROW, KV8_SLOTS) {
         Ok(())
     } else {
-        Err(format!(
-            "FP8 K/V needs {KV8_ROW}-channel heads and 1..={KV8_SLOTS} kv heads (this model: {head_dim}-channel heads, {n_kv_heads} kv heads)"
-        ))
+        Err(shape_refusal(head_dim, n_kv_heads))
     }
 }
 
-/// The decode form may run on FP8 K/V.
-pub fn check_fp8_decode(form: KvDecode, what: &str) -> Result<(), String> {
-    if kv8_decode_ok(form) {
+/// What decides whether a load configured for FP8 K/V takes it (`kv8_load_check`).
+#[derive(Debug, Clone, Copy)]
+pub struct Kv8Load<'a> {
+    /// A K/V calibration load (`--kv-calibrate`).
+    pub kv_calibrate: bool,
+    /// An activation-scale calibration load (`--fp8-calibrate`).
+    pub act_calibrate: bool,
+    pub moe: bool,
+    /// DeltaNet (linear-attention) layers of the model.
+    pub n_linear: u64,
+    pub head_dim: u64,
+    pub n_kv_heads: u64,
+    /// The decode form the load serves, and what it is (for the message).
+    pub form: KvDecode,
+    pub form_name: &'a str,
+    /// The model's family (for the message).
+    pub family: &'a str,
+}
+
+/// The load takes FP8 K/V (`kv8_load_check`); the error says what refused it.
+pub fn check_fp8_load(l: &Kv8Load) -> Result<(), String> {
+    match kv8_load_check(
+        l.kv_calibrate,
+        l.act_calibrate,
+        l.moe,
+        l.n_linear,
+        l.head_dim,
+        l.n_kv_heads,
+        KV8_ROW,
+        KV8_SLOTS,
+        l.form,
+    ) {
+        Kv8Refusal::KrNone => Ok(()),
+        Kv8Refusal::KrCalibration => {
+            Err("a calibration load measures the BF16 graphs (leave --kv-cache at bf16)".into())
+        }
+        Kv8Refusal::KrFamily => Err(format!(
+            "FP8 K/V has run on the dense hybrid Qwen3.5 / 3.8 models only (this model: {}{})",
+            l.family,
+            if l.moe { ", mixture of experts" } else { "" }
+        )),
+        Kv8Refusal::KrShape => Err(shape_refusal(l.head_dim, l.n_kv_heads)),
+        Kv8Refusal::KrDecode => Err(format!(
+            "FP8 K/V has not been validated with {}: its tokens are not yet known to match FP8-K/V K=0 (run it with --kv-cache bf16, or without the drafter)",
+            l.form_name
+        )),
+    }
+}
+
+/// The calibration's V maxima of a layer cover the model's kv heads (`kv8_table_heads_ok`).
+pub fn check_table_heads(listed: usize, n_kv_heads: u64) -> Result<(), String> {
+    if kv8_table_heads_ok(listed as u64, n_kv_heads) {
         Ok(())
     } else {
         Err(format!(
-            "FP8 K/V has not been validated with {what}: its tokens are not yet known to match FP8-K/V K=0 (run it with --kv-cache bf16, or without the drafter)"
+            "it lists {listed} kv heads, the model has {n_kv_heads}"
         ))
     }
 }
@@ -384,12 +451,62 @@ mod tests {
         assert!(check_fp8_shape(256, 0).is_err());
     }
 
+    /// The 27B: dense hybrid, 48 DeltaNet layers, 4 kv heads of 256 channels.
+    fn load_27b(form: KvDecode) -> Kv8Load<'static> {
+        Kv8Load {
+            kv_calibrate: false,
+            act_calibrate: false,
+            moe: false,
+            n_linear: 48,
+            head_dim: 256,
+            n_kv_heads: 4,
+            form,
+            form_name: "test",
+            family: "Qwen35Dense",
+        }
+    }
+
+    /// Today's policies (decode forms, families), pinned here rather than in sealed laws.
     #[test]
-    fn decode_forms_today() {
-        assert!(check_fp8_decode(KvDecode::KdPlain, "K=0").is_ok());
-        assert!(check_fp8_decode(KvDecode::KdChain, "DSpine").is_ok());
-        assert!(check_fp8_decode(KvDecode::KdTree, "a draft tree").is_err());
-        assert!(check_fp8_decode(KvDecode::KdOther, "MTP").is_err());
+    fn loads_and_decode_forms_today() {
+        assert!(check_fp8_load(&load_27b(KvDecode::KdPlain)).is_ok());
+        assert!(check_fp8_load(&load_27b(KvDecode::KdChain)).is_ok());
+        assert!(check_fp8_load(&load_27b(KvDecode::KdTree)).is_err());
+        assert!(check_fp8_load(&load_27b(KvDecode::KdOther)).is_err());
+        let refusal = |l: Kv8Load| {
+            kv8_load_check(
+                l.kv_calibrate,
+                l.act_calibrate,
+                l.moe,
+                l.n_linear,
+                l.head_dim,
+                l.n_kv_heads,
+                KV8_ROW,
+                KV8_SLOTS,
+                l.form,
+            )
+        };
+        let ok = load_27b(KvDecode::KdPlain);
+        let cases = [
+            (ok, Kv8Refusal::KrNone),
+            (Kv8Load { kv_calibrate: true, ..ok }, Kv8Refusal::KrCalibration),
+            (Kv8Load { act_calibrate: true, ..ok }, Kv8Refusal::KrCalibration),
+            // the 35B MoE's heads fit the kernels, its family has not run FP8 K/V
+            (Kv8Load { moe: true, n_kv_heads: 2, ..ok }, Kv8Refusal::KrFamily),
+            // plain Qwen3: no DeltaNet layers
+            (Kv8Load { n_linear: 0, ..ok }, Kv8Refusal::KrFamily),
+            (Kv8Load { n_kv_heads: 8, ..ok }, Kv8Refusal::KrShape),
+            (Kv8Load { form: KvDecode::KdTree, ..ok }, Kv8Refusal::KrDecode),
+        ];
+        for (l, want) in cases {
+            assert_eq!(refusal(l), want, "{l:?}");
+        }
+        assert!(check_setting_taken(false, KvDtype::KvBf16, "Gemma 4").is_ok());
+        assert!(check_setting_taken(false, KvDtype::KvFp8, "Gemma 4").is_err());
+        assert!(check_setting_taken(true, KvDtype::KvFp8, "Qwen3.5").is_ok());
+        assert!(check_table_heads(4, 4).is_ok());
+        assert!(check_table_heads(2, 4).is_err());
+        assert!(check_table_heads(8, 4).is_err());
     }
 
     #[test]

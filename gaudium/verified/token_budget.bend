@@ -94,6 +94,12 @@ def tb_bool_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
     case True{}: {==}
     case False{}: {==}
 
+def tb_lt_succ_add(+p: Nat, e: Nat) -> {Nat.is_lt(p, 1n+Nat.add(p, e)) == True{} : Bool}:
+  match p:
+    case 0n: {==}
+    case 1n+q:
+      tb_lt_succ_add(q, e)
+
 # ============================================================================
 # 2. Context & Token Budget Arithmetic (serve_proto.hpp, gaudium_engine.cpp)
 # ============================================================================
@@ -108,6 +114,11 @@ def served_ctx(lmax: Nat) -> Nat:
 # Prompt is admitted iff 1 <= prompt_len < served_ctx(lmax) (leaves >= 1 token room).
 def prompt_admitted(+prompt_len: Nat, lmax: Nat) -> Bool:
   Bool.and(Nat.is_gt(prompt_len, 0n), Nat.is_lt(prompt_len, served_ctx(lmax)))
+
+# Context capacity a load sizes for its longest prompt of `prompt_len` tokens and one generated
+# token: the prompt, that token and the engine's reserve.
+def ctx_for_prompt(prompt_len: Nat) -> Nat:
+  Nat.add(ctx_reserve(), 1n+prompt_len)
 
 def prompt_room(prompt_len: Nat, lmax: Nat) -> Nat:
   Nat.sub(served_ctx(lmax), prompt_len)
@@ -371,3 +382,14 @@ law top_k_clamped_to_vocab:
 
 def top_k_clamped_to_vocab(k, v):
   tb_min_le_r(k, v)
+
+# Not sealed yet: waiting for an independent review (AGENTS.md section 5).
+# promise: a capacity of at least ctx_for_prompt(p) admits a non-empty prompt of p tokens, also after it is rounded up to whole cache chunks
+# harm: a calibration load would refuse its own longest prompt after the engine had loaded
+law ctx_for_prompt_admits:
+  for +p: Nat
+  for +extra: Nat
+  {prompt_admitted(1n+p, Nat.add(ctx_for_prompt(1n+p), extra)) == True{} : Bool}
+
+def ctx_for_prompt_admits(p, extra):
+  tb_lt_succ_add(p, extra)

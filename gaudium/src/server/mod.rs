@@ -350,8 +350,9 @@ struct AppState {
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     next_req_id: AtomicU64,
     hub: EventHub,
-    /// Data types of a model's step graph by `(model, fp8 weights, routed experts)`.
-    dtypes: Mutex<HashMap<(usize, bool, bool), Option<crate::engine::qwen3_traffic::StepDtypes>>>,
+    /// Data types of a model's step graph by `(model, fp8 weights, routed experts, FP8 K/V)`.
+    dtypes:
+        Mutex<HashMap<(usize, bool, bool, bool), Option<crate::engine::qwen3_traffic::StepDtypes>>>,
     /// Chat requests take turns on the card through this queue (model load + generation in one turn).
     turns: TurnQueue,
     /// The MCP proxy (off unless the server was started with `--mcp-proxy`).
@@ -436,6 +437,13 @@ impl AppState {
                 .per_model
                 .iter()
                 .any(|(id, o)| *id == m.id && o.moe_routed),
+            kv_dtype: self
+                .cfg
+                .per_model
+                .iter()
+                .find(|(id, _)| *id == m.id)
+                .and_then(|(_, o)| o.kv_dtype)
+                .unwrap_or(crate::verified::KvDtype::KvBf16),
             drafter: self.planned_drafter(idx).map(|(dir, kind, mut ks)| {
                 ks.sort_unstable_by(|a, b| b.cmp(a));
                 DrafterFacts {
@@ -459,13 +467,16 @@ impl AppState {
         idx: usize,
         facts: &RunFacts,
     ) -> Option<crate::engine::qwen3_traffic::StepDtypes> {
-        let key = (idx, facts.fp8_weights, facts.moe_routed);
+        let key = (
+            idx,
+            facts.fp8_weights,
+            facts.moe_routed,
+            crate::verified::kv_is_fp8(facts.kv_dtype),
+        );
         if let Some(v) = self.dtypes.lock().unwrap().get(&key) {
             return v.clone();
         }
-        let mut spec = self.models[idx].spec.clone();
-        spec.fp8_weights = facts.fp8_weights;
-        spec.moe_routed = facts.moe_routed;
+        let spec = readout::run_spec(&self.models[idx].spec, facts);
         // a graph description only; a shape the builders refuse yields no data types
         let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::engine::qwen3_traffic::step_dtypes(&spec)
@@ -938,6 +949,7 @@ impl AppState {
                     from_engine: true,
                     fp8_weights: eng.spec().fp8_weights,
                     moe_routed: eng.spec().moe_routed,
+                    kv_dtype: eng.spec().kv_dtype,
                     drafter: eng.spec_info().map(|i| {
                         DrafterFacts::from_engine(&i, drafter_dir.as_deref().and_then(dir_name))
                     }),

@@ -261,11 +261,13 @@ impl GenEngine for inkling2::Inkling2Engine {
 
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
 pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
+    use crate::core::kv_cache::check_setting_taken;
     if crate::gguf::looks_like_gguf(&cfg.model_dir) {
         // a GGUF file names its family in its metadata
         let g = crate::gguf::Gguf::open(&cfg.model_dir).map_err(|e| format!("open GGUF: {e}"))?;
         if inkling2::gguf_source::is_family(&g) {
             drop(g);
+            check_setting_taken(false, cfg.kv_dtype, "Inkling 2")?;
             return Ok(Box::new(inkling2::Inkling2Engine::load(cfg)?));
         }
         return Err(format!(
@@ -279,8 +281,15 @@ pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
         ModelFamily::Qwen3 | ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe => {
             Ok(Box::new(qwen3::Qwen3Engine::load(cfg)?))
         }
-        ModelFamily::Gemma4 => Ok(Box::new(gemma4::Gemma4Engine::load(cfg)?)),
-        ModelFamily::Inkling2 => Ok(Box::new(inkling2::Inkling2Engine::load(cfg)?)),
+        // [kv8] these engines' graphs have no FP8 attention
+        ModelFamily::Gemma4 => {
+            check_setting_taken(false, cfg.kv_dtype, "Gemma 4")?;
+            Ok(Box::new(gemma4::Gemma4Engine::load(cfg)?))
+        }
+        ModelFamily::Inkling2 => {
+            check_setting_taken(false, cfg.kv_dtype, "Inkling 2")?;
+            Ok(Box::new(inkling2::Inkling2Engine::load(cfg)?))
+        }
         other => Err(format!(
             "no live Gaudi 2 engine is wired up for model family {other:?} yet"
         )),

@@ -542,7 +542,8 @@ fn print_usage() {
          \x20 --prompt-ids-file <p> Calibration prompt as token IDs (repeatable)\n\
          \x20 --prompt-file <path>  Calibration prompt as text (repeatable)\n\
          \x20 --out <file>          Table to write (default: <model_dir>-gaudium-pc/kv_scales.txt)\n\
-         \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default: the longest prompt)\n\
+         \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default and least: what the\n\
+         \x20                       longest prompt needs, with the engine's reserve)\n\
          \x20 --precision <p>       Weight precision of the measuring load, as the served one: auto\n\
          \x20                       (default), bf16 or fp8\n\
          \x20 --fp8-act <file>      FP8 activation-scale table of an fp8 load\n\
@@ -1780,8 +1781,10 @@ fn run_kv_calibrate(args: &[String]) -> Result<(), String> {
         .unwrap_or(1);
 
     let mut cfg = Qwen3Config::new(model_dir.clone(), kernels_dir);
-    // one more row than the longest prompt: the readout's token
-    cfg.max_ctx = max_ctx.unwrap_or(longest + 1).max(longest + 1);
+    // room for the longest prompt, its one generated token and the engine's reserve (the
+    // engine rounds it up to whole chunks)
+    let need = gaudium::core::budget::ctx_for_prompt(longest);
+    cfg.max_ctx = max_ctx.unwrap_or(need).max(need);
     cfg.cache_dir = cache_dir;
     cfg.no_cache = no_cache;
     cfg.verbose = verbose;

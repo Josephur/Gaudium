@@ -16,8 +16,8 @@
 
 use super::*;
 use crate::core::kv_cache::{
-    check_fp8_decode, check_fp8_shape, default_table_path, kv_dtype_name, KvCalibration,
-    Kv8Layer, KvDecode, KV8_TABLE_LEN,
+    check_fp8_load, check_table_heads, default_table_path, kv_dtype_name, Kv8Layer, Kv8Load,
+    KvCalibration, KvDecode, KV8_TABLE_LEN,
 };
 use crate::verified::{kv_is_fp8, kv_layer_dtype, KvDtype};
 
@@ -118,21 +118,20 @@ pub fn resolve(
         return Ok(None);
     }
     let refuse = |why: String| format!("--kv-cache fp8: {why}");
-    if cfg.kv_calibrate || cfg.fp8_calibrate {
-        return Err(refuse(
-            "a calibration load measures the BF16 caches (leave --kv-cache at bf16)".into(),
-        ));
-    }
-    if spec.is_moe() || spec.n_linear_layers() == 0 {
-        return Err(refuse(format!(
-            "the FP8 attention is wired for the dense hybrid Qwen3.5 / 3.8 models only (this model: {:?}{})",
-            spec.family,
-            if spec.is_moe() { ", mixture of experts" } else { "" }
-        )));
-    }
-    check_fp8_shape(spec.head_dim, spec.n_kv_heads).map_err(refuse)?;
-    let (form, what) = decode_form(cfg.spec.as_ref());
-    check_fp8_decode(form, what).map_err(refuse)?;
+    let (form, form_name) = decode_form(cfg.spec.as_ref());
+    let family = format!("{:?}", spec.family);
+    check_fp8_load(&Kv8Load {
+        kv_calibrate: cfg.kv_calibrate,
+        act_calibrate: cfg.fp8_calibrate,
+        moe: spec.is_moe(),
+        n_linear: spec.n_linear_layers() as u64,
+        head_dim: spec.head_dim,
+        n_kv_heads: spec.n_kv_heads,
+        form,
+        form_name,
+        family: &family,
+    })
+    .map_err(refuse)?;
     let path = cfg
         .kv_scales
         .clone()
@@ -152,14 +151,9 @@ pub fn resolve(
                 path.display()
             ))
         })?;
-        if a.v.len() as u64 != spec.n_kv_heads {
-            return Err(refuse(format!(
-                "the K/V scale table {} lists {} heads for layer {l}, the model has {}",
-                path.display(),
-                a.v.len(),
-                spec.n_kv_heads
-            )));
-        }
+        check_table_heads(a.v.len(), spec.n_kv_heads).map_err(|e| {
+            refuse(format!("the K/V scale table {}, layer {l}: {e}", path.display()))
+        })?;
     }
     spec.kv_dtype = KvDtype::KvFp8;
     if cfg.verbose {
