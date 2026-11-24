@@ -762,6 +762,8 @@ f6359c44f5f5b85b  ln_skips_count_pass  law ln_skips_count_pass : for + s : Nat {
 # promise ln_slot_fits_covered: a slot the batch check accepts never writes a row past the chunks the step covers.
 4cc5ec693cf7c8ee  ln_slot_fits_within_lane  law ln_slot_fits_within_lane : for + c : Nat for + r : Nat for + n : Nat for + ch : Nat for + lc : Nat { Bool.and ( ln_slot_fits ( c , r , n , ch , lc ) , Nat.is_lt ( Nat.mul ( lc , ch ) , Nat.add ( c , r ) ) ) == False { } : Bool }
 # promise ln_slot_fits_within_lane: a slot the batch check accepts never writes a row past the chunks its lane owns.
+bfa338a9ab5398d1  ln_spec_batched_fits  law ln_spec_batched_fits : for + c : Nat for + r : Nat for + m : Nat { Bool.or ( Bool.not ( ln_spec_batched ( c , r , m ) ) , Nat.is_le ( Nat.add ( c , r ) , m ) ) == True { } : Bool }
+# promise ln_spec_batched_fits: a speculative lane takes a batched step only when all the step's rows fit in its context.
 85f34955c36750a4  ln_stage_cursor_after_ids  law ln_stage_cursor_after_ids : for + b : Nat for + j : Nat { Nat.is_le ( Nat.mul ( b , 4n ) , ln_stage_cursor ( b , j ) ) == True { } : Bool }
 # promise ln_stage_cursor_after_ids: a slot's cursor in the host staging buffer never lies inside the step's token ids.
 2050e2a578376618  ln_stage_cursors_apart  law ln_stage_cursors_apart : for + b : Nat for + j : Nat { Nat.is_le ( Nat.add ( ln_stage_cursor ( b , j ) , 4n ) , ln_stage_cursor ( b , 1n + j ) ) == True { } : Bool }
