@@ -16,6 +16,9 @@ pub(super) struct ProfRt {
     started: bool,
     /// Launch index the open window started at.
     open_at: u64,
+    /// The open window counts a lane session's batched launches: the prefills of requests
+    /// admitted inside it leave it open (their launches show as their own node families).
+    lane_open: bool,
 }
 
 impl ProfRt {
@@ -25,6 +28,7 @@ impl ProfRt {
             request: 0,
             started: false,
             open_at: 0,
+            lane_open: false,
         }
     }
 }
@@ -42,6 +46,7 @@ pub(super) fn begin_request(eng: &mut Qwen3Engine) {
 fn report(p: &mut ProfRt, dev: &HpuDevice, upto: u64) -> Result<(), String> {
     unsafe { dev.sync_stream(dev.compute_stream()) }
         .map_err(|e| format!("profile: drain before stop: {e}"))?;
+    p.lane_open = false;
     let Some((w, events)) = p.prof.stop().map_err(|e| format!("profile stop: {e}"))? else {
         return Ok(());
     };
@@ -105,6 +110,9 @@ pub(super) fn before_prefill_launch(
     let Some(p) = prof.as_mut() else {
         return Ok(());
     };
+    if p.lane_open {
+        return Ok(());
+    }
     let req = p.request;
     if p.prof.wants_stop(req, idx, true) {
         report(p, dev, idx)?;
@@ -129,7 +137,7 @@ pub(super) fn end_prefill(
     let Some(p) = prof.as_mut() else {
         return Ok(());
     };
-    if p.prof.open_window().is_some_and(|w| w.prefill) {
+    if !p.lane_open && p.prof.open_window().is_some_and(|w| w.prefill) {
         report(p, dev, launched)?;
     }
     Ok(())
@@ -165,6 +173,7 @@ pub(super) fn before_lane_launch(eng: &mut Qwen3Engine, idx: u64) -> Result<(), 
             .start(0, idx, false)
             .map_err(|e| format!("profile start: {e}"))?;
         p.open_at = idx;
+        p.lane_open = p.prof.open_window().is_some();
     }
     Ok(())
 }
