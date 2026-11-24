@@ -31,7 +31,9 @@
 //! launch has. That is measured on the card (each lane against the same request run alone).
 
 use super::*;
-use crate::core::lanes::{batch_chunks, slot_fits, step_chunk_counts, step_chunks, LaneTable};
+use crate::core::lanes::{
+    batch_chunks, slot_fits, step_chunk_counts, step_chunks, LaneTable, Offer,
+};
 use crate::engine::{FeedHead, LaneDone, LaneFeed, LaneJob, LaneOut, LaneView};
 
 /// Name prefix of slot `j`'s own tensors in a batched step.
@@ -41,14 +43,18 @@ pub fn slot_pfx(j: u64) -> String {
 
 /// Name of a batched step recipe.
 pub fn batched_step_name(b: u64, nch: u64, sampled: bool) -> String {
-    format!(
-        "g_qwen_{}bstep_B{b}_C{nch}",
-        if sampled { "s" } else { "" }
-    )
+    format!("g_qwen_{}bstep_B{b}_C{nch}", if sampled { "s" } else { "" })
 }
 
 /// `b` columns of `x {d, b}` as `b` tensors `{d, 1}` (intermediates).
-fn split_cols(gb: &mut GraphBuilder, x: TensorId, dt: SynDataType, d: u64, b: u64, name: &str) -> Vec<TensorId> {
+fn split_cols(
+    gb: &mut GraphBuilder,
+    x: TensorId,
+    dt: SynDataType,
+    d: u64,
+    b: u64,
+    name: &str,
+) -> Vec<TensorId> {
     let parts: Vec<TensorId> = (0..b)
         .map(|j| gb.add_intermediate(format!("{name}_c{j}"), dt, &[d, 1]))
         .collect();
@@ -70,10 +76,13 @@ pub fn build_batched_step_graph(
         gb.record_kernel_elf_hash(k, h);
     }
     let hid = spec.hidden;
-    let table = gb.get_or_add_persistent_tensor("embed_table", SynDataType::Bf16, &[hid, spec.vocab]);
+    let table =
+        gb.get_or_add_persistent_tensor("embed_table", SynDataType::Bf16, &[hid, spec.vocab]);
     let ids = gb.add_persistent_tensor("ids", SynDataType::Int32, &[b]);
     let cursors: Vec<TensorId> = (0..b)
-        .map(|j| gb.add_persistent_tensor(format!("{}cursor", slot_pfx(j)), SynDataType::Int32, &[1]))
+        .map(|j| {
+            gb.add_persistent_tensor(format!("{}cursor", slot_pfx(j)), SynDataType::Int32, &[1])
+        })
         .collect();
     let rope_c = gb.get_or_add_persistent_tensor("rope_c", SynDataType::Float, &[128, lmax]);
     let rope_s = gb.get_or_add_persistent_tensor("rope_s", SynDataType::Float, &[128, lmax]);
@@ -96,9 +105,30 @@ pub fn build_batched_step_graph(
         let attn = if spec.is_full_attention_layer(l) {
             let (nh, dh) = (spec.n_heads, spec.head_dim);
             let (qg, k, v) = append_attn_proj(&mut gb, spec, x, h_pre, &lpfx, b);
-            let qgs = split_cols(&mut gb, qg, SynDataType::Bf16, spec.qg_dim(), b, &format!("{lpfx}qg"));
-            let ks = split_cols(&mut gb, k, SynDataType::Bf16, spec.kv_dim(), b, &format!("{lpfx}k"));
-            let vs = split_cols(&mut gb, v, SynDataType::Bf16, spec.kv_dim(), b, &format!("{lpfx}v"));
+            let qgs = split_cols(
+                &mut gb,
+                qg,
+                SynDataType::Bf16,
+                spec.qg_dim(),
+                b,
+                &format!("{lpfx}qg"),
+            );
+            let ks = split_cols(
+                &mut gb,
+                k,
+                SynDataType::Bf16,
+                spec.kv_dim(),
+                b,
+                &format!("{lpfx}k"),
+            );
+            let vs = split_cols(
+                &mut gb,
+                v,
+                SynDataType::Bf16,
+                spec.kv_dim(),
+                b,
+                &format!("{lpfx}v"),
+            );
             let cores: Vec<TensorId> = (0..b as usize)
                 .map(|j| {
                     let spfx = format!("{}{lpfx}", slot_pfx(j as u64));
@@ -110,12 +140,34 @@ pub fn build_batched_step_graph(
                 .collect();
             let core = gb.add_intermediate(format!("{lpfx}core"), SynDataType::Bf16, &[nh * dh, b]);
             gb.op_concat(format!("{lpfx}core_cat"), &cores, core, 1);
-            add_linear_bf16(&mut gb, core, &format!("{lpfx}W_o"), nh * dh, hid, b, &format!("{lpfx}attn"))
+            add_linear_bf16(
+                &mut gb,
+                core,
+                &format!("{lpfx}W_o"),
+                nh * dh,
+                hid,
+                b,
+                &format!("{lpfx}attn"),
+            )
         } else {
             let (hv, dl) = (spec.gdn_v_heads, spec.gdn_v_dim);
             let (qkvz, ba) = append_linear_proj(&mut gb, spec, x, h_pre, &lpfx, b);
-            let qs = split_cols(&mut gb, qkvz, SynDataType::Bf16, spec.gdn_qkvz_dim(), b, &format!("{lpfx}qkvz"));
-            let bs = split_cols(&mut gb, ba, SynDataType::Bf16, spec.gdn_ba_dim(), b, &format!("{lpfx}ba"));
+            let qs = split_cols(
+                &mut gb,
+                qkvz,
+                SynDataType::Bf16,
+                spec.gdn_qkvz_dim(),
+                b,
+                &format!("{lpfx}qkvz"),
+            );
+            let bs = split_cols(
+                &mut gb,
+                ba,
+                SynDataType::Bf16,
+                spec.gdn_ba_dim(),
+                b,
+                &format!("{lpfx}ba"),
+            );
             let cores: Vec<TensorId> = (0..b as usize)
                 .map(|j| {
                     let spfx = format!("{}{lpfx}", slot_pfx(j as u64));
@@ -133,7 +185,15 @@ pub fn build_batched_step_graph(
                 .collect();
             let core = gb.add_intermediate(format!("{lpfx}core"), SynDataType::Bf16, &[hv * dl, b]);
             gb.op_concat(format!("{lpfx}core_cat"), &cores, core, 1);
-            add_linear_bf16(&mut gb, core, &format!("{lpfx}W_o"), hv * dl, hid, b, &format!("{lpfx}attn"))
+            add_linear_bf16(
+                &mut gb,
+                core,
+                &format!("{lpfx}W_o"),
+                hv * dl,
+                hid,
+                b,
+                &format!("{lpfx}attn"),
+            )
         };
         let (out_x, next) = append_post_and_mlp(
             &mut gb,
@@ -237,7 +297,8 @@ pub(super) struct LanePlan {
     pub n: usize,
     /// Buffers of the batched steps (scratch shared by every lane), by name.
     pub act_specs: BTreeMap<String, u64>,
-    /// Step inputs / outputs and per-lane sampler parameters, in bytes.
+    /// Step inputs / outputs and per-lane sampler parameters, in bytes (`io_names`, one
+    /// buffer each).
     pub io_bytes: u64,
     /// Recipes compiled at load (their workspaces are part of the plan).
     pub eager: Vec<((u64, u64, bool), CompiledRecipe)>,
@@ -246,8 +307,20 @@ pub(super) struct LanePlan {
     pub elf_hashes: Vec<(String, String)>,
 }
 
-/// Bytes of one 256-aligned scalar buffer of the step io.
-const IO_SCALAR: u64 = 256;
+/// Bytes of one scalar buffer of the step io (each one its own 256-aligned buffer).
+pub const IO_SCALAR: u64 = 256;
+
+/// The step io buffers of `n` lanes: the ids and tokens of a step, one cursor per slot, and two
+/// sampler parameter buffers per lane.
+pub fn io_names(n: usize) -> Vec<String> {
+    let mut v = vec!["io_ids".to_string(), "io_tokens".to_string()];
+    v.extend((0..n).map(|j| format!("io_cursor{j}")));
+    for l in 0..n {
+        v.push(format!("io_samp_f{l}"));
+        v.push(format!("io_samp_i{l}"));
+    }
+    v
+}
 
 impl LanePlan {
     /// Plans `n` lanes: the buffers of the widest batched step (`n` slots, every chunk), and the
@@ -277,7 +350,8 @@ impl LanePlan {
                 }
             }
         }
-        let widest = build_batched_step_graph(spec, lmax, max_chunks, n as u64, &elf_hashes, sampler);
+        let widest =
+            build_batched_step_graph(spec, lmax, max_chunks, n as u64, &elf_hashes, sampler);
         let mut act_specs = BTreeMap::new();
         for (name, _dt, _dims, bytes) in widest.persistent_tensor_specs() {
             if weights(&name)
@@ -289,8 +363,7 @@ impl LanePlan {
             }
             act_specs.insert(name, bytes);
         }
-        // ids, tokens, one cursor per slot, two sampler parameter buffers per lane
-        let io_bytes = IO_SCALAR * (2 + n as u64 + 2 * n as u64);
+        let io_bytes = IO_SCALAR * io_names(n).len() as u64;
         let mut keys: Vec<(u64, u64, bool)> = Vec::new();
         let fams: &[bool] = if sampler { &[false, true] } else { &[false] };
         for &sm in fams {
@@ -329,7 +402,12 @@ impl LanePlan {
                 Ok(Some(r)) => r,
                 _ => describe(i)
                     .compile(Arc::clone(api), cache, driver_version)
-                    .map_err(|e| format!("compile batched step {}: {e}", batched_step_name(key.0, key.1, key.2)))?,
+                    .map_err(|e| {
+                        format!(
+                            "compile batched step {}: {e}",
+                            batched_step_name(key.0, key.1, key.2)
+                        )
+                    })?,
             };
             if r.from_cache {
                 hits += 1;
@@ -397,21 +475,20 @@ const LAUNCH_CACHE: usize = 256;
 
 impl LaneRt {
     /// After the device plan is allocated: lane 0 is the engine's own buffers, `others` lanes
-    /// `1..n`; `act_addr` the step buffers, `io_base` the io region (`LanePlan::io_bytes`).
+    /// `1..n`; `act_addr` the step buffers, `io` the io buffers by name ([`io_names`]).
     pub fn new(
         plan: LanePlan,
         others: Vec<LaneBufs>,
         act_addr: BTreeMap<String, u64>,
-        io_base: u64,
+        io: &BTreeMap<String, u64>,
         reset_mode: request_reset::ResetMode,
     ) -> Self {
         let n = plan.n;
-        let at = |k: u64| io_base + k * IO_SCALAR;
-        let io_ids = at(0);
-        let io_tokens = at(1);
-        let io_cursor: Vec<u64> = (0..n as u64).map(|j| at(2 + j)).collect();
-        let samp_bufs: Vec<(u64, u64)> = (0..n as u64)
-            .map(|l| (at(2 + n as u64 + 2 * l), at(3 + n as u64 + 2 * l)))
+        let io_ids = io["io_ids"];
+        let io_tokens = io["io_tokens"];
+        let io_cursor: Vec<u64> = (0..n).map(|j| io[&format!("io_cursor{j}")]).collect();
+        let samp_bufs: Vec<(u64, u64)> = (0..n)
+            .map(|l| (io[&format!("io_samp_f{l}")], io[&format!("io_samp_i{l}")]))
             .collect();
         let mut bufs = vec![LaneBufs::placeholder(reset_mode)];
         bufs.extend(others);
@@ -441,7 +518,11 @@ impl LaneRt {
 
     /// After the seal: binds the workspaces; `weights` = every address the engine binds as a
     /// weight or table.
-    pub fn finish(&mut self, dev: &HpuDevice, weights: &BTreeMap<String, u64>) -> Result<(), String> {
+    pub fn finish(
+        &mut self,
+        dev: &HpuDevice,
+        weights: &BTreeMap<String, u64>,
+    ) -> Result<(), String> {
         for r in self.recipes.values_mut() {
             r.bind_shared_workspace(dev)
                 .map_err(|e| format!("bind {} ws: {e}", r.name))?;
@@ -575,7 +656,11 @@ struct Run {
 impl Run {
     /// The lane's request ends after this token (or before the next one).
     fn done(&self) -> bool {
-        self.stopped_by_eos || self.stopped_by_cancel || self.budget.remaining() == 0
+        crate::core::lanes::run_done(
+            self.stopped_by_eos,
+            self.stopped_by_cancel,
+            self.budget.remaining(),
+        )
     }
 
     /// Takes one generated token as the single-stream decode loop does.
@@ -605,18 +690,19 @@ fn view(rt: &LaneRt, runs: &[Option<Run>]) -> Vec<LaneView> {
                 prompt_tokens: r.prompt_len,
                 generated: r.generated.len() as u64,
                 reused: r.reused,
+                busy: rt.table.is_busy(i),
             },
             None => LaneView {
                 state: rt.table.state_name(i),
+                busy: rt.table.is_busy(i),
                 ..LaneView::default()
             },
         })
         .collect()
 }
 
-/// `(prompt rows lane `lane` would take over for `prompt`, rows its held prompt shares with it)`
-/// (routing).
-fn lane_reuse(eng: &Qwen3Engine, lane: usize, prompt: &[i32], params: &Qwen3GenParams) -> (u64, u64) {
+/// What lane `lane` offers a request of `prompt` (routing).
+fn lane_reuse(eng: &Qwen3Engine, lane: usize, prompt: &[i32], params: &Qwen3GenParams) -> Offer {
     let rt = eng.lanes.as_ref().expect("lanes");
     let (prefix, reset) = if rt.active == lane {
         (&eng.prefix, &eng.reset)
@@ -624,7 +710,12 @@ fn lane_reuse(eng: &Qwen3Engine, lane: usize, prompt: &[i32], params: &Qwen3GenP
         (&rt.bufs[lane].prefix, &rt.bufs[lane].reset)
     };
     let p = prefix.peek(prompt, &[], params.cache_prompt, reset.zeroes_rows());
-    (p.resume, p.cap)
+    let held = prefix.held().0.len() as u64;
+    Offer {
+        resume: p.resume,
+        shared: p.cap,
+        loss: crate::verified::ln_route_loss(held, p.cap),
+    }
 }
 
 fn done_event(report: Result<Qwen3GenReport, String>, eng: &Qwen3Engine, images: bool) -> LaneOut {
@@ -643,6 +734,7 @@ fn done_event(report: Result<Qwen3GenReport, String>, eng: &Qwen3Engine, images:
 /// Admits `job` into the free lane `lane` and runs its prefill. `Ok(None)`: the request already
 /// ended (its `Done` is sent).
 fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option<Run>, String> {
+    let exclusive = job.exclusive();
     let LaneJob {
         id,
         prompt,
@@ -653,7 +745,6 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
     } = job;
     activate(eng, lane);
     out(LaneOut::Started { lane });
-    let exclusive = images.as_ref().is_some_and(|v| !v.is_empty());
     let fail = |eng: &mut Qwen3Engine, out: &mut Box<dyn FnMut(LaneOut) + Send>, e: String| {
         let res: Result<Qwen3GenReport, String> = Err(e);
         request_reset::end_request(eng, prompt.len() as u64, &res);
@@ -661,20 +752,25 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
         out(done_event(res, eng, exclusive));
     };
     if prompt.is_empty() {
-        out(done_event(Err("prompt must contain at least 1 token".into()), eng, false));
+        out(done_event(
+            Err("prompt must contain at least 1 token".into()),
+            eng,
+            false,
+        ));
         return Ok(None);
     }
-    let mut budget = match SequenceBudget::admit(prompt.len() as u64, Some(params.max_new), eng.max_ctx) {
-        Ok(b) => b,
-        Err(e) => {
-            out(done_event(
-                Err(format!("SequenceBudget rejected prompt/max_new: {e:?}")),
-                eng,
-                false,
-            ));
-            return Ok(None);
-        }
-    };
+    let mut budget =
+        match SequenceBudget::admit(prompt.len() as u64, Some(params.max_new), eng.max_ctx) {
+            Ok(b) => b,
+            Err(e) => {
+                out(done_event(
+                    Err(format!("SequenceBudget rejected prompt/max_new: {e:?}")),
+                    eng,
+                    false,
+                ));
+                return Ok(None);
+            }
+        };
     let sampled = params.temperature > 0.0;
     if sampled && !eng.lanes.as_ref().is_some_and(|rt| rt.sampled) {
         out(done_event(
@@ -844,7 +940,11 @@ fn end_lane(eng: &mut Qwen3Engine, lane: usize, mut run: Run) {
 
 /// Makes the batched step `(b, nch, sampled)` launchable; the ms a first use took.
 fn ensure_recipe(eng: &mut Qwen3Engine, key: (u64, u64, bool)) -> Result<f64, String> {
-    if eng.lanes.as_ref().is_some_and(|rt| rt.recipes.contains_key(&key)) {
+    if eng
+        .lanes
+        .as_ref()
+        .is_some_and(|rt| rt.recipes.contains_key(&key))
+    {
         return Ok(0.0);
     }
     let t0 = Instant::now();
@@ -861,7 +961,12 @@ fn ensure_recipe(eng: &mut Qwen3Engine, key: (u64, u64, bool)) -> Result<f64, St
     let (b, nch, sm) = key;
     let mut r = build_batched_step_graph(spec, *max_ctx, nch, b, &rt.elf_hashes, sm)
         .compile(Arc::clone(dev.api()), cache, driver_version)
-        .map_err(|e| format!("compile batched step {}: {e}", batched_step_name(b, nch, sm)))?;
+        .map_err(|e| {
+            format!(
+                "compile batched step {}: {e}",
+                batched_step_name(b, nch, sm)
+            )
+        })?;
     r.bind_shared_workspace(dev)
         .map_err(|e| format!("bind {} ws: {e}", r.name))?;
     if eng.verbose {
@@ -877,7 +982,12 @@ fn ensure_recipe(eng: &mut Qwen3Engine, key: (u64, u64, bool)) -> Result<f64, St
 
 /// The prepared launch of batched step `key` with `lanes[j]` (state parity `parities[j]`) in
 /// slot `j`.
-fn prepare(eng: &mut Qwen3Engine, key: (u64, u64, bool), lanes: &[usize], parities: &[usize]) -> Result<(), String> {
+fn prepare(
+    eng: &mut Qwen3Engine,
+    key: (u64, u64, bool),
+    lanes: &[usize],
+    parities: &[usize],
+) -> Result<(), String> {
     let lk: LaunchKey = (
         key.0,
         key.1,
@@ -885,7 +995,11 @@ fn prepare(eng: &mut Qwen3Engine, key: (u64, u64, bool), lanes: &[usize], pariti
         lanes.iter().map(|&l| l as u8).collect(),
         parities.iter().map(|&p| p as u8).collect(),
     );
-    if eng.lanes.as_ref().is_some_and(|rt| rt.launches.contains_key(&lk)) {
+    if eng
+        .lanes
+        .as_ref()
+        .is_some_and(|rt| rt.launches.contains_key(&lk))
+    {
         return Ok(());
     }
     let rt = eng.lanes.as_ref().expect("lanes");
@@ -924,7 +1038,12 @@ fn prepare(eng: &mut Qwen3Engine, key: (u64, u64, bool), lanes: &[usize], pariti
 }
 
 /// One batched step of `lanes` (all of one readout kind): every lane's next token.
-fn step(eng: &mut Qwen3Engine, lanes: &[usize], runs: &[Option<Run>], sampled: bool) -> Result<Vec<i32>, String> {
+fn step(
+    eng: &mut Qwen3Engine,
+    lanes: &[usize],
+    runs: &[Option<Run>],
+    sampled: bool,
+) -> Result<Vec<i32>, String> {
     let b = lanes.len() as u64;
     let slots: Vec<(u64, u64)> = lanes
         .iter()
@@ -1025,7 +1144,11 @@ fn publish(eng: &Qwen3Engine, feed: &mut dyn LaneFeed, runs: &[Option<Run>]) {
     feed.lanes(&v);
 }
 
-fn serve_loop(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed, runs: &mut [Option<Run>]) -> Result<(), String> {
+fn serve_loop(
+    eng: &mut Qwen3Engine,
+    feed: &mut dyn LaneFeed,
+    runs: &mut [Option<Run>],
+) -> Result<(), String> {
     loop {
         // 1. admission: the oldest waiting request, while the lane gate lets it in
         loop {
@@ -1035,7 +1158,13 @@ fn serve_loop(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed, runs: &mut [Option
                 FeedHead::Empty => break,
                 FeedHead::Job { exclusive } => exclusive,
             };
-            if !eng.lanes.as_ref().expect("lanes").table.can_admit(exclusive) {
+            if !eng
+                .lanes
+                .as_ref()
+                .expect("lanes")
+                .table
+                .can_admit(exclusive)
+            {
                 break;
             }
             let Some(job) = feed.take() else { break };

@@ -99,19 +99,76 @@ def ln_ev_is_admit(ev: LaneEvent) -> Bool:
     case _:
       False{}
 
+def ln_ev_is_release(ev: LaneEvent) -> Bool:
+  match ev:
+    case EvLnRelease{}:
+      True{}
+    case _:
+      False{}
+
+# Does the lifecycle allow `ev` in state `s`? Every allowed event moves the lane; one it does not
+# allow leaves it where it was (the shell refuses it).
+def ln_allows(s: LaneState, ev: LaneEvent) -> Bool:
+  match s ev:
+    case LnFree{} EvLnAdmit{}:
+      True{}
+    case LnPrefill{} EvLnPrefilled{}:
+      True{}
+    case LnPrefill{} EvLnFinish{}:
+      True{}
+    case LnPrefill{} EvLnFail{}:
+      True{}
+    case LnDecode{} EvLnFinish{}:
+      True{}
+    case LnDecode{} EvLnFail{}:
+      True{}
+    case LnDrain{} EvLnRelease{}:
+      True{}
+    case _ _:
+      False{}
+
+# Has a lane's request ended? It stopped at an end-of-sequence token, was cancelled, or has no
+# token left in its budget.
+def ln_run_done(eos: Bool, cancelled: Bool, +remaining: Nat) -> Bool:
+  Bool.or(eos, Bool.or(cancelled, Nat.is_eq(remaining, 0n)))
+
+# ============================================================================
+# 1b. The lane session of a model (the server's queue)
+# ============================================================================
+#
+# Requests for a model served with lanes wait in that model's queue; one session at a time hands
+# them to the engine's lanes. Both decisions below are made under the queue's lock.
+
+# A request arrives while a session is `active` or not: does it start one?
+def ln_session_starts(active: Bool) -> Bool:
+  Bool.not(active)
+
+# Does the session end, with no lane busy (`idle`) and a request waiting or not?
+def ln_session_ends(idle: Bool, waiting: Bool) -> Bool:
+  Bool.and(idle, Bool.not(waiting))
+
 # ============================================================================
 # 2. Routing a request to a lane
 # ============================================================================
 
 # Is free lane `a` a better place for a request than free lane `b`? `ra`: the prompt rows lane
-# `a` would take over (resume), `ca`: the rows its held prompt shares with the request, `sa`:
-# when it was last used. More rows taken over wins; between equals, more shared rows (a
-# conversation stays in its lane, the other lanes keep theirs); then the lane used longest ago.
-def ln_route_better(+ra: Nat, +ca: Nat, +sa: Nat, +rb: Nat, +cb: Nat, +sb: Nat) -> Bool:
+# `a` would take over (resume); `la`: the rows of its held prompt the request would destroy
+# (held but not shared: the conversation it holds loses them); `ca`: the rows its held prompt
+# shares with the request; `sa`: when a request was last admitted to it. The larger net of rows taken over and
+# rows kept wins (`ra + lb` against `rb + la`); between equals, more shared rows (a conversation
+# stays in its lane); then the lane used longest ago.
+def ln_route_better(+ra: Nat, +la: Nat, +ca: Nat, +sa: Nat, +rb: Nat, +lb: Nat, +cb: Nat, +sb: Nat) -> Bool:
   Bool.or(
-    Nat.is_gt(ra, rb),
-    Bool.and(Nat.is_eq(ra, rb), Bool.or(Nat.is_gt(ca, cb), Bool.and(Nat.is_eq(ca, cb), Nat.is_lt(sa, sb))))
+    Nat.is_gt(Nat.add(lb, ra), Nat.add(la, rb)),
+    Bool.and(
+      Nat.is_eq(Nat.add(lb, ra), Nat.add(la, rb)),
+      Bool.or(Nat.is_gt(ca, cb), Bool.and(Nat.is_eq(ca, cb), Nat.is_lt(sa, sb)))
+    )
   )
+
+# Rows of a lane's held prompt (`held`) that a request sharing `shared` of them destroys.
+def ln_route_loss(held: Nat, shared: Nat) -> Nat:
+  Nat.sub(held, shared)
 
 # ============================================================================
 # 3. The device plan of N lanes
@@ -123,6 +180,14 @@ def ln_plan_bytes(n: Nat, lane_bytes: Nat, shared: Nat) -> Nat:
 
 def ln_plan_fits(n: Nat, lane_bytes: Nat, shared: Nat, usable: Nat) -> Bool:
   Nat.is_le(ln_plan_bytes(n, lane_bytes, shared), usable)
+
+# Lanes of `lane_bytes` that fit beside `shared` bytes in `usable` bytes (the refusal says it).
+def ln_lanes_fit(lane_bytes: Nat, shared: Nat, usable: Nat) -> Nat:
+  Nat.div(Nat.sub(usable, shared), lane_bytes)
+
+# Kept prefix positions per lane when `granted` fit for all `n` lanes: the same count each.
+def ln_prefix_per_lane(granted: Nat, n: Nat) -> Nat:
+  Nat.div(granted, n)
 
 # What a refused plan lacks (0 for a plan that fits).
 def ln_plan_shortfall(n: Nat, lane_bytes: Nat, shared: Nat, usable: Nat) -> Nat:
@@ -185,12 +250,13 @@ def ln_drafter_ok(d: LaneDrafter) -> Bool:
     case _:
       False{}
 
-# Lanes a model is served with: the lanes asked for (at least one) when its engine and its
-# drafter have batched steps, otherwise one.
-def ln_served_lanes(+requested: Nat, ok: Bool) -> Nat:
+# Lanes a model is served with: the lanes asked for (at least one, at most `max`, the most the
+# batched step graphs are built for) when its engine and its drafter have batched steps,
+# otherwise one.
+def ln_served_lanes(+requested: Nat, +max: Nat, ok: Bool) -> Nat:
   match ok:
     case True{}:
-      Nat.max(1n, requested)
+      Nat.min(Nat.max(1n, max), Nat.max(1n, requested))
     case False{}:
       1n
 
@@ -256,6 +322,19 @@ def ln_cover_aux(+need: Nat, +lc: Nat, b: Bool, e: {Nat.is_lt(lc, need) == b : B
       {==}
     case False{}:
       ln_min_ge(lc, Nat.max(need, ln_pow2_up(need, Nat.is_ge(1n, need), 1n, need)), need, L.nat_not_lt_imp_le(lc, need, e), L.nat_max_ge_l(need, ln_pow2_up(need, Nat.is_ge(1n, need), 1n, need)))
+
+def ln_div_mul_le(+a: Nat, +bp: Nat) -> {Nat.is_le(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), a) == True{} : Bool}:
+  L.nat_le_subst_r(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), Nat.add(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), Nat.mod(a, 1n+bp)), a, L.nat_div_mod_r(a, bp), L.nat_add_le_r(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), Nat.mod(a, 1n+bp)))
+
+def ln_fit_count_aux(+bp: Nat, +sh: Nat, +u: Nat, b: Bool, e: {Nat.is_lt(u, sh) == b : Bool}) -> {Bool.or(b, ln_plan_fits(ln_lanes_fit(1n+bp, sh, u), 1n+bp, sh, u)) == True{} : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      L.nat_le_subst_r(Nat.add(sh, Nat.mul(Nat.div(Nat.sub(u, sh), 1n+bp), 1n+bp)), Nat.add(Nat.sub(u, sh), sh), u, L.nat_sub_add_cancel(u, sh, L.nat_not_lt_imp_le(u, sh, e)), L.nat_le_subst_r(Nat.add(sh, Nat.mul(Nat.div(Nat.sub(u, sh), 1n+bp), 1n+bp)), Nat.add(sh, Nat.sub(u, sh)), Nat.add(Nat.sub(u, sh), sh), L.nat_add_comm(sh, Nat.sub(u, sh)), L.nat_add_le_mono(sh, sh, Nat.mul(Nat.div(Nat.sub(u, sh), 1n+bp), 1n+bp), Nat.sub(u, sh), L.nat_le_refl(sh), ln_div_mul_le(Nat.sub(u, sh), bp))))
+
+def ln_min_ge1(+a: Nat, +b: Nat) -> {Nat.is_le(1n, Nat.min(Nat.max(1n, a), Nat.max(1n, b))) == True{} : Bool}:
+  ln_min_ge(Nat.max(1n, a), Nat.max(1n, b), 1n, L.nat_max_ge_l(1n, a), L.nat_max_ge_l(1n, b))
 
 def ln_fit_within(
   +c: Nat,
@@ -381,42 +460,29 @@ def ln_batch_lane_busy(s):
     case LnDecode{}: {==}
     case LnDrain{}: {==}
 
-# promise: a request is routed only to a lane that admission then makes busy (never to a busy lane).
-law ln_route_only_admittable:
+# promise: a request is routed only to a free lane, never to a lane that holds a request.
+law ln_route_only_free:
   for +s: LaneState
-  {Bool.and(ln_route_eligible(s), ln_is_free(ln_step(s, EvLnAdmit{}))) == False{} : Bool}
+  {Bool.and(ln_route_eligible(s), Bool.not(ln_is_free(s))) == False{} : Bool}
 
-def ln_route_only_admittable(s):
+def ln_route_only_free(s):
   match s:
     case LnFree{}: {==}
     case LnPrefill{}: {==}
     case LnDecode{}: {==}
     case LnDrain{}: {==}
 
-# promise: a free lane that would take over more of a request's prompt is always preferred to one that would take over less.
-law ln_route_more_reuse_wins:
-  for +rb: Nat
-  for +e: Nat
-  for +ca: Nat
-  for +sa: Nat
-  for +cb: Nat
-  for +sb: Nat
-  {ln_route_better(1n+Nat.add(rb, e), ca, sa, rb, cb, sb) == True{} : Bool}
-
-def ln_route_more_reuse_wins(rb, e, ca, sa, cb, sb):
-  %ln_gt_succ_add(rb, e) : {Bool.or(_, Bool.and(Nat.is_eq(1n+Nat.add(rb, e), rb), Bool.or(Nat.is_gt(ca, cb), Bool.and(Nat.is_eq(ca, cb), Nat.is_lt(sa, sb))))) == True{} : Bool}
-  {==}
-
-# promise: no lane is a better place than itself, so the lane routing picks is well defined.
+# promise: no lane is a better place than itself: the routing order is strict.
 law ln_route_irreflexive:
   for +r: Nat
+  for +l: Nat
   for +c: Nat
   for +s: Nat
-  {ln_route_better(r, c, s, r, c, s) == False{} : Bool}
+  {ln_route_better(r, l, c, s, r, l, c, s) == False{} : Bool}
 
-def ln_route_irreflexive(r, c, s):
-  %ln_gt_refl_false(r) : {Bool.or(_, Bool.and(Nat.is_eq(r, r), Bool.or(Nat.is_gt(c, c), Bool.and(Nat.is_eq(c, c), Nat.is_lt(s, s))))) == False{} : Bool}
-  %ln_eq_refl_true(r) : {Bool.or(False{}, Bool.and(_, Bool.or(Nat.is_gt(c, c), Bool.and(Nat.is_eq(c, c), Nat.is_lt(s, s))))) == False{} : Bool}
+def ln_route_irreflexive(r, l, c, s):
+  %ln_gt_refl_false(Nat.add(l, r)) : {Bool.or(_, Bool.and(Nat.is_eq(Nat.add(l, r), Nat.add(l, r)), Bool.or(Nat.is_gt(c, c), Bool.and(Nat.is_eq(c, c), Nat.is_lt(s, s))))) == False{} : Bool}
+  %ln_eq_refl_true(Nat.add(l, r)) : {Bool.or(False{}, Bool.and(_, Bool.or(Nat.is_gt(c, c), Bool.and(Nat.is_eq(c, c), Nat.is_lt(s, s))))) == False{} : Bool}
   %ln_gt_refl_false(c) : {Bool.or(False{}, Bool.and(True{}, Bool.or(_, Bool.and(Nat.is_eq(c, c), Nat.is_lt(s, s))))) == False{} : Bool}
   %ln_eq_refl_true(c) : {Bool.or(False{}, Bool.and(True{}, Bool.or(False{}, Bool.and(_, Nat.is_lt(s, s))))) == False{} : Bool}
   %ln_lt_refl_false(s) : {Bool.or(False{}, Bool.and(True{}, Bool.or(False{}, Bool.and(True{}, _)))) == False{} : Bool}
@@ -479,42 +545,67 @@ law ln_slot_fits_covered:
 def ln_slot_fits_covered(c, r, n, ch, lc):
   ln_fit_covered(c, r, n, ch, Nat.is_le(n, lc), Nat.is_le(Nat.add(c, r), Nat.mul(n, ch)), {==})
 
-# promise: a model that decodes without a drafter can always be served with several lanes.
-law ln_plain_decode_lanes_ok:
-  {ln_drafter_ok(LdNone{}) == True{} : Bool}
+# promise: a model whose engine or drafter has no batched steps is served with one lane.
+law ln_served_lanes_one_without_batching:
+  for +r: Nat
+  for +m: Nat
+  {Nat.is_le(ln_served_lanes(r, m, False{}), 1n) == True{} : Bool}
 
-def ln_plain_decode_lanes_ok():
+def ln_served_lanes_one_without_batching(r, m):
   {==}
 
 # promise: a model is always served with at least one lane.
 law ln_served_lanes_at_least_one:
   for +r: Nat
+  for +m: Nat
   for +ok: Bool
-  {Nat.is_le(1n, ln_served_lanes(r, ok)) == True{} : Bool}
+  {Nat.is_le(1n, ln_served_lanes(r, m, ok)) == True{} : Bool}
 
-def ln_served_lanes_at_least_one(r, ok):
+def ln_served_lanes_at_least_one(r, m, ok):
   match ok:
     case True{}:
-      L.nat_max_ge_l(1n, r)
+      ln_min_ge1(m, r)
     case False{}:
       {==}
 
 # promise: a model is never served with more lanes than were asked for.
 law ln_served_lanes_within_request:
   for +r: Nat
+  for +m: Nat
   for +ok: Bool
-  {Nat.is_le(ln_served_lanes(1n+r, ok), 1n+r) == True{} : Bool}
+  {Nat.is_le(ln_served_lanes(1n+r, m, ok), 1n+r) == True{} : Bool}
 
-def ln_served_lanes_within_request(r, ok):
+def ln_served_lanes_within_request(r, m, ok):
   match r:
     case 0n:
       match ok:
-        case True{}: {==}
+        case True{}:
+          L.nat_min_le_r(Nat.max(1n, m), Nat.max(1n, 1n))
         case False{}: {==}
     case 1n+rp:
       match ok:
         case True{}:
-          L.nat_le_refl(1n+1n+rp)
+          L.nat_min_le_r(Nat.max(1n, m), Nat.max(1n, 1n+1n+rp))
+        case False{}: {==}
+
+# promise: a model is never served with more lanes than the batched step graphs are built for.
+law ln_served_lanes_within_max:
+  for +r: Nat
+  for +m: Nat
+  for +ok: Bool
+  {Nat.is_le(ln_served_lanes(r, 1n+m, ok), 1n+m) == True{} : Bool}
+
+def ln_served_lanes_within_max(r, m, ok):
+  match m:
+    case 0n:
+      match ok:
+        case True{}:
+          L.nat_min_le_l(Nat.max(1n, 1n), Nat.max(1n, r))
+        case False{}: {==}
+    case 1n+mp:
+      match ok:
+        case True{}:
+          L.nat_min_le_l(Nat.max(1n, 1n+1n+mp), Nat.max(1n, r))
         case False{}: {==}
 
 # promise: a batched step never covers more chunks than a lane owns.
@@ -534,3 +625,124 @@ law ln_step_chunks_cover_need:
 
 def ln_step_chunks_cover_need(need, lc):
   ln_cover_aux(need, lc, Nat.is_lt(lc, need), {==})
+
+# promise: a lane whose request ended leaves that state only when its report is delivered and it is released.
+law ln_drain_left_only_by_release:
+  for +ev: LaneEvent
+  {Bool.or(ln_ev_is_release(ev), ln_is_drain(ln_step(LnDrain{}, ev))) == True{} : Bool}
+
+def ln_drain_left_only_by_release(ev):
+  match ev:
+    case EvLnAdmit{}: {==}
+    case EvLnPrefilled{}: {==}
+    case EvLnFinish{}: {==}
+    case EvLnFail{}: {==}
+    case EvLnRelease{}: {==}
+
+# promise: an event the lane lifecycle allows always moves the lane to another state, and one it refuses leaves the lane as it was.
+law ln_allowed_moves:
+  for +s: LaneState
+  for +ev: LaneEvent
+  {ln_allows(s, ev) == Bool.not(ln_eq(ln_step(s, ev), s)) : Bool}
+
+def ln_allowed_moves(s, ev):
+  match s ev:
+    case LnFree{} EvLnAdmit{}: {==}
+    case LnFree{} EvLnPrefilled{}: {==}
+    case LnFree{} EvLnFinish{}: {==}
+    case LnFree{} EvLnFail{}: {==}
+    case LnFree{} EvLnRelease{}: {==}
+    case LnPrefill{} EvLnAdmit{}: {==}
+    case LnPrefill{} EvLnPrefilled{}: {==}
+    case LnPrefill{} EvLnFinish{}: {==}
+    case LnPrefill{} EvLnFail{}: {==}
+    case LnPrefill{} EvLnRelease{}: {==}
+    case LnDecode{} EvLnAdmit{}: {==}
+    case LnDecode{} EvLnPrefilled{}: {==}
+    case LnDecode{} EvLnFinish{}: {==}
+    case LnDecode{} EvLnFail{}: {==}
+    case LnDecode{} EvLnRelease{}: {==}
+    case LnDrain{} EvLnAdmit{}: {==}
+    case LnDrain{} EvLnPrefilled{}: {==}
+    case LnDrain{} EvLnFinish{}: {==}
+    case LnDrain{} EvLnFail{}: {==}
+    case LnDrain{} EvLnRelease{}: {==}
+
+# promise: a request with no token left in its budget has ended.
+law ln_run_done_at_budget_end:
+  for +e: Bool
+  for +c: Bool
+  {ln_run_done(e, c, 0n) == True{} : Bool}
+
+def ln_run_done_at_budget_end(e, c):
+  match e c:
+    case True{} _: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a request that arrives while no session runs for its model starts one, so it is never left without one.
+law ln_session_never_neither:
+  for +a: Bool
+  {Bool.or(a, ln_session_starts(a)) == True{} : Bool}
+
+def ln_session_never_neither(a):
+  match a:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a lane session never ends while a request waits.
+law ln_session_waits_for_queue:
+  for +i: Bool
+  {ln_session_ends(i, True{}) == False{} : Bool}
+
+def ln_session_waits_for_queue(i):
+  match i:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a lane session never ends while a lane is busy.
+law ln_session_waits_for_lanes:
+  for +w: Bool
+  {ln_session_ends(False{}, w) == False{} : Bool}
+
+def ln_session_waits_for_lanes(w):
+  {==}
+
+# promise: the lanes of a plan are always counted in full in its bytes.
+law ln_plan_counts_every_lane:
+  for +n: Nat
+  for +lb: Nat
+  for +sh: Nat
+  {Nat.is_le(Nat.mul(n, lb), ln_plan_bytes(n, lb, sh)) == True{} : Bool}
+
+def ln_plan_counts_every_lane(n, lb, sh):
+  L.nat_add_le_l(sh, Nat.mul(n, lb))
+
+# promise: the shared part of a plan is always counted in full in its bytes.
+law ln_plan_counts_shared:
+  for +n: Nat
+  for +lb: Nat
+  for +sh: Nat
+  {Nat.is_le(sh, ln_plan_bytes(n, lb, sh)) == True{} : Bool}
+
+def ln_plan_counts_shared(n, lb, sh):
+  L.nat_add_le_r(sh, Nat.mul(n, lb))
+
+# promise: the lane count a refused plan reports as fitting does fit, whenever the shared part does.
+law ln_lanes_fit_fits:
+  for +bp: Nat
+  for +sh: Nat
+  for +u: Nat
+  {Bool.or(Nat.is_lt(u, sh), ln_plan_fits(ln_lanes_fit(1n+bp, sh, u), 1n+bp, sh, u)) == True{} : Bool}
+
+def ln_lanes_fit_fits(bp, sh, u):
+  ln_fit_count_aux(bp, sh, u, Nat.is_lt(u, sh), {==})
+
+# promise: the lanes together never get more kept prefix positions than were granted for them.
+law ln_prefix_per_lane_within_grant:
+  for +g: Nat
+  for +np: Nat
+  {Nat.is_le(Nat.mul(ln_prefix_per_lane(g, 1n+np), 1n+np), g) == True{} : Bool}
+
+def ln_prefix_per_lane_within_grant(g, np):
+  ln_div_mul_le(g, np)

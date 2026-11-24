@@ -38,7 +38,9 @@ impl LaneHub {
         let mut g = self.mu.lock().unwrap();
         let m = &mut g[idx];
         m.queue.push_back(job);
-        !std::mem::replace(&mut m.active, true)
+        let start = crate::core::lanes::session_starts(m.active);
+        m.active = true;
+        start
     }
 
     /// The lanes of model `idx` as its session last reported them.
@@ -103,17 +105,18 @@ impl LaneFeed for HubFeed<'_> {
         }
         let mut g = self.hub.mu.lock().unwrap();
         let m = &mut g[self.idx];
-        if let Some(j) = m.queue.front() {
-            return FeedHead::Job {
-                exclusive: j.exclusive(),
-            };
-        }
-        if idle {
+        let waiting = !m.queue.is_empty();
+        if crate::core::lanes::session_ends(idle, waiting) {
             m.active = false;
             self.ended = true;
             return FeedHead::End;
         }
-        FeedHead::Empty
+        match m.queue.front() {
+            Some(j) => FeedHead::Job {
+                exclusive: j.exclusive(),
+            },
+            None => FeedHead::Empty,
+        }
     }
 
     fn take(&mut self) -> Option<LaneJob> {
@@ -124,7 +127,7 @@ impl LaneFeed for HubFeed<'_> {
     }
 
     fn lanes(&mut self, view: &[LaneView]) {
-        let busy = view.iter().filter(|v| v.state != "free").count() as u64;
+        let busy = view.iter().filter(|v| v.busy).count() as u64;
         self.hub.mu.lock().unwrap()[self.idx].view = view.to_vec();
         if let Some(f) = self.on_lanes.as_mut() {
             f(busy);
@@ -165,7 +168,11 @@ mod tests {
         assert_eq!(feed.head(true), FeedHead::Job { exclusive: false });
         assert_eq!(feed.take().map(|j| j.id), Some(1));
         assert_eq!(feed.take().map(|j| j.id), Some(2));
-        assert_eq!(feed.head(false), FeedHead::Empty, "busy lanes keep the session");
+        assert_eq!(
+            feed.head(false),
+            FeedHead::Empty,
+            "busy lanes keep the session"
+        );
         assert_eq!(feed.head(true), FeedHead::End);
         assert!(feed.take().is_none());
         assert_eq!(feed.head(true), FeedHead::End, "an ended feed stays ended");
@@ -186,6 +193,9 @@ mod tests {
             _ => panic!("expected the end of the request"),
         }
         let (b, _rb) = job(2, false);
-        assert!(hub.submit(1, b), "a failed session lets the next arrival start one");
+        assert!(
+            hub.submit(1, b),
+            "a failed session lets the next arrival start one"
+        );
     }
 }

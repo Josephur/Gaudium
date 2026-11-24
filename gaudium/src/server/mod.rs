@@ -1206,7 +1206,11 @@ fn served_lanes(cfg: &ServerConfig, id: &str, spec: &ModelSpec) -> (usize, Optio
         Some(_) => LaneDrafter::LdOther,
     };
     let engine_ok = crate::engine::lanes_supported(spec);
-    let n = ln_served_lanes(cfg.parallel, engine_ok && ln_drafter_ok(drafter)) as usize;
+    let n = ln_served_lanes(
+        cfg.parallel,
+        crate::engine::MAX_LANES,
+        engine_ok && ln_drafter_ok(drafter),
+    ) as usize;
     let why = (cfg.parallel > 1 && n <= 1).then_some(if engine_ok {
         "its drafter has no batched steps yet"
     } else {

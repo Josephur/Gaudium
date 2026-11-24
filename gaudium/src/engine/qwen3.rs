@@ -1280,21 +1280,23 @@ impl Qwen3Engine {
 
         let has_gdn = spec.n_linear_layers() > 0;
         let reset_mode = request_reset::ResetMode::from_config(cfg.request_reset.as_deref())?;
-        // [lanes] several requests at once: the batched steps exist for plain decode
-        let n_lanes = cfg.lanes.clamp(1, crate::engine::MAX_LANES) as usize;
-        if n_lanes > 1 {
-            let why = if cfg.spec.is_some() {
-                Some("speculative decoding has no batched steps for several lanes yet")
-            } else if spec.is_moe() {
-                Some("the mixture-of-experts form has no batched steps for several lanes")
-            } else if cfg.fp8_calibrate {
-                Some("a calibration load runs one request at a time")
-            } else {
-                None
-            };
-            if let Some(why) = why {
-                return Err(format!("--parallel {n_lanes}: {why}"));
-            }
+        // [lanes] several requests at once: lanes need batched steps for this engine and its
+        // drafter (the verified choice the server makes too); a calibration load has one lane
+        let lane_drafter = match cfg.spec.as_ref().map(|sc| &sc.method) {
+            None => crate::verified::LaneDrafter::LdNone,
+            Some(spec::SpecMethod::DSpine { .. }) => crate::verified::LaneDrafter::LdDSpine,
+            Some(_) => crate::verified::LaneDrafter::LdOther,
+        };
+        let lanes_ok = crate::engine::lanes_supported(&spec)
+            && crate::verified::ln_drafter_ok(lane_drafter)
+            && !cfg.fp8_calibrate;
+        let n_lanes =
+            crate::verified::ln_served_lanes(cfg.lanes, crate::engine::MAX_LANES, lanes_ok) as usize;
+        if (n_lanes as u64) < cfg.lanes {
+            eprintln!(
+                "[gaudium] lanes: {n_lanes} of the {} asked for (this engine, drafter or load has no batched steps for more)",
+                cfg.lanes
+            );
         }
         let max_ctx = align_up(cfg.max_ctx.max(KV_CHUNK), KV_CHUNK);
         let max_chunks = max_ctx / KV_CHUNK;
@@ -1812,7 +1814,7 @@ impl Qwen3Engine {
                 crate::core::lanes::plan_check(n_lanes as u64, kv_bytes, shared, usable)
             {
                 let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-                let fit = usable.saturating_sub(shared) / kv_bytes.max(1);
+                let fit = crate::core::lanes::lanes_fit(kv_bytes, shared, usable);
                 return Err(format!(
                     "--parallel {n_lanes} at {max_ctx} tokens per lane does not fit: each lane needs {:.2} GiB (K/V caches and DeltaNet state), the shared part (weights, step buffers, workspace) {:.2} GiB, together {:.2} GiB of the {:.2} GiB the card has usable, {:.2} GiB short. At this context {fit} lane(s) fit; or lower the context per lane (--max-ctx / --model-ctx)",
                     gib(kv_bytes),
@@ -1832,9 +1834,10 @@ impl Qwen3Engine {
                     usable_hbm_bytes(total_hbm, total_hbm.saturating_sub(free_hbm), headroom);
                 let all = pfx_wanted.saturating_mul(lanes_u);
                 let fit = grant_prefix_slots(all, pfx_slot_bytes, base_total, usable);
-                let granted =
-                    crate::verified::pc_grant_checked(fit, pfx_slot_bytes, base_total, usable)
-                        / lanes_u;
+                let granted = crate::core::lanes::prefix_per_lane(
+                    crate::verified::pc_grant_checked(fit, pfx_slot_bytes, base_total, usable),
+                    lanes_u,
+                );
                 if granted < pfx_wanted {
                     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
                     eprintln!(
@@ -2218,7 +2221,10 @@ impl Qwen3Engine {
                 for (name, &bytes) in &lp.act_specs {
                     act.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
                 }
-                let io = suballoc(&mut act_arena, lp.io_bytes)?;
+                let mut io = BTreeMap::new();
+                for name in lanes_rt::io_names(lp.n) {
+                    io.insert(name, suballoc(&mut act_arena, lanes_rt::IO_SCALAR)?);
+                }
                 Some((act, io))
             }
             None => None,
@@ -2452,7 +2458,7 @@ impl Qwen3Engine {
                 lp,
                 other_lanes,
                 act,
-                io,
+                &io,
                 reset_mode,
             )),
             _ => None,

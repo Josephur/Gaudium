@@ -90,6 +90,8 @@ pub struct LaneView {
     pub generated: u64,
     /// Prompt rows the lane's request took over from what the lane held.
     pub reused: u64,
+    /// The lane holds a request (`core::lanes::LaneTable::is_busy`).
+    pub busy: bool,
 }
 
 /// Where an engine's lanes take their requests from, in arrival order.
@@ -130,6 +132,7 @@ pub fn serve_lanes_serially(
             state: "prefill",
             job: Some(id),
             prompt_tokens: prompt.len() as u64,
+            busy: true,
             ..LaneView::default()
         }]);
         out(LaneOut::Started { lane: 0 });
