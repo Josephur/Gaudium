@@ -1287,10 +1287,11 @@ impl Qwen3Engine {
             Some(spec::SpecMethod::DSpine { .. }) => crate::verified::LaneDrafter::LdDSpine,
             Some(_) => crate::verified::LaneDrafter::LdOther,
         };
+        // (a calibration load: of the FP8 weights' activation sites, or of the K/V caches)
         let lanes_ok = crate::verified::ln_lanes_ok(
             crate::engine::lanes_supported(&spec),
             lane_drafter,
-            cfg.fp8_calibrate,
+            cfg.fp8_calibrate || cfg.kv_calibrate,
         );
         let n_lanes =
             crate::verified::ln_served_lanes(cfg.lanes, crate::engine::MAX_LANES, lanes_ok) as usize;
