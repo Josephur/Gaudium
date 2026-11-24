@@ -1261,7 +1261,7 @@ impl Inkling2Engine {
     }
 
     /// The chunks of the global layer's cache a block at anchor position `p` reads.
-    fn mtp_bucket(&self, p: u64) -> u64 {
+    pub(super) fn mtp_bucket(&self, p: u64) -> u64 {
         step_bucket(mtp_ctx_chunks(p, IK_CHUNK), self.max_chunks)
     }
 
@@ -1316,6 +1316,8 @@ impl Inkling2Engine {
             r.launch_prepared(&self.dev, prepared)
                 .map_err(|e| format!("launch drafter block (p={p}): {e}"))?;
         }
+        // readout: the first launch call of the decode step's group returned
+        self.live.launch_submitted();
         self.sync_compute("drafter block")?;
         let n = b - 1;
         self.dev

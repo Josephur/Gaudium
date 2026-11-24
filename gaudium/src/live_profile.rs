@@ -161,6 +161,17 @@ impl Traffic {
         rules: TrafficRules,
         is_weight: &dyn Fn(&str) -> bool,
     ) -> Self {
+        Self::from_graph_kinds(gb, rules, &|name| kind_of(name, is_weight(name)))
+    }
+
+    /// [`Traffic::from_graph`] for an engine whose tensor names the default rules of
+    /// [`kind_of`] do not cover: `kind_fn` gives the data kind of every persistent tensor (the byte
+    /// rules then follow that kind: a [`Kind::Kv`] output is charged for the pass's rows).
+    pub fn from_graph_kinds(
+        gb: &GraphBuilder,
+        rules: TrafficRules,
+        kind_fn: &dyn Fn(&str) -> Kind,
+    ) -> Self {
         let mut tr = Self::default();
         let rows = rules.rows.max(1) as f64;
         for node in gb.node_io_views() {
@@ -195,7 +206,7 @@ impl Traffic {
                 {
                     by /= last;
                 }
-                let kind = kind_of(t.name, is_weight(t.name));
+                let kind = kind_fn(t.name);
                 if kind == Kind::Weight && custom_kernel && by > INDEXED_TABLE_MIN {
                     // a TPC kernel indexes a large table (candidate rows, codes, scores): it
                     // does not stream it the way a GEMM streams a weight matrix
@@ -210,7 +221,7 @@ impl Traffic {
                 }
                 seen.push(t.id);
                 let mut by = t.bytes as f64;
-                let k = kind_of(t.name, is_weight(t.name));
+                let k = kind_fn(t.name);
                 if k == Kind::Kv && rules.kv_positions > 0 {
                     let pos = rules.kv_positions as f64;
                     by = by * rows.min(pos) / pos;

@@ -224,6 +224,9 @@ impl GenEngine for inkling2::Inkling2Engine {
     fn prefix_stats(&self) -> Option<qwen3::prefix_cache::PrefixStats> {
         inkling2::Inkling2Engine::prefix_stats(self)
     }
+    fn spec_info(&self) -> Option<qwen3::spec::readout::SpecInfo> {
+        inkling2::Inkling2Engine::spec_info(self)
+    }
     fn vision_spec(&self) -> Option<&crate::vision::VisionSpec> {
         inkling2::Inkling2Engine::vision_spec(self)
     }
