@@ -129,6 +129,12 @@ pub fn build_cache(cfg: &Qwen3Config, spec_chunks: &[u64]) -> Result<(), String>
             true,
         )?;
         if let Some(sc) = &cfg.spec {
+            // (a load of several lanes takes the lanes' verify form)
+            let step_opts = {
+                let mut o = cfg.step.clone();
+                o.gdn_verify = crate::engine::lane_verify(&cfg.step, cfg.lanes);
+                o
+            };
             let rt = spec::SpecRuntime::prepare(
                 sc,
                 &spec,
@@ -144,7 +150,7 @@ pub fn build_cache(cfg: &Qwen3Config, spec_chunks: &[u64]) -> Result<(), String>
                 samp.is_some(),
                 // the chunk counts between the first and the last are chosen below
                 false,
-                &cfg.step,
+                &step_opts,
             )?;
             // the drafter's own recipes of every chunk count (cheap; first use is inside a request),
             // with the image forms when the load plans a vision tower

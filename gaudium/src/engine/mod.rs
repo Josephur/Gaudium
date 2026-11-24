@@ -439,19 +439,40 @@ pub fn lanes_supported(spec: &ModelSpec) -> bool {
 }
 
 /// The kind of drafter the verified lane rule (`ln_drafter_ok`) judges: none, DSpine with the
-/// checkpoint form of the verify rows (the form the batched speculative steps are built for), or
-/// another. `dspine`: whether the load has a drafter, and whether it is DSpine. The engine and the
+/// checkpoint or the replay form of the verify rows (the forms the batched speculative steps are
+/// built for), or another. `dspine`: whether the load has a drafter, and whether it is DSpine. The engine and the
 /// server both ask this, so they agree on which loads get lanes.
 pub fn lane_drafter(
     dspine: Option<bool>,
     verify: step_opts::GdnVerify,
 ) -> crate::verified::LaneDrafter {
-    // (the batched speculative steps are built for the checkpointed verify rows)
+    // (the batched speculative steps are built for the checkpointed and the replayed verify rows)
     crate::verified::ln_lane_drafter_of(
         dspine.is_some(),
         dspine == Some(true),
-        verify == step_opts::GdnVerify::Checkpoint,
+        matches!(
+            verify,
+            step_opts::GdnVerify::Checkpoint | step_opts::GdnVerify::Replay
+        ),
     )
+}
+
+/// The verify form of a load of `lanes` lanes with step options `opts` (the verified
+/// `ln_lane_verify`): the form asked for, else for several lanes the replay form, else the
+/// default. The engine and the server both ask this.
+pub fn lane_verify(opts: &step_opts::StepOpts, lanes: u64) -> step_opts::GdnVerify {
+    use crate::verified::VerifyForm;
+    use step_opts::GdnVerify;
+    let form = match opts.gdn_verify {
+        GdnVerify::Checkpoint => VerifyForm::VfCheckpoint,
+        GdnVerify::Replay => VerifyForm::VfReplay,
+        GdnVerify::Mme => VerifyForm::VfMme,
+    };
+    match crate::verified::ln_lane_verify(opts.gdn_verify_asked, form, lanes) {
+        VerifyForm::VfCheckpoint => GdnVerify::Checkpoint,
+        VerifyForm::VfReplay => GdnVerify::Replay,
+        VerifyForm::VfMme => GdnVerify::Mme,
+    }
 }
 
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
@@ -556,10 +577,23 @@ mod lane_drafter_tests {
     use crate::verified::LaneDrafter;
 
     #[test]
-    fn only_dspine_with_checkpointed_verify_rows_counts_as_a_lane_drafter() {
+    fn only_dspine_with_checkpointed_or_replayed_verify_rows_counts_as_a_lane_drafter() {
         assert!(matches!(lane_drafter(None, GdnVerify::Checkpoint), LaneDrafter::LdNone));
         assert!(matches!(lane_drafter(Some(true), GdnVerify::Checkpoint), LaneDrafter::LdDSpine));
-        assert!(matches!(lane_drafter(Some(true), GdnVerify::Replay), LaneDrafter::LdOther));
+        assert!(matches!(lane_drafter(Some(true), GdnVerify::Replay), LaneDrafter::LdDSpine));
+        assert!(matches!(lane_drafter(Some(true), GdnVerify::Mme), LaneDrafter::LdOther));
+    }
+
+    #[test]
+    fn lanes_take_the_replay_form_unless_a_form_was_named() {
+        use super::{lane_verify, step_opts::StepOpts};
+        let mut o = StepOpts::default();
+        assert_eq!(lane_verify(&o, 1), GdnVerify::Checkpoint);
+        assert_eq!(lane_verify(&o, 4), GdnVerify::Replay);
+        o.gdn_verify_asked = true;
+        assert_eq!(lane_verify(&o, 4), GdnVerify::Checkpoint);
+        o.gdn_verify = GdnVerify::Mme;
+        assert_eq!(lane_verify(&o, 4), GdnVerify::Mme);
         assert!(matches!(lane_drafter(Some(false), GdnVerify::Checkpoint), LaneDrafter::LdOther));
     }
 }

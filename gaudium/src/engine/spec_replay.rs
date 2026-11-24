@@ -198,6 +198,104 @@ pub(super) fn append_linear_layer_replay(
     append_post_and_mlp(gb, spec, x, attn, lpfx, t, true, wnext_norm)
 }
 
+/// [lanes] The replay-form DeltaNet core of several slots side by side (`widths[j]` rows of slot
+/// `j`, in slot order, in `qkvz` / `ba`): per slot, the kernels of [`append_linear_layer_replay`]
+/// on its own rows, its lane's single states, update buffers and first-step cursor (`spfx[j]`
+/// names them, `rp_first[j]` is the lane's cursor tensor); every slot's conv prep and gate, then
+/// every slot's recurrence, then the output norm and gate of every row at once. `slots[j]` = the
+/// previous step's accepted row of slot `j`, `cursors[j]` its cursor.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_gdn_replay_slots(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    qkvz: TensorId,
+    ba: TensorId,
+    slots: &[TensorId],
+    cursors: &[TensorId],
+    rp_first: &[TensorId],
+    wpfx: &str,
+    spfx: &[String],
+    widths: &[u64],
+    ns: u64,
+) -> TensorId {
+    let hv = spec.gdn_v_heads;
+    let dl = spec.gdn_v_dim;
+    let qkv = spec.gdn_qkv_dim();
+    let hvp = spec.gdn_hvp();
+    let f32t = SynDataType::Float;
+    let split_bf16 = |gb: &mut GraphBuilder, x: TensorId, d: u64, name: &str| -> Vec<TensorId> {
+        let parts: Vec<TensorId> = widths
+            .iter()
+            .enumerate()
+            .map(|(j, &w)| gb.add_intermediate(format!("{}{name}", spfx[j]), SynDataType::Bf16, &[d, w]))
+            .collect();
+        gb.op_split(format!("{wpfx}{name}_split"), x, &parts, 1);
+        parts
+    };
+    let qkvzs = split_bf16(gb, qkvz, spec.gdn_qkvz_dim(), "qkvz");
+    let bas = split_bf16(gb, ba, spec.gdn_ba_dim(), "ba");
+
+    // 1. every slot's conv prep and gate (the key rows and the decays are the lane's update
+    // buffers of this step)
+    let conv_w = gb.get_or_add_persistent_tensor(format!("{wpfx}conv_w"), f32t, &[qkv, 4]);
+    let conv_b = gb.get_or_add_persistent_tensor(format!("{wpfx}conv_b"), f32t, &[qkv]);
+    let a_log = gb.get_or_add_persistent_tensor(format!("{wpfx}A_log"), f32t, &[hvp]);
+    let dt_bias = gb.get_or_add_persistent_tensor(format!("{wpfx}dt_bias"), f32t, &[hvp]);
+    let mut rows_s = Vec::with_capacity(widths.len());
+    for (j, &t) in widths.iter().enumerate() {
+        let sp = &spfx[j];
+        let cs_in = gb.add_persistent_tensor(format!("{sp}cs_in"), f32t, &[qkv, 3, ns]);
+        let cs_out = gb.add_persistent_tensor(format!("{sp}cs_out"), f32t, &[qkv, 3]);
+        let cs_ckpt = gb.add_persistent_tensor(format!("{sp}cs_ckpt"), f32t, &[qkv, 3, t]);
+        let q = gb.add_persistent_tensor(format!("{sp}q"), f32t, &[dl, hv, t]);
+        let k = gb.add_persistent_tensor(format!("{sp}rpk_out"), f32t, &[dl, hv, t]);
+        let v = gb.add_persistent_tensor(format!("{sp}v"), f32t, &[dl, hv, t]);
+        gb.add_node(
+            "gaudium_gdn_prep",
+            format!("{sp}gdn_prep"),
+            &[qkvzs[j], conv_w, cs_in, conv_b, slots[j]],
+            &[q, k, v, cs_out, cs_ckpt],
+            &u32_params(&[2 | 16]),
+        );
+        let eg = gb.add_persistent_tensor(format!("{sp}rpg_out"), f32t, &[hvp, t]);
+        let beta = gb.add_persistent_tensor(format!("{sp}beta"), f32t, &[hvp, t]);
+        gb.add_node(
+            "gaudium_gdn_gate",
+            format!("{sp}gdn_gate"),
+            &[bas[j], a_log, dt_bias],
+            &[eg, beta],
+            &[],
+        );
+        rows_s.push((q, k, v, eg, beta));
+    }
+
+    // 2. every slot's recurrence: the previous step's accepted rows replayed onto the state it
+    // started from, then this step's rows
+    let mut os = Vec::with_capacity(widths.len());
+    for (j, &t) in widths.iter().enumerate() {
+        let sp = &spfx[j];
+        let (q, k, v, eg, beta) = rows_s[j];
+        let s_in = gb.add_persistent_tensor(format!("{sp}S_in"), f32t, &[64, 256, hv]);
+        let s_base = gb.add_persistent_tensor(format!("{sp}S_base"), f32t, &[64, 256, hv]);
+        let pk = gb.add_persistent_tensor(format!("{sp}rpk_in"), f32t, &[dl, hv, ns]);
+        let pd = gb.add_persistent_tensor(format!("{sp}rpd_in"), f32t, &[64, 8, hv, ns]);
+        let pg = gb.add_persistent_tensor(format!("{sp}rpg_in"), f32t, &[hvp, ns]);
+        let dr = gb.add_persistent_tensor(format!("{sp}rpd_out"), f32t, &[64, 8, hv, t]);
+        let o = gb.add_persistent_tensor(format!("{sp}o"), f32t, &[dl, hv, t]);
+        gb.add_node(
+            "gaudium_gdn_f32r",
+            format!("{sp}gdn"),
+            &[s_in, q, k, v, eg, beta, pk, pd, pg, slots[j], cursors[j], rp_first[j]],
+            &[o, s_base, dr],
+            &u32_params(&[0u32]),
+        );
+        os.push(o);
+    }
+
+    // 3. the output norm and gate of every row
+    super::append_gdn_post_groups(gb, spec, &os, qkvz, wpfx, widths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

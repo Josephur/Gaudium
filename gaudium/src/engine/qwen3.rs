@@ -640,11 +640,48 @@ pub(crate) fn append_attn_core(
     t: u64,
     nch: u64,
 ) -> TensorId {
+    let slot = AttnSlot {
+        qg,
+        k,
+        v,
+        cursor,
+        spfx: spfx.to_string(),
+        t,
+    };
+    append_attn_core_slots(gb, spec, &[slot], rope_c, rope_s, wpfx, nch)
+        .pop()
+        .expect("one slot")
+}
+
+/// One slot of [`append_attn_core_slots`]: its rows' projections, its cursor, the prefix of its
+/// tensors (its lane's caches among them) and its row count.
+pub(crate) struct AttnSlot {
+    pub qg: TensorId,
+    pub k: TensorId,
+    pub v: TensorId,
+    pub cursor: TensorId,
+    pub spfx: String,
+    pub t: u64,
+}
+
+/// The attention cores of several slots of one layer, each on its own rows, cursor and caches
+/// (the kernels of [`append_attn_core`]), emitted stage by stage across the slots (every slot's
+/// prep, then every slot's scores, softmax, PV, combine and gate) so that one slot's matrix
+/// stage can run beside another's vector stage. One slot is [`append_attn_core`]'s graph.
+/// Returns each slot's `core {nh * dh, t}`.
+pub(crate) fn append_attn_core_slots(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    slots: &[AttnSlot],
+    rope_c: TensorId,
+    rope_s: TensorId,
+    wpfx: &str,
+    nch: u64,
+) -> Vec<TensorId> {
     let nh = spec.n_heads;
     let nkv = spec.n_kv_heads;
     let dh = spec.head_dim;
     let gq = nh / nkv;
-    let r = gq * t;
     let b = nkv * nch;
 
     let g_aprep = if dh == 128 {
@@ -668,56 +705,87 @@ pub(crate) fn append_attn_core(
     // [kv8] the cache dtype of this layer (q block, caches and P) and its scale table (the
     // layer's, shared by every slot)
     let kv = kv8::AttnKv::of(gb, spec, wpfx);
-    let qb = gb.add_persistent_tensor(format!("{spfx}qb"), kv.dt, &[dh, r, b]);
-    let kcache =
-        gb.add_persistent_tensor(format!("{spfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
-    let vcache =
-        gb.add_persistent_tensor(format!("{spfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
-    let prep_params = u32_params(&[0u32]); // coff = 0
-    gb.add_node(
-        g_aprep,
-        format!("{spfx}attn_prep"),
-        &kv.inputs(&[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor]),
-        &[qb, kcache, vcache],
-        &prep_params,
-    );
+    let mut st: Vec<(TensorId, TensorId, TensorId)> = Vec::with_capacity(slots.len());
+    for sl in slots {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let qb = gb.add_persistent_tensor(format!("{spfx}qb"), kv.dt, &[dh, r, b]);
+        let kcache =
+            gb.add_persistent_tensor(format!("{spfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
+        let vcache =
+            gb.add_persistent_tensor(format!("{spfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
+        let prep_params = u32_params(&[0u32]); // coff = 0
+        gb.add_node(
+            g_aprep,
+            format!("{spfx}attn_prep"),
+            &kv.inputs(&[sl.qg, sl.k, sl.v, qn_w, kn_w, rope_c, rope_s, sl.cursor]),
+            &[qb, kcache, vcache],
+            &prep_params,
+        );
+        st.push((qb, kcache, vcache));
+    }
 
-    let scores = gb.add_persistent_tensor(
-        format!("{spfx}scores"),
-        SynDataType::Float,
-        &[KV_CHUNK, r, b],
-    );
-    gb.op_batch_gemm(format!("{spfx}qk"), qb, kcache, scores, false, true);
+    let mut scores_s = Vec::with_capacity(slots.len());
+    for (sl, &(qb, kcache, _)) in slots.iter().zip(&st) {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let scores = gb.add_persistent_tensor(
+            format!("{spfx}scores"),
+            SynDataType::Float,
+            &[KV_CHUNK, r, b],
+        );
+        gb.op_batch_gemm(format!("{spfx}qk"), qb, kcache, scores, false, true);
+        scores_s.push(scores);
+    }
 
-    let pm = gb.add_persistent_tensor(format!("{spfx}P"), kv.dt, &[KV_CHUNK, r, b]);
-    let stats =
-        gb.add_persistent_tensor(format!("{spfx}stats"), SynDataType::Float, &[64, 2, r, b]);
-    let sm_params = u32_params(&[t as u32, nch as u32, 0u32, 0u32]);
-    gb.add_node(
-        "gaudium_attn_softmax_chunk",
-        format!("{spfx}softmax"),
-        &kv.inputs(&[scores, cursor]),
-        &[pm, stats],
-        &sm_params,
-    );
+    let mut pm_s = Vec::with_capacity(slots.len());
+    for (sl, &scores) in slots.iter().zip(&scores_s) {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let pm = gb.add_persistent_tensor(format!("{spfx}P"), kv.dt, &[KV_CHUNK, r, b]);
+        let stats =
+            gb.add_persistent_tensor(format!("{spfx}stats"), SynDataType::Float, &[64, 2, r, b]);
+        let sm_params = u32_params(&[sl.t as u32, nch as u32, 0u32, 0u32]);
+        gb.add_node(
+            "gaudium_attn_softmax_chunk",
+            format!("{spfx}softmax"),
+            &kv.inputs(&[scores, sl.cursor]),
+            &[pm, stats],
+            &sm_params,
+        );
+        pm_s.push((pm, stats));
+    }
 
-    let ao_part =
-        gb.add_persistent_tensor(format!("{spfx}ao_part"), SynDataType::Float, &[dh, r, b]);
-    gb.op_batch_gemm(format!("{spfx}pv"), pm, vcache, ao_part, false, false);
+    let mut part_s = Vec::with_capacity(slots.len());
+    for ((sl, &(_, _, vcache)), &(pm, _)) in slots.iter().zip(&st).zip(&pm_s) {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let ao_part =
+            gb.add_persistent_tensor(format!("{spfx}ao_part"), SynDataType::Float, &[dh, r, b]);
+        gb.op_batch_gemm(format!("{spfx}pv"), pm, vcache, ao_part, false, false);
+        part_s.push(ao_part);
+    }
 
-    let ao = gb.add_persistent_tensor(format!("{spfx}ao"), SynDataType::Float, &[dh, r, nkv]);
-    let comb_params = u32_params(&[nch as u32]);
-    gb.add_node(
-        g_acomb,
-        format!("{spfx}combine"),
-        &[ao_part, stats],
-        &[ao],
-        &comb_params,
-    );
+    let mut ao_s = Vec::with_capacity(slots.len());
+    for ((sl, &ao_part), &(_, stats)) in slots.iter().zip(&part_s).zip(&pm_s) {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let ao = gb.add_persistent_tensor(format!("{spfx}ao"), SynDataType::Float, &[dh, r, nkv]);
+        let comb_params = u32_params(&[nch as u32]);
+        gb.add_node(
+            g_acomb,
+            format!("{spfx}combine"),
+            &[ao_part, stats],
+            &[ao],
+            &comb_params,
+        );
+        ao_s.push(ao);
+    }
 
-    let core = gb.add_persistent_tensor(format!("{spfx}core"), SynDataType::Bf16, &[nh * dh, t]);
-    gb.add_node(g_apost, format!("{spfx}attn_post"), &[ao, qg], &[core], &[]);
-    core
+    let mut cores = Vec::with_capacity(slots.len());
+    for (sl, &ao) in slots.iter().zip(&ao_s) {
+        let spfx = &sl.spfx;
+        let core =
+            gb.add_persistent_tensor(format!("{spfx}core"), SynDataType::Bf16, &[nh * dh, sl.t]);
+        gb.add_node(g_apost, format!("{spfx}attn_post"), &[ao, sl.qg], &[core], &[]);
+        cores.push(core);
+    }
+    cores
 }
 
 /// Appends one Gated DeltaNet (`linear_attention`) layer (`Qwen3.5/3.8`).
@@ -1290,7 +1358,7 @@ impl Qwen3Engine {
             cfg.spec
                 .as_ref()
                 .map(|sc| matches!(sc.method, spec::SpecMethod::DSpine { .. })),
-            cfg.step.gdn_verify,
+            crate::engine::lane_verify(&cfg.step, cfg.lanes),
         );
         // (a calibration load: of the FP8 weights' activation sites, or of the K/V caches)
         let lanes_ok = crate::verified::ln_lanes_ok(
@@ -1300,6 +1368,13 @@ impl Qwen3Engine {
         );
         let n_lanes =
             crate::verified::ln_served_lanes(cfg.lanes, crate::engine::MAX_LANES, lanes_ok) as usize;
+        // [lanes] the verify form of the speculative steps (several lanes: the replay form unless
+        // a form was named)
+        let step_opts = {
+            let mut o = cfg.step.clone();
+            o.gdn_verify = crate::engine::lane_verify(&cfg.step, n_lanes as u64);
+            o
+        };
         if (n_lanes as u64) < cfg.lanes {
             eprintln!(
                 "[gaudium] lanes: {n_lanes} of the {} asked for (this engine, drafter or load has no batched steps for more)",
@@ -1517,14 +1592,22 @@ impl Qwen3Engine {
         }
         let mut specdec = match &cfg.spec {
             Some(sc) => Some(spec::SpecRuntime::prepare(
-                // [lanes] lanes step at one width, the narrowest asked for (its rings are sized
-                // for it): every lane verifies the same rows in a launch
+                // [lanes] a lane verifies at the narrowest width asked, or at the widest when its
+                // rings hold the widest rows (the verified ring rule: the replay form keeps the
+                // rows' updates there, the checkpoint form a state per row)
                 &if n_lanes > 1 {
-                    let mut one = sc.clone();
-                    one.draft_k = vec![
-                        crate::core::lanes::lane_width(sc.draft_k.iter().copied()).unwrap_or(1),
-                    ];
-                    one
+                    let mut lw = sc.clone();
+                    let narrow =
+                        crate::core::lanes::lane_width(sc.draft_k.iter().copied()).unwrap_or(1);
+                    let wide =
+                        crate::core::lanes::lane_width_wide(sc.draft_k.iter().copied()).unwrap_or(narrow);
+                    let replay = step_opts.gdn_verify == crate::engine::step_opts::GdnVerify::Replay;
+                    let ring = crate::core::lanes::lane_ring_rows(narrow + 1, wide + 1, replay);
+                    // the narrow width and the widest one the rings hold (the same one when they
+                    // hold the narrow rows only)
+                    lw.draft_k = vec![narrow, crate::core::lanes::lane_wide_held(narrow, wide, ring)];
+                    lw.draft_k.dedup();
+                    lw
                 } else {
                     sc.clone()
                 },
@@ -1540,7 +1623,7 @@ impl Qwen3Engine {
                 cfg.verbose || plan_only,
                 samp.is_some(),
                 plan_only,
-                &cfg.step,
+                &step_opts,
             )?),
             None => None,
         };
@@ -1576,6 +1659,7 @@ impl Qwen3Engine {
                 &driver_version,
                 cfg.verbose || plan_only,
                 plan_only,
+                !cfg.step.profile.is_empty(),
             )?;
             max_ws = max_ws.max(p.max_ws);
             Some(p)

@@ -60,6 +60,13 @@ command line, prompts and logs under `--out`. The exit status is 0 only when eve
 `--only <model>` or `--only <model>/<method>` runs a subset; options after `--` are added to
 every row (for example `-- --max-ctx 16384`).
 
+A model served with `--parallel` lanes runs requests only through the server, so the suite's rows
+(one `--generate` process each) do not reach its lanes. `tools/lanes_check.py --suite
+gaudium/tests/vision_suite/suite.json` sends the same image cases to a running server: their
+references come from one request at a time (`--write-ref`, best against a `--parallel 1` K=0
+server), then every case runs beside the other prompts at each concurrency (`--check`). A case
+fails when its stream differs from its reference or its answer lacks the case's expected words.
+
 ## Adding a model family or a drafter
 
 A new family is one more entry of `models` in the suite file, a new drafter one more entry of a

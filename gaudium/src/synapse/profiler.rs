@@ -437,8 +437,15 @@ pub fn node_of_event(ev: &str) -> &str {
 }
 
 /// Node family: the layer number after a leading `L` / `D` folded to `#` (`L12_qkvz_gemm` ->
-/// `L#_qkvz_gemm`).
+/// `L#_qkvz_gemm`), and the slot of a batched lane step too (`s3_L12_gdn` -> `s#_L#_gdn`).
 pub fn family_of(node: &str) -> String {
+    // a slot's node of a batched lane step (`s<j>_...`) folds with the other slots'
+    if let Some(rest) = node.strip_prefix('s') {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest.as_bytes().get(digits) == Some(&b'_') {
+            return format!("s#_{}", family_of(&rest[digits + 1..]));
+        }
+    }
     let b = node.as_bytes();
     if b.len() > 1 && (b[0] == b'L' || b[0] == b'D') && b[1].is_ascii_digit() {
         let rest = node[1..].trim_start_matches(|c: char| c.is_ascii_digit());
@@ -667,6 +674,10 @@ mod tests {
         assert_eq!(family_of("D4_softmax"), "D#_softmax");
         assert_eq!(family_of("logits_gemm"), "logits_gemm");
         assert_eq!(family_of("Lx"), "Lx");
+        assert_eq!(family_of("s3_L12_gdn"), "s#_L#_gdn");
+        assert_eq!(family_of("s12_accept"), "s#_accept");
+        assert_eq!(family_of("samp_init"), "samp_init");
+        assert_eq!(family_of("s_x"), "s_x");
         assert_eq!(class_of("DCORE0 TPC 2"), "TPC");
         assert_eq!(class_of("EDMA 3"), "DMA");
         assert_eq!(class_of("MME0"), "MME");

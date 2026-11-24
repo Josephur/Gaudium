@@ -111,6 +111,13 @@ fn print_usage() {
          \x20 --cache-keep-days <D> With --cache-max-gb: recipes used within D days are kept even\n\
          \x20                       over the budget (default: 1; decimals allowed)\n\
          \x20 --cache-trim-every <M> With --cache-max-gb: minutes between trims (default: 60)\n\
+         \x20 --profile-steps <A-B[:file]>  Device trace of the batched launches A..B (0-based,\n\
+         \x20                       counted from the load) of a model served with --parallel\n\
+         \x20                       lanes: prints each launch's split by node family (a slot's\n\
+         \x20                       nodes fold together as s#_) and engine; :file also writes the\n\
+         \x20                       raw events. Repeatable. The batched recipes compile fresh\n\
+         \x20                       (the others load from the recipe cache); a profiled run is\n\
+         \x20                       not a timing result\n\
          \x20 --lazy                Start without holding Gaudi 2; load on first chat/start\n\
          \x20 --build-cache         With --serve: compile every recipe the served models load into\n\
          \x20                       the recipe cache and exit, without opening the card and without\n\
@@ -145,9 +152,14 @@ fn print_usage() {
          \x20                       free lane where it takes over the most of its prompt for the\n\
          \x20                       least of another conversation's rows. Dense Qwen3 /\n\
          \x20                       Qwen3.5 / Qwen3.8 models without a drafter or with a DSpine\n\
-         \x20                       drafter whose verify rows are checkpointed (--gdn-verify\n\
-         \x20                       checkpoint, the default); every lane verifies and drafts at\n\
-         \x20                       the narrowest --draft-k width. Other models are\n\
+         \x20                       drafter whose verify rows are replayed or checkpointed:\n\
+         \x20                       lanes take the replay form (no per-row state copies, about\n\
+         \x20                       2 GiB less per lane on the 27B) unless GAUDIUM_GDN_VERIFY\n\
+         \x20                       names a form. With replay each lane verifies at a width of\n\
+         \x20                       its own, the narrowest or the widest --draft-k, chosen every\n\
+         \x20                       step from its own acceptance and the measured step times;\n\
+         \x20                       with checkpoint every lane steps at the narrowest. Other\n\
+         \x20                       models are\n\
          \x20                       served with one lane (the log says why). /props total_slots\n\
          \x20                       and /slots show the lanes. Not with --cache-ram yet (the\n\
          \x20                       host-RAM tier is off for a model served with lanes)\n\
@@ -463,7 +475,8 @@ fn print_usage() {
          \x20                       default 7; mtp: at most 15, default 4; assistant: default 4);\n\
          \x20                       several values let the engine pick a width per step from\n\
          \x20                       acceptance (mtp: every step then drafts the widest listed block;\n\
-         \x20                       a model served with --parallel lanes steps at the narrowest)\n\
+         \x20                       --parallel lanes: each lane at the narrowest or the widest\n\
+         \x20                       listed in the replay form, else at the narrowest)\n\
          \x20 --sweep-draft-k       Measurement: with several --draft-k widths, run every request once\n\
          \x20                       per listed width as a fixed-width run, then once with the width\n\
          \x20                       policy (one engine load for a whole width sweep)\n\
@@ -1218,6 +1231,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     cfg.step.draft_fp8_calibrate = draft_fp8_calibrate;
     if let Some(v) = gdn_verify {
         cfg.step.gdn_verify = v;
+        cfg.step.gdn_verify_asked = true;
     }
     if let Some(v) = k0_pipeline {
         cfg.step.k0_pipeline = v;
@@ -2326,6 +2340,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut cache_max_gb: Option<f64> = None;
     let mut cache_keep_days: Option<f64> = None;
     let mut cache_trim_every: Option<u64> = None;
+    let mut profile: Vec<gaudium::synapse::profiler::ProfileWindow> = Vec::new();
     // `<id>=<path>` options are collected per served model id.
     fn model_opt<'a>(
         per_model: &'a mut Vec<(String, ModelRunOptions)>,
@@ -2503,6 +2518,12 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                         .ok_or_else(|| format!("invalid --cache-trim-every '{s}' (minutes, > 0)"))?,
                 );
             }
+            "--profile-steps" => {
+                profile.push(gaudium::synapse::profiler::ProfileWindow::parse(&next_val(
+                    &mut i,
+                    "--profile-steps",
+                )?)?)
+            }
             "--lazy" => lazy = true,
             "--build-cache" => build_cache = true,
             "--build-cache-only" => {
@@ -2630,6 +2651,11 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         }
     };
 
+    if !profile.is_empty() {
+        // as for --generate: the template before the device opens (the batched lane recipes
+        // compile in the process, the others load from the recipe cache)
+        gaudium::synapse::profiler::setup_env();
+    }
     let cfg = ServerConfig {
         host,
         port,
@@ -2658,6 +2684,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         cache_ram_bytes,
         parallel,
         cache_trim,
+        profile,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {

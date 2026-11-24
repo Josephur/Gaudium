@@ -84,6 +84,13 @@ Serve options:
   --cache-keep-days <D> With --cache-max-gb: recipes used within D days are kept even
                         over the budget (default: 1; decimals allowed)
   --cache-trim-every <M> With --cache-max-gb: minutes between trims (default: 60)
+  --profile-steps <A-B[:file]>  Device trace of the batched launches A..B (0-based,
+                        counted from the load) of a model served with --parallel
+                        lanes: prints each launch's split by node family (a slot's
+                        nodes fold together as s#_) and engine; :file also writes the
+                        raw events. Repeatable. The batched recipes compile fresh
+                        (the others load from the recipe cache); a profiled run is
+                        not a timing result
   --lazy                Start without holding Gaudi 2; load on first chat/start
   --build-cache         With --serve: compile every recipe the served models load into
                         the recipe cache and exit, without opening the card and without
@@ -118,9 +125,14 @@ Serve options:
                         free lane where it takes over the most of its prompt for the
                         least of another conversation's rows. Dense Qwen3 /
                         Qwen3.5 / Qwen3.8 models without a drafter or with a DSpine
-                        drafter whose verify rows are checkpointed (--gdn-verify
-                        checkpoint, the default); every lane verifies and drafts at
-                        the narrowest --draft-k width. Other models are
+                        drafter whose verify rows are replayed or checkpointed:
+                        lanes take the replay form (no per-row state copies, about
+                        2 GiB less per lane on the 27B) unless GAUDIUM_GDN_VERIFY
+                        names a form. With replay each lane verifies at a width of
+                        its own, the narrowest or the widest --draft-k, chosen every
+                        step from its own acceptance and the measured step times;
+                        with checkpoint every lane steps at the narrowest. Other
+                        models are
                         served with one lane (the log says why). /props total_slots
                         and /slots show the lanes. Not with --cache-ram yet (the
                         host-RAM tier is off for a model served with lanes)
@@ -436,7 +448,8 @@ Generate options:
                         default 7; mtp: at most 15, default 4; assistant: default 4);
                         several values let the engine pick a width per step from
                         acceptance (mtp: every step then drafts the widest listed block;
-                        a model served with --parallel lanes steps at the narrowest)
+                        --parallel lanes: each lane at the narrowest or the widest
+                        listed in the replay form, else at the narrowest)
   --sweep-draft-k       Measurement: with several --draft-k widths, run every request once
                         per listed width as a fixed-width run, then once with the width
                         policy (one engine load for a whole width sweep)

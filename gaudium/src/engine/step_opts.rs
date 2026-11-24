@@ -72,6 +72,9 @@ pub struct StepOpts {
     pub draft_ring: Option<bool>,
     /// DeltaNet state handling of the verify rows.
     pub gdn_verify: GdnVerify,
+    /// `gdn_verify` was named (`--gdn-verify`, `GAUDIUM_GDN_VERIFY`); otherwise a load of several
+    /// lanes takes the replay form (`engine::lane_verify`).
+    pub gdn_verify_asked: bool,
     /// Checkpoint form: run the rows with the kernel build that takes its per-row gate scalars as
     /// vector loads (bit-identical, fewer slow scalar loads from device memory). `None`: when
     /// that kernel and its glue library are installed.
@@ -91,6 +94,7 @@ impl Default for StepOpts {
             draft_fp8_calibrate: None,
             draft_ring: None,
             gdn_verify: GdnVerify::default(),
+            gdn_verify_asked: false,
             gdn_fast_rows: None,
             k0_pipeline: true,
         }
@@ -125,6 +129,7 @@ impl StepOpts {
             gdn_verify: var("GAUDIUM_GDN_VERIFY")
                 .and_then(|v| GdnVerify::parse(v.trim()))
                 .unwrap_or_default(),
+            gdn_verify_asked: var("GAUDIUM_GDN_VERIFY").is_some_and(|v| GdnVerify::parse(v.trim()).is_some()),
             gdn_fast_rows: var("GAUDIUM_GDN_FAST_ROWS").and_then(|v| match v.trim() {
                 "0" => Some(false),
                 "1" => Some(true),

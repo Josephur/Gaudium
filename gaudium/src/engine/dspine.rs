@@ -463,12 +463,93 @@ pub fn append_ctx_pass_p(
     rope_s: TensorId,
     lmax: u64,
 ) {
+    let slot = CtxSlot {
+        pfx: pfx.to_string(),
+        t,
+        cursor,
+        fix,
+    };
+    append_ctx_pass_slots(gb, pfx, dc, hs, &[slot], depth, rope_c, rope_s, lmax)
+}
+
+/// One slot of a drafter pass that runs over several lanes' rows in one launch: the prefix of
+/// its own tensors (which also names its lane's context caches), its rows and its inputs.
+#[derive(Debug, Clone)]
+pub struct CtxSlot {
+    pub pfx: String,
+    /// The slot's target rows: its columns of the taps, in slot order.
+    pub t: u64,
+    pub cursor: TensorId,
+    /// The lane's context bound.
+    pub fix: TensorId,
+}
+
+/// `x {d, sum widths}` as one tensor per slot of `widths[j]` columns (intermediates named by
+/// `name(j)`); a single slot is `x` itself.
+fn split_slot_cols(
+    gb: &mut GraphBuilder,
+    x: TensorId,
+    dt: SynDataType,
+    d: u64,
+    widths: &[u64],
+    split_name: &str,
+    name: impl Fn(usize) -> String,
+) -> Vec<TensorId> {
+    if widths.len() == 1 {
+        return vec![x];
+    }
+    let parts: Vec<TensorId> = widths
+        .iter()
+        .enumerate()
+        .map(|(j, &w)| gb.add_intermediate(name(j), dt, &[d, w]))
+        .collect();
+    gb.op_split(split_name, x, &parts, 1);
+    parts
+}
+
+/// The slots' tensors `{d, w_j}` side by side as one `{d, sum w_j}` (an intermediate `name`);
+/// a single slot's is its own tensor.
+fn cat_slot_cols(
+    gb: &mut GraphBuilder,
+    parts: &[TensorId],
+    dt: SynDataType,
+    dims: &[u64],
+    axis: u32,
+    name: &str,
+) -> TensorId {
+    if parts.len() == 1 {
+        return parts[0];
+    }
+    let out = gb.add_intermediate(name, dt, dims);
+    gb.op_concat(format!("{name}_cat"), parts, out, axis);
+    out
+}
+
+/// The context pass of several slots in one launch (`hs[i]` = tap `i` over every slot's rows,
+/// slot by slot): the fc projection, its norm and every layer's context K/V projection run once
+/// over all rows, so each weight is read once; each slot's K/V rows are then written to its own
+/// lane's caches at its own cursor. `bpfx` names the tensors of the shared part; with one slot
+/// whose prefix it is, this is the single-stream pass.
+#[allow(clippy::too_many_arguments)]
+pub fn append_ctx_pass_slots(
+    gb: &mut GraphBuilder,
+    bpfx: &str,
+    dc: &DSpineCfg,
+    hs: &[TensorId],
+    slots: &[CtxSlot],
+    depth: TensorId,
+    rope_c: TensorId,
+    rope_s: TensorId,
+    lmax: u64,
+) {
     let hid = dc.hidden;
     let fci = hid * hs.len() as u64;
-    let cat = gb.add_persistent_tensor(format!("{pfx}ctx_cat"), SynDataType::Bf16, &[fci, t]);
-    gb.op_concat(format!("{pfx}ctx_concat"), hs, cat, 0);
-    let f = add_linear_bf16(gb, cat, "df_W_fc", fci, hid, t, &format!("{pfx}ctx_f"));
-    let cn = d_rmsnorm(gb, f, "df_w_hn", &format!("{pfx}ctx_cn"), hid, t);
+    let widths: Vec<u64> = slots.iter().map(|s| s.t).collect();
+    let t: u64 = widths.iter().sum();
+    let cat = gb.add_persistent_tensor(format!("{bpfx}ctx_cat"), SynDataType::Bf16, &[fci, t]);
+    gb.op_concat(format!("{bpfx}ctx_concat"), hs, cat, 0);
+    let f = add_linear_bf16(gb, cat, "df_W_fc", fci, hid, t, &format!("{bpfx}ctx_f"));
+    let cn = d_rmsnorm(gb, f, "df_w_hn", &format!("{bpfx}ctx_cn"), hid, t);
     for l in 0..dc.nl {
         let lp = format!("D{l}_");
         let kc = add_linear_bf16(
@@ -478,7 +559,7 @@ pub fn append_ctx_pass_p(
             hid,
             D_KVD,
             t,
-            &format!("{pfx}ctx_{lp}k"),
+            &format!("{bpfx}ctx_{lp}k"),
         );
         let vc = add_linear_bf16(
             gb,
@@ -487,32 +568,41 @@ pub fn append_ctx_pass_p(
             hid,
             D_KVD,
             t,
-            &format!("{pfx}ctx_{lp}v"),
+            &format!("{bpfx}ctx_{lp}v"),
         );
         let kn_w =
             gb.get_or_add_persistent_tensor(format!("{lp}kn_w"), SynDataType::Float, &[D_DH]);
+        let kcs = split_slot_cols(gb, kc, SynDataType::Bf16, D_KVD, &widths, &format!("{bpfx}ctx_{lp}k_split"), |j| {
+            format!("{}ctx_{lp}k", slots[j].pfx)
+        });
+        let vcs = split_slot_cols(gb, vc, SynDataType::Bf16, D_KVD, &widths, &format!("{bpfx}ctx_{lp}v_split"), |j| {
+            format!("{}ctx_{lp}v", slots[j].pfx)
+        });
         let rows = dc.ctx_rows(lmax);
-        let kcache = gb.get_or_add_persistent_tensor(
-            format!("{pfx}{lp}kcache"),
-            SynDataType::Bf16,
-            &[D_DH, rows, D_NKV],
-        );
-        let vcache = gb.get_or_add_persistent_tensor(
-            format!("{pfx}{lp}vcache"),
-            SynDataType::Bf16,
-            &[D_DH, rows, D_NKV],
-        );
-        gb.add_node(
-            if dc.ring > 0 {
-                "gaudium_ds_ctxr"
-            } else {
-                "gaudium_df_ctx"
-            },
-            format!("{pfx}ctx_{lp}kv"),
-            &[kc, vc, kn_w, rope_c, rope_s, cursor, depth, fix],
-            &[kcache, vcache],
-            &[],
-        );
+        for (j, s) in slots.iter().enumerate() {
+            let pfx = &s.pfx;
+            let kcache = gb.get_or_add_persistent_tensor(
+                format!("{pfx}{lp}kcache"),
+                SynDataType::Bf16,
+                &[D_DH, rows, D_NKV],
+            );
+            let vcache = gb.get_or_add_persistent_tensor(
+                format!("{pfx}{lp}vcache"),
+                SynDataType::Bf16,
+                &[D_DH, rows, D_NKV],
+            );
+            gb.add_node(
+                if dc.ring > 0 {
+                    "gaudium_ds_ctxr"
+                } else {
+                    "gaudium_df_ctx"
+                },
+                format!("{pfx}ctx_{lp}kv"),
+                &[kcs[j], vcs[j], kn_w, rope_c, rope_s, s.cursor, depth, s.fix],
+                &[kcache, vcache],
+                &[],
+            );
+        }
     }
 }
 
@@ -529,31 +619,47 @@ struct Stash {
     pk: TensorId,
 }
 
-/// One drafter layer plus its code bridge. `x_in` = the normalised layer input, `resid` = the
-/// residual stream; returns `(next normalised input, written stream, pre-write state)`.
+/// One slot of a block pass over several lanes in one launch: the prefix of its own tensors
+/// (which also names its lane's context caches), its block's ids and position, its context
+/// bound, and its sampler parameters `samp` (`(samp_f, samp_i)` names, for the coupled walk).
+#[derive(Debug, Clone)]
+pub struct BlkSlot {
+    pub pfx: String,
+    pub ids_blk: TensorId,
+    pub cur_blk: TensorId,
+    pub fix: TensorId,
+    pub samp: (String, String),
+}
+
+/// One drafter layer plus its code bridge over the blocks of `slots`, side by side (`block`
+/// rows each). `x_in` = the normalised layer input, `resid` = the residual stream; returns `(next normalised input, written stream,
+/// pre-write state)`. The projections, the MLP, the bridge's read and its GEMMs run once over
+/// every slot's rows (each weight read once); each slot's attention runs on its own block and
+/// its lane's context caches. With one slot whose prefix is `bpfx` this is the single-stream
+/// layer.
 #[allow(clippy::too_many_arguments)]
 fn append_spine_layer(
     gb: &mut GraphBuilder,
-    pfx: &str,
+    bpfx: &str,
+    slots: &[BlkSlot],
     dc: &DSpineCfg,
     x_in: TensorId,
     resid: TensorId,
     l: usize,
-    ids_blk: TensorId,
-    cur_blk: TensorId,
-    fix: TensorId,
     rope_c: TensorId,
     rope_s: TensorId,
     lmax: u64,
     vocab: u64,
 ) -> (TensorId, TensorId, Stash) {
-    let t = dc.block;
+    let tb = dc.block;
+    let t = tb * slots.len() as u64;
     let hid = dc.hidden;
     let inter = dc.intermediate;
-    let r4 = 4 * t;
+    let r4 = 4 * tb;
     let lp = format!("D{l}_");
-    // the layer's own tensors (and the lane's context caches): one name set per lane
-    let ap = format!("{pfx}D{l}_");
+    // the layer's own tensors: one name set per launch (`bpfx`), the attention's per slot
+    let ap = format!("{bpfx}D{l}_");
+    let pfx = bpfx;
 
     let s_xin = fp8_site(l, "xin");
     let q = d_gemm_p(
@@ -594,61 +700,100 @@ fn append_spine_layer(
     );
     let qn_w = gb.get_or_add_persistent_tensor(format!("{lp}qn_w"), SynDataType::Float, &[D_DH]);
     let kn_w = gb.get_or_add_persistent_tensor(format!("{lp}kn_w"), SynDataType::Float, &[D_DH]);
-    let qb = gb.add_persistent_tensor(format!("{ap}qb"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
-    let kblk =
-        gb.add_persistent_tensor(format!("{ap}kblk"), SynDataType::Bf16, &[D_DH, 128, D_NKV]);
-    let vblk =
-        gb.add_persistent_tensor(format!("{ap}vblk"), SynDataType::Bf16, &[D_DH, 128, D_NKV]);
-    gb.add_node(
-        "gaudium_df_attn_prep",
-        format!("{ap}attn_prep"),
-        &[q, k, v, qn_w, kn_w, rope_c, rope_s, cur_blk],
-        &[qb, kblk, vblk],
-        &[],
-    );
-    // the context keys: one row per position, or the ring of the window (`dc.ring`)
+    let widths = vec![tb; slots.len()];
+    let qs = split_slot_cols(gb, q, SynDataType::Bf16, D_QD, &widths, &format!("{ap}q_split"), |j| {
+        format!("{}D{l}_q", slots[j].pfx)
+    });
+    let ks = split_slot_cols(gb, k, SynDataType::Bf16, D_KVD, &widths, &format!("{ap}k_split"), |j| {
+        format!("{}D{l}_k", slots[j].pfx)
+    });
+    let vs = split_slot_cols(gb, v, SynDataType::Bf16, D_KVD, &widths, &format!("{ap}v_split"), |j| {
+        format!("{}D{l}_v", slots[j].pfx)
+    });
+    // each slot's attention on its own block and its lane's context caches, stage by stage across
+    // the slots (one slot's matrix stage beside another's vector stage)
     let rows = dc.ctx_rows(lmax);
-    let kcache = gb.get_or_add_persistent_tensor(
-        format!("{ap}kcache"),
-        SynDataType::Bf16,
-        &[D_DH, rows, D_NKV],
-    );
-    let vcache = gb.get_or_add_persistent_tensor(
-        format!("{ap}vcache"),
-        SynDataType::Bf16,
-        &[D_DH, rows, D_NKV],
-    );
-    let sc = gb.add_persistent_tensor(format!("{ap}sc"), SynDataType::Float, &[rows, r4, D_NKV]);
-    let sb = gb.add_persistent_tensor(format!("{ap}sb"), SynDataType::Float, &[128, r4, D_NKV]);
-    gb.op_batch_gemm(format!("{ap}qk_ctx"), qb, kcache, sc, false, true);
-    gb.op_batch_gemm(format!("{ap}qk_blk"), qb, kblk, sb, false, true);
-    let pc = gb.add_persistent_tensor(format!("{ap}Pc"), SynDataType::Bf16, &[rows, r4, D_NKV]);
-    let pb = gb.add_persistent_tensor(format!("{ap}Pb"), SynDataType::Bf16, &[128, r4, D_NKV]);
-    gb.add_node(
-        if dc.ring > 0 {
-            "gaudium_ds_softr"
-        } else {
-            "gaudium_ds_softmax"
-        },
-        format!("{ap}softmax"),
-        &[sc, sb, cur_blk, fix],
-        &[pc, pb],
-        &u32_params(&[t as u32, dc.window as u32]),
-    );
-    let aoc = gb.add_persistent_tensor(format!("{ap}aoc"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
-    let aob = gb.add_persistent_tensor(format!("{ap}aob"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
-    let ao = gb.add_persistent_tensor(format!("{ap}ao"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
-    gb.op_batch_gemm(format!("{ap}pv_ctx"), pc, vcache, aoc, false, false);
-    gb.op_batch_gemm(format!("{ap}pv_blk"), pb, vblk, aob, false, false);
-    gb.op_add_bf16(format!("{ap}ao_add"), aoc, aob, ao);
-    let core = gb.add_persistent_tensor(format!("{ap}core"), SynDataType::Bf16, &[D_QD, t]);
-    gb.add_node(
-        "gaudium_df_post",
-        format!("{ap}attn_post"),
-        &[ao],
-        &[core],
-        &[],
-    );
+    let sap = |sl: &BlkSlot| format!("{}D{l}_", sl.pfx);
+    let mut prep = Vec::with_capacity(slots.len());
+    for (j, sl) in slots.iter().enumerate() {
+        let ap = sap(sl);
+        let qb = gb.add_persistent_tensor(format!("{ap}qb"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
+        let kblk =
+            gb.add_persistent_tensor(format!("{ap}kblk"), SynDataType::Bf16, &[D_DH, 128, D_NKV]);
+        let vblk =
+            gb.add_persistent_tensor(format!("{ap}vblk"), SynDataType::Bf16, &[D_DH, 128, D_NKV]);
+        gb.add_node(
+            "gaudium_df_attn_prep",
+            format!("{ap}attn_prep"),
+            &[qs[j], ks[j], vs[j], qn_w, kn_w, rope_c, rope_s, sl.cur_blk],
+            &[qb, kblk, vblk],
+            &[],
+        );
+        prep.push((qb, kblk, vblk));
+    }
+    let mut scs = Vec::with_capacity(slots.len());
+    for (sl, &(qb, kblk, _)) in slots.iter().zip(&prep) {
+        let ap = sap(sl);
+        // the context keys: one row per position, or the ring of the window (`dc.ring`)
+        let kcache = gb.get_or_add_persistent_tensor(
+            format!("{ap}kcache"),
+            SynDataType::Bf16,
+            &[D_DH, rows, D_NKV],
+        );
+        let vcache = gb.get_or_add_persistent_tensor(
+            format!("{ap}vcache"),
+            SynDataType::Bf16,
+            &[D_DH, rows, D_NKV],
+        );
+        let sc = gb.add_persistent_tensor(format!("{ap}sc"), SynDataType::Float, &[rows, r4, D_NKV]);
+        let sb = gb.add_persistent_tensor(format!("{ap}sb"), SynDataType::Float, &[128, r4, D_NKV]);
+        gb.op_batch_gemm(format!("{ap}qk_ctx"), qb, kcache, sc, false, true);
+        gb.op_batch_gemm(format!("{ap}qk_blk"), qb, kblk, sb, false, true);
+        scs.push((sc, sb, vcache));
+    }
+    let mut ps = Vec::with_capacity(slots.len());
+    for (sl, &(sc, sb, _)) in slots.iter().zip(&scs) {
+        let ap = sap(sl);
+        let pc = gb.add_persistent_tensor(format!("{ap}Pc"), SynDataType::Bf16, &[rows, r4, D_NKV]);
+        let pb = gb.add_persistent_tensor(format!("{ap}Pb"), SynDataType::Bf16, &[128, r4, D_NKV]);
+        gb.add_node(
+            if dc.ring > 0 {
+                "gaudium_ds_softr"
+            } else {
+                "gaudium_ds_softmax"
+            },
+            format!("{ap}softmax"),
+            &[sc, sb, sl.cur_blk, sl.fix],
+            &[pc, pb],
+            &u32_params(&[tb as u32, dc.window as u32]),
+        );
+        ps.push((pc, pb));
+    }
+    let mut aos = Vec::with_capacity(slots.len());
+    for (((sl, &(pc, pb)), &(_, _, vcache)), &(_, _, vblk)) in slots.iter().zip(&ps).zip(&scs).zip(&prep) {
+        let ap = sap(sl);
+        let aoc = gb.add_persistent_tensor(format!("{ap}aoc"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
+        let aob = gb.add_persistent_tensor(format!("{ap}aob"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
+        let ao = gb.add_persistent_tensor(format!("{ap}ao"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
+        gb.op_batch_gemm(format!("{ap}pv_ctx"), pc, vcache, aoc, false, false);
+        gb.op_batch_gemm(format!("{ap}pv_blk"), pb, vblk, aob, false, false);
+        gb.op_add_bf16(format!("{ap}ao_add"), aoc, aob, ao);
+        aos.push(ao);
+    }
+    let mut cores = Vec::with_capacity(slots.len());
+    for (sl, &ao) in slots.iter().zip(&aos) {
+        let ap = sap(sl);
+        let core = gb.add_persistent_tensor(format!("{ap}core"), SynDataType::Bf16, &[D_QD, tb]);
+        gb.add_node(
+            "gaudium_df_post",
+            format!("{ap}attn_post"),
+            &[ao],
+            &[core],
+            &[],
+        );
+        cores.push(core);
+    }
+    let core = cat_slot_cols(gb, &cores, SynDataType::Bf16, &[D_QD, t], 1, &format!("{ap}core_all"));
     let attn = d_gemm_p(
         gb,
         pfx,
@@ -710,6 +855,8 @@ fn append_spine_layer(
     gb.op_add_bf16(format!("{ap}out_add"), h, mo, raw);
 
     // ---- code bridge ----
+    // (the read, the three GEMMs and the norms run over every slot's rows; the code, message
+    // and finish kernels treat row 0 of a block as its anchor, so they run per slot)
     let (c, r) = (dc.code_size, dc.rank);
     let nrm = gb.add_persistent_tensor(format!("{ap}bn"), SynDataType::Bf16, &[hid, t]);
     let rms = gb.add_persistent_tensor(format!("{ap}brms"), SynDataType::Float, &[64, t]);
@@ -722,24 +869,42 @@ fn append_spine_layer(
     );
     let z = add_linear_bf16(gb, nrm, &format!("ds_R{l}"), hid, c, t, &format!("{ap}bz"));
     let cb = gb.get_or_add_persistent_tensor("ds_cb", SynDataType::Bf16, &[c, vocab]);
-    let codes = gb.add_persistent_tensor(format!("{ap}bcodes"), SynDataType::Bf16, &[c, t]);
-    gb.add_node(
-        "gaudium_ds_codes",
-        format!("{ap}bcode"),
-        &[z, cb, ids_blk],
-        &[codes],
-        &[],
-    );
+    let zs = split_slot_cols(gb, z, SynDataType::Bf16, c, &widths, &format!("{ap}bz_split"), |j| {
+        format!("{}D{l}_bz", slots[j].pfx)
+    });
+    let mut codes_s = Vec::with_capacity(slots.len());
+    for (j, sl) in slots.iter().enumerate() {
+        let sp = format!("{}D{l}_", sl.pfx);
+        let codes = gb.add_persistent_tensor(format!("{sp}bcodes"), SynDataType::Bf16, &[c, tb]);
+        gb.add_node(
+            "gaudium_ds_codes",
+            format!("{sp}bcode"),
+            &[zs[j], cb, sl.ids_blk],
+            &[codes],
+            &[],
+        );
+        codes_s.push(codes);
+    }
+    let codes = cat_slot_cols(gb, &codes_s, SynDataType::Bf16, &[c, t], 1, &format!("{ap}bcodes_all"));
     let pk = add_linear_bf16(gb, codes, "ds_PW", c, 3 * r, t, &format!("{ap}bpk"));
     let gbias = gb.get_or_add_persistent_tensor("ds_gb", SynDataType::Float, &[r]);
-    let msg = gb.add_persistent_tensor(format!("{ap}bmsg"), SynDataType::Bf16, &[r, t]);
-    gb.add_node(
-        "gaudium_ds_msg",
-        format!("{ap}bmsgk"),
-        &[pk, gbias],
-        &[msg],
-        &[],
-    );
+    let pks = split_slot_cols(gb, pk, SynDataType::Bf16, 3 * r, &widths, &format!("{ap}bpk_split"), |j| {
+        format!("{}D{l}_bpk", slots[j].pfx)
+    });
+    let mut msg_s = Vec::with_capacity(slots.len());
+    for (j, sl) in slots.iter().enumerate() {
+        let sp = format!("{}D{l}_", sl.pfx);
+        let msg = gb.add_persistent_tensor(format!("{sp}bmsg"), SynDataType::Bf16, &[r, tb]);
+        gb.add_node(
+            "gaudium_ds_msg",
+            format!("{sp}bmsgk"),
+            &[pks[j], gbias],
+            &[msg],
+            &[],
+        );
+        msg_s.push(msg);
+    }
+    let msg = cat_slot_cols(gb, &msg_s, SynDataType::Bf16, &[r, t], 1, &format!("{ap}bmsg_all"));
     let delta = add_linear_bf16(
         gb,
         msg,
@@ -750,15 +915,32 @@ fn append_spine_layer(
         &format!("{ap}bdelta"),
     );
     let wn = gb.get_or_add_persistent_tensor(format!("ds_wnext{l}"), SynDataType::Float, &[hid]);
-    let outp = gb.add_persistent_tensor(format!("{ap}bout"), SynDataType::Bf16, &[hid, t]);
-    let nx = gb.add_persistent_tensor(format!("{ap}bnx"), SynDataType::Bf16, &[hid, t]);
-    gb.add_node(
-        "gaudium_ds_finish",
-        format!("{ap}bfin"),
-        &[raw, delta, rms, wn],
-        &[outp, nx],
-        &[],
-    );
+    let raws = split_slot_cols(gb, raw, SynDataType::Bf16, hid, &widths, &format!("{ap}out_split"), |j| {
+        format!("{}D{l}_out", slots[j].pfx)
+    });
+    let deltas = split_slot_cols(gb, delta, SynDataType::Bf16, hid, &widths, &format!("{ap}bdelta_split"), |j| {
+        format!("{}D{l}_bdelta", slots[j].pfx)
+    });
+    let rmss = split_slot_cols(gb, rms, SynDataType::Float, 64, &widths, &format!("{ap}brms_split"), |j| {
+        format!("{}D{l}_brms", slots[j].pfx)
+    });
+    let (mut outp_s, mut nx_s) = (Vec::with_capacity(slots.len()), Vec::with_capacity(slots.len()));
+    for (j, sl) in slots.iter().enumerate() {
+        let sp = format!("{}D{l}_", sl.pfx);
+        let outp = gb.add_persistent_tensor(format!("{sp}bout"), SynDataType::Bf16, &[hid, tb]);
+        let nx = gb.add_persistent_tensor(format!("{sp}bnx"), SynDataType::Bf16, &[hid, tb]);
+        gb.add_node(
+            "gaudium_ds_finish",
+            format!("{sp}bfin"),
+            &[raws[j], deltas[j], rmss[j], wn],
+            &[outp, nx],
+            &[],
+        );
+        outp_s.push(outp);
+        nx_s.push(nx);
+    }
+    let outp = cat_slot_cols(gb, &outp_s, SynDataType::Bf16, &[hid, t], 1, &format!("{ap}bout_all"));
+    let nx = cat_slot_cols(gb, &nx_s, SynDataType::Bf16, &[hid, t], 1, &format!("{ap}bnx_all"));
     (nx, outp, Stash { raw, rms, pk })
 }
 
@@ -813,19 +995,54 @@ pub fn append_block_pass_p(
     coupled: bool,
     samp: (&str, &str),
 ) -> BlockOut {
-    let t = dc.block;
-    let s = t - 1;
+    let slot = BlkSlot {
+        pfx: pfx.to_string(),
+        ids_blk,
+        cur_blk,
+        fix,
+        samp: (samp.0.to_string(), samp.1.to_string()),
+    };
+    append_block_pass_slots(gb, pfx, spec, dc, &[slot], rope_c, rope_s, lmax, coupled)
+        .pop()
+        .expect("one slot")
+}
+
+/// The draft blocks of several slots in one launch: the embedding, every layer's projections,
+/// MLP and bridge GEMMs, the final norm and the readout run once over every slot's block rows
+/// (each weight read once); each slot's attention, candidates' base and score, and walk run on
+/// its own rows, its lane's context caches and its own parameters. `bpfx` names the tensors of
+/// the shared part; with one slot whose prefix it is, this is the single-stream pass. Returns
+/// each slot's drafts.
+#[allow(clippy::too_many_arguments)]
+pub fn append_block_pass_slots(
+    gb: &mut GraphBuilder,
+    bpfx: &str,
+    spec: &ModelSpec,
+    dc: &DSpineCfg,
+    slots: &[BlkSlot],
+    rope_c: TensorId,
+    rope_s: TensorId,
+    lmax: u64,
+    coupled: bool,
+) -> Vec<BlockOut> {
+    let tb = dc.block;
+    let s = tb - 1;
+    let t = tb * slots.len() as u64;
     let hid = dc.hidden;
     let vocab = spec.vocab;
+    let pfx = bpfx;
+    let widths = vec![tb; slots.len()];
+    let ids_s: Vec<TensorId> = slots.iter().map(|sl| sl.ids_blk).collect();
+    let ids_all = cat_slot_cols(gb, &ids_s, SynDataType::Int32, &[t], 0, &format!("{pfx}blk_ids_all"));
     let table = gb.get_or_add_persistent_tensor("embed_table", SynDataType::Bf16, &[hid, vocab]);
     let x = gb.add_persistent_tensor(format!("{pfx}blk_x0"), SynDataType::Bf16, &[hid, t]);
-    gb.op_gather_bf16(format!("{pfx}blk_embed"), table, ids_blk, x, 1);
+    gb.op_gather_bf16(format!("{pfx}blk_embed"), table, ids_all, x, 1);
     let mut resid = x;
     let mut x_in = d_rmsnorm(gb, x, "D0_w_in", &format!("{pfx}D0_h"), hid, t);
     let mut stash = None;
     for l in 0..dc.nl {
         let (nx, outp, st) = append_spine_layer(
-            gb, pfx, dc, x_in, resid, l, ids_blk, cur_blk, fix, rope_c, rope_s, lmax, vocab,
+            gb, pfx, slots, dc, x_in, resid, l, rope_c, rope_s, lmax, vocab,
         );
         x_in = nx;
         resid = outp;
@@ -870,58 +1087,84 @@ pub fn append_block_pass_p(
     if mapped {
         cand = append_dv_map(gb, cand, &[TOPK, t], &format!("{pfx}blk_cand"), "ds_dv_ids", dc.nvd);
     }
+    // per slot: its rows of the candidates and of the last layer's pre-write state
+    let cands = split_slot_cols(gb, cand, SynDataType::Int32, TOPK, &widths, &format!("{pfx}blk_cand_split"), |j| {
+        format!("{}blk_cand_s", slots[j].pfx)
+    });
+    let raws = split_slot_cols(gb, st.raw, SynDataType::Bf16, hid, &widths, &format!("{pfx}blk_raw_split"), |j| {
+        format!("{}blk_raw", slots[j].pfx)
+    });
+    let pks = split_slot_cols(gb, st.pk, SynDataType::Bf16, 3 * dc.rank, &widths, &format!("{pfx}blk_pk_split"), |j| {
+        format!("{}blk_pk", slots[j].pfx)
+    });
+    let rmss = split_slot_cols(gb, st.rms, SynDataType::Float, 64, &widths, &format!("{pfx}blk_rms_split"), |j| {
+        format!("{}blk_rms", slots[j].pfx)
+    });
 
-    let nw = gb.get_or_add_persistent_tensor("ds_nw", SynDataType::Float, &[hid]);
-    let lm = gb.get_or_add_persistent_tensor(lm_name, SynDataType::Bf16, &[hid, vocab]);
-    let base = gb.add_persistent_tensor(format!("{pfx}blk_base"), SynDataType::Float, &[TOPK, t]);
-    gb.add_node(
-        "gaudium_ds_base",
-        format!("{pfx}blk_base_k"),
-        &[st.raw, nw, cand, lm],
-        &[base],
-        &[],
-    );
-    let r = dc.rank;
-    let gbias = gb.get_or_add_persistent_tensor("ds_gb", SynDataType::Float, &[r]);
-    let tsv = gb.get_or_add_persistent_tensor("ds_TSV", SynDataType::Bf16, &[2 * r, vocab]);
-    let tg = gb.get_or_add_persistent_tensor("ds_TG", SynDataType::Bf16, &[r, vocab]);
-    let scores = gb.add_persistent_tensor(format!("{pfx}blk_scores"), SynDataType::Float, &[TOPK, TOPK, s]);
-    gb.add_node(
-        "gaudium_ds_score",
-        format!("{pfx}blk_score"),
-        &[cand, base, st.pk, st.rms, gbias, tsv, tg, ids_blk],
-        &[scores],
-        &[],
-    );
-    let drafts = gb.add_persistent_tensor(format!("{pfx}blk_drafts"), SynDataType::Int32, &[s]);
-    let alts = gb.add_persistent_tensor(format!("{pfx}blk_alts"), SynDataType::Int32, &[s]);
-    let alts2 = gb.add_persistent_tensor(format!("{pfx}blk_alts2"), SynDataType::Int32, &[s]);
-    if coupled {
-        let spf = gb.get_or_add_persistent_tensor(samp.0, SynDataType::Float, &[8]);
-        let spi = gb.get_or_add_persistent_tensor(samp.1, SynDataType::Int32, &[8]);
-        // the row scales the kernel used (read back by the host twin under `sample_check`)
-        let cs = gb.add_persistent_tensor(format!("{pfx}blk_cwcs"), SynDataType::Float, &[64, s]);
+    let mut outs = Vec::with_capacity(slots.len());
+    for (j, sl) in slots.iter().enumerate() {
+        let pfx = sl.pfx.as_str();
+        let (cand, t) = (cands[j], tb);
+        let st = Stash {
+            raw: raws[j],
+            rms: rmss[j],
+            pk: pks[j],
+        };
+        let (ids_blk, cur_blk) = (sl.ids_blk, sl.cur_blk);
+        let samp = (sl.samp.0.as_str(), sl.samp.1.as_str());
+        let nw = gb.get_or_add_persistent_tensor("ds_nw", SynDataType::Float, &[hid]);
+        let lm = gb.get_or_add_persistent_tensor(lm_name, SynDataType::Bf16, &[hid, vocab]);
+        let base = gb.add_persistent_tensor(format!("{pfx}blk_base"), SynDataType::Float, &[TOPK, t]);
         gb.add_node(
-            "gaudium_ds_cwalk",
-            format!("{pfx}blk_cwalk"),
-            &[scores, cand, st.rms, spf, spi, cur_blk],
-            &[drafts, alts, alts2, cs],
-            &u32_params(&[CWALK_ALPHA.to_bits()]),
-        );
-    } else {
-        gb.add_node(
-            "gaudium_df_walk",
-            format!("{pfx}blk_walk"),
-            &[scores, cand],
-            &[drafts, alts, alts2],
+            "gaudium_ds_base",
+            format!("{pfx}blk_base_k"),
+            &[st.raw, nw, cand, lm],
+            &[base],
             &[],
         );
+        let r = dc.rank;
+        let gbias = gb.get_or_add_persistent_tensor("ds_gb", SynDataType::Float, &[r]);
+        let tsv = gb.get_or_add_persistent_tensor("ds_TSV", SynDataType::Bf16, &[2 * r, vocab]);
+        let tg = gb.get_or_add_persistent_tensor("ds_TG", SynDataType::Bf16, &[r, vocab]);
+        let scores = gb.add_persistent_tensor(format!("{pfx}blk_scores"), SynDataType::Float, &[TOPK, TOPK, s]);
+        gb.add_node(
+            "gaudium_ds_score",
+            format!("{pfx}blk_score"),
+            &[cand, base, st.pk, st.rms, gbias, tsv, tg, ids_blk],
+            &[scores],
+            &[],
+        );
+        let drafts = gb.add_persistent_tensor(format!("{pfx}blk_drafts"), SynDataType::Int32, &[s]);
+        let alts = gb.add_persistent_tensor(format!("{pfx}blk_alts"), SynDataType::Int32, &[s]);
+        let alts2 = gb.add_persistent_tensor(format!("{pfx}blk_alts2"), SynDataType::Int32, &[s]);
+        if coupled {
+            let spf = gb.get_or_add_persistent_tensor(samp.0, SynDataType::Float, &[8]);
+            let spi = gb.get_or_add_persistent_tensor(samp.1, SynDataType::Int32, &[8]);
+            // the row scales the kernel used (read back by the host twin under `sample_check`)
+            let cs = gb.add_persistent_tensor(format!("{pfx}blk_cwcs"), SynDataType::Float, &[64, s]);
+            gb.add_node(
+                "gaudium_ds_cwalk",
+                format!("{pfx}blk_cwalk"),
+                &[scores, cand, st.rms, spf, spi, cur_blk],
+                &[drafts, alts, alts2, cs],
+                &u32_params(&[CWALK_ALPHA.to_bits()]),
+            );
+        } else {
+            gb.add_node(
+                "gaudium_df_walk",
+                format!("{pfx}blk_walk"),
+                &[scores, cand],
+                &[drafts, alts, alts2],
+                &[],
+            );
+        }
+        outs.push(BlockOut {
+            drafts,
+            alts,
+            alts2,
+        });
     }
-    BlockOut {
-        drafts,
-        alts,
-        alts2,
-    }
+    outs
 }
 
 /// Draft-vocabulary row indices `li` (`dims`) -> token ids through the table `table` `{1, nvd}`,
@@ -1002,28 +1245,97 @@ pub fn append_step_drafter_p(
     coupled: bool,
     samp: (&str, &str),
 ) {
+    let slot = StepSlot {
+        pfx: pfx.to_string(),
+        samp: (samp.0.to_string(), samp.1.to_string()),
+        t,
+        cursor,
+        tokens,
+        a_out,
+        cursor_out,
+    };
+    append_step_drafter_slots(gb, pfx, spec, dc, taps, &[slot], depth, lmax, coupled)
+}
+
+/// One slot of the drafter section of a batched step: the prefix of its own tensors (which
+/// also names its lane's context caches, context bound and next ids), its sampler parameters,
+/// its verify rows and what its accept produced.
+#[derive(Debug, Clone)]
+pub struct StepSlot {
+    pub pfx: String,
+    pub samp: (String, String),
+    /// Verify rows of the slot: its columns of the taps, in slot order.
+    pub t: u64,
+    pub cursor: TensorId,
+    pub tokens: TensorId,
+    pub a_out: TensorId,
+    pub cursor_out: TensorId,
+}
+
+/// [`append_step_drafter`] for several slots in one launch: the context pass over every slot's
+/// verify rows and the next blocks of every slot side by side, each drafter weight read once
+/// ([`append_ctx_pass_slots`], [`append_block_pass_slots`]); `taps[i]` = tap `i` over every
+/// slot's rows, slot by slot. With one slot whose prefix is `bpfx` this is the single-stream
+/// drafter section.
+#[allow(clippy::too_many_arguments)]
+pub fn append_step_drafter_slots(
+    gb: &mut GraphBuilder,
+    bpfx: &str,
+    spec: &ModelSpec,
+    dc: &DSpineCfg,
+    taps: &[TensorId],
+    slots: &[StepSlot],
+    depth: TensorId,
+    lmax: u64,
+    coupled: bool,
+) {
     let (rc, rs) = rope_tables(gb, lmax);
-    let nofix = gb.get_or_add_persistent_tensor(format!("{pfx}df_nofix"), SynDataType::Int32, &[2]);
-    append_ctx_pass_p(gb, pfx, dc, taps, t, cursor, depth, nofix, rc, rs, lmax);
-    let ids_blk = gb.add_persistent_tensor(format!("{pfx}df_ids_blk"), SynDataType::Int32, &[dc.block]);
-    gb.add_node(
-        "gaudium_df_ids",
-        format!("{pfx}df_ids"),
-        &[tokens, a_out],
-        &[ids_blk],
-        &u32_params(&[dc.mask_id as u32]),
-    );
-    let out = append_block_pass_p(
-        gb, pfx, spec, dc, ids_blk, cursor_out, nofix, rc, rs, lmax, coupled, samp,
-    );
-    let next_ids = gb.add_persistent_tensor(format!("{pfx}next_ids"), SynDataType::Int32, &[dc.block]);
-    gb.add_node(
-        "gaudium_df_next",
-        format!("{pfx}next_ids"),
-        &[tokens, a_out, out.drafts, out.alts, out.alts2],
-        &[next_ids],
-        &u32_params(&[(dc.block - 1) as u32]),
-    );
+    let nofix: Vec<TensorId> = slots
+        .iter()
+        .map(|sl| gb.get_or_add_persistent_tensor(format!("{}df_nofix", sl.pfx), SynDataType::Int32, &[2]))
+        .collect();
+    let ctx: Vec<CtxSlot> = slots
+        .iter()
+        .zip(&nofix)
+        .map(|(sl, &fix)| CtxSlot {
+            pfx: sl.pfx.clone(),
+            t: sl.t,
+            cursor: sl.cursor,
+            fix,
+        })
+        .collect();
+    append_ctx_pass_slots(gb, bpfx, dc, taps, &ctx, depth, rc, rs, lmax);
+    let mut blk = Vec::with_capacity(slots.len());
+    for (sl, &fix) in slots.iter().zip(&nofix) {
+        let pfx = &sl.pfx;
+        let ids_blk = gb.add_persistent_tensor(format!("{pfx}df_ids_blk"), SynDataType::Int32, &[dc.block]);
+        gb.add_node(
+            "gaudium_df_ids",
+            format!("{pfx}df_ids"),
+            &[sl.tokens, sl.a_out],
+            &[ids_blk],
+            &u32_params(&[dc.mask_id as u32]),
+        );
+        blk.push(BlkSlot {
+            pfx: pfx.clone(),
+            ids_blk,
+            cur_blk: sl.cursor_out,
+            fix,
+            samp: sl.samp.clone(),
+        });
+    }
+    let outs = append_block_pass_slots(gb, bpfx, spec, dc, &blk, rc, rs, lmax, coupled);
+    for (sl, out) in slots.iter().zip(outs) {
+        let pfx = &sl.pfx;
+        let next_ids = gb.add_persistent_tensor(format!("{pfx}next_ids"), SynDataType::Int32, &[dc.block]);
+        gb.add_node(
+            "gaudium_df_next",
+            format!("{pfx}next_ids"),
+            &[sl.tokens, sl.a_out, out.drafts, out.alts, out.alts2],
+            &[next_ids],
+            &u32_params(&[(dc.block - 1) as u32]),
+        );
+    }
 }
 
 /// Drafter context for a prefill tile of `t` rows (`df_tap{i}` = the tile's tap outputs).
