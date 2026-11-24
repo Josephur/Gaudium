@@ -12,14 +12,22 @@ Two steps, against a running server:
 Modes: `greedy` (temperature 0) and `sampled` (temperature 1.0, top-k 20, top-p 0.95 and a fixed
 seed per prompt): a seeded sampled stream must equal its reference as exactly as a greedy one.
 
+Options add prompts: `--long 6000,10000` long prompts of about that many words (their streams
+cover several KV chunks), `--image` one prompt with a generated PNG (an image request runs alone
+on a lane server). `--turns` checks routing after the concurrent runs: every long prompt's next
+turn (its reply and one more user message) must take over rows of the lane that held it.
+
 Only the Python standard library is used. Results go to stdout and, with `--out`, to a JSON file.
 """
 
 import argparse
+import base64
 import json
+import struct
 import threading
 import time
 import urllib.request
+import zlib
 
 PROMPTS = [
     "Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring.",
@@ -41,10 +49,38 @@ PROMPTS = [
 ]
 
 
-def chat(base, model, prompt, mode, seed, max_tokens, api_key, timeout):
+def long_prompt(words):
+    """About `words` words of numbered sentences, then a question about them."""
+    parts = []
+    i = 0
+    while len(parts) < words:
+        i += 1
+        parts.extend(f"Note {i}: the {['red', 'green', 'blue', 'amber'][i % 4]} crate in row {i * 7 % 97} holds {i * 13 % 89} parts.".split())
+    return " ".join(parts[:words]) + "\n\nWhich rows hold amber crates? Answer briefly."
+
+
+def png_data_url(w=96, h=96):
+    """A small RGB gradient as a PNG data URL (no image library needed)."""
+    rows = b"".join(b"\x00" + bytes(v for x in range(w) for v in (x * 255 // w, y * 255 // h, 128)) for y in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + \
+        chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+IMAGE_MARK = "<image>"
+
+
+def chat(base, model, prompt, mode, seed, max_tokens, api_key, timeout, history=None):
+    if prompt.startswith(IMAGE_MARK):
+        content = [{"type": "image_url", "image_url": {"url": png_data_url()}},
+                   {"type": "text", "text": prompt[len(IMAGE_MARK):]}]
+    else:
+        content = prompt
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": (history or []) + [{"role": "user", "content": content}],
         "max_tokens": max_tokens,
         "stream": False,
         "gaudium_return_tokens": True,
@@ -66,8 +102,11 @@ def chat(base, model, prompt, mode, seed, max_tokens, api_key, timeout):
     wall = time.monotonic() - t0
     g = resp.get("gaudium", {})
     t = resp.get("timings", {})
+    msg = resp.get("choices", [{}])[0].get("message", {})
     return {
         "tokens": g.get("tokens", []),
+        "content": msg.get("content") or "",
+        "reused": g.get("prefix", {}).get("reused_tokens", 0),
         "wall_s": wall,
         "prefill_ms": t.get("prompt_ms", 0.0),
         "decode_ms": t.get("predicted_ms", 0.0),
@@ -102,9 +141,20 @@ def main():
     ap.add_argument("--concurrency", default="1,2,4,8")
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--out", default="")
+    ap.add_argument("--long", default="", help="extra long prompts of about these many words")
+    ap.add_argument("--image", action="store_true", help="one extra prompt with an image")
+    ap.add_argument("--turns", action="store_true", help="next turns of the long prompts must reuse rows")
     a = ap.parse_args()
     modes = [m for m in a.modes.split(",") if m]
     n = min(a.prompts, len(PROMPTS))
+    first_long = n
+    for w in [int(x) for x in a.long.split(",") if x]:
+        PROMPTS.insert(n, long_prompt(w))
+        n += 1
+    long_idx = list(range(first_long, n))
+    if a.image:
+        PROMPTS.insert(n, IMAGE_MARK + "Describe the colours of this image in one sentence.")
+        n += 1
     out = {"base": a.base, "model": a.model, "max_tokens": a.max_tokens, "modes": modes}
 
     if a.write_ref:
@@ -126,7 +176,10 @@ def main():
         bad = 0
         for c in [int(x) for x in a.concurrency.split(",") if x]:
             for m in modes:
-                idx = [i % n for i in range(c)]
+                # the extra prompts (long, image) always take part: their streams are the hard ones
+                extra = list(range(first_long, n))
+                order = extra + [i for i in range(n) if i not in extra]
+                idx = [order[j % n] for j in range(c)]
                 res = [None] * c
                 errs = [None] * c
 
@@ -181,6 +234,22 @@ def main():
         out["runs"] = runs
         out["mismatches"] = bad
         print(f"mismatching streams: {bad}")
+        if a.turns and long_idx:
+            # each long prompt again with its reply and one more message: the lane that holds the
+            # conversation takes its rows over (the other long prompts ran in between)
+            turns = []
+            for i in long_idx:
+                first = chat(a.base, a.model, PROMPTS[i], "greedy", a.seed + i, a.max_tokens, a.api_key, a.timeout)
+                hist = [{"role": "user", "content": PROMPTS[i]}, {"role": "assistant", "content": first["content"]}]
+                turns.append((i, hist))
+            for i, hist in turns:
+                nxt = chat(a.base, a.model, "Now list them in ascending order.", "greedy", a.seed, 32,
+                           a.api_key, a.timeout, history=hist)
+                ok = nxt["reused"] > 0
+                bad += 0 if ok else 1
+                print(f"turn 2 of long prompt {i}: {nxt['reused']} prompt rows taken over ({'ok' if ok else 'NONE'})", flush=True)
+                out.setdefault("turns", []).append({"prompt": i, "reused": nxt["reused"]})
+            out["mismatches"] = bad
 
     if a.out:
         with open(a.out, "w") as f:

@@ -32,6 +32,10 @@ What the Rust engine does today:
 - Prefix reuse between consecutive requests, and from host memory when the card no longer
   holds a conversation (another conversation or model in between, the idle release of the
   card): `--cache-ram`.
+- Several requests at once (`--parallel N`): each in a lane of its own (its own K/V rows,
+  recurrent state and prefix reuse), the decoding lanes stepped together in one launch that
+  reads the weights once, every stream token-identical to the same request run alone. Dense
+  Qwen3 / Qwen3.5 / Qwen3.8 models without a drafter for now.
 - An OpenAI-compatible (and Anthropic-style) chat API with streaming, tool calls, an
   optional MCP proxy for the Web UI, optional HTTPS on the same port, and A2UI interfaces.
 
