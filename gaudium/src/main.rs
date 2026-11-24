@@ -1285,6 +1285,16 @@ fn run_generate(args: &[String]) -> Result<(), String> {
         );
     }
 
+    // The requests, built on the host before anything is loaded (a malformed one fails here,
+    // also under --build-cache). Every `--prompt-ids-file` after the first is one more request served by the same loaded engine.
+    let mut all_prompts: Vec<Vec<i32>> = vec![prompt_ids];
+    for csv in &extra_prompt_ids_raw {
+        all_prompts.push(parse_ids_csv(csv)?);
+    }
+    all_prompts.extend(extra_text_ids);
+    // a further request's image-pad placeholders become its images' token runs
+    gaudium::vision::cli::expand_requests(&mut all_prompts[1..], &request_images[1..])?;
+
     // `--build-cache`: compile this configuration's recipes without the card (SynapseAI is
     // initialized, the device is never acquired), then exit. With `--build-cache-chunks` the
     // speculative step recipes of exactly those KV chunk counts are compiled (the routed
@@ -1307,16 +1317,6 @@ fn run_generate(args: &[String]) -> Result<(), String> {
         engine.set_request_images(v.images.clone())?;
     }
 
-    // Every `--prompt-ids-file` after the first is one more request served by the same loaded engine.
-    let mut all_prompts: Vec<Vec<i32>> = vec![prompt_ids];
-    for (k, csv) in extra_prompt_ids_raw.iter().enumerate() {
-        let ids = parse_ids_csv(csv)?;
-        all_prompts.push(match &request_images[1 + k] {
-            Some(v) => v.expand_prompt(&ids)?,
-            None => ids,
-        });
-    }
-    all_prompts.extend(extra_text_ids);
     // Sampler settings every request runs under (`--sampling`, else the single base setting).
     let mut settings: Vec<Qwen3GenParams> = Vec::new();
     for raw in &samplings {

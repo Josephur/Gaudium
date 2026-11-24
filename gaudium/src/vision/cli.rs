@@ -87,6 +87,27 @@ impl CliImages {
     }
 }
 
+/// Expands the image-pad placeholders of every request that has images (`images[r]` belongs
+/// to `prompts[r]`) to its images' token runs.
+pub fn expand_requests(
+    prompts: &mut [Vec<i32>],
+    images: &[Option<CliImages>],
+) -> Result<(), String> {
+    if prompts.len() != images.len() {
+        return Err(format!(
+            "{} requests but images for {}",
+            prompts.len(),
+            images.len()
+        ));
+    }
+    for (ids, imgs) in prompts.iter_mut().zip(images) {
+        if let Some(v) = imgs {
+            *ids = v.expand_prompt(ids)?;
+        }
+    }
+    Ok(())
+}
+
 /// Plans the tower for the images of several requests of one run: its largest image (or the
 /// larger explicit patch cap), the image tokens of the request that holds the most, and a
 /// recipe for every image size.
@@ -249,5 +270,19 @@ mod tests {
         assert_eq!(cfg.vision_precompile, vec![256, 560]);
         configure_requests(&[&one], &mut cfg, 0);
         assert_eq!((cfg.vision_max_patches, cfg.vision_max_tokens), (256, 64));
+
+        // per request: a text request keeps its ids, an image request gets its own runs
+        let text = vec![1, 2, 3];
+        let with_one = vec![1, 248_053, 248_056, 248_054, 7];
+        let mut prompts = vec![text.clone(), with_one.clone(), ids.to_vec()];
+        let images = vec![None, Some(one), Some(cli)];
+        expand_requests(&mut prompts, &images).unwrap();
+        assert_eq!(prompts[0], text);
+        assert_eq!(prompts[1].len(), with_one.len() - 1 + 64);
+        assert_eq!(prompts[2].len(), ids.len() - 2 + 64 + 140);
+        // a request whose placeholders do not match its images is refused
+        let mut bad = vec![text.clone()];
+        assert!(expand_requests(&mut bad, &images[1..2]).is_err());
+        assert!(expand_requests(&mut prompts, &images[..1]).is_err());
     }
 }
