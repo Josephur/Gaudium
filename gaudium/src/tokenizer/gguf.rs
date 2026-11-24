@@ -381,6 +381,8 @@ mod tests {
                 Kv::StrArr(vec!["a b".into()]),
             ),
         ];
+        // today's rule (pinned here, not sealed: it follows the tokenizer a file was written for)
+        assert!(!v::mt_tok_encodable(MtTokKind::MtTokUnused));
         let (p, g) = file("unused", &kvs);
         let t = Tokenizer::from_gguf(&g).unwrap();
         assert_eq!(t.encode("ab", false), vec![b'a' as i32, b'b' as i32]);

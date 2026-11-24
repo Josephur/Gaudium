@@ -145,6 +145,15 @@ def gg_limit_ok(+x: Nat, +max: Nat) -> Bool:
 def gg_shard_ok(+no: Nat, +k: Nat, +count: Nat) -> Bool:
   Bool.and(Nat.is_eq(no, k), Nat.is_lt(k, count))
 
+# Shard `k` of a split model of `count` shards (the first shard's `split.count`) is in the set: its own
+# `split.no` is `no` and its own `split.count` is `own`.
+def gg_shard_in_set(+no: Nat, +own: Nat, +k: Nat, +count: Nat) -> Bool:
+  Bool.and(gg_shard_ok(no, k, count), Nat.is_eq(own, count))
+
+# The shards hold the tensor count the first shard declares (`split.tensors.count`).
+def gg_tensor_total_ok(+declared: Nat, +total: Nat) -> Bool:
+  Nat.is_eq(declared, total)
+
 # `present` shards make up a split model of `count` shards.
 def gg_split_complete(+present: Nat, +count: Nat) -> Bool:
   Bool.and(Nat.is_gt(count, 0n), Nat.is_eq(present, count))
@@ -329,6 +338,60 @@ law gg_shard_index_within:
 
 def gg_shard_index_within(no, k, c):
   gg_shard_fit(Nat.is_eq(no, k), k, c, Nat.is_lt(k, c), {==})
+
+def gg_and_not_r(a: Bool, e: Bool) -> {Bool.and(Bool.and(a, e), Bool.not(e)) == False{} : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match e:
+        case True{}: {==}
+        case False{}: {==}
+
+def gg_and_mid(a: Bool, e: Bool, -c: Bool, h: {Bool.and(a, c) == False{} : Bool}) -> {Bool.and(Bool.and(a, e), c) == False{} : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match e:
+        case False{}: {==}
+        case True{}: h
+
+def gg_and_not_self(x: Bool) -> {Bool.and(x, Bool.not(x)) == False{} : Bool}:
+  match x:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: every shard the reader accepts into a split model declares the same shard count as the first one.
+# harm: shards of two different splits could be stitched into one model
+law gg_shard_in_set_count:
+  for +no: Nat
+  for +own: Nat
+  for +k: Nat
+  for +c: Nat
+  {Bool.and(gg_shard_in_set(no, own, k, c), Nat.is_ne(own, c)) == False{} : Bool}
+
+def gg_shard_in_set_count(no, own, k, c):
+  gg_and_not_r(gg_shard_ok(no, k, c), Nat.is_eq(own, c))
+
+# promise: a shard the reader accepts into a split model has an index below the shard count.
+law gg_shard_in_set_index:
+  for +no: Nat
+  for +own: Nat
+  for +k: Nat
+  for +c: Nat
+  {Bool.and(gg_shard_in_set(no, own, k, c), Nat.is_le(c, k)) == False{} : Bool}
+
+def gg_shard_in_set_index(no, own, k, c):
+  gg_and_mid(gg_shard_ok(no, k, c), Nat.is_eq(own, c), Nat.is_le(c, k), gg_shard_fit(Nat.is_eq(no, k), k, c, Nat.is_lt(k, c), {==}))
+
+# promise: a split model is accepted only when its shards hold the tensor count its first shard declares.
+# harm: a missing or duplicated shard's tensors would go unnoticed
+law gg_tensor_total_matches:
+  for +d: Nat
+  for +t: Nat
+  {Bool.and(gg_tensor_total_ok(d, t), Nat.is_ne(d, t)) == False{} : Bool}
+
+def gg_tensor_total_matches(d, t):
+  gg_and_not_self(Nat.is_eq(d, t))
 
 # promise: a model with no shards at all is never taken as a complete split model.
 law gg_split_empty_refused:

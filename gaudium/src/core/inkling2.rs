@@ -4,9 +4,10 @@
 use crate::model_spec::{Inkling2Spec, ModelSpec};
 use crate::verified::{
     ik_app_layer, ik_app_msgs, ik_app_pass, ik_apps, ik_attn_geom_valid, ik_buf_clobbers,
-    ik_buf_reusable, ik_dims_valid, ik_eff_loop_end, ik_eff_loop_start, ik_hist_rows,
-    ik_layer_looped, ik_loop_index, ik_msg_states, ik_opens_block, ik_ring_slots_within,
-    ik_schedule_valid, ik_states_attn, ik_states_mlp, ik_vocab_valid,
+    ik_buf_reusable, ik_counts_valid, ik_dims_valid, ik_eff_loop_end, ik_eff_loop_start,
+    ik_hist_rows, ik_layer_looped, ik_loop_index, ik_msg_states, ik_opens_block,
+    ik_ring_slots_within, ik_schedule_valid, ik_states_attn, ik_states_final, ik_states_mlp,
+    ik_vocab_valid,
 };
 
 /// Block states one residual mix of the family's kernels reads beside the partial state.
@@ -15,6 +16,15 @@ pub const IK_MAX_STATES: u64 = 4;
 /// Slots of the largest K / V ring the softmax kernel stages as one chunk
 /// (`kernels/tpc/ik_softmax_gaudi2.c`: a chunk of at most 4096 keys in its local memory).
 pub const IK_MAX_RING_SLOTS: u64 = 4096;
+
+/// Layer applications of one token a model may run (the schedule and the plans hold one entry each).
+pub const IK_MAX_APPS: u64 = 4096;
+
+/// Longest sliding window a model may declare: a window must fit beside a pass in the largest ring.
+pub const IK_MAX_WINDOW: u64 = IK_MAX_RING_SLOTS;
+
+/// Most query heads a model may declare (the projection widths are multiples of the head count).
+pub const IK_MAX_HEADS: u64 = 1024;
 
 /// One application of a layer's weights to the rows of a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +78,23 @@ pub fn validate_inkling2(spec: &ModelSpec, ik: &Inkling2Spec) -> Result<(), Stri
         ));
     }
     let (ls, le) = span_of(ik);
+    // before anything multiplies or adds them: the application count, the window, the heads
+    if !ik_counts_valid(
+        spec.n_layers,
+        ls,
+        le,
+        ik.passes,
+        ik.window,
+        spec.n_heads,
+        IK_MAX_APPS,
+        IK_MAX_WINDOW,
+        IK_MAX_HEADS,
+    ) {
+        return Err(format!(
+            "Inkling 2 counts outside the engine's limits: {} layers, layers {}..{} x {} passes (at most {IK_MAX_APPS} layer applications), sliding window {} (at most {IK_MAX_WINDOW}), {} query heads (at most {IK_MAX_HEADS})",
+            spec.n_layers, ik.loop_start, ik.loop_end, ik.passes, ik.window, spec.n_heads
+        ));
+    }
     if !ik_schedule_valid(spec.n_layers, ls, le, ik.passes, ik.block, IK_MAX_STATES) {
         return Err(format!(
             "Inkling 2 schedule outside the kernels' range: {} layers, blocks of {}, layers {}..{} x {} passes (at most {IK_MAX_STATES} block states per mix)",
@@ -134,7 +161,7 @@ pub fn msg_states(ik: &Inkling2Spec) -> u64 {
 
 /// Block states the final mix reads.
 pub fn final_states(spec: &ModelSpec, ik: &Inkling2Spec) -> u64 {
-    ik_states_mlp(spec.n_layers - 1, ik.block)
+    ik_states_final(spec.n_layers, ik.block)
 }
 
 /// Slots of a sliding layer's K / V ring for passes of at most `rows` rows.
@@ -436,9 +463,10 @@ mod tests {
 mod pinned_values {
     use super::*;
     use crate::verified::{
-        ik_bias_off, ik_bias_src, ik_bias_width, ik_gate_off, ik_is_pow2, ik_kx_width,
-        ik_nib_row_bytes, ik_nib_row_scales, ik_pow2_rows, ik_qx_width, ik_rel_off,
-        ik_ring_slots, ik_tile_last_row, ik_tile_rows, ik_tile_take,
+        ik_apps, ik_bias_off, ik_bias_src, ik_bias_width, ik_f8_row_ok, ik_f8_row_scales,
+        ik_gate_off, ik_heads_width, ik_is_pow2, ik_kx_width, ik_nib_row_bytes, ik_nib_row_scales,
+        ik_pow2_rows, ik_qx_width, ik_rel_off, ik_ring_slots, ik_tile_last_row, ik_tile_rows,
+        ik_tile_take,
     };
 
     #[test]
@@ -496,6 +524,9 @@ mod pinned_values {
         assert_eq!((ik_nib_row_bytes(2304), ik_nib_row_scales(2304)), (1152, 144));
         assert_eq!(ik_nib_row_bytes(24), 0);
         assert_eq!(ik_nib_row_bytes(0), 0);
+        assert!(ik_f8_row_ok(2304) && ik_f8_row_scales(2304) == 72);
+        assert!(!ik_f8_row_ok(48) && !ik_f8_row_ok(0));
+        assert_eq!(ik_heads_width(24), 3072);
     }
 
     #[test]
@@ -524,5 +555,24 @@ mod pinned_values {
         assert!(ik_vocab_valid(200058, 201024) && !ik_vocab_valid(201025, 201024));
         assert!(ik_buf_reusable(3, 4) && !ik_buf_reusable(4, 4));
         assert!(ik_buf_clobbers(2, 2, 3, 4, 4) && !ik_buf_clobbers(2, 1, 3, 4, 4));
+    }
+
+    #[test]
+    fn counts_guard_refuses_counts_that_would_overflow_the_sizing() {
+        let ok = |n, ls, le, p, w, nh| {
+            ik_counts_valid(n, ls, le, p, w, nh, IK_MAX_APPS, IK_MAX_WINDOW, IK_MAX_HEADS)
+        };
+        // the publisher's mini model: 24 layers, layers 6..18 run 3 times
+        assert!(ok(24, 6, 18, 3, 1024, 24));
+        assert_eq!(ik_apps(24, 6, 18, 3), 48);
+        // exactly at the application limit, and one pass past it
+        assert!(ok(16, 0, 16, 256, 1024, 24) && ik_apps(16, 0, 16, 256) == IK_MAX_APPS);
+        assert!(!ok(16, 0, 16, 257, 1024, 24));
+        // a pass count from a file that would overflow passes x span, and an empty span
+        assert!(!ok(24, 6, 18, u64::MAX, 1024, 24));
+        assert!(ok(24, 4, 4, u64::MAX, 1024, 24));
+        assert!(!ok(IK_MAX_APPS + 1, 4, 4, 1, 1024, 24));
+        assert!(!ok(24, 6, 18, 3, u64::MAX, 24) && !ok(24, 6, 18, 3, 1024, u64::MAX));
+        assert!(ok(24, 6, 18, 3, IK_MAX_WINDOW, IK_MAX_HEADS));
     }
 }

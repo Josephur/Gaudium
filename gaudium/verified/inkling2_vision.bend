@@ -90,7 +90,9 @@ def ikv_round_go(fuel: Nat, +need: Nat, +b: Nat) -> Nat:
       Bool.pick(Nat, Nat.is_le(need, b), b, Bool.pick(Nat, Nat.is_le(need, Nat.add(b, Nat.div(b, 2n))), Nat.add(b, Nat.div(b, 2n)), ikv_round_go(f, need, Nat.mul(b, 2n))))
 
 # The ladder rung of an image of `need` tokens: the tower compiles one set of recipes per rung,
-# so images of nearby sizes share them (padding rows are masked out of attention).
+# so images of nearby sizes share them (padding rows are masked out of attention). A need near the
+# top of u64 (only an operator flag can ask for one) is refused rather than doubled past it.
+# rusty-bends: total
 def ikv_round(+need: Nat) -> Nat:
   ikv_round_go(64n, need, 16n)
 
@@ -101,7 +103,8 @@ def ikv_bucket(+need: Nat, rung: Nat, cap: Nat) -> Nat:
   Nat.min(Nat.max(need, rung), cap)
 
 # Rows of a tower sequence of `tokens` image tokens of `ppt` patches each: the class row first,
-# then the patches.
+# then the patches (refused on overflow: the plan's sizes come from operator flags).
+# rusty-bends: total
 def ikv_seq_rows(tokens: Nat, ppt: Nat) -> Nat:
   1n+Nat.mul(tokens, ppt)
 
@@ -116,7 +119,8 @@ def ikv_key_live(j: Nat, tokens: Nat, ppt: Nat) -> Bool:
 
 # Columns of the feature buffer: column 0 stays zero (what text rows read), then one column per
 # image token of a request, then room for the padding columns the merger of the last image's
-# bucket writes behind its tokens.
+# bucket writes behind its tokens (refused on overflow: both counts come from operator flags).
+# rusty-bends: total
 def ikv_feat_cols(max_tokens: Nat, cap: Nat) -> Nat:
   Nat.add(1n+max_tokens, cap)
 
@@ -132,6 +136,20 @@ def ikv_feat_row(is_img: Bool, rank: Nat) -> Nat:
       1n+rank
     case False{}:
       0n
+
+# Column the first image's features start at: behind the text rows' column.
+def ikv_feat_start() -> Nat:
+  1n
+
+# Column the next image's features start at when this image's start at `off` and it has `tokens`
+# tokens (the padding columns of its bucket behind them are overwritten by the next image).
+def ikv_feat_next(off: Nat, tokens: Nat) -> Nat:
+  Nat.add(off, tokens)
+
+# The check the shell runs before a merger writes: inside the buffer, and starting behind the
+# column the text rows read (so a write can never cover it). Overflow-free: `off + b` is not formed.
+def ikv_feat_write_safe(+off: Nat, +b: Nat, +cols: Nat) -> Bool:
+  Bool.and(Nat.is_lt(ikv_feat_row(False{}, 0n), off), Bool.and(Nat.is_le(off, cols), Nat.is_le(b, Nat.sub(cols, off))))
 
 # A request's prompt placeholders against its images' features: one row each, no more, no less.
 def ikv_rows_match(placeholders: Nat, features: Nat) -> Bool:
@@ -309,32 +327,116 @@ def ikv_feat_write_in_buffer(off, b, mt, cap):
   ikv_write_in(off, b, mt, cap, Nat.is_le(off, 1n+mt), {==}, Nat.is_le(b, cap), {==})
 
 # LAW IKV.13
-# promise: a text row reads the zero column of the feature buffer.
-law ikv_text_row_reads_zero:
-  for r: Nat
-  {ikv_feat_row(False{}, r) == 0n : Nat}
+# promise: a text row never reads a column an image row reads.
+# harm: a text row would take an image's features as its embedding
+law ikv_text_image_rows_apart:
+  for +r1: Nat
+  for +r2: Nat
+  {Nat.is_eq(ikv_feat_row(True{}, r1), ikv_feat_row(False{}, r2)) == False{} : Bool}
 
-def ikv_text_row_reads_zero(r):
+def ikv_text_image_rows_apart(r1, r2):
   {==}
+
+def ikv_row_in(+r: Nat, +mt: Nat, +cap: Nat, x: Bool, ex: {Nat.is_lt(r, mt) == x : Bool}) -> {Bool.and(x, Bool.not(Nat.is_lt(ikv_feat_row(True{}, r), ikv_feat_cols(mt, cap)))) == False{} : Bool}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      %Equal.sym(Bool, Nat.is_lt(1n+r, Nat.add(1n+mt, cap)), True{}, L.nat_lt_le_trans(1n+r, 1n+mt, Nat.add(1n+mt, cap), ex, L.nat_add_le_r(1n+mt, cap))) : {Bool.and(True{}, Bool.not(_)) == False{} : Bool}
+      {==}
 
 # LAW IKV.14
-# promise: an image row never reads the zero column.
-law ikv_image_row_not_zero:
-  for r: Nat
-  {Nat.is_eq(ikv_feat_row(True{}, r), 0n) == False{} : Bool}
+# promise: an image row whose rank is inside the request's tokens reads a column inside the feature buffer.
+# harm: the prefill's gather would read past the feature buffer
+law ikv_image_row_in_range:
+  for +r: Nat
+  for +mt: Nat
+  for +cap: Nat
+  {Bool.and(Nat.is_lt(r, mt), Bool.not(Nat.is_lt(ikv_feat_row(True{}, r), ikv_feat_cols(mt, cap)))) == False{} : Bool}
 
-def ikv_image_row_not_zero(r):
-  {==}
+def ikv_image_row_in_range(r, mt, cap):
+  ikv_row_in(r, mt, cap, Nat.is_lt(r, mt), {==})
+
+def ikv_and_l(a: Bool, -b: Bool, h: {Bool.and(a, b) == True{} : Bool}) -> {a == True{} : Bool}:
+  match a:
+    case True{}:
+      {==}
+    case False{}:
+      h
+
+# A write that starts behind column 0 does not cover column 0.
+def ikv_skip_zero(+off: Nat, +b: Nat, h: {Nat.is_lt(0n, off) == True{} : Bool}) -> {Bool.and(Nat.is_le(off, 0n), Nat.is_lt(0n, Nat.add(off, b))) == False{} : Bool}:
+  match off:
+    case 0n:
+      L.bool_absurd({Bool.and(Nat.is_le(0n, 0n), Nat.is_lt(0n, Nat.add(0n, b))) == False{} : Bool}, h)
+    case 1n+op:
+      {==}
+
+def ikv_write_skip(+off: Nat, +b: Nat, +cols: Nat, +r: Nat, v: Bool, hv: {ikv_feat_write_safe(off, b, cols) == v : Bool}) -> {Bool.and(v, Bool.and(Nat.is_le(off, ikv_feat_row(False{}, r)), Nat.is_lt(ikv_feat_row(False{}, r), Nat.add(off, b)))) == False{} : Bool}:
+  match v:
+    case False{}:
+      {==}
+    case True{}:
+      ikv_skip_zero(off, b, ikv_and_l(Nat.is_lt(ikv_feat_row(False{}, 0n), off), Bool.and(Nat.is_le(off, cols), Nat.is_le(b, Nat.sub(cols, off))), hv))
 
 # LAW IKV.15
-# promise: an image row whose rank is inside the request's tokens reads a column inside the request's columns.
-law ikv_image_row_in_range:
-  for r: Nat
-  for mt: Nat
-  {Nat.is_lt(ikv_feat_row(True{}, r), 1n+mt) == Nat.is_lt(r, mt) : Bool}
+# promise: a merger write the shell's check accepts never covers the column text rows read.
+# harm: an image's features would overwrite the embedding every text row reads
+law ikv_merge_skips_text_col:
+  for +off: Nat
+  for +b: Nat
+  for +cols: Nat
+  for +r: Nat
+  {Bool.and(ikv_feat_write_safe(off, b, cols), Bool.and(Nat.is_le(off, ikv_feat_row(False{}, r)), Nat.is_lt(ikv_feat_row(False{}, r), Nat.add(off, b)))) == False{} : Bool}
 
-def ikv_image_row_in_range(r, mt):
-  {==}
+def ikv_merge_skips_text_col(off, b, cols, r):
+  ikv_write_skip(off, b, cols, r, ikv_feat_write_safe(off, b, cols), {==})
+
+def ikv_and_r(a: Bool, -b: Bool, h: {Bool.and(a, b) == True{} : Bool}) -> {b == True{} : Bool}:
+  match a:
+    case True{}:
+      h
+    case False{}:
+      L.bool_absurd({b == True{} : Bool}, h)
+
+# off <= cols gives off + (cols - off) == cols.
+def ikv_off_rest(+off: Nat, +cols: Nat, h: {Nat.is_le(off, cols) == True{} : Bool}) -> {Nat.add(off, Nat.sub(cols, off)) == cols : Nat}:
+  %L.nat_add_comm(Nat.sub(cols, off), off) : {_ == cols : Nat}
+  L.nat_sub_add_cancel(cols, off, h)
+
+# off <= cols and b <= cols - off give off + b <= cols.
+def ikv_safe_in(+off: Nat, +b: Nat, +cols: Nat, +h: {Bool.and(Nat.is_le(off, cols), Nat.is_le(b, Nat.sub(cols, off))) == True{} : Bool}) -> {Nat.is_lt(cols, Nat.add(off, b)) == False{} : Bool}:
+  L.nat_le_lt_false(cols, Nat.add(off, b), L.nat_le_subst_r(Nat.add(off, b), Nat.add(off, Nat.sub(cols, off)), cols, ikv_off_rest(off, cols, ikv_and_l(Nat.is_le(off, cols), Nat.is_le(b, Nat.sub(cols, off)), h)), L.nat_add_le_mono(off, off, b, Nat.sub(cols, off), L.nat_le_refl(off), ikv_and_r(Nat.is_le(off, cols), Nat.is_le(b, Nat.sub(cols, off)), h))))
+
+def ikv_write_in_safe(+off: Nat, +b: Nat, +cols: Nat, v: Bool, hv: {ikv_feat_write_safe(off, b, cols) == v : Bool}) -> {Bool.and(v, Nat.is_lt(cols, Nat.add(off, b))) == False{} : Bool}:
+  match v:
+    case False{}:
+      {==}
+    case True{}:
+      ikv_safe_in(off, b, cols, ikv_and_r(Nat.is_lt(ikv_feat_row(False{}, 0n), off), Bool.and(Nat.is_le(off, cols), Nat.is_le(b, Nat.sub(cols, off))), hv))
+
+# LAW IKV.15a
+# promise: a merger write the shell's check accepts ends inside the feature buffer.
+# harm: the merger would write past the feature buffer into another tensor
+law ikv_merge_write_in_buffer:
+  for +off: Nat
+  for +b: Nat
+  for +cols: Nat
+  {Bool.and(ikv_feat_write_safe(off, b, cols), Nat.is_lt(cols, Nat.add(off, b))) == False{} : Bool}
+
+def ikv_merge_write_in_buffer(off, b, cols):
+  ikv_write_in_safe(off, b, cols, ikv_feat_write_safe(off, b, cols), {==})
+
+# LAW IKV.15b
+# promise: the next image's features start behind every column of the current image's tokens, so two images' tokens never share a column.
+# harm: an image's features would overwrite the tokens of the image before it
+law ikv_feat_next_past:
+  for +off: Nat
+  for +t: Nat
+  {Nat.is_le(Nat.add(off, t), ikv_feat_next(off, t)) == True{} : Bool}
+
+def ikv_feat_next_past(off, t):
+  L.nat_le_refl(Nat.add(off, t))
 
 # LAW IKV.16
 # promise: a prompt with more image placeholders than its images have tokens is refused.

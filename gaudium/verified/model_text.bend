@@ -163,6 +163,11 @@ def mt_cli_chat(+gemma_turns: Bool, +builtin: Bool, +template: Bool) -> MtChatFo
     case True{}: mt_builtin_form(gemma_turns)
     case False{}: mt_template_or_none(template)
 
+# Whether the command line loads the model's chat template: `--chat` is on (`chat`) and the family
+# has no built-in chat form that `mt_cli_chat` would prefer (`builtin`).
+def mt_cli_wants_template(+chat: Bool, +builtin: Bool) -> Bool:
+  Bool.and(chat, Bool.not(builtin))
+
 def mt_chat_is_template(+f: MtChatForm) -> Bool:
   match f:
     case MtChatGemma{}: False{}
@@ -173,15 +178,6 @@ def mt_chat_is_template(+f: MtChatForm) -> Bool:
 # ============================================================================
 # 7. Laws
 # ============================================================================
-
-# promise: a resource the GGUF model file's own metadata carries is always taken from that metadata.
-# harm: a tokenizer or template beside the file, written for another build, could replace the one made with the weights.
-law mt_file_wins:
-  for +d: Bool
-  {mt_source(True{}, True{}, d) == MtFromFile{} : MtSource}
-
-def mt_file_wins(d):
-  {==}
 
 # promise: a checkpoint directory never takes a resource from GGUF metadata.
 law mt_checkpoint_never_file:
@@ -274,13 +270,6 @@ law mt_normal_not_added:
 def mt_normal_not_added():
   {==}
 
-# promise: an entry the file marks unused is never produced by encoding.
-law mt_unused_not_encoded:
-  {mt_tok_encodable(MtTokUnused{}) == False{} : Bool}
-
-def mt_unused_not_encoded():
-  {==}
-
 # promise: the command line never renders a chat prompt through a template the model does not have.
 law mt_chat_template_needs_one:
   for +g: Bool
@@ -297,3 +286,29 @@ def mt_chat_template_needs_one(g, b):
       match b:
         case True{}: {==}
         case False{}: {==}
+
+# promise: with --chat on, a template the command-line chat form would render through is always loaded first.
+# harm: the chat form would pick the model's template and find none loaded, or render without it
+law mt_cli_loads_used_template:
+  for +g: Bool
+  for +b: Bool
+  {Bool.and(mt_chat_is_template(mt_cli_chat(g, b, True{})), Bool.not(mt_cli_wants_template(True{}, b))) == False{} : Bool}
+
+def mt_cli_loads_used_template(g, b):
+  match g:
+    case True{}:
+      match b:
+        case True{}: {==}
+        case False{}: {==}
+    case False{}:
+      match b:
+        case True{}: {==}
+        case False{}: {==}
+
+# promise: the command line never loads a chat template when --chat is off.
+law mt_cli_no_chat_no_template:
+  for +b: Bool
+  {mt_cli_wants_template(False{}, b) == False{} : Bool}
+
+def mt_cli_no_chat_no_template(b):
+  {==}

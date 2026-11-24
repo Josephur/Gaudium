@@ -665,11 +665,11 @@ pub fn render_chat(t: &ChatTemplate, body: &JsonValue) -> Result<ChatPrompt, Str
             text.push_str(&forced_prefix);
         }
         // the template opened the reasoning anyway: the call cannot be placed
-        ForcePlace::FpIgnored if in_reasoning => {
+        ForcePlace::FpInReasoning => {
             ignored.push("tool_choice with a template that always reasons (not forced)".into())
         }
         // the model writes a call's name first, so a call to any tool cannot be opened for it
-        ForcePlace::FpIgnored => ignored.push(
+        ForcePlace::FpCannotWrite => ignored.push(
             "tool_choice=required with a model whose calls open with their name (not forced; name the function to force it)".into(),
         ),
         ForcePlace::FpNone => {}

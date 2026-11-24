@@ -21,7 +21,9 @@ use super::IkDims;
 use crate::core::gemma4::{lane_in_block, natural_channel};
 use crate::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use crate::safetensors::{SafetensorsStore, TensorMeta};
-use crate::verified::{ik_bias_src, ik_nib_row_bytes, ik_nib_row_scales};
+use crate::verified::{
+    ik_bias_src, ik_f8_row_ok, ik_f8_row_scales, ik_nib_row_bytes, ik_nib_row_scales,
+};
 
 /// Values of the sixteen 4-bit codes (sign, two exponent bits, one mantissa bit). Code 8 is a
 /// negative zero in the format; it is stored as the same weight, a positive zero, so that every
@@ -126,7 +128,7 @@ impl ExpertRows for StExperts<'_> {
                 ik_nib_row_bytes(self.cols as u64) as usize,
                 ik_nib_row_scales(self.cols as u64) as usize,
             ),
-            None => (self.cols, self.cols / 32),
+            None => (self.cols, ik_f8_row_scales(self.cols as u64) as usize),
         };
         let wi = (e * self.rows + r) * rb;
         let si = (e * self.rows + r) * rs;
@@ -262,12 +264,12 @@ impl IkSource for StSource<'_> {
                 ("F8_E4M3", Some(f), rb, ik_nib_row_scales(cols))
             }
             "F8_E4M3" => {
-                if !cols.is_multiple_of(32) {
+                if !ik_f8_row_ok(cols) {
                     return Err(format!(
                         "expert tensor '{full}': {cols} columns are not whole blocks of 32 values"
                     ));
                 }
-                ("U8", None, cols, cols / 32)
+                ("U8", None, cols, ik_f8_row_scales(cols))
             }
             other => {
                 return Err(format!(

@@ -296,15 +296,18 @@ fn bucket_ladder_of_today() {
     // the rungs (a tuning choice, pinned here, bounded by the verified laws)
     let rungs: Vec<u64> = [1, 15, 16, 17, 24, 25, 144, 193, 576, 1000, 1024, 1025]
         .iter()
-        .map(|&n| ikv_round(n))
+        .map(|&n| ikv_round(n).unwrap())
         .collect();
     assert_eq!(
         rungs,
         vec![16, 16, 16, 24, 24, 32, 192, 256, 768, 1024, 1024, 1536]
     );
-    assert_eq!(ikv_bucket(1000, ikv_round(1000), 1024), 1024);
-    assert_eq!(ikv_bucket(900, ikv_round(900), 960), 960);
-    assert_eq!(ikv_seq_rows(16, 4), 65);
+    assert_eq!(ikv_bucket(1000, ikv_round(1000).unwrap(), 1024), 1024);
+    assert_eq!(ikv_bucket(900, ikv_round(900).unwrap(), 960), 960);
+    assert_eq!(ikv_seq_rows(16, 4), Some(65));
+    // a need near the top of u64 (an operator flag) is refused, not doubled past it
+    assert_eq!(ikv_round(u64::MAX), None);
+    assert_eq!(ikv_seq_rows(u64::MAX, 4), None);
     assert!(ikv_key_live(64, 15, 4) == false && ikv_key_live(60, 15, 4));
 }
 
@@ -475,4 +478,22 @@ fn server_media_path_expands_one_placeholder_per_tile() {
     let small = VisionServe::new(spec(), 4 * 100, 16_384, MediaLimits::default()).unwrap();
     let e = RequestMedia::prepare(&refs, &small, false).unwrap_err();
     assert!(e.contains("576 patches") && e.contains("400"), "{e}");
+}
+
+#[test]
+fn feature_columns_of_today() {
+    // today's layout (a choice, pinned here; the laws only keep merger writes off the text
+    // rows' column and inside the buffer): text rows read column 0, image tokens follow from 1
+    assert_eq!(ikv_feat_row(false, 7), 0);
+    assert_eq!(ikv_feat_start(), 1);
+    // two images of 5 and 7 tokens: the second starts where the first one's tokens end, and the
+    // prompt's 6th placeholder (rank 5, the second image's first token) reads that column
+    let second = ikv_feat_next(ikv_feat_start(), 5);
+    assert_eq!(second, 6);
+    assert_eq!(ikv_feat_row(true, 5), second);
+    assert_eq!(ikv_feat_row(true, 11), ikv_feat_next(second, 7) - 1);
+    // the write check: inside the buffer and never over column 0
+    assert!(ikv_feat_write_safe(1, 16, 17) && !ikv_feat_write_safe(2, 16, 17));
+    assert!(!ikv_feat_write_safe(0, 4, 17));
+    assert!(!ikv_feat_write_safe(u64::MAX, u64::MAX, 17));
 }
