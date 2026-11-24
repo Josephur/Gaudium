@@ -304,7 +304,7 @@ impl TileForm {
     /// plain softmax keeps the 256-row tile those recipes were validated at.
     pub fn tile_candidates(&self, spec: &ModelSpec) -> &'static [u64] {
         if crate::verified::kv_is_fp8(spec.kv_dtype) {
-            // [kv8] measured on the card (SynapseAI 1.24, issue #11): the 512-row FP8 attention
+            // [kv8] measured on the card (SynapseAI 1.24, issue #63): the 512-row FP8 attention
             // tile gives NaN rows once it reads more than one cache chunk (any softmax build,
             // with or without chunk groups); 256-row tiles are correct at every chunk count
             return &TILE_CANDIDATES[1..];
