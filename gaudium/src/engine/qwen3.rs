@@ -1176,7 +1176,7 @@ impl Qwen3Engine {
         // 2. Configure TPC-C kernel ELFs & Synapse GC glue BEFORE opening SynapseAI
         let kenv = KernelEnv::configure_from_dir(&cfg.kernels_dir)?;
         let mut required_elfs: Vec<&str> = required_elfs.to_vec();
-        if crate::verified::kv_is_fp8(spec.kv_dtype) {
+        if crate::verified::kv_is_fp8(crate::engine::qwen3::kv8::trunk_dtype(&spec)) {
             required_elfs.extend_from_slice(kv8::KV8_ELFS); // [kv8]
         }
         let elf_hashes = kenv.fingerprint_hashes(&required_elfs)?;
@@ -1829,7 +1829,7 @@ impl Qwen3Engine {
                 gib(planned_total),
                 gib(weights_bytes),
                 gib(kv_bytes.saturating_sub(gdn_state_bytes)),
-                crate::core::kv_cache::kv_dtype_name(spec.kv_dtype),
+                crate::core::kv_cache::kv_dtype_name(kv8::trunk_dtype(&spec)),
                 gib(gdn_state_bytes),
                 gdn_slots,
                 gib(pfx_bytes),
@@ -2040,7 +2040,7 @@ impl Qwen3Engine {
                 format!(
                     "{model_name}, {} weights, {} K/V",
                     if spec.fp8_weights { "FP8" } else { "BF16" },
-                    if crate::verified::kv_is_fp8(spec.kv_dtype) { "FP8" } else { "BF16" }
+                    if crate::verified::kv_is_fp8(crate::engine::qwen3::kv8::trunk_dtype(&spec)) { "FP8" } else { "BF16" }
                 ),
             );
             if let Some(sc) = cfg.spec.as_ref() {

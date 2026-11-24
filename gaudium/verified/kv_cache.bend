@@ -2,7 +2,9 @@
 #
 # Formally specifies and proves:
 #   - The bytes of one cache element and of one position of one layer's cache, per dtype
-#   - Which caches take the configured dtype (the trunk's) and which stay BF16 (every other one)
+#   - Which caches take the configured dtype (those whose graphs have the FP8 attention kernels
+#     and a scale table: the trunk's) and which stay BF16
+#   - The block the V rows of a cache are permuted in, per dtype
 #   - Which head shapes the FP8 attention kernels take (one FP8 vector per cache row, the scale
 #     table's group slots)
 #   - The power-of-two multiplier that maps a tensor into the FP8 range: its scaled maximum stays
@@ -15,7 +17,9 @@
 # A tensor whose largest magnitude has exponent field `a`, scaled by 2^(e - 127), has its largest
 # magnitude at exponent field a + e - 127; the FP8 format's largest finite value has exponent field
 # f (Gaudi 2 E4M3: 240 = 1.875 * 2^7, f = 134). With top = f + 127, a + e <= top - margin and
-# margin >= 1 puts the scaled maximum below 2^(f - 127), which the format holds exactly.
+# margin >= 1 puts the scaled maximum below 2^(f - 127), which the format holds without saturation
+# (still rounded to its 3 mantissa bits). f is a parameter of the rules, not a constant of them:
+# 134 holds for the default exponent bias of the format.
 
 import Base
 import nat_lemmas.bend as L
@@ -121,15 +125,26 @@ def kv_is_fp8(d: KvDtype) -> Bool:
 def kv_row_bytes(+heads: Nat, +width: Nat, d: KvDtype) -> Nat:
   Nat.mul(Nat.mul(heads, width), kv_elem_bytes(d))
 
-# The dtype of one attention cache. Only the trunk's caches take the configured dtype: their
-# attention has the FP8 kernels and a scale table. Every other cache (a drafter's context, an MTP
-# head's own cache) is read by BF16 graphs and stays BF16.
-def kv_layer_dtype(trunk: Bool, cfg: KvDtype) -> KvDtype:
-  match trunk:
+# The dtype of one attention cache. Only a cache whose graphs have the FP8 attention kernels and
+# a scale table (`fp8_reader`: today the trunk's) takes the configured dtype; every other one (an
+# MTP head's own cache) is read by BF16 graphs and stays BF16.
+def kv_layer_dtype(fp8_reader: Bool, cfg: KvDtype) -> KvDtype:
+  match fp8_reader:
     case True{}:
       cfg
     case False{}:
       KvBf16{}
+
+# Rows of the blocks a cache's V rows are permuted in: the BF16 caches inside 128-row blocks (the
+# softmax's interleaving BF16 conversion of P), the FP8 caches inside 256-row blocks (one FP8
+# vector of P per 256 positions). A copy of whole rows ranges (the host-RAM tier) moves whole
+# blocks, or V rows of neighbouring ranges mix.
+def kv_vperm_rows(d: KvDtype) -> Nat:
+  match d:
+    case KvBf16{}:
+      128n
+    case KvFp8{}:
+      256n
 
 # ============================================================================
 # 3. The FP8 attention kernels' shape rule
@@ -208,8 +223,8 @@ def kv_wv_row(+c: Nat, +head_dim: Nat, d: KvDtype) -> Nat:
 # 7. Laws
 # ============================================================================
 
-# promise: a cache element always takes at least one byte, so a planned cache is never sized zero
-# harm: a zero-sized cache would be planned and then written past its end
+# promise: a cache element always takes at least one byte, so a cache row is never sized zero
+# harm: the host-RAM tier would lay out rows of zero bytes and copy nothing it needs
 law kv_elem_nonzero:
   for d: KvDtype
   {Nat.is_le(1n, kv_elem_bytes(d)) == True{} : Bool}
@@ -220,7 +235,7 @@ def kv_elem_nonzero(d):
     case KvFp8{}: {==}
 
 # promise: an FP8 cache position never takes more bytes than the same position in BF16
-# harm: choosing FP8 K/V could shrink the served context instead of growing it
+# harm: the host-RAM tier would hold FP8 entries larger than the BF16 ones they replace
 law kv_fp8_row_not_larger:
   for +h: Nat
   for +w: Nat
@@ -229,7 +244,7 @@ law kv_fp8_row_not_larger:
 def kv_fp8_row_not_larger(h, w):
   L.nat_mul_le_mono_l(Nat.mul(h, w), 1n, 2n, {==})
 
-# promise: a cache outside the trunk (a drafter's, an MTP head's) is always BF16
+# promise: a cache whose graphs have no FP8 attention kernels and scale table is always BF16
 # harm: a BF16 graph would read FP8 bytes as BF16 values
 law kv_side_cache_bf16:
   for d: KvDtype
@@ -238,14 +253,18 @@ law kv_side_cache_bf16:
 def kv_side_cache_bf16(d):
   {==}
 
-# promise: the trunk's caches always take the dtype the load asked for, never another one
-# harm: a load asked for FP8 K/V could silently serve BF16 and fail its memory plan, or the reverse
-law kv_trunk_takes_config:
-  for d: KvDtype
-  {kv_layer_dtype(True{}, d) == d : KvDtype}
+# Not sealed: the reviewer's corrected form of an earlier law that pinned behaviour, waiting for a
+# second review before it enters rusty-bends.lock.
+# promise: a load configured for BF16 K/V never gets an FP8 cache
+# harm: a cache would be FP8 without a scale table made for it
+law kv_bf16_load_stays_bf16:
+  for t: Bool
+  {kv_layer_dtype(t, KvBf16{}) == KvBf16{} : KvDtype}
 
-def kv_trunk_takes_config(d):
-  {==}
+def kv_bf16_load_stays_bf16(t):
+  match t:
+    case True{}: {==}
+    case False{}: {==}
 
 # promise: a head shape the FP8 kernels accept never has more kv groups than the scale table has slots
 # harm: a group past the table would read another kind's multiplier

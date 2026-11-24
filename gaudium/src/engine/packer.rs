@@ -296,7 +296,11 @@ impl<'a> WeightPacker<'a> {
                     for g in 0..(nkv as usize) {
                         for c in 0..(dh as usize) {
                             // [kv8] the cache dtype's V row order (`verified/kv_cache.bend`)
-                            let dst_c = kv_wv_row(c as u64, dh, m.kv_dtype) as usize;
+                            let dst_c = kv_wv_row(
+                                c as u64,
+                                dh,
+                                crate::engine::qwen3::kv8::trunk_dtype(m),
+                            ) as usize;
                             let s_off = (g * (dh as usize) + c) * row_bytes;
                             let d_off = (g * (dh as usize) + dst_c) * row_bytes;
                             dst[d_off..d_off + row_bytes]

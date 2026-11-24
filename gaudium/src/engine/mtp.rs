@@ -1187,7 +1187,7 @@ impl Mtp {
         lspec.fp8_weights = false;
         // [kv8] and its own cache is BF16 whatever the trunk's is (`kv_layer_dtype`): its V
         // projection keeps the BF16 row order
-        lspec.kv_dtype = crate::verified::kv_layer_dtype(false, spec.kv_dtype);
+        lspec.kv_dtype = crate::engine::qwen3::kv8::cache_dtype(spec, "M_");
         let ext =
             crate::engine::fp8_pack::ExtPacker::new(packer.store(), &lspec, BTreeMap::new(), None);
         let mut layer = WeightPacker::new(packer.store(), &lspec);

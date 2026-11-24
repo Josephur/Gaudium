@@ -56,7 +56,7 @@ pub fn tree_elfs(spec: &ModelSpec) -> Vec<&'static str> {
         v.push("GAUDIUM_GDNT_ELF");
         v.push("GAUDIUM_PREPT_ELF");
     }
-    if crate::verified::kv_is_fp8(spec.kv_dtype) {
+    if crate::verified::kv_is_fp8(crate::engine::qwen3::kv8::trunk_dtype(&spec)) {
         v.extend_from_slice(crate::engine::qwen3::kv8::KV8_TREE_ELFS); // [kv8]
     }
     v

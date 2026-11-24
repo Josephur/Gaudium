@@ -35,11 +35,23 @@ pub fn is_kv8_suffix(suffix: &str) -> bool {
     suffix == KV8_SUFFIX
 }
 
-/// A trunk layer prefix: `L<l>_`, or the prefill's generic `L_`.
+/// A trunk layer prefix: `L<l>_`, or the prefill's generic `L_` (the layers whose graphs have the
+/// FP8 attention kernels and a scale table).
 fn is_trunk_prefix(lpfx: &str) -> bool {
     lpfx.strip_prefix('L')
         .and_then(|r| r.strip_suffix('_'))
         .is_some_and(|d| d.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// The dtype of the cache of the attention layer of prefix `lpfx` (`kv_layer_dtype`): what its
+/// graph builds and what its packer and copies assume, from one place.
+pub fn cache_dtype(spec: &ModelSpec, lpfx: &str) -> KvDtype {
+    kv_layer_dtype(is_trunk_prefix(lpfx), spec.kv_dtype)
+}
+
+/// The dtype of the trunk's caches.
+pub fn trunk_dtype(spec: &ModelSpec) -> KvDtype {
+    cache_dtype(spec, "L_")
 }
 
 /// The cache dtype of one attention layer and the tensors its graph needs for it.
@@ -54,7 +66,7 @@ pub struct AttnKv {
 impl AttnKv {
     /// The attention layer of prefix `lpfx` in `spec`'s graphs.
     pub fn of(gb: &mut GraphBuilder, spec: &ModelSpec, lpfx: &str) -> Self {
-        let d = kv_layer_dtype(is_trunk_prefix(lpfx), spec.kv_dtype);
+        let d = cache_dtype(spec, lpfx);
         if kv_is_fp8(d) {
             let t = gb.get_or_add_persistent_tensor(
                 format!("{lpfx}{KV8_SUFFIX}"),
@@ -205,7 +217,13 @@ impl Qwen3Engine {
 
     fn kv_measure_into(&mut self, cal: &mut KvCalibration, rows: u64) -> Result<(), String> {
         let nkv = self.spec.n_kv_heads as usize;
-        let head_bytes = (KV_CHUNK * self.spec.head_dim * 2) as usize; // one {head_dim, C} batch
+        // a calibration load reads BF16 caches (`resolve` refuses FP8 K/V on one)
+        let dt = trunk_dtype(&self.spec);
+        if kv_is_fp8(dt) {
+            return Err("the K/V read-back measures BF16 caches only".into());
+        }
+        // one {head_dim, C} batch of one kv head
+        let head_bytes = (KV_CHUNK * crate::core::kv_cache::row_bytes(1, self.spec.head_dim, dt)) as usize;
         let chunks = rows.div_ceil(KV_CHUNK).clamp(1, self.max_chunks) as usize;
         let piece = self.stage_io.len() - self.stage_io.len() % 2;
         unsafe { self.dev.sync_stream(self.dev.compute_stream()) }
@@ -402,6 +420,15 @@ mod tests {
         for p in ["M_", "D0_", "L3", "Lx_", "G_", ""] {
             assert!(!is_trunk_prefix(p), "{p}");
         }
+        // today the trunk takes the configured dtype (a policy, pinned here, not a sealed law)
+        let f = spec_27b(KvDtype::KvFp8);
+        assert_eq!(trunk_dtype(&f), KvDtype::KvFp8);
+        assert_eq!(cache_dtype(&f, "L3_"), KvDtype::KvFp8);
+        assert_eq!(cache_dtype(&f, "M_"), KvDtype::KvBf16);
+        assert_eq!(trunk_dtype(&spec_27b(KvDtype::KvBf16)), KvDtype::KvBf16);
+        // the V permutation blocks of the kernels (attn_prep VPERM / VPERM8)
+        assert_eq!(crate::verified::kv_vperm_rows(KvDtype::KvBf16), 128);
+        assert_eq!(crate::verified::kv_vperm_rows(KvDtype::KvFp8), 256);
     }
 
     #[test]

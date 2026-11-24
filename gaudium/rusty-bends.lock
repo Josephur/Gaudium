@@ -501,7 +501,33 @@ e6d2c9266532af2c  ikv_token_cap_within_patches  law ikv_token_cap_within_patches
 # promise ikv_tokens_within_limit: an image whose tile grid the token check accepts never has more tokens than the limit.
 f42d899343546720  ikv_tokens_zero_cols_refused  law ikv_tokens_zero_cols_refused : for + rows : Nat for m : Nat { ikv_tokens_fit ( rows , 0n , m ) == False { } : Bool }
 # promise ikv_tokens_zero_cols_refused: an image with no tile column is refused.
+17dcbaf889122ee2  kv8_fit_capped  law kv8_fit_capped : for + a : Nat for + top : Nat for + margin : Nat for + cap : Nat { Nat.is_le ( kv8_fit ( a , top , margin , cap ) , cap ) == True { } : Bool }
+# promise kv8_fit_capped: a multiplier never exceeds its cap
+# harm kv8_fit_capped: a head measured as all zero would get a multiplier that blows any later value up to the format's maximum
+583c506a729fb4d5  kv8_fit_never_clips  law kv8_fit_never_clips : for + a : Nat for + top : Nat for + margin : Nat for + cap : Nat { Bool.or ( Nat.is_lt ( Nat.sub ( top , margin ) , a ) , Nat.is_le ( Nat.add ( a , kv8_fit ( a , top , margin , cap ) ) , Nat.sub ( top , margin ) ) ) == True { } : Bool }
+# promise kv8_fit_never_clips: whenever a multiplier can fit, the scaled maximum stays at or below top - margin, so with a margin of one or more nothing is clipped
+# harm kv8_fit_never_clips: the largest K / V values would saturate at the format's maximum
+4e94b3b4b28733f7  kv8_min4_within_each  law kv8_min4_within_each : for + a : Nat for + b : Nat for + c : Nat for + d : Nat { Bool.and ( Bool.and ( Nat.is_le ( kv8_min4 ( a , b , c , d ) , a ) , Nat.is_le ( kv8_min4 ( a , b , c , d ) , b ) ) , Bool.and ( Nat.is_le ( kv8_min4 ( a , b , c , d ) , c ) , Nat.is_le ( kv8_min4 ( a , b , c , d ) , d ) ) ) == True { } : Bool }
+# promise kv8_min4_within_each: a layer's one V multiplier is never larger than any of its heads' own
+# harm kv8_min4_within_each: the heads with the largest V values would be clipped
+2a7f3f2b85bac040  kv8_plain_decode_ok  law kv8_plain_decode_ok : { kv8_decode_ok ( KdPlain { } ) == True { } : Bool }
+# promise kv8_plain_decode_ok: the non-speculative decode always runs on FP8 K/V, so every speculative form has its exactness reference
+# harm kv8_plain_decode_ok: an FP8 K/V load could offer a drafter with nothing to check its tokens against
+5f4bc6ba5ca18326  kv8_shape_needs_groups  law kv8_shape_needs_groups : for + w : Nat for + r : Nat for + s : Nat { kv8_shape_ok ( w , 0n , r , s ) == False { } : Bool }
+# promise kv8_shape_needs_groups: a model without kv heads is never accepted by the FP8 kernels
+80e696ec1290a904  kv8_shape_within_slots  law kv8_shape_within_slots : for + w : Nat for + n : Nat for + r : Nat for + s : Nat { Bool.and ( kv8_shape_ok ( w , n , r , s ) , Nat.is_lt ( s , n ) ) == False { } : Bool }
+# promise kv8_shape_within_slots: a head shape the FP8 kernels accept never has more kv groups than the scale table has slots
+# harm kv8_shape_within_slots: a group past the table would read another kind's multiplier
+3ecec3b47c1c0b81  kv_elem_nonzero  law kv_elem_nonzero : for d : KvDtype { Nat.is_le ( 1n , kv_elem_bytes ( d ) ) == True { } : Bool }
+# promise kv_elem_nonzero: a cache element always takes at least one byte, so a cache row is never sized zero
+# harm kv_elem_nonzero: the host-RAM tier would lay out rows of zero bytes and copy nothing it needs
+4f2ae6bc0834a730  kv_fp8_row_not_larger  law kv_fp8_row_not_larger : for + h : Nat for + w : Nat { Nat.is_le ( kv_row_bytes ( h , w , KvFp8 { } ) , kv_row_bytes ( h , w , KvBf16 { } ) ) == True { } : Bool }
+# promise kv_fp8_row_not_larger: an FP8 cache position never takes more bytes than the same position in BF16
+# harm kv_fp8_row_not_larger: the host-RAM tier would hold FP8 entries larger than the BF16 ones they replace
 ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat for + k : Nat for + b : Nat for + lmax : Nat { Nat.is_le ( kv_high_water ( p , c , k , b , lmax ) , lmax ) == True { } : Bool }
+afeb8bc174d22774  kv_side_cache_bf16  law kv_side_cache_bf16 : for d : KvDtype { kv_layer_dtype ( False { } , d ) == KvBf16 { } : KvDtype }
+# promise kv_side_cache_bf16: a cache whose graphs have no FP8 attention kernels and scale table is always BF16
+# harm kv_side_cache_bf16: a BF16 graph would read FP8 bytes as BF16 values
 3ddfe8a0a0c54651  lane_busy_blocks_exclusive  law lane_busy_blocks_exclusive : for b : Nat for max_lanes : Nat { lane_can_admit ( 1n + b , max_lanes , False { } , True { } ) == False { } : Bool }
 3f71bff599d5e309  lane_exclusive_blocks_all  law lane_exclusive_blocks_all : for busy : Nat for max_lanes : Nat for want_excl : Bool { lane_can_admit ( busy , max_lanes , True { } , want_excl ) == False { } : Bool }
 4775d7007e9e1d84  lane_full_blocks_shared  law lane_full_blocks_shared : for + cap : Nat for excl : Bool { lane_can_admit ( cap , cap , excl , False { } ) == False { } : Bool }

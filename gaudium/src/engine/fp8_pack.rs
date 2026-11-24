@@ -565,7 +565,11 @@ impl<'a> ExtPacker<'a> {
                         let dc = if !chunked_attn {
                             c
                         } else {
-                            crate::verified::kv_wv_row(c, dh, m.kv_dtype)
+                            crate::verified::kv_wv_row(
+                                c,
+                                dh,
+                                crate::engine::qwen3::kv8::trunk_dtype(m),
+                            )
                         };
                         map[(g * dh + dc) as usize] = (0, (g * dh + c) as u32);
                     }
@@ -698,8 +702,9 @@ impl<'a> ExtPacker<'a> {
                 .iter()
                 .any(|s| name.ends_with(s));
         // [kv8] and so do the V projections of FP8 K/V loads (their rows in the FP8 V order)
-        let kv8_rows =
-            crate::verified::kv_is_fp8(self.spec.kv_dtype) && name.ends_with("_W_v");
+        let kv8_rows = crate::verified::kv_is_fp8(crate::engine::qwen3::kv8::trunk_dtype(
+            self.spec,
+        )) && name.ends_with("_W_v");
         let entry = if shared_only {
             format!("{name}_shared")
         } else if kv8_rows {

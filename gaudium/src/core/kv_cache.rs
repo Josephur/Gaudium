@@ -43,6 +43,7 @@ pub use crate::verified::{KvDecode, KvDtype};
 use crate::verified::{
     kv8_decode_ok, kv8_fit, kv8_min4, kv8_shape_ok, kv_elem_bytes, kv_is_fp8, kv_row_bytes,
 };
+const _: () = assert!(KV8_ROW == 256, "the attention scale below assumes 256-channel rows");
 
 /// The kernels' FP8 vector: one 256-channel cache row.
 pub const KV8_ROW: u64 = 256;
@@ -55,7 +56,9 @@ pub const KV_TABLE_FILE: &str = "kv_scales.txt";
 
 /// f32 exponent bias: a field e stands for 2^(e - 127).
 const F32_BIAS: u64 = 127;
-/// Exponent field of the Gaudi 2 `fp8_143` maximum (240 = 1.875 * 2^7).
+/// Exponent field of the Gaudi 2 `fp8_143` maximum (240 = 1.875 * 2^7) at the format's default
+/// exponent bias, which the FP8 attention kernels' conversions use. A parameter of the verified
+/// rules, not part of them: a kernel built for another bias passes its own maximum.
 const FP8_143_MAX_FIELD: u64 = 134;
 /// The fit rule's `top`: the format's largest exponent field plus the bias.
 const FP8_TOP: u64 = FP8_143_MAX_FIELD + F32_BIAS;
@@ -63,7 +66,8 @@ const FP8_TOP: u64 = FP8_143_MAX_FIELD + F32_BIAS;
 const MARGIN_BOUND: u64 = 1;
 /// Margin bits of a calibrated maximum (V: a later input may exceed what calibration saw).
 const MARGIN_CALIBRATED: u64 = 1;
-/// P's maximum is exactly 1.0: no margin.
+/// P's maximum is exactly 1.0: no margin. Valid only for a maximum that is an exact power of two
+/// (zero mantissa: scaled, it lands exactly on 2^(f - 127), which the format holds).
 const MARGIN_EXACT: u64 = 0;
 /// No multiplier above 2^24 (a head calibrated as all zero is not blown up past that).
 const CAP_FIELD: u64 = F32_BIAS + 24;
@@ -305,14 +309,10 @@ impl Kv8Layer {
     /// kernels read them), whose heads' calibrated V maxima are `v_amax` (1..=4 heads) and whose
     /// heads have `head_dim` channels (a power of four: the attention scale is a power of two).
     pub fn new(max_qn: f32, max_kn: f32, v_amax: &[f32], head_dim: u64) -> Result<Self, String> {
-        if v_amax.is_empty() || v_amax.len() as u64 > KV8_SLOTS {
-            return Err(format!("{} V maxima for one layer", v_amax.len()));
-        }
-        let root = (head_dim as f64).sqrt();
-        if root.fract() != 0.0 || !(root as u64).is_power_of_two() {
-            return Err(format!("head_dim {head_dim}: 1/sqrt(head_dim) is not a power of two"));
-        }
-        let root = root as f32;
+        // the kernels' shape rule: one FP8 vector per row, 1 ..= slots groups (`kv8_shape_ok`)
+        check_fp8_shape(head_dim, v_amax.len() as u64)?;
+        // head_dim is the kernels' 256-channel row: the attention scale 1/16 is a power of two
+        let root = (head_dim as f32).sqrt();
         // q / sqrt(head_dim) <= max|qn_w|, K <= sqrt(head_dim) * max|kn_w| (module docs)
         let eq = kv8_fit(field_of(max_qn)?, FP8_TOP, MARGIN_BOUND, CAP_FIELD);
         let ek = kv8_fit(field_of(max_kn * root)?, FP8_TOP, MARGIN_BOUND, CAP_FIELD);
