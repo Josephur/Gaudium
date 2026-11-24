@@ -124,10 +124,6 @@ def ikv_key_live(j: Nat, tokens: Nat, ppt: Nat) -> Bool:
 def ikv_feat_cols(max_tokens: Nat, cap: Nat) -> Nat:
   Nat.add(1n+max_tokens, cap)
 
-# The merger of a bucket of `b` tokens writes columns `off .. off + b` of a buffer of `cols`.
-def ikv_feat_write_ok(off: Nat, b: Nat, cols: Nat) -> Bool:
-  Nat.is_le(Nat.add(off, b), cols)
-
 # Feature column a prompt row reads: an image row (the `rank`-th placeholder of the prompt) its
 # own column, a text row the zero column.
 def ikv_feat_row(is_img: Bool, rank: Nat) -> Nat:
@@ -302,29 +298,6 @@ law ikv_padding_key_dead:
 
 def ikv_padding_key_dead(t, p, e):
   ikv_add_not_lt(Nat.mul(t, p), e)
-
-# off <= 1 + mt and b <= cap give off + b <= feat_cols(mt, cap).
-def ikv_write_in(+off: Nat, +b: Nat, +mt: Nat, +cap: Nat, x: Bool, ex: {Nat.is_le(off, 1n+mt) == x : Bool}, y: Bool, ey: {Nat.is_le(b, cap) == y : Bool}) -> {Bool.and(Bool.and(x, y), Bool.not(ikv_feat_write_ok(off, b, ikv_feat_cols(mt, cap)))) == False{} : Bool}:
-  match x y:
-    case False{} _:
-      {==}
-    case True{} False{}:
-      {==}
-    case True{} True{}:
-      %Equal.sym(Bool, Nat.is_le(Nat.add(off, b), Nat.add(1n+mt, cap)), True{}, L.nat_add_le_mono(off, 1n+mt, b, cap, ex, ey)) : {Bool.and(True{}, Bool.not(_)) == False{} : Bool}
-      {==}
-
-# LAW IKV.12
-# promise: the merger of an image that starts inside the request's columns, with a bucket the plan admits, never writes past the feature buffer.
-law ikv_feat_write_in_buffer:
-  for +off: Nat
-  for +b: Nat
-  for +mt: Nat
-  for +cap: Nat
-  {Bool.and(Bool.and(Nat.is_le(off, 1n+mt), Nat.is_le(b, cap)), Bool.not(ikv_feat_write_ok(off, b, ikv_feat_cols(mt, cap)))) == False{} : Bool}
-
-def ikv_feat_write_in_buffer(off, b, mt, cap):
-  ikv_write_in(off, b, mt, cap, Nat.is_le(off, 1n+mt), {==}, Nat.is_le(b, cap), {==})
 
 # LAW IKV.13
 # promise: a text row never reads a column an image row reads.

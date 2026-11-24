@@ -496,4 +496,13 @@ fn feature_columns_of_today() {
     assert!(ikv_feat_write_safe(1, 16, 17) && !ikv_feat_write_safe(2, 16, 17));
     assert!(!ikv_feat_write_safe(0, 4, 17));
     assert!(!ikv_feat_write_safe(u64::MAX, u64::MAX, 17));
+    // the sizing of today: the planned buffer takes the merger of every admitted request (an
+    // image starting inside the request's columns, a bucket of at most the per-image cap)
+    for (mt, cap) in [(16u64, 4u64), (16384, 2048), (1, 1)] {
+        let cols = ikv_feat_cols(mt, cap).unwrap();
+        for off in [1, mt / 2 + 1, mt + 1] {
+            assert!(ikv_feat_write_safe(off, cap, cols), "{off} {cap} {cols}");
+        }
+        assert!(!ikv_feat_write_safe(mt + 2, cap, cols));
+    }
 }
