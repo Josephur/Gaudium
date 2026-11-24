@@ -193,11 +193,7 @@ pub fn build_batched_spec_step_graph(
 
     let parent = gb.get_or_add_persistent_tensor("sp_parent", SynDataType::Int32, &[t]);
     let depth = gb.get_or_add_persistent_tensor("sp_depth", SynDataType::Int32, &[t]);
-    let taps: Vec<Vec<TensorId>> = dc
-        .taps
-        .iter()
-        .map(|&l| split_groups(&mut gb, layer_out[l], SynDataType::Bf16, hid, b, t, &format!("tap{l}")))
-        .collect();
+    let mut draft_slots = Vec::with_capacity(b as usize);
     for j in 0..b as usize {
         let sp = slot_pfx(j as u64);
         let a_out = gb.add_persistent_tensor(format!("{sp}a_out"), SynDataType::Int32, &[1]);
@@ -211,24 +207,21 @@ pub fn build_batched_spec_step_graph(
             &[a_out, cursor_out, emitted, fix_out],
             &[],
         );
-        let slot_taps: Vec<TensorId> = taps.iter().map(|g| g[j]).collect();
-        dspine::append_step_drafter_p(
-            &mut gb,
-            &sp,
-            spec,
-            dc,
-            &slot_taps,
+        draft_slots.push(dspine::StepSlot {
+            samp: (format!("{sp}samp_f"), format!("{sp}samp_i")),
+            pfx: sp,
             t,
-            cursors[j],
-            depth,
-            tokens[j],
+            cursor: cursors[j],
+            tokens: tokens[j],
             a_out,
             cursor_out,
-            lmax,
-            sampled,
-            (&format!("{sp}samp_f"), &format!("{sp}samp_i")),
-        );
+        });
     }
+    // the drafter over every slot at once: its context pass over all verify rows and the next
+    // blocks side by side (each drafter weight read once per step); per slot only its context
+    // caches, its block attention and its walk
+    let taps: Vec<TensorId> = dc.taps.iter().map(|&l| layer_out[l]).collect();
+    dspine::append_step_drafter_slots(&mut gb, "", spec, dc, &taps, &draft_slots, depth, lmax, sampled);
     gb
 }
 
@@ -309,10 +302,31 @@ mod tests {
             v.iter().filter(|n| n.guid == guid).count()
         };
         // every per-row kernel of the solo step, three times; the trunk GEMMs once
-        for guid in ["gaudium_accept_t", "gaudium_attn_prep", "gaudium_gdn_f32", "gaudium_ds_score", "gaudium_df_next"] {
+        for guid in [
+            "gaudium_accept_t", "gaudium_attn_prep", "gaudium_gdn_f32", "gaudium_ds_score",
+            "gaudium_df_next", "gaudium_df_attn_prep", "gaudium_ds_codes", "gaudium_ds_msg",
+            "gaudium_ds_finish", "gaudium_ds_base", "gaudium_df_walk", "gaudium_df_ids",
+        ] {
             assert_eq!(count(&views, guid), 3 * count(&solo_views, guid), "{guid}");
         }
         assert_eq!(count(&views, "argmax_fwd_bf16"), 1);
+        // the drafter's weights are read as often as in the solo step: once per launch for all
+        // three slots (its context pass, its block projections, MLPs, bridge and readout)
+        let readers = |v: &[crate::synapse::graph::NodeIoView<'_>], w: &str| {
+            v.iter().filter(|n| n.inputs.iter().any(|t| t.name == w)).count()
+        };
+        let drafter_weights: Vec<String> = solo
+            .persistent_tensor_specs()
+            .into_iter()
+            .map(|s| s.0)
+            .filter(|n| dspine::is_drafter_weight(n) && (n.contains("_W_") || n.starts_with("ds_W") || n.starts_with("ds_R") || n == "ds_PW"))
+            .collect();
+        assert!(drafter_weights.len() >= 5 * 7, "{drafter_weights:?}");
+        for w in &drafter_weights {
+            assert_eq!(readers(&views, w), readers(&solo_views, w), "{w}");
+        }
+        // and so is the draft readout
+        assert_eq!(count(&views, "gaudium_df_topk1"), count(&solo_views, "gaudium_df_topk1"));
         let specs = g.persistent_tensor_specs();
         let dims = |n: &str| specs.iter().find(|s| s.0 == n).map(|s| s.2.clone());
         assert_eq!(dims("L3_qg"), Some(vec![spec.qg_dim(), 24]));

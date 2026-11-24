@@ -117,6 +117,9 @@ def chat(base, model, prompt, mode, seed, max_tokens, api_key, timeout, history=
         "n": t.get("predicted_n", 0),
         "queued_ms": g.get("queued_ms", 0.0),
         "method": g.get("engine_method", ""),
+        "launches": t.get("launches", 0),
+        "draft_n": t.get("draft_n", 0),
+        "draft_accepted": t.get("draft_n_accepted", 0),
     }
 
 
@@ -230,12 +233,19 @@ def main():
                     "decode_tok_s": dec / max(span, 1e-9),
                     "per_stream_decode_tok_s": [r["n"] / max(r["decode_ms"], 1e-9) * 1e3 for r in ok],
                     "prefill_ms": [r["prefill_ms"] for r in ok],
+                    "launches": sum(r["launches"] for r in ok),
+                    "draft_n": sum(r["draft_n"] for r in ok),
+                    "draft_accepted": sum(r["draft_accepted"] for r in ok),
                     "diffs": diffs,
                 }
+                # decode tokens per launch (each stream's first token comes from its prefill)
+                row["tok_per_launch"] = dec / row["launches"] if row["launches"] else 0.0
                 runs.append(row)
                 print(f"c={c} {m:7s}: {same}/{c} identical, {toks} tokens in {wall:6.2f}s = {row['total_tok_s']:7.1f} tok/s total "
                       f"(decode {row['decode_tok_s']:7.1f} tok/s; per stream "
                       f"{sum(row['per_stream_decode_tok_s']) / max(len(ok), 1):6.1f})"
+                      + (f", {row['tok_per_launch']:.2f} tok/launch, {row['draft_accepted']}/{row['draft_n']} drafts accepted"
+                         if row["launches"] else "")
                       + (f"  DIFF {diffs}" if diffs else ""), flush=True)
         out["runs"] = runs
         out["mismatches"] = bad
