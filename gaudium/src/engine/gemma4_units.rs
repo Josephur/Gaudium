@@ -84,16 +84,102 @@ impl VisLoad {
 }
 
 /// One prefill tile of an image request.
-#[derive(Debug, Clone, Copy)]
-struct Tile {
-    pos: u64,
-    t: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Tile {
+    pub pos: u64,
+    pub t: u64,
 }
 
 impl Tile {
-    fn end(&self) -> u64 {
+    pub fn end(&self) -> u64 {
         self.pos + self.t
     }
+}
+
+/// The prompt's tiles of at most `tile` rows.
+pub(super) fn split_tiles(len: u64, tile: u64) -> Vec<Tile> {
+    let mut tiles = Vec::new();
+    let mut pos = 0u64;
+    while pos < len {
+        let t = (len - pos).min(tile);
+        tiles.push(Tile { pos, t });
+        pos += t;
+    }
+    tiles
+}
+
+/// The largest end of the image blocks (`(first row, rows)`) over the rows `[a, b)` (0: none).
+pub(super) fn block_end(blocks: &[(usize, usize)], a: u64, b: u64) -> u64 {
+    blocks
+        .iter()
+        .filter(|&&(s, n)| (s as u64) < b && (s + n) as u64 > a)
+        .map(|&(s, n)| (s + n) as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+/// One prefill unit: its tiles (indices), the end of its rows, whether it runs the two-way
+/// form, and the tile the next unit starts at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Unit {
+    pub tiles: Vec<usize>,
+    pub end: u64,
+    pub two_way: bool,
+    pub next: usize,
+}
+
+/// The unit that starts at tile `i`: the tile, and the later tiles an image block runs into
+/// (while the plan holds buffers for them, `g4u_join`); the next unit starts at the first of its
+/// tiles that is not final (`g4u_final`), else behind it. Refused when even the first tile is
+/// not final (a block longer than a unit reaches).
+pub(super) fn plan_unit(
+    tiles: &[Tile],
+    blocks: &[(usize, usize)],
+    i: usize,
+    bidir: bool,
+    max_tiles: u64,
+) -> Result<Unit, String> {
+    let mut unit = vec![i];
+    if bidir {
+        while let Some(&last) = unit.last() {
+            let end = tiles[last].end();
+            let cross = last + 1 < tiles.len() && block_end(blocks, end - 1, end) > end;
+            if !g4u_join(cross, unit.len() as u64, max_tiles) {
+                break;
+            }
+            unit.push(last + 1);
+        }
+    }
+    let end = tiles[*unit.last().expect("one tile")].end();
+    let two_way = bidir
+        && unit
+            .iter()
+            .any(|&j| block_end(blocks, tiles[j].pos, tiles[j].end()) > 0);
+    let next = unit
+        .iter()
+        .copied()
+        .find(|&j| !g4u_final(block_end(blocks, tiles[j].pos, tiles[j].end()), end))
+        .unwrap_or(unit[unit.len() - 1] + 1);
+    if next == i {
+        return Err(format!(
+            "an image block from row {} runs past the {max_tiles} tiles a prefill unit holds",
+            tiles[i].pos
+        ));
+    }
+    Ok(Unit {
+        tiles: unit,
+        end,
+        two_way,
+        next,
+    })
+}
+
+/// Positions after its own that the row at `p` attends in a unit ending at `unit_end`.
+pub(super) fn row_ext(blocks: &[(usize, usize)], p: u64, unit_end: u64) -> u64 {
+    let blk = blocks
+        .iter()
+        .find(|&&(s, n)| (s as u64) <= p && p < (s + n) as u64);
+    g4u_ext(blk.is_some(), p, blk.map_or(0, |&(s, n)| (s + n) as u64), unit_end)
 }
 
 /// Buffers of the `j`-th tile of a unit: its two layer buffers, ids, cursor, extension table.
@@ -242,26 +328,9 @@ impl Gemma4Engine {
             .ok_or("an image prefill without an image request")?;
         let n_layers = self.dims.n_layers;
         let kinds = self.dims.kinds();
-        let tile = self.prefill_tile;
-        let len = prompt_ids.len() as u64;
-        let mut tiles = Vec::new();
-        let mut pos = 0u64;
-        while pos < len {
-            let t = (len - pos).min(tile);
-            tiles.push(Tile { pos, t });
-            pos += t;
-        }
+        let tiles = split_tiles(prompt_ids.len() as u64, self.prefill_tile);
         let bidir = self.vis_load.as_ref().is_some_and(|v| v.bidir);
         let max_tiles = self.vis_load.as_ref().map_or(1, |v| v.unit_tiles);
-        // the largest end of the image blocks over rows [a, b)
-        let block_end = |a: u64, b: u64| -> u64 {
-            req.blocks
-                .iter()
-                .filter(|&&(s, n)| (s as u64) < b && (s + n) as u64 > a)
-                .map(|&(s, n)| (s + n) as u64)
-                .max()
-                .unwrap_or(0)
-        };
         let mut recipe_ms = 0.0f64;
         let mut out_addr = 0u64;
         let mut i = 0usize;
@@ -269,23 +338,12 @@ impl Gemma4Engine {
             if is_cancelled() {
                 return Ok(None);
             }
-            // the unit: the tile, and the later tiles an image block runs into
-            let mut unit = vec![i];
-            if bidir {
-                while let Some(&last) = unit.last() {
-                    let end = tiles[last].end();
-                    let cross = last + 1 < tiles.len() && block_end(end - 1, end) > end;
-                    if !g4u_join(cross, unit.len() as u64, max_tiles) {
-                        break;
-                    }
-                    unit.push(last + 1);
-                }
-            }
-            let unit_end = tiles[*unit.last().expect("one tile")].end();
-            let two_way = bidir
-                && unit
-                    .iter()
-                    .any(|&j| block_end(tiles[j].pos, tiles[j].end()) > 0);
+            let Unit {
+                tiles: unit,
+                end: unit_end,
+                two_way,
+                next,
+            } = plan_unit(&tiles, &req.blocks, i, bidir, max_tiles)?;
             for (k, &j) in unit.iter().enumerate() {
                 let b = self.unit_bufs(k);
                 recipe_ms += self.embed_tile(prompt_ids, &req.fidx, tiles[j], &b)?;
@@ -314,7 +372,7 @@ impl Gemma4Engine {
                 self.sync_compute("prefill tile")?;
                 out_addr = self.prefill_io(n_layers - 1).1;
                 self.live.prefill_progress(tl.end());
-                i += 1;
+                i = next;
                 continue;
             }
             // two-way blocks: every row's extension, then the unit layer by layer
@@ -322,12 +380,7 @@ impl Gemma4Engine {
                 let tl = tiles[j];
                 let mut ext = Vec::with_capacity(tl.t as usize * 4);
                 for p in tl.pos..tl.end() {
-                    let blk = req
-                        .blocks
-                        .iter()
-                        .find(|&&(s, n)| (s as u64) <= p && p < (s + n) as u64);
-                    let e = g4u_ext(blk.is_some(), p, blk.map_or(0, |&(s, n)| (s + n) as u64), unit_end);
-                    ext.extend_from_slice(&(e as i32).to_le_bytes());
+                    ext.extend_from_slice(&(row_ext(&req.blocks, p, unit_end) as i32).to_le_bytes());
                 }
                 let b = self.unit_bufs(k);
                 self.dev
@@ -358,18 +411,6 @@ impl Gemma4Engine {
                 }
             }
             self.sync_compute("image prefill unit")?;
-            // the next unit starts at the first tile whose blocks ran past this unit
-            let next = unit
-                .iter()
-                .copied()
-                .find(|&j| !g4u_final(block_end(tiles[j].pos, tiles[j].end()), unit_end))
-                .unwrap_or(unit[unit.len() - 1] + 1);
-            if next == i {
-                return Err(format!(
-                    "an image block from row {} runs past the {} tiles a prefill unit holds",
-                    tiles[i].pos, max_tiles
-                ));
-            }
             let last = unit[unit.len() - 1];
             if next > last {
                 let b = self.unit_bufs(unit.len() - 1);
@@ -380,5 +421,84 @@ impl Gemma4Engine {
         }
         let last_t = tiles.last().map_or(0, |t| t.t);
         Ok(Some((last_t, out_addr, recipe_ms)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the planner over a prompt and checks what the prefill relies on: every unit fits the
+    /// ring, never holds more tiles than planned, makes progress, every row's extension stays in
+    /// its unit and inside its own block, and every tile is eventually run in a unit where it
+    /// is final.
+    fn walk(len: u64, tile: u64, blocks: &[(usize, usize)], ring: u64, w: u64) -> Vec<Unit> {
+        let tiles = split_tiles(len, tile);
+        let block = blocks.iter().map(|b| b.1 as u64).max().unwrap_or(1);
+        let max_tiles = (tile - 1 + block).div_ceil(tile);
+        assert!(g4u_fits(ring, w, max_tiles * tile));
+        let mut done = vec![false; tiles.len()];
+        let mut units = Vec::new();
+        let mut i = 0;
+        while i < tiles.len() {
+            let u = plan_unit(&tiles, blocks, i, true, max_tiles).unwrap();
+            assert!(u.tiles.len() as u64 <= max_tiles);
+            assert!(u.next > i);
+            let rows = u.end - tiles[u.tiles[0]].pos;
+            assert!(g4u_fits(ring, w, rows));
+            for &j in &u.tiles {
+                for p in tiles[j].pos..tiles[j].end() {
+                    let e = row_ext(blocks, p, u.end);
+                    assert!(p + e < u.end);
+                    if let Some(&(s, n)) = blocks.iter().find(|&&(s, n)| s as u64 <= p && p < (s + n) as u64) {
+                        assert!(p + e < (s + n) as u64);
+                        // a final tile's rows see their whole block
+                        if j < u.next {
+                            assert_eq!(p + e + 1, (s + n) as u64, "row {p}");
+                        }
+                    } else {
+                        assert_eq!(e, 0);
+                    }
+                }
+                if j < u.next {
+                    done[j] = true;
+                }
+            }
+            i = u.next;
+            units.push(u);
+        }
+        assert!(done.iter().all(|&d| d));
+        units
+    }
+
+    #[test]
+    fn one_image_over_a_tile_boundary_is_one_unit() {
+        // 298 rows: a block of 260 rows from row 5 crosses the boundary of 256-row tiles
+        let u = walk(298, 256, &[(5, 260)], 2048, 1024);
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tiles, vec![0, 1]);
+        assert!(u[0].two_way);
+    }
+
+    #[test]
+    fn small_tiles_and_back_to_back_images() {
+        // blocks over three 128-row tiles each, and two images with one text row between
+        walk(1200, 128, &[(100, 280), (382, 280), (700, 266)], 2048, 1024);
+        walk(1200, 16, &[(3, 280), (290, 280)], 2048, 1024);
+        let u = walk(600, 256, &[(10, 200)], 2048, 1024);
+        // a block inside the first tile: units of one tile
+        assert!(u.iter().all(|u| u.tiles.len() == 1));
+    }
+
+    #[test]
+    fn a_text_prompt_never_runs_two_way() {
+        let u = walk(1000, 256, &[], 2048, 1024);
+        assert!(u.iter().all(|u| !u.two_way && u.tiles.len() == 1));
+    }
+
+    #[test]
+    fn a_block_longer_than_the_planned_unit_is_refused() {
+        let tiles = split_tiles(2000, 128);
+        assert!(plan_unit(&tiles, &[(10, 900)], 0, true, 3).is_err());
     }
 }
