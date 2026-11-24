@@ -1545,7 +1545,7 @@ law ln_kv_arena_counts_both:
 def ln_kv_arena_counts_both(a, p):
   L.nat_le_refl(Nat.add(a, p))
 
-# promise: an engine with more than one lane never gets a host-RAM tier that keeps a single prefix cache.
+# promise: an engine with more than one lane never gets a host-RAM tier that is not built for several lanes.
 law ln_host_tier_never_with_lanes:
   for +k: Nat
   {ln_host_tier_ok(Nat.add(2n, k), False{}) == False{} : Bool}

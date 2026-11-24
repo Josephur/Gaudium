@@ -616,8 +616,14 @@ e8dd4d122e82d747  kv_wv_rows_distinct_256  law kv_wv_rows_distinct_256 : for + a
 # promise ln_admit_stamp_latest: a lane admitted now is stamped later than every lane stamped before, so routing reads it as the most recently used.
 b0815bca45eb3881  ln_admit_takes_lane  law ln_admit_takes_lane : { ln_is_free ( ln_step ( LnFree { } , EvLnAdmit { } ) ) == False { } : Bool }
 # promise ln_admit_takes_lane: admitting a request to a free lane makes the lane busy.
+3ccb69c4a7d7d4ad  ln_after_never_strands  law ln_after_never_strands : for + o : Bool for + y : Bool { ln_sa_done ( ln_session_after ( o , y , False { } ) ) == False { } : Bool }
+# promise ln_after_never_strands: a lane session's driver never stops while its feed has not ended the session, so no request is left queued with no session.
+4d5d6edc30a53910  ln_after_yield_returns  law ln_after_yield_returns : { ln_session_after ( True { } , True { } , False { } ) == SaAgain { } : SessionAfter }
+# promise ln_after_yield_returns: a lane session that handed the card back waits for its next turn.
 d984ec24670227e3  ln_allowed_moves  law ln_allowed_moves : for + s : LaneState for + ev : LaneEvent { ln_allows ( s , ev ) == Bool.not ( ln_eq ( ln_step ( s , ev ) , s ) ) : Bool }
 # promise ln_allowed_moves: an event the lane lifecycle allows always moves the lane to another state, and one it refuses leaves the lane as it was.
+da951f22a93a4785  ln_arena_counts_all  law ln_arena_counts_all : for + kv : Nat for + sp : Nat for + n : Nat { Nat.is_le ( Nat.add ( Nat.mul ( n , kv ) , Nat.mul ( Nat.sub ( n , 1n ) , sp ) ) , ln_lane_arena_bytes ( kv , sp , n ) ) == True { } : Bool }
+# promise ln_arena_counts_all: the device plan counts every lane's caches and state and the speculative buffers of every lane but the first, together.
 12c99bee3423d523  ln_arena_counts_lane_caches  law ln_arena_counts_lane_caches : for + kv : Nat for + sp : Nat for + n : Nat { Nat.is_le ( Nat.mul ( n , kv ) , ln_lane_arena_bytes ( kv , sp , n ) ) == True { } : Bool }
 # promise ln_arena_counts_lane_caches: the device plan counts the caches and recurrent state of every lane.
 28b7f3c70ba23a58  ln_arena_counts_other_spec  law ln_arena_counts_other_spec : for + kv : Nat for + sp : Nat for + n : Nat { Nat.is_le ( Nat.mul ( Nat.sub ( n , 1n ) , sp ) , ln_lane_arena_bytes ( kv , sp , n ) ) == True { } : Bool }
@@ -650,6 +656,10 @@ c4d0890ac614d952  ln_free_lane_routable  law ln_free_lane_routable : for + s : L
 # promise ln_free_lane_routable: every free lane is one routing may send a request to.
 be0740605e54f74d  ln_free_left_only_by_admit  law ln_free_left_only_by_admit : for + ev : LaneEvent { Bool.or ( ln_ev_is_admit ( ev ) , ln_is_free ( ln_step ( LnFree { } , ev ) ) ) == True { } : Bool }
 # promise ln_free_left_only_by_admit: a free lane leaves the free state only when a request is admitted to it.
+bb557c04a151fa5f  ln_host_tier_never_with_lanes  law ln_host_tier_never_with_lanes : for + k : Nat { ln_host_tier_ok ( Nat.add ( 2n , k ) , False { } ) == False { } : Bool }
+# promise ln_host_tier_never_with_lanes: an engine with more than one lane never gets a host-RAM tier that is not built for several lanes.
+e17bb2f8a04442b6  ln_kv_arena_counts_both  law ln_kv_arena_counts_both : for + a : Nat for + p : Nat { Nat.is_le ( Nat.add ( a , p ) , ln_kv_arena_total ( a , p ) ) == True { } : Bool }
+# promise ln_kv_arena_counts_both: the device arena holds both the lanes' caches and state and their kept positions.
 3ba7a01ca8594135  ln_lanes_fit_fits  law ln_lanes_fit_fits : for + bp : Nat for + sh : Nat for + u : Nat { Bool.or ( Nat.is_lt ( u , sh ) , ln_plan_fits ( ln_lanes_fit ( 1n + bp , sh , u ) , 1n + bp , sh , u ) ) == True { } : Bool }
 # promise ln_lanes_fit_fits: the lane count a refused plan reports as fitting does fit, whenever the shared part does.
 af6ef3a569dc3bf7  ln_lanes_need_drafter  law ln_lanes_need_drafter : for + e : Bool for + d : LaneDrafter for + c : Bool { Bool.and ( ln_lanes_ok ( e , d , c ) , Bool.not ( ln_drafter_ok ( d ) ) ) == False { } : Bool }
@@ -680,6 +690,10 @@ a388dd3e65dec6b0  ln_next_never_yields_busy  law ln_next_never_yields_busy : for
 # promise ln_parity_alternates: a lane's next step reads the recurrent-state buffer the step before it wrote, never the one it read.
 da2684c09ec42ceb  ln_parity_in_range  law ln_parity_in_range : for + p : Nat { Nat.is_le ( ln_lane_parity_next ( p ) , 1n ) == True { } : Bool }
 # promise ln_parity_in_range: a lane's next step reads one of its two recurrent-state buffers.
+22c0ff7ad8fc46fa  ln_pfx_ask_counts_every_lane  law ln_pfx_ask_counts_every_lane : for + w : Nat for + n : Nat { Nat.is_le ( Nat.mul ( n , w ) , ln_lane_pfx_ask ( w , n ) ) == True { } : Bool }
+# promise ln_pfx_ask_counts_every_lane: a load asks the plan for the kept positions of every lane.
+29b0c8a6b88363c3  ln_pfx_counts_every_lane  law ln_pfx_counts_every_lane : for + p : Nat for + s : Nat for + n : Nat { Nat.is_le ( Nat.mul ( n , Nat.mul ( p , s ) ) , ln_lane_pfx_bytes ( p , s , n ) ) == True { } : Bool }
+# promise ln_pfx_counts_every_lane: the device plan counts the kept prefix positions of every lane.
 5df90855617e3558  ln_plan_check_sees_whole_plan  law ln_plan_check_sees_whole_plan : for + t : Nat for + n : Nat for + lb : Nat { Nat.is_le ( t , ln_plan_bytes ( n , lb , ln_plan_shared ( t , n , lb ) ) ) == True { } : Bool }
 # promise ln_plan_check_sees_whole_plan: the lane plan check is never given less than the whole device plan.
 4ee286db60615584  ln_plan_counts_all  law ln_plan_counts_all : for + n : Nat for + lb : Nat for + sh : Nat { Nat.is_le ( Nat.add ( sh , Nat.mul ( n , lb ) ) , ln_plan_bytes ( n , lb , sh ) ) == True { } : Bool }
