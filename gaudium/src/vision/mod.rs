@@ -1,6 +1,7 @@
 //! Image and video input for the Qwen3.5/3.8 vision-language family on Intel Gaudi 2, and the
 //! model-independent parts (decoders, request media, budgets) that the Inkling 2 family's tower
-//! (`engine::inkling2::vision`, `ImageProcessor::Tiles`) shares.
+//! (`engine::inkling2::vision`, `ImageProcessor::Tiles`) and the Gemma 4 family's image path
+//! (`engine::gemma4::vision`, `ImageProcessor::Gemma4`, images only) share.
 //!
 //! - `decode`: the crate's own image file decoders (JPEG, PNG, GIF, WebP, BMP), bit-exact with
 //!   the reference image processor's decoder; animations as frames.
