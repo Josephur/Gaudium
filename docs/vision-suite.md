@@ -65,7 +65,7 @@ every row (for example `-- --max-ctx 16384`).
 A new family is one more entry of `models` in the suite file, a new drafter one more entry of a
 model's `methods`, with the options its `gaudium --generate` run takes. Nothing in the runner is
 specific to a model family. Once the rows of a pairing pass, its case of `vis_drafter_ok` may
-become `True{}` (Gemma 4's drafters, for example, through their own rows).
+become `True{}`. The Gemma 4 12B rows (K=0 and its `-assistant` drafter) are in the suite file; that drafter's case is `True{}` on the strength of the same K=0 comparison made by hand on the card, ahead of a full suite run.
 
 ## How the drafters see an image
 

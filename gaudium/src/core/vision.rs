@@ -255,8 +255,9 @@ mod tests {
     #[test]
     fn only_validated_drafters_run_with_the_tower() {
         use ModelFamily as F;
-        // today's validated set (the vision suite passed on the card): plain decode, DSpine, a
-        // dense model's DFlash2 drafter and own MTP head, Inkling 2's own drafter
+        // today's validated set (token-identical to K=0 with images on the card): plain decode,
+        // DSpine, a dense model's DFlash2 drafter and own MTP head, Inkling 2's own drafter, and
+        // Gemma 4's -assistant drafter (the server's "mtp" kind for that family)
         for f in [F::Qwen3, F::Qwen35Dense, F::Qwen35Moe, F::Gemma4, F::Inkling2] {
             assert!(drafter_runs_with_vision(None, f));
             assert!(!drafter_runs_with_vision(Some("something new"), f));
@@ -270,9 +271,10 @@ mod tests {
         assert!(drafter_runs_with_vision(Some("dflash2"), F::Qwen35Dense));
         assert!(drafter_runs_with_vision(Some("mtp"), F::Qwen35Dense));
         assert!(drafter_runs_with_vision(Some("mtp"), F::Inkling2));
-        // not yet through the suite: the mixture-of-experts MTP head, Gemma 4's drafters
+        assert!(drafter_runs_with_vision(Some("mtp"), F::Gemma4));
+        // not yet through the suite: the mixture-of-experts MTP head; a Gemma 4 block drafter
+        // embeds prompt rows of its own and is not implemented with images
         assert!(!drafter_runs_with_vision(Some("mtp"), F::Qwen35Moe));
-        assert!(!drafter_runs_with_vision(Some("mtp"), F::Gemma4));
         assert!(!drafter_runs_with_vision(Some("dflash2"), F::Gemma4));
         assert!(!drafter_runs_with_vision(Some("dflash2"), F::Qwen35Moe));
         assert!(!drafter_runs_with_vision(Some("dflash2"), F::Inkling2));

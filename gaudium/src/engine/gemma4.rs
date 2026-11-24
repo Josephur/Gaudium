@@ -51,10 +51,18 @@ use crate::synapse::ffi::{SynDataType, SynapseApi};
 use crate::synapse::graph::{CompiledRecipe, GraphBuilder, PreparedLaunch, TensorId};
 use crate::synapse::ops::{as_param_bytes, u32_params, TransposeParams};
 use crate::synapse::recipe_cache::RecipeCache;
-use crate::verified::{align_up, HbmCat};
+use crate::verified::{align_up, g4v_arena_step, g4v_part_bytes, HbmCat};
 
 #[path = "gemma4_spec.rs"]
 pub mod spec;
+// Image input: the image path (a tower or the unified embedder), its preprocessing, and the
+// hand-over of the soft tokens to the prefill.
+#[path = "gemma4_vision.rs"]
+pub mod vision;
+// The prefill of a prompt with images: the embedding stage of image rows and the two-way image
+// blocks of the sliding layers.
+#[path = "gemma4_units.rs"]
+mod units;
 
 /// Rows of one chunk of a global layer's K / V cache (the chunked softmax kernel's `C`).
 pub const G4_CHUNK: u64 = 4096;
@@ -532,6 +540,12 @@ struct G4LayerIo<'a> {
     rope_s: TensorId,
     /// The layer's per-layer input `{ple, t}`.
     pli: Option<TensorId>,
+    /// A sliding layer of a tile with image rows: positions after its own that each row also
+    /// attends (`ext {t}`, the rest of its image block; the ring softmax with an extension).
+    ext: Option<TensorId>,
+    /// Only the layer's key / value write (a later tile's keys put into the ring before an
+    /// earlier tile's image block attends them): the graph ends after the attention front end.
+    kv_only: bool,
 }
 
 /// Appends one Gemma 4 decoder layer over `t` rows at positions `cursor + row`:
@@ -653,6 +667,9 @@ fn append_g4_layer(
             &u32_params(&[0, u32::from(!glob)]),
         );
     }
+    if io.kv_only {
+        return qb;
+    }
 
     let scores = gb.add_persistent_tensor(format!("{l}scores"), SynDataType::Float, &[c, r, b]);
     gb.op_batch_gemm(format!("{l}qk"), qb, kcache, scores, false, true);
@@ -666,6 +683,16 @@ fn append_g4_layer(
             &[scores, io.cursor],
             &[pm, stats],
             &u32_params(&[t as u32, nch as u32, 0, 0]),
+        );
+    } else if let Some(ext) = io.ext {
+        // node params: T, coff, W, mode (not read): row t at its own position, seeing the
+        // positions (p - W, p + ext[t]]
+        gb.add_node(
+            "gaudium_ga_softmax_ringx",
+            format!("{l}softmax"),
+            &[scores, io.cursor, ext],
+            &[pm, stats],
+            &u32_params(&[t as u32, 0, d.window as u32, 0]),
         );
     } else {
         // node params: T, coff, W, mode 0 (row t at its own position, masked by ring distance)
@@ -810,7 +837,7 @@ fn append_g4_embed(gb: &mut GraphBuilder, d: &G4Dims, ids: TensorId, t: u64) -> 
 ///
 /// `layer_major`: returns one persistent tensor `ple_out {ple, t, layers}` (a prefill tile: each
 /// layer's recipe reads its block). Otherwise one `{ple, t}` workspace view per layer (a step).
-fn append_g4_ple(
+pub(crate) fn append_g4_ple(
     gb: &mut GraphBuilder,
     d: &G4Dims,
     x0: TensorId,
@@ -946,6 +973,8 @@ pub fn build_layer_graph(
         rope_c,
         rope_s,
         pli,
+        ext: None,
+        kv_only: false,
     };
     let inter = if kind.is_shared() {
         d.inter_shared
@@ -962,6 +991,56 @@ pub fn build_layer_graph(
         inter,
         t,
         nch,
+        d.norm.row_norm(true),
+    );
+    gb
+}
+
+/// A sliding layer of a tile with image rows (`g_g4_sx_T{t}`: each row also attends the rest
+/// of its image block, `ext`) or the key / value write of a sliding layer alone (`g_g4_skv_T{t}`:
+/// a later tile's keys into the ring before an earlier tile's block attends them). Only the
+/// sizes whose decoder lets image rows attend both ways (`use_bidirectional_attention: vision`)
+/// build them; they have keys in every layer.
+pub fn build_sliding_vis_graph(
+    d: &G4Dims,
+    t: u64,
+    lmax: u64,
+    kv_only: bool,
+    elf_hashes: &[(String, String)],
+) -> GraphBuilder {
+    let name = if kv_only {
+        format!("g_g4_skv_T{t}")
+    } else {
+        format!("g_g4_sx_T{t}")
+    };
+    let mut gb = g4_graph(d, name, elf_hashes);
+    let x_in = gb.add_persistent_tensor("x_in", SynDataType::Bf16, &[d.hid, t]);
+    let cursor = gb.add_persistent_tensor("cursor", SynDataType::Int32, &[1]);
+    let (rc_name, rs_name) = rope_names(false);
+    let rw = d.rope_width(false);
+    let rope_c = gb.add_persistent_tensor(rc_name, SynDataType::Float, &[rw, lmax]);
+    let rope_s = gb.add_persistent_tensor(rs_name, SynDataType::Float, &[rw, lmax]);
+    let ext = (!kv_only).then(|| gb.add_persistent_tensor("ext", SynDataType::Int32, &[t]));
+    let io = G4LayerIo {
+        lpfx: "L_",
+        kv_pfx: "L_",
+        cursor,
+        rope_c,
+        rope_s,
+        pli: None,
+        ext,
+        kv_only,
+    };
+    let _ = append_g4_layer(
+        &mut gb,
+        d,
+        x_in,
+        &io,
+        false,
+        false,
+        d.inter,
+        t,
+        1,
         d.norm.row_norm(true),
     );
     gb
@@ -1055,6 +1134,8 @@ fn append_g4_trunk(
             rope_c: rc,
             rope_s: rs,
             pli: pli.get(l).copied(),
+            ext: None,
+            kv_only: false,
         };
         x = append_g4_layer(
             gb,
@@ -1145,9 +1226,18 @@ fn is_prefill_special(name: &str) -> bool {
     )
 }
 
-fn align256(n: u64) -> u64 {
-    align_up(n.max(256), 256)
+/// One buffer of `bytes` out of a sealed arena: it starts on the arena's step and takes at least
+/// one step (`g4v_arena_step`), which is what the plan counts for it (`g4v_part_bytes`).
+fn arena_take(arena: &mut HbmArena, bytes: u64) -> Result<u64, String> {
+    let step = g4v_arena_step();
+    let (addr, _off) = arena
+        .suballoc(bytes.max(step), step)
+        .map_err(|e| format!("arena suballoc: {e}"))?;
+    Ok(addr)
 }
+
+/// Bytes of the prefill cursor buffer (one `i32`, given a whole buffer).
+const PF_CURSOR_BYTES: u64 = 256;
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -1171,6 +1261,11 @@ struct G4Plan {
     pf_ids_bytes: u64,
     pf_ple_bytes: u64,
     pf_hfin_bytes: u64,
+    /// Image input: the image path's own weights and activations.
+    vis: Option<vision::run::G4vPlan>,
+    /// Image input: the tiles of a prefill unit beyond the first (two layer buffers, ids, cursor
+    /// and extension table each).
+    unit_extra: u64,
 }
 
 impl G4Plan {
@@ -1180,6 +1275,7 @@ impl G4Plan {
         max_chunks: u64,
         tile: u64,
         sp: Option<&spec::G4SpecCfg>,
+        vis: Option<&units::VisLoad>,
     ) -> Self {
         let mut p = Self::default();
         let step = build_step_graph(d, max_ctx, max_chunks, &[]);
@@ -1203,6 +1299,13 @@ impl G4Plan {
         ];
         for kind in d.kinds() {
             graphs.push(build_layer_graph(d, kind, tile, max_ctx, max_chunks, &[]));
+        }
+        if let Some(v) = vis {
+            // the embedding stage of image rows (its `vis_feat` is the request's feature buffer)
+            // and the two-way block recipes
+            graphs.extend(v.sizing_graphs(d, tile, max_ctx));
+            p.vis = Some(v.geo.plan_bytes());
+            p.unit_extra = v.unit_tiles.saturating_sub(1);
         }
         for gb in &graphs {
             for (name, _dt, _dims, bytes) in gb.persistent_tensor_specs() {
@@ -1252,11 +1355,11 @@ impl G4Plan {
     }
 
     fn sum(m: &BTreeMap<String, u64>) -> u64 {
-        m.values().map(|&b| align256(b)).sum()
+        m.values().map(|&b| g4v_part_bytes(b)).sum()
     }
 
     fn weights_bytes(&self) -> u64 {
-        Self::sum(&self.weights)
+        Self::sum(&self.weights) + self.vis.as_ref().map_or(0, |v| v.weights_bytes())
     }
 
     fn kv_bytes(&self) -> u64 {
@@ -1270,11 +1373,13 @@ impl G4Plan {
     fn act_bytes(&self) -> u64 {
         Self::sum(&self.step_acts)
             + Self::sum(&self.pf_scratch)
-            + 2 * align256(self.pf_x_bytes)
-            + align256(self.pf_ids_bytes)
-            + 256
-            + align256(self.pf_ple_bytes)
-            + align256(self.pf_hfin_bytes)
+            + 2 * g4v_part_bytes(self.pf_x_bytes)
+            + g4v_part_bytes(self.pf_ids_bytes)
+            + g4v_part_bytes(PF_CURSOR_BYTES)
+            + g4v_part_bytes(self.pf_ple_bytes)
+            + g4v_part_bytes(self.pf_hfin_bytes)
+            + self.vis.as_ref().map_or(0, |v| v.act_bytes())
+            + units::unit_bytes(self.unit_extra, self.pf_x_bytes, self.pf_ids_bytes)
     }
 
     fn total(&self, ws_bytes: u64) -> u64 {
@@ -1298,7 +1403,7 @@ pub fn hbm_plan_bytes(
     let max_ctx = align_up(max_ctx.max(G4_CHUNK), G4_CHUNK);
     let tile = prefill_tile.clamp(1, G4_MAX_PREFILL_TILE);
     let d = G4Dims::from_spec(spec, tile, norm)?;
-    let p = G4Plan::build(&d, max_ctx, max_ctx / G4_CHUNK, tile, None);
+    let p = G4Plan::build(&d, max_ctx, max_ctx / G4_CHUNK, tile, None, None);
     Ok([
         p.weights_bytes(),
         p.kv_bytes(),
@@ -1307,7 +1412,7 @@ pub fn hbm_plan_bytes(
     ])
 }
 
-fn select_exact_bindings(
+pub(crate) fn select_exact_bindings(
     recipe: &CompiledRecipe,
     pool: &BTreeMap<String, u64>,
 ) -> Result<BTreeMap<String, u64>, String> {
@@ -1402,6 +1507,13 @@ pub struct Gemma4Engine {
     pf_hfin: u64,
     hbm_bytes: [u64; 5],
     live: LiveReporter,
+
+    // Image input (recipes and pinned memory: must drop before `dev`)
+    vision: Option<vision::run::G4Vision>,
+    vis_load: Option<units::VisLoad>,
+    vis_recipes: HashMap<(units::VisRecipe, u64), CompiledRecipe>,
+    /// Buffers of the tiles of a prefill unit beyond the first.
+    pf_unit: Vec<units::TileBufs>,
 
     // Device handle (dropped LAST)
     dev: HpuDevice,
@@ -1524,9 +1636,26 @@ impl Gemma4Engine {
             RecipeCache::from_env()
         };
 
+        // image input: the image path's share of the plan (none without `--vision-max-patches`,
+        // a checkpoint without an image path, or a calibration load)
+        let vis_geo = if spec.has_vision && !cfg.fp8_calibrate {
+            vision::run::G4vGeo::plan(cfg)?
+        } else {
+            None
+        };
+        // the drafter must be one that runs beside the image path (the verified table): the
+        // size's assistant reads the target's states and keys only, a block drafter embeds
+        // prompt rows of its own
+        let drafter_kind = spec_cfg
+            .as_ref()
+            .map(|s| if s.reads_prompt_rows() { "dflash2" } else { "mtp" });
+        if vis_geo.is_some() && !crate::core::vision::drafter_runs_with_vision(drafter_kind, spec.family) {
+            return Err("image input with a block drafter is not implemented: load without --vision-max-patches or with the size's own -assistant drafter".into());
+        }
+
         // ---- Plan: the largest prefill tile whose exact plan fits the card ----
         let mut tile = cfg.prefill_tile.clamp(1, G4_MAX_PREFILL_TILE);
-        let (dims, plan) = loop {
+        let (dims, plan, vis_load) = loop {
             // a sliding layer's ring holds its window beside the widest pass (tile or verify)
             let pass_rows = tile.max(spec_cfg.as_ref().map_or(1, |s| s.max_rows()));
             let d = G4Dims::from_spec(&spec, pass_rows, norm)?;
@@ -1534,10 +1663,14 @@ impl Gemma4Engine {
                 sc.tile = tile;
                 sc.check_target(&d)?;
             }
-            let p = G4Plan::build(&d, max_ctx, max_chunks, tile, spec_cfg.as_ref());
+            let vl = match &vis_geo {
+                Some(g) => Some(units::VisLoad::new(g.clone(), &spec, &d, tile)?),
+                None => None,
+            };
+            let p = G4Plan::build(&d, max_ctx, max_chunks, tile, spec_cfg.as_ref(), vl.as_ref());
             let total = p.total(MIN_SHARED_WORKSPACE_BYTES);
             match dev.check_plan_fits(total, HBM_HEADROOM_BYTES) {
-                Ok(_) => break (d, p),
+                Ok(_) => break (d, p, vl),
                 Err(e) if tile <= G4_MIN_PREFILL_TILE => {
                     return Err(format!(
                         "HBM plan does not fit at max_ctx={max_ctx} even with a {tile}-row prefill tile: planned {:.2} GiB (weights {:.2}, global KV {:.2}, rings {:.2}, activations {:.2}, workspace {:.2}) of {:.2} GiB free: {e}",
@@ -1653,6 +1786,54 @@ impl Gemma4Engine {
             }
             None => None,
         };
+        // image input: the image path's largest recipes and the decoder's image-tile recipes at
+        // the planned tile, so the shared workspace covers them
+        let mut vision = vis_load
+            .as_ref()
+            .map(|vl| -> Result<vision::run::G4Vision, String> {
+                let elf = kenv.fingerprint_hashes(vision::graphs::G4V_ELFS)?;
+                Ok(vision::run::G4Vision::new(vl.geo.clone(), elf))
+            })
+            .transpose()?;
+        let mut pre_vis: Vec<((units::VisRecipe, u64), CompiledRecipe)> = Vec::new();
+        if let (Some(v), Some(vl)) = (vision.as_mut(), vis_load.as_ref()) {
+            max_ws = max_ws.max(v.compile_planned(&api, &cache, &driver_version)?);
+            let mut elf = elf_hashes.clone();
+            elf.extend_from_slice(v.elf());
+            let mut gbs = vec![(
+                units::VisRecipe::Embed,
+                vision::graphs::build_embed_vis_graph(&dims, vl.geo.feat_cols, prefill_tile, &elf),
+            )];
+            if vl.bidir {
+                for (kind, kv) in [
+                    (units::VisRecipe::SlidingExt, false),
+                    (units::VisRecipe::SlidingKv, true),
+                ] {
+                    gbs.push((kind, build_sliding_vis_graph(&dims, prefill_tile, max_ctx, kv, &elf)));
+                }
+            }
+            for (kind, gb) in gbs {
+                let r = gb
+                    .compile(Arc::clone(&api), &cache, &driver_version)
+                    .map_err(|e| format!("compile vision {kind:?}: {e}"))?;
+                note(&r);
+                max_ws = max_ws.max(r.ws_size);
+                pre_vis.push(((kind, prefill_tile), r));
+            }
+            if cfg.verbose {
+                eprintln!(
+                    "[gaudium] gemma4 vision: {:?} path, images of up to {} soft tokens, {} per request, feature buffer {} columns, two-way blocks {} (units of up to {} tiles), {:.2} GiB weights + {:.2} GiB buffers",
+                    vl.geo.d.kind,
+                    vision::soft_budget(&vl.geo.spec),
+                    vl.geo.max_tokens,
+                    vl.geo.feat_cols,
+                    vl.bidir,
+                    vl.unit_tiles,
+                    gib(plan.vis.as_ref().map_or(0, |p| p.weights_bytes())),
+                    gib(plan.vis.as_ref().map_or(0, |p| p.act_bytes())),
+                );
+            }
+        }
         if cfg.verbose {
             eprintln!(
                 "[gaudium] core recipes ready in {:.2}s (max_ws={:.2} MiB)",
@@ -1662,7 +1843,7 @@ impl Gemma4Engine {
         }
 
         // ---- Exact arena sizes, final fit check, allocation, seal ----
-        let ws_bytes = align256(max_ws.max(MIN_SHARED_WORKSPACE_BYTES));
+        let ws_bytes = align_up(max_ws.max(MIN_SHARED_WORKSPACE_BYTES), 256);
         let weights_bytes = plan.weights_bytes();
         let kv_bytes = plan.kv_bytes();
         let ring_bytes = plan.ring_bytes();
@@ -1703,42 +1884,65 @@ impl Gemma4Engine {
             .alloc_arena(act_bytes, HbmCat::CatScratch, "g4_act_arena")
             .map_err(|e| format!("alloc act arena: {e}"))?;
 
-        let suballoc = |arena: &mut HbmArena, bytes: u64| -> Result<u64, String> {
-            let (addr, _off) = arena
-                .suballoc(bytes.max(256), 256)
-                .map_err(|e| format!("arena suballoc: {e}"))?;
-            Ok(addr)
-        };
-
         let mut weights_addr = BTreeMap::new();
         for (name, &bytes) in &plan.weights {
-            weights_addr.insert(name.clone(), suballoc(&mut weights_arena, bytes)?);
+            weights_addr.insert(name.clone(), arena_take(&mut weights_arena, bytes)?);
         }
         let mut kv_addr = BTreeMap::new();
         for (name, &bytes) in &plan.kv {
-            kv_addr.insert(name.clone(), (suballoc(&mut kv_arena, bytes)?, bytes));
+            kv_addr.insert(name.clone(), (arena_take(&mut kv_arena, bytes)?, bytes));
         }
         if let Some(arena) = ring_arena.as_mut() {
             for (name, &bytes) in &plan.rings {
-                kv_addr.insert(name.clone(), (suballoc(arena, bytes)?, bytes));
+                kv_addr.insert(name.clone(), (arena_take(arena, bytes)?, bytes));
             }
         }
         let mut step_act_addr = BTreeMap::new();
         for (name, &bytes) in &plan.step_acts {
-            step_act_addr.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
+            step_act_addr.insert(name.clone(), arena_take(&mut act_arena, bytes)?);
         }
         let mut pf_scratch = BTreeMap::new();
         for (name, &bytes) in &plan.pf_scratch {
-            pf_scratch.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
+            pf_scratch.insert(name.clone(), arena_take(&mut act_arena, bytes)?);
         }
         let pf_x = [
-            suballoc(&mut act_arena, plan.pf_x_bytes)?,
-            suballoc(&mut act_arena, plan.pf_x_bytes)?,
+            arena_take(&mut act_arena, plan.pf_x_bytes)?,
+            arena_take(&mut act_arena, plan.pf_x_bytes)?,
         ];
-        let pf_ids = suballoc(&mut act_arena, plan.pf_ids_bytes)?;
-        let pf_cursor = suballoc(&mut act_arena, 256)?;
-        let pf_ple = suballoc(&mut act_arena, plan.pf_ple_bytes)?;
-        let pf_hfin = suballoc(&mut act_arena, plan.pf_hfin_bytes)?;
+        let pf_ids = arena_take(&mut act_arena, plan.pf_ids_bytes)?;
+        let pf_cursor = arena_take(&mut act_arena, PF_CURSOR_BYTES)?;
+        let pf_ple = arena_take(&mut act_arena, plan.pf_ple_bytes)?;
+        let pf_hfin = arena_take(&mut act_arena, plan.pf_hfin_bytes)?;
+        // image input: the image path's weights and buffers, the unit tiles' buffers
+        let mut vis_w_addr = BTreeMap::new();
+        let mut vis_act_addr = BTreeMap::new();
+        let mut vis_x = [0u64; 2];
+        if let Some(vp) = plan.vis.as_ref() {
+            for (name, &bytes) in &vp.weights {
+                vis_w_addr.insert(name.clone(), arena_take(&mut weights_arena, bytes)?);
+            }
+            for (name, &bytes) in &vp.acts {
+                vis_act_addr.insert(name.clone(), arena_take(&mut act_arena, bytes)?);
+            }
+            if vp.x_bytes > 0 {
+                vis_x = [
+                    arena_take(&mut act_arena, vp.x_bytes)?,
+                    arena_take(&mut act_arena, vp.x_bytes)?,
+                ];
+            }
+        }
+        let mut pf_unit = Vec::new();
+        for _ in 0..plan.unit_extra {
+            pf_unit.push(units::TileBufs {
+                x: [
+                    arena_take(&mut act_arena, plan.pf_x_bytes)?,
+                    arena_take(&mut act_arena, plan.pf_x_bytes)?,
+                ],
+                ids: arena_take(&mut act_arena, plan.pf_ids_bytes)?,
+                cursor: arena_take(&mut act_arena, PF_CURSOR_BYTES)?,
+                ext: arena_take(&mut act_arena, plan.pf_ids_bytes)?,
+            });
+        }
 
         dev.seal_with_shared_workspace(ws_bytes)
             .map_err(|e| format!("seal HBM allocations: {e}"))?;
@@ -1761,6 +1965,13 @@ impl Gemma4Engine {
         for (_, r) in pre_layers.iter_mut() {
             r.bind_shared_workspace(&dev)
                 .map_err(|e| format!("bind {} ws: {e}", r.name))?;
+        }
+        for (_, r) in pre_vis.iter_mut() {
+            r.bind_shared_workspace(&dev)
+                .map_err(|e| format!("bind {} ws: {e}", r.name))?;
+        }
+        if let Some(v) = vision.as_mut() {
+            v.bind_workspaces(&dev)?;
         }
 
         // ---- Upload weights and RoPE tables from the mmap'd checkpoint ----
@@ -1823,6 +2034,25 @@ impl Gemma4Engine {
             dev.upload_h2d_chunked(&data, addr, &mut stage_upload)
                 .map_err(|e| format!("upload weight '{name}': {e}"))?;
             uploaded_bytes += expected;
+        }
+        if let Some(v) = vision.as_mut() {
+            for (name, &addr) in &vis_w_addr {
+                let data = vision::run::pack_weight(&store, &v.geo, name)?;
+                let expected = plan.vis.as_ref().map_or(0, |p| p.weights[name]);
+                if data.len() as u64 != expected {
+                    return Err(format!(
+                        "vision weight '{name}' packed size {} != graph tensor size {expected}",
+                        data.len()
+                    ));
+                }
+                dev.upload_h2d_chunked(&data, addr, &mut stage_upload)
+                    .map_err(|e| format!("upload vision weight '{name}': {e}"))?;
+                uploaded_bytes += expected;
+            }
+            let feat = *pf_scratch
+                .get("vis_feat")
+                .ok_or("the plan has no feature buffer")?;
+            v.attach(&store, &dev, vis_w_addr, vis_act_addr, vis_x, feat)?;
         }
         let fstats = fpacker.stats();
         drop(fpacker);
@@ -1907,6 +2137,10 @@ impl Gemma4Engine {
             pf_hfin,
             hbm_bytes,
             live,
+            vision,
+            vis_load,
+            vis_recipes: pre_vis.into_iter().collect(),
+            pf_unit,
             dev,
         };
         let prepared = engine.prepare_step(&step1)?;
@@ -1918,6 +2152,36 @@ impl Gemma4Engine {
 
     pub fn spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    /// The image settings when the engine was loaded with image input.
+    pub fn vision_spec(&self) -> Option<&crate::vision::VisionSpec> {
+        self.vision.as_ref().map(|v| v.spec())
+    }
+
+    /// Hands the images of the next request to the engine, in prompt order.
+    pub fn set_request_images(
+        &mut self,
+        images: Vec<crate::vision::PreparedImage>,
+    ) -> Result<(), String> {
+        match self.vision.as_mut() {
+            Some(v) => v.set_request_images(images),
+            None if images.is_empty() => Ok(()),
+            None => Err("this engine was loaded without image input".into()),
+        }
+    }
+
+    /// Image timings of the last request (`None`: it had no images).
+    pub fn last_vision_report(&self) -> Option<crate::vision::VisionReport> {
+        self.vision.as_ref().and_then(|v| v.last_report())
+    }
+
+    /// Soft tokens of the last image request read back from HBM (`tokens x hidden` BF16).
+    pub fn read_vision_embeddings(&self) -> Result<Vec<u8>, String> {
+        self.vision
+            .as_ref()
+            .ok_or("this engine was loaded without image input")?
+            .read_features(&self.dev)
     }
 
     pub fn max_ctx(&self) -> u64 {
@@ -2177,6 +2441,15 @@ impl Gemma4Engine {
         cancel: Option<&AtomicBool>,
         mut on_token: impl FnMut(i32),
     ) -> Result<GenReport, String> {
+        // image input: the request's images (taken even when the request fails) against its
+        // placeholder rows
+        let images = match self.vision.as_mut() {
+            Some(v) => v.begin_request(prompt_ids)?,
+            None => Vec::new(),
+        };
+        if !images.is_empty() && self.calib.is_some() {
+            return Err("a calibration load takes text prompts only".into());
+        }
         if prompt_ids.is_empty() {
             return Err("prompt must contain at least 1 token".into());
         }
@@ -2215,6 +2488,7 @@ impl Gemma4Engine {
         self.live.prefill_progress(0);
         let res = self.run_generate_inner(
             prompt_ids,
+            &images,
             params,
             &mut budget,
             &is_eos,
@@ -2222,6 +2496,9 @@ impl Gemma4Engine {
             &mut on_token,
         );
         self.live.end_request();
+        if let Some(v) = self.vision.as_mut() {
+            v.req = None;
+        }
         if res.is_err() {
             // never leave a launch queued behind an error return
             let _ = self.dev.sync_all();
@@ -2232,6 +2509,7 @@ impl Gemma4Engine {
     fn run_generate_inner(
         &mut self,
         prompt_ids: &[i32],
+        images: &[crate::vision::PreparedImage],
         params: &GenParams,
         budget: &mut SequenceBudget,
         is_eos: &impl Fn(i32) -> bool,
@@ -2263,6 +2541,31 @@ impl Gemma4Engine {
         let mut last_tile = 0u64;
         // time spent compiling / loading recipes on first use: reported, not counted as prefill rate
         let mut recipe_ms = 0.0f64;
+        // image input: the image path runs first, its soft tokens land in the feature buffer;
+        // the prefill then reads them at the image rows
+        let mut last_out = None;
+        if !images.is_empty() {
+            let v = self.vision.as_mut().expect("images are taken by the image path");
+            v.encode(
+                &self.dev,
+                self.dev.api(),
+                &self.cache,
+                &self.driver_version,
+                images,
+            )?;
+            if let Some(r) = v.last_report() {
+                recipe_ms += r.compile_ms;
+            }
+            match self.prefill_vis(prompt_ids, is_cancelled)? {
+                Some((t, out, ms)) => {
+                    last_tile = t;
+                    last_out = Some(out);
+                    recipe_ms += ms;
+                    pos = prompt_ids.len();
+                }
+                None => return Ok(cancelled_report(t_prefill.elapsed().as_secs_f64() * 1000.0)),
+            }
+        }
         while pos < prompt_ids.len() {
             if is_cancelled() {
                 return Ok(cancelled_report(t_prefill.elapsed().as_secs_f64() * 1000.0));
@@ -2336,7 +2639,10 @@ impl Gemma4Engine {
         recipe_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
         {
             let mut pool = self.pf_scratch.clone();
-            pool.insert("x_in".into(), self.prefill_io(n_layers - 1).1);
+            pool.insert(
+                "x_in".into(),
+                last_out.unwrap_or_else(|| self.prefill_io(n_layers - 1).1),
+            );
             pool.insert("w_final".into(), self.weights_addr["w_final"]);
             pool.insert("h_final".into(), self.pf_hfin);
             let r = &self.final_recipes[&last_tile];
@@ -2581,7 +2887,7 @@ impl Gemma4Engine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn spec_json(extra_tc: &str, layers: usize, global_every: usize) -> String {
@@ -2617,7 +2923,7 @@ mod tests {
         )
     }
 
-    fn e2b() -> ModelSpec {
+    pub(crate) fn e2b() -> ModelSpec {
         let tc = r#""hidden_size": 1536, "intermediate_size": 6144, "num_attention_heads": 8,
             "num_key_value_heads": 1, "num_global_key_value_heads": null, "sliding_window": 512,
             "attention_k_eq_v": false, "hidden_size_per_layer_input": 256,
@@ -2626,13 +2932,48 @@ mod tests {
         ModelSpec::from_config_json(&spec_json(tc, 35, 5)).unwrap()
     }
 
-    fn b31() -> ModelSpec {
+    pub(crate) fn b31() -> ModelSpec {
         let tc = r#""hidden_size": 5376, "intermediate_size": 21504, "num_attention_heads": 32,
             "num_key_value_heads": 16, "num_global_key_value_heads": 4, "sliding_window": 1024,
             "attention_k_eq_v": true, "hidden_size_per_layer_input": 0,
             "vocab_size_per_layer_input": 262144, "num_kv_shared_layers": 0,
             "use_double_wide_mlp": false"#;
         ModelSpec::from_config_json(&spec_json(tc, 60, 6)).unwrap()
+    }
+
+    #[test]
+    fn the_plan_covers_what_the_arena_takes() {
+        use crate::verified::g4v_add_part;
+        // two 257-byte buffers: the second starts on the next step, so with today's 256-byte
+        // step the arena needs 769 bytes, which an unaligned count (514) would miss
+        let plan = g4v_add_part(g4v_add_part(0, 257), 257);
+        let mut a = HbmArena::new(0, plan);
+        arena_take(&mut a, 257).unwrap();
+        assert_eq!(arena_take(&mut a, 257).unwrap(), 2 * g4v_arena_step());
+        assert_eq!(a.used(), 769);
+        // sequences of sizes around the step, empty buffers included: an arena of exactly the
+        // plan's bytes holds every buffer of the plan
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..200 {
+            let sizes: Vec<u64> = (0..1 + round % 17)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let s = g4v_arena_step();
+                    match (seed >> 60) % 4 {
+                        0 => (seed >> 20) % 4,
+                        1 => s - 2 + (seed >> 20) % 4,
+                        2 => (seed >> 20) % (8 * s),
+                        _ => (seed >> 20) % (1 << 22),
+                    }
+                })
+                .collect();
+            let plan = sizes.iter().fold(0, |t, &b| g4v_add_part(t, b));
+            let mut a = HbmArena::new(0, plan);
+            for &b in &sizes {
+                arena_take(&mut a, b).unwrap_or_else(|e| panic!("{sizes:?}: {e}"));
+            }
+            assert!(a.used() <= plan);
+        }
     }
 
     #[test]
@@ -2726,7 +3067,7 @@ mod tests {
     fn plan_of_the_large_size_matches_the_shapes() {
         let s = b31();
         let d = G4Dims::from_spec(&s, 256, G4NormMode::Vendor).unwrap();
-        let p = G4Plan::build(&d, 4096, 1, 256, None);
+        let p = G4Plan::build(&d, 4096, 1, 256, None, None);
         // 50 sliding layers: K and V rings of 16 heads x 256 x 2048 slots, BF16
         assert_eq!(p.rings.len(), 100);
         assert_eq!(p.ring_bytes(), 100 * 16 * 256 * 2048 * 2);
@@ -2745,7 +3086,7 @@ mod tests {
             );
         }
         // the full context: the global caches grow 64-fold, the rings do not
-        let p64 = G4Plan::build(&d, 262_144, 64, 256, None);
+        let p64 = G4Plan::build(&d, 262_144, 64, 256, None, None);
         assert_eq!(p64.kv_bytes(), 64 * p.kv_bytes());
         assert_eq!(p64.ring_bytes(), p.ring_bytes());
         // generic layer recipes name every weight of their kind with the generic prefix

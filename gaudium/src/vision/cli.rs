@@ -68,10 +68,21 @@ impl CliImages {
     /// Puts one placeholder block per image in front of the user text, as the chat template
     /// does for `[image..., text]` content, unless the text already places them itself.
     pub fn with_placeholders(&self, text: &str) -> String {
-        if text.contains(self.spec.image_block.as_str()) || text.contains("<|image_pad|>") {
+        // a model whose processor writes more than the template's block (begin and end tokens
+        // around the pad) gets that text in place of each block
+        let block = self.spec.image_block.as_str();
+        let full = if self.spec.image_text.is_empty() {
+            block
+        } else {
+            self.spec.image_text.as_str()
+        };
+        if text.contains(full) || text.contains("<|image_pad|>") {
             return text.to_string();
         }
-        let mut s = self.spec.image_block.repeat(self.images.len());
+        if text.contains(block) {
+            return text.replace(block, full);
+        }
+        let mut s = full.repeat(self.images.len());
         s.push_str(text);
         s
     }

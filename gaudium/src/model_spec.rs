@@ -52,6 +52,11 @@ pub struct Gemma4Spec {
     pub v_heads: u64,
     pub v_head_dim: u64,
     pub v_hidden: u64,
+    /// The rows of one image attend each other both ways in the sliding layers
+    /// (`use_bidirectional_attention: "vision"`).
+    pub bidirectional_vision: bool,
+    /// `pad_token_id`: what an image row's per-layer input gathers.
+    pub pad_id: i32,
 }
 
 /// Geometry of an Inkling 2 decoder beyond the common fields (`text_config` of its `config.json`).
@@ -472,6 +477,13 @@ impl ModelSpec {
                 v_heads: vc.map(|x| u64_field(x, "num_attention_heads")).unwrap_or(0),
                 v_head_dim: vc.map(|x| u64_field(x, "head_dim")).unwrap_or(0),
                 v_hidden: vc.map(|x| u64_field(x, "hidden_size")).unwrap_or(0),
+                bidirectional_vision: tc.get("use_bidirectional_attention").and_then(JsonValue::as_str)
+                    == Some("vision"),
+                pad_id: tc
+                    .get("pad_token_id")
+                    .or_else(|| root.get("pad_token_id"))
+                    .and_then(JsonValue::as_i64)
+                    .map_or(0, |v| v as i32),
             })
         } else {
             None

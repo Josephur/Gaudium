@@ -310,6 +310,8 @@ pub fn tiled_spec(
     let s = VisionSpec {
         processor: ImageProcessor::Tiles,
         image_block: format!("{}{token}", FAMILY.content_image),
+        image_text: String::new(),
+        rescale: 1.0 / 255.0,
         depth: d.layers,
         hidden: d.hid,
         n_heads: d.nh,
@@ -429,6 +431,7 @@ pub fn prepare_tiles(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, S
         pixels.push(f32_to_bf16_rne((v - mean[c]) / std[c]))
     });
     Ok(PreparedImage {
+        merge: vs.merge as usize,
         src_width: img.width,
         src_height: img.height,
         width: rw,

@@ -1306,9 +1306,18 @@ fn served_max_ctx(cfg: &ServerConfig, id: &str, dir: &Path) -> u64 {
     )
 }
 
+/// Whether the engine of a model family runs its checkpoint's image path (the Qwen3.5 / 3.8,
+/// Inkling 2 and Gemma 4 families).
+fn engine_runs_tower(family: ModelFamily) -> bool {
+    matches!(
+        family,
+        ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe | ModelFamily::Inkling2 | ModelFamily::Gemma4
+    )
+}
+
 /// The vision tower the served model `id` is loaded with: `(largest image in patches, image
 /// tokens per request)`, or `None` for text only. A model has a tower when its checkpoint has
-/// one, its engine runs it (the Qwen3.5 / 3.8 and Inkling 2 families), its drafter is one that runs with image
+/// one, its engine runs it (`engine_runs_tower`), its drafter is one that runs with image
 /// input (the verified `vis_drafter_ok`), and neither `--no-vision` nor the model's own
 /// `--model-vision <id>=off` turned it off. The token count is held to the context.
 fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Option<(u64, u64)> {
@@ -1327,11 +1336,7 @@ fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Opt
     }
     // vision: a checkpoint with a tower, or a GGUF model with a projector file beside it
     let spec = crate::vision::model_with_tower(dir)?;
-    let runs_tower = matches!(
-        spec.family,
-        ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe | ModelFamily::Inkling2
-    );
-    if !runs_tower {
+    if !engine_runs_tower(spec.family) {
         return None;
     }
     let drafter = planned_drafter_of(cfg, id).map(|(_, kind, _)| kind);
@@ -1358,6 +1363,12 @@ fn vision_serve_of(
     };
     let spec = VisionSpec::from_model_dir(dir)?;
     let ppt = spec.patches_per_token();
+    // a model whose tokens are 3 x 3 patches (Gemma 4) plans whole tokens of the patch count
+    let patches = if matches!(spec.processor, crate::vision::ImageProcessor::Gemma4 { .. }) {
+        crate::verified::g4v_whole_token_patches(patches, ppt)
+    } else {
+        patches
+    };
     if !patches.is_multiple_of(ppt) {
         return Err(format!(
             "the largest image ({patches} patches) must be a multiple of {ppt} patches"
@@ -1619,18 +1630,14 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         let max_ctx = served_max_ctx(&cfg, &entry.id, &entry.dir);
         let vision = vision_serve_of(&cfg, &entry.id, &entry.dir, max_ctx)
             .map_err(|e| format!("vision input of '{}': {e}", entry.id))?;
-        let runs_tower = matches!(
-            spec.family,
-            ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe | ModelFamily::Inkling2
-        );
-        if vision.is_none() && spec.has_vision && runs_tower && cfg.vision {
+        if vision.is_none() && spec.has_vision && engine_runs_tower(spec.family) && cfg.vision {
             if let Some((_, kind, _)) =
 planned_drafter_of(&cfg, &entry.id).filter(|d| {
                     !drafter_runs_with_vision(Some(d.1), spec.family)
                 })
             {
                 eprintln!(
-                    "[server] model '{}': served text only: its {kind} drafter has not passed the vision regression suite for this model family (plain decode, DSpine, a dense Qwen model's DFlash2 drafter and MTP head, and Inkling 2's own drafter have)",
+                    "[server] model '{}': served text only: its {kind} drafter is not validated with image input for this model family (plain decode, DSpine, a dense Qwen model's DFlash2 drafter and MTP head, Inkling 2's own drafter and Gemma 4's -assistant drafter are)",
                     entry.id
                 );
             }

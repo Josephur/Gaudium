@@ -269,6 +269,9 @@ pub struct RequestMedia {
     pub items: Vec<MediaItem>,
     /// The template's text for one image (`VisionSpec::image_block`; empty: `IMAGE_BLOCK`).
     pub image_block: String,
+    /// What each image block becomes in the expanded text (`VisionSpec::image_text`; empty:
+    /// the block itself).
+    pub image_text: String,
     /// Host time spent decoding and preparing (ms).
     pub host_ms: f64,
 }
@@ -602,6 +605,7 @@ impl RequestMedia {
         Ok(Self {
             items,
             image_block: serve.spec.image_block.clone(),
+            image_text: serve.spec.image_text.clone(),
             host_ms: t0.elapsed().as_secs_f64() * 1000.0,
         })
     }
@@ -674,7 +678,8 @@ impl RequestMedia {
             }
             out.push_str(&rest[..at]);
             match it {
-                MediaItem::Image(_) => out.push_str(image_block),
+                MediaItem::Image(_) if self.image_text.is_empty() => out.push_str(image_block),
+                MediaItem::Image(_) => out.push_str(&self.image_text),
                 MediaItem::Video(v) => {
                     for &t in &v.times {
                         out.push_str(&time_label(t));

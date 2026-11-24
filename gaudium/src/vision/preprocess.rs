@@ -352,8 +352,11 @@ pub struct PreparedImage {
     /// Patch grid of the resized image (rows, columns); both even.
     pub grid_h: usize,
     pub grid_w: usize,
-    /// Values per patch row (`VisionSpec::patch_row`).
+    /// Values per patch row (`VisionSpec::patch_row`; a Gemma 4 unified row holds a whole
+    /// token's `merge x merge` patches).
     pub row_len: usize,
+    /// Patches along each axis that make one decoder token (`VisionSpec::merge`).
+    pub merge: usize,
     /// BF16 patch rows `[n_patches][row_len]` in merge order (the tower's `{row_len, N}` input).
     pub pixels: Vec<u16>,
 }
@@ -370,7 +373,8 @@ impl PreparedImage {
             height: rh,
             grid_h: rh / p,
             grid_w: rw / p,
-            row_len: vs.patch_row() as usize,
+            row_len: crate::engine::gemma4::vision::row_len(vs),
+            merge: vs.merge as usize,
             pixels: Vec::new(),
         }
     }
@@ -381,7 +385,7 @@ impl PreparedImage {
 
     /// Decoder tokens (image-pad rows) this image occupies.
     pub fn n_tokens(&self) -> usize {
-        (self.grid_h / 2) * (self.grid_w / 2)
+        crate::core::vision::grid_tokens(self.grid_h, self.grid_w, self.merge as u64) as usize
     }
 }
 
@@ -446,6 +450,9 @@ pub fn image_target_size(
     if vs.processor == ImageProcessor::Tiles {
         return crate::engine::inkling2::vision::padded_size(width, height, vs);
     }
+    if let ImageProcessor::Gemma4 { .. } = vs.processor {
+        return crate::engine::gemma4::vision::target_size(width, height, vs);
+    }
     smart_resize(
         height,
         width,
@@ -491,6 +498,7 @@ fn patch_rows_bf16(
     });
     debug_assert_eq!(pixels.len(), grid_h * grid_w * row_len);
     PreparedImage {
+        merge: vs.merge as usize,
         src_width: src.0,
         src_height: src.1,
         width: rw,
@@ -506,6 +514,9 @@ fn patch_rows_bf16(
 pub fn prepare_image(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, String> {
     if vs.processor == ImageProcessor::Tiles {
         return crate::engine::inkling2::vision::prepare_tiles(img, vs);
+    }
+    if let ImageProcessor::Gemma4 { .. } = vs.processor {
+        return crate::engine::gemma4::vision::prepare_image(img, vs);
     }
     let (rh, rw, resized) = resize_for_tower(img, vs)?;
     let frames = vec![resized.as_slice(); vs.temporal as usize];
@@ -524,6 +535,9 @@ pub fn prepare_image(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, S
 pub fn patch_rows_f32(img: &RgbImage, vs: &VisionSpec) -> Result<(usize, usize, Vec<f32>), String> {
     if vs.processor == ImageProcessor::Tiles {
         return crate::engine::inkling2::vision::tile_rows_f32(img, vs);
+    }
+    if let ImageProcessor::Gemma4 { .. } = vs.processor {
+        return crate::engine::gemma4::vision::pixel_rows_f32(img, vs);
     }
     let (rh, rw, resized) = resize_for_tower(img, vs)?;
     let p = vs.patch as usize;

@@ -195,14 +195,17 @@ fn print_usage() {
          \x20                       WebP, or a list of frames with their rate) in chat requests.\n\
          \x20                       A GGUF model's tower is a projector file (mmproj*.gguf) beside\n\
          \x20                       it; with none there it is served text only.\n\
-         \x20                       A model drafted by a block or an MTP drafter is served text\n\
-         \x20                       only (plain decode, DSpine and Inkling 2's own drafter run\n\
-         \x20                       with image input)\n\
+         \x20                       Drafters that run with image input: DSpine, a dense Qwen\n\
+         \x20                       model's DFlash2 drafter and MTP head, Inkling 2's own drafter\n\
+         \x20                       and Gemma 4's -assistant drafter; a model with another drafter\n\
+         \x20                       is served text only (Gemma 4 takes images, no video)\n\
          \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\
          \x20                       model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:\n\
          \x20                       1024x1024 pixels, larger images are resized down to it; 20x20\n\
          \x20                       for Inkling 2, which never resizes: an image of more than N/4\n\
-         \x20                       tiles of 40x40 pixels is refused). The tower's device memory\n\
+         \x20                       tiles of 40x40 pixels is refused; Gemma 4: an image is resized\n\
+         \x20                       to whole 48x48-pixel soft tokens of 9 patches, at most N/9 and\n\
+         \x20                       at most the checkpoint's own budget). The tower's device memory\n\
          \x20                       grows with N^2 (about 160 bytes x N^2: 2.5 GiB at 4096)\n\
          \x20 --vision-max-tokens <N>  Image tokens one request may hold, all images and video\n\
          \x20                       frames together (default: 16384; 10 KiB of device memory each)\n\
