@@ -357,6 +357,19 @@ mod tests {
         assert!(with.total() > mid.total());
         assert_eq!(prefill_tile_launches(&d, false, false), 49);
         assert_eq!(prefill_tile_launches(&d, true, true), 52);
+        // today's plan, pinned here rather than sealed (a later fusion may change it): the last
+        // tile and a drafter add launches, never remove them
+        for drafter in [false, true] {
+            assert!(
+                prefill_tile_launches(&d, drafter, true)
+                    >= prefill_tile_launches(&d, drafter, false)
+            );
+        }
+        for last in [false, true] {
+            assert!(
+                prefill_tile_launches(&d, true, last) >= prefill_tile_launches(&d, false, last)
+            );
+        }
         assert_ne!(
             tile_key(256, 1, false, true),
             tile_key(256, 1, false, false)

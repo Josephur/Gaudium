@@ -377,6 +377,9 @@ d1a4f19a096d333c  ik_taps_nonzero  law ik_taps_nonzero : for + t : Nat { Bool.an
 # promise ik_taps_nonzero: the shape guard refuses short convolutions without taps.
 1020da00a9c12c67  ik_tile_holds_rows  law ik_tile_holds_rows : for + rows : Nat for + tile : Nat for + room : Nat { Nat.is_le ( rows , ik_tile_rows ( rows , tile , room ) ) == True { } : Bool }
 # promise ik_tile_holds_rows: a prefill tile never has fewer rows than the prompt rows it carries.
+43c5cf58b599e634  ik_tile_launches_some  law ik_tile_launches_some : for apps : Nat for drafter : Bool for last : Bool { Nat.is_lt ( 0n , ik_tile_launches ( apps , drafter , last ) ) == True { } : Bool }
+# promise ik_tile_launches_some: a prefill tile always runs at least one launch
+# harm ik_tile_launches_some: the readout reports a tile that ran nothing on the card
 ee1eabf3467cbedc  ik_tile_readout_inside  law ik_tile_readout_inside : for + rp : Nat for + tile : Nat for + room : Nat { Nat.is_lt ( ik_tile_last_row ( 1n + rp ) , ik_tile_rows ( 1n + rp , tile , room ) ) == True { } : Bool }
 # promise ik_tile_readout_inside: the row the prefill readout reads is a row of the last tile (its last prompt row).
 ab05c1840659a1e2  ik_tile_take_bounded  law ik_tile_take_bounded : for + left : Nat for + tile : Nat { Bool.and ( Nat.is_le ( ik_tile_take ( left , tile ) , left ) , Nat.is_le ( ik_tile_take ( left , tile ) , tile ) ) == True { } : Bool }
