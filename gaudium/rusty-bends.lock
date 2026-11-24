@@ -83,14 +83,59 @@ d556bde2ff41c207  g4_heads_zero_kv_rejected  law g4_heads_zero_kv_rejected : for
 b92e3f940df9aed8  g4_kv_share_all_rejected  law g4_kv_share_all_rejected : for + nl : Nat for + extra : Nat { g4_kv_share_valid ( nl , Nat.add ( nl , extra ) ) == False { } : Bool }
 c53430ffbf275392  g4_ple_off_always_valid  law g4_ple_off_always_valid : for pv : Nat for v : Nat { g4_ple_valid ( 0n , pv , v ) == True { } : Bool }
 629829a88fd02c54  g4_rope_vecs_boundary  law g4_rope_vecs_boundary : { Bool.and ( Nat.is_eq ( g4_rope_vecs ( 0n ) , 0n ) , Nat.is_eq ( g4_rope_vecs ( 128n ) , 1n ) ) == True { } : Bool }
+1c002a72a7319a99  g4u_block_before_rows_outside  law g4u_block_before_rows_outside : for + s : Nat for + n : Nat for + k : Nat for + b : Nat { g4u_overlaps ( s , n , Nat.add ( Nat.add ( s , n ) , k ) , b ) == False { } : Bool }
+# promise g4u_block_before_rows_outside: an image block that ends at or before the first of some rows has no row among them.
+4e85b1fb1a5becf2  g4u_block_end_row_outside  law g4u_block_end_row_outside : for + s : Nat for + n : Nat { g4u_in_block ( s , n , Nat.add ( s , n ) ) == False { } : Bool }
+# promise g4u_block_end_row_outside: the row right after an image block is not in it.
+e45d92ed19b2ff9f  g4u_causal_tile_final  law g4u_causal_tile_final : for + e : Nat for u : Nat { g4u_final ( False { } , e , u ) == True { } : Bool }
+# promise g4u_causal_tile_final: a tile of a causal unit (no two-way image block) is always final, so the prefill always moves past it.
+# harm g4u_causal_tile_final: the small sizes' image prompts would be refused whenever an image crosses a tile boundary.
+921914aa21e1c368  g4u_ext_within_block  law g4u_ext_within_block : for + p : Nat for + k : Nat for + u : Nat { Nat.is_lt ( Nat.add ( p , g4u_ext ( True { } , p , 1n + Nat.add ( p , k ) , u ) ) , 1n + Nat.add ( p , k ) ) == True { } : Bool }
+# promise g4u_ext_within_block: a row of an image block never attends a position past the end of its own block.
+# harm g4u_ext_within_block: it would attend text or another image that the reference keeps causal.
 7abfa6b6fe57928a  g4u_ext_within_unit  law g4u_ext_within_unit : for b : Bool for + p : Nat for + e : Nat for + k : Nat { Nat.is_lt ( Nat.add ( p , g4u_ext ( b , p , e , 1n + Nat.add ( p , k ) ) ) , 1n + Nat.add ( p , k ) ) == True { } : Bool }
 # promise g4u_ext_within_unit: a prefill row in a sliding layer never attends a position past the end of the keys its unit has written.
 # harm g4u_ext_within_unit: it would read a ring slot that holds a stale or foreign key.
+25d795bd7c4ec518  g4u_final_refuses_past_end  law g4u_final_refuses_past_end : for + u : Nat for + k : Nat { g4u_final ( True { } , 1n + Nat.add ( u , k ) , u ) == False { } : Bool }
+# promise g4u_final_refuses_past_end: a tile whose image block runs past the keys its unit wrote is never taken as final.
+# harm g4u_final_refuses_past_end: its block rows would keep an attention that missed the rest of their image.
 e8092380d5d2675c  g4u_fits_within_ring  law g4u_fits_within_ring : for + r : Nat for + w : Nat for + n : Nat { Bool.and ( g4u_fits ( r , w , n ) , Nat.is_lt ( 1n + r , Nat.add ( n , w ) ) ) == False { } : Bool }
 # promise g4u_fits_within_ring: a prefill unit the ring is said to fit keeps its rows and the window of its first row inside the ring (rows + window <= ring + 1).
 # harm g4u_fits_within_ring: a later tile's keys would overwrite keys an earlier tile's rows still attend.
 cce1a244d6e57d79  g4u_join_within_buffers  law g4u_join_within_buffers : for c : Bool for + n : Nat for + m : Nat { Bool.and ( g4u_join ( c , n , m ) , Nat.is_le ( m , n ) ) == False { } : Bool }
 # promise g4u_join_within_buffers: a unit never takes a tile beyond the tile buffers the plan holds for it.
+2b6968de5ecec504  g4u_text_row_causal  law g4u_text_row_causal : for + p : Nat for e : Nat for u : Nat { g4u_ext ( False { } , p , e , u ) == 0n : Nat }
+# promise g4u_text_row_causal: a text row attends nothing after its own position.
+f6b30e6f9966fc4e  g4u_unit_tiles_at_least_one  law g4u_unit_tiles_at_least_one : for + t : Nat for + b : Nat { Nat.is_le ( 1n , g4u_unit_tiles ( t , b ) ) == True { } : Bool }
+# promise g4u_unit_tiles_at_least_one: a prefill unit always holds at least the tile it starts with.
+1f25794122474e68  g4v_add_part_covers  law g4v_add_part_covers : for + t : Nat for + b : Nat { Nat.is_le ( Nat.add ( t , b ) , g4v_add_part ( t , b ) ) == True { } : Bool }
+# promise g4v_add_part_covers: adding a buffer to a plan grows its total by at least the buffer's bytes.
+09b284953e9e5a35  g4v_empty_width_refused  law g4v_empty_width_refused : { g4v_width_ok ( 0n ) == False { } : Bool }
+# promise g4v_empty_width_refused: an empty width is never taken by the row kernels.
+ba9095e8dd5c8650  g4v_image_budget_within_model  law g4v_image_budget_within_model : for + m : Nat for + p : Nat for + k : Nat { Nat.is_le ( g4v_image_budget ( m , p , k ) , m ) == True { } : Bool }
+# promise g4v_image_budget_within_model: an image's soft-token budget never exceeds the checkpoint's own budget.
+b5e7132dadf28738  g4v_image_budget_within_tower  law g4v_image_budget_within_tower : for + m : Nat for + p : Nat for + kp : Nat { Nat.is_le ( Nat.mul ( g4v_image_budget ( m , p , 1n + kp ) , 1n + kp ) , p ) == True { } : Bool }
+# promise g4v_image_budget_within_tower: the patches of an image of the budget never exceed the patches the tower is planned for.
+# harm g4v_image_budget_within_tower: the tower's planned buffers would be too small for an image the processor accepts.
+52925649d6a88207  g4v_layerless_tower_refused  law g4v_layerless_tower_refused : for + i : Nat { g4v_tower_ok ( 0n , i ) == False { } : Bool }
+# promise g4v_layerless_tower_refused: a tower without layers is refused.
+6c4083aec2e0d559  g4v_request_holds_an_image  law g4v_request_holds_an_image : for c : Nat for + b : Nat { Nat.is_le ( b , g4v_request_tokens ( c , b ) ) == True { } : Bool }
+# promise g4v_request_holds_an_image: the tokens a request may hold always take at least one image of the budget.
+732286c720e4c43b  g4v_size_within_budget  law g4v_size_within_budget : for + th : Nat for + tw : Nat for + patch : Nat for + merge : Nat for + m : Nat { Bool.and ( g4v_size_ok ( th , tw , patch , merge , m ) , Nat.is_lt ( m , g4v_tokens ( th , tw , patch , merge ) ) ) == False { } : Bool }
+# promise g4v_size_within_budget: an image size the processor accepts never holds more soft tokens than the budget the tower is planned for.
+# harm g4v_size_within_budget: an image past the budget would write soft tokens beyond the planned buffers.
+0e4e462545246a64  g4v_soft_budget_within_pixels  law g4v_soft_budget_within_pixels : for + px : Nat for + sp : Nat { Nat.is_le ( Nat.mul ( g4v_soft_budget ( px , 1n + sp ) , Nat.mul ( 1n + sp , 1n + sp ) ) , px ) == True { } : Bool }
+# promise g4v_soft_budget_within_pixels: the soft tokens a pixel budget is said to hold never take more pixels than the budget.
+b0df17526860efb7  g4v_table_refuses_tall_grid  law g4v_table_refuses_tall_grid : for + n : Nat for + k : Nat for + w : Nat { g4v_table_holds ( 1n + Nat.add ( n , k ) , w , n ) == False { } : Bool }
+# promise g4v_table_refuses_tall_grid: a grid taller than the position table is refused.
+# harm g4v_table_refuses_tall_grid: the host would read position rows past the end of the table.
+89ab677ff5ef8ff3  g4v_unified_pad_holds_its_rows  law g4v_unified_pad_holds_its_rows : for + b : Nat for k : Nat { Nat.is_le ( g4v_recipe_rows ( True { } , b , k ) , g4v_pad_cols ( True { } , b ) ) == True { } : Bool }
+# promise g4v_unified_pad_holds_its_rows: the feature buffer's padding holds every row the unified embedder's recipe writes past an image.
+# harm g4v_unified_pad_holds_its_rows: the last image's recipe would write past the feature buffer.
+dcfddfa5a53ff82e  g4v_whole_token_patches_within  law g4v_whole_token_patches_within : for + p : Nat for + kp : Nat { Nat.is_le ( g4v_whole_token_patches ( p , 1n + kp ) , p ) == True { } : Bool }
+# promise g4v_whole_token_patches_within: flooring a patch count to whole tokens never raises it.
+6dcec9a285ad3c40  g4v_zero_patch_refused  law g4v_zero_patch_refused : for + q : Nat for + n : Nat { g4v_grid_ok ( 0n , q , n ) == False { } : Bool }
+# promise g4v_zero_patch_refused: an image path without a patch size is refused.
 13a2fa8783059771  gdn_zero_k_rejected  law gdn_zero_k_rejected : for + vh : Nat for ck : Nat { gdn_dims_valid ( 0n , vh , ck ) == False { } : Bool }
 5e31df0d7e1ee34b  gen_end_call_limit_not_cancel  law gen_end_call_limit_not_cancel : for eos : Bool for cancelled : Bool { gen_end ( False { } , True { } , eos , cancelled ) == GeCallLimit { } : GenEnd }
 701a333557e52866  gen_end_no_flag_is_length  law gen_end_no_flag_is_length : { gen_end ( False { } , False { } , False { } , False { } ) == GeLength { } : GenEnd }
