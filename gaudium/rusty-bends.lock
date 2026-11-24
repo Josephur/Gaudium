@@ -1071,6 +1071,10 @@ de268a1486c5450c  turn_due_after_max_skips  law turn_due_after_max_skips : for +
 # promise turn_due_after_max_skips: a waiter passed over its maximum number of times is due: no request passes it over any more.
 5b87da18e5435668  turn_due_after_max_wait  law turn_due_after_max_wait : for + w : Nat for + e : Nat for + s : Nat for + ms : Nat { turn_due ( Nat.add ( w , e ) , w , s , ms ) == True { } : Bool }
 # promise turn_due_after_max_wait: a waiter that has waited its maximum wait is due: no request passes it over any more.
+e1c0a1c7de02c50e  turn_due_keeps_turn  law turn_due_keeps_turn : for + d : Bool for + l1 : Bool for + l2 : Bool { turn_better ( turn_rank ( d , l1 ) , turn_rank ( True { } , l2 ) ) == False { } : Bool }
+# promise turn_due_keeps_turn: no later waiter takes the card's turn from a waiter whose turn is due.
+1efa0cb517137444  turn_due_takes_turn  law turn_due_takes_turn : for + l1 : Bool for + l2 : Bool { turn_better ( turn_rank ( True { } , l1 ) , turn_rank ( False { } , l2 ) ) == True { } : Bool }
+# promise turn_due_takes_turn: a waiter whose turn on the card is due takes the turn from every earlier waiter whose turn is not due.
 09ae686fe3d30743  unsupported_method_refuses_sampling  law unsupported_method_refuses_sampling : { sampling_request_admitted ( False { } , True { } ) == False { } : Bool }
 95d8e8e470b18e0a  vid_frame_index_in_range  law vid_frame_index_in_range : for + raw : Nat for + p : Nat { Nat.is_le ( vid_frame_index ( raw , 1n + p ) , p ) == True { } : Bool }
 673301e5bd807518  vid_group_frame_in_range  law vid_group_frame_in_range : for + g : Nat for + s : Nat for + t : Nat for + p : Nat { Nat.is_le ( vid_group_frame ( g , s , t , 1n + p ) , p ) == True { } : Bool }
