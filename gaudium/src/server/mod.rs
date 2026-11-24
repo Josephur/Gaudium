@@ -2531,9 +2531,12 @@ impl TurnQueue {
                         // the waiters it takes the card before, that arrived first, were passed
                         // over once more (the verified rule a lane session's admissions use)
                         let at = self.clock(st.waiting[pos].since);
-                        for w in &mut st.waiting[..pos] {
-                            let passed = crate::core::lanes::passes_over(self.clock(w.since), at);
-                            w.skips = crate::core::lanes::skips_after(w.skips, passed);
+                        for (i, w) in st.waiting.iter_mut().enumerate() {
+                            if i != pos {
+                                let passed =
+                                    crate::core::lanes::passes_over(self.clock(w.since), at);
+                                w.skips = crate::core::lanes::skips_after(w.skips, passed);
+                            }
                         }
                         st.waiting.remove(pos);
                         st.busy = true;
@@ -2645,8 +2648,8 @@ fn drive_lanes(state: Arc<AppState>, idx: usize) {
             let mut s = state.slot.lock().unwrap();
             match s.engine.take() {
                 Some(e) if s.resident_idx == Some(idx) => {
-                    // the session counts as one active request while it runs (no idle release)
-                    s.active_requests += 1;
+                    // the session counts as an active request while it runs (no idle release)
+                    s.active_requests = crate::core::lanes::session_active(0);
                     s.last_activity = Instant::now();
                     Some(e)
                 }
@@ -2667,7 +2670,7 @@ fn drive_lanes(state: Arc<AppState>, idx: usize) {
         state.publish_engine_event();
         let mut feed = state.lanes.feed(idx);
         let st = &state;
-        let mut last_busy = 1u64;
+        let mut last_busy = crate::core::lanes::session_active(0);
         feed.on_lanes = Some(Box::new(move |busy| {
             let busy = crate::core::lanes::session_active(busy);
             if busy != last_busy {
@@ -2707,19 +2710,20 @@ fn drive_lanes(state: Arc<AppState>, idx: usize) {
             );
         }
         state.publish_engine_event();
-        if res.is_ok() && yielded {
-            // the oldest waiter takes the card; this session's requests wait for its next turn
-            continue;
-        }
-        if !ended {
+        match crate::verified::ln_session_after(res.is_ok(), yielded, ended) {
+            // the waiter that is due takes the card; this session's requests wait for its next turn
+            crate::verified::SessionAfter::SaAgain => continue,
             // the engine stopped before its feed ended the session: what still waits fails
-            let why = res
-                .err()
-                .unwrap_or_else(|| "the lane session ended".to_string());
-            state.lanes.fail_waiting(idx, &why);
-            state.publish_engine_event();
+            crate::verified::SessionAfter::SaFail => {
+                let why = res
+                    .err()
+                    .unwrap_or_else(|| "the lane session ended".to_string());
+                state.lanes.fail_waiting(idx, &why);
+                state.publish_engine_event();
+                return;
+            }
+            crate::verified::SessionAfter::SaDone => return,
         }
-        return;
     }
 }
 

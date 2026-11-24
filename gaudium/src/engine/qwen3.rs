@@ -1834,7 +1834,7 @@ impl Qwen3Engine {
                 use crate::core::hbm::{grant_prefix_slots, usable_hbm_bytes};
                 let usable =
                     usable_hbm_bytes(total_hbm, total_hbm.saturating_sub(free_hbm), headroom);
-                let all = pfx_wanted.saturating_mul(lanes_u);
+                let all = crate::verified::ln_lane_pfx_ask(pfx_wanted, lanes_u);
                 let fit = grant_prefix_slots(all, pfx_slot_bytes, base_total, usable);
                 let granted = crate::core::lanes::prefix_per_lane(
                     crate::verified::pc_grant_checked(fit, pfx_slot_bytes, base_total, usable),
@@ -1863,9 +1863,8 @@ impl Qwen3Engine {
         if let Some(why) = pfx_why_not.filter(|_| cfg.prefix_slots > 0) {
             eprintln!("[gaudium] prefix reuse: off ({why})");
         }
-        let pfx_bytes = pfx_granted
-            .saturating_mul(pfx_slot_bytes)
-            .saturating_mul(lanes_u);
+        let pfx_bytes = crate::verified::ln_lane_pfx_bytes(pfx_granted, pfx_slot_bytes, lanes_u);
+        let kv_arena_bytes = crate::verified::ln_kv_arena_total(kv_all, pfx_bytes);
         let planned_total = base_total.saturating_add(pfx_bytes);
         // [live] the same plan, buffer by buffer under named parts (the live record's
         // `hbm_detail`, and the lines below the plan total)
@@ -2088,7 +2087,7 @@ impl Qwen3Engine {
             eprintln!(
                 "[gaudium] HBM plan fits: weights={:.2} GiB, kv+state={:.2} GiB, acts={:.2} MiB, ws={:.2} MiB",
                 weights_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                (kv_all + pfx_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
+                kv_arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 act_bytes as f64 / (1024.0 * 1024.0),
                 ws_bytes as f64 / (1024.0 * 1024.0),
             );
@@ -2108,7 +2107,7 @@ impl Qwen3Engine {
             .alloc_arena(weights_bytes, HbmCat::CatWeights, "weights_arena")
             .map_err(|e| format!("alloc weights arena: {e}"))?;
         let mut kv_arena = dev
-            .alloc_arena(kv_all + pfx_bytes, HbmCat::CatKv, "kv_state_arena")
+            .alloc_arena(kv_arena_bytes, HbmCat::CatKv, "kv_state_arena")
             .map_err(|e| format!("alloc kv/state arena: {e}"))?;
         let mut act_arena = dev
             .alloc_arena(act_bytes, HbmCat::CatScratch, "act_arena")
@@ -2264,7 +2263,7 @@ impl Qwen3Engine {
         // Every K/V cache and state ring starts as zeros (a masked row must be finite): filled
         // on the device while the weights upload, ahead of any launch on the compute stream.
         let t_zero = Instant::now();
-        let mut zero_regions = vec![(kv_arena.base(), kv_all + pfx_bytes)];
+        let mut zero_regions = vec![(kv_arena.base(), kv_arena_bytes)];
         if let Some(sd) = &specdec {
             zero_regions.extend(sd.cache_regions());
         }
@@ -2680,7 +2679,8 @@ impl Qwen3Engine {
             dev,
         };
         eng.warm_prefill_tiles(cfg.prefill_warm_rows, cfg.verbose)?;
-        if eng.lanes.is_none() {
+        // (the host tier keeps one prefix cache, not one per lane)
+        if crate::verified::ln_host_tier_ok(n_lanes as u64, false) {
             host_tier::attach(&mut eng, cfg)?;
         } else if cfg.host_cache.is_some() {
             eprintln!(

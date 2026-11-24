@@ -148,6 +148,22 @@ impl LaneTable {
         Ok(())
     }
 
+    /// After a failed session: every lane's request ended with the error, and every lane is
+    /// free again, each through the verified lifecycle (a busy lane fails, then is released).
+    pub fn fail_all(&mut self) -> Result<(), LaneError> {
+        for lane in 0..self.states.len() {
+            let s = self.states[lane];
+            if ln_is_free(s) {
+                continue;
+            }
+            if !ln_is_drain(s) {
+                self.fail(lane)?;
+            }
+            self.release(lane)?;
+        }
+        Ok(())
+    }
+
     /// The lane's prompt is prefilled: it decodes from now on.
     pub fn prefilled(&mut self, lane: usize) -> Result<(), LaneError> {
         self.apply(lane, LaneEvent::EvLnPrefilled).map(|_| ())
@@ -445,6 +461,39 @@ mod tests {
         assert_eq!(ln_lane_arena_bytes(10, 3, 4), 49, "and lanes 1..4's step buffers");
         assert_eq!(ln_lane_arena_bytes(10, 3, 1), 10, "one lane: the runtime's own buffers");
         assert_eq!(ln_plan_shared(100, 4, 10), 60);
+    }
+
+    #[test]
+    fn a_failed_session_frees_every_lane_through_the_lifecycle() {
+        let mut t = LaneTable::new(4);
+        t.admit(0, false).unwrap(); // prefill
+        t.admit(1, false).unwrap();
+        t.prefilled(1).unwrap(); // decode
+        t.admit(2, true).unwrap();
+        t.prefilled(2).unwrap();
+        t.finish(2).unwrap(); // drained
+        t.fail_all().unwrap();
+        assert_eq!(t.busy(), 0);
+        assert!(!t.exclusive_active());
+        assert_eq!(t.route(|_| Offer::default()).is_some(), true);
+    }
+
+    #[test]
+    fn the_kept_positions_the_arena_the_host_tier_and_a_sessions_end() {
+        use crate::verified::{
+            ln_host_tier_ok, ln_kv_arena_total, ln_lane_pfx_ask, ln_lane_pfx_bytes,
+            ln_session_after, SessionAfter,
+        };
+        assert_eq!(ln_lane_pfx_bytes(8, 10, 4), 320);
+        assert_eq!(ln_lane_pfx_ask(8, 4), 32);
+        assert_eq!(ln_kv_arena_total(5, 7), 12);
+        assert!(ln_host_tier_ok(1, false) && ln_host_tier_ok(0, false));
+        assert!(!ln_host_tier_ok(2, false) && ln_host_tier_ok(2, true));
+        assert!(matches!(ln_session_after(true, true, false), SessionAfter::SaAgain));
+        assert!(matches!(ln_session_after(true, false, true), SessionAfter::SaDone));
+        assert!(matches!(ln_session_after(true, false, false), SessionAfter::SaFail));
+        assert!(matches!(ln_session_after(false, false, false), SessionAfter::SaFail));
+        assert!(matches!(ln_session_after(false, false, true), SessionAfter::SaDone));
     }
 
     #[test]

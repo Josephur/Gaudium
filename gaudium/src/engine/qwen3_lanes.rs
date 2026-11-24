@@ -786,7 +786,8 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
             }
         };
     let sampled = params.temperature > 0.0;
-    if sampled && !eng.lanes.as_ref().is_some_and(|rt| rt.sampled) {
+    let can_sample = eng.lanes.as_ref().is_some_and(|rt| rt.sampled);
+    if !crate::verified::sampling_request_admitted(can_sample, sampled) {
         out(done_event(
             Err("a sampled request in a lane needs the on-card sampler, which this model or kernel directory lacks".into()),
             eng,
@@ -1156,7 +1157,11 @@ pub(super) fn serve(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed) -> Result<()
             }
         }
         let rt = eng.lanes.as_mut().expect("lanes");
-        rt.table = LaneTable::new(n);
+        if rt.table.fail_all().is_err() {
+            // (every move of fail_all is allowed from a busy state; a table that refused one
+            // is replaced by a free one, as at load)
+            rt.table = LaneTable::new(n);
+        }
         let v = view(rt, &runs);
         feed.lanes(&v);
     }

@@ -218,6 +218,40 @@ def ln_lane_cursor_next(cursor: Nat, emitted: Nat, rows: Nat) -> Nat:
 def ln_lane_parity_next(p: Nat) -> Nat:
   Nat.sub(1n, p)
 
+# What a lane session's driver does once the engine stopped serving: wait for the card's next
+# turn (the session handed it back), fail the requests still queued (the engine stopped before its
+# feed ended the session), or stop (the feed ended the session: nothing is queued).
+type SessionAfter is Data:
+  SaAgain{}
+  SaFail{}
+  SaDone{}
+
+def ln_session_after_end(ended: Bool) -> SessionAfter:
+  match ended:
+    case True{}:
+      SaDone{}
+    case False{}:
+      SaFail{}
+
+# `ok`: the engine served without an error; `yielded`: the feed handed the card back; `ended`:
+# the feed ended the session.
+def ln_session_after(ok: Bool, yielded: Bool, ended: Bool) -> SessionAfter:
+  match ok:
+    case True{}:
+      match yielded:
+        case True{}:
+          SaAgain{}
+        case False{}:
+          ln_session_after_end(ended)
+    case False{}:
+      ln_session_after_end(ended)
+
+def ln_sa_done(a: SessionAfter) -> Bool:
+  match a:
+    case SaAgain{}: False{}
+    case SaFail{}: False{}
+    case SaDone{}: True{}
+
 # What a running lane session does next.
 type SessionMove is Data:
   SmEnd{}
@@ -327,6 +361,23 @@ def ln_plan_fits(n: Nat, lane_bytes: Nat, shared: Nat, usable: Nat) -> Bool:
 # (the first lane's are the speculative runtime's own, planned with it).
 def ln_lane_arena_bytes(kv: Nat, spec: Nat, +n: Nat) -> Nat:
   Nat.add(Nat.mul(n, kv), Nat.mul(Nat.sub(n, 1n), spec))
+
+# Bytes of the lanes' kept prefix positions: `n` lanes of `per_lane` positions of `slot` bytes.
+def ln_lane_pfx_bytes(per_lane: Nat, slot: Nat, n: Nat) -> Nat:
+  Nat.mul(n, Nat.mul(per_lane, slot))
+
+# Kept prefix positions a load asks the plan for: `wanted` in each of `n` lanes.
+def ln_lane_pfx_ask(wanted: Nat, n: Nat) -> Nat:
+  Nat.mul(n, wanted)
+
+# The device arena of the lanes' caches and state (`arena`) and their kept positions (`pfx`).
+def ln_kv_arena_total(arena: Nat, pfx: Nat) -> Nat:
+  Nat.add(arena, pfx)
+
+# May an engine with `lanes` lanes have the host-RAM tier of prefix reuse? Only one lane, unless
+# the tier keeps one prefix cache per lane (`per_lane`).
+def ln_host_tier_ok(lanes: Nat, per_lane: Bool) -> Bool:
+  Bool.or(Nat.is_le(lanes, 1n), per_lane)
 
 # The shared part of a device plan of `total` bytes holding `n` lanes of `lane_bytes`: what the
 # lane plan check is given beside the lanes.
@@ -1455,3 +1506,69 @@ law ln_plan_check_sees_whole_plan:
 
 def ln_plan_check_sees_whole_plan(t, n, lb):
   ln_sub_add_ge(t, Nat.mul(n, lb))
+
+# promise: the device plan counts every lane's caches and state and the speculative buffers of every lane but the first, together.
+law ln_arena_counts_all:
+  for +kv: Nat
+  for +sp: Nat
+  for +n: Nat
+  {Nat.is_le(Nat.add(Nat.mul(n, kv), Nat.mul(Nat.sub(n, 1n), sp)), ln_lane_arena_bytes(kv, sp, n)) == True{} : Bool}
+
+def ln_arena_counts_all(kv, sp, n):
+  L.nat_le_refl(Nat.add(Nat.mul(n, kv), Nat.mul(Nat.sub(n, 1n), sp)))
+
+# promise: the device plan counts the kept prefix positions of every lane.
+law ln_pfx_counts_every_lane:
+  for +p: Nat
+  for +s: Nat
+  for +n: Nat
+  {Nat.is_le(Nat.mul(n, Nat.mul(p, s)), ln_lane_pfx_bytes(p, s, n)) == True{} : Bool}
+
+def ln_pfx_counts_every_lane(p, s, n):
+  L.nat_le_refl(Nat.mul(n, Nat.mul(p, s)))
+
+# promise: a load asks the plan for the kept positions of every lane.
+law ln_pfx_ask_counts_every_lane:
+  for +w: Nat
+  for +n: Nat
+  {Nat.is_le(Nat.mul(n, w), ln_lane_pfx_ask(w, n)) == True{} : Bool}
+
+def ln_pfx_ask_counts_every_lane(w, n):
+  L.nat_le_refl(Nat.mul(n, w))
+
+# promise: the device arena holds both the lanes' caches and state and their kept positions.
+law ln_kv_arena_counts_both:
+  for +a: Nat
+  for +p: Nat
+  {Nat.is_le(Nat.add(a, p), ln_kv_arena_total(a, p)) == True{} : Bool}
+
+def ln_kv_arena_counts_both(a, p):
+  L.nat_le_refl(Nat.add(a, p))
+
+# promise: an engine with more than one lane never gets a host-RAM tier that keeps a single prefix cache.
+law ln_host_tier_never_with_lanes:
+  for +k: Nat
+  {ln_host_tier_ok(Nat.add(2n, k), False{}) == False{} : Bool}
+
+def ln_host_tier_never_with_lanes(k):
+  {==}
+
+# promise: a lane session's driver never stops while its feed has not ended the session, so no request is left queued with no session.
+law ln_after_never_strands:
+  for +o: Bool
+  for +y: Bool
+  {ln_sa_done(ln_session_after(o, y, False{})) == False{} : Bool}
+
+def ln_after_never_strands(o, y):
+  match o y:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a lane session that handed the card back waits for its next turn.
+law ln_after_yield_returns:
+  {ln_session_after(True{}, True{}, False{}) == SaAgain{} : SessionAfter}
+
+def ln_after_yield_returns():
+  {==}
