@@ -1286,15 +1286,12 @@ impl Qwen3Engine {
         // [lanes] several requests at once: lanes need batched steps for this engine and its
         // drafter (the verified choice the server makes too); a calibration load has one lane
         // (the batched speculative steps are DSpine's with the checkpoint form of the verify rows)
-        let lane_drafter = match cfg.spec.as_ref().map(|sc| &sc.method) {
-            None => crate::verified::LaneDrafter::LdNone,
-            Some(spec::SpecMethod::DSpine { .. })
-                if cfg.step.gdn_verify == crate::engine::step_opts::GdnVerify::Checkpoint =>
-            {
-                crate::verified::LaneDrafter::LdDSpine
-            }
-            Some(_) => crate::verified::LaneDrafter::LdOther,
-        };
+        let lane_drafter = crate::engine::lane_drafter(
+            cfg.spec
+                .as_ref()
+                .map(|sc| matches!(sc.method, spec::SpecMethod::DSpine { .. })),
+            cfg.step.gdn_verify,
+        );
         // (a calibration load: of the FP8 weights' activation sites, or of the K/V caches)
         let lanes_ok = crate::verified::ln_lanes_ok(
             crate::engine::lanes_supported(&spec),

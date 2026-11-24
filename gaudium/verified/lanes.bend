@@ -1665,3 +1665,10 @@ law ln_spec_batched_fits:
 
 def ln_spec_batched_fits(c, r, m):
   ln_or_not_self(Nat.is_le(Nat.add(c, r), m))
+
+# promise: a drafter without batched steps (any kind other than plain decode and DSpine with checkpointed verify rows) never gets lanes.
+law ln_other_drafter_no_lanes:
+  {ln_drafter_ok(LdOther{}) == False{} : Bool}
+
+def ln_other_drafter_no_lanes():
+  {==}

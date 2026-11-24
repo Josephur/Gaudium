@@ -729,17 +729,6 @@ pub struct SpecLane {
 }
 
 impl SpecRuntime {
-    /// [lanes] Does this runtime have batched steps for several lanes? A DSpine drafter with the
-    /// checkpoint form of the DeltaNet verify rows.
-    pub fn lanes_ok(&self) -> bool {
-        self.drafter.is_some()
-            && self.dflash2.is_none()
-            && self.mtp.is_none()
-            && self.tree.is_none()
-            && !self.gdn_replay
-            && self.vmconv.is_none()
-    }
-
     /// [lanes] Rows of a batched step: the narrowest verify width (the one the lanes step at).
     pub fn lane_rows(&self) -> u64 {
         self.widths

@@ -423,6 +423,22 @@ pub fn lanes_supported(spec: &ModelSpec) -> bool {
     matches!(spec.family, ModelFamily::Qwen3 | ModelFamily::Qwen35Dense) && !spec.is_moe()
 }
 
+/// The kind of drafter the verified lane rule (`ln_drafter_ok`) judges: none, DSpine with the
+/// checkpoint form of the verify rows (the form the batched speculative steps are built for), or
+/// another. `dspine`: whether the load has a drafter, and whether it is DSpine. The engine and the
+/// server both ask this, so they agree on which loads get lanes.
+pub fn lane_drafter(
+    dspine: Option<bool>,
+    verify: step_opts::GdnVerify,
+) -> crate::verified::LaneDrafter {
+    use crate::verified::LaneDrafter;
+    match dspine {
+        None => LaneDrafter::LdNone,
+        Some(true) if verify == step_opts::GdnVerify::Checkpoint => LaneDrafter::LdDSpine,
+        Some(_) => LaneDrafter::LdOther,
+    }
+}
+
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
 pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
     use crate::core::kv_cache::check_setting_taken;
@@ -515,5 +531,20 @@ mod tests {
         std::fs::write(dir.join("config.json"), "{}").unwrap();
         assert_eq!(clamp_ctx_to_model(262144, &dir), 262144);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod lane_drafter_tests {
+    use super::lane_drafter;
+    use super::step_opts::GdnVerify;
+    use crate::verified::LaneDrafter;
+
+    #[test]
+    fn only_dspine_with_checkpointed_verify_rows_counts_as_a_lane_drafter() {
+        assert!(matches!(lane_drafter(None, GdnVerify::Checkpoint), LaneDrafter::LdNone));
+        assert!(matches!(lane_drafter(Some(true), GdnVerify::Checkpoint), LaneDrafter::LdDSpine));
+        assert!(matches!(lane_drafter(Some(true), GdnVerify::Replay), LaneDrafter::LdOther));
+        assert!(matches!(lane_drafter(Some(false), GdnVerify::Checkpoint), LaneDrafter::LdOther));
     }
 }

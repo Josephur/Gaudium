@@ -965,6 +965,17 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
             run.ttft_ms = rep.ttft_ms;
             Ok(Some(run))
         }
+        Ok(Prefilled::OneRow { .. }) if eng.specdec.is_some() => {
+            // (`run_prefill` defers a one-row prompt only when asked to, which lanes never do: a
+            // speculative lane's step buffers are written after its first token)
+            eng.live.end_request();
+            fail(
+                eng,
+                &mut run.out,
+                "internal: a speculative lane got a deferred one-row prompt".into(),
+            );
+            Ok(None)
+        }
         Ok(Prefilled::OneRow {
             gdn_parity,
             ttft_recipe_ms,
