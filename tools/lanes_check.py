@@ -332,19 +332,26 @@ def main():
         out["runs"] = runs
         out["mismatches"] = bad
         print(f"mismatching streams: {bad}")
-        if a.turns and long_idx:
+        missing = [i for i in long_idx if f"turn1:{i}" not in ref or f"turn2:{i}" not in ref] if a.turns else []
+        if missing:
+            # a next turn is only checked against references of both its turns
+            print(f"--turns: the reference file has no turn references for long prompt(s) {missing}; "
+                  "write it again with --write-ref ... --turns (same prompts and --long)", flush=True)
+            bad += len(missing)
+            out["mismatches"] = bad
+        elif a.turns and long_idx:
             # each long prompt again with its reply and one more message: the lane that holds the
             # conversation takes its rows over (the other long prompts ran in between), or with
             # --park the host-RAM tier gives them back after the card was released
             turns = []
             for i in long_idx:
                 first = chat(a.base, a.model, PROMPTS[i], "greedy", a.seed + i, a.max_tokens, a.api_key, a.timeout)
-                r1 = ref.get(f"turn1:{i}")
-                if r1 is not None and first_diff(first["tokens"], r1["tokens"]) is not None:
+                r1 = ref[f"turn1:{i}"]
+                if first_diff(first["tokens"], r1["tokens"]) is not None:
                     bad += 1
                     print(f"turn 1 of long prompt {i}: DIFF against its reference", flush=True)
                 # the history of the reference's first turn, so that the next turn's prompt is its
-                content = (r1 or first)["content"]
+                content = r1["content"]
                 hist = [{"role": "user", "content": PROMPTS[i]}, {"role": "assistant", "content": content}]
                 turns.append((i, hist))
             if a.park:
@@ -363,8 +370,8 @@ def main():
             for (i, _), nxt in zip(turns, res2):
                 want = a.park and "host" or None
                 ok = nxt is not None and nxt["reused"] > 0 and (want is None or nxt["tier"] == want)
-                r2 = ref.get(f"turn2:{i}")
-                same = nxt is not None and (r2 is None or first_diff(nxt["tokens"], r2["tokens"]) is None)
+                r2 = ref[f"turn2:{i}"]
+                same = nxt is not None and first_diff(nxt["tokens"], r2["tokens"]) is None
                 bad += (0 if ok else 1) + (0 if same else 1)
                 print(f"turn 2 of long prompt {i}: {nxt and nxt['reused']} prompt rows taken over from {nxt and nxt['tier']} "
                       f"({'ok' if ok else 'NONE'}), {'identical to' if same else 'DIFF against'} its reference", flush=True)
