@@ -494,6 +494,10 @@ mod tests {
         assert!(matches!(ln_session_after(true, false, false), SessionAfter::SaFail));
         assert!(matches!(ln_session_after(false, false, false), SessionAfter::SaFail));
         assert!(matches!(ln_session_after(false, false, true), SessionAfter::SaDone));
+        assert!(
+            matches!(ln_session_after(false, true, false), SessionAfter::SaFail),
+            "an engine error after a yield fails the queued requests"
+        );
     }
 
     #[test]

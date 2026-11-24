@@ -1157,9 +1157,9 @@ pub(super) fn serve(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed) -> Result<()
             }
         }
         let rt = eng.lanes.as_mut().expect("lanes");
-        if rt.table.fail_all().is_err() {
-            // (every move of fail_all is allowed from a busy state; a table that refused one
-            // is replaced by a free one, as at load)
+        if let Err(le) = rt.table.fail_all() {
+            // (every move of fail_all is allowed from a busy state: this is an internal error)
+            eprintln!("[gaudium] internal: lanes: {le}; the lane table is reset to free lanes");
             rt.table = LaneTable::new(n);
         }
         let v = view(rt, &runs);

@@ -85,7 +85,8 @@ Serve options:
                         the one before it prefills only the rest, with the same output
                         as a whole prefill. N = positions of the previous prompt whose
                         recurrent state is kept on the card to resume from (default: 8;
-                        0 = off; 0.15 GiB each for a 48-layer DeltaNet model). The
+                        0 = off; at most 4096; 0.15 GiB each for a 48-layer DeltaNet
+                        model). The
                         context is planned first: a load keeps as many as fit beside
                         it and says so. A request with cache_prompt: false prefills
                         its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a

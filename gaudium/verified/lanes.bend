@@ -226,25 +226,26 @@ type SessionAfter is Data:
   SaFail{}
   SaDone{}
 
-def ln_session_after_end(ended: Bool) -> SessionAfter:
-  match ended:
-    case True{}:
-      SaDone{}
-    case False{}:
-      SaFail{}
-
-# `ok`: the engine served without an error; `yielded`: the feed handed the card back; `ended`:
-# the feed ended the session.
-def ln_session_after(ok: Bool, yielded: Bool, ended: Bool) -> SessionAfter:
+def ln_session_after_open(ok: Bool, yielded: Bool) -> SessionAfter:
   match ok:
     case True{}:
       match yielded:
         case True{}:
           SaAgain{}
         case False{}:
-          ln_session_after_end(ended)
+          SaFail{}
     case False{}:
-      ln_session_after_end(ended)
+      SaFail{}
+
+# `ok`: the engine served without an error; `yielded`: the feed handed the card back; `ended`:
+# the feed ended the session (it cleared the session's flag under the queue's lock, so a new
+# arrival may already have started the next one: this driver only stops).
+def ln_session_after(ok: Bool, yielded: Bool, ended: Bool) -> SessionAfter:
+  match ended:
+    case True{}:
+      SaDone{}
+    case False{}:
+      ln_session_after_open(ok, yielded)
 
 def ln_sa_done(a: SessionAfter) -> Bool:
   match a:
@@ -1571,4 +1572,13 @@ law ln_after_yield_returns:
   {ln_session_after(True{}, True{}, False{}) == SaAgain{} : SessionAfter}
 
 def ln_after_yield_returns():
+  {==}
+
+# promise: a lane session whose feed ended it only stops: it never runs again beside the next session or fails that session's requests.
+law ln_after_ended_done:
+  for +o: Bool
+  for +y: Bool
+  {ln_sa_done(ln_session_after(o, y, True{})) == True{} : Bool}
+
+def ln_after_ended_done(o, y):
   {==}

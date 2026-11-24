@@ -34,6 +34,11 @@ use gaudium::verified::{DevEvent, HbmCat, ReqEvent};
 
 /// The line `gaudium --version` prints: the crate version, then the commit the binary was built
 /// from when the build was given one in `GAUDIUM_BUILD_COMMIT`.
+
+/// Most kept prefix positions `--prefix-cache` accepts (a lane plan multiplies them by the lanes
+/// and the slot size in checked arithmetic; far more than any card holds).
+const MAX_PREFIX_SLOTS: u64 = 4096;
+
 fn version_line() -> String {
     let version = env!("CARGO_PKG_VERSION");
     match option_env!("GAUDIUM_BUILD_COMMIT") {
@@ -107,7 +112,8 @@ fn print_usage() {
          \x20                       the one before it prefills only the rest, with the same output\n\
          \x20                       as a whole prefill. N = positions of the previous prompt whose\n\
          \x20                       recurrent state is kept on the card to resume from (default: 8;\n\
-         \x20                       0 = off; 0.15 GiB each for a 48-layer DeltaNet model). The\n\
+         \x20                       0 = off; at most 4096; 0.15 GiB each for a 48-layer DeltaNet\n\
+         \x20                       model). The\n\
          \x20                       context is planned first: a load keeps as many as fit beside\n\
          \x20                       it and says so. A request with cache_prompt: false prefills\n\
          \x20                       its whole prompt. Dense Qwen3.5 / Qwen3.8 models without a\n\
@@ -1003,7 +1009,11 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                 let s = next_val(&mut i, "--prefix-cache")?;
                 prefix_slots = s
                     .parse()
-                    .map_err(|_| format!("invalid --prefix-cache '{s}'"))?;
+                    .ok()
+                    .filter(|&n| n <= MAX_PREFIX_SLOTS)
+                    .ok_or_else(|| {
+                        format!("invalid --prefix-cache '{s}' (0..={MAX_PREFIX_SLOTS} positions)")
+                    })?;
             }
             "--prefill" => {
                 let s = next_val(&mut i, "--prefill")?;
@@ -2411,7 +2421,11 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 let s = next_val(&mut i, "--prefix-cache")?;
                 prefix_slots = s
                     .parse()
-                    .map_err(|_| format!("invalid --prefix-cache '{s}'"))?;
+                    .ok()
+                    .filter(|&n| n <= MAX_PREFIX_SLOTS)
+                    .ok_or_else(|| {
+                        format!("invalid --prefix-cache '{s}' (0..={MAX_PREFIX_SLOTS} positions)")
+                    })?;
             }
             "--parallel" => {
                 let s = next_val(&mut i, "--parallel")?;
