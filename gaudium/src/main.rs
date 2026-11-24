@@ -195,10 +195,10 @@ fn print_usage() {
          \x20                       WebP, or a list of frames with their rate) in chat requests.\n\
          \x20                       A GGUF model's tower is a projector file (mmproj*.gguf) beside\n\
          \x20                       it; with none there it is served text only.\n\
-         \x20                       A model drafted by a block or an MTP drafter is served text\n\
-         \x20                       only (plain decode, DSpine, Inkling 2's own drafter and\n\
-         \x20                       Gemma 4's -assistant drafter run with image input; Gemma 4\n\
-         \x20                       takes images, no video)\n\
+         \x20                       Drafters that run with image input: DSpine, a dense Qwen\n\
+         \x20                       model's DFlash2 drafter and MTP head, Inkling 2's own drafter\n\
+         \x20                       and Gemma 4's -assistant drafter; a model with another drafter\n\
+         \x20                       is served text only (Gemma 4 takes images, no video)\n\
          \x20 --vision-max-patches <N>  Largest image the vision tower is planned for, in the\n\
          \x20                       model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:\n\
          \x20                       1024x1024 pixels, larger images are resized down to it; 20x20\n\

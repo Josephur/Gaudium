@@ -1,5 +1,5 @@
 {
-  "about": "Vision regression suite (gaudium --vision-suite). Each model x method row is one engine load that serves the text request, every image case, then the text request again, each under every sampler setting and each against its own K=0 reference. A further model family or drafter is one more models / methods entry here (Gemma 4 and its -assistant drafter: issue #5). Paths: relative model names and {models} resolve in --models <dir>; images are relative to this file.",
+  "about": "Vision regression suite (gaudium --vision-suite). Each model x method row is one engine load that serves the text request, every image case, then the text request again, each under every sampler setting and each against its own K=0 reference. A further model family or drafter is one more models / methods entry here. Paths: relative model names and {models} resolve in --models <dir>; images are relative to this file.",
   "args": ["--chat", "--no-think", "--max-new", "48"],
   "samplings": ["0", "0.7:20:0.95:0:7"],
   "text": {
@@ -49,6 +49,15 @@
         {"name": "dflash2", "args": ["--spec", "dflash2", "--draft-model", "{models}/Qwen3.8-27B-DFlash2"]},
         {"name": "mtp-chain", "args": ["--spec", "mtp", "--draft-k", "4"]},
         {"name": "mtp-tree", "args": ["--spec", "mtp", "--tree", "4:1-2@2"], "opt_in_forks": true}
+      ]
+    },
+    {
+      "name": "gemma4-12b-bf16",
+      "model": "gemma-4-12B-it",
+      "args": ["--precision", "bf16"],
+      "methods": [
+        {"name": "k0", "args": []},
+        {"name": "assistant", "args": ["--spec", "assistant", "--draft-model", "{models}/gemma-4-12B-it-assistant", "--draft-k", "4"]}
       ]
     }
   ]

@@ -169,10 +169,10 @@ Serve options:
                         WebP, or a list of frames with their rate) in chat requests.
                         A GGUF model's tower is a projector file (mmproj*.gguf) beside
                         it; with none there it is served text only.
-                        A model drafted by a block or an MTP drafter is served text
-                        only (plain decode, DSpine, Inkling 2's own drafter and
-                        Gemma 4's -assistant drafter run with image input; Gemma 4
-                        takes images, no video)
+                        Drafters that run with image input: DSpine, a dense Qwen
+                        model's DFlash2 drafter and MTP head, Inkling 2's own drafter
+                        and Gemma 4's -assistant drafter; a model with another drafter
+                        is served text only (Gemma 4 takes images, no video)
   --vision-max-patches <N>  Largest image the vision tower is planned for, in the
                         model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:
                         1024x1024 pixels, larger images are resized down to it; 20x20

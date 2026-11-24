@@ -884,11 +884,18 @@ mod tests {
         // greedy first (the after request's first setting), then a seeded sampled setting
         assert_eq!(s.samplings[0], "0");
         assert!(s.samplings.len() >= 2);
-        // the methods every Qwen3.8-27B row carries
+        // the methods every row of a model carries: each Qwen3.8-27B row every drafter of its
+        // family, each Gemma 4 row its size's -assistant drafter, all of them K=0
         for m in &s.models {
             let names: Vec<&str> = m.methods.iter().map(|k| k.name.as_str()).collect();
-            for want in ["k0", "dspine", "dflash2", "mtp-chain", "mtp-tree"] {
-                assert!(names.contains(&want), "{}: {want}", m.name);
+            let wants: &[&str] = if m.model.starts_with("gemma-4-") {
+                &["k0", "assistant"]
+            } else {
+                assert_eq!(m.model, "Qwen3.8-27B", "{}", m.name);
+                &["k0", "dspine", "dflash2", "mtp-chain", "mtp-tree"]
+            };
+            for want in wants {
+                assert!(names.contains(want), "{}: {want}", m.name);
             }
             // only the draft tree may fork (opt-in)
             for k in &m.methods {

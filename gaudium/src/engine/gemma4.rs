@@ -1649,7 +1649,7 @@ impl Gemma4Engine {
         let drafter_kind = spec_cfg
             .as_ref()
             .map(|s| if s.reads_prompt_rows() { "dflash2" } else { "mtp" });
-        if vis_geo.is_some() && !crate::core::vision::drafter_runs_with_vision(drafter_kind, true) {
+        if vis_geo.is_some() && !crate::core::vision::drafter_runs_with_vision(drafter_kind, spec.family) {
             return Err("image input with a block drafter is not implemented: load without --vision-max-patches or with the size's own -assistant drafter".into());
         }
 

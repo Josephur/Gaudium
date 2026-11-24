@@ -1317,7 +1317,7 @@ fn engine_runs_tower(family: ModelFamily) -> bool {
 
 /// The vision tower the served model `id` is loaded with: `(largest image in patches, image
 /// tokens per request)`, or `None` for text only. A model has a tower when its checkpoint has
-/// one, its engine runs it (the Qwen3.5 / 3.8 and Inkling 2 families), its drafter is one that runs with image
+/// one, its engine runs it (`engine_runs_tower`), its drafter is one that runs with image
 /// input (the verified `vis_drafter_ok`), and neither `--no-vision` nor the model's own
 /// `--model-vision <id>=off` turned it off. The token count is held to the context.
 fn vision_plan_of(cfg: &ServerConfig, id: &str, dir: &Path, max_ctx: u64) -> Option<(u64, u64)> {
@@ -1637,7 +1637,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
                 })
             {
                 eprintln!(
-                    "[server] model '{}': served text only: its {kind} drafter has not passed the vision regression suite for this model family (plain decode, DSpine, a dense Qwen model's DFlash2 drafter and MTP head, and Inkling 2's own drafter have)",
+                    "[server] model '{}': served text only: its {kind} drafter is not validated with image input for this model family (plain decode, DSpine, a dense Qwen model's DFlash2 drafter and MTP head, Inkling 2's own drafter and Gemma 4's -assistant drafter are)",
                     entry.id
                 );
             }

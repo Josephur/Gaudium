@@ -166,9 +166,11 @@ type VisDrafter is Data:
 # image-pad embeddings) at image positions AND has passed the vision regression suite on the card
 # (`gaudium --vision-suite`): today the DSpine and DFlash2 block drafters and the MTP head of a
 # dense model, whose context is the target model's hidden states or which embeds the image's own
-# rows (`engine/mtp.rs`), and Inkling 2's own drafter (`VdStates`). The mixture-of-experts MTP head
-# and Gemma 4's drafters are served text only until the suite has passed for them; a pairing this
-# table does not know always is.
+# rows (`engine/mtp.rs`), Inkling 2's own drafter (`VdStates`), and Gemma 4's `-assistant` drafter
+# (`VdAssistant`: it embeds no prompt row, it reads the target's hidden state and keys only; token-
+# identical to K=0 with images on the card, its suite rows are in the suite file). The
+# mixture-of-experts MTP head is served text only until the suite has passed for it; a pairing this
+# table does not know (a Gemma 4 block drafter among them) always is.
 def vis_drafter_ok(d: VisDrafter) -> Bool:
   match d:
     case VdNone{}:
@@ -184,7 +186,7 @@ def vis_drafter_ok(d: VisDrafter) -> Bool:
     case VdMtpMoe{}:
       False{}
     case VdAssistant{}:
-      False{}
+      True{}
     case VdOther{}:
       False{}
 
