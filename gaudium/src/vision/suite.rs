@@ -237,11 +237,14 @@ impl Suite {
 pub enum IdentityLine {
     Identical,
     LengthDiffers,
-    /// First divergence at a generated index; with a greedy run's margin trace there:
-    /// `(K=0 token's logit, the run's token's logit)`.
+    /// First divergence at a generated index. A greedy run's margin trace replays the run's
+    /// whole stream on the K=0 loop: `traces` = every position where K=0 would have chosen
+    /// otherwise, `(index, K=0 token's logit, the run's token's logit)`; `replayed` = the replay
+    /// reached the end of the stream.
     Diverged {
         index: usize,
-        trace: Option<(f64, f64)>,
+        traces: Vec<(usize, f64, f64)>,
+        replayed: bool,
     },
 }
 
@@ -321,22 +324,25 @@ pub fn parse_child_stderr(text: &str) -> ChildReport {
                 number_after(line, "FIRST DIVERGENCE at generated index ").map(|i| {
                     IdentityLine::Diverged {
                         index: i as usize,
-                        trace: None,
+                        traces: Vec::new(),
+                        replayed: false,
                     }
                 })
             };
+        } else if line.starts_with("[gaudium] FORK TRACE done:") {
+            if let Some(IdentityLine::Diverged { replayed, .. }) = run.identity.as_mut() {
+                *replayed = true;
+            }
         } else if line.starts_with("[gaudium] FORK TRACE at generated index ") {
             let at = number_after(line, "FORK TRACE at generated index ").map(|i| i as usize);
             let k0 = number_after(line, " logit ");
             let ours = line
                 .find(" vs the run's token ")
                 .and_then(|p| number_after(&line[p..], " logit "));
-            if let (Some(IdentityLine::Diverged { index, trace }), Some(a), Some(b), Some(at)) =
+            if let (Some(IdentityLine::Diverged { traces, .. }), Some(a), Some(b), Some(at)) =
                 (run.identity.as_mut(), k0, ours, at)
             {
-                if *index == at {
-                    *trace = Some((a, b));
-                }
+                traces.push((at, a, b));
             }
         } else if line.starts_with("[gaudium] method: ") {
             run.tokens_per_launch = number_after(line, "tokens/launch: ");
@@ -363,21 +369,27 @@ pub fn bf16_ulp(x: f64) -> f64 {
     (2.0f64).powi(a.log2().floor() as i32 - 7)
 }
 
-/// The verified outcome of one run: a fork counts as a traced tie when its margin trace shows
-/// the two tokens' BF16 logits at most one unit in the last place apart (both printed rounded
-/// to 4 decimals, hence the tolerance of that rounding).
+/// Two logits a margin trace printed are a tie: at most one BF16 unit in the last place apart
+/// (both printed rounded to 4 decimals, hence the tolerance of that rounding).
+pub fn near_tie(k0: f64, ours: f64) -> bool {
+    (k0 - ours).abs() <= bf16_ulp(k0.abs().max(ours.abs())) + 1e-4
+}
+
+/// The verified outcome of one run. A fork counts as a traced tie only when the replay of the
+/// run's whole stream completed, traced the first divergence, and every position where K=0
+/// would have chosen otherwise (the first fork and every later one) is a tie.
 pub fn classify(identity: Option<&IdentityLine>) -> VsIdentity {
     match identity {
         None => VsIdentity::VsMissing,
         Some(IdentityLine::Identical) => VsIdentity::VsSame,
         Some(IdentityLine::LengthDiffers) => VsIdentity::VsFork,
-        Some(IdentityLine::Diverged { trace: None, .. }) => VsIdentity::VsFork,
         Some(IdentityLine::Diverged {
-            trace: Some((k0, ours)),
-            ..
+            index,
+            traces,
+            replayed,
         }) => {
-            let ulp = bf16_ulp(k0.abs().max(ours.abs()));
-            if (k0 - ours).abs() <= ulp + 1e-4 {
+            let first = traces.iter().any(|t| t.0 == *index);
+            if *replayed && first && traces.iter().all(|t| near_tie(t.1, t.2)) {
                 VsIdentity::VsTracedTie
             } else {
                 VsIdentity::VsFork
@@ -448,16 +460,21 @@ pub fn judge(
             identity_ok &= ok;
             match (outcome, run.and_then(|x| x.identity.as_ref())) {
                 (VsIdentity::VsSame, _) => {}
-                (o, Some(IdentityLine::Diverged { index, trace })) => forks.push(format!(
-                    "{label} / sampling {s}: fork at token {index}{} ({})",
-                    trace.map_or(String::new(), |(a, b)| format!(
-                        ", K=0 logit {a:.4} vs {b:.4}"
-                    )),
-                    match o {
-                        VsIdentity::VsTracedTie => "traced tie",
-                        _ => "not a traced tie",
-                    }
-                )),
+                (o, Some(IdentityLine::Diverged { index, traces, replayed })) => {
+                    forks.push(format!(
+                        "{label} / sampling {s}: fork at token {index}; {} traced position(s){}{} ({})",
+                        traces.len(),
+                        traces
+                            .iter()
+                            .map(|(p, a, b)| format!(", token {p}: K=0 logit {a:.4} vs {b:.4}"))
+                            .collect::<String>(),
+                        if *replayed { "" } else { "; the replay did not complete" },
+                        match o {
+                            VsIdentity::VsTracedTie => "traced tie",
+                            _ => "not a traced tie",
+                        }
+                    ))
+                }
                 (_, Some(IdentityLine::LengthDiffers)) => {
                     forks.push(format!("{label} / sampling {s}: length differs from K=0"))
                 }
@@ -935,7 +952,8 @@ TOKENS: [1, 2, 4]
 [gaudium] request 1: prompt_tokens=300 sampling: greedy
 TOKENS: [5, 6]
 [gaudium] IDENTITY vs K=0 (greedy): FIRST DIVERGENCE at generated index 1: K=0 7 vs speculative 6 (of 2 / 2 tokens)
-[gaudium] FORK TRACE at generated index 1: K=0 token 7 logit 21.3750 vs the run's token 6 logit 21.2500 (margin 0.1250 BF16 logits; 0 earlier disagreements on the forced prefix)
+[gaudium] FORK TRACE at generated index 1: K=0 token 7 logit 21.3750 vs the run's token 6 logit 21.2500 (margin 0.1250 BF16 logits)
+[gaudium] FORK TRACE done: the run's 2 tokens replayed on the K=0 loop, 1 disagreement(s)
 [gaudium] request 1: prompt_tokens=300 sampling: T=0.7 seed 7
 TOKENS: [5, 8]
 [gaudium] IDENTITY vs K=0 (T=0.7): LENGTH DIFFERS (K=0 3 tokens, speculative 2), common prefix identical
@@ -958,7 +976,8 @@ AFTER TOKENS: [1, 2, 4]
             r.runs[&(1, 0)].identity,
             Some(IdentityLine::Diverged {
                 index: 1,
-                trace: Some((21.375, 21.25))
+                traces: vec![(1, 21.375, 21.25)],
+                replayed: true,
             })
         );
         assert_eq!(r.runs[&(1, 1)].identity, Some(IdentityLine::LengthDiffers));
@@ -970,18 +989,28 @@ AFTER TOKENS: [1, 2, 4]
         // BF16 has 8 significant bits: logits in [16, 32) step by 1/8
         assert_eq!(bf16_ulp(21.375), 0.125);
         assert_eq!(bf16_ulp(-3.0), 1.0 / 64.0);
-        let tie = |a: f64, b: f64| IdentityLine::Diverged {
+        let fork = |traces: Vec<(usize, f64, f64)>, replayed: bool| IdentityLine::Diverged {
             index: 3,
-            trace: Some((a, b)),
+            traces,
+            replayed,
         };
-        assert_eq!(classify(Some(&tie(21.375, 21.25))), VsIdentity::VsTracedTie);
-        assert_eq!(classify(Some(&tie(21.375, 21.375))), VsIdentity::VsTracedTie);
-        assert_eq!(classify(Some(&tie(21.5, 21.25))), VsIdentity::VsFork);
-        let untraced = IdentityLine::Diverged {
-            index: 0,
-            trace: None,
-        };
-        assert_eq!(classify(Some(&untraced)), VsIdentity::VsFork);
+        let c = |t: Vec<(usize, f64, f64)>| classify(Some(&fork(t, true)));
+        assert_eq!(c(vec![(3, 21.375, 21.25)]), VsIdentity::VsTracedTie);
+        assert_eq!(c(vec![(3, 21.375, 21.375)]), VsIdentity::VsTracedTie);
+        assert_eq!(c(vec![(3, 21.5, 21.25)]), VsIdentity::VsFork);
+        // every later disagreement along the run's stream must be a tie too
+        assert_eq!(
+            c(vec![(3, 21.375, 21.25), (9, 12.0, 11.9921875)]),
+            VsIdentity::VsTracedTie
+        );
+        assert_eq!(c(vec![(3, 21.375, 21.25), (9, 12.0, 10.0)]), VsIdentity::VsFork);
+        // the first divergence itself must be traced, and the replay must have completed
+        assert_eq!(c(vec![(5, 21.375, 21.25)]), VsIdentity::VsFork);
+        assert_eq!(c(vec![]), VsIdentity::VsFork);
+        assert_eq!(
+            classify(Some(&fork(vec![(3, 21.375, 21.25)], false))),
+            VsIdentity::VsFork
+        );
         assert_eq!(classify(Some(&IdentityLine::LengthDiffers)), VsIdentity::VsFork);
         assert_eq!(classify(None), VsIdentity::VsMissing);
     }

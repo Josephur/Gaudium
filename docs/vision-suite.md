@@ -24,7 +24,8 @@ when all of these hold:
 - **identity**: every run is token-identical to its K=0 reference. An opt-in method (marked
   `"opt_in_forks"` in the suite file AND selecting an opt-in form in its own options: a draft
   tree, which may differ from K=0 in the last bit of a leaf row, or `--gdn-verify mme`) may fork
-  only where the run's margin trace shows the two tokens' BF16 logits at most one unit in the
+  only at ties: the run's whole stream is replayed on the K=0 loop, and at every position where
+  K=0 would have chosen otherwise the two tokens' BF16 logits must be at most one unit in the
   last place apart;
 - **answers**: every answer, decoded with the model's tokenizer, contains one accepted word of
   every `expect` group of its case;

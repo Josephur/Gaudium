@@ -368,7 +368,9 @@ fn print_usage() {
          \x20 --compare-k0          Run every request first on the plain non-speculative K=0 loop\n\
          \x20                       of the same engine (same seed and sampler settings), then as\n\
          \x20                       configured (speculatively with --spec, enqueue-ahead K=0\n\
-         \x20                       without), and report identity or the first divergence\n\
+         \x20                       without), and report identity or the first divergence (greedy:\n\
+         \x20                       with both tokens' logits at every position of the run's stream\n\
+         \x20                       where K=0 would have chosen otherwise, from a teacher-forced replay)\n\
          \x20 --profile-steps <[p]A-B[@R][:file]>  Device trace of decode launches A..B (0-based; with\n\
          \x20                       a leading p: of prefill launches A..B, counted over the tile\n\
          \x20                       loop's embed and layer launches) of\n\
@@ -1567,15 +1569,16 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                         got.len()
                     );
                     // Margin trace of a greedy fork: the plain K=0 loop teacher-forced along the
-                    // run's own stream up to the fork, which records both tokens' logits there.
+                    // run's whole stream, which records both tokens' logits at every position
+                    // where K=0 would have chosen otherwise (the first fork and any later one).
                     if params.temperature <= 0.0 && i > 0 {
                         let mut pt = params.clone();
                         pt.non_speculative = true;
                         pt.k0_plain = true;
                         pt.force_draft_k = None;
-                        pt.max_new = i as u64 + 1;
+                        pt.max_new = got.len() as u64;
                         pt.stop_on_eos = false;
-                        pt.force_tokens = Some(got[..=i].to_vec());
+                        pt.force_tokens = Some(got.clone());
                         if let Some(v) = &request_images[prompt_idx] {
                             engine.set_request_images(v.images.clone())?;
                         }
@@ -1585,20 +1588,28 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                             Some(gaudium::signals::term_flag()),
                             &mut |_| {},
                         )?;
-                        match rt.forks.iter().find(|f| f.pos == i) {
-                            Some(f) => eprintln!(
-                                "[gaudium] FORK TRACE at generated index {i}: K=0 token {} logit {:.4} vs the run's token {} logit {:.4} (margin {:.4} BF16 logits; {} earlier disagreements on the forced prefix)",
+                        for f in &rt.forks {
+                            eprintln!(
+                                "[gaudium] FORK TRACE at generated index {}: K=0 token {} logit {:.4} vs the run's token {} logit {:.4} (margin {:.4} BF16 logits)",
+                                f.pos,
                                 f.engine_token,
                                 f.engine_logit,
                                 f.forced_token,
                                 f.forced_logit,
                                 f.engine_logit - f.forced_logit,
-                                rt.forks.iter().filter(|x| x.pos < i).count()
-                            ),
-                            None => eprintln!(
-                                "[gaudium] FORK TRACE at generated index {i}: the teacher-forced K=0 pass agreed with the run's token ({} disagreements elsewhere)",
+                            );
+                        }
+                        if !rt.forks.iter().any(|f| f.pos == i) {
+                            eprintln!(
+                                "[gaudium] FORK TRACE at generated index {i}: the teacher-forced K=0 pass agreed with the run's token"
+                            );
+                        }
+                        if !gaudium::signals::term_requested() {
+                            eprintln!(
+                                "[gaudium] FORK TRACE done: the run's {} tokens replayed on the K=0 loop, {} disagreement(s)",
+                                rt.generated_tokens.len(),
                                 rt.forks.len()
-                            ),
+                            );
                         }
                     }
                 }

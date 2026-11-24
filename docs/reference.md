@@ -346,7 +346,9 @@ Generate options:
   --compare-k0          Run every request first on the plain non-speculative K=0 loop
                         of the same engine (same seed and sampler settings), then as
                         configured (speculatively with --spec, enqueue-ahead K=0
-                        without), and report identity or the first divergence
+                        without), and report identity or the first divergence (greedy:
+                        with both tokens' logits at every position of the run's stream
+                        where K=0 would have chosen otherwise, from a teacher-forced replay)
   --profile-steps <[p]A-B[@R][:file]>  Device trace of decode launches A..B (0-based; with
                         a leading p: of prefill launches A..B, counted over the tile
                         loop's embed and layer launches) of

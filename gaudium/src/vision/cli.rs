@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::{EngineConfig, GenEngine, GenParams, GenReport};
+use crate::verified::{vis_plan_raise, vis_request_tokens};
 use crate::vision::mrope::expand_image_pads;
 use crate::vision::preprocess::{prepare_image, PreparedImage, RgbImage};
 use crate::vision::{VisionReport, VisionSpec};
@@ -110,19 +111,24 @@ pub fn expand_requests(
 
 /// Plans the tower for the images of several requests of one run: its largest image (or the
 /// larger explicit patch cap), the image tokens of the request that holds the most, and a
-/// recipe for every image size.
+/// recipe for every image size. The counts and the plan are the verified
+/// `vis_request_tokens` / `vis_plan_raise` (`verified/vision_budget.bend`).
 pub fn configure_requests(requests: &[&CliImages], cfg: &mut EngineConfig, max_patches: u64) {
     let mut ns: Vec<u64> = Vec::new();
-    let mut tokens = 0u64;
+    let (mut patches, mut tokens) = (max_patches, 0u64);
     for r in requests {
+        let mut request = 0u64;
         for i in &r.images {
-            if !ns.contains(&(i.n_patches() as u64)) {
-                ns.push(i.n_patches() as u64);
+            let n = i.n_patches() as u64;
+            if !ns.contains(&n) {
+                ns.push(n);
             }
+            patches = vis_plan_raise(patches, n);
+            request = vis_request_tokens(request, i.n_tokens() as u64);
         }
-        tokens = tokens.max(r.images.iter().map(|i| i.n_tokens() as u64).sum());
+        tokens = vis_plan_raise(tokens, request);
     }
-    cfg.vision_max_patches = max_patches.max(ns.iter().copied().max().unwrap_or(0));
+    cfg.vision_max_patches = patches;
     cfg.vision_max_tokens = tokens;
     cfg.vision_precompile = ns;
 }

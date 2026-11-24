@@ -318,6 +318,20 @@ def vis_run_emb_off(+start: Nat, len: Nat, lo: Nat, hi: Nat, shift: Nat) -> Nat:
   Nat.sub(vis_run_first(start, len, lo, hi, shift), start)
 
 # ============================================================================
+# 8a. Tower plan of a run's image requests
+# ============================================================================
+
+# Image tokens of one request: the tokens counted so far plus one more image's.
+def vis_request_tokens(counted: Nat, image: Nat) -> Nat:
+  Nat.add(counted, image)
+
+# The tower of a run with several image requests is planned for its largest image and for the
+# request holding the most image tokens: the plan so far, raised to one more request's or
+# image's need.
+def vis_plan_raise(planned: Nat, need: Nat) -> Nat:
+  Nat.max(planned, need)
+
+# ============================================================================
 # 9. Laws
 # ============================================================================
 
@@ -621,3 +635,45 @@ def vis_run_in_image(start, len, lo, hi, shift):
   +t = Nat.min(Nat.add(start, len), Nat.add(shift, hi))
   %Equal.sym(Nat, Nat.add(Nat.sub(Nat.min(f, t), start), Nat.sub(t, f)), Nat.sub(t, start), vb_min_sub_add_sub(start, f, t, L.nat_max_ge_l(start, Nat.add(shift, lo)))) : {Nat.is_le(_, len) == True{} : Bool}
   L.nat_le_subst_r(Nat.sub(t, start), Nat.sub(Nat.add(start, len), start), len, L.nat_add_sub_cancel_l(start, len), vb_sub_le_mono(t, Nat.add(start, len), start, vb_min_le_l(Nat.add(start, len), Nat.add(shift, hi))))
+
+# LAW VB.27: a request's image tokens count every one of its images.
+# promise: the image tokens counted for a request never leave out an image added to the count.
+# harm: a request could be planned for fewer image rows than one of its images needs.
+law vis_request_counts_image:
+  for +c: Nat
+  for +i: Nat
+  {Nat.is_le(i, vis_request_tokens(c, i)) == True{} : Bool}
+
+def vis_request_counts_image(c, i):
+  L.nat_add_le_l(c, i)
+
+# LAW VB.28: adding an image never lowers a request's count.
+# promise: counting one more image never lowers the image tokens already counted for the request.
+law vis_request_count_grows:
+  for +c: Nat
+  for +i: Nat
+  {Nat.is_le(c, vis_request_tokens(c, i)) == True{} : Bool}
+
+def vis_request_count_grows(c, i):
+  L.nat_add_le_r(c, i)
+
+# LAW VB.29: the raised plan covers the request (or image) it was raised for.
+# promise: the tower plan raised for a request's or an image's need always covers that need.
+# harm: the tower or its embedding buffer could be planned too small for an image request of the run.
+law vis_plan_covers_need:
+  for +p: Nat
+  for +n: Nat
+  {Nat.is_le(n, vis_plan_raise(p, n)) == True{} : Bool}
+
+def vis_plan_covers_need(p, n):
+  L.nat_max_ge_r(p, n)
+
+# LAW VB.30: raising the plan never shrinks what earlier requests were planned for.
+# promise: raising the tower plan for one more need never shrinks what it covered before.
+law vis_plan_keeps_earlier:
+  for +p: Nat
+  for +n: Nat
+  {Nat.is_le(p, vis_plan_raise(p, n)) == True{} : Bool}
+
+def vis_plan_keeps_earlier(p, n):
+  L.nat_max_ge_l(p, n)
