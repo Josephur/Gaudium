@@ -260,105 +260,8 @@ fn append_linear_layer_ckpt(
     let hid = spec.hidden;
     let hv = spec.gdn_v_heads;
     let dl = spec.gdn_v_dim;
-    let qkv = spec.gdn_qkv_dim();
-    let qkvz_dim = spec.gdn_qkvz_dim();
-    let hvp = spec.gdn_hvp();
-    let ba_dim = spec.gdn_ba_dim();
-
-    let h = match h_pre {
-        Some(h_in) => h_in,
-        None => add_rmsnorm(gb, spec, x, &format!("{lpfx}w_in"), &format!("{lpfx}h"), t),
-    };
-    let qkvz = add_linear_bf16(
-        gb,
-        h,
-        &format!("{lpfx}W_qkvz"),
-        hid,
-        qkvz_dim,
-        t,
-        &format!("{lpfx}qkvz"),
-    );
-    let ba = add_linear_bf16(
-        gb,
-        h,
-        &format!("{lpfx}W_ba"),
-        hid,
-        ba_dim,
-        t,
-        &format!("{lpfx}ba"),
-    );
-
-    let conv_w =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}conv_w"), SynDataType::Float, &[qkv, 4]);
-    let conv_b =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}conv_b"), SynDataType::Float, &[qkv]);
-    let cs_in = gb.add_persistent_tensor(format!("{lpfx}cs_in"), SynDataType::Float, &[qkv, 3, ns]);
-    let cs_out = gb.add_persistent_tensor(format!("{lpfx}cs_out"), SynDataType::Float, &[qkv, 3]);
-    let cs_ckpt =
-        gb.add_persistent_tensor(format!("{lpfx}cs_ckpt"), SynDataType::Float, &[qkv, 3, t]);
-    let q = gb.add_persistent_tensor(format!("{lpfx}q"), SynDataType::Float, &[dl, hv, t]);
-    let k = gb.add_persistent_tensor(format!("{lpfx}k"), SynDataType::Float, &[dl, hv, t]);
-    let v = gb.add_persistent_tensor(format!("{lpfx}v"), SynDataType::Float, &[dl, hv, t]);
-    gb.add_node(
-        "gaudium_gdn_prep",
-        format!("{lpfx}gdn_prep"),
-        &[qkvz, conv_w, cs_in, conv_b, slot],
-        &[q, k, v, cs_out, cs_ckpt],
-        &u32_params(&[2 | 16]),
-    );
-
-    let a_log = gb.get_or_add_persistent_tensor(format!("{lpfx}A_log"), SynDataType::Float, &[hvp]);
-    let dt_bias =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}dt_bias"), SynDataType::Float, &[hvp]);
-    let eg = gb.add_persistent_tensor(format!("{lpfx}eg"), SynDataType::Float, &[hvp, t]);
-    let beta = gb.add_persistent_tensor(format!("{lpfx}beta"), SynDataType::Float, &[hvp, t]);
-    gb.add_node(
-        "gaudium_gdn_gate",
-        format!("{lpfx}gdn_gate"),
-        &[ba, a_log, dt_bias],
-        &[eg, beta],
-        &[],
-    );
-
-    let s_in = gb.add_persistent_tensor(
-        format!("{lpfx}S_in"),
-        SynDataType::Float,
-        &[64, 256, hv, ns],
-    );
-    let s_out =
-        gb.add_persistent_tensor(format!("{lpfx}S_out"), SynDataType::Float, &[64, 256, hv]);
-    let s_ckpt = gb.add_persistent_tensor(
-        format!("{lpfx}S_ckpt"),
-        SynDataType::Float,
-        &[64, 256, hv, t],
-    );
-    let o = gb.add_persistent_tensor(format!("{lpfx}o"), SynDataType::Float, &[dl, hv, t]);
-    // [step] the same rows through the kernel build with vector-loaded gate scalars when the
-    // step family carries it (bit-identical outputs)
-    let gdn_guid = if fast_rows {
-        "gaudium_gdn_f32v"
-    } else {
-        "gaudium_gdn_f32"
-    };
-    gb.add_node(
-        gdn_guid,
-        format!("{lpfx}gdn"),
-        &[s_in, q, k, v, eg, beta, slot],
-        &[o, s_out, s_ckpt],
-        &u32_params(&[1 | 16]),
-    );
-
-    let norm_w =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}norm_w"), SynDataType::Float, &[dl]);
-    let core = gb.add_persistent_tensor(format!("{lpfx}core"), SynDataType::Bf16, &[hv * dl, t]);
-    gb.add_node(
-        "gaudium_gdn_post",
-        format!("{lpfx}gdn_post"),
-        &[o, qkvz, norm_w],
-        &[core],
-        &u32_params(&[0u32]),
-    );
-
+    let (qkvz, ba) = append_linear_proj(gb, spec, x, h_pre, lpfx, t);
+    let core = append_gdn_ckpt_core(gb, spec, qkvz, ba, slot, lpfx, lpfx, t, ns, fast_rows);
     let attn = add_linear_bf16(
         gb,
         core,
@@ -369,6 +272,102 @@ fn append_linear_layer_ckpt(
         &format!("{lpfx}attn"),
     );
     append_post_and_mlp(gb, spec, x, attn, lpfx, t, true, wnext_norm)
+}
+
+/// The recurrence of a Gated DeltaNet layer over `t` verify rows that keeps one state checkpoint
+/// per row: it starts from slot `slot` of the state rings `S_in` / `cs_in` (`ns` slots) and
+/// writes the state after every row into `S_ckpt` / `cs_ckpt` -> `core {hv * dl, t}`. `wpfx`
+/// names the layer's weights, `spfx` the core's own tensors and nodes (one prefix per lane in a
+/// batched step).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_gdn_ckpt_core(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    qkvz: TensorId,
+    ba: TensorId,
+    slot: TensorId,
+    wpfx: &str,
+    spfx: &str,
+    t: u64,
+    ns: u64,
+    fast_rows: bool,
+) -> TensorId {
+    let hv = spec.gdn_v_heads;
+    let dl = spec.gdn_v_dim;
+    let qkv = spec.gdn_qkv_dim();
+    let hvp = spec.gdn_hvp();
+
+    let conv_w =
+        gb.get_or_add_persistent_tensor(format!("{wpfx}conv_w"), SynDataType::Float, &[qkv, 4]);
+    let conv_b =
+        gb.get_or_add_persistent_tensor(format!("{wpfx}conv_b"), SynDataType::Float, &[qkv]);
+    let cs_in = gb.add_persistent_tensor(format!("{spfx}cs_in"), SynDataType::Float, &[qkv, 3, ns]);
+    let cs_out = gb.add_persistent_tensor(format!("{spfx}cs_out"), SynDataType::Float, &[qkv, 3]);
+    let cs_ckpt =
+        gb.add_persistent_tensor(format!("{spfx}cs_ckpt"), SynDataType::Float, &[qkv, 3, t]);
+    let q = gb.add_persistent_tensor(format!("{spfx}q"), SynDataType::Float, &[dl, hv, t]);
+    let k = gb.add_persistent_tensor(format!("{spfx}k"), SynDataType::Float, &[dl, hv, t]);
+    let v = gb.add_persistent_tensor(format!("{spfx}v"), SynDataType::Float, &[dl, hv, t]);
+    gb.add_node(
+        "gaudium_gdn_prep",
+        format!("{spfx}gdn_prep"),
+        &[qkvz, conv_w, cs_in, conv_b, slot],
+        &[q, k, v, cs_out, cs_ckpt],
+        &u32_params(&[2 | 16]),
+    );
+
+    let a_log = gb.get_or_add_persistent_tensor(format!("{wpfx}A_log"), SynDataType::Float, &[hvp]);
+    let dt_bias =
+        gb.get_or_add_persistent_tensor(format!("{wpfx}dt_bias"), SynDataType::Float, &[hvp]);
+    let eg = gb.add_persistent_tensor(format!("{spfx}eg"), SynDataType::Float, &[hvp, t]);
+    let beta = gb.add_persistent_tensor(format!("{spfx}beta"), SynDataType::Float, &[hvp, t]);
+    gb.add_node(
+        "gaudium_gdn_gate",
+        format!("{spfx}gdn_gate"),
+        &[ba, a_log, dt_bias],
+        &[eg, beta],
+        &[],
+    );
+
+    let s_in = gb.add_persistent_tensor(
+        format!("{spfx}S_in"),
+        SynDataType::Float,
+        &[64, 256, hv, ns],
+    );
+    let s_out =
+        gb.add_persistent_tensor(format!("{spfx}S_out"), SynDataType::Float, &[64, 256, hv]);
+    let s_ckpt = gb.add_persistent_tensor(
+        format!("{spfx}S_ckpt"),
+        SynDataType::Float,
+        &[64, 256, hv, t],
+    );
+    let o = gb.add_persistent_tensor(format!("{spfx}o"), SynDataType::Float, &[dl, hv, t]);
+    // [step] the same rows through the kernel build with vector-loaded gate scalars when the
+    // step family carries it (bit-identical outputs)
+    let gdn_guid = if fast_rows {
+        "gaudium_gdn_f32v"
+    } else {
+        "gaudium_gdn_f32"
+    };
+    gb.add_node(
+        gdn_guid,
+        format!("{spfx}gdn"),
+        &[s_in, q, k, v, eg, beta, slot],
+        &[o, s_out, s_ckpt],
+        &u32_params(&[1 | 16]),
+    );
+
+    let norm_w =
+        gb.get_or_add_persistent_tensor(format!("{wpfx}norm_w"), SynDataType::Float, &[dl]);
+    let core = gb.add_persistent_tensor(format!("{spfx}core"), SynDataType::Bf16, &[hv * dl, t]);
+    gb.add_node(
+        "gaudium_gdn_post",
+        format!("{spfx}gdn_post"),
+        &[o, qkvz, norm_w],
+        &[core],
+        &u32_params(&[0u32]),
+    );
+    core
 }
 
 /// Builds the speculative step graph for `t` verify rows over `nch` KV chunks.

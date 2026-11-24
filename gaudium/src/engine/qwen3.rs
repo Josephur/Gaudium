@@ -4041,6 +4041,25 @@ mod tests {
     }
 
     #[test]
+    fn tmp_print_fingerprints() {
+        let s27 = qwen38_27b_spec();
+        let mut f27 = qwen38_27b_spec();
+        f27.fp8_weights = true;
+        let s8 = qwen3_8b_spec();
+        let e: Vec<(String, String)> = vec![("GAUDIUM_GDNS_ELF".into(), "aa".into())];
+        let fp = |g: GraphBuilder| g.fingerprint("x");
+        println!("FP step27_1 {}", fp(build_decode_step_graph(&s27, 16384, 1, &e)));
+        println!("FP step27_4 {}", fp(build_decode_step_graph(&s27, 16384, 4, &e)));
+        println!("FP sstep27_1 {}", fp(build_sampled_decode_step_graph(&s27, 16384, 1, &e)));
+        println!("FP step27f8_2 {}", fp(build_decode_step_graph(&f27, 16384, 2, &e)));
+        println!("FP step8_2 {}", fp(build_decode_step_graph(&s8, 16384, 2, &e)));
+        println!("FP pfa27 {}", fp(build_prefill_attn_layer_graph(&s27, 128, 16384, 1, &e)));
+        println!("FP pfl27 {}", fp(build_prefill_linear_layer_graph(&s27, 128, &e)));
+        println!("FP spec27 {}", fp(spec::build_spec_step_graph(&s27, 16384, 1, 8, 8, None, &e)));
+        println!("FP spec27f8 {}", fp(spec::build_spec_step_graph(&f27, 16384, 2, 16, 16, None, &e)));
+    }
+
+    #[test]
     fn qwen3_8b_graphs_build_and_fingerprint_deterministically() {
         let spec = qwen3_8b_spec();
         spec.validate().unwrap();
