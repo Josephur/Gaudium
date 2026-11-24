@@ -1588,9 +1588,7 @@ fn serve_loop(
                             run.cursor
                         ));
                     }
-                    run.parity ^= 1;
-                    run.cursor += n_emit as u64;
-                    run.steps += 1;
+                    run.advance(n_emit as u64, rows);
                     run.drafted += rows - 1;
                     run.accepted += n_emit as u64 - 1;
                     run.observe_cancel();
