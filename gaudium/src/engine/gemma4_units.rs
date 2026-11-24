@@ -1,0 +1,384 @@
+//! The prefill of a prompt with images (child module of `gemma4`).
+//!
+//! - **Image rows** take their soft tokens: a tile with image rows runs the embedding stage
+//!   `g_g4_embed_vis_T<t>` (the token embedding times a keep flag, plus a gather from the feature
+//!   buffer), and its ids carry the pad id at image rows (what the small sizes' per-layer inputs
+//!   gather there, as the reference does).
+//! - **Two-way image blocks** (the sizes with `use_bidirectional_attention: "vision"`): in a
+//!   sliding layer a row of an image block attends the rest of its block as well. A tile whose
+//!   block runs into later tiles prefills with them as one *unit*, layer by layer: at every
+//!   sliding layer the later tiles' keys go into the ring first (`g_g4_skv_T<t>`), then every tile
+//!   of the unit runs the layer with the ring softmax that extends each row's window to the end of
+//!   its block (`g_g4_sx_T<t>`, `ext`). Global layers stay causal and run tile by tile. A unit
+//!   never holds more rows than the ring keeps beside the window (`g4u_fits`, checked at load for
+//!   the largest unit), so the ring stays the text ring and the decode step is unchanged. A tile of
+//!   a unit is final when every block over it ends inside the unit (`g4u_final`); the next unit
+//!   starts at the first tile that is not.
+//!
+//! Positions stay `0, 1, 2, ...` in this family (no multi-axis positions): a row's RoPE position
+//! is its KV slot. Text-only requests never come here and launch what they launched before.
+
+use std::time::Instant;
+
+use super::vision::graphs::build_embed_vis_graph;
+use super::*;
+use crate::verified::{g4u_ext, g4u_final, g4u_fits, g4u_join};
+
+/// The vision recipes of the decoder, by kind and tile rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum VisRecipe {
+    Embed,
+    SlidingExt,
+    SlidingKv,
+}
+
+/// What the decoder's plan holds for image input.
+#[derive(Debug, Clone)]
+pub(super) struct VisLoad {
+    pub geo: vision::run::G4vGeo,
+    /// Image rows attend their block both ways in the sliding layers.
+    pub bidir: bool,
+    /// Tiles a unit may hold (1 without two-way blocks).
+    pub unit_tiles: u64,
+}
+
+impl VisLoad {
+    /// The decoder side of the image path for tiles of `tile` rows, or the reason the
+    /// configuration cannot take images.
+    pub fn new(geo: vision::run::G4vGeo, spec: &ModelSpec, d: &G4Dims, tile: u64) -> Result<Self, String> {
+        let bidir = spec
+            .gemma4
+            .as_ref()
+            .is_some_and(|g| g.bidirectional_vision);
+        let mut unit_tiles = 1;
+        if bidir {
+            if d.first_shared < d.n_layers {
+                return Err("two-way image blocks with layers that share keys are not implemented".into());
+            }
+            // the tiles the largest block reaches from any row of a tile (its first tile included)
+            let block = super::vision::soft_budget(&geo.spec);
+            unit_tiles = (tile - 1 + block).div_ceil(tile);
+            if !g4u_fits(d.ring, d.window, unit_tiles * tile) {
+                return Err(format!(
+                    "an image block of {block} rows reaches {unit_tiles} prefill tiles of {tile} rows: with a window of {} that needs more than the {}-slot ring",
+                    d.window, d.ring
+                ));
+            }
+        }
+        Ok(Self {
+            geo,
+            bidir,
+            unit_tiles,
+        })
+    }
+
+    /// The decoder graphs of the image path at the planned tile (for the plan's scratch sizes).
+    pub fn sizing_graphs(&self, d: &G4Dims, tile: u64, lmax: u64) -> Vec<GraphBuilder> {
+        let mut v = vec![build_embed_vis_graph(d, self.geo.feat_cols, tile, &[])];
+        if self.bidir {
+            v.push(build_sliding_vis_graph(d, tile, lmax, false, &[]));
+            v.push(build_sliding_vis_graph(d, tile, lmax, true, &[]));
+        }
+        v
+    }
+}
+
+/// One prefill tile of an image request.
+#[derive(Debug, Clone, Copy)]
+struct Tile {
+    pos: u64,
+    t: u64,
+}
+
+impl Tile {
+    fn end(&self) -> u64 {
+        self.pos + self.t
+    }
+}
+
+/// Buffers of the `j`-th tile of a unit: its two layer buffers, ids, cursor, extension table.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TileBufs {
+    pub x: [u64; 2],
+    pub ids: u64,
+    pub cursor: u64,
+    pub ext: u64,
+}
+
+impl Gemma4Engine {
+    fn unit_bufs(&self, j: usize) -> TileBufs {
+        if j == 0 {
+            TileBufs {
+                x: self.pf_x,
+                ids: self.pf_ids,
+                cursor: self.pf_cursor,
+                ext: self.pf_scratch.get("ext").copied().unwrap_or(0),
+            }
+        } else {
+            self.pf_unit[j - 1]
+        }
+    }
+
+    fn ensure_vis(&mut self, kind: VisRecipe, t: u64) -> Result<(), String> {
+        if self.vis_recipes.contains_key(&(kind, t)) {
+            return Ok(());
+        }
+        let v = self.vision.as_ref().ok_or("no image input")?;
+        let mut elf = self.elf_hashes.clone();
+        elf.extend_from_slice(v.elf());
+        let gb = match kind {
+            VisRecipe::Embed => build_embed_vis_graph(&self.dims, v.geo.feat_cols, t, &elf),
+            VisRecipe::SlidingExt => build_sliding_vis_graph(&self.dims, t, self.max_ctx, false, &elf),
+            VisRecipe::SlidingKv => build_sliding_vis_graph(&self.dims, t, self.max_ctx, true, &elf),
+        };
+        let r = self.compile(&gb, &format!("vision {kind:?} T={t}"))?;
+        self.vis_recipes.insert((kind, t), r);
+        Ok(())
+    }
+
+    /// The binding pool of layer `l` of a prefill tile (its weights under their generic names,
+    /// the K / V it attends, the RoPE tables) with the tile's buffers.
+    fn layer_pool(&self, l: usize, x_in: u64, x_out: u64, b: &TileBufs) -> BTreeMap<String, u64> {
+        let d = &self.dims;
+        let glob = d.is_global(l);
+        let mut pool = self.pf_scratch.clone();
+        pool.insert("x_in".into(), x_in);
+        pool.insert("L_out".into(), x_out);
+        pool.insert("cursor".into(), b.cursor);
+        pool.insert("ext".into(), b.ext);
+        let (rc, rs) = rope_names(glob);
+        pool.insert(rc.into(), self.weights_addr[rc]);
+        pool.insert(rs.into(), self.weights_addr[rs]);
+        let lp = format!("L{l}_");
+        for (name, &addr) in self
+            .weights_addr
+            .range(lp.clone()..)
+            .take_while(|(name, _)| name.starts_with(&lp))
+        {
+            pool.insert(format!("L_{}", &name[lp.len()..]), addr);
+        }
+        let src = d.kv_source(l);
+        let (kk, vk) = kv_names(glob);
+        pool.insert(format!("L_{kk}"), self.kv_addr[&format!("L{src}_{kk}")].0);
+        pool.insert(format!("L_{vk}"), self.kv_addr[&format!("L{src}_{vk}")].0);
+        pool
+    }
+
+    fn launch_pool(&self, r: &CompiledRecipe, pool: &BTreeMap<String, u64>, what: &str) -> Result<(), String> {
+        let bind = select_exact_bindings(r, pool)?;
+        r.launch_checked(&self.dev, &bind)
+            .map_err(|e| format!("launch {what}: {e}"))
+    }
+
+    /// The embedding stage of tile `tl` into `b.x[0]`: the plain recipe for a text tile, the
+    /// vision recipe for a tile with image rows (ids with the pad id there, feature columns,
+    /// keep flags). Synced (the next tile's inputs reuse the staging buffers).
+    fn embed_tile(&mut self, ids: &[i32], fidx: &[i32], tl: Tile, b: &TileBufs) -> Result<f64, String> {
+        let (p0, t) = (tl.pos as usize, tl.t as usize);
+        let has_img = fidx[p0..p0 + t].iter().any(|&f| f != 0);
+        let t_rec = Instant::now();
+        if has_img {
+            self.ensure_vis(VisRecipe::Embed, tl.t)?;
+        } else {
+            self.ensure_embed(tl.t)?;
+        }
+        let recipe_ms = t_rec.elapsed().as_secs_f64() * 1000.0;
+        let pad = self.spec.gemma4.as_ref().map_or(0, |g| g.pad_id.max(0));
+        {
+            let st = self.stage_io.as_mut_slice();
+            for k in 0..t {
+                let id = if fidx[p0 + k] != 0 { pad } else { ids[p0 + k] };
+                st[k * 4..k * 4 + 4].copy_from_slice(&id.to_le_bytes());
+            }
+        }
+        self.dev
+            .copy_h2d_pinned_sync(&self.stage_io, t * 4, b.ids)
+            .map_err(|e| format!("upload prefill ids: {e}"))?;
+        self.write_i32_scalar(b.cursor, tl.pos as i32)?;
+        let mut pool = self.pf_scratch.clone();
+        for name in GLOBAL_WEIGHTS {
+            if let Some(&addr) = self.weights_addr.get(*name) {
+                pool.insert((*name).to_string(), addr);
+            }
+        }
+        pool.insert("ids".into(), b.ids);
+        pool.insert("x0".into(), b.x[0]);
+        pool.insert("ple_out".into(), self.pf_ple);
+        if has_img {
+            let mut fb = Vec::with_capacity(t * 4);
+            let mut kb = Vec::with_capacity(t * 2);
+            let one = crate::fp8::f32_to_bf16_rne(1.0);
+            for &f in &fidx[p0..p0 + t] {
+                fb.extend_from_slice(&f.to_le_bytes());
+                kb.extend_from_slice(&(if f == 0 { one } else { 0u16 }).to_le_bytes());
+            }
+            self.dev
+                .copy_h2d_sync(&fb, self.pf_scratch["vis_fidx"])
+                .map_err(|e| format!("upload feature columns: {e}"))?;
+            self.dev
+                .copy_h2d_sync(&kb, self.pf_scratch["vis_keep"])
+                .map_err(|e| format!("upload keep flags: {e}"))?;
+            let r = &self.vis_recipes[&(VisRecipe::Embed, tl.t)];
+            self.launch_pool(r, &pool, &format!("vision embed T={t}"))?;
+        } else {
+            let r = &self.embed_recipes[&tl.t];
+            self.launch_pool(r, &pool, &format!("embed T={t}"))?;
+        }
+        self.sync_compute("prefill embedding")?;
+        Ok(recipe_ms)
+    }
+
+    /// Prefill of an image request. Returns `(rows of the last tile, address of its last layer's
+    /// output, first-use recipe time)`, or `None` when cancelled.
+    pub(super) fn prefill_vis(
+        &mut self,
+        prompt_ids: &[i32],
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Result<Option<(u64, u64, f64)>, String> {
+        let req = self
+            .vision
+            .as_ref()
+            .and_then(|v| v.req.clone())
+            .ok_or("an image prefill without an image request")?;
+        let n_layers = self.dims.n_layers;
+        let kinds = self.dims.kinds();
+        let tile = self.prefill_tile;
+        let len = prompt_ids.len() as u64;
+        let mut tiles = Vec::new();
+        let mut pos = 0u64;
+        while pos < len {
+            let t = (len - pos).min(tile);
+            tiles.push(Tile { pos, t });
+            pos += t;
+        }
+        let bidir = self.vis_load.as_ref().is_some_and(|v| v.bidir);
+        let max_tiles = self.vis_load.as_ref().map_or(1, |v| v.unit_tiles);
+        // the largest end of the image blocks over rows [a, b)
+        let block_end = |a: u64, b: u64| -> u64 {
+            req.blocks
+                .iter()
+                .filter(|&&(s, n)| (s as u64) < b && (s + n) as u64 > a)
+                .map(|&(s, n)| (s + n) as u64)
+                .max()
+                .unwrap_or(0)
+        };
+        let mut recipe_ms = 0.0f64;
+        let mut out_addr = 0u64;
+        let mut i = 0usize;
+        while i < tiles.len() {
+            if is_cancelled() {
+                return Ok(None);
+            }
+            // the unit: the tile, and the later tiles an image block runs into
+            let mut unit = vec![i];
+            if bidir {
+                while let Some(&last) = unit.last() {
+                    let end = tiles[last].end();
+                    let cross = last + 1 < tiles.len() && block_end(end - 1, end) > end;
+                    if !g4u_join(cross, unit.len() as u64, max_tiles) {
+                        break;
+                    }
+                    unit.push(last + 1);
+                }
+            }
+            let unit_end = tiles[*unit.last().expect("one tile")].end();
+            let two_way = bidir
+                && unit
+                    .iter()
+                    .any(|&j| block_end(tiles[j].pos, tiles[j].end()) > 0);
+            for (k, &j) in unit.iter().enumerate() {
+                let b = self.unit_bufs(k);
+                recipe_ms += self.embed_tile(prompt_ids, &req.fidx, tiles[j], &b)?;
+            }
+            let t_rec = Instant::now();
+            for &j in &unit {
+                let (t, nch) = (tiles[j].t, tiles[j].end().div_ceil(G4_CHUNK).clamp(1, self.max_chunks));
+                for &kind in &kinds {
+                    if !(two_way && kind == G4LayerKind::Sliding) {
+                        self.ensure_layer(kind, t, nch)?;
+                    }
+                }
+                if two_way {
+                    self.ensure_vis(VisRecipe::SlidingExt, t)?;
+                    self.ensure_vis(VisRecipe::SlidingKv, t)?;
+                }
+            }
+            recipe_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
+            if !two_way {
+                // a text tile (or a size whose image rows attend causally): the plain launches
+                let tl = tiles[i];
+                let nch = tl.end().div_ceil(G4_CHUNK).clamp(1, self.max_chunks);
+                for l in 0..n_layers {
+                    self.launch_prefill_layer(l, tl.t, nch)?;
+                }
+                self.sync_compute("prefill tile")?;
+                out_addr = self.prefill_io(n_layers - 1).1;
+                self.live.prefill_progress(tl.end());
+                i += 1;
+                continue;
+            }
+            // two-way blocks: every row's extension, then the unit layer by layer
+            for (k, &j) in unit.iter().enumerate() {
+                let tl = tiles[j];
+                let mut ext = Vec::with_capacity(tl.t as usize * 4);
+                for p in tl.pos..tl.end() {
+                    let blk = req
+                        .blocks
+                        .iter()
+                        .find(|&&(s, n)| (s as u64) <= p && p < (s + n) as u64);
+                    let e = g4u_ext(blk.is_some(), p, blk.map_or(0, |&(s, n)| (s + n) as u64), unit_end);
+                    ext.extend_from_slice(&(e as i32).to_le_bytes());
+                }
+                let b = self.unit_bufs(k);
+                self.dev
+                    .copy_h2d_sync(&ext, b.ext)
+                    .map_err(|e| format!("upload block extensions: {e}"))?;
+            }
+            for l in 0..n_layers {
+                let glob = self.dims.is_global(l);
+                if !glob {
+                    for (k, &j) in unit.iter().enumerate().skip(1) {
+                        let b = self.unit_bufs(k);
+                        let pool = self.layer_pool(l, b.x[l % 2], b.x[(l + 1) % 2], &b);
+                        let r = &self.vis_recipes[&(VisRecipe::SlidingKv, tiles[j].t)];
+                        self.launch_pool(r, &pool, &format!("block keys layer {l}"))?;
+                    }
+                }
+                for (k, &j) in unit.iter().enumerate() {
+                    let tl = tiles[j];
+                    let b = self.unit_bufs(k);
+                    let pool = self.layer_pool(l, b.x[l % 2], b.x[(l + 1) % 2], &b);
+                    let r = if glob {
+                        let nch = tl.end().div_ceil(G4_CHUNK).clamp(1, self.max_chunks);
+                        &self.layer_recipes[&(G4LayerKind::Global, tl.t, nch)]
+                    } else {
+                        &self.vis_recipes[&(VisRecipe::SlidingExt, tl.t)]
+                    };
+                    self.launch_pool(r, &pool, &format!("image prefill layer {l} at {}", tl.pos))?;
+                }
+            }
+            self.sync_compute("image prefill unit")?;
+            // the next unit starts at the first tile whose blocks ran past this unit
+            let next = unit
+                .iter()
+                .copied()
+                .find(|&j| !g4u_final(block_end(tiles[j].pos, tiles[j].end()), unit_end))
+                .unwrap_or(unit[unit.len() - 1] + 1);
+            if next == i {
+                return Err(format!(
+                    "an image block from row {} runs past the {} tiles a prefill unit holds",
+                    tiles[i].pos, max_tiles
+                ));
+            }
+            let last = unit[unit.len() - 1];
+            if next > last {
+                let b = self.unit_bufs(unit.len() - 1);
+                out_addr = b.x[n_layers % 2];
+            }
+            self.live.prefill_progress(tiles[next - 1].end());
+            i = next;
+        }
+        let last_t = tiles.last().map_or(0, |t| t.t);
+        Ok(Some((last_t, out_addr, recipe_ms)))
+    }
+}

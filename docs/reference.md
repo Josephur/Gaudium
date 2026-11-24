@@ -170,13 +170,16 @@ Serve options:
                         A GGUF model's tower is a projector file (mmproj*.gguf) beside
                         it; with none there it is served text only.
                         A model drafted by a block or an MTP drafter is served text
-                        only (plain decode, DSpine and Inkling 2's own drafter run
-                        with image input)
+                        only (plain decode, DSpine, Inkling 2's own drafter and
+                        Gemma 4's -assistant drafter run with image input; Gemma 4
+                        takes images, no video)
   --vision-max-patches <N>  Largest image the vision tower is planned for, in the
                         model's patches (default: 4096; 16x16 pixels for Qwen3.5 / 3.8:
                         1024x1024 pixels, larger images are resized down to it; 20x20
                         for Inkling 2, which never resizes: an image of more than N/4
-                        tiles of 40x40 pixels is refused). The tower's device memory
+                        tiles of 40x40 pixels is refused; Gemma 4: an image is resized
+                        to whole 48x48-pixel soft tokens of 9 patches, at most N/9 and
+                        at most the checkpoint's own budget). The tower's device memory
                         grows with N^2 (about 160 bytes x N^2: 2.5 GiB at 4096)
   --vision-max-tokens <N>  Image tokens one request may hold, all images and video
                         frames together (default: 16384; 10 KiB of device memory each)
@@ -592,6 +595,8 @@ or reads it to rewrite a file.
 | `GAUDIUM_INKLING2_DIR` | `tokenizer::tests::inkling2_ids_match_the_reference`, `server::chat::tests::inkling2_template_renders_like_jinja2`, `server::chat::tests::inkling2_requests_render_through_the_model_template`, `engine::inkling2::vision::tests::pos_rows_match_the_reference` (`--ignored`) | An Inkling 2 model directory: its `tokenizer.json` must encode and decode the cases of `gaudium/tests/data/tokenizer/inkling2_cases.json` exactly, its `chat_template.jinja` must render the contexts of `gaudium/tests/data/chat/inkling2_renders.json` as Jinja2 does, and the vision tower's position rows and class row resampled from its checkpoint must match `gaudium/tests/data/vision/inkling2/fixture.json` bit for bit (all written by the generator scripts next to them). |
 | `GAUDIUM_IMAGE_REF_DIR` | the decoder tests in `src/vision/decode/` (`--ignored`) | A directory of image files with the raw RGB dump the reference image library wrote for each; every file must decode to the same bytes. |
 | `GAUDIUM_IMAGE_PIPELINE_REF_DIR` | `vision::media::tests::reference_pipeline_records_match_bit_for_bit` (`--ignored`) | A directory written by `gaudium/tests/data/vision/make_pipeline_refs.py`: image files with the patch rows of the checkpoint's own image processor, which must match bit for bit. |
+| `GAUDIUM_G4V_MODEL` | `engine::gemma4::vision::tests::reference_pixel_rows_match_bit_for_bit` (`--ignored`) | The Gemma 4 model directory whose processor settings the check uses (with `GAUDIUM_G4V_REF_DIR`). |
+| `GAUDIUM_G4V_REF_DIR` | `engine::gemma4::vision::tests::reference_pixel_rows_match_bit_for_bit` (`--ignored`) | A directory of Gemma 4 image records (`tests/data/vision/gemma4/make_gemma4_refs.py`): the processor's pixel rows must match them bit for bit. |
 | `GAUDIUM_VISION_REF_DIR` | `vision::tests::reference_prompt_records_match_bit_for_bit` (`--ignored`) | A directory of reference prompt records (token ids, image grids, positions, patch rows) that the prompt layout and the image preprocessing must reproduce. |
 | `GAUDIUM_GGUF_REF_DIR` | `gguf::tests::reference_gguf_files_open_and_decode` (`--ignored`) | A directory of published GGUF files (and its `dspark/` subdirectory): every file must open, the Inkling 2 Mini model must have its 744 tensors with architecture `inkling2_loop` and NVFP4 weights, every NVFP4 tensor its per-expert `.scale`, and one row of every type must decode to finite numbers. |
 | `GAUDIUM_INKLING2_GGUF` | `engine::inkling2::gguf_source::tests::gguf_and_checkpoint_pack_the_same_device_tensors`, `tokenizer::gguf::tests::inkling2_gguf_tokenizer_matches_the_checkpoint`, `server::chat::tests::inkling2_gguf_renders_like_the_checkpoint`, `engine::inkling2::vision::gguf_tower::tests::projector_and_checkpoint_pack_the_same_tower` (`--ignored`, with `GAUDIUM_INKLING2_DIR`) | A GGUF file of the same Inkling 2 model as the checkpoint directory `GAUDIUM_INKLING2_DIR`: both must pack byte-identical device tensors, the tokenizer built from the file's metadata must equal the one of `tokenizer.json` (every token, every merge, the fixture cases), and the file's chat template must render the Jinja2 fixture contexts and a set of chat requests to the same prompts and ids as the checkpoint's. The projector file beside it must give the checkpoint's tower geometry, image spec and every tower device tensor byte for byte. |

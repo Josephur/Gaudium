@@ -1,0 +1,258 @@
+# Gemma 4 image input: the resized size of an image, its soft-token count against the budget the
+# tower is planned for, and the prefill units that let an image block attend both ways in the
+# sliding layers.
+# Formally specifies and proves:
+#   - An accepted resized size never holds more soft tokens than the budget
+#   - A prefill unit (a tile and the later tiles its image blocks reach into) joins a tile only
+#     while it still fits the sliding ring beside the window
+#   - A unit that fits keeps every row's window and its block's extension inside the ring
+#   - A prefill row of an image block never attends a key the unit has not written
+
+import Base
+import nat_lemmas.bend as L
+import vision_budget.bend as VB
+
+# ============================================================================
+# 1. Helper lemmas (erased before Rust codegen)
+# ============================================================================
+
+# (a and b) and c is false when b and c is.
+def g4v_and3_false(a: Bool, b: Bool, c: Bool, e: {Bool.and(b, c) == False{} : Bool}) -> {Bool.and(Bool.and(a, b), c) == False{} : Bool}:
+  match a:
+    case True{}:
+      e
+    case False{}:
+      {==}
+
+# b and not b is false.
+def g4v_and_not_self(b: Bool) -> {Bool.and(b, Bool.not(b)) == False{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# ============================================================================
+# 2. Resized size of an image
+# ============================================================================
+
+# Side of the resized height from the floored candidates `th0` / `tw0` (whole squares of `side`
+# pixels at the budget's scale): a height that floored to zero takes one square, a width that did
+# takes the height of the aspect ratio `qh` (source height over width) in squares, at most
+# `max_side`; both zero is no size.
+def g4v_pick_h(hz: Bool, wz: Bool, th0: Nat, qh: Nat, side: Nat, max_side: Nat) -> Nat:
+  match hz:
+    case True{}:
+      match wz:
+        case True{}:
+          0n
+        case False{}:
+          side
+    case False{}:
+      match wz:
+        case True{}:
+          Nat.min(Nat.mul(qh, side), max_side)
+        case False{}:
+          th0
+
+# The same for the width (`qw`: source width over height).
+def g4v_pick_w(hz: Bool, wz: Bool, tw0: Nat, qw: Nat, side: Nat, max_side: Nat) -> Nat:
+  match hz:
+    case True{}:
+      match wz:
+        case True{}:
+          0n
+        case False{}:
+          Nat.min(Nat.mul(qw, side), max_side)
+    case False{}:
+      match wz:
+        case True{}:
+          side
+        case False{}:
+          tw0
+
+def g4v_target_h(+th0: Nat, +tw0: Nat, qh: Nat, side: Nat, max_side: Nat) -> Nat:
+  g4v_pick_h(Nat.is_eq(th0, 0n), Nat.is_eq(tw0, 0n), th0, qh, side, max_side)
+
+def g4v_target_w(+th0: Nat, +tw0: Nat, qw: Nat, side: Nat, max_side: Nat) -> Nat:
+  g4v_pick_w(Nat.is_eq(th0, 0n), Nat.is_eq(tw0, 0n), tw0, qw, side, max_side)
+
+# Soft tokens of a resized image of `th x tw` pixels: one per square of `side` pixels.
+def g4v_tokens(th: Nat, tw: Nat, +side: Nat) -> Nat:
+  Nat.mul(Nat.div(tw, side), Nat.div(th, side))
+
+# Whether a resized size is taken: both sides whole squares, neither empty, and at most
+# `max_soft` squares (the overflow-free canvas test of the media check).
+def g4v_size_ok(+th: Nat, +tw: Nat, +side: Nat, max_soft: Nat) -> Bool:
+  Bool.and(Bool.and(Nat.is_eq(Nat.mod(th, side), 0n), Nat.is_eq(Nat.mod(tw, side), 0n)), VB.media_canvas_ok(Nat.div(tw, side), Nat.div(th, side), max_soft))
+
+# ============================================================================
+# 3. Prefill units of the two-way image blocks
+# ============================================================================
+
+# Whether `rows` consecutive prefill rows fit a sliding layer's ring of `ring` slots beside its
+# window of `w` positions: the first row's window and the last row both stay in the ring
+# (`rows + w - 1 <= ring`, written so that nothing is formed past the operands).
+def g4u_fits(+ring: Nat, +w: Nat, +rows: Nat) -> Bool:
+  match w:
+    case 0n:
+      Nat.is_le(rows, ring)
+    case 1n+wp:
+      Bool.and(Nat.is_lt(wp, ring), Nat.is_le(rows, Nat.sub(ring, wp)))
+
+# Whether the next tile joins a unit of `tiles` tiles: an image block runs from the unit's last
+# tile into it (`cross`), and the unit has room for one more tile of the `max_tiles` the plan
+# holds buffers for (the load checks that a unit of `max_tiles` full tiles fits the ring).
+def g4u_join(cross: Bool, +tiles: Nat, max_tiles: Nat) -> Bool:
+  Bool.and(cross, Nat.is_lt(tiles, max_tiles))
+
+# Whether a tile of a unit is final when the image blocks over it end at `end` (the largest
+# end) and the unit's keys end at `u`: its rows then attended the whole of their blocks.
+def g4u_final(+end: Nat, u: Nat) -> Bool:
+  Nat.is_le(end, u)
+
+# Positions after its own that the prefill row at position `p` attends in a sliding layer: a row
+# of an image block the rest of its block (which ends before `e`), cut at `u`, the end of the keys
+# the unit has written; a text row none.
+def g4u_ext(in_block: Bool, p: Nat, e: Nat, u: Nat) -> Nat:
+  match in_block:
+    case True{}:
+      Nat.sub(Nat.min(e, u), 1n+p)
+    case False{}:
+      0n
+
+# ============================================================================
+# 4. Laws
+# ============================================================================
+
+# and(b, le(m, n)) is false when b says n < m.
+def g4u_lt_le_false(+n: Nat, +m: Nat, b: Bool, e: {Nat.is_lt(n, m) == b : Bool}) -> {Bool.and(b, Nat.is_le(m, n)) == False{} : Bool}:
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_lt_le_false(n, m, e)
+
+# 1 + u + k <= u never holds.
+def g4u_past_not_le(+u: Nat, +k: Nat) -> {Nat.is_le(1n+Nat.add(u, k), u) == False{} : Bool}:
+  match u:
+    case 0n:
+      {==}
+    case 1n+up:
+      g4u_past_not_le(up, k)
+
+# p + 0 < 1 + p + k.
+def g4u_lt_self_add(+p: Nat, +k: Nat) -> {Nat.is_lt(Nat.add(p, 0n), 1n+Nat.add(p, k)) == True{} : Bool}:
+  %Equal.sym(Nat, Nat.add(p, 0n), p, L.nat_add_zero_r(p)) : {Nat.is_lt(_, 1n+Nat.add(p, k)) == True{} : Bool}
+  %Equal.sym(Bool, Nat.is_lt(p, 1n+Nat.add(p, k)), Nat.is_le(p, Nat.add(p, k)), L.nat_lt_succ_eq_le(p, Nat.add(p, k))) : {_ == True{} : Bool}
+  L.nat_add_le_r(p, k)
+
+# x <= 1 + p + k gives p + (x - (1 + p)) < 1 + p + k.
+def g4u_ext_lt(+p: Nat, +x: Nat, +k: Nat, h: {Nat.is_le(x, 1n+Nat.add(p, k)) == True{} : Bool}) -> {Nat.is_lt(Nat.add(p, Nat.sub(x, 1n+p)), 1n+Nat.add(p, k)) == True{} : Bool}:
+  match p:
+    case 0n:
+      match x:
+        case 0n:
+          {==}
+        case 1n+xp:
+          %Equal.sym(Nat, Nat.sub(xp, 0n), xp, L.nat_sub_zero_r(xp)) : {Nat.is_lt(_, 1n+k) == True{} : Bool}
+          %Equal.sym(Bool, Nat.is_lt(xp, 1n+k), Nat.is_le(xp, k), L.nat_lt_succ_eq_le(xp, k)) : {_ == True{} : Bool}
+          h
+    case 1n+pp:
+      match x:
+        case 0n:
+          g4u_lt_self_add(pp, k)
+        case 1n+xp:
+          g4u_ext_lt(pp, xp, k, h)
+
+# w = 0: an accepted unit (rows <= ring) keeps rows + 0 within ring + 1.
+def g4u_fits_zero(+r: Nat, +n: Nat, b: Bool, e: {Nat.is_le(n, r) == b : Bool}) -> {Bool.and(b, Nat.is_lt(1n+r, Nat.add(n, 0n))) == False{} : Bool}:
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      %Equal.sym(Nat, Nat.add(n, 0n), n, L.nat_add_zero_r(n)) : {Nat.is_lt(1n+r, _) == False{} : Bool}
+      L.nat_le_lt_false(1n+r, n, L.nat_le_succ_r(n, r, e))
+
+# w = 1 + wp: wp < ring and rows <= ring - wp keep rows + 1 + wp within ring + 1.
+def g4u_fits_succ(+r: Nat, +wp: Nat, +n: Nat, b1: Bool, e1: {Nat.is_lt(wp, r) == b1 : Bool}, b2: Bool, e2: {Nat.is_le(n, Nat.sub(r, wp)) == b2 : Bool}) -> {Bool.and(Bool.and(b1, b2), Nat.is_lt(1n+r, Nat.add(n, 1n+wp))) == False{} : Bool}:
+  match b1:
+    case False{}:
+      {==}
+    case True{}:
+      match b2:
+        case False{}:
+          {==}
+        case True{}:
+          %Equal.sym(Nat, Nat.add(n, 1n+wp), 1n+Nat.add(n, wp), L.nat_add_succ_r(n, wp)) : {Nat.is_lt(1n+r, _) == False{} : Bool}
+          L.nat_le_lt_false(r, Nat.add(n, wp), L.nat_le_subst_r(Nat.add(n, wp), Nat.add(Nat.sub(r, wp), wp), r, L.nat_sub_add_cancel(r, wp, L.nat_lt_imp_le(wp, r, e1)), L.nat_add_le_mono(n, Nat.sub(r, wp), wp, wp, e2, L.nat_le_refl(wp))))
+
+# LAW G4V.1
+# promise: an image size the processor accepts never holds more soft tokens than the budget the tower is planned for.
+# harm: an image past the budget would write soft tokens beyond the planned buffers.
+law g4v_size_within_budget:
+  for +th: Nat
+  for +tw: Nat
+  for +side: Nat
+  for +m: Nat
+  {Bool.and(g4v_size_ok(th, tw, side, m), Nat.is_lt(m, g4v_tokens(th, tw, side))) == False{} : Bool}
+
+def g4v_size_within_budget(th, tw, side, m):
+  g4v_and3_false(Bool.and(Nat.is_eq(Nat.mod(th, side), 0n), Nat.is_eq(Nat.mod(tw, side), 0n)), VB.media_canvas_ok(Nat.div(tw, side), Nat.div(th, side), m), Nat.is_lt(m, g4v_tokens(th, tw, side)), VB.media_canvas_within_limit(Nat.div(tw, side), Nat.div(th, side), m))
+
+# LAW G4U.1
+# promise: a prefill unit the ring is said to fit keeps its rows and the window of its first row inside the ring (rows + window <= ring + 1).
+# harm: a later tile's keys would overwrite keys an earlier tile's rows still attend.
+law g4u_fits_within_ring:
+  for +r: Nat
+  for +w: Nat
+  for +n: Nat
+  {Bool.and(g4u_fits(r, w, n), Nat.is_lt(1n+r, Nat.add(n, w))) == False{} : Bool}
+
+def g4u_fits_within_ring(r, w, n):
+  match w:
+    case 0n:
+      g4u_fits_zero(r, n, Nat.is_le(n, r), {==})
+    case 1n+wp:
+      g4u_fits_succ(r, wp, n, Nat.is_lt(wp, r), {==}, Nat.is_le(n, Nat.sub(r, wp)), {==})
+
+# LAW G4U.2
+# promise: a unit never takes a tile beyond the tile buffers the plan holds for it.
+law g4u_join_within_buffers:
+  for c: Bool
+  for +n: Nat
+  for +m: Nat
+  {Bool.and(g4u_join(c, n, m), Nat.is_le(m, n)) == False{} : Bool}
+
+def g4u_join_within_buffers(c, n, m):
+  match c:
+    case True{}:
+      g4u_lt_le_false(n, m, Nat.is_lt(n, m), {==})
+    case False{}:
+      {==}
+
+# LAW G4U.3
+# promise: a tile whose image block runs past the keys its unit wrote is never taken as final.
+# harm: its block rows would keep an attention that missed the rest of their image.
+law g4u_final_refuses_past_end:
+  for +u: Nat
+  for +k: Nat
+  {g4u_final(1n+Nat.add(u, k), u) == False{} : Bool}
+
+def g4u_final_refuses_past_end(u, k):
+  g4u_past_not_le(u, k)
+
+# LAW G4U.4
+# promise: a prefill row in a sliding layer never attends a position past the end of the keys its unit has written.
+# harm: it would read a ring slot that holds a stale or foreign key.
+law g4u_ext_within_unit:
+  for b: Bool
+  for +p: Nat
+  for +e: Nat
+  for +k: Nat
+  {Nat.is_lt(Nat.add(p, g4u_ext(b, p, e, 1n+Nat.add(p, k))), 1n+Nat.add(p, k)) == True{} : Bool}
+
+def g4u_ext_within_unit(b, p, e, k):
+  match b:
+    case True{}:
+      g4u_ext_lt(p, Nat.min(e, 1n+Nat.add(p, k)), k, L.nat_min_le_r(e, 1n+Nat.add(p, k)))
+    case False{}:
+      g4u_lt_self_add(p, k)

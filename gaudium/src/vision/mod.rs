@@ -46,6 +46,13 @@ pub enum ImageProcessor {
     /// per tile, patch rows laid out y, x, channel (the Inkling 2 family,
     /// `engine::inkling2::vision`).
     Tiles,
+    /// Resized with its aspect kept to the largest size of whole `patch * merge` squares within
+    /// the soft-token budget (`max_pixels`), pixels rescaled to `0..1` and not normalised; one
+    /// token per `merge x merge` patches (the Gemma 4 family, `engine::gemma4::vision`).
+    /// `merged`: one patch row per token (`merge * patch` square, y, x, channel: the encoder-free
+    /// embedder of the unified form); otherwise one row per patch (y, x, channel) in pooling
+    /// order, for the tower.
+    Gemma4 { merged: bool },
 }
 
 /// Vision tower geometry, special token IDs and image-processor settings of one checkpoint.
@@ -54,6 +61,12 @@ pub struct VisionSpec {
     pub processor: ImageProcessor,
     /// The chat template's text for one image (its pad is expanded to the image's tokens).
     pub image_block: String,
+    /// What the prompt holds in place of each `image_block` before its pad is expanded (empty:
+    /// the block itself; the Gemma 4 template writes the bare pad and the processor puts the
+    /// image's begin and end tokens around it).
+    pub image_text: String,
+    /// Factor from a pixel byte to the value the model's processor computes from it (`1 / 255`).
+    pub rescale: f64,
     pub depth: u64,
     pub hidden: u64,
     pub n_heads: u64,
@@ -203,6 +216,15 @@ impl VisionSpec {
             let proc = std::fs::read_to_string(dir.join("processor_config.json")).ok();
             return crate::engine::inkling2::vision::vision_spec(&cfg, proc.as_deref());
         }
+        if crate::engine::gemma4::vision::is_gemma4_vision(&cfg) {
+            let proc = std::fs::read_to_string(dir.join("processor_config.json")).ok();
+            let tok = std::fs::read_to_string(dir.join("tokenizer_config.json")).ok();
+            return crate::engine::gemma4::vision::vision_spec(
+                &cfg,
+                proc.as_deref(),
+                tok.as_deref(),
+            );
+        }
         let mut s = Self::from_json(&cfg, pre.as_deref())?;
         if s.video_token_id >= 0 {
             if let Ok(text) = std::fs::read_to_string(dir.join("video_preprocessor_config.json")) {
@@ -215,6 +237,9 @@ impl VisionSpec {
     pub fn from_json(config_json: &str, preprocessor_json: Option<&str>) -> Result<Self, String> {
         if crate::engine::inkling2::vision::is_inkling2_vision(config_json) {
             return crate::engine::inkling2::vision::vision_spec(config_json, preprocessor_json);
+        }
+        if crate::engine::gemma4::vision::is_gemma4_vision(config_json) {
+            return crate::engine::gemma4::vision::vision_spec(config_json, preprocessor_json, None);
         }
         let root = parse_json(config_json).map_err(|e| format!("config.json: {e}"))?;
         let vc = root
@@ -264,6 +289,8 @@ impl VisionSpec {
         let mut s = Self {
             processor: ImageProcessor::Resize,
             image_block: media::IMAGE_BLOCK.to_string(),
+            image_text: String::new(),
+            rescale: 1.0 / 255.0,
             depth: need("depth")?,
             hidden: need("hidden_size")?,
             n_heads: need("num_heads")?,
@@ -333,6 +360,16 @@ impl VisionSpec {
 
     /// Shape rules the graphs, the merge order and the M-RoPE layout rely on.
     pub fn validate(&self) -> Result<(), String> {
+        if let ImageProcessor::Gemma4 { .. } = self.processor {
+            // the family's own reader checked the tower's sizes; what the host pipeline relies on
+            if self.patch == 0 || self.merge == 0 || self.temporal != 1 || self.in_channels != 3 {
+                return Err("a Gemma 4 vision_config needs a positive patch and pooling size, one frame, 3 channels".into());
+            }
+            if self.max_pixels < self.resize_factor() * self.resize_factor() {
+                return Err("the image budget holds no soft token".into());
+            }
+            return Ok(());
+        }
         if self.depth == 0 || self.hidden == 0 || self.n_heads == 0 || self.intermediate == 0 {
             return Err("vision_config: depth, hidden_size, num_heads and intermediate_size must be positive".into());
         }

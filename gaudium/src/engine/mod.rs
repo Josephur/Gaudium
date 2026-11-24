@@ -366,6 +366,21 @@ impl GenEngine for gemma4::Gemma4Engine {
     fn set_speculative(&mut self, on: bool) -> Result<(), String> {
         gemma4::Gemma4Engine::set_speculative(self, on)
     }
+    fn vision_spec(&self) -> Option<&crate::vision::VisionSpec> {
+        gemma4::Gemma4Engine::vision_spec(self)
+    }
+    fn set_request_images(
+        &mut self,
+        images: Vec<crate::vision::PreparedImage>,
+    ) -> Result<(), String> {
+        gemma4::Gemma4Engine::set_request_images(self, images)
+    }
+    fn last_vision_report(&self) -> Option<crate::vision::VisionReport> {
+        gemma4::Gemma4Engine::last_vision_report(self)
+    }
+    fn read_vision_embeddings(&self) -> Result<Vec<u8>, String> {
+        gemma4::Gemma4Engine::read_vision_embeddings(self)
+    }
 }
 
 impl GenEngine for inkling2::Inkling2Engine {

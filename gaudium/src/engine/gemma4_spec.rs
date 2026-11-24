@@ -391,6 +391,12 @@ impl G4SpecCfg {
         self.kmax() + 1
     }
 
+    /// Whether the drafter embeds prompt rows of its own (a block drafter's context from tapped
+    /// layer outputs); the size's assistant reads only the target's states and keys.
+    pub fn reads_prompt_rows(&self) -> bool {
+        matches!(self.drafter, G4Drafter::DFlash(_))
+    }
+
     /// Method name of the reports.
     pub fn method_name(&self) -> &'static str {
         match self.drafter {
