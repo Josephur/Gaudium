@@ -156,7 +156,7 @@ fn print_usage() {
          \x20                       default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock\n\
          \x20                       state dir). Keys: group_max_wait_min (default 45), group_max_skips\n\
          \x20                       (default 3): a request for the loaded model may run ahead of older\n\
-         \x20                       requests until the oldest has waited that long or been passed over\n\
+         \x20                       requests until one of them has waited that long or been passed over\n\
          \x20                       that many times (a request a --parallel lane session admits\n\
          \x20                       counts too: the session then lets its lanes drain and hands\n\
          \x20                       the card on)\n\

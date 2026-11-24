@@ -158,6 +158,24 @@ def ln_session_ends(idle: Bool, waiting: Bool) -> Bool:
 def turn_due(waited: Nat, max_wait: Nat, skips: Nat, max_skips: Nat) -> Bool:
   Bool.or(Nat.is_ge(waited, max_wait), Nat.is_ge(skips, max_skips))
 
+# How a waiter for the card ranks when the card's next turn is given: a waiter whose turn is
+# `due` first, then a waiter of the model `loaded` now (no reload), then the others. Between
+# equal ranks the waiter that arrived first takes the turn (`turn_better` is strict).
+def turn_rank(due: Bool, loaded: Bool) -> Nat:
+  match due:
+    case True{}:
+      2n
+    case False{}:
+      match loaded:
+        case True{}:
+          1n
+        case False{}:
+          0n
+
+# Does a waiter of rank `a`, later in arrival order, take the turn from the best so far (`b`)?
+def turn_better(a: Nat, b: Nat) -> Bool:
+  Nat.is_gt(a, b)
+
 # Does a request that arrived at `request` pass over a waiter for the card that arrived at
 # `waiter` (both on one clock)? Only a waiter that arrived first is passed over.
 def ln_passes_over(waiter: Nat, request: Nat) -> Bool:
@@ -1199,3 +1217,79 @@ def ln_parity_alternates(p):
           {==}
         case 1n+u:
           {==}
+
+def ln_lt_add_succ(+c: Nat, +m: Nat) -> {True{} == Nat.is_lt(c, Nat.add(c, 1n+m)) : Bool}:
+  match c:
+    case 0n:
+      {==}
+    case 1n+cp:
+      ln_lt_add_succ(cp, m)
+
+# promise: a waiter whose turn on the card is due ranks above every waiter whose turn is not due.
+law turn_due_outranks:
+  for +l1: Bool
+  for +l2: Bool
+  {Nat.is_gt(turn_rank(True{}, l1), turn_rank(False{}, l2)) == True{} : Bool}
+
+def turn_due_outranks(l1, l2):
+  match l1 l2:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a waiter never takes the card's turn from an equally ranked waiter that arrived before it.
+law turn_better_strict:
+  for +r: Nat
+  {turn_better(r, r) == False{} : Bool}
+
+def turn_better_strict(r):
+  %ln_gt_refl_false(r) : {_ == False{} : Bool}
+  {==}
+
+# promise: a lane session never ends while one of its lanes is busy.
+law ln_next_never_ends_busy:
+  for +w: Bool
+  for +b: Bool
+  {ln_sm_ends(ln_session_next(False{}, w, b)) == False{} : Bool}
+
+def ln_next_never_ends_busy(w, b):
+  match w b:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a lane session with no lane busy never sits holding the card: it ends, admits a request or hands the turn back.
+law ln_next_idle_never_waits:
+  for +w: Bool
+  for +b: Bool
+  {ln_sm_waits(ln_session_next(True{}, w, b)) == False{} : Bool}
+
+def ln_next_idle_never_waits(w, b):
+  match w b:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a step moves a lane's cursor at most over the rows it accepted.
+law ln_cursor_never_past_emitted:
+  for +c: Nat
+  for +e: Nat
+  for +r: Nat
+  {Nat.is_le(ln_lane_cursor_next(c, e, r), Nat.add(c, e)) == True{} : Bool}
+
+def ln_cursor_never_past_emitted(c, e, r):
+  L.nat_add_le_mono(c, c, Nat.min(e, r), e, L.nat_le_refl(c), L.nat_min_le_l(e, r))
+
+# promise: a step that wrote and accepted a row moves the lane's cursor forward.
+law ln_cursor_moves_forward:
+  for +c: Nat
+  for +e: Nat
+  for +r: Nat
+  {Nat.is_lt(c, ln_lane_cursor_next(c, 1n+e, 1n+r)) == True{} : Bool}
+
+def ln_cursor_moves_forward(c, e, r):
+  %ln_lt_add_succ(c, Nat.min(e, r)) : {_ == True{} : Bool}
+  {==}

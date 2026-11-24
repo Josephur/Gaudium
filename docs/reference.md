@@ -134,7 +134,7 @@ Serve options:
                         default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock
                         state dir). Keys: group_max_wait_min (default 45), group_max_skips
                         (default 3): a request for the loaded model may run ahead of older
-                        requests until the oldest has waited that long or been passed over
+                        requests until one of them has waited that long or been passed over
                         that many times (a request a --parallel lane session admits
                         counts too: the session then lets its lanes drain and hands
                         the card on)

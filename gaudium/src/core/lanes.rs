@@ -259,6 +259,20 @@ pub fn passes_over(waiter: u64, request: u64) -> bool {
     ln_passes_over(waiter, request)
 }
 
+/// The waiter for the card that gets its next turn, among `waiting` in arrival order as
+/// `(turn due, of the model loaded now)`: the best by the verified `turn_rank`, the first among
+/// equals (`turn_better` is strict). `None`: nobody waits.
+pub fn next_turn_of(waiting: impl IntoIterator<Item = (bool, bool)>) -> Option<usize> {
+    let mut best: Option<(usize, u64)> = None;
+    for (i, (due, loaded)) in waiting.into_iter().enumerate() {
+        let r = crate::verified::turn_rank(due, loaded);
+        if best.is_none_or(|(_, b)| crate::verified::turn_better(r, b)) {
+            best = Some((i, r));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 /// Would admitting a request that arrived at `request` pass over the oldest waiter for the card
 /// (arrived at `waiter`, its turn `due`)?
 pub fn admission_blocked(due: bool, waiter: u64, request: u64) -> bool {
@@ -403,6 +417,15 @@ mod tests {
         t.admit(1, false).unwrap();
         t.admit(0, false).unwrap();
         assert_eq!(t.route(|_| Offer::default()), None);
+    }
+
+    #[test]
+    fn the_cards_next_turn_goes_to_a_due_waiter_then_the_loaded_model_then_arrival_order() {
+        assert_eq!(next_turn_of([]), None);
+        assert_eq!(next_turn_of([(false, false), (false, true), (true, false)]), Some(2));
+        assert_eq!(next_turn_of([(false, false), (false, true), (false, true)]), Some(1));
+        assert_eq!(next_turn_of([(false, false), (false, false)]), Some(0));
+        assert_eq!(next_turn_of([(true, false), (true, true)]), Some(0), "the first due one");
     }
 
     #[test]

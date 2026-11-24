@@ -1019,6 +1019,8 @@ fn prepare(
     let mut pool = rt.base.clone();
     for (j, (&lane, &p)) in lanes.iter().zip(parities).enumerate() {
         let sp = slot_pfx(j as u64);
+        // the state buffer the step writes: the one its lane's next step reads
+        let q = crate::verified::ln_lane_parity_next(p as u64) as usize;
         pool.insert(format!("{sp}cursor"), rt.io_cursor[j]);
         pool.insert(format!("{sp}samp_f"), rt.samp_bufs[lane].0);
         pool.insert(format!("{sp}samp_i"), rt.samp_bufs[lane].1);
@@ -1032,9 +1034,9 @@ fn prepare(
         }
         for (&l, st) in gdn {
             pool.insert(format!("{sp}L{l}_S_in"), st.s[p]);
-            pool.insert(format!("{sp}L{l}_S_out"), st.s[1 - p]);
+            pool.insert(format!("{sp}L{l}_S_out"), st.s[q]);
             pool.insert(format!("{sp}L{l}_cs_in"), st.cs[p]);
-            pool.insert(format!("{sp}L{l}_cs_out"), st.cs[1 - p]);
+            pool.insert(format!("{sp}L{l}_cs_out"), st.cs[q]);
         }
     }
     let recipe = &rt.recipes[&key];

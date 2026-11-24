@@ -2373,8 +2373,8 @@ fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     );
 }
 
-/// How far a request for the loaded model may jump the queue: the oldest request is never passed over once
-/// it has waited `max_wait` or been passed over `max_skips` times. Read from the card-queue settings file
+/// How far a request for the loaded model may jump the queue: no request is passed over once it has waited
+/// `max_wait` or been passed over `max_skips` times. Read from the card-queue settings file
 /// (`queue.conf`, keys `group_max_wait_min` and `group_max_skips`), the same file the card lock reads.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TurnLimits {
@@ -2422,8 +2422,8 @@ impl TurnLimits {
 /// The chat server's card queue. Requests get the card in arrival order, except that a request for the
 /// model already loaded goes ahead of older requests for another model, so the card is not unloaded and
 /// reloaded between them. The model index is the whole configuration: every load option is fixed per model
-/// at startup, and per-request settings (sampling, method) never reload the card. The oldest request is
-/// never passed over beyond the `TurnLimits` of the settings file.
+/// at startup, and per-request settings (sampling, method) never reload the card. No request is passed over
+/// beyond the `TurnLimits` of the settings file (the verified `turn_rank`: a due waiter goes first).
 struct TurnQueue {
     mu: Mutex<TurnState>,
     cv: Condvar,
@@ -2473,14 +2473,11 @@ fn next_turn(
     now: Instant,
     lim: TurnLimits,
 ) -> Option<usize> {
-    let first = waiting.first()?;
-    let due = waiter_due(first, now, lim);
-    match ready {
-        Some(m) if first.model != m && !due => {
-            Some(waiting.iter().position(|w| w.model == m).unwrap_or(0))
-        }
-        _ => Some(0),
-    }
+    crate::core::lanes::next_turn_of(
+        waiting
+            .iter()
+            .map(|w| (waiter_due(w, now, lim), ready == Some(w.model))),
+    )
 }
 
 /// Holding the card: dropping it hands the card to the next waiter.
@@ -2550,13 +2547,15 @@ impl TurnQueue {
         u64::try_from(t.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// [lanes] Would admitting a request that arrived at `since` pass over the oldest waiter,
-    /// whose turn is due? (A lane session admits nothing more then.)
+    /// [lanes] Would admitting a request that arrived at `since` pass over a waiter whose turn
+    /// is due? (A lane session admits nothing more then.) Every waiter counts, not only the
+    /// first: a lane session that queued again stands among them in arrival order.
     fn blocks(&self, since: Instant, lim: TurnLimits) -> bool {
         let st = self.mu.lock().unwrap();
-        st.waiting.first().is_some_and(|w| {
+        let now = Instant::now();
+        st.waiting.iter().any(|w| {
             crate::core::lanes::admission_blocked(
-                waiter_due(w, Instant::now(), lim),
+                waiter_due(w, now, lim),
                 self.clock(w.since),
                 self.clock(since),
             )
@@ -2678,7 +2677,9 @@ fn drive_lanes(state: Arc<AppState>, idx: usize) {
                 st.publish_engine_event();
             }
         }));
-        feed.blocks = Some(Box::new(move |since| st.turns.blocks(since, limits())));
+        // the queue settings are read once per turn, like the turn queue's own
+        let lim = limits();
+        feed.blocks = Some(Box::new(move |since| st.turns.blocks(since, lim)));
         feed.on_admit = Some(Box::new(move |since| st.turns.passed_over(since)));
         let res = engine.serve_lanes(&mut feed);
         let (ended, yielded) = (feed.ended, feed.yielded);
@@ -4137,6 +4138,30 @@ mod tests {
         assert!(!q.blocks(w0, lim));
         q.mu.lock().unwrap().waiting.clear();
         assert!(!q.blocks(later(10), lim), "nobody waits");
+    }
+
+    #[test]
+    fn a_due_waiter_behind_one_that_is_not_due_is_never_passed_over() {
+        let now = Instant::now();
+        let lim = TurnLimits::default();
+        // a lane session queued again (model 0, no skips yet) stands before a waiter that is due
+        let mut w = waiters(&[0, 1], now);
+        w[1].skips = lim.max_skips;
+        assert_eq!(next_turn(&w, Some(0), now, lim), Some(1), "the due waiter goes first");
+        assert_eq!(next_turn(&w, None, now, lim), Some(1));
+        w[1].skips = 0;
+        assert_eq!(next_turn(&w, Some(1), now, lim), Some(1), "then the loaded model");
+        assert_eq!(next_turn(&w, Some(2), now, lim), Some(0), "then arrival order");
+        let q = TurnQueue::default();
+        let t0 = Instant::now();
+        {
+            let mut st = q.mu.lock().unwrap();
+            st.waiting = waiters(&[0, 1], t0);
+            st.waiting[1].since = t0 + Duration::from_millis(5);
+            st.waiting[1].skips = lim.max_skips;
+        }
+        assert!(q.blocks(t0 + Duration::from_millis(9), lim), "a due waiter second in line blocks");
+        assert!(!q.blocks(t0 + Duration::from_millis(5), lim), "not a request as old as it");
     }
 
     #[test]
