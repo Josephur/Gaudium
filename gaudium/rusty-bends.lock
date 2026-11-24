@@ -83,13 +83,28 @@ d556bde2ff41c207  g4_heads_zero_kv_rejected  law g4_heads_zero_kv_rejected : for
 b92e3f940df9aed8  g4_kv_share_all_rejected  law g4_kv_share_all_rejected : for + nl : Nat for + extra : Nat { g4_kv_share_valid ( nl , Nat.add ( nl , extra ) ) == False { } : Bool }
 c53430ffbf275392  g4_ple_off_always_valid  law g4_ple_off_always_valid : for pv : Nat for v : Nat { g4_ple_valid ( 0n , pv , v ) == True { } : Bool }
 629829a88fd02c54  g4_rope_vecs_boundary  law g4_rope_vecs_boundary : { Bool.and ( Nat.is_eq ( g4_rope_vecs ( 0n ) , 0n ) , Nat.is_eq ( g4_rope_vecs ( 128n ) , 1n ) ) == True { } : Bool }
+5a668aa3b7995174  g4u_block_after_rows_outside  law g4u_block_after_rows_outside : for + b : Nat for + k : Nat for + n : Nat for + a : Nat { g4u_overlaps ( Nat.add ( b , k ) , n , a , b ) == False { } : Bool }
+# promise g4u_block_after_rows_outside: an image block that starts at or after the end of some rows has no row among them.
+# harm g4u_block_after_rows_outside: a unit would count a later block as its own, and join or refuse tiles for no reason.
 1c002a72a7319a99  g4u_block_before_rows_outside  law g4u_block_before_rows_outside : for + s : Nat for + n : Nat for + k : Nat for + b : Nat { g4u_overlaps ( s , n , Nat.add ( Nat.add ( s , n ) , k ) , b ) == False { } : Bool }
 # promise g4u_block_before_rows_outside: an image block that ends at or before the first of some rows has no row among them.
 4e85b1fb1a5becf2  g4u_block_end_row_outside  law g4u_block_end_row_outside : for + s : Nat for + n : Nat { g4u_in_block ( s , n , Nat.add ( s , n ) ) == False { } : Bool }
 # promise g4u_block_end_row_outside: the row right after an image block is not in it.
+2cb29091d2d17978  g4u_block_row_before_outside  law g4u_block_row_before_outside : for + p : Nat for + k : Nat for + n : Nat { g4u_in_block ( 1n + Nat.add ( p , k ) , n , p ) == False { } : Bool }
+# promise g4u_block_row_before_outside: a row before an image block is not in it.
+# harm g4u_block_row_before_outside: a text row before an image would attend into the image.
 e45d92ed19b2ff9f  g4u_causal_tile_final  law g4u_causal_tile_final : for + e : Nat for u : Nat { g4u_final ( False { } , e , u ) == True { } : Bool }
 # promise g4u_causal_tile_final: a tile of a causal unit (no two-way image block) is always final, so the prefill always moves past it.
 # harm g4u_causal_tile_final: the small sizes' image prompts would be refused whenever an image crosses a tile boundary.
+18f7833d1bb58b1f  g4u_cross_into_block  law g4u_cross_into_block : for + i : Nat for + k : Nat for + e : Nat for + j : Nat { g4u_cross ( True { } , i , 1n + Nat.add ( i , k ) , 1n + Nat.add ( e , j ) , e ) == True { } : Bool }
+# promise g4u_cross_into_block: in a size whose image blocks attend both ways, a block that runs past a unit's last tile into a later tile always takes that tile into the unit.
+# harm g4u_cross_into_block: an image over a tile boundary would be refused although the plan holds the tiles it needs.
+eab1cc3a920ceb27  g4u_cross_within_tiles  law g4u_cross_within_tiles : for b : Bool for + n : Nat for + k : Nat for + be : Nat for + e : Nat { g4u_cross ( b , Nat.add ( n , k ) , n , be , e ) == False { } : Bool }
+# promise g4u_cross_within_tiles: a unit never takes a tile past the prompt's last tile.
+# harm g4u_cross_within_tiles: the prefill would index a tile that does not exist.
+5807b4c3133f5e78  g4u_ext_reaches_block_end  law g4u_ext_reaches_block_end : for + p : Nat for + e : Nat for + u : Nat { Nat.is_le ( Nat.min ( e , u ) , 1n + Nat.add ( p , g4u_ext ( True { } , p , e , u ) ) ) == True { } : Bool }
+# promise g4u_ext_reaches_block_end: a row of an image block attends at least to the end of its block, or to the end of the unit's keys when they end sooner.
+# harm g4u_ext_reaches_block_end: the row would miss part of its image that the reference attends.
 921914aa21e1c368  g4u_ext_within_block  law g4u_ext_within_block : for + p : Nat for + k : Nat for + u : Nat { Nat.is_lt ( Nat.add ( p , g4u_ext ( True { } , p , 1n + Nat.add ( p , k ) , u ) ) , 1n + Nat.add ( p , k ) ) == True { } : Bool }
 # promise g4u_ext_within_block: a row of an image block never attends a position past the end of its own block.
 # harm g4u_ext_within_block: it would attend text or another image that the reference keeps causal.
@@ -104,8 +119,17 @@ e8092380d5d2675c  g4u_fits_within_ring  law g4u_fits_within_ring : for + r : Nat
 # harm g4u_fits_within_ring: a later tile's keys would overwrite keys an earlier tile's rows still attend.
 cce1a244d6e57d79  g4u_join_within_buffers  law g4u_join_within_buffers : for c : Bool for + n : Nat for + m : Nat { Bool.and ( g4u_join ( c , n , m ) , Nat.is_le ( m , n ) ) == False { } : Bool }
 # promise g4u_join_within_buffers: a unit never takes a tile beyond the tile buffers the plan holds for it.
+b11d2e65e607d41e  g4u_joined_unit_two_way  law g4u_joined_unit_two_way : for b : Bool for + i : Nat for + n : Nat for + be : Nat for + e : Nat for + k : Nat { Bool.and ( g4u_cross ( b , i , n , be , e ) , Bool.not ( g4u_two_way ( b , Nat.add ( be , k ) ) ) ) == False { } : Bool }
+# promise g4u_joined_unit_two_way: a unit that takes a later tile always runs the two-way form, whatever further blocks its other tiles hold.
+# harm g4u_joined_unit_two_way: the causal path prefills only a unit's first tile and moves past the rest, which would leave their rows unwritten.
 2b6968de5ecec504  g4u_text_row_causal  law g4u_text_row_causal : for + p : Nat for e : Nat for u : Nat { g4u_ext ( False { } , p , e , u ) == 0n : Nat }
 # promise g4u_text_row_causal: a text row attends nothing after its own position.
+8a14deb6f4f59b62  g4u_two_way_needs_bidir  law g4u_two_way_needs_bidir : for + be : Nat { g4u_two_way ( False { } , be ) == False { } : Bool }
+# promise g4u_two_way_needs_bidir: a size whose reference keeps image rows causal never runs a unit in the two-way form.
+# harm g4u_two_way_needs_bidir: its image rows would attend positions after their own, unlike the reference.
+1392288440e916e0  g4u_two_way_with_block  law g4u_two_way_with_block : for + be : Nat { g4u_two_way ( True { } , 1n + be ) == True { } : Bool }
+# promise g4u_two_way_with_block: in a size whose image blocks attend both ways, a unit with an image block always runs the two-way form.
+# harm g4u_two_way_with_block: its image rows would attend causally, unlike the reference.
 f6b30e6f9966fc4e  g4u_unit_tiles_at_least_one  law g4u_unit_tiles_at_least_one : for + t : Nat for + b : Nat { Nat.is_le ( 1n , g4u_unit_tiles ( t , b ) ) == True { } : Bool }
 # promise g4u_unit_tiles_at_least_one: a prefill unit always holds at least the tile it starts with.
 1f25794122474e68  g4v_add_part_covers  law g4v_add_part_covers : for + t : Nat for + b : Nat { Nat.is_le ( Nat.add ( t , b ) , g4v_add_part ( t , b ) ) == True { } : Bool }
@@ -119,6 +143,33 @@ b5e7132dadf28738  g4v_image_budget_within_tower  law g4v_image_budget_within_tow
 # harm g4v_image_budget_within_tower: the tower's planned buffers would be too small for an image the processor accepts.
 52925649d6a88207  g4v_layerless_tower_refused  law g4v_layerless_tower_refused : for + i : Nat { g4v_tower_ok ( 0n , i ) == False { } : Bool }
 # promise g4v_layerless_tower_refused: a tower without layers is refused.
+a283122145023bfe  g4v_part_holds_a_step  law g4v_part_holds_a_step : for + b : Nat { Nat.is_le ( g4v_arena_step ( ) , g4v_part_bytes ( b ) ) == True { } : Bool }
+# promise g4v_part_holds_a_step: the bytes planned for a buffer hold at least one step of the arena, an empty buffer's included.
+# harm g4v_part_holds_a_step: the arena takes a step for every buffer, so a plan of small buffers would count less than it consumes.
+fb6fd5784ec1037b  g4v_part_holds_buffer  law g4v_part_holds_buffer : for + b : Nat { Nat.is_le ( b , g4v_part_bytes ( b ) ) == True { } : Bool }
+# promise g4v_part_holds_buffer: the bytes planned for a buffer always hold the buffer.
+# harm g4v_part_holds_buffer: a sealed arena would run out before the last buffer of the plan.
+a87ff206fdc48a73  g4v_part_whole_steps  law g4v_part_whole_steps : for + b : Nat { Nat.mod ( g4v_part_bytes ( b ) , g4v_arena_step ( ) ) == 0n : Nat }
+# promise g4v_part_whole_steps: the bytes planned for a buffer are whole steps of the arena, so the next buffer starts where the plan counts it.
+# harm g4v_part_whole_steps: the arena would move the next buffer to a step boundary past the plan's count, and run out before the plan's last buffer.
+2865cc4a36fdcb37  g4v_pool_rows_distinct  law g4v_pool_rows_distinct : for + i : Nat for + nbxp : Nat for + pp : Nat { g4v_pool_row ( g4v_pool_y ( i , 1n + nbxp , 1n + pp ) , g4v_pool_x ( i , 1n + nbxp , 1n + pp ) , 1n + nbxp , 1n + pp ) == i : Nat }
+# promise g4v_pool_rows_distinct: the pooling order holds no patch twice: the row a patch is read from is recovered from its grid position.
+# harm g4v_pool_rows_distinct: a patch would enter its token's mean twice and another patch not at all.
+f0dca6752ce79a77  g4v_pool_x_in_token_block  law g4v_pool_x_in_token_block : for + i : Nat for + nbxp : Nat for + pp : Nat { Nat.div ( g4v_pool_x ( i , 1n + nbxp , 1n + pp ) , 1n + pp ) == Nat.mod ( Nat.div ( i , Nat.mul ( 1n + pp , 1n + pp ) ) , 1n + nbxp ) : Nat }
+# promise g4v_pool_x_in_token_block: the rows of a soft token in the pooling order all lie in the token's own pooling block, the blocks in raster order (the reference's order of the soft tokens): its block column.
+# harm g4v_pool_x_in_token_block: a token would pool patches of another block, or the tokens would leave the tower out of order.
+bdfca062616ca300  g4v_pool_x_within  law g4v_pool_x_within : for + i : Nat for + nbxp : Nat for + pp : Nat { Nat.is_lt ( g4v_pool_x ( i , 1n + nbxp , 1n + pp ) , Nat.mul ( 1n + nbxp , 1n + pp ) ) == True { } : Bool }
+# promise g4v_pool_x_within: every row of the pooling order holds a patch of a column inside the grid's whole blocks.
+# harm g4v_pool_x_within: the host would read a patch's pixels and position row from outside the image.
+33824bef87de235a  g4v_pool_y_in_token_block  law g4v_pool_y_in_token_block : for + i : Nat for + nbx : Nat for + pp : Nat { Nat.div ( g4v_pool_y ( i , nbx , 1n + pp ) , 1n + pp ) == Nat.div ( Nat.div ( i , Nat.mul ( 1n + pp , 1n + pp ) ) , nbx ) : Nat }
+# promise g4v_pool_y_in_token_block: the rows of a soft token in the pooling order all lie in the token's own pooling block, the blocks in raster order (the reference's order of the soft tokens): its block row.
+# harm g4v_pool_y_in_token_block: a token would pool patches of another block, or the tokens would leave the tower out of order.
+1acfd8219a414ae1  g4v_pool_y_within  law g4v_pool_y_within : for + i : Nat for + nby : Nat for + nbxp : Nat for + pp : Nat { Bool.and ( Nat.is_lt ( i , g4v_pool_count ( nby , 1n + nbxp , 1n + pp ) ) , Nat.is_le ( Nat.mul ( nby , 1n + pp ) , g4v_pool_y ( i , 1n + nbxp , 1n + pp ) ) ) == False { } : Bool }
+# promise g4v_pool_y_within: every row of the pooling order of whole blocks holds a patch of a row inside the grid's whole blocks.
+# harm g4v_pool_y_within: the host would read a patch's pixels and position row from outside the image.
+0448c6ea505fda8b  g4v_processor_budget_holds_a_token  law g4v_processor_budget_holds_a_token : for + p : Nat for + m : Nat for + f : Nat for + c : Nat for + px : Nat { Bool.and ( g4v_processor_ok ( p , m , f , c , px ) , Nat.is_eq ( g4v_soft_budget ( px , Nat.mul ( p , m ) ) , 0n ) ) == False { } : Bool }
+# promise g4v_processor_budget_holds_a_token: a vision config the host processor takes has a pixel budget of at least one soft token (so a positive patch and pooling size).
+# harm g4v_processor_budget_holds_a_token: every image would resize to no tokens or be refused, with a tower planned for none.
 6c4083aec2e0d559  g4v_request_holds_an_image  law g4v_request_holds_an_image : for c : Nat for + b : Nat { Nat.is_le ( b , g4v_request_tokens ( c , b ) ) == True { } : Bool }
 # promise g4v_request_holds_an_image: the tokens a request may hold always take at least one image of the budget.
 732286c720e4c43b  g4v_size_within_budget  law g4v_size_within_budget : for + th : Nat for + tw : Nat for + patch : Nat for + merge : Nat for + m : Nat { Bool.and ( g4v_size_ok ( th , tw , patch , merge , m ) , Nat.is_lt ( m , g4v_tokens ( th , tw , patch , merge ) ) ) == False { } : Bool }
@@ -129,9 +180,21 @@ b5e7132dadf28738  g4v_image_budget_within_tower  law g4v_image_budget_within_tow
 b0df17526860efb7  g4v_table_refuses_tall_grid  law g4v_table_refuses_tall_grid : for + n : Nat for + k : Nat for + w : Nat { g4v_table_holds ( 1n + Nat.add ( n , k ) , w , n ) == False { } : Bool }
 # promise g4v_table_refuses_tall_grid: a grid taller than the position table is refused.
 # harm g4v_table_refuses_tall_grid: the host would read position rows past the end of the table.
+8ada318c60e1bec1  g4v_table_refuses_wide_grid  law g4v_table_refuses_wide_grid : for + h : Nat for + n : Nat for + k : Nat { g4v_table_holds ( h , 1n + Nat.add ( n , k ) , n ) == False { } : Bool }
+# promise g4v_table_refuses_wide_grid: a grid wider than the position table is refused.
+# harm g4v_table_refuses_wide_grid: the host would read a column's position row from the table's rows axis: wrong positions and no error.
 89ab677ff5ef8ff3  g4v_unified_pad_holds_its_rows  law g4v_unified_pad_holds_its_rows : for + b : Nat for k : Nat { Nat.is_le ( g4v_recipe_rows ( True { } , b , k ) , g4v_pad_cols ( True { } , b ) ) == True { } : Bool }
 # promise g4v_unified_pad_holds_its_rows: the feature buffer's padding holds every row the unified embedder's recipe writes past an image.
 # harm g4v_unified_pad_holds_its_rows: the last image's recipe would write past the feature buffer.
+e44c5dd281609120  g4v_unified_refuses_other_patch  law g4v_unified_refuses_other_patch : for + mp : Nat for + p : Nat for + q : Nat for hp : Bool for + pr : Nat for + h : Nat { Bool.and ( g4v_unified_ok ( True { } , mp , p , q , hp , pr , h ) , Nat.is_ne ( mp , Nat.mul ( p , q ) ) ) == False { } : Bool }
+# promise g4v_unified_refuses_other_patch: a unified embedder whose merged patch is not the processor's pool x pool patches is refused.
+# harm g4v_unified_refuses_other_patch: the embedder's weights would read merged patches of another size than the processor writes.
+02019a758153989c  g4v_unified_refuses_other_width  law g4v_unified_refuses_other_width : for hm : Bool for + mp : Nat for + p : Nat for + q : Nat for + pr : Nat for + h : Nat { Bool.and ( g4v_unified_ok ( hm , mp , p , q , True { } , pr , h ) , Nat.is_ne ( pr , h ) ) == False { } : Bool }
+# promise g4v_unified_refuses_other_width: a unified embedder whose projection changes the embedding width is refused.
+# harm g4v_unified_refuses_other_width: the embedder's graph would take a projection of another width than its weights hold.
+b8337cf5ee34f634  g4v_whole_token_patches_whole  law g4v_whole_token_patches_whole : for + p : Nat for + kp : Nat { Nat.mod ( g4v_whole_token_patches ( p , 1n + kp ) , 1n + kp ) == 0n : Nat }
+# promise g4v_whole_token_patches_whole: flooring a patch count to whole tokens leaves a whole number of tokens.
+# harm g4v_whole_token_patches_whole: the last token's pooling block would take patches of no token.
 dcfddfa5a53ff82e  g4v_whole_token_patches_within  law g4v_whole_token_patches_within : for + p : Nat for + kp : Nat { Nat.is_le ( g4v_whole_token_patches ( p , 1n + kp ) , p ) == True { } : Bool }
 # promise g4v_whole_token_patches_within: flooring a patch count to whole tokens never raises it.
 6dcec9a285ad3c40  g4v_zero_patch_refused  law g4v_zero_patch_refused : for + q : Nat for + n : Nat { g4v_grid_ok ( 0n , q , n ) == False { } : Bool }
