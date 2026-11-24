@@ -2528,8 +2528,13 @@ impl TurnQueue {
             if !st.busy {
                 if let Some(pos) = next_turn(&st.waiting, ready(), Instant::now(), limits()) {
                     if st.waiting[pos].id == id {
+                        // the waiters it takes the card before, that arrived first, were passed
+                        // over once more (the verified rule a lane session's admissions use)
+                        let at = self.clock(st.waiting[pos].since);
                         for w in &mut st.waiting[..pos] {
-                            w.skips += 1;
+                            if crate::core::lanes::passes_over(self.clock(w.since), at) {
+                                w.skips += 1;
+                            }
                         }
                         st.waiting.remove(pos);
                         st.busy = true;

@@ -1305,3 +1305,34 @@ law ln_admit_stamp_latest:
 
 def ln_admit_stamp_latest(c, s):
   ln_gt_succ_or(s, c)
+
+# promise: a waiter whose turn on the card is due takes the turn from every earlier waiter whose turn is not due.
+law turn_due_takes_turn:
+  for +l1: Bool
+  for +l2: Bool
+  {turn_better(turn_rank(True{}, l1), turn_rank(False{}, l2)) == True{} : Bool}
+
+def turn_due_takes_turn(l1, l2):
+  match l1 l2:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: no later waiter takes the card's turn from a waiter whose turn is due.
+law turn_due_keeps_turn:
+  for +d: Bool
+  for +l1: Bool
+  for +l2: Bool
+  {turn_better(turn_rank(d, l1), turn_rank(True{}, l2)) == False{} : Bool}
+
+def turn_due_keeps_turn(d, l1, l2):
+  match d l1 l2:
+    case True{} True{} True{}: {==}
+    case True{} True{} False{}: {==}
+    case True{} False{} True{}: {==}
+    case True{} False{} False{}: {==}
+    case False{} True{} True{}: {==}
+    case False{} True{} False{}: {==}
+    case False{} False{} True{}: {==}
+    case False{} False{} False{}: {==}
