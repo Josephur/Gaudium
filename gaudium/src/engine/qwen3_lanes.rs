@@ -587,18 +587,34 @@ impl WidthCosts {
     }
 
     /// A launch of `b` slots over `nch` chunks, `wide` of them at their wide width, took `ms`.
+    /// What it measures is the verified rule's (`ln_cost_measures_narrow`,
+    /// `ln_cost_measures_extra`).
     fn observe(&mut self, b: u64, nch: u64, wide: u64, ms: f64) {
+        use crate::verified::{ln_cost_measures_extra, ln_cost_measures_narrow};
         self.wide_slots += wide;
         self.slots += b;
-        if wide == 0 {
-            let mut m = self.narrow_ms.get(&(b, nch)).copied();
+        let narrow = self.narrow_ms.get(&(b, nch)).copied();
+        if ln_cost_measures_narrow(wide) {
+            let mut m = narrow;
             Self::ema(&mut m, ms);
             self.narrow_ms.insert((b, nch), m.unwrap_or(ms));
-        } else if let Some(&t0) = self.narrow_ms.get(&(b, nch)) {
+        } else if ln_cost_measures_extra(narrow.is_some(), wide) {
+            let t0 = narrow.expect("the verified rule measures against a measured narrow step");
             let mut m = self.extra_ms.get(&b).copied();
             Self::ema(&mut m, ((ms - t0) / wide as f64).max(0.0));
             self.extra_ms.insert(b, m.unwrap_or(0.0));
         }
+    }
+
+    /// The measured slot count whose extra time stands in for `b` slots (the verified
+    /// `ln_cost_takes`, over the measured counts in increasing order): `None` until any is.
+    fn cost_source(&self, b: u64) -> Option<u64> {
+        let mut counts: Vec<u64> = self.extra_ms.keys().copied().collect();
+        counts.sort_unstable();
+        counts.into_iter().fold(None, |best, c| match best {
+            Some(p) if !crate::verified::ln_cost_takes(b, c, p) => Some(p),
+            _ => Some(c),
+        })
     }
 
     /// What the model holds, for the session report (and a fresh count of the slot steps).
@@ -631,17 +647,12 @@ impl WidthCosts {
 
     /// `(time of the narrow step, extra time of one wide slot)` in ms for `b` slots over `nch`
     /// chunks: `None` until the narrow step was measured. The extra time of a slot count not
-    /// measured yet is the nearest measured slot count's (a wide slot's own work hardly depends
-    /// on the others), and 0 until any was (so a lane that expects more from the wide step tries
-    /// it).
+    /// measured yet is another measured count's ([`Self::cost_source`]: a wide slot's own work
+    /// hardly depends on the others), and 0 until any was (so a lane that expects more from the
+    /// wide step tries it).
     fn estimate(&self, b: u64, nch: u64) -> Option<(f64, f64)> {
         let t0 = *self.narrow_ms.get(&(b, nch))?;
-        let extra = self.extra_ms.get(&b).copied().or_else(|| {
-            self.extra_ms
-                .iter()
-                .min_by_key(|(&k, _)| k.abs_diff(b))
-                .map(|(_, &v)| v)
-        });
+        let extra = self.cost_source(b).map(|c| self.extra_ms[&c]);
         Some((t0, extra.unwrap_or(0.0)))
     }
 }
@@ -2161,6 +2172,27 @@ mod tests {
         assert_eq!(w.estimate(3, 1), None);
         w.observe(3, 1, 0, 18.0);
         assert_eq!(w.estimate(3, 1), Some((18.0, 2.0)));
+    }
+
+    #[test]
+    fn a_slot_count_borrows_its_own_then_the_nearest_measured_extra_time() {
+        let mut w = WidthCosts::default();
+        assert_eq!(w.cost_source(4), None);
+        for (b, extra) in [(2u64, 1.0f64), (6, 3.0), (8, 4.0)] {
+            w.observe(b, 1, 0, 10.0);
+            w.observe(b, 1, 1, 10.0 + extra);
+        }
+        // its own, whichever order the counts are kept in
+        assert_eq!(w.cost_source(6), Some(6));
+        assert_eq!(w.cost_source(8), Some(8));
+        // the nearest, the smaller one on a tie (today's rule)
+        assert_eq!(w.cost_source(7), Some(6));
+        assert_eq!(w.cost_source(1), Some(2));
+        assert_eq!(w.cost_source(4), Some(2));
+        assert_eq!(w.cost_source(5), Some(6));
+        assert_eq!(w.cost_source(16), Some(8));
+        w.observe(4, 1, 0, 10.0);
+        assert_eq!(w.estimate(4, 1), Some((10.0, 1.0)));
     }
 
     fn qwen38_27b_spec() -> ModelSpec {

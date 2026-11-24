@@ -2240,3 +2240,99 @@ law ln_post_call_joins_adds_slot:
 
 def ln_post_call_joins_adds_slot(a, w, l):
   ln_post_joins_aux(Nat.is_gt(Nat.add(a, w), l), a, w)
+
+# ============================================================================
+# 11. The measurements of the width model
+# ============================================================================
+#
+# A lane session's width model times each batched launch on the device. A launch with no wide
+# slot measures the narrow step of its shape; one with `wide` wide slots measures the extra time
+# of a wide slot against the narrow step of the same shape, once that is known. A slot count with
+# no measured extra time borrows a measured count's: the measured counts are visited in
+# increasing order, and `ln_cost_takes(b, c, best)` says whether count `c`'s measurement replaces
+# the one of count `best` chosen so far for `b` slots (today: the nearest count, the smaller one
+# on a tie).
+
+# Does a launch with `wide` wide slots measure the narrow step of its shape?
+def ln_cost_measures_narrow(wide: Nat) -> Bool:
+  Nat.is_eq(wide, 0n)
+
+# promise: a launch with a wide slot is never taken as the time of the narrow step.
+law ln_cost_narrow_has_no_wide:
+  for +w: Nat
+  {ln_cost_measures_narrow(1n+w) == False{} : Bool}
+
+def ln_cost_narrow_has_no_wide(w):
+  {==}
+
+# Does a launch with `wide` wide slots measure a wide slot's extra time (`narrow_known`: the
+# narrow step of its shape was measured)?
+def ln_cost_measures_extra(narrow_known: Bool, wide: Nat) -> Bool:
+  Bool.and(narrow_known, Nat.is_gt(wide, 0n))
+
+# promise: a wide slot's extra time is measured only against a measured narrow step of the same shape.
+law ln_cost_extra_needs_narrow:
+  for +w: Nat
+  {ln_cost_measures_extra(False{}, w) == False{} : Bool}
+
+def ln_cost_extra_needs_narrow(w):
+  {==}
+
+# promise: a launch with no wide slot never measures a wide slot's extra time (nothing to divide by).
+law ln_cost_extra_needs_wide:
+  for +k: Bool
+  {ln_cost_measures_extra(k, 0n) == False{} : Bool}
+
+def ln_cost_extra_needs_wide(k):
+  match k:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# The distance between slot counts `b` and `c`.
+def ln_cost_dist(+b: Nat, +c: Nat) -> Nat:
+  Nat.add(Nat.sub(b, c), Nat.sub(c, b))
+
+def ln_cost_takes_of(own_best: Bool, own_c: Bool, nearer: Bool) -> Bool:
+  match own_best:
+    case True{}:
+      False{}
+    case False{}:
+      match own_c:
+        case True{}:
+          True{}
+        case False{}:
+          nearer
+
+# Does the measured extra time of `c` slots replace the one of `best` slots, chosen so far, as
+# the estimate for `b` slots?
+def ln_cost_takes(+b: Nat, +c: Nat, +best: Nat) -> Bool:
+  ln_cost_takes_of(Nat.is_eq(best, b), Nat.is_eq(c, b), Nat.is_lt(ln_cost_dist(b, c), ln_cost_dist(b, best)))
+
+# promise: a slot count's own measured extra time is never replaced by another slot count's.
+law ln_cost_own_kept:
+  for +b: Nat
+  for +c: Nat
+  {ln_cost_takes(b, c, b) == False{} : Bool}
+
+def ln_cost_own_kept(b, c):
+  %ln_eq_refl_true(b) : {ln_cost_takes_of(_, Nat.is_eq(c, b), Nat.is_lt(ln_cost_dist(b, c), ln_cost_dist(b, b))) == False{} : Bool}
+  {==}
+
+def ln_cost_own_aux(x: Bool, n: Bool) -> {ln_cost_takes_of(x, True{}, n) == Bool.not(x) : Bool}:
+  match x:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# promise: a slot count's own measured extra time replaces the one of any other slot count.
+law ln_cost_own_taken:
+  for +b: Nat
+  for +c: Nat
+  {ln_cost_takes(b, b, c) == Bool.not(Nat.is_eq(c, b)) : Bool}
+
+def ln_cost_own_taken(b, c):
+  %ln_eq_refl_true(b) : {ln_cost_takes_of(Nat.is_eq(c, b), _, Nat.is_lt(ln_cost_dist(b, b), ln_cost_dist(b, c))) == Bool.not(Nat.is_eq(c, b)) : Bool}
+  ln_cost_own_aux(Nat.is_eq(c, b), Nat.is_lt(ln_cost_dist(b, b), ln_cost_dist(b, c)))
