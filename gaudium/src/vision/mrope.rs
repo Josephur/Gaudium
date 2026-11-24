@@ -460,6 +460,34 @@ mod tests {
     }
 
     #[test]
+    fn image_runs_take_exactly_the_tiles_image_tokens() {
+        // every small span x tile x shift: a run's tile row and embedding row name the same
+        // prompt slot, and the run covers every slot both the tile's tokens and the image hold
+        use crate::verified::{vis_run_emb_off, vis_run_rows, vis_run_tile_row};
+        for start in 0..9u64 {
+            for len in 0..9u64 {
+                for lo in 0..9u64 {
+                    for hi in lo..12u64 {
+                        for shift in 0..3u64 {
+                            let n = vis_run_rows(start, len, lo, hi, shift);
+                            let row = vis_run_tile_row(start, len, lo, hi, shift);
+                            let off = vis_run_emb_off(start, len, lo, hi, shift);
+                            let want: Vec<u64> = (lo + shift..hi + shift)
+                                .filter(|t| *t >= start && *t < start + len)
+                                .collect();
+                            assert_eq!(n as usize, want.len(), "{start} {len} {lo} {hi} {shift}");
+                            if n > 0 {
+                                assert_eq!(lo + shift + row, start + off);
+                                assert_eq!(want[0], start + off);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn layout_refuses_mismatched_runs() {
         let vs = qwen38_vision_spec();
         let (ids, grids) = two_image_prompt();

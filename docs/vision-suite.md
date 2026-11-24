@@ -21,10 +21,11 @@ Every request runs under every sampler setting of the suite file (greedy, and sa
 seed), each run right after its K=0 reference on the same engine (`--compare-k0`). The row passes
 when all of these hold:
 
-- **identity**: every run is token-identical to its K=0 reference. A method marked
-  `"opt_in_forks"` (a draft tree, which may differ from K=0 in the last bit of a leaf row) may
-  fork only where the run's margin trace shows the two tokens' BF16 logits at most one unit in
-  the last place apart;
+- **identity**: every run is token-identical to its K=0 reference. An opt-in method (marked
+  `"opt_in_forks"` in the suite file AND selecting an opt-in form in its own options: a draft
+  tree, which may differ from K=0 in the last bit of a leaf row, or `--gdn-verify mme`) may fork
+  only where the run's margin trace shows the two tokens' BF16 logits at most one unit in the
+  last place apart;
 - **answers**: every answer, decoded with the model's tokenizer, contains one accepted word of
   every `expect` group of its case;
 - **no state left behind**: the text request after the images gives the tokens it gave before

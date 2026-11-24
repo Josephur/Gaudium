@@ -91,12 +91,16 @@ pub fn check_canvas(width: usize, height: usize, max_pixels: u64) -> Result<(), 
 /// kind and the family name the drafter (a Qwen model's `mtp` is its own MTP head, a Gemma 4
 /// model's is its `-assistant` checkpoint, Inkling 2's is its block drafter over the target's
 /// hidden states); the verified `vis_drafter_ok` decides. A pairing not listed here is
-/// [`VisDrafter::VdOther`], which never runs with images.
+/// [`VisDrafter::VdOther`], which never runs with images. The server reads the kind off the
+/// drafter's directory name, so `dspine` names the DSpine drafter only for the family it was
+/// validated on.
 pub fn drafter_runs_with_vision(kind: Option<&str>, family: ModelFamily) -> bool {
     use ModelFamily as F;
     vis_drafter_ok(match (kind, family) {
         (None, _) => VisDrafter::VdNone,
-        (Some("dspine"), _) => VisDrafter::VdDSpine,
+        // the kind is read off the drafter's directory name, so "dspine" is also what any other
+        // drafter checkpoint is called: only the family DSpine passed the suite on counts as it
+        (Some("dspine"), F::Qwen35Dense) => VisDrafter::VdDSpine,
         (Some("dflash2"), F::Qwen35Dense) => VisDrafter::VdBlock,
         (Some("mtp"), F::Qwen35Dense) => VisDrafter::VdMtp,
         (Some("mtp"), F::Qwen35Moe) => VisDrafter::VdMtpMoe,
@@ -255,8 +259,13 @@ mod tests {
         // dense model's DFlash2 drafter and own MTP head, Inkling 2's own drafter
         for f in [F::Qwen3, F::Qwen35Dense, F::Qwen35Moe, F::Gemma4, F::Inkling2] {
             assert!(drafter_runs_with_vision(None, f));
-            assert!(drafter_runs_with_vision(Some("dspine"), f));
             assert!(!drafter_runs_with_vision(Some("something new"), f));
+        }
+        assert!(drafter_runs_with_vision(Some("dspine"), F::Qwen35Dense));
+        // a drafter directory named neither *dflash* nor *-assistant is called "dspine" by the
+        // server; for another family it is not the DSpine drafter that passed the suite
+        for f in [F::Qwen3, F::Qwen35Moe, F::Gemma4, F::Inkling2] {
+            assert!(!drafter_runs_with_vision(Some("dspine"), f), "{f:?}");
         }
         assert!(drafter_runs_with_vision(Some("dflash2"), F::Qwen35Dense));
         assert!(drafter_runs_with_vision(Some("mtp"), F::Qwen35Dense));

@@ -55,8 +55,23 @@ pub struct Method {
     pub name: String,
     /// `gaudium --generate` options of the method (`{models}`: the models directory).
     pub args: Vec<String>,
-    /// An opt-in mode that may fork from K=0 at a traced tie (AGENTS.md section 7.2).
+    /// The suite file marks the method as an opt-in mode that may fork from K=0 at a traced
+    /// tie (AGENTS.md section 7.2); see [`Method::opt_in`].
     pub opt_in_forks: bool,
+}
+
+impl Method {
+    /// The method counts as opt-in only when the suite file marks it so AND its own options
+    /// select an opt-in form (a draft tree, or the DeltaNet verify on the MME): a default mode
+    /// labelled opt-in by mistake is still held to exact identity.
+    pub fn opt_in(&self) -> bool {
+        let tree = self.args.iter().any(|a| a == "--tree");
+        let mme = self
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--gdn-verify" && w[1] == "mme");
+        self.opt_in_forks && (tree || mme)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -425,7 +440,7 @@ pub fn judge(
         for s in 0..ns {
             let run = rep.runs.get(&(r, s));
             let outcome = classify(run.and_then(|x| x.identity.as_ref()));
-            let ok = vs_identity_ok(outcome, method.opt_in_forks);
+            let ok = vs_identity_ok(outcome, method.opt_in());
             ident.1 += 1;
             if ok {
                 ident.0 += 1;
@@ -853,7 +868,7 @@ mod tests {
             }
             // only the draft tree may fork (opt-in)
             for k in &m.methods {
-                assert_eq!(k.opt_in_forks, k.name == "mtp-tree", "{}", k.name);
+                assert_eq!(k.opt_in(), k.name == "mtp-tree", "{}", k.name);
             }
         }
         // a case whose second image span crosses the first 512-row prefill tile (and the MTP
@@ -985,8 +1000,21 @@ AFTER TOKENS: [1, 2, 4]
         };
         let tree = Method {
             opt_in_forks: true,
+            args: vec!["--spec".into(), "mtp".into(), "--tree".into(), "4:1-2@2".into()],
             ..exact.clone()
         };
+        // a default method marked opt-in in the file is still held to identity
+        let mislabelled = Method {
+            opt_in_forks: true,
+            ..exact.clone()
+        };
+        assert!(tree.opt_in() && !mislabelled.opt_in());
+        let mme = Method {
+            opt_in_forks: true,
+            args: vec!["--gdn-verify".into(), "mme".into()],
+            ..exact.clone()
+        };
+        assert!(mme.opt_in());
         let decode = |ids: &[i32]| -> String {
             match ids.first() {
                 Some(1) => "Paris.".into(),
@@ -1003,6 +1031,7 @@ AFTER TOKENS: [1, 2, 4]
         assert_eq!(r.semantic, (4, 4));
         rep.runs.get_mut(&(1, 1)).unwrap().identity = Some(IdentityLine::Identical);
         assert!(!judge(&s, &exact, &rep, &decode).pass);
+        assert!(!judge(&s, &mislabelled, &rep, &decode).pass);
         let t = judge(&s, &tree, &rep, &decode);
         assert!(t.pass, "{t:?}");
         // a wrong answer fails the row even with identical streams
