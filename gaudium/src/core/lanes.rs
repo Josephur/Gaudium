@@ -143,7 +143,7 @@ impl LaneTable {
     pub fn admit(&mut self, lane: usize, exclusive: bool) -> Result<(), LaneError> {
         self.apply(lane, LaneEvent::EvLnAdmit)?;
         self.exclusive[lane] = exclusive;
-        self.clock += 1;
+        self.clock = crate::verified::ln_admit_clock(self.clock);
         self.stamps[lane] = self.clock;
         Ok(())
     }

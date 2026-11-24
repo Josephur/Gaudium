@@ -289,6 +289,11 @@ def ln_route_better(+ra: Nat, +la: Nat, +ca: Nat, +sa: Nat, +rb: Nat, +lb: Nat, 
     )
   )
 
+# The routing clock after an admission at clock `c`: the admitted lane is stamped with it (when a
+# request was last admitted to it, which routing reads: the lane used longest ago goes first).
+def ln_admit_clock(c: Nat) -> Nat:
+  Nat.add(1n, c)
+
 # Rows of a lane's held prompt (`held`) that a request sharing `shared` of them destroys.
 def ln_route_loss(held: Nat, shared: Nat) -> Nat:
   Nat.sub(held, shared)
@@ -1293,3 +1298,23 @@ law ln_cursor_moves_forward:
 def ln_cursor_moves_forward(c, e, r):
   %ln_lt_add_succ(c, Nat.min(e, r)) : {_ == True{} : Bool}
   {==}
+
+def ln_gt_succ_or(+s: Nat, +c: Nat) -> {Bool.or(Nat.is_gt(s, c), Nat.is_gt(1n+c, s)) == True{} : Bool}:
+  match s c:
+    case 0n 0n:
+      {==}
+    case 0n 1n+cp:
+      {==}
+    case 1n+sp 0n:
+      {==}
+    case 1n+sp 1n+cp:
+      ln_gt_succ_or(sp, cp)
+
+# promise: a lane admitted now is stamped later than every lane stamped before, so routing reads it as the most recently used.
+law ln_admit_stamp_latest:
+  for +c: Nat
+  for +s: Nat
+  {Bool.or(Nat.is_gt(s, c), Nat.is_gt(ln_admit_clock(c), s)) == True{} : Bool}
+
+def ln_admit_stamp_latest(c, s):
+  ln_gt_succ_or(s, c)
