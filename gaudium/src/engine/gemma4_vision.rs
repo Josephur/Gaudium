@@ -29,7 +29,7 @@
 
 use crate::fp8::f32_to_bf16_rne;
 use crate::json::{parse_json, JsonValue};
-use crate::verified::{g4v_size_ok, g4v_target_h, g4v_target_w, g4v_tokens};
+use crate::verified::{g4v_size_ok, g4v_soft_budget, g4v_target_h, g4v_target_w, g4v_tokens};
 use crate::vision::preprocess::{resize_rgb, PreparedImage, RgbImage};
 use crate::vision::{ImageProcessor, VisionSpec};
 
@@ -365,8 +365,7 @@ pub fn vision_spec(
 
 /// Soft tokens the budget `vs.max_pixels` holds.
 pub fn soft_budget(vs: &VisionSpec) -> u64 {
-    let side = vs.resize_factor();
-    vs.max_pixels / (side * side).max(1)
+    g4v_soft_budget(vs.max_pixels, vs.resize_factor())
 }
 
 /// The resized `(height, width)` of a `width x height` image: the processor's aspect-preserving

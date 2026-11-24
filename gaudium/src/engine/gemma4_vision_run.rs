@@ -25,7 +25,8 @@ use crate::synapse::graph::{CompiledRecipe, GraphBuilder};
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
     g4_lane, ikv_feat_cols, ikv_feat_next, ikv_feat_row, ikv_feat_start, ikv_feat_write_safe,
-    ikv_rows_match, vis_grid_fits, vis_rows_fit,
+    g4v_image_budget, g4v_pad_cols, g4v_recipe_rows, g4v_request_tokens, ikv_rows_match,
+    vis_grid_fits, vis_rows_fit,
 };
 use crate::vision::preprocess::PreparedImage;
 use crate::vision::{VisionReport, VisionSpec};
@@ -66,27 +67,27 @@ impl G4vGeo {
         let d = G4vDims::from_config_json(&cfg_text)?;
         let mut spec = VisionSpec::from_model_dir(&cfg.model_dir)?;
         let ppt = d.ppt();
-        // the tower holds images of at most `max_patches` patches: the budget's tokens, lowered
-        // to what the plan holds
-        let planned_tokens = cfg.vision_max_patches / ppt;
-        if planned_tokens == 0 {
+        // the tower holds images of at most `--vision-max-patches` patches: the checkpoint's
+        // budget, lowered to the whole tokens the plan holds
+        let budget = g4v_image_budget(super::soft_budget(&spec), cfg.vision_max_patches, ppt);
+        if budget == 0 {
             return Err(format!(
                 "--vision-max-patches {} holds no soft token of {ppt} patches",
                 cfg.vision_max_patches
             ));
         }
-        let side = d.side();
-        let budget = super::soft_budget(&spec).min(planned_tokens);
-        spec.max_pixels = budget * side * side;
-        let max_tokens = if cfg.vision_max_tokens > 0 {
-            cfg.vision_max_tokens.max(budget)
-        } else {
-            budget
-        };
-        let (max_n, cap) = match d.kind {
-            G4vKind::Tower => (budget * ppt, 0),
-            G4vKind::Unified => (budget, budget),
-        };
+        let unified = d.kind == G4vKind::Unified;
+        // the processor's pixel budget lowered to the image the plan holds (the server's rule)
+        spec.max_pixels = crate::core::vision::image_pixel_cap(
+            spec.max_pixels,
+            g4v_recipe_rows(false, budget, ppt),
+            d.patch,
+        );
+        let max_tokens = g4v_request_tokens(cfg.vision_max_tokens, budget);
+        let (max_n, cap) = (
+            g4v_recipe_rows(unified, budget, ppt),
+            g4v_pad_cols(unified, budget),
+        );
         let feat_cols = ikv_feat_cols(max_tokens, cap)
             .ok_or("the feature buffer's column count overflows")?;
         Ok(Some(Self {

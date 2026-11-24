@@ -87,6 +87,46 @@ def g4v_size_ok(+th: Nat, +tw: Nat, +patch: Nat, +merge: Nat, max_soft: Nat) -> 
   Bool.and(Bool.and(Nat.is_eq(Nat.mod(th, Nat.mul(patch, merge)), 0n), Nat.is_eq(Nat.mod(tw, Nat.mul(patch, merge)), 0n)), VB.media_canvas_ok(Nat.div(Nat.div(tw, patch), merge), Nat.div(Nat.div(th, patch), merge), max_soft))
 
 # ============================================================================
+# 2b. Capacity of the image path (sizes the up-front plan)
+# ============================================================================
+
+# Soft tokens a pixel budget holds: one per `side x side` square.
+def g4v_soft_budget(max_pixels: Nat, +side: Nat) -> Nat:
+  Nat.div(max_pixels, Nat.mul(side, side))
+
+# Soft tokens one image may hold: the checkpoint's own budget, lowered to the tokens of `ppt`
+# patches that the tower planned for `planned_patches` patches holds.
+def g4v_image_budget(model_tokens: Nat, planned_patches: Nat, +ppt: Nat) -> Nat:
+  Nat.min(model_tokens, Nat.div(planned_patches, ppt))
+
+# Image tokens one request may hold: the configured count, never below one image of the budget;
+# the budget when no count is configured (0).
+def g4v_request_tokens(configured: Nat, +budget: Nat) -> Nat:
+  match configured:
+    case 0n:
+      budget
+    case 1n+c:
+      Nat.max(1n+c, budget)
+
+# Rows of the image path's recipe for an image of the budget: its patches (the tower) or its
+# tokens (the unified embedder's one recipe of fixed rows).
+def g4v_recipe_rows(unified: Bool, +budget: Nat, ppt: Nat) -> Nat:
+  match unified:
+    case True{}:
+      budget
+    case False{}:
+      Nat.mul(budget, ppt)
+
+# Feature columns behind a request's tokens that a recipe may write past its image: the unified
+# recipe writes all its fixed rows, the tower exactly its image's tokens.
+def g4v_pad_cols(unified: Bool, budget: Nat) -> Nat:
+  match unified:
+    case True{}:
+      budget
+    case False{}:
+      0n
+
+# ============================================================================
 # 3. Prefill units of the two-way image blocks
 # ============================================================================
 
@@ -372,3 +412,65 @@ law g4u_block_before_rows_outside:
 def g4u_block_before_rows_outside(s, n, k, b):
   %Equal.sym(Bool, Nat.is_lt(Nat.add(Nat.add(s, n), k), Nat.add(s, n)), False{}, g4u_add_lt_false(Nat.add(s, n), k)) : {Bool.and(Nat.is_lt(s, b), _) == False{} : Bool}
   g4u_and_false_r(Nat.is_lt(s, b))
+
+# (a / (1 + bp)) (1 + bp) <= a.
+def g4v_div_mul_le(+a: Nat, +bp: Nat) -> {Nat.is_le(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), a) == True{} : Bool}:
+  L.nat_le_subst_r(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), Nat.add(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), Nat.mod(a, 1n+bp)), a, L.nat_div_mod_r(a, bp), L.nat_add_le_r(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), Nat.mod(a, 1n+bp)))
+
+# LAW G4V.2
+# promise: an image's soft-token budget never exceeds the checkpoint's own budget.
+law g4v_image_budget_within_model:
+  for +m: Nat
+  for +p: Nat
+  for +k: Nat
+  {Nat.is_le(g4v_image_budget(m, p, k), m) == True{} : Bool}
+
+def g4v_image_budget_within_model(m, p, k):
+  L.nat_min_le_l(m, Nat.div(p, k))
+
+# LAW G4V.3
+# promise: the patches of an image of the budget never exceed the patches the tower is planned for.
+# harm: the tower's planned buffers would be too small for an image the processor accepts.
+law g4v_image_budget_within_tower:
+  for +m: Nat
+  for +p: Nat
+  for +kp: Nat
+  {Nat.is_le(Nat.mul(g4v_image_budget(m, p, 1n+kp), 1n+kp), p) == True{} : Bool}
+
+def g4v_image_budget_within_tower(m, p, kp):
+  L.nat_le_trans(Nat.mul(Nat.min(m, Nat.div(p, 1n+kp)), 1n+kp), Nat.mul(Nat.div(p, 1n+kp), 1n+kp), p, L.nat_mul_le_mono_r(Nat.min(m, Nat.div(p, 1n+kp)), Nat.div(p, 1n+kp), 1n+kp, L.nat_min_le_r(m, Nat.div(p, 1n+kp))), g4v_div_mul_le(p, kp))
+
+# LAW G4V.4
+# promise: the tokens a request may hold always take at least one image of the budget.
+law g4v_request_holds_an_image:
+  for c: Nat
+  for +b: Nat
+  {Nat.is_le(b, g4v_request_tokens(c, b)) == True{} : Bool}
+
+def g4v_request_holds_an_image(c, b):
+  match c:
+    case 0n:
+      L.nat_le_refl(b)
+    case 1n+cp:
+      L.nat_max_ge_r(1n+cp, b)
+
+# LAW G4V.5
+# promise: the feature buffer's padding holds every row the unified embedder's recipe writes past an image.
+# harm: the last image's recipe would write past the feature buffer.
+law g4v_unified_pad_holds_its_rows:
+  for +b: Nat
+  for k: Nat
+  {Nat.is_le(g4v_recipe_rows(True{}, b, k), g4v_pad_cols(True{}, b)) == True{} : Bool}
+
+def g4v_unified_pad_holds_its_rows(b, k):
+  L.nat_le_refl(b)
+
+# LAW G4V.6
+# promise: the soft tokens a pixel budget is said to hold never take more pixels than the budget.
+law g4v_soft_budget_within_pixels:
+  for +px: Nat
+  for +sp: Nat
+  {Nat.is_le(Nat.mul(g4v_soft_budget(px, 1n+sp), Nat.mul(1n+sp, 1n+sp)), px) == True{} : Bool}
+
+def g4v_soft_budget_within_pixels(px, sp):
+  g4v_div_mul_le(px, Nat.add(sp, Nat.mul(sp, 1n+sp)))
