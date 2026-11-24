@@ -1963,17 +1963,15 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         tls_key: None,
         cache_ram_bytes: Some(0),
     };
-    // plain decode and a DSpine drafter: the server-wide tower
-    for id in ["plain", "ds"] {
+    // plain decode and the drafters that passed the vision suite on this (dense) family: the
+    // server-wide tower
+    for id in ["plain", "ds", "mtp", "block"] {
         assert_eq!(
             vision_plan_of(&cfg, id, &dir, 262_144),
             Some((4096, 16_384)),
             "{id}"
         );
     }
-    // drafters that are not validated with image input: text only
-    assert_eq!(vision_plan_of(&cfg, "mtp", &dir, 262_144), None);
-    assert_eq!(vision_plan_of(&cfg, "block", &dir, 262_144), None);
     // the model's own setting wins over the server's
     assert_eq!(vision_plan_of(&cfg, "off", &dir, 262_144), None);
     assert_eq!(
@@ -1993,8 +1991,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         q.vision_cache_sizes.contains(&4032) && q.vision_cache_sizes.iter().all(|&n| n <= 4096)
     );
     let (q, _) = engine_config_of(&cfg, "mtp", &dir, 262_144);
-    assert_eq!((q.vision_max_patches, q.vision_max_tokens), (0, 0));
-    assert!(q.vision_precompile.is_empty() && q.vision_cache_sizes.is_empty());
+    assert_eq!((q.vision_max_patches, q.vision_max_tokens), (4096, 16_384));
     // what requests may carry
     let serve = vision_serve_of(&cfg, "ds", &dir, 262_144).unwrap().unwrap();
     assert_eq!(
@@ -2018,6 +2015,22 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
     assert_eq!(
         vision_plan_of(&cfg, "big", &dir, 262_144),
         Some((8192, 16_384))
+    );
+    // the mixture-of-experts family's own MTP head has not passed the suite: text only (its
+    // other drafters and plain decode keep the tower)
+    cfg.vision = true;
+    let moe = std::fs::read_to_string(dir.join("config.json"))
+        .unwrap()
+        .replacen("\"qwen3_5_text\"", "\"qwen3_5_moe_text\"", 1);
+    std::fs::write(dir.join("config.json"), moe).unwrap();
+    assert_eq!(
+        crate::vision::model_with_tower(&dir).map(|s| s.family),
+        Some(crate::model_spec::ModelFamily::Qwen35Moe)
+    );
+    assert_eq!(vision_plan_of(&cfg, "mtp", &dir, 262_144), None);
+    assert_eq!(
+        vision_plan_of(&cfg, "plain", &dir, 262_144),
+        Some((4096, 16_384))
     );
     // a checkpoint without a tower, or a missing one, has none
     std::fs::write(

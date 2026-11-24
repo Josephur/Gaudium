@@ -7,6 +7,7 @@
 #   - Video frame sampling counts, sampled frame indices and temporal grouping (never out of range)
 #   - Mirrored row / column indices of an orientation change (never out of range)
 #   - Which speculative drafters a model may run beside its vision tower
+#   - The image rows a prefill tile takes (never past the tile's rows, never past the image's)
 
 import Base
 import nat_lemmas.bend as L
@@ -79,6 +80,49 @@ def vb_over_not_le(m: Nat, extra: Nat) -> {Nat.is_le(Nat.add(1n+m, extra), m) ==
     case 1n+p:
       vb_over_not_le(p, extra)
 
+# min(f, t) + (t - f) == t
+def vb_min_add_sub(+f: Nat, +t: Nat) -> {Nat.add(Nat.min(f, t), Nat.sub(t, f)) == t : Nat}:
+  match f t:
+    case 0n 0n: {==}
+    case 0n 1n+tp: {==}
+    case 1n+fp 0n: {==}
+    case 1n+fp 1n+tp:
+      %vb_min_add_sub(fp, tp) : {1n+Nat.add(Nat.min(fp, tp), Nat.sub(tp, fp)) == 1n+_ : Nat}
+      {==}
+
+# c <= f: (min(f, t) - c) + (t - f) == t - c
+def vb_min_sub_add_sub(+c: Nat, +f: Nat, +t: Nat, h: {Nat.is_le(c, f) == True{} : Bool}) -> {Nat.add(Nat.sub(Nat.min(f, t), c), Nat.sub(t, f)) == Nat.sub(t, c) : Nat}:
+  match c f t:
+    case 0n 0n _: {==}
+    case 0n 1n+fp 0n: {==}
+    case 0n 1n+fp 1n+tp:
+      %vb_min_add_sub(fp, tp) : {1n+Nat.add(Nat.min(fp, tp), Nat.sub(tp, fp)) == 1n+_ : Nat}
+      {==}
+    case 1n+cp 0n _:
+      L.bool_absurd({Nat.add(Nat.sub(Nat.min(0n, t), 1n+cp), Nat.sub(t, 0n)) == Nat.sub(t, 1n+cp) : Nat}, h)
+    case 1n+cp 1n+fp 0n: {==}
+    case 1n+cp 1n+fp 1n+tp:
+      vb_min_sub_add_sub(cp, fp, tp, h)
+
+# x <= y: x - c <= y - c
+def vb_sub_le_mono(+x: Nat, +y: Nat, +c: Nat, h: {Nat.is_le(x, y) == True{} : Bool}) -> {Nat.is_le(Nat.sub(x, c), Nat.sub(y, c)) == True{} : Bool}:
+  match x y c:
+    case 0n _ _:
+      L.nat_le_zero(Nat.sub(y, c))
+    case 1n+xp 0n _:
+      L.bool_absurd({Nat.is_le(Nat.sub(1n+xp, c), Nat.sub(0n, c)) == True{} : Bool}, h)
+    case 1n+xp 1n+yp 0n:
+      h
+    case 1n+xp 1n+yp 1n+cp:
+      vb_sub_le_mono(xp, yp, cp, h)
+
+# (s + a) - (s + b) == a - b
+def vb_add_sub_add_l(s: Nat, -a: Nat, -b: Nat) -> {Nat.sub(Nat.add(s, a), Nat.add(s, b)) == Nat.sub(a, b) : Nat}:
+  match s:
+    case 0n: {==}
+    case 1n+sp:
+      vb_add_sub_add_l(sp, a, b)
+
 # ============================================================================
 # 2. Media sources
 # ============================================================================
@@ -98,19 +142,33 @@ def media_source_allowed(s: MediaSource, allow_remote: Bool) -> Bool:
       allow_remote
 
 # The drafter a served model decodes with.
+#   VdNone       plain decode (no drafter)
+#   VdDSpine     a DSpine block drafter
+#   VdBlock      a DFlash2 block drafter of a dense Qwen3.5 / 3.8 model
+#   VdMtp        the own MTP head of a dense Qwen3.5 / 3.8 model
+#   VdMtpMoe     the own MTP head of a mixture-of-experts Qwen3.5 / 3.6 model
+#   VdStates     a block drafter that takes its context from the target model's hidden states
+#                (Inkling 2's own drafter)
+#   VdAssistant  a Gemma 4 model's own `-assistant` drafter checkpoint
+#   VdOther      any other pairing of a drafter and a model family
 type VisDrafter is Data:
   VdNone{}
   VdDSpine{}
   VdBlock{}
   VdMtp{}
   VdStates{}
+  VdMtpMoe{}
+  VdAssistant{}
+  VdOther{}
 
 # Whether a model with this drafter may be loaded with its vision tower. Plain decode is the
 # exactness reference and always may. A drafter may once it reads vision embeddings (never
-# image-pad embeddings) at image positions AND has passed the vision regression on the card:
-# today that is the DSpine drafter, and the block drafter whose context is the target model's own
-# hidden states (`VdStates`: it embeds no prompt row itself, an image reaches it as what the target
-# made of it). The others are served text only until they have.
+# image-pad embeddings) at image positions AND has passed the vision regression suite on the card
+# (`gaudium --vision-suite`): today the DSpine and DFlash2 block drafters and the MTP head of a
+# dense model, whose context is the target model's hidden states or which embeds the image's own
+# rows (`engine/mtp.rs`), and Inkling 2's own drafter (`VdStates`). The mixture-of-experts MTP head
+# and Gemma 4's drafters are served text only until the suite has passed for them; a pairing this
+# table does not know always is.
 def vis_drafter_ok(d: VisDrafter) -> Bool:
   match d:
     case VdNone{}:
@@ -118,11 +176,17 @@ def vis_drafter_ok(d: VisDrafter) -> Bool:
     case VdDSpine{}:
       True{}
     case VdBlock{}:
-      False{}
+      True{}
     case VdMtp{}:
-      False{}
+      True{}
     case VdStates{}:
       True{}
+    case VdMtpMoe{}:
+      False{}
+    case VdAssistant{}:
+      False{}
+    case VdOther{}:
+      False{}
 
 # ============================================================================
 # 3. Limits checked before decoding
@@ -220,7 +284,55 @@ def orient_mirror(i: Nat, n: Nat) -> Nat:
   Nat.sub(Nat.sub(n, 1n), i)
 
 # ============================================================================
-# 8. Laws
+# 8. Image rows of a prefill tile
+# ============================================================================
+
+# A prefill tile holds the prompt rows [lo, hi), and its row r embeds the token at slot
+# r + shift: shift 0 for the decoder itself, shift 1 for a next-token head (the MTP fusion's
+# row r embeds token r + 1). An image holds the slots [start, start + len) and one embedding row
+# per slot. The tokens the tile embeds from the image form one run of slots [from, to), maybe
+# empty; the rows below are where the run lands in the tile and in the image's embeddings.
+
+# First slot of the run.
+def vis_run_from(start: Nat, lo: Nat, shift: Nat) -> Nat:
+  Nat.max(start, Nat.add(shift, lo))
+
+# End of the run (one past its last slot).
+def vis_run_to(start: Nat, len: Nat, hi: Nat, shift: Nat) -> Nat:
+  Nat.min(Nat.add(start, len), Nat.add(shift, hi))
+
+# Rows of the run (0: the tile takes nothing from this image).
+def vis_run_rows(+start: Nat, len: Nat, lo: Nat, hi: Nat, +shift: Nat) -> Nat:
+  Nat.sub(vis_run_to(start, len, hi, shift), vis_run_from(start, lo, shift))
+
+# The run's first slot; an empty run sits at its end, so it never points past the tile.
+def vis_run_first(+start: Nat, len: Nat, lo: Nat, hi: Nat, +shift: Nat) -> Nat:
+  Nat.min(vis_run_from(start, lo, shift), vis_run_to(start, len, hi, shift))
+
+# Tile row (0 = row lo) that embeds the run's first slot.
+def vis_run_tile_row(+start: Nat, len: Nat, +lo: Nat, hi: Nat, +shift: Nat) -> Nat:
+  Nat.sub(vis_run_first(start, len, lo, hi, shift), Nat.add(shift, lo))
+
+# The run's first slot as a row of the image's own embeddings (0 = the image's first token).
+def vis_run_emb_off(+start: Nat, len: Nat, lo: Nat, hi: Nat, shift: Nat) -> Nat:
+  Nat.sub(vis_run_first(start, len, lo, hi, shift), start)
+
+# ============================================================================
+# 8a. Tower plan of a run's image requests
+# ============================================================================
+
+# Image tokens of one request: the tokens counted so far plus one more image's.
+def vis_request_tokens(counted: Nat, image: Nat) -> Nat:
+  Nat.add(counted, image)
+
+# The tower of a run with several image requests is planned for its largest image and for the
+# request holding the most image tokens: the plan so far, raised to one more request's or
+# image's need.
+def vis_plan_raise(planned: Nat, need: Nat) -> Nat:
+  Nat.max(planned, need)
+
+# ============================================================================
+# 9. Laws
 # ============================================================================
 
 # LAW VB.1: inline media is taken whatever the remote setting is.
@@ -479,3 +591,89 @@ def orient_mirror_in_range(i, p):
       vb_sub_le_self(0n, i)
     case 1n+q:
       vb_sub_le_self(1n+q, i)
+
+# LAW VB.24: a drafter pairing the table does not know never runs beside the vision tower.
+# promise: a model whose drafter is not one the vision table knows is always served text only.
+# harm: an unknown drafter could read image-pad embeddings and be served with images unchecked.
+law vis_unknown_drafter_text_only:
+  {vis_drafter_ok(VdOther{}) == False{} : Bool}
+
+def vis_unknown_drafter_text_only():
+  {==}
+
+# LAW VB.25: the rows a tile takes from an image lie inside the tile.
+# promise: the image rows a prefill tile takes never reach past the tile's own rows.
+# harm: a device copy past the tile would overwrite rows of another buffer.
+law vis_run_in_tile:
+  for +start: Nat
+  for +len: Nat
+  for +lo: Nat
+  for +hi: Nat
+  for +shift: Nat
+  {Nat.is_le(Nat.add(vis_run_tile_row(start, len, lo, hi, shift), vis_run_rows(start, len, lo, hi, shift)), Nat.sub(hi, lo)) == True{} : Bool}
+
+def vis_run_in_tile(start, len, lo, hi, shift):
+  +f = Nat.max(start, Nat.add(shift, lo))
+  +t = Nat.min(Nat.add(start, len), Nat.add(shift, hi))
+  +c = Nat.add(shift, lo)
+  %Equal.sym(Nat, Nat.add(Nat.sub(Nat.min(f, t), c), Nat.sub(t, f)), Nat.sub(t, c), vb_min_sub_add_sub(c, f, t, L.nat_max_ge_r(start, c))) : {Nat.is_le(_, Nat.sub(hi, lo)) == True{} : Bool}
+  L.nat_le_subst_r(Nat.sub(t, c), Nat.sub(Nat.add(shift, hi), c), Nat.sub(hi, lo), vb_add_sub_add_l(shift, hi, lo), vb_sub_le_mono(t, Nat.add(shift, hi), c, vb_min_le_r(Nat.add(start, len), Nat.add(shift, hi))))
+
+# LAW VB.26: the rows a tile takes from an image lie inside the image's embeddings.
+# promise: the image rows a prefill tile takes never reach past that image's own embedding rows.
+# harm: a device copy past the image would read another image's (or stale) embedding rows.
+law vis_run_in_image:
+  for +start: Nat
+  for +len: Nat
+  for +lo: Nat
+  for +hi: Nat
+  for +shift: Nat
+  {Nat.is_le(Nat.add(vis_run_emb_off(start, len, lo, hi, shift), vis_run_rows(start, len, lo, hi, shift)), len) == True{} : Bool}
+
+def vis_run_in_image(start, len, lo, hi, shift):
+  +f = Nat.max(start, Nat.add(shift, lo))
+  +t = Nat.min(Nat.add(start, len), Nat.add(shift, hi))
+  %Equal.sym(Nat, Nat.add(Nat.sub(Nat.min(f, t), start), Nat.sub(t, f)), Nat.sub(t, start), vb_min_sub_add_sub(start, f, t, L.nat_max_ge_l(start, Nat.add(shift, lo)))) : {Nat.is_le(_, len) == True{} : Bool}
+  L.nat_le_subst_r(Nat.sub(t, start), Nat.sub(Nat.add(start, len), start), len, L.nat_add_sub_cancel_l(start, len), vb_sub_le_mono(t, Nat.add(start, len), start, vb_min_le_l(Nat.add(start, len), Nat.add(shift, hi))))
+
+# LAW VB.27: a request's image tokens cover all of its images together, not only the largest.
+# promise: a request's image-token count covers the tokens counted before plus the added image's, so it covers all of the request's images.
+# harm: the embedding buffer could be planned for fewer rows than a multi-image request holds.
+law vis_request_counts_all:
+  for +c: Nat
+  for +i: Nat
+  {Nat.is_le(Nat.add(c, i), vis_request_tokens(c, i)) == True{} : Bool}
+
+def vis_request_counts_all(c, i):
+  L.nat_le_refl(Nat.add(c, i))
+
+# LAW VB.28: adding an image never lowers a request's count.
+# promise: counting one more image never lowers the image tokens already counted for the request.
+law vis_request_count_grows:
+  for +c: Nat
+  for +i: Nat
+  {Nat.is_le(c, vis_request_tokens(c, i)) == True{} : Bool}
+
+def vis_request_count_grows(c, i):
+  L.nat_add_le_r(c, i)
+
+# LAW VB.29: the raised plan covers the request (or image) it was raised for.
+# promise: the tower plan raised for a request's or an image's need always covers that need.
+# harm: the tower or its embedding buffer could be planned too small for an image request of the run.
+law vis_plan_covers_need:
+  for +p: Nat
+  for +n: Nat
+  {Nat.is_le(n, vis_plan_raise(p, n)) == True{} : Bool}
+
+def vis_plan_covers_need(p, n):
+  L.nat_max_ge_r(p, n)
+
+# LAW VB.30: raising the plan never shrinks what earlier requests were planned for.
+# promise: raising the tower plan for one more need never shrinks what it covered before.
+law vis_plan_keeps_earlier:
+  for +p: Nat
+  for +n: Nat
+  {Nat.is_le(p, vis_plan_raise(p, n)) == True{} : Bool}
+
+def vis_plan_keeps_earlier(p, n):
+  L.nat_max_ge_l(p, n)

@@ -31,11 +31,16 @@
 //!
 //! The drafter only proposes: the verify decides every token, so nothing here affects exactness.
 //!
-//! Vision note (not built here): at image positions the fusion must read the vision embedding
-//! row, not the embedding of the image-pad token. The fusion takes its embedding rows as a
-//! tensor (`append_fuse`), so a vision prefill only swaps the gather of the context recipe for
-//! the merged embedding rows. Positions are RoPE positions of the trunk (`cursor` based), never
-//! cache slots.
+//! Vision: the row of position `p` embeds the token at `p + 1`, and where that token is an
+//! image token the fusion must read the image's own embedding row, never the embedding of the
+//! image-pad token. A prompt tile with such rows runs the context pass in its image form
+//! (`g_mtp_ctxi_*`, [`build_ctx_graph_image`]): its embedding rows `mc_e` are an input. The
+//! trunk's own embed recipe gathers them (the same gather the text form runs inside its recipe)
+//! and the tower's rows are copied over the image slots shifted by one
+//! (`PromptLayout::overlaps_shifted`, the verified `vis_run_*` arithmetic). Tiles without such
+//! rows, and every text-only request, launch the text form as before. The first block and every
+//! step embed generated tokens only. Positions are RoPE positions of the trunk (`cursor`
+//! based), never cache slots.
 
 use std::borrow::Cow;
 
@@ -822,7 +827,32 @@ pub fn build_ctx_graph(
     nch: u64,
     elf_hashes: &[(String, String)],
 ) -> GraphBuilder {
-    let mut gb = GraphBuilder::new(format!("g_mtp_ctx_T{t}_C{nch}"));
+    ctx_graph(spec, t, lmax, nch, elf_hashes, false)
+}
+
+/// [`build_ctx_graph`] for a tile with image rows: the embedding rows `mc_e` (the tile's tokens
+/// shifted by one, image slots holding the image's own embeddings) are an input, filled before
+/// the launch; everything after them is the text form's.
+pub fn build_ctx_graph_image(
+    spec: &ModelSpec,
+    t: u64,
+    lmax: u64,
+    nch: u64,
+    elf_hashes: &[(String, String)],
+) -> GraphBuilder {
+    ctx_graph(spec, t, lmax, nch, elf_hashes, true)
+}
+
+fn ctx_graph(
+    spec: &ModelSpec,
+    t: u64,
+    lmax: u64,
+    nch: u64,
+    elf_hashes: &[(String, String)],
+    image: bool,
+) -> GraphBuilder {
+    let form = if image { "ctxi" } else { "ctx" };
+    let mut gb = GraphBuilder::new(format!("g_mtp_{form}_T{t}_C{nch}"));
     for (k, h) in elf_hashes {
         gb.record_kernel_elf_hash(k, h);
     }
@@ -830,16 +860,20 @@ pub fn build_ctx_graph(
     let nkv = spec.n_kv_heads;
     let dh = spec.head_dim;
     let r = (spec.n_heads / nkv) * t;
+    // (the text form's tensors and nodes in the order its recipe key was first built with)
     let x_in = gb.add_persistent_tensor("mtp_ctx_x", SynDataType::Bf16, &[hid, t]);
-    let ids = gb.add_persistent_tensor("mtp_ctx_ids", SynDataType::Int32, &[t]);
+    let ids = (!image).then(|| gb.add_persistent_tensor("mtp_ctx_ids", SynDataType::Int32, &[t]));
     let cursor = gb.add_persistent_tensor("ctx_cursor", SynDataType::Int32, &[1]);
-    let table =
-        gb.get_or_add_persistent_tensor("embed_table", SynDataType::Bf16, &[hid, spec.vocab]);
+    let table = (!image).then(|| {
+        gb.get_or_add_persistent_tensor("embed_table", SynDataType::Bf16, &[hid, spec.vocab])
+    });
     let rope_c = gb.get_or_add_persistent_tensor("rope_c", SynDataType::Float, &[128, lmax]);
     let rope_s = gb.get_or_add_persistent_tensor("rope_s", SynDataType::Float, &[128, lmax]);
     let h = add_rmsnorm(&mut gb, spec, x_in, "w_final", "mc_hf", t);
     let e = gb.add_persistent_tensor("mc_e", SynDataType::Bf16, &[hid, t]);
-    gb.op_gather_bf16("mc_embed", table, ids, e, 1);
+    if let (Some(table), Some(ids)) = (table, ids) {
+        gb.op_gather_bf16("mc_embed", table, ids, e, 1);
+    }
     let (_x, h64) = append_fuse(&mut gb, spec, e, h, "mc_", t);
     let qg = add_linear_bf16(&mut gb, h64, "M_W_qg", hid, spec.qg_dim(), t, "mc_qg");
     let k = add_linear_bf16(&mut gb, h64, "M_W_k", hid, spec.kv_dim(), t, "mc_k");
@@ -950,6 +984,8 @@ pub struct Mtp {
     /// Ids of the first step (`kd + 1`, or the tree's nodes).
     n_first: usize,
     ctx: HashMap<(u64, u64), CompiledRecipe>,
+    /// Image form of the context pass (tiles with image rows), compiled on first use.
+    ctxi: HashMap<(u64, u64), CompiledRecipe>,
     first: HashMap<u64, CompiledRecipe>,
     pool: BTreeMap<String, u64>,
 }
@@ -991,6 +1027,7 @@ impl Mtp {
             tree: tree.cloned(),
             n_first: tree.map_or(kd as usize + 1, |s| s.n_nodes()),
             ctx: HashMap::new(),
+            ctxi: HashMap::new(),
             first: HashMap::new(),
             pool: BTreeMap::new(),
         })
@@ -1020,16 +1057,18 @@ impl Mtp {
     }
 
     /// The head's own recipes of KV chunk count `nch` that a request compiles on first use
-    /// (device-less pre-compilation): the prompt-tile rows and the first block.
+    /// (device-less pre-compilation): the prompt-tile rows and the first block, and with image
+    /// input (`image`) the image form of the prompt-tile rows.
     pub fn lazy_graphs(
         &self,
         spec: &ModelSpec,
         lmax: u64,
         prefill_tile: u64,
         nch: u64,
+        image: bool,
         elf_hashes: &[(String, String)],
     ) -> Vec<GraphBuilder> {
-        vec![
+        let mut v = vec![
             build_ctx_graph(spec, prefill_tile, lmax, nch, elf_hashes),
             build_first_graph(
                 spec,
@@ -1040,7 +1079,11 @@ impl Mtp {
                 self.tree.as_ref(),
                 elf_hashes,
             ),
-        ]
+        ];
+        if image {
+            v.push(build_ctx_graph_image(spec, prefill_tile, lmax, nch, elf_hashes));
+        }
+        v
     }
 
     /// Compiles the recipes whose workspace must be known before the allocation seal.
@@ -1216,7 +1259,12 @@ impl Mtp {
             );
         }
         self.pool = pool;
-        for r in self.first.values_mut().chain(self.ctx.values_mut()) {
+        for r in self
+            .first
+            .values_mut()
+            .chain(self.ctx.values_mut())
+            .chain(self.ctxi.values_mut())
+        {
             r.bind_shared_workspace(dev)
                 .map_err(|e| format!("bind {} ws: {e}", r.name))?;
         }
@@ -1232,6 +1280,29 @@ pub(super) fn prefill_tile(eng: &mut Qwen3Engine, pos: u64, tile_len: u64) -> Re
     } else {
         eng.pf_x1
     };
+    // Rows whose next token is an image token: `(source address, byte offset in the tile's
+    // embedding rows, bytes)` of the image's own embedding rows (row r embeds token r + 1).
+    let row_bytes = eng.spec.hidden * 2;
+    let image_rows: Vec<(u64, u64, u64)> =
+        match (eng.last_prompt_layout(), eng.vision_embeddings_addr()) {
+            (Some(layout), Some(emb)) => layout
+                .overlaps_shifted(pos as usize, (pos + tile_len) as usize, 1)
+                .map(|(row, first, n)| {
+                    (
+                        emb + row as u64 * row_bytes,
+                        (first as u64 - pos) * row_bytes,
+                        n as u64 * row_bytes,
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+    if eng.verbose && !image_rows.is_empty() {
+        let rows: u64 = image_rows.iter().map(|r| r.2 / row_bytes).sum();
+        eprintln!(
+            "[gaudium] mtp: prefill tile at row {pos} ({tile_len} rows): {rows} rows embed image tokens (image form of the context pass)"
+        );
+    }
     let Qwen3Engine {
         specdec,
         dev,
@@ -1240,6 +1311,7 @@ pub(super) fn prefill_tile(eng: &mut Qwen3Engine, pos: u64, tile_len: u64) -> Re
         driver_version,
         stage_io,
         pf_cursor,
+        embed_recipes,
         ..
     } = eng;
     let rt: &mut SpecRuntime = specdec.as_mut().expect("spec runtime");
@@ -1251,12 +1323,20 @@ pub(super) fn prefill_tile(eng: &mut Qwen3Engine, pos: u64, tile_len: u64) -> Re
         ..
     } = rt;
     let m = mtp.as_mut().expect("mtp drafter");
-    if let std::collections::hash_map::Entry::Vacant(slot) = m.ctx.entry((tile_len, nch)) {
-        let mut r = build_ctx_graph(spec, tile_len, *lmax, nch, elf_hashes)
+    let image = !image_rows.is_empty();
+    let recipes = if image { &mut m.ctxi } else { &mut m.ctx };
+    if let std::collections::hash_map::Entry::Vacant(slot) = recipes.entry((tile_len, nch)) {
+        let form = if image { "ctxi" } else { "ctx" };
+        let gb = if image {
+            build_ctx_graph_image(spec, tile_len, *lmax, nch, elf_hashes)
+        } else {
+            build_ctx_graph(spec, tile_len, *lmax, nch, elf_hashes)
+        };
+        let mut r = gb
             .compile(Arc::clone(dev.api()), cache, driver_version)
-            .map_err(|e| format!("compile mtp ctx T={tile_len} C={nch}: {e}"))?;
+            .map_err(|e| format!("compile mtp {form} T={tile_len} C={nch}: {e}"))?;
         r.bind_shared_workspace(dev)
-            .map_err(|e| format!("bind mtp ctx T={tile_len} C={nch} ws: {e}"))?;
+            .map_err(|e| format!("bind mtp {form} T={tile_len} C={nch} ws: {e}"))?;
         slot.insert(r);
     }
     // the rows' next tokens; the last prompt position has none yet (the first block redoes it)
@@ -1268,7 +1348,35 @@ pub(super) fn prefill_tile(eng: &mut Qwen3Engine, pos: u64, tile_len: u64) -> Re
     }
     dev.copy_h2d_pinned_sync(stage_io, n * 4, m.pool["mtp_ctx_ids"])
         .map_err(|e| format!("mtp ctx ids H2D: {e}"))?;
-    let r = &m.ctx[&(tile_len, nch)];
+    if image {
+        // the rows' embeddings: the trunk's embed recipe of this tile length (the gather the
+        // text form runs inside its recipe), then the image slots' own rows over the pad rows
+        let mc_e = m.pool["mc_e"];
+        let emb_recipe = embed_recipes
+            .get(&tile_len)
+            .ok_or_else(|| format!("mtp ctxi: no embed recipe of {tile_len} rows"))?;
+        let mut emb_pool = BTreeMap::new();
+        emb_pool.insert("embed_table".to_string(), m.pool["embed_table"]);
+        emb_pool.insert("ids".to_string(), m.pool["mtp_ctx_ids"]);
+        emb_pool.insert("x0".to_string(), mc_e);
+        let emb_bind = select_exact_bindings(emb_recipe, &emb_pool)?;
+        emb_recipe
+            .launch_checked(dev, &emb_bind)
+            .map_err(|e| format!("launch mtp ctxi embed T={tile_len}: {e}"))?;
+        for &(src, off, bytes) in &image_rows {
+            if let Err(e) = dev.copy_d2d_compute(src, bytes, mc_e + off) {
+                // the embed launch is already queued: drain before reporting
+                // SAFETY: the compute stream belongs to `dev`.
+                let _ = unsafe { dev.sync_stream(dev.compute_stream()) };
+                return Err(format!("copy image embeddings into the mtp ctx rows: {e}"));
+            }
+        }
+    }
+    let r = if image {
+        &m.ctxi[&(tile_len, nch)]
+    } else {
+        &m.ctx[&(tile_len, nch)]
+    };
     let mut pool = m.pool.clone();
     pool.insert("mtp_ctx_x".into(), x_final);
     pool.insert("ctx_cursor".into(), *pf_cursor);
@@ -1435,6 +1543,33 @@ mod tests {
         let g2 = build_chain_step_graph(&spec, 4096, 1, 2, 5, 0, &[]);
         assert!(dims(&g2, "mtp_drafts").is_none() && dims(&g2, "d2_tok").is_none());
         assert_eq!(dims(&g2, "next_ids"), Some(vec![2]));
+    }
+
+    #[test]
+    fn image_form_takes_its_embedding_rows_as_input() {
+        let spec = target_27b();
+        let text = build_ctx_graph(&spec, 512, 16384, 4, &[]);
+        let image = build_ctx_graph_image(&spec, 512, 16384, 4, &[]);
+        assert_eq!(text.recipe_name(), "g_mtp_ctx_T512_C4");
+        assert_eq!(image.recipe_name(), "g_mtp_ctxi_T512_C4");
+        // the image form neither gathers nor binds the ids or the table
+        assert_eq!(dims(&text, "mtp_ctx_ids"), Some(vec![512]));
+        assert!(dims(&image, "mtp_ctx_ids").is_none() && dims(&image, "embed_table").is_none());
+        // its embedding rows are the trunk's embed recipe's output shape, and everything else
+        // (names and dims, so the same planned buffers) is the text form's
+        let emb = crate::engine::qwen3::build_embed_graph(&spec, 512);
+        assert_eq!(dims(&image, "mc_e"), dims(&emb, "x0"));
+        let names = |g: &GraphBuilder| -> Vec<(String, Vec<u64>)> {
+            g.persistent_tensor_specs()
+                .into_iter()
+                .filter(|t| t.0 != "mtp_ctx_ids" && t.0 != "embed_table")
+                .map(|t| (t.0, t.2))
+                .collect()
+        };
+        let (mut a, mut b) = (names(&text), names(&image));
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
     }
 
     #[test]

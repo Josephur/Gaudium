@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use super::{Qwen3Config, Qwen3Engine};
 use crate::model_spec::ModelSpec;
+use crate::verified::vis_plan_raise;
 use crate::vision::mrope::layout_prompt;
 use crate::vision::vit::{VisionTower, ROPE_ROW_MARGIN};
 use crate::vision::{PreparedImage, PromptLayout, VisionReport, VisionSpec};
@@ -32,13 +33,23 @@ pub(super) struct VisionRequestState {
     last_layout: Option<PromptLayout>,
 }
 
+impl Qwen3Config {
+    /// Patches of the largest image the vision tower is planned for: the explicit cap raised to
+    /// every image size to precompile (verified `vis_plan_raise`). 0: no image input.
+    pub(crate) fn vision_plan_patches(&self) -> u64 {
+        self.vision_precompile
+            .iter()
+            .copied()
+            .fold(self.vision_max_patches, vis_plan_raise)
+    }
+}
+
 /// Plans the vision tower when the configuration asks for image input.
 pub(super) fn plan_vision(
     spec: &ModelSpec,
     cfg: &Qwen3Config,
 ) -> Result<Option<VisionTower>, String> {
-    let max_pre = cfg.vision_precompile.iter().copied().max().unwrap_or(0);
-    let max_patches = cfg.vision_max_patches.max(max_pre);
+    let max_patches = cfg.vision_plan_patches();
     if max_patches == 0 {
         return Ok(None);
     }
