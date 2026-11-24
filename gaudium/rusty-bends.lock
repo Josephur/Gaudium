@@ -860,6 +860,14 @@ e6d2224aaf980fef  ln_plan_counts_shared  law ln_plan_counts_shared : for + n : N
 # promise ln_plan_counts_shared: the shared part of a plan is always counted in full in its bytes.
 0947116a7392fafc  ln_plan_fits_iff_no_shortfall  law ln_plan_fits_iff_no_shortfall : for + n : Nat for + lb : Nat for + sh : Nat for + u : Nat { ln_plan_fits ( n , lb , sh , u ) == Nat.is_eq ( ln_plan_shortfall ( n , lb , sh , u ) , 0n ) : Bool }
 # promise ln_plan_fits_iff_no_shortfall: a lane plan is refused exactly when it lacks device memory, and then it reports a positive shortfall.
+68d38adbf0bddf72  ln_post_call_joins_adds_slot  law ln_post_call_joins_adds_slot : for + a : Nat for + w : Nat for + l : Nat { Bool.or ( ln_post_call_opens ( a , w , l ) , Nat.is_eq ( ln_post_call_rows ( a , w , l ) , Nat.add ( a , w ) ) ) == True { } : Bool }
+# promise ln_post_call_joins_adds_slot: a slot that joins a call of the output norm adds exactly its rows to it (every slot's rows are in exactly one call).
+217846802d9ba4ae  ln_post_call_joins_within  law ln_post_call_joins_within : for + a : Nat for + w : Nat for + l : Nat { Bool.or ( ln_post_call_opens ( a , w , l ) , Nat.is_le ( Nat.add ( a , w ) , l ) ) == True { } : Bool }
+# promise ln_post_call_joins_within: a slot joins the open call of the output norm only when the call's rows stay within the limit.
+22a16a5dbe3e2356  ln_post_call_opens_with_slot  law ln_post_call_opens_with_slot : for + a : Nat for + w : Nat for + l : Nat { Bool.or ( Bool.not ( ln_post_call_opens ( a , w , l ) ) , Nat.is_eq ( ln_post_call_rows ( a , w , l ) , w ) ) == True { } : Bool }
+# promise ln_post_call_opens_with_slot: a call of the output norm that a slot opens holds exactly that slot's rows.
+46925de39c5f3fe2  ln_post_call_rows_within  law ln_post_call_rows_within : for + a : Nat for + w : Nat for + l : Nat { Bool.or ( ln_post_call_opens ( a , w , l ) , Nat.is_le ( ln_post_call_rows ( a , w , l ) , l ) ) == True { } : Bool }
+# promise ln_post_call_rows_within: a call of the output norm that a slot joined never holds more rows than the limit.
 4daa72327243e704  ln_prefix_per_lane_within_grant  law ln_prefix_per_lane_within_grant : for + g : Nat for + np : Nat { Nat.is_le ( Nat.mul ( ln_prefix_per_lane ( g , 1n + np ) , 1n + np ) , g ) == True { } : Bool }
 # promise ln_prefix_per_lane_within_grant: the lanes together never get more kept prefix positions than were granted for them.
 c06abd2451430893  ln_queue_ahead_fits  law ln_queue_ahead_fits : for + w : Bool for + s : Bool { ln_queue_ahead ( w , s , False { } ) == False { } : Bool }
