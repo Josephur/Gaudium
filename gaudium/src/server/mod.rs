@@ -1199,12 +1199,12 @@ fn planned_drafter_of(
 /// have batched steps (the dense Qwen3 / Qwen3.5 / Qwen3.8 engine), else one lane, with the
 /// reason.
 fn served_lanes(cfg: &ServerConfig, id: &str, spec: &ModelSpec) -> (usize, Option<&'static str>) {
-    use crate::verified::{ln_lanes_ok, ln_served_lanes, LaneDrafter};
-    let drafter = match planned_drafter_of(cfg, id) {
-        None => LaneDrafter::LdNone,
-        Some((_, "dspine", _)) => LaneDrafter::LdDSpine,
-        Some(_) => LaneDrafter::LdOther,
-    };
+    use crate::verified::{ln_lanes_ok, ln_served_lanes};
+    // the engine's verify form comes from the environment (`Qwen3Config::new`), as here
+    let drafter = crate::engine::lane_drafter(
+        planned_drafter_of(cfg, id).map(|(_, kind, _)| kind == "dspine"),
+        crate::engine::step_opts::StepOpts::from_env().gdn_verify,
+    );
     let engine_ok = crate::engine::lanes_supported(spec);
     // (the server never calibrates)
     let n = ln_served_lanes(

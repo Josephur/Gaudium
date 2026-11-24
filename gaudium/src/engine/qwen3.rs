@@ -1147,6 +1147,9 @@ pub struct Qwen3Engine {
     /// and writes its token to the other token buffer. Empty: the plain loop only.
     step_fb_launches: Vec<[PreparedLaunch; 2]>,
     step_cursor_b: u64,
+    /// Every address a single-row decode step binds but the caches and states (the weights, the
+    /// step's buffers): a lane's one-row prompt binds its own caches and states beside them.
+    step_base: BTreeMap<String, u64>,
     step_ids: u64,
     step_cursor: u64,
     step_tokens: u64,
@@ -1282,11 +1285,13 @@ impl Qwen3Engine {
         let reset_mode = request_reset::ResetMode::from_config(cfg.request_reset.as_deref())?;
         // [lanes] several requests at once: lanes need batched steps for this engine and its
         // drafter (the verified choice the server makes too); a calibration load has one lane
-        let lane_drafter = match cfg.spec.as_ref().map(|sc| &sc.method) {
-            None => crate::verified::LaneDrafter::LdNone,
-            Some(spec::SpecMethod::DSpine { .. }) => crate::verified::LaneDrafter::LdDSpine,
-            Some(_) => crate::verified::LaneDrafter::LdOther,
-        };
+        // (the batched speculative steps are DSpine's with the checkpoint form of the verify rows)
+        let lane_drafter = crate::engine::lane_drafter(
+            cfg.spec
+                .as_ref()
+                .map(|sc| matches!(sc.method, spec::SpecMethod::DSpine { .. })),
+            cfg.step.gdn_verify,
+        );
         // (a calibration load: of the FP8 weights' activation sites, or of the K/V caches)
         let lanes_ok = crate::verified::ln_lanes_ok(
             crate::engine::lanes_supported(&spec),
@@ -1512,7 +1517,17 @@ impl Qwen3Engine {
         }
         let mut specdec = match &cfg.spec {
             Some(sc) => Some(spec::SpecRuntime::prepare(
-                sc,
+                // [lanes] lanes step at one width, the narrowest asked for (its rings are sized
+                // for it): every lane verifies the same rows in a launch
+                &if n_lanes > 1 {
+                    let mut one = sc.clone();
+                    one.draft_k = vec![
+                        crate::core::lanes::lane_width(sc.draft_k.iter().copied()).unwrap_or(1),
+                    ];
+                    one
+                } else {
+                    sc.clone()
+                },
                 &spec,
                 &kenv,
                 &elf_hashes,
@@ -1534,15 +1549,28 @@ impl Qwen3Engine {
         }
         // [lanes] the batched step recipes and their buffers
         let lane_plan = if n_lanes > 1 {
+            let (family, sampler) = match specdec.as_ref() {
+                Some(sd) => (
+                    lanes_rt::LaneFamily::Spec(sd.lane_graph()),
+                    samp.is_some() && sd.handles_sampled(),
+                ),
+                None => (
+                    lanes_rt::LaneFamily::k0(&elf_hashes, &kenv, samp.is_some())?,
+                    samp.is_some(),
+                ),
+            };
             let p = lanes_rt::LanePlan::prepare(
                 n_lanes,
                 &spec,
                 max_ctx,
                 max_chunks,
-                &elf_hashes,
-                &kenv,
-                samp.is_some(),
-                &|name| weight_specs.contains_key(name) || is_weight_or_table(name),
+                family,
+                sampler,
+                &|name| {
+                    weight_specs.contains_key(name)
+                        || is_weight_or_table(name)
+                        || specdec.as_ref().is_some_and(|sd| sd.is_weight(name))
+                },
                 &api,
                 &cache,
                 &driver_version,
@@ -1614,7 +1642,22 @@ impl Qwen3Engine {
         let kv_bytes: u64 = kv_specs.values().map(|&b| align256(b)).sum::<u64>() + gdn_state_bytes;
         // [lanes] every lane holds what lane 0 holds (its caches and state rings), and the
         // batched steps have buffers of their own
-        let kv_all = crate::verified::ln_lane_arena_bytes(kv_bytes, 0, n_lanes as u64);
+        // (with a drafter, a lane also owns its step buffers and the drafter's context caches;
+        // lane 0's are the speculative runtime's own)
+        let spec_lane_bufs: Vec<(String, u64)> = if n_lanes > 1 {
+            specdec
+                .as_ref()
+                .map(|sd| sd.lane_buffers())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // (each buffer as the arena allocates it: the verified rule of the lanes' step buffers)
+        let spec_lane_bytes: u64 = spec_lane_bufs
+            .iter()
+            .fold(0, |acc, (_, b)| crate::verified::ln_lane_bufs_add(acc, *b));
+        let lane_bytes = kv_bytes + spec_lane_bytes;
+        let kv_all = crate::verified::ln_lane_arena_bytes(kv_bytes, spec_lane_bytes, n_lanes as u64);
         let lane_act_bytes = lane_plan.as_ref().map_or(0, |p| p.act_bytes());
 
         let pf_x_bytes = align256(spec.hidden * prefill_tile * 2);
@@ -1812,17 +1855,17 @@ impl Qwen3Engine {
         if n_lanes > 1 && dev_opt.is_some() {
             use crate::core::hbm::usable_hbm_bytes;
             let usable = usable_hbm_bytes(total_hbm, total_hbm.saturating_sub(free_hbm), headroom);
-            let shared = crate::verified::ln_plan_shared(base_total, n_lanes as u64, kv_bytes);
+            let shared = crate::verified::ln_plan_shared(base_total, n_lanes as u64, lane_bytes);
             if let Err(short) =
-                crate::core::lanes::plan_check(n_lanes as u64, kv_bytes, shared, usable)
+                crate::core::lanes::plan_check(n_lanes as u64, lane_bytes, shared, usable)
             {
                 let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-                let fit = crate::core::lanes::lanes_fit(kv_bytes, shared, usable);
+                let fit = crate::core::lanes::lanes_fit(lane_bytes, shared, usable);
                 return Err(format!(
                     "--parallel {n_lanes} at {max_ctx} tokens per lane does not fit: each lane needs {:.2} GiB (K/V caches and DeltaNet state), the shared part (weights, step buffers, workspace) {:.2} GiB, together {:.2} GiB of the {:.2} GiB the card has usable, {:.2} GiB short. At this context {fit} lane(s) fit; or lower the context per lane (--max-ctx / --model-ctx)",
-                    gib(kv_bytes),
+                    gib(lane_bytes),
                     gib(shared),
-                    gib(shared.saturating_add(kv_all)),
+                    gib(shared.saturating_add(lane_bytes.saturating_mul(n_lanes as u64))),
                     gib(usable),
                     gib(short),
                 ));
@@ -1888,6 +1931,11 @@ impl Qwen3Engine {
                     "DeltaNet conv-state rings",
                     n_lin * 2 * align256(cs_ring_bytes),
                 );
+            }
+            for _ in 1..n_lanes {
+                for (name, bytes) in &spec_lane_bufs {
+                    r.add(HbmCat::CatKv, "kv-drafter-lanes", name, align256(*bytes));
+                }
             }
             if let Some(lp) = lane_plan.as_ref() {
                 r.add_map(HbmCat::CatOther, &lp.act_specs, |_| "lanes");
@@ -2175,6 +2223,7 @@ impl Qwen3Engine {
                 cs_ring_bytes,
                 cs_one_bytes,
                 pfx_granted,
+                &spec_lane_bufs,
                 &|| {
                     prefix_cache::PrefixCache::new(
                         prefill_tile,
@@ -2486,6 +2535,11 @@ impl Qwen3Engine {
             )?;
         }
         let spec_finish_s = t_spec_fin.elapsed().as_secs_f64();
+        // [lanes] every lane's share of the speculative runtime (context bounds start as loaded)
+        let lane_bounds = match (lane_rt.as_mut(), specdec.as_ref()) {
+            (Some(rt), Some(sd)) => rt.attach_spec(sd),
+            _ => Vec::new(),
+        };
         pf.finish_load(&dev)?; // [prefill]
                                // [moe hook] routed form: bind the routed-experts prefill recipe, zero its padded rows
         moe_rx.finish(
@@ -2522,6 +2576,12 @@ impl Qwen3Engine {
         // SAFETY: the compute stream belongs to `dev`.
         unsafe { dev.sync_stream(dev.compute_stream()) }
             .map_err(|e| format!("zero device state at load: {e}"))?;
+        // (after the zero fill: a lane's context bound reads "none" until a request sets it)
+        for &a in &lane_bounds {
+            let none: Vec<u8> = [-1i32, -1].iter().flat_map(|v| v.to_le_bytes()).collect();
+            dev.copy_h2d_sync(&none, a)
+                .map_err(|e| format!("lane context bound H2D: {e}"))?;
+        }
         if cfg.verbose {
             eprintln!(
                 "[gaudium] KV caches + state rings zeroed on the device: {:.2} GiB (enqueue {:.1} ms; complete within {:.2}s of the seal, overlapped with the upload)",
@@ -2645,6 +2705,7 @@ impl Qwen3Engine {
             step_launches,
             step_fb_launches,
             step_cursor_b,
+            step_base: base_step_addrs,
             step_ids,
             step_cursor,
             step_tokens,
@@ -3164,7 +3225,10 @@ impl Qwen3Engine {
         }
         let first_tok: i32 = if prompt_ids.len() == 1 {
             self.write_step_inputs(prompt_ids[0], 0)?;
-            if samp_on {
+            if self.lanes.is_some() {
+                // [lanes] the active lane's caches and states, bound at the launch
+                ttft_recipe_ms += lanes_rt::launch_one_row(self, gdn_parity, samp_on)?;
+            } else if samp_on {
                 ttft_recipe_ms += samp_rt::ensure_step(self, 1)?;
                 samp_rt::launch_step(self, 1, gdn_parity)?;
             } else {

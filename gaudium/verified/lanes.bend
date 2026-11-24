@@ -461,13 +461,56 @@ type LaneDrafter is Data:
   LdDSpine{}
   LdOther{}
 
-# Which kinds of decode have batched steps for several lanes.
+# Which kinds of decode have batched steps for several lanes: plain decode, and DSpine.
 def ln_drafter_ok(d: LaneDrafter) -> Bool:
   match d:
     case LdNone{}:
       True{}
-    case _:
+    case LdDSpine{}:
+      True{}
+    case LdOther{}:
       False{}
+
+# Does a speculative lane whose next row is `cursor` take the batched step of `rows` rows, in a
+# context of `max_ctx` rows? Otherwise it takes single-row steps, which draft nothing, to the
+# end of its request (as a single stream does near the end of its context).
+def ln_spec_batched(cursor: Nat, rows: Nat, max_ctx: Nat) -> Bool:
+  Nat.is_le(Nat.add(cursor, rows), max_ctx)
+
+# Of two draft widths asked for, the one lanes step at (every lane verifies the same rows in a
+# launch, and the state rings are sized for it); folded over every width asked for.
+def ln_lane_width_pick(+a: Nat, +b: Nat) -> Nat:
+  Nat.min(a, b)
+
+# The kind of drafter the lane rule judges, for a load with a drafter (`has`) or not, a DSpine
+# drafter (`dspine`) or another, whose verify rows are in a form the batched speculative steps are
+# built for (`batched_form`: today the checkpointed DeltaNet verify rows) or not.
+def ln_lane_drafter_of(has: Bool, dspine: Bool, batched_form: Bool) -> LaneDrafter:
+  match has:
+    case False{}:
+      LdNone{}
+    case True{}:
+      match dspine:
+        case True{}:
+          match batched_form:
+            case True{}:
+              LdDSpine{}
+            case False{}:
+              LdOther{}
+        case False{}:
+          LdOther{}
+
+def ln_ld_is_none(d: LaneDrafter) -> Bool:
+  match d:
+    case LdNone{}: True{}
+    case LdDSpine{}: False{}
+    case LdOther{}: False{}
+
+def ln_ld_is_dspine(d: LaneDrafter) -> Bool:
+  match d:
+    case LdNone{}: False{}
+    case LdDSpine{}: True{}
+    case LdOther{}: False{}
 
 # Does a load get lanes? Its engine has batched steps (`engine_ok`), its drafter has, and it is
 # not a calibration load (which runs one request at a time).
@@ -1101,6 +1144,11 @@ def ln_or_true_r(b: Bool) -> {Bool.or(b, True{}) == True{} : Bool}:
     case True{}: {==}
     case False{}: {==}
 
+def ln_or_not_self(b: Bool) -> {Bool.or(Bool.not(b), b) == True{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
 # promise: a waiter that has waited its maximum wait is due: no request passes it over any more.
 law turn_due_after_max_wait:
   for +w: Nat
@@ -1639,4 +1687,86 @@ law ln_sa_done_of_done:
   {ln_sa_done(SaDone{}) == True{} : Bool}
 
 def ln_sa_done_of_done():
+  {==}
+
+# promise: a speculative lane takes a batched step only when all the step's rows fit in its context.
+law ln_spec_batched_fits:
+  for +c: Nat
+  for +r: Nat
+  for +m: Nat
+  {Bool.or(Bool.not(ln_spec_batched(c, r, m)), Nat.is_le(Nat.add(c, r), m)) == True{} : Bool}
+
+def ln_spec_batched_fits(c, r, m):
+  ln_or_not_self(Nat.is_le(Nat.add(c, r), m))
+
+# promise: a drafter without batched steps (any kind other than plain decode and DSpine with checkpointed verify rows) never gets lanes.
+law ln_other_drafter_no_lanes:
+  {ln_drafter_ok(LdOther{}) == False{} : Bool}
+
+def ln_other_drafter_no_lanes():
+  {==}
+
+def ln_min_is_input(+a: Nat, +b: Nat) -> {Bool.or(Nat.is_eq(Nat.min(a, b), a), Nat.is_eq(Nat.min(a, b), b)) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      {==}
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      ln_min_is_input(ap, bp)
+
+# promise: lanes step at a draft width that was asked for.
+law ln_lane_width_is_asked:
+  for +a: Nat
+  for +b: Nat
+  {Bool.or(Nat.is_eq(ln_lane_width_pick(a, b), a), Nat.is_eq(ln_lane_width_pick(a, b), b)) == True{} : Bool}
+
+def ln_lane_width_is_asked(a, b):
+  ln_min_is_input(a, b)
+
+# promise: a load whose drafter verifies its rows in a form the batched speculative steps are not built for never gets lanes.
+law ln_unbatched_verify_no_lanes:
+  for +d: Bool
+  {ln_drafter_ok(ln_lane_drafter_of(True{}, d, False{})) == False{} : Bool}
+
+def ln_unbatched_verify_no_lanes(d):
+  match d:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a load with a drafter is never judged as plain decode by the lane rule.
+law ln_drafter_never_plain:
+  for +d: Bool
+  for +b: Bool
+  {ln_ld_is_none(ln_lane_drafter_of(True{}, d, b)) == False{} : Bool}
+
+def ln_drafter_never_plain(d, b):
+  match d b:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a drafter other than DSpine is never judged as DSpine by the lane rule.
+law ln_other_never_dspine:
+  for +b: Bool
+  {ln_ld_is_dspine(ln_lane_drafter_of(True{}, False{}, b)) == False{} : Bool}
+
+def ln_other_never_dspine(b):
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: the lane rule's plain-decode check holds for plain decode.
+law ln_ld_is_none_of_none:
+  {ln_ld_is_none(LdNone{}) == True{} : Bool}
+
+def ln_ld_is_none_of_none():
+  {==}
+
+# promise: the lane rule's DSpine check holds for DSpine.
+law ln_ld_is_dspine_of_dspine:
+  {ln_ld_is_dspine(LdDSpine{}) == True{} : Bool}
+
+def ln_ld_is_dspine_of_dspine():
   {==}

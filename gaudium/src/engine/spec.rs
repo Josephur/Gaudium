@@ -52,6 +52,9 @@ pub mod replay;
 #[path = "spec_vmme.rs"]
 pub mod vmme;
 // --- readout: runtime description and the step launches' byte model (host-only) ---
+// --- lanes: batched speculative steps of several requests (`--parallel`) ---
+#[path = "spec_lanes.rs"]
+pub mod lanes;
 #[path = "spec_readout.rs"]
 pub mod readout;
 
@@ -260,105 +263,8 @@ fn append_linear_layer_ckpt(
     let hid = spec.hidden;
     let hv = spec.gdn_v_heads;
     let dl = spec.gdn_v_dim;
-    let qkv = spec.gdn_qkv_dim();
-    let qkvz_dim = spec.gdn_qkvz_dim();
-    let hvp = spec.gdn_hvp();
-    let ba_dim = spec.gdn_ba_dim();
-
-    let h = match h_pre {
-        Some(h_in) => h_in,
-        None => add_rmsnorm(gb, spec, x, &format!("{lpfx}w_in"), &format!("{lpfx}h"), t),
-    };
-    let qkvz = add_linear_bf16(
-        gb,
-        h,
-        &format!("{lpfx}W_qkvz"),
-        hid,
-        qkvz_dim,
-        t,
-        &format!("{lpfx}qkvz"),
-    );
-    let ba = add_linear_bf16(
-        gb,
-        h,
-        &format!("{lpfx}W_ba"),
-        hid,
-        ba_dim,
-        t,
-        &format!("{lpfx}ba"),
-    );
-
-    let conv_w =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}conv_w"), SynDataType::Float, &[qkv, 4]);
-    let conv_b =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}conv_b"), SynDataType::Float, &[qkv]);
-    let cs_in = gb.add_persistent_tensor(format!("{lpfx}cs_in"), SynDataType::Float, &[qkv, 3, ns]);
-    let cs_out = gb.add_persistent_tensor(format!("{lpfx}cs_out"), SynDataType::Float, &[qkv, 3]);
-    let cs_ckpt =
-        gb.add_persistent_tensor(format!("{lpfx}cs_ckpt"), SynDataType::Float, &[qkv, 3, t]);
-    let q = gb.add_persistent_tensor(format!("{lpfx}q"), SynDataType::Float, &[dl, hv, t]);
-    let k = gb.add_persistent_tensor(format!("{lpfx}k"), SynDataType::Float, &[dl, hv, t]);
-    let v = gb.add_persistent_tensor(format!("{lpfx}v"), SynDataType::Float, &[dl, hv, t]);
-    gb.add_node(
-        "gaudium_gdn_prep",
-        format!("{lpfx}gdn_prep"),
-        &[qkvz, conv_w, cs_in, conv_b, slot],
-        &[q, k, v, cs_out, cs_ckpt],
-        &u32_params(&[2 | 16]),
-    );
-
-    let a_log = gb.get_or_add_persistent_tensor(format!("{lpfx}A_log"), SynDataType::Float, &[hvp]);
-    let dt_bias =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}dt_bias"), SynDataType::Float, &[hvp]);
-    let eg = gb.add_persistent_tensor(format!("{lpfx}eg"), SynDataType::Float, &[hvp, t]);
-    let beta = gb.add_persistent_tensor(format!("{lpfx}beta"), SynDataType::Float, &[hvp, t]);
-    gb.add_node(
-        "gaudium_gdn_gate",
-        format!("{lpfx}gdn_gate"),
-        &[ba, a_log, dt_bias],
-        &[eg, beta],
-        &[],
-    );
-
-    let s_in = gb.add_persistent_tensor(
-        format!("{lpfx}S_in"),
-        SynDataType::Float,
-        &[64, 256, hv, ns],
-    );
-    let s_out =
-        gb.add_persistent_tensor(format!("{lpfx}S_out"), SynDataType::Float, &[64, 256, hv]);
-    let s_ckpt = gb.add_persistent_tensor(
-        format!("{lpfx}S_ckpt"),
-        SynDataType::Float,
-        &[64, 256, hv, t],
-    );
-    let o = gb.add_persistent_tensor(format!("{lpfx}o"), SynDataType::Float, &[dl, hv, t]);
-    // [step] the same rows through the kernel build with vector-loaded gate scalars when the
-    // step family carries it (bit-identical outputs)
-    let gdn_guid = if fast_rows {
-        "gaudium_gdn_f32v"
-    } else {
-        "gaudium_gdn_f32"
-    };
-    gb.add_node(
-        gdn_guid,
-        format!("{lpfx}gdn"),
-        &[s_in, q, k, v, eg, beta, slot],
-        &[o, s_out, s_ckpt],
-        &u32_params(&[1 | 16]),
-    );
-
-    let norm_w =
-        gb.get_or_add_persistent_tensor(format!("{lpfx}norm_w"), SynDataType::Float, &[dl]);
-    let core = gb.add_persistent_tensor(format!("{lpfx}core"), SynDataType::Bf16, &[hv * dl, t]);
-    gb.add_node(
-        "gaudium_gdn_post",
-        format!("{lpfx}gdn_post"),
-        &[o, qkvz, norm_w],
-        &[core],
-        &u32_params(&[0u32]),
-    );
-
+    let (qkvz, ba) = append_linear_proj(gb, spec, x, h_pre, lpfx, t);
+    let core = append_gdn_ckpt_core(gb, spec, qkvz, ba, slot, lpfx, lpfx, t, ns, fast_rows);
     let attn = add_linear_bf16(
         gb,
         core,
@@ -369,6 +275,102 @@ fn append_linear_layer_ckpt(
         &format!("{lpfx}attn"),
     );
     append_post_and_mlp(gb, spec, x, attn, lpfx, t, true, wnext_norm)
+}
+
+/// The recurrence of a Gated DeltaNet layer over `t` verify rows that keeps one state checkpoint
+/// per row: it starts from slot `slot` of the state rings `S_in` / `cs_in` (`ns` slots) and
+/// writes the state after every row into `S_ckpt` / `cs_ckpt` -> `core {hv * dl, t}`. `wpfx`
+/// names the layer's weights, `spfx` the core's own tensors and nodes (one prefix per lane in a
+/// batched step).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_gdn_ckpt_core(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    qkvz: TensorId,
+    ba: TensorId,
+    slot: TensorId,
+    wpfx: &str,
+    spfx: &str,
+    t: u64,
+    ns: u64,
+    fast_rows: bool,
+) -> TensorId {
+    let hv = spec.gdn_v_heads;
+    let dl = spec.gdn_v_dim;
+    let qkv = spec.gdn_qkv_dim();
+    let hvp = spec.gdn_hvp();
+
+    let conv_w =
+        gb.get_or_add_persistent_tensor(format!("{wpfx}conv_w"), SynDataType::Float, &[qkv, 4]);
+    let conv_b =
+        gb.get_or_add_persistent_tensor(format!("{wpfx}conv_b"), SynDataType::Float, &[qkv]);
+    let cs_in = gb.add_persistent_tensor(format!("{spfx}cs_in"), SynDataType::Float, &[qkv, 3, ns]);
+    let cs_out = gb.add_persistent_tensor(format!("{spfx}cs_out"), SynDataType::Float, &[qkv, 3]);
+    let cs_ckpt =
+        gb.add_persistent_tensor(format!("{spfx}cs_ckpt"), SynDataType::Float, &[qkv, 3, t]);
+    let q = gb.add_persistent_tensor(format!("{spfx}q"), SynDataType::Float, &[dl, hv, t]);
+    let k = gb.add_persistent_tensor(format!("{spfx}k"), SynDataType::Float, &[dl, hv, t]);
+    let v = gb.add_persistent_tensor(format!("{spfx}v"), SynDataType::Float, &[dl, hv, t]);
+    gb.add_node(
+        "gaudium_gdn_prep",
+        format!("{spfx}gdn_prep"),
+        &[qkvz, conv_w, cs_in, conv_b, slot],
+        &[q, k, v, cs_out, cs_ckpt],
+        &u32_params(&[2 | 16]),
+    );
+
+    let a_log = gb.get_or_add_persistent_tensor(format!("{wpfx}A_log"), SynDataType::Float, &[hvp]);
+    let dt_bias =
+        gb.get_or_add_persistent_tensor(format!("{wpfx}dt_bias"), SynDataType::Float, &[hvp]);
+    let eg = gb.add_persistent_tensor(format!("{spfx}eg"), SynDataType::Float, &[hvp, t]);
+    let beta = gb.add_persistent_tensor(format!("{spfx}beta"), SynDataType::Float, &[hvp, t]);
+    gb.add_node(
+        "gaudium_gdn_gate",
+        format!("{spfx}gdn_gate"),
+        &[ba, a_log, dt_bias],
+        &[eg, beta],
+        &[],
+    );
+
+    let s_in = gb.add_persistent_tensor(
+        format!("{spfx}S_in"),
+        SynDataType::Float,
+        &[64, 256, hv, ns],
+    );
+    let s_out =
+        gb.add_persistent_tensor(format!("{spfx}S_out"), SynDataType::Float, &[64, 256, hv]);
+    let s_ckpt = gb.add_persistent_tensor(
+        format!("{spfx}S_ckpt"),
+        SynDataType::Float,
+        &[64, 256, hv, t],
+    );
+    let o = gb.add_persistent_tensor(format!("{spfx}o"), SynDataType::Float, &[dl, hv, t]);
+    // [step] the same rows through the kernel build with vector-loaded gate scalars when the
+    // step family carries it (bit-identical outputs)
+    let gdn_guid = if fast_rows {
+        "gaudium_gdn_f32v"
+    } else {
+        "gaudium_gdn_f32"
+    };
+    gb.add_node(
+        gdn_guid,
+        format!("{spfx}gdn"),
+        &[s_in, q, k, v, eg, beta, slot],
+        &[o, s_out, s_ckpt],
+        &u32_params(&[1 | 16]),
+    );
+
+    let norm_w =
+        gb.get_or_add_persistent_tensor(format!("{wpfx}norm_w"), SynDataType::Float, &[dl]);
+    let core = gb.add_persistent_tensor(format!("{spfx}core"), SynDataType::Bf16, &[hv * dl, t]);
+    gb.add_node(
+        "gaudium_gdn_post",
+        format!("{spfx}gdn_post"),
+        &[o, qkvz, norm_w],
+        &[core],
+        &u32_params(&[0u32]),
+    );
+    core
 }
 
 /// Builds the speculative step graph for `t` verify rows over `nch` KV chunks.
@@ -718,7 +720,137 @@ fn is_parity_tensor(name: &str) -> bool {
         || vmme::is_parity_name(name)
 }
 
+/// [lanes] What one lane owns of the speculative runtime: its step buffers of both parities and
+/// the drafter's context caches and context bound, by name.
+#[derive(Debug, Clone, Default)]
+pub struct SpecLane {
+    pub addr: BTreeMap<String, u64>,
+    pub ds: dspine::DSpineLane,
+}
+
 impl SpecRuntime {
+    /// [lanes] Rows of a batched step: the narrowest verify width (the one the lanes step at).
+    pub fn lane_rows(&self) -> u64 {
+        // (the single-row width is every runtime's fallback, not a width asked for)
+        crate::core::lanes::lane_width(self.widths.iter().copied().filter(|&t| t > 1)).unwrap_or(1)
+    }
+
+    /// [lanes] The buffers a lane owns, `(name, bytes)`: the step buffers of both parities, the
+    /// drafter's context caches and its context bound.
+    pub(super) fn lane_buffers(&self) -> Vec<(String, u64)> {
+        let mut v = Vec::new();
+        for p in 0..2 {
+            for n in ["sp_ids", "sp_cur", "sp_a", "sp_emit"] {
+                let name = format!("{n}{p}");
+                if let Some(&b) = self.act_specs.get(&name) {
+                    v.push((name, b));
+                }
+            }
+        }
+        for (n, &b) in &self.kv_specs {
+            v.push((n.clone(), b));
+        }
+        if let Some(&b) = self.weight_specs.get("df_nofix") {
+            v.push(("df_nofix".to_string(), b));
+        }
+        v
+    }
+
+    /// [lanes] A lane's share of this runtime at the addresses `addr` (by the names of
+    /// [`Self::lane_buffers`]); its context bound starts as loaded (none).
+    pub(super) fn lane_at(&self, addr: BTreeMap<String, u64>) -> SpecLane {
+        let names = self
+            .drafter
+            .as_ref()
+            .map(|d| d.lane_pool_names())
+            .unwrap_or_default();
+        let pool = names
+            .into_iter()
+            .filter_map(|n| addr.get(&n).map(|&a| (n, a)))
+            .collect();
+        SpecLane {
+            addr,
+            ds: dspine::DSpineLane {
+                pool,
+                ctx_floor: -1,
+            },
+        }
+    }
+
+    /// [lanes] Exchanges the active lane's buffers with `lane`'s.
+    pub(super) fn swap_lane(&mut self, lane: &mut SpecLane) {
+        for (name, a) in lane.addr.iter_mut() {
+            if let Some(x) = self.addr.get_mut(name) {
+                std::mem::swap(x, a);
+            }
+        }
+        self.kv_addr = self
+            .kv_specs
+            .iter()
+            .map(|(n, &b)| (self.addr[n], b))
+            .collect();
+        if let Some(d) = self.drafter.as_mut() {
+            d.swap_lane(&mut lane.ds);
+        }
+    }
+
+    /// [lanes] Address of a step buffer of the active lane (`sp_ids0`, ...).
+    pub(super) fn step_addr(&self, name: &str) -> u64 {
+        self.addr[name]
+    }
+
+    /// [lanes] Everything a batched step binds the same way for every slot: the runtime's own
+    /// weights and buffers.
+    pub(super) fn shared_addrs(&self) -> &BTreeMap<String, u64> {
+        &self.addr
+    }
+
+    /// [lanes] Names the runtime binds as weights or tables (never a lane's).
+    pub(super) fn is_weight(&self, name: &str) -> bool {
+        self.weight_specs.contains_key(name)
+    }
+
+    /// [lanes] The runtime's weights and tables (drafter weights, the step tables), which every
+    /// slot of a batched step binds the same way.
+    pub(super) fn weight_addrs(&self) -> Vec<(String, u64)> {
+        self.addr
+            .iter()
+            .filter(|(n, _)| self.is_weight(n) && n.as_str() != "df_nofix")
+            .map(|(n, &a)| (n.clone(), a))
+            .collect()
+    }
+
+    /// [lanes] What the batched steps at the lanes' width are built from.
+    pub(super) fn lane_graph(&self) -> lanes::SpecLaneGraph {
+        lanes::SpecLaneGraph {
+            lmax: self.lmax,
+            ns: self.ns,
+            t: self.lane_rows(),
+            dc: self
+                .drafter
+                .as_ref()
+                .expect("lanes need a DSpine drafter")
+                .cfg
+                .clone(),
+            hashes: self.elf_hashes.clone(),
+            samp_hashes: self.samp_elf_hashes.clone(),
+        }
+    }
+
+    /// [lanes] The first block of a lane's request (anchor = the prefill's token at `cursor`):
+    /// its drafts.
+    pub(super) fn lane_block0(
+        &mut self,
+        dev: &HpuDevice,
+        stage_io: &mut PinnedBuf,
+        first: i32,
+        cursor: u64,
+        sampled: bool,
+    ) -> Result<Vec<i32>, String> {
+        let d = self.drafter.as_mut().expect("lanes need a DSpine drafter");
+        d.launch_block0(dev, stage_io, first, cursor as i32, sampled)
+    }
+
     pub fn gdn_slots(&self) -> u64 {
         self.ns
     }
@@ -1574,7 +1706,7 @@ impl SpecRuntime {
         for (k, &v) in &self.addr {
             pool.insert(k.clone(), v);
         }
-        let q = 1 - p;
+        let q = crate::verified::ln_lane_parity_next(p as u64) as usize;
         pool.insert("ids".into(), self.addr[&format!("sp_ids{p}")]);
         pool.insert("next_ids".into(), self.addr[&format!("sp_ids{q}")]);
         pool.insert("cursor".into(), self.addr[&format!("sp_cur{p}")]);
@@ -1988,7 +2120,7 @@ fn ensure_step_as(eng: &mut Qwen3Engine, sampled: bool, t: u64, nch: u64) -> Res
     Ok(())
 }
 
-fn write_i32s(eng: &mut Qwen3Engine, writes: &[(u64, &[i32])]) -> Result<(), String> {
+pub(super) fn write_i32s(eng: &mut Qwen3Engine, writes: &[(u64, &[i32])]) -> Result<(), String> {
     let mut transfers = Vec::with_capacity(writes.len());
     let mut off = 0usize;
     let buf = eng.stage_io.as_mut_slice();
@@ -2004,7 +2136,41 @@ fn write_i32s(eng: &mut Qwen3Engine, writes: &[(u64, &[i32])]) -> Result<(), Str
         .map_err(|e| format!("spec H2D: {e}"))
 }
 
-fn read_i32s(eng: &mut Qwen3Engine, addr: u64, n: usize) -> Result<Vec<i32>, String> {
+/// [lanes] One single-row step of the active lane over `nch` chunks with its step buffers of
+/// parity `p` (the narrowest step, which drafts nothing), as a single stream steps near the end
+/// of its context. `samp` = the lane's sampler parameters `(samp_f, samp_i)`. Returns the emitted
+/// tokens (a negative value ends the list).
+pub(super) fn lane_single_row_step(
+    eng: &mut Qwen3Engine,
+    sampled: bool,
+    p: usize,
+    nch: u64,
+    samp: (u64, u64),
+) -> Result<Vec<i32>, String> {
+    ensure_step_as(eng, sampled, 1, nch)?;
+    {
+        let rt = eng.specdec.as_ref().expect("spec runtime");
+        let mut pool = rt.step_pool(p, &eng.weights_addr, &eng.kv_addr, &eng.gdn_state);
+        pool.insert(crate::engine::sampler::SAMP_F.into(), samp.0);
+        pool.insert(crate::engine::sampler::SAMP_I.into(), samp.1);
+        let step = if sampled {
+            &rt.ssteps[&(1, nch)]
+        } else {
+            &rt.steps[&(1, nch)]
+        };
+        let exact = select_exact_bindings(&step.recipe, &pool)?;
+        step.recipe
+            .launch_checked(&eng.dev, &exact)
+            .map_err(|e| format!("launch spec step (lane, T=1, C={nch}): {e}"))?;
+    }
+    // SAFETY: the compute stream belongs to `eng.dev`.
+    unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
+        .map_err(|e| format!("sync spec step (lane, T=1): {e}"))?;
+    let addr = eng.specdec.as_ref().expect("spec runtime").addr[&format!("sp_emit{p}")];
+    read_i32s(eng, addr, 1)
+}
+
+pub(super) fn read_i32s(eng: &mut Qwen3Engine, addr: u64, n: usize) -> Result<Vec<i32>, String> {
     eng.dev
         .copy_d2h_pinned_sync(addr, &mut eng.stage_io, n * 4)
         .map_err(|e| format!("spec D2H: {e}"))?;
