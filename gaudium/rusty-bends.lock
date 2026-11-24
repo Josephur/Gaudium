@@ -624,8 +624,14 @@ c4187b93477568c1  ln_batch_lane_busy  law ln_batch_lane_busy : for + s : LaneSta
 # promise ln_batch_lane_busy: a free lane never takes part in a step.
 3f79c9a164d9c2e1  ln_busy_ignores_admit  law ln_busy_ignores_admit : for + s : LaneState { Bool.or ( ln_is_free ( s ) , ln_eq ( ln_step ( s , EvLnAdmit { } ) , s ) ) == True { } : Bool }
 # promise ln_busy_ignores_admit: a lane that holds a request is never given a second one: admission changes only a free lane.
+4b529e672abc1446  ln_cursor_never_back  law ln_cursor_never_back : for + c : Nat for + e : Nat for + r : Nat { Nat.is_le ( c , ln_lane_cursor_next ( c , e , r ) ) == True { } : Bool }
+# promise ln_cursor_never_back: a step never moves a lane's cursor back.
+e6ce37735cf24bee  ln_cursor_never_past_rows  law ln_cursor_never_past_rows : for + c : Nat for + e : Nat for + r : Nat { Nat.is_le ( ln_lane_cursor_next ( c , e , r ) , Nat.add ( c , r ) ) == True { } : Bool }
+# promise ln_cursor_never_past_rows: a step moves a lane's cursor only over rows the step wrote.
 04929caaa3dc95e3  ln_drain_left_only_by_release  law ln_drain_left_only_by_release : for + ev : LaneEvent { Bool.or ( ln_ev_is_release ( ev ) , ln_is_drain ( ln_step ( LnDrain { } , ev ) ) ) == True { } : Bool }
 # promise ln_drain_left_only_by_release: a lane whose request ended leaves that state only when its report is delivered and it is released.
+a1ec6796ab0a929d  ln_due_older_waiter_blocks  law ln_due_older_waiter_blocks : for + w : Nat for + e : Nat { ln_admission_blocked ( True { } , w , Nat.add ( 1n + w , e ) ) == True { } : Bool }
+# promise ln_due_older_waiter_blocks: a waiter whose turn is due and who arrived before a session's next request blocks its admission.
 ca6c53e6ce7c6290  ln_fail_leaves_batch  law ln_fail_leaves_batch : for s : LaneState { ln_in_batch ( ln_step ( s , EvLnFail { } ) ) == False { } : Bool }
 # promise ln_fail_leaves_batch: a lane whose request failed takes part in no further step.
 5fef5a8c3062d3ac  ln_finish_leaves_batch  law ln_finish_leaves_batch : for s : LaneState { ln_in_batch ( ln_step ( s , EvLnFinish { } ) ) == False { } : Bool }
@@ -642,6 +648,24 @@ c3fa29078370a38d  ln_lanes_need_engine  law ln_lanes_need_engine : for + d : Lan
 # promise ln_lanes_need_engine: an engine without batched steps is never given lanes, whatever its drafter.
 640e1ce3eba53008  ln_lanes_never_calibrating  law ln_lanes_never_calibrating : for + e : Bool for + d : LaneDrafter { ln_lanes_ok ( e , d , True { } ) == False { } : Bool }
 # promise ln_lanes_never_calibrating: a calibration load is never given lanes.
+9077088cb191c7e0  ln_never_passes_younger  law ln_never_passes_younger : for + r : Nat for + e : Nat { ln_passes_over ( Nat.add ( r , e ) , r ) == False { } : Bool }
+# promise ln_never_passes_younger: a request never counts as passing over a waiter for the card that arrived after it.
+ec1806058792e6c2  ln_next_admits_only_waiting  law ln_next_admits_only_waiting : for + i : Bool for + b : Bool { ln_sm_admits ( ln_session_next ( i , False { } , b ) ) == False { } : Bool }
+# promise ln_next_admits_only_waiting: a lane session admits a request only when one waits.
+84c2c0d2b09602c1  ln_next_idle_moves  law ln_next_idle_moves : for + b : Bool { ln_sm_waits ( ln_session_next ( True { } , True { } , b ) ) == False { } : Bool }
+# promise ln_next_idle_moves: a lane session with no lane busy and a request waiting admits it or hands the card's turn back; it never sits idle.
+1457e46a286b70bc  ln_next_never_admits_blocked  law ln_next_never_admits_blocked : for + i : Bool for + w : Bool { ln_sm_admits ( ln_session_next ( i , w , True { } ) ) == False { } : Bool }
+# promise ln_next_never_admits_blocked: a lane session never admits a request that would pass over a waiter whose turn on the card is due.
+997e51c25ac0c3f7  ln_next_never_ends_waiting  law ln_next_never_ends_waiting : for + i : Bool for + b : Bool { ln_sm_ends ( ln_session_next ( i , True { } , b ) ) == False { } : Bool }
+# promise ln_next_never_ends_waiting: a lane session never ends while a request of its model waits.
+a388dd3e65dec6b0  ln_next_never_yields_busy  law ln_next_never_yields_busy : for + w : Bool for + b : Bool { ln_sm_yields ( ln_session_next ( False { } , w , b ) ) == False { } : Bool }
+# promise ln_next_never_yields_busy: a lane session never hands the card's turn back while one of its lanes is busy.
+555750e9182df8c0  ln_next_never_yields_unblocked  law ln_next_never_yields_unblocked : for + i : Bool for + w : Bool { ln_sm_yields ( ln_session_next ( i , w , False { } ) ) == False { } : Bool }
+# promise ln_next_never_yields_unblocked: a lane session hands the card's turn back only when its next admission would pass over a due waiter.
+29f0b746463b60c9  ln_parity_alternates  law ln_parity_alternates : for + p : Nat { Bool.or ( Nat.is_gt ( p , 1n ) , Nat.is_ne ( ln_lane_parity_next ( p ) , p ) ) == True { } : Bool }
+# promise ln_parity_alternates: a lane's next step reads the recurrent-state buffer the step before it wrote, never the one it read.
+da2684c09ec42ceb  ln_parity_in_range  law ln_parity_in_range : for + p : Nat { Nat.is_le ( ln_lane_parity_next ( p ) , 1n ) == True { } : Bool }
+# promise ln_parity_in_range: a lane's next step reads one of its two recurrent-state buffers.
 4ee286db60615584  ln_plan_counts_all  law ln_plan_counts_all : for + n : Nat for + lb : Nat for + sh : Nat { Nat.is_le ( Nat.add ( sh , Nat.mul ( n , lb ) ) , ln_plan_bytes ( n , lb , sh ) ) == True { } : Bool }
 # promise ln_plan_counts_all: a plan's bytes hold its shared part and all its lanes together.
 49d2f13787d5755f  ln_plan_counts_every_lane  law ln_plan_counts_every_lane : for + n : Nat for + lb : Nat for + sh : Nat { Nat.is_le ( Nat.mul ( n , lb ) , ln_plan_bytes ( n , lb , sh ) ) == True { } : Bool }
@@ -694,6 +718,8 @@ d4b7d09914eb7e0f  ln_session_waits_for_queue  law ln_session_waits_for_queue : f
 # promise ln_step_chunks_cover_need: a batched step covers every chunk its slots need whenever a lane can hold them.
 a0c03e484928dc40  ln_step_chunks_within_lane  law ln_step_chunks_within_lane : for + need : Nat for + lc : Nat { Nat.is_le ( ln_step_chunks ( need , lc ) , lc ) == True { } : Bool }
 # promise ln_step_chunks_within_lane: a batched step never covers more chunks than a lane owns.
+f8533147dc62d652  ln_younger_waiter_never_blocks  law ln_younger_waiter_never_blocks : for + d : Bool for + r : Nat for + e : Nat { ln_admission_blocked ( d , Nat.add ( r , e ) , r ) == False { } : Bool }
+# promise ln_younger_waiter_never_blocks: a waiter that arrived after a session's next request never blocks its admission.
 1d7a0b64d1763db8  ls_hello_byte_recognised  law ls_hello_byte_recognised : { ls_is_hello ( 22n ) == True { } : Bool }
 e0bc2b3a6b6233d4  ls_hello_never_plain  law ls_hello_never_plain : for + t : Bool { ls_proto_is_plain ( ls_proto ( True { } , t ) ) == False { } : Bool }
 bc58a58ba0b50f25  ls_no_tls_without_listener  law ls_no_tls_without_listener : for + h : Bool { ls_proto_is_tls ( ls_proto ( h , False { } ) ) == False { } : Bool }
