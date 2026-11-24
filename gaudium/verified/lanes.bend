@@ -381,9 +381,10 @@ def ln_lane_buf_bytes(bytes: Nat) -> Nat:
 def ln_lane_bufs_add(acc: Nat, bytes: Nat) -> Nat:
   Nat.add(acc, ln_lane_buf_bytes(bytes))
 
-# Bytes of the batched steps' io scalars: `count` of `each` bytes.
+# Bytes of the batched steps' io scalars: `count` buffers of `each` bytes, each as the arena
+# allocates it.
 def ln_lane_io_bytes(count: Nat, each: Nat) -> Nat:
-  Nat.mul(count, each)
+  Nat.mul(count, ln_lane_buf_bytes(each))
 
 # The device arena of the lanes' caches and state (`arena`) and their kept positions (`pfx`).
 def ln_kv_arena_total(arena: Nat, pfx: Nat) -> Nat:
@@ -1613,4 +1614,29 @@ law ln_lane_io_counts_each:
   {Nat.is_le(Nat.mul(c, e), ln_lane_io_bytes(c, e)) == True{} : Bool}
 
 def ln_lane_io_counts_each(c, e):
-  L.nat_le_refl(Nat.mul(c, e))
+  L.nat_mul_le_mono_l(c, e, ln_lane_buf_bytes(e), ln_lane_buf_holds_it(e))
+
+# promise: the batched steps' buffer total counts everything so far and the next buffer as the arena allocates it.
+law ln_lane_bufs_add_rounded:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_le(Nat.add(a, ln_lane_buf_bytes(b)), ln_lane_bufs_add(a, b)) == True{} : Bool}
+
+def ln_lane_bufs_add_rounded(a, b):
+  L.nat_le_refl(Nat.add(a, ln_lane_buf_bytes(b)))
+
+# promise: the plan counts every io buffer of the batched steps as the arena allocates it.
+law ln_lane_io_counts_rounded:
+  for +c: Nat
+  for +e: Nat
+  {Nat.is_le(Nat.mul(c, ln_lane_buf_bytes(e)), ln_lane_io_bytes(c, e)) == True{} : Bool}
+
+def ln_lane_io_counts_rounded(c, e):
+  L.nat_le_refl(Nat.mul(c, ln_lane_buf_bytes(e)))
+
+# promise: a driver's outcome counts as stopping exactly when it is the stop outcome.
+law ln_sa_done_of_done:
+  {ln_sa_done(SaDone{}) == True{} : Bool}
+
+def ln_sa_done_of_done():
+  {==}

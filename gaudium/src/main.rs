@@ -32,13 +32,12 @@ use gaudium::tokenizer::{
 };
 use gaudium::verified::{DevEvent, HbmCat, ReqEvent};
 
-/// The line `gaudium --version` prints: the crate version, then the commit the binary was built
-/// from when the build was given one in `GAUDIUM_BUILD_COMMIT`.
-
 /// Most kept prefix positions `--prefix-cache` accepts (a lane plan multiplies them by the lanes
 /// and the slot size in checked arithmetic; far more than any card holds).
 const MAX_PREFIX_SLOTS: u64 = 4096;
 
+/// The line `gaudium --version` prints: the crate version, then the commit the binary was built
+/// from when the build was given one in `GAUDIUM_BUILD_COMMIT`.
 fn version_line() -> String {
     let version = env!("CARGO_PKG_VERSION");
     match option_env!("GAUDIUM_BUILD_COMMIT") {

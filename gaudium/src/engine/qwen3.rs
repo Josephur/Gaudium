@@ -2220,12 +2220,15 @@ impl Qwen3Engine {
         let lane_alloc = match lane_plan.as_ref() {
             Some(lp) => {
                 let mut act = BTreeMap::new();
+                // (each buffer as the plan counts it: `ln_lane_buf_bytes`)
                 for (name, &bytes) in &lp.act_specs {
-                    act.insert(name.clone(), suballoc(&mut act_arena, bytes)?);
+                    let b = crate::verified::ln_lane_buf_bytes(bytes);
+                    act.insert(name.clone(), suballoc(&mut act_arena, b)?);
                 }
                 let mut io = BTreeMap::new();
+                let io_b = crate::verified::ln_lane_buf_bytes(lanes_rt::IO_SCALAR);
                 for name in lanes_rt::io_names(lp.n) {
-                    io.insert(name, suballoc(&mut act_arena, lanes_rt::IO_SCALAR)?);
+                    io.insert(name, suballoc(&mut act_arena, io_b)?);
                 }
                 Some((act, io))
             }
