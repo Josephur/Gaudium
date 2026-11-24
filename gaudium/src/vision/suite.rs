@@ -32,7 +32,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::json::{parse_json, quote_json, JsonValue};
-use crate::verified::{vs_identity_ok, vs_row_ok, VsIdentity};
+use crate::verified::{vs_fork_outcome, vs_identity_ok, vs_row_ok, VsIdentity};
 
 /// Pause between two rows: the next child opens the card only after the previous one exited
 /// and the driver has finished releasing the device.
@@ -375,9 +375,11 @@ pub fn near_tie(k0: f64, ours: f64) -> bool {
     (k0 - ours).abs() <= bf16_ulp(k0.abs().max(ours.abs())) + 1e-4
 }
 
-/// The verified outcome of one run. A fork counts as a traced tie only when the replay of the
-/// run's whole stream completed, traced the first divergence, and every position where K=0
-/// would have chosen otherwise (the first fork and every later one) is a tie.
+/// The outcome of one run. A diverged run's outcome is the verified `vs_fork_outcome`
+/// (`verified/vision_suite.bend`) of three facts read off its margin trace: the replay of the
+/// run's whole stream completed, the first divergence is among the traced positions, and every
+/// traced position where K=0 would have chosen otherwise (the first fork and every later one)
+/// is a tie.
 pub fn classify(identity: Option<&IdentityLine>) -> VsIdentity {
     match identity {
         None => VsIdentity::VsMissing,
@@ -387,14 +389,11 @@ pub fn classify(identity: Option<&IdentityLine>) -> VsIdentity {
             index,
             traces,
             replayed,
-        }) => {
-            let first = traces.iter().any(|t| t.0 == *index);
-            if *replayed && first && traces.iter().all(|t| near_tie(t.1, t.2)) {
-                VsIdentity::VsTracedTie
-            } else {
-                VsIdentity::VsFork
-            }
-        }
+        }) => vs_fork_outcome(
+            *replayed,
+            traces.iter().any(|t| t.0 == *index),
+            traces.iter().all(|t| near_tie(t.1, t.2)),
+        ),
     }
 }
 

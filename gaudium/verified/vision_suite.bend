@@ -8,8 +8,9 @@
 #   - a row passes only when every run's identity, every semantic answer check and the text
 #     request after the images (no state left behind) passed.
 # Formally specifies and proves that a fork never passes a default method, that a fork without a
-# trace or a missing report never passes at all, and that no failed check is outweighed by the
-# others.
+# trace or a missing report never passes at all, that a diverged run passes an opt-in method only
+# when its replay completed, traced the first divergence and found only ties, and that no failed
+# check is outweighed by the others.
 
 import Base
 
@@ -25,6 +26,26 @@ type VsIdentity is Data:
   VsTracedTie{}
   VsFork{}
   VsMissing{}
+
+# The outcome of a run whose tokens diverged from K=0, from the facts the shell read off its
+# margin trace: `replayed` (the replay of the run's whole stream on the K=0 loop completed),
+# `first_traced` (the first divergence is among the traced positions) and `all_ties` (every
+# traced position where K=0 would have chosen otherwise is a tie of the BF16 logits). Only with
+# all three is the fork a traced tie; otherwise it is a fork.
+def vs_fork_outcome(replayed: Bool, first_traced: Bool, all_ties: Bool) -> VsIdentity:
+  match replayed:
+    case True{}:
+      match first_traced:
+        case True{}:
+          match all_ties:
+            case True{}:
+              VsTracedTie{}
+            case False{}:
+              VsFork{}
+        case False{}:
+          VsFork{}
+    case False{}:
+      VsFork{}
 
 # Whether a run's identity outcome passes: identical always, a traced tie only for an opt-in
 # method, anything else never.
@@ -113,3 +134,60 @@ def vs_row_needs_clean_after(i, s):
     case True{} True{}: {==}
     case True{} False{}: {==}
     case False{} _: {==}
+
+# LAW VS.7: a diverged run whose replay did not complete never passes.
+# promise: a run that diverged from K=0 never passes the suite unless the replay of its whole stream on the K=0 loop completed.
+# harm: a fork later in a cut-off replay would go untraced and the run would still pass.
+law vs_fork_needs_replay:
+  for +f: Bool
+  for +t: Bool
+  for +b: Bool
+  {vs_identity_ok(vs_fork_outcome(False{}, f, t), b) == False{} : Bool}
+
+def vs_fork_needs_replay(f, t, b):
+  {==}
+
+# LAW VS.8: a diverged run whose first divergence was not traced never passes.
+# promise: a run that diverged from K=0 never passes the suite unless its first divergence is among the traced positions.
+# harm: the fork that changed the output could be one no trace looked at.
+law vs_fork_needs_first_trace:
+  for +r: Bool
+  for +t: Bool
+  for +b: Bool
+  {vs_identity_ok(vs_fork_outcome(r, False{}, t), b) == False{} : Bool}
+
+def vs_fork_needs_first_trace(r, t, b):
+  match r:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW VS.9: a diverged run with a traced disagreement that is not a tie never passes.
+# promise: a run that diverged from K=0 never passes the suite when any traced disagreement is not a tie.
+# harm: an opt-in mode could fork at a real difference after a first tie and still pass.
+law vs_fork_needs_all_ties:
+  for +r: Bool
+  for +f: Bool
+  for +b: Bool
+  {vs_identity_ok(vs_fork_outcome(r, f, False{}), b) == False{} : Bool}
+
+def vs_fork_needs_all_ties(r, f, b):
+  match r f:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} _: {==}
+
+# LAW VS.10: a diverged run never passes a default method, whatever its trace shows.
+# promise: a run that diverged from K=0 never passes a default speculative method, whatever its margin trace shows.
+# harm: a default mode could fork from K=0 at a traced tie and still be reported as exact.
+law vs_fork_fails_default:
+  for +r: Bool
+  for +f: Bool
+  for +t: Bool
+  {vs_identity_ok(vs_fork_outcome(r, f, t), False{}) == False{} : Bool}
+
+def vs_fork_fails_default(r, f, t):
+  match r f t:
+    case True{} True{} True{}: {==}
+    case True{} True{} False{}: {==}
+    case True{} False{} _: {==}
+    case False{} _ _: {==}

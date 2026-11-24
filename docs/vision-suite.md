@@ -33,8 +33,9 @@ when all of these hold:
   them, under every sampler setting.
 
 The verdict itself is verified code (`gaudium/verified/vision_suite.bend`): no fork passes a
-default method, an untraced fork or a missing report never passes, and no failed check is
-outweighed by the others.
+default method, an untraced fork or a missing report never passes, a diverged run passes an
+opt-in method only when its replay completed, traced the first divergence and found only ties,
+and no failed check is outweighed by the others.
 
 ## Running it
 

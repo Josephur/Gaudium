@@ -636,16 +636,16 @@ def vis_run_in_image(start, len, lo, hi, shift):
   %Equal.sym(Nat, Nat.add(Nat.sub(Nat.min(f, t), start), Nat.sub(t, f)), Nat.sub(t, start), vb_min_sub_add_sub(start, f, t, L.nat_max_ge_l(start, Nat.add(shift, lo)))) : {Nat.is_le(_, len) == True{} : Bool}
   L.nat_le_subst_r(Nat.sub(t, start), Nat.sub(Nat.add(start, len), start), len, L.nat_add_sub_cancel_l(start, len), vb_sub_le_mono(t, Nat.add(start, len), start, vb_min_le_l(Nat.add(start, len), Nat.add(shift, hi))))
 
-# LAW VB.27: a request's image tokens count every one of its images.
-# promise: the image tokens counted for a request never leave out an image added to the count.
-# harm: a request could be planned for fewer image rows than one of its images needs.
-law vis_request_counts_image:
+# LAW VB.27: a request's image tokens cover all of its images together, not only the largest.
+# promise: a request's image-token count covers the tokens counted before plus the added image's, so it covers all of the request's images.
+# harm: the embedding buffer could be planned for fewer rows than a multi-image request holds.
+law vis_request_counts_all:
   for +c: Nat
   for +i: Nat
-  {Nat.is_le(i, vis_request_tokens(c, i)) == True{} : Bool}
+  {Nat.is_le(Nat.add(c, i), vis_request_tokens(c, i)) == True{} : Bool}
 
-def vis_request_counts_image(c, i):
-  L.nat_add_le_l(c, i)
+def vis_request_counts_all(c, i):
+  L.nat_le_refl(Nat.add(c, i))
 
 # LAW VB.28: adding an image never lowers a request's count.
 # promise: counting one more image never lowers the image tokens already counted for the request.
