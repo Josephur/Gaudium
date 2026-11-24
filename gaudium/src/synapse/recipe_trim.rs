@@ -234,7 +234,10 @@ fn scan(dir: &Path) -> io::Result<Scan> {
                 // gone since the listing, a link, a directory, or a name that is not an entry's
                 if fs::symlink_metadata(item.path()).is_ok() {
                     out.unknown_files += 1;
-                    out.unknown_bytes += st.map_or(0, |s| s.bytes);
+                    out.unknown_bytes = rt_count_add(out.unknown_bytes, st.map_or(0, |s| s.bytes))
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "sizes overflow 64 bits")
+                        })?;
                 }
             }
         }
@@ -264,7 +267,12 @@ impl Removal {
     }
 }
 
-fn remove_file(path: &Path) -> Removal {
+/// Removes the file at `path` when it is a regular file (`regular`: as stated just before, under
+/// the registry lock). Anything else there (nothing, a link, a directory) is never touched.
+fn remove_file(path: &Path, regular: bool) -> Removal {
+    if !regular {
+        return Removal::Absent;
+    }
     match fs::remove_file(path) {
         Ok(()) => Removal::Removed,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Removal::Absent,
@@ -324,7 +332,7 @@ pub(crate) fn trim_at(
     rep.bytes_before = held;
 
     let registry = in_use_registry();
-    for (stem, seen, used) in order {
+    for (stem, seen, _) in order {
         if !rt_should_evict(held, opts.target_bytes, false) {
             break; // within budget: nothing after this entry goes either
         }
@@ -339,16 +347,6 @@ pub(crate) fn trim_at(
             recipe: stat_file(&recipe_path),
             sidecar: stat_file(&sidecar_path),
         };
-        let used_now = if fresh.recipe.is_none() && fresh.sidecar.is_none() {
-            used
-        } else {
-            fresh.last_used()
-        };
-        let protected = rt_protected(used_now, now, opts.keep_secs, in_use);
-        if !rt_should_evict(held, opts.target_bytes, protected) {
-            rep.protected_over_budget += 1;
-            continue;
-        }
         // bytes of each file as counted at the scan; a file written since counts 0
         let (r_bytes, m_bytes) = (
             seen.recipe.map_or(0, |f| f.bytes),
@@ -356,23 +354,37 @@ pub(crate) fn trim_at(
         );
         let gone_bytes =
             |r: &Removal, m: &Removal| rt_gone_bytes(r_bytes, r.gone(), m_bytes, m.gone());
+        if fresh.recipe.is_none() && fresh.sidecar.is_none() {
+            // another process removed it since the scan: its bytes are gone, not freed here
+            drop(held_set);
+            let bytes = gone_bytes(&Removal::Absent, &Removal::Absent).ok_or_else(overflow)?;
+            held = rt_after(held, bytes);
+            rep.gone_meanwhile += 1;
+            continue;
+        }
+        // the times as they are now decide, not the scan's
+        let protected = rt_protected(fresh.last_used(), now, opts.keep_secs, in_use);
+        if !rt_should_evict(held, opts.target_bytes, protected) {
+            rep.protected_over_budget += 1;
+            continue;
+        }
         if opts.dry_run {
             let bytes = gone_bytes(&Removal::Absent, &Removal::Absent).ok_or_else(overflow)?;
-            held = rt_after(held, bytes, true);
+            held = rt_after(held, bytes);
             rep.evicted += 1;
             rep.freed_bytes = add(rep.freed_bytes, bytes)?;
             continue;
         }
         // Sidecar first: from here on the entry is not a hit for anyone. The files are the ones
         // on disk now, so a sidecar written since the scan goes too.
-        let side = remove_file(&sidecar_path);
+        let side = remove_file(&sidecar_path, fresh.sidecar.is_some());
         let recipe = if rt_may_remove_recipe(fresh.sidecar.is_some(), side.gone()) {
-            remove_file(&recipe_path)
+            remove_file(&recipe_path, fresh.recipe.is_some())
         } else {
             Removal::Kept
         };
         drop(held_set);
-        held = rt_after(held, gone_bytes(&recipe, &side).ok_or_else(overflow)?, true);
+        held = rt_after(held, gone_bytes(&recipe, &side).ok_or_else(overflow)?);
         let freed = rt_gone_bytes(r_bytes, recipe.removed(), m_bytes, side.removed())
             .ok_or_else(overflow)?;
         rep.freed_bytes = add(rep.freed_bytes, freed)?;
@@ -564,12 +576,22 @@ mod tests {
             fs::write(d.join(f), vec![0u8; 4096]).unwrap();
             set_time(&d.join(f), NOW - 400 * DAY);
         }
+        // a directory and a link at an entry's recipe path, each beside a real sidecar: the
+        // sidecars go, the directory and the link (and the link's target) stay
         fs::create_dir(d.join(format!("dir-{H1}.recipe"))).unwrap();
+        fs::write(d.join(format!("dir-{H1}.sha256")), b"s").unwrap();
+        set_time(&d.join(format!("dir-{H1}.sha256")), NOW - 9 * DAY);
         #[cfg(unix)]
-        std::os::unix::fs::symlink(d.join("README"), d.join(format!("link-{H2}.recipe"))).unwrap();
+        {
+            std::os::unix::fs::symlink(d.join("README"), d.join(format!("link-{H2}.recipe")))
+                .unwrap();
+            fs::write(d.join(format!("link-{H2}.sha256")), b"s").unwrap();
+            set_time(&d.join(format!("link-{H2}.sha256")), NOW - 9 * DAY);
+        }
         let rep = trim_at(&d, &opts(0, 0), NOW, false).unwrap();
-        assert_eq!(rep.entries, 3);
-        assert_eq!(rep.evicted, 3);
+        let sidecar_only = if cfg!(unix) { 2 } else { 1 };
+        assert_eq!(rep.entries, 3 + sidecar_only);
+        assert_eq!(rep.evicted, 3 + sidecar_only);
         assert_eq!(rep.bytes_after, 0);
         assert!(rep.errors.is_empty(), "{:?}", rep.errors);
         assert!(!exists(&d, &format!("a-{H1}.recipe")) && !exists(&d, &format!("a-{H1}.sha256")));
@@ -579,9 +601,11 @@ mod tests {
             assert!(exists(&d, f), "{f} must stay");
         }
         assert!(d.join(format!("dir-{H1}.recipe")).is_dir());
+        assert!(!exists(&d, &format!("dir-{H1}.sha256")));
         #[cfg(unix)]
         {
             assert!(fs::symlink_metadata(d.join(format!("link-{H2}.recipe"))).is_ok());
+            assert!(!exists(&d, &format!("link-{H2}.sha256")));
             assert_eq!(rep.unknown_files, 6);
         }
         let _ = fs::remove_dir_all(&d);
