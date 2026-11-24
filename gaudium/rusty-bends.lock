@@ -616,6 +616,8 @@ e8dd4d122e82d747  kv_wv_rows_distinct_256  law kv_wv_rows_distinct_256 : for + a
 # promise ln_admit_stamp_latest: a lane admitted now is stamped later than every lane stamped before, so routing reads it as the most recently used.
 b0815bca45eb3881  ln_admit_takes_lane  law ln_admit_takes_lane : { ln_is_free ( ln_step ( LnFree { } , EvLnAdmit { } ) ) == False { } : Bool }
 # promise ln_admit_takes_lane: admitting a request to a free lane makes the lane busy.
+0fff0d6daeda6df4  ln_after_ended_done  law ln_after_ended_done : for + o : Bool for + y : Bool { ln_sa_done ( ln_session_after ( o , y , True { } ) ) == True { } : Bool }
+# promise ln_after_ended_done: a lane session whose feed ended it only stops: it never runs again beside the next session or fails that session's requests.
 3ccb69c4a7d7d4ad  ln_after_never_strands  law ln_after_never_strands : for + o : Bool for + y : Bool { ln_sa_done ( ln_session_after ( o , y , False { } ) ) == False { } : Bool }
 # promise ln_after_never_strands: a lane session's driver never stops while its feed has not ended the session, so no request is left queued with no session.
 4d5d6edc30a53910  ln_after_yield_returns  law ln_after_yield_returns : { ln_session_after ( True { } , True { } , False { } ) == SaAgain { } : SessionAfter }
@@ -660,6 +662,10 @@ bb557c04a151fa5f  ln_host_tier_never_with_lanes  law ln_host_tier_never_with_lan
 # promise ln_host_tier_never_with_lanes: an engine with more than one lane never gets a host-RAM tier that is not built for several lanes.
 e17bb2f8a04442b6  ln_kv_arena_counts_both  law ln_kv_arena_counts_both : for + a : Nat for + p : Nat { Nat.is_le ( Nat.add ( a , p ) , ln_kv_arena_total ( a , p ) ) == True { } : Bool }
 # promise ln_kv_arena_counts_both: the device arena holds both the lanes' caches and state and their kept positions.
+88450676aa88ca86  ln_lane_buf_holds_it  law ln_lane_buf_holds_it : for + b : Nat { Nat.is_le ( b , ln_lane_buf_bytes ( b ) ) == True { } : Bool }
+# promise ln_lane_buf_holds_it: the activation arena gives every buffer of the batched steps at least the bytes it needs.
+dd0df277e44fd2b1  ln_lane_io_counts_each  law ln_lane_io_counts_each : for + c : Nat for + e : Nat { Nat.is_le ( Nat.mul ( c , e ) , ln_lane_io_bytes ( c , e ) ) == True { } : Bool }
+# promise ln_lane_io_counts_each: the plan counts every io scalar of the batched steps.
 3ba7a01ca8594135  ln_lanes_fit_fits  law ln_lanes_fit_fits : for + bp : Nat for + sh : Nat for + u : Nat { Bool.or ( Nat.is_lt ( u , sh ) , ln_plan_fits ( ln_lanes_fit ( 1n + bp , sh , u ) , 1n + bp , sh , u ) ) == True { } : Bool }
 # promise ln_lanes_fit_fits: the lane count a refused plan reports as fitting does fit, whenever the shared part does.
 af6ef3a569dc3bf7  ln_lanes_need_drafter  law ln_lanes_need_drafter : for + e : Bool for + d : LaneDrafter for + c : Bool { Bool.and ( ln_lanes_ok ( e , d , c ) , Bool.not ( ln_drafter_ok ( d ) ) ) == False { } : Bool }

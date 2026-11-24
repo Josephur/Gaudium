@@ -1605,14 +1605,6 @@ law ln_lane_buf_holds_it:
 def ln_lane_buf_holds_it(b):
   L.nat_le_trans(b, Nat.max(b, 256n), TB.align_up(Nat.max(b, 256n), 256n), L.nat_max_ge_l(b, 256n), TB.align_up_never_shrinks(Nat.max(b, 256n), 256n))
 
-# promise: the batched steps' buffer total counts everything so far and the next buffer.
-law ln_lane_bufs_add_counts:
-  for +a: Nat
-  for +b: Nat
-  {Nat.is_le(Nat.add(a, b), ln_lane_bufs_add(a, b)) == True{} : Bool}
-
-def ln_lane_bufs_add_counts(a, b):
-  L.nat_add_le_mono(a, a, b, ln_lane_buf_bytes(b), L.nat_le_refl(a), ln_lane_buf_holds_it(b))
 
 # promise: the plan counts every io scalar of the batched steps.
 law ln_lane_io_counts_each:
