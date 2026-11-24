@@ -630,10 +630,18 @@ ca6c53e6ce7c6290  ln_fail_leaves_batch  law ln_fail_leaves_batch : for s : LaneS
 # promise ln_fail_leaves_batch: a lane whose request failed takes part in no further step.
 5fef5a8c3062d3ac  ln_finish_leaves_batch  law ln_finish_leaves_batch : for s : LaneState { ln_in_batch ( ln_step ( s , EvLnFinish { } ) ) == False { } : Bool }
 # promise ln_finish_leaves_batch: a lane whose request finished takes part in no further step.
+c4d0890ac614d952  ln_free_lane_routable  law ln_free_lane_routable : for + s : LaneState { Bool.or ( Bool.not ( ln_is_free ( s ) ) , ln_route_eligible ( s ) ) == True { } : Bool }
+# promise ln_free_lane_routable: every free lane is one routing may send a request to.
 be0740605e54f74d  ln_free_left_only_by_admit  law ln_free_left_only_by_admit : for + ev : LaneEvent { Bool.or ( ln_ev_is_admit ( ev ) , ln_is_free ( ln_step ( LnFree { } , ev ) ) ) == True { } : Bool }
 # promise ln_free_left_only_by_admit: a free lane leaves the free state only when a request is admitted to it.
 3ba7a01ca8594135  ln_lanes_fit_fits  law ln_lanes_fit_fits : for + bp : Nat for + sh : Nat for + u : Nat { Bool.or ( Nat.is_lt ( u , sh ) , ln_plan_fits ( ln_lanes_fit ( 1n + bp , sh , u ) , 1n + bp , sh , u ) ) == True { } : Bool }
 # promise ln_lanes_fit_fits: the lane count a refused plan reports as fitting does fit, whenever the shared part does.
+c3fa29078370a38d  ln_lanes_need_engine  law ln_lanes_need_engine : for + d : LaneDrafter for + c : Bool { ln_lanes_ok ( False { } , d , c ) == False { } : Bool }
+# promise ln_lanes_need_engine: an engine without batched steps is never given lanes, whatever its drafter.
+640e1ce3eba53008  ln_lanes_never_calibrating  law ln_lanes_never_calibrating : for + e : Bool for + d : LaneDrafter { ln_lanes_ok ( e , d , True { } ) == False { } : Bool }
+# promise ln_lanes_never_calibrating: a calibration load is never given lanes.
+4ee286db60615584  ln_plan_counts_all  law ln_plan_counts_all : for + n : Nat for + lb : Nat for + sh : Nat { Nat.is_le ( Nat.add ( sh , Nat.mul ( n , lb ) ) , ln_plan_bytes ( n , lb , sh ) ) == True { } : Bool }
+# promise ln_plan_counts_all: a plan's bytes hold its shared part and all its lanes together.
 49d2f13787d5755f  ln_plan_counts_every_lane  law ln_plan_counts_every_lane : for + n : Nat for + lb : Nat for + sh : Nat { Nat.is_le ( Nat.mul ( n , lb ) , ln_plan_bytes ( n , lb , sh ) ) == True { } : Bool }
 # promise ln_plan_counts_every_lane: the lanes of a plan are always counted in full in its bytes.
 e6d2224aaf980fef  ln_plan_counts_shared  law ln_plan_counts_shared : for + n : Nat for + lb : Nat for + sh : Nat { Nat.is_le ( sh , ln_plan_bytes ( n , lb , sh ) ) == True { } : Bool }
@@ -650,6 +658,10 @@ eb78c06bf888695a  ln_route_irreflexive  law ln_route_irreflexive : for + r : Nat
 # promise ln_route_only_free: a request is routed only to a free lane, never to a lane that holds a request.
 0c4cb6d7d3d0ac7a  ln_run_done_at_budget_end  law ln_run_done_at_budget_end : for + e : Bool for + c : Bool { ln_run_done ( e , c , 0n ) == True { } : Bool }
 # promise ln_run_done_at_budget_end: a request with no token left in its budget has ended.
+50e19c2afe640233  ln_run_done_at_eos  law ln_run_done_at_eos : for + c : Bool for + r : Nat { ln_run_done ( True { } , c , r ) == True { } : Bool }
+# promise ln_run_done_at_eos: a request that produced an end-of-sequence token has ended.
+e22c036f6d4f833c  ln_run_done_when_cancelled  law ln_run_done_when_cancelled : for + e : Bool for + r : Nat { ln_run_done ( e , True { } , r ) == True { } : Bool }
+# promise ln_run_done_when_cancelled: a cancelled request has ended.
 19e041957d1c0b08  ln_served_lanes_at_least_one  law ln_served_lanes_at_least_one : for + r : Nat for + m : Nat for + ok : Bool { Nat.is_le ( 1n , ln_served_lanes ( r , m , ok ) ) == True { } : Bool }
 # promise ln_served_lanes_at_least_one: a model is always served with at least one lane.
 743d48f0889ba4ef  ln_served_lanes_one_without_batching  law ln_served_lanes_one_without_batching : for + r : Nat for + m : Nat { Nat.is_le ( ln_served_lanes ( r , m , False { } ) , 1n ) == True { } : Bool }
@@ -660,6 +672,8 @@ e72d1ee9144841c2  ln_served_lanes_within_request  law ln_served_lanes_within_req
 # promise ln_served_lanes_within_request: a model is never served with more lanes than were asked for.
 2f00db09731c6af6  ln_session_never_neither  law ln_session_never_neither : for + a : Bool { Bool.or ( a , ln_session_starts ( a ) ) == True { } : Bool }
 # promise ln_session_never_neither: a request that arrives while no session runs for its model starts one, so it is never left without one.
+7560d94867a8f9cd  ln_session_once  law ln_session_once : { ln_session_starts ( True { } ) == False { } : Bool }
+# promise ln_session_once: a request that arrives while its model's session runs never starts a second one.
 25657a333e57ff3c  ln_session_waits_for_lanes  law ln_session_waits_for_lanes : for + w : Bool { ln_session_ends ( False { } , w ) == False { } : Bool }
 # promise ln_session_waits_for_lanes: a lane session never ends while a lane is busy.
 d4b7d09914eb7e0f  ln_session_waits_for_queue  law ln_session_waits_for_queue : for + i : Bool { ln_session_ends ( i , True { } ) == False { } : Bool }
@@ -668,6 +682,10 @@ d4b7d09914eb7e0f  ln_session_waits_for_queue  law ln_session_waits_for_queue : f
 # promise ln_slot_fits_covered: a slot the batch check accepts never writes a row past the chunks the step covers.
 4cc5ec693cf7c8ee  ln_slot_fits_within_lane  law ln_slot_fits_within_lane : for + c : Nat for + r : Nat for + n : Nat for + ch : Nat for + lc : Nat { Bool.and ( ln_slot_fits ( c , r , n , ch , lc ) , Nat.is_lt ( Nat.mul ( lc , ch ) , Nat.add ( c , r ) ) ) == False { } : Bool }
 # promise ln_slot_fits_within_lane: a slot the batch check accepts never writes a row past the chunks its lane owns.
+85f34955c36750a4  ln_stage_cursor_after_ids  law ln_stage_cursor_after_ids : for + b : Nat for + j : Nat { Nat.is_le ( Nat.mul ( b , 4n ) , ln_stage_cursor ( b , j ) ) == True { } : Bool }
+# promise ln_stage_cursor_after_ids: a slot's cursor in the host staging buffer never lies inside the step's token ids.
+2050e2a578376618  ln_stage_cursors_apart  law ln_stage_cursors_apart : for + b : Nat for + j : Nat { Nat.is_le ( Nat.add ( ln_stage_cursor ( b , j ) , 4n ) , ln_stage_cursor ( b , 1n + j ) ) == True { } : Bool }
+# promise ln_stage_cursors_apart: two slots' cursors in the host staging buffer never overlap.
 3a06271d0f07d4e9  ln_step_chunks_cover_need  law ln_step_chunks_cover_need : for + need : Nat for + lc : Nat { Bool.or ( Nat.is_lt ( lc , need ) , Nat.is_le ( need , ln_step_chunks ( need , lc ) ) ) == True { } : Bool }
 # promise ln_step_chunks_cover_need: a batched step covers every chunk its slots need whenever a lane can hold them.
 a0c03e484928dc40  ln_step_chunks_within_lane  law ln_step_chunks_within_lane : for + need : Nat for + lc : Nat { Nat.is_le ( ln_step_chunks ( need , lc ) , lc ) == True { } : Bool }
