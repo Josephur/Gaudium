@@ -155,6 +155,12 @@ a87ff206fdc48a73  g4v_part_whole_steps  law g4v_part_whole_steps : for + b : Nat
 2865cc4a36fdcb37  g4v_pool_rows_distinct  law g4v_pool_rows_distinct : for + i : Nat for + nbxp : Nat for + pp : Nat { g4v_pool_row ( g4v_pool_y ( i , 1n + nbxp , 1n + pp ) , g4v_pool_x ( i , 1n + nbxp , 1n + pp ) , 1n + nbxp , 1n + pp ) == i : Nat }
 # promise g4v_pool_rows_distinct: the pooling order holds no patch twice: the row a patch is read from is recovered from its grid position.
 # harm g4v_pool_rows_distinct: a patch would enter its token's mean twice and another patch not at all.
+fa27bf628dd9567a  g4v_pool_w_keeps_channel  law g4v_pool_w_keeps_channel : for + o : Nat for + c : Nat for + hp : Nat { Bool.and ( g4v_pool_w_one ( o , c , 1n + hp ) , Nat.is_ne ( Nat.mod ( c , 1n + hp ) , o ) ) == False { } : Bool }
+# promise g4v_pool_w_keeps_channel: the pooling GEMM never mixes channels: an output channel takes only the same channel of the token's patches.
+# harm g4v_pool_w_keeps_channel: a soft token would average one channel of its patches into another.
+08ff19ad7dc1ad4e  g4v_pool_w_takes_every_patch  law g4v_pool_w_takes_every_patch : for + o : Nat for + j : Nat for + hp : Nat { Bool.and ( Nat.is_le ( o , hp ) , Bool.not ( g4v_pool_w_one ( o , Nat.add ( Nat.mul ( j , 1n + hp ) , o ) , 1n + hp ) ) ) == False { } : Bool }
+# promise g4v_pool_w_takes_every_patch: the pooling GEMM takes every patch of a soft token's block: each output channel sums that channel of all its patches.
+# harm g4v_pool_w_takes_every_patch: a soft token's mean would miss a patch of its block.
 f0dca6752ce79a77  g4v_pool_x_in_token_block  law g4v_pool_x_in_token_block : for + i : Nat for + nbxp : Nat for + pp : Nat { Nat.div ( g4v_pool_x ( i , 1n + nbxp , 1n + pp ) , 1n + pp ) == Nat.mod ( Nat.div ( i , Nat.mul ( 1n + pp , 1n + pp ) ) , 1n + nbxp ) : Nat }
 # promise g4v_pool_x_in_token_block: the rows of a soft token in the pooling order all lie in the token's own pooling block, the blocks in raster order (the reference's order of the soft tokens): its block column.
 # harm g4v_pool_x_in_token_block: a token would pool patches of another block, or the tokens would leave the tower out of order.
