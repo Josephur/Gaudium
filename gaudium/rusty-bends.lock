@@ -670,6 +670,9 @@ dd0df277e44fd2b1  ln_lane_io_counts_each  law ln_lane_io_counts_each : for + c :
 # promise ln_lane_io_counts_each: the plan counts every io scalar of the batched steps.
 ceb04216f442329f  ln_lane_io_counts_rounded  law ln_lane_io_counts_rounded : for + c : Nat for + e : Nat { Nat.is_le ( Nat.mul ( c , ln_lane_buf_bytes ( e ) ) , ln_lane_io_bytes ( c , e ) ) == True { } : Bool }
 # promise ln_lane_io_counts_rounded: the plan counts every io buffer of the batched steps as the arena allocates it.
+
+60cd9d5a4cd02577  ln_lane_width_is_asked  law ln_lane_width_is_asked : for + a : Nat for + b : Nat { Bool.or ( Nat.is_eq ( ln_lane_width_pick ( a , b ) , a ) , Nat.is_eq ( ln_lane_width_pick ( a , b ) , b ) ) == True { } : Bool }
+# promise ln_lane_width_is_asked: lanes step at a draft width that was asked for.
 3ba7a01ca8594135  ln_lanes_fit_fits  law ln_lanes_fit_fits : for + bp : Nat for + sh : Nat for + u : Nat { Bool.or ( Nat.is_lt ( u , sh ) , ln_plan_fits ( ln_lanes_fit ( 1n + bp , sh , u ) , 1n + bp , sh , u ) ) == True { } : Bool }
 # promise ln_lanes_fit_fits: the lane count a refused plan reports as fitting does fit, whenever the shared part does.
 af6ef3a569dc3bf7  ln_lanes_need_drafter  law ln_lanes_need_drafter : for + e : Bool for + d : LaneDrafter for + c : Bool { Bool.and ( ln_lanes_ok ( e , d , c ) , Bool.not ( ln_drafter_ok ( d ) ) ) == False { } : Bool }
@@ -774,6 +777,8 @@ bfa338a9ab5398d1  ln_spec_batched_fits  law ln_spec_batched_fits : for + c : Nat
 # promise ln_step_chunks_cover_need: a batched step covers every chunk its slots need whenever a lane can hold them.
 a0c03e484928dc40  ln_step_chunks_within_lane  law ln_step_chunks_within_lane : for + need : Nat for + lc : Nat { Nat.is_le ( ln_step_chunks ( need , lc ) , lc ) == True { } : Bool }
 # promise ln_step_chunks_within_lane: a batched step never covers more chunks than a lane owns.
+6fee86abb8400a0c  ln_unbatched_verify_no_lanes  law ln_unbatched_verify_no_lanes : for + d : Bool { ln_drafter_ok ( ln_lane_drafter_of ( True { } , d , False { } ) ) == False { } : Bool }
+# promise ln_unbatched_verify_no_lanes: a load whose drafter verifies its rows in a form the batched speculative steps are not built for never gets lanes.
 f8533147dc62d652  ln_younger_waiter_never_blocks  law ln_younger_waiter_never_blocks : for + d : Bool for + r : Nat for + e : Nat { ln_admission_blocked ( d , Nat.add ( r , e ) , r ) == False { } : Bool }
 # promise ln_younger_waiter_never_blocks: a waiter that arrived after a session's next request never blocks its admission.
 1d7a0b64d1763db8  ls_hello_byte_recognised  law ls_hello_byte_recognised : { ls_is_hello ( 22n ) == True { } : Bool }
