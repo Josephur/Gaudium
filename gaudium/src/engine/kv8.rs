@@ -470,4 +470,29 @@ mod tests {
             .collect();
         assert_eq!(bf16_max_abs(&v), 3.0); // 1.0, -3.0, +0, -0
     }
+
+    /// The read-back's batch offsets follow the cache layout the attention prep writes
+    /// (`attn_prep_gaudi2.c`): a `{head_dim, C, nkv * nch}` tensor whose batch `ch * nkv + g`
+    /// holds kv head g of chunk ch. The verified `kv_batches_apart` only rules out overlap;
+    /// this pins today's order.
+    #[test]
+    fn batch_offsets_follow_the_chunk_major_cache_layout() {
+        for (dh, nkv, nch) in [(256u64, 4u64, 3u64), (128, 2, 5), (256, 1, 2)] {
+            let row = crate::core::kv_cache::row_bytes(1, dh, KvDtype::KvBf16);
+            let elem = row / dh;
+            let head = KV_CHUNK * row;
+            // byte of element (channel c, position p, batch b) of the {dh, C, nkv * nch} tensor
+            let at = |c: u64, p: u64, b: u64| ((b * KV_CHUNK + p) * dh + c) * elem;
+            for ch in 0..nch {
+                for g in 0..nkv {
+                    let b = ch * nkv + g;
+                    let off = kv_batch_off(ch, g, nkv, head);
+                    assert_eq!(off, at(0, 0, b), "dh {dh} nkv {nkv}: chunk {ch} head {g}");
+                    // the batch's last element lies inside it, and the next batch starts at its end
+                    assert_eq!(off + head - elem, at(dh - 1, KV_CHUNK - 1, b));
+                    assert_eq!(off + head, at(0, 0, b + 1));
+                }
+            }
+        }
+    }
 }
