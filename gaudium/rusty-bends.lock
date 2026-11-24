@@ -744,6 +744,8 @@ b0815bca45eb3881  ln_admit_takes_lane  law ln_admit_takes_lane : { ln_is_free ( 
 # promise ln_after_never_strands: a lane session's driver never stops while its feed has not ended the session, so no request is left queued with no session.
 4d5d6edc30a53910  ln_after_yield_returns  law ln_after_yield_returns : { ln_session_after ( True { } , True { } , False { } ) == SaAgain { } : SessionAfter }
 # promise ln_after_yield_returns: a lane session that handed the card back waits for its next turn.
+f50118e54daea828  ln_ahead_lands_when_ended  law ln_ahead_lands_when_ended : { ln_ahead_lands ( True { } ) == True { } : Bool }
+# promise ln_ahead_lands_when_ended: a lane whose request ended is never released while a step queued ahead still covers it.
 d984ec24670227e3  ln_allowed_moves  law ln_allowed_moves : for + s : LaneState for + ev : LaneEvent { ln_allows ( s , ev ) == Bool.not ( ln_eq ( ln_step ( s , ev ) , s ) ) : Bool }
 # promise ln_allowed_moves: an event the lane lifecycle allows always moves the lane to another state, and one it refuses leaves the lane as it was.
 da951f22a93a4785  ln_arena_counts_all  law ln_arena_counts_all : for + kv : Nat for + sp : Nat for + n : Nat { Nat.is_le ( Nat.add ( Nat.mul ( n , kv ) , Nat.mul ( Nat.sub ( n , 1n ) , sp ) ) , ln_lane_arena_bytes ( kv , sp , n ) ) == True { } : Bool }
@@ -782,6 +784,8 @@ c4d0890ac614d952  ln_free_lane_routable  law ln_free_lane_routable : for + s : L
 # promise ln_free_lane_routable: every free lane is one routing may send a request to.
 be0740605e54f74d  ln_free_left_only_by_admit  law ln_free_left_only_by_admit : for + ev : LaneEvent { Bool.or ( ln_ev_is_admit ( ev ) , ln_is_free ( ln_step ( LnFree { } , ev ) ) ) == True { } : Bool }
 # promise ln_free_left_only_by_admit: a free lane leaves the free state only when a request is admitted to it.
+c6c45063af08372d  ln_goes_wide_needs_gain  law ln_goes_wide_needs_gain : for + d : Nat for + t : Nat for + s : Nat { ln_lane_goes_wide ( 0n , d , t , s ) == False { } : Bool }
+# promise ln_goes_wide_needs_gain: a lane that expects no more tokens from the wide step never goes wide.
 bb557c04a151fa5f  ln_host_tier_never_with_lanes  law ln_host_tier_never_with_lanes : for + k : Nat { ln_host_tier_ok ( Nat.add ( 2n , k ) , False { } ) == False { } : Bool }
 # promise ln_host_tier_never_with_lanes: an engine with more than one lane never gets a host-RAM tier that is not built for several lanes.
 e17bb2f8a04442b6  ln_kv_arena_counts_both  law ln_kv_arena_counts_both : for + a : Nat for + p : Nat { Nat.is_le ( Nat.add ( a , p ) , ln_kv_arena_total ( a , p ) ) == True { } : Bool }
@@ -794,8 +798,16 @@ dd0df277e44fd2b1  ln_lane_io_counts_each  law ln_lane_io_counts_each : for + c :
 # promise ln_lane_io_counts_each: the plan counts every io scalar of the batched steps.
 ceb04216f442329f  ln_lane_io_counts_rounded  law ln_lane_io_counts_rounded : for + c : Nat for + e : Nat { Nat.is_le ( Nat.mul ( c , ln_lane_buf_bytes ( e ) ) , ln_lane_io_bytes ( c , e ) ) == True { } : Bool }
 # promise ln_lane_io_counts_rounded: the plan counts every io buffer of the batched steps as the arena allocates it.
+f8d87289b37f0fcf  ln_lane_ring_rows_is_asked  law ln_lane_ring_rows_is_asked : for + n : Nat for + w : Nat for + r : Bool { Bool.or ( Nat.is_eq ( ln_lane_ring_rows ( n , w , r ) , n ) , Nat.is_eq ( ln_lane_ring_rows ( n , w , r ) , w ) ) == True { } : Bool }
+# promise ln_lane_ring_rows_is_asked: a lane's state rings hold the rows of one of the widths it may verify at.
+6ab9c7ea747fc212  ln_lane_verify_keeps_asked  law ln_lane_verify_keeps_asked : for f : VerifyForm for + n : Nat { ln_lane_verify ( True { } , f , n ) == f : VerifyForm }
+# promise ln_lane_verify_keeps_asked: a verify form that was asked for is the one a load takes.
+d0f1610aab0ce1f9  ln_lane_verify_mme_only_given  law ln_lane_verify_mme_only_given : for + a : Bool for + f : VerifyForm for + n : Nat { Bool.or ( Bool.not ( ln_vf_is_mme ( ln_lane_verify ( a , f , n ) ) ) , ln_vf_is_mme ( f ) ) == True { } : Bool }
+# promise ln_lane_verify_mme_only_given: a load's verify rows never take the MME form (which may leave the K=0 stream) unless that form was the one given.
 60cd9d5a4cd02577  ln_lane_width_is_asked  law ln_lane_width_is_asked : for + a : Nat for + b : Nat { Bool.or ( Nat.is_eq ( ln_lane_width_pick ( a , b ) , a ) , Nat.is_eq ( ln_lane_width_pick ( a , b ) , b ) ) == True { } : Bool }
 # promise ln_lane_width_is_asked: lanes step at a draft width that was asked for.
+678444468e66a037  ln_lane_width_wide_is_asked  law ln_lane_width_wide_is_asked : for + a : Nat for + b : Nat { Bool.or ( Nat.is_eq ( ln_lane_width_wide ( a , b ) , a ) , Nat.is_eq ( ln_lane_width_wide ( a , b ) , b ) ) == True { } : Bool }
+# promise ln_lane_width_wide_is_asked: the widest draft width a lane may verify at is one that was asked for.
 3ba7a01ca8594135  ln_lanes_fit_fits  law ln_lanes_fit_fits : for + bp : Nat for + sh : Nat for + u : Nat { Bool.or ( Nat.is_lt ( u , sh ) , ln_plan_fits ( ln_lanes_fit ( 1n + bp , sh , u ) , 1n + bp , sh , u ) ) == True { } : Bool }
 # promise ln_lanes_fit_fits: the lane count a refused plan reports as fitting does fit, whenever the shared part does.
 af6ef3a569dc3bf7  ln_lanes_need_drafter  law ln_lanes_need_drafter : for + e : Bool for + d : LaneDrafter for + c : Bool { Bool.and ( ln_lanes_ok ( e , d , c ) , Bool.not ( ln_drafter_ok ( d ) ) ) == False { } : Bool }
@@ -850,6 +862,10 @@ e6d2224aaf980fef  ln_plan_counts_shared  law ln_plan_counts_shared : for + n : N
 # promise ln_plan_fits_iff_no_shortfall: a lane plan is refused exactly when it lacks device memory, and then it reports a positive shortfall.
 4daa72327243e704  ln_prefix_per_lane_within_grant  law ln_prefix_per_lane_within_grant : for + g : Nat for + np : Nat { Nat.is_le ( Nat.mul ( ln_prefix_per_lane ( g , 1n + np ) , 1n + np ) , g ) == True { } : Bool }
 # promise ln_prefix_per_lane_within_grant: the lanes together never get more kept prefix positions than were granted for them.
+c06abd2451430893  ln_queue_ahead_fits  law ln_queue_ahead_fits : for + w : Bool for + s : Bool { ln_queue_ahead ( w , s , False { } ) == False { } : Bool }
+# promise ln_queue_ahead_fits: no step is queued ahead for lanes whose next rows might not fit their context.
+39606523b79d8fad  ln_queue_ahead_same  law ln_queue_ahead_same : for + w : Bool for + f : Bool { ln_queue_ahead ( w , False { } , f ) == False { } : Bool }
+# promise ln_queue_ahead_same: a step queued ahead for a group that changed is never kept.
 fac48eb6065735a2  ln_release_only_drained  law ln_release_only_drained : for + s : LaneState { Bool.or ( ln_is_drain ( s ) , ln_eq ( ln_step ( s , EvLnRelease { } ) , s ) ) == True { } : Bool }
 # promise ln_release_only_drained: a lane is freed only after its request ended, never while it prefills or decodes.
 eb78c06bf888695a  ln_route_irreflexive  law ln_route_irreflexive : for + r : Nat for + l : Nat for + c : Nat for + s : Nat { ln_route_better ( r , l , c , s , r , l , c , s ) == False { } : Bool }
@@ -906,8 +922,20 @@ bfa338a9ab5398d1  ln_spec_batched_fits  law ln_spec_batched_fits : for + c : Nat
 # promise ln_step_chunks_cover_need: a batched step covers every chunk its slots need whenever a lane can hold them.
 a0c03e484928dc40  ln_step_chunks_within_lane  law ln_step_chunks_within_lane : for + need : Nat for + lc : Nat { Nat.is_le ( ln_step_chunks ( need , lc ) , lc ) == True { } : Bool }
 # promise ln_step_chunks_within_lane: a batched step never covers more chunks than a lane owns.
+0c7b843488bcffde  ln_step_rows_in_ctx  law ln_step_rows_in_ctx : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_gt ( Nat.add ( c , n ) , m ) , Nat.is_le ( Nat.add ( c , ln_lane_step_rows ( g , n , w , r , c , m ) ) , m ) ) == True { } : Bool }
+# promise ln_step_rows_in_ctx: a lane never verifies rows past the end of its context in a batched step, whenever its narrow rows fit it.
+cd5590e07b5dcccf  ln_step_rows_in_ring  law ln_step_rows_in_ring : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_gt ( n , r ) , Nat.is_le ( ln_lane_step_rows ( g , n , w , r , c , m ) , r ) ) == True { } : Bool }
+# promise ln_step_rows_in_ring: a lane never verifies more rows in a batched step than its state rings hold, whenever its narrow rows fit them.
+2719c715ac4c4f70  ln_step_rows_is_asked  law ln_step_rows_is_asked : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_eq ( ln_lane_step_rows ( g , n , w , r , c , m ) , n ) , Nat.is_eq ( ln_lane_step_rows ( g , n , w , r , c , m ) , w ) ) == True { } : Bool }
+# promise ln_step_rows_is_asked: a lane verifies at the narrow or at the wide width asked for, never at another.
+ad3088743b14ce44  ln_step_rows_unchosen_narrow  law ln_step_rows_unchosen_narrow : for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { ln_lane_step_rows ( False { } , n , w , r , c , m ) == n : Nat }
+# promise ln_step_rows_unchosen_narrow: a lane not chosen to go wide verifies at the narrow width.
 6fee86abb8400a0c  ln_unbatched_verify_no_lanes  law ln_unbatched_verify_no_lanes : for + d : Bool { ln_drafter_ok ( ln_lane_drafter_of ( True { } , d , False { } ) ) == False { } : Bool }
 # promise ln_unbatched_verify_no_lanes: a load whose drafter verifies its rows in a form the batched speculative steps are not built for never gets lanes.
+1d47a3ea1689a045  ln_wide_held_in_ring  law ln_wide_held_in_ring : for + n : Nat for + w : Nat for + r : Nat { Bool.or ( Nat.is_gt ( Nat.add ( n , 1n ) , r ) , Nat.is_le ( Nat.add ( ln_lane_wide_held ( n , w , r ) , 1n ) , r ) ) == True { } : Bool }
+# promise ln_wide_held_in_ring: a lane is never given a draft width whose verify rows its state rings cannot hold, whenever they hold the narrow width's.
+d460c8070aa7e22e  ln_wide_held_is_asked  law ln_wide_held_is_asked : for + n : Nat for + w : Nat for + r : Nat { Bool.or ( Nat.is_eq ( ln_lane_wide_held ( n , w , r ) , n ) , Nat.is_eq ( ln_lane_wide_held ( n , w , r ) , w ) ) == True { } : Bool }
+# promise ln_wide_held_is_asked: the widest width a lane is given is one of the widths asked for.
 f8533147dc62d652  ln_younger_waiter_never_blocks  law ln_younger_waiter_never_blocks : for + d : Bool for + r : Nat for + e : Nat { ln_admission_blocked ( d , Nat.add ( r , e ) , r ) == False { } : Bool }
 # promise ln_younger_waiter_never_blocks: a waiter that arrived after a session's next request never blocks its admission.
 1d7a0b64d1763db8  ls_hello_byte_recognised  law ls_hello_byte_recognised : { ls_is_hello ( 22n ) == True { } : Bool }

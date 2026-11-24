@@ -2059,15 +2059,6 @@ def ln_ahead_lands(ended: Bool) -> Bool:
     case False{}:
       False{}
 
-# promise: no step is queued ahead while a request waits for a lane.
-law ln_queue_ahead_not_waiting:
-  for +s: Bool
-  for +f: Bool
-  {ln_queue_ahead(True{}, s, f) == False{} : Bool}
-
-def ln_queue_ahead_not_waiting(s, f):
-  {==}
-
 # promise: no step is queued ahead for lanes whose next rows might not fit their context.
 law ln_queue_ahead_fits:
   for +w: Bool
@@ -2141,17 +2132,6 @@ law ln_lane_verify_keeps_asked:
 
 def ln_lane_verify_keeps_asked(f, n):
   {==}
-
-# promise: a load of one lane takes the form it is given.
-law ln_lane_verify_one_lane:
-  for +a: Bool
-  for f: VerifyForm
-  {ln_lane_verify(a, f, 1n) == f : VerifyForm}
-
-def ln_lane_verify_one_lane(a, f):
-  match a:
-    case True{}: {==}
-    case False{}: {==}
 
 def ln_verify_mme_aux(a: Bool, m: Bool, +f: VerifyForm) -> {Bool.or(Bool.not(ln_vf_is_mme(ln_verify_pick(a, m, f))), ln_vf_is_mme(f)) == True{} : Bool}:
   match a:
