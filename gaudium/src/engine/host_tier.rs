@@ -520,11 +520,12 @@ impl HostTier {
         }
     }
 
-    /// This share writes entry `id`: its count goes up, and this share's record is of the new one.
+    /// This share writes entry `id`: its count goes up (the verified `ln_tier_write_count`), and
+    /// this share's record is of the new one.
     fn note_write(&mut self, id: u64) {
         let mut writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
         let c = writes.entry(id).or_insert(0);
-        *c += 1;
+        *c = crate::verified::ln_tier_write_count(*c);
         self.seen.insert(id, *c);
     }
 
