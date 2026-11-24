@@ -1297,6 +1297,12 @@ pub(super) fn prefill_tile(eng: &mut Qwen3Engine, pos: u64, tile_len: u64) -> Re
                 .collect(),
             _ => Vec::new(),
         };
+    if eng.verbose && !image_rows.is_empty() {
+        let rows: u64 = image_rows.iter().map(|r| r.2 / row_bytes).sum();
+        eprintln!(
+            "[gaudium] mtp: prefill tile at row {pos} ({tile_len} rows): {rows} rows embed image tokens (image form of the context pass)"
+        );
+    }
     let Qwen3Engine {
         specdec,
         dev,
