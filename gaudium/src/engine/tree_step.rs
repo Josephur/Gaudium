@@ -56,6 +56,9 @@ pub fn tree_elfs(spec: &ModelSpec) -> Vec<&'static str> {
         v.push("GAUDIUM_GDNT_ELF");
         v.push("GAUDIUM_PREPT_ELF");
     }
+    if crate::verified::kv_is_fp8(spec.kv_dtype) {
+        v.extend_from_slice(crate::engine::qwen3::kv8::KV8_TREE_ELFS); // [kv8]
+    }
     v
 }
 
@@ -245,23 +248,19 @@ fn append_attn_layer_tree(
     );
     let qn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}qn_w"), SynDataType::Float, &[dh]);
     let kn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}kn_w"), SynDataType::Float, &[dh]);
-    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), SynDataType::Bf16, &[dh, r, b]);
-    let kcache = gb.add_persistent_tensor(
-        format!("{lpfx}kcache"),
-        SynDataType::Bf16,
-        &[dh, KV_CHUNK, b],
-    );
-    let vcache = gb.add_persistent_tensor(
-        format!("{lpfx}vcache"),
-        SynDataType::Bf16,
-        &[dh, KV_CHUNK, b],
-    );
+    // [kv8] the cache dtype of this layer (q block, caches and P) and its scale table
+    let kv = crate::engine::qwen3::kv8::AttnKv::of(gb, spec, lpfx);
+    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), kv.dt, &[dh, r, b]);
+    let kcache =
+        gb.add_persistent_tensor(format!("{lpfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
+    let vcache =
+        gb.add_persistent_tensor(format!("{lpfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
     gb.add_node(
         g_aprep,
         format!("{lpfx}attn_prep"),
-        &[
+        &kv.inputs(&[
             qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor, tabs.depth, fix,
-        ],
+        ]),
         &[qb, kcache, vcache],
         &u32_params(&[0u32]),
     );
@@ -271,13 +270,13 @@ fn append_attn_layer_tree(
         &[KV_CHUNK, r, b],
     );
     gb.op_batch_gemm(format!("{lpfx}qk"), qb, kcache, scores, false, true);
-    let pm = gb.add_persistent_tensor(format!("{lpfx}P"), SynDataType::Bf16, &[KV_CHUNK, r, b]);
+    let pm = gb.add_persistent_tensor(format!("{lpfx}P"), kv.dt, &[KV_CHUNK, r, b]);
     let stats =
         gb.add_persistent_tensor(format!("{lpfx}stats"), SynDataType::Float, &[64, 2, r, b]);
     gb.add_node(
         "gaudium_attn_softmax_chunk",
         format!("{lpfx}softmax"),
-        &[scores, cursor, tabs.anc],
+        &kv.inputs(&[scores, cursor, tabs.anc]),
         &[pm, stats],
         &u32_params(&[t as u32, nch as u32, 0u32, 0u32]),
     );

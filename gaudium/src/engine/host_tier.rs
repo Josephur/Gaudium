@@ -1113,7 +1113,7 @@ pub(super) fn engine_text(cfg: &Qwen3Config, eng: &Qwen3Engine) -> String {
         format!("{sc:?}|{dir}")
     });
     format!(
-        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8={}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
+        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8={}|kv8={}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
         cfg.model_dir.display(),
         files_of(&cfg.model_dir, false),
         eng.spec,
@@ -1123,6 +1123,8 @@ pub(super) fn engine_text(cfg: &Qwen3Config, eng: &Qwen3Engine) -> String {
         eng.pf.opts,
         cfg.precision,
         eng.fp8_id,
+        // [kv8] the K/V dtype is in `spec`; the scale tables' calibration here
+        eng.kv8_id,
         cfg.moe_routed,
         cfg.request_reset,
         cfg.step,
@@ -1166,7 +1168,8 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         eng.max_chunks,
         KV_CHUNK,
         eng.spec.n_kv_heads,
-        eng.spec.head_dim * 2,
+        // [kv8] one head's row of one position, in the caches' own dtype
+        crate::core::kv_cache::row_bytes(1, eng.spec.head_dim, eng.spec.kv_dtype),
         eng.prefill_tile,
     ) {
         Ok(r) => r,

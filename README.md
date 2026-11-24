@@ -26,6 +26,8 @@ What the Rust engine does today:
 - Image input for vision-language checkpoints.
 - Long contexts (up to 256K on the models that support it), planned against HBM at load
   time: a context that does not fit is refused at start with the exact shortfall.
+- An FP8 K/V cache for the Qwen3.5 / 3.8 hybrids (`--kv-cache fp8`, scale tables from
+  `--kv-calibrate`): half the K/V bytes per position, so a longer context fits.
 - Prefix reuse between consecutive requests, and from host memory when the card no longer
   holds a conversation (another conversation or model in between, the idle release of the
   card): `--cache-ram`.

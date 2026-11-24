@@ -114,7 +114,9 @@ pub fn down_site(spec: &ModelSpec) -> &'static str {
 /// layer: the router, the shared-expert gate, the routed form's stacked expert tensors,
 /// per-channel weight scales and site cast scales.
 pub(crate) fn is_ext_layer_weight(suffix: &str) -> bool {
-    matches!(suffix, "W_router" | "W_sgate" | "EW12" | "EW3") || is_fp8_aux_suffix(suffix)
+    matches!(suffix, "W_router" | "W_sgate" | "EW12" | "EW3")
+        || is_fp8_aux_suffix(suffix)
+        || crate::engine::qwen3::kv8::is_kv8_suffix(suffix) // [kv8] the FP8 K/V scale tables
 }
 
 /// `ns_MoeKernel::ParamsV4` of the vendor `moe` node (SynapseAI 1.24 `perf_lib_layer_params.h`).

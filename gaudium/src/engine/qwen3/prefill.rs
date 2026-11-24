@@ -240,7 +240,8 @@ impl TileForm {
         } else {
             0
         };
-        let s16 = if fastexp && dense_hybrid {
+        // [kv8] the half-width core is a BF16-cache form
+        let s16 = if fastexp && dense_hybrid && !crate::verified::kv_is_fp8(spec.kv_dtype) {
             o.s16.unwrap_or(s16_default)
         } else {
             0
@@ -275,6 +276,9 @@ impl TileForm {
                     "GAUDIUM_POSTB_ELF",
                 ]),
             }
+        }
+        if self.fastexp && crate::verified::kv_is_fp8(spec.kv_dtype) {
+            v.extend_from_slice(super::kv8::KV8_PREFILL_ELFS); // [kv8]
         }
         if self.fastexp {
             v.push("GAUDIUM_ASOFTCX_ELF");
@@ -481,27 +485,24 @@ fn append_attn_first_tile(
 
     let qn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}qn_w"), SynDataType::Float, &[dh]);
     let kn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}kn_w"), SynDataType::Float, &[dh]);
-    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), SynDataType::Bf16, &[dh, r, b]);
-    let kcache = gb.add_persistent_tensor(
-        format!("{lpfx}kcache"),
-        SynDataType::Bf16,
-        &[dh, KV_CHUNK, b],
-    );
-    let vcache = gb.add_persistent_tensor(
-        format!("{lpfx}vcache"),
-        SynDataType::Bf16,
-        &[dh, KV_CHUNK, b],
-    );
+    // [kv8] the cache dtype of this layer (q block, caches and P) and its scale table
+    let kv = super::kv8::AttnKv::of(gb, spec, lpfx);
+    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), kv.dt, &[dh, r, b]);
+    let kcache =
+        gb.add_persistent_tensor(format!("{lpfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
+    let vcache =
+        gb.add_persistent_tensor(format!("{lpfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
     gb.add_node(
         g_aprep,
         format!("{lpfx}attn_prep"),
-        &[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor],
+        &kv.inputs(&[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor]),
         &[qb, kcache, vcache],
         &u32_params(&[0u32]),
     );
 
     let ao = gb.add_persistent_tensor(format!("{lpfx}ao"), SynDataType::Float, &[dh, r, nkv]);
-    let s16 = form.s16 > 0;
+    // the half-width core reads BF16 caches (`TileForm::resolve` turns it off for FP8 K/V)
+    let s16 = form.s16 > 0 && kv.kv8.is_none();
     let gsz = chunk_groups(nch, form.groups);
     if gsz.len() == 1 && !s16 {
         // one group: the plain node chain with the tile builds of the softmax and the combine
@@ -511,13 +512,13 @@ fn append_attn_first_tile(
             &[KV_CHUNK, r, b],
         );
         gb.op_batch_gemm(format!("{lpfx}qk"), qb, kcache, scores, false, true);
-        let pm = gb.add_persistent_tensor(format!("{lpfx}P"), SynDataType::Bf16, &[KV_CHUNK, r, b]);
+        let pm = gb.add_persistent_tensor(format!("{lpfx}P"), kv.dt, &[KV_CHUNK, r, b]);
         let stats =
             gb.add_persistent_tensor(format!("{lpfx}stats"), SynDataType::Float, &[64, 2, r, b]);
         gb.add_node(
             "gaudium_attn_softmax_chunk",
             format!("{lpfx}softmax"),
-            &[scores, cursor],
+            &kv.inputs(&[scores, cursor]),
             &[pm, stats],
             &u32_params(&[t as u32, nch as u32, 0, 0, 1]),
         );
@@ -535,7 +536,7 @@ fn append_attn_first_tile(
         // half-width core: queries in the score unit of the 128-lane softmax, V chunks in the
         // key order of its P. Kept persistent (scratch) so no recipe's workspace grows with the
         // context.
-        let p8 = form.s16 >= 2;
+        let p8 = s16 && form.s16 >= 2;
         let (qsrc, vsrc, vdt) = if s16 {
             let qs =
                 gb.add_persistent_tensor(format!("{lpfx}qs16"), SynDataType::Bf16, &[dh, r, b]);
@@ -581,7 +582,7 @@ fn append_attn_first_tile(
                 (qs, vn, SynDataType::Bf16)
             }
         } else {
-            (qb, vcache, SynDataType::Bf16)
+            (qb, vcache, kv.dt)
         };
         let sdt = if s16 {
             SynDataType::Bf16
@@ -591,23 +592,23 @@ fn append_attn_first_tile(
         let pdt = if p8 {
             SynDataType::Fp8_143
         } else {
-            SynDataType::Bf16
+            kv.dt
         };
         let qv = group_views(
             gb,
             qsrc,
             &format!("{lpfx}qb"),
-            SynDataType::Bf16,
+            if s16 { SynDataType::Bf16 } else { kv.dt },
             dh,
             r,
             nkv,
             &gsz,
         );
-        let kv = group_views(
+        let kvw = group_views(
             gb,
             kcache,
             &format!("{lpfx}kc"),
-            SynDataType::Bf16,
+            kv.dt,
             dh,
             KV_CHUNK,
             nkv,
@@ -621,7 +622,7 @@ fn append_attn_first_tile(
             let gp = format!("{lpfx}g{g}_");
             let bg = nkv * n;
             let sc = gb.add_persistent_tensor(format!("{gp}scores"), sdt, &[KV_CHUNK, r, bg]);
-            gb.op_batch_gemm(format!("{gp}qk"), qv[g], kv[g], sc, false, true);
+            gb.op_batch_gemm(format!("{gp}qk"), qv[g], kvw[g], sc, false, true);
             let pg = gb.add_persistent_tensor(format!("{gp}P"), pdt, &[KV_CHUNK, r, bg]);
             let stg =
                 gb.add_persistent_tensor(format!("{gp}stats"), SynDataType::Float, &[64, 2, r, bg]);
@@ -638,7 +639,7 @@ fn append_attn_first_tile(
                 gb.add_node(
                     "gaudium_attn_softmax_chunk",
                     format!("{gp}softmax"),
-                    &[sc, cursor],
+                    &kv.inputs(&[sc, cursor]),
                     &[pg, stg],
                     &u32_params(&[t as u32, n as u32, 0, 0, 1, base]),
                 );

@@ -88,6 +88,15 @@ pub trait GenEngine: Send {
     fn fp8_calibration(&self) -> Option<std::collections::BTreeMap<String, crate::fp8::ActScale>> {
         None
     }
+    /// K/V calibration load (`EngineConfig::kv_calibrate`): reads the trunk's caches back after a
+    /// request whose prompt had `rows` positions and folds their per-head maxima in.
+    fn kv_measure(&mut self, _rows: u64) -> Result<(), String> {
+        Err("this engine has no K/V calibration pass".into())
+    }
+    /// The running K/V calibration of a calibration load (`None`: not one).
+    fn kv_calibration(&self) -> Option<crate::core::kv_cache::KvCalibration> {
+        None
+    }
     /// Prefix reuse across requests: the positions the engine keeps to resume a prefill from
     /// and what its requests took over (`None`: this engine prefills every prompt whole).
     fn prefix_stats(&self) -> Option<qwen3::prefix_cache::PrefixStats> {
@@ -151,6 +160,12 @@ impl GenEngine for qwen3::Qwen3Engine {
     }
     fn fp8_calibration(&self) -> Option<std::collections::BTreeMap<String, crate::fp8::ActScale>> {
         qwen3::Qwen3Engine::fp8_calibration(self)
+    }
+    fn kv_measure(&mut self, rows: u64) -> Result<(), String> {
+        qwen3::Qwen3Engine::kv_measure(self, rows)
+    }
+    fn kv_calibration(&self) -> Option<crate::core::kv_cache::KvCalibration> {
+        qwen3::Qwen3Engine::kv_calibration(self)
     }
     fn prefix_stats(&self) -> Option<qwen3::prefix_cache::PrefixStats> {
         qwen3::Qwen3Engine::prefix_stats(self)

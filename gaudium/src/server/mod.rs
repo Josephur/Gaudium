@@ -152,6 +152,10 @@ pub struct ModelRunOptions {
     pub vision_patches: Option<u64>,
     /// The reasoning-effort levels instead of the ones read from the model's chat template.
     pub effort_levels: Option<EffortLevels>,
+    /// [kv8] The K/V cache dtype of this model (`None`: BF16).
+    pub kv_dtype: Option<crate::verified::KvDtype>,
+    /// [kv8] The K/V calibration of an FP8 K/V load (`None`: the model's default table).
+    pub kv_scales: Option<PathBuf>,
 }
 
 struct RegisteredModel {
@@ -1298,6 +1302,10 @@ fn engine_config_of(
         qcfg.fp8_act = opts.fp8_act.clone();
         qcfg.fp8_cache = opts.fp8_cache.clone();
         qcfg.moe_routed = opts.moe_routed;
+        if let Some(d) = opts.kv_dtype {
+            qcfg.kv_dtype = d;
+        }
+        qcfg.kv_scales = opts.kv_scales.clone();
         if let Some(p) = opts.precision {
             qcfg.precision = p;
         }

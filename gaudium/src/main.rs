@@ -69,6 +69,8 @@ fn print_usage() {
          \x20                                           without opening the card (Qwen engines)\n\
          \x20 gaudium --serve [options]                 Start OpenAI HTTP/SSE + Gaudium Web UI server\n\
          \x20 gaudium --fp8-calibrate [options]         Measure a model's FP8 activation scales (BF16 graphs)\n\
+         \x20 gaudium --kv-calibrate [options]          Measure the K/V maxima a model's FP8 K/V scale tables\n\
+         \x20                                           are made from (BF16 caches, read back per prompt)\n\
          \x20 gaudium --fp8-pack --model <dir> --fp8-cache <dir>\n\
          \x20                                           Quantise a Gemma 4 BF16 checkpoint's matrices into an\n\
          \x20                                           FP8 cache directory (host only, no card)\n\
@@ -178,6 +180,12 @@ fn print_usage() {
          \x20                       above: its largest image in patches, or off for text only\n\
          \x20 --fp8-act <id=file>   FP8 activation-scale table for FP8 model <id> (repeatable)\n\
          \x20 --fp8-cache <id=dir>  Cache directory for model <id>'s quantised FP8 matrices\n\
+         \x20 --kv-cache <id=d>     K/V cache of model <id>: bf16 (default) or fp8 (half the bytes per\n\
+         \x20                       position, so a longer context fits; its K=0 stream is its own and\n\
+         \x20                       the reference of its drafter; dense Qwen3.5 / 3.8 hybrids, K=0 or\n\
+         \x20                       DSpine; needs the scale table from --kv-calibrate)\n\
+         \x20 --kv-scales <id=file> K/V calibration of model <id> (default:\n\
+         \x20                       <model_dir>-gaudium-pc/kv_scales.txt)\n\
          \x20 --api-key <key>       Optional Bearer / X-Api-Key auth token (or GAUDIUM_API_KEY)\n\
          \x20 --a2ui                Offer A2UI 1.0 interfaces (or GAUDIUM_A2UI=1): a chat request that\n\
          \x20                       declares its renderer in the field gaudium_a2ui (true, or an\n\
@@ -477,6 +485,12 @@ fn print_usage() {
          \x20 --fp8-act <file>      FP8 activation-scale table (or GAUDIUM_FP8_ACT; default:\n\
          \x20                       <model_dir>-gaudium-pc/act_scales_lc.txt)\n\
          \x20 --fp8-cache <dir>     Cache directory for the quantised FP8 matrices (or GAUDIUM_FP8_CACHE)\n\
+         \x20 --kv-cache <d>        K/V cache: bf16 (default) or fp8 (FP8 q / K / V / P in the trunk's\n\
+         \x20                       attention, half the K/V bytes; a precision of its own: its K=0\n\
+         \x20                       stream is the reference of FP8-K/V speculation. Dense Qwen3.5 / 3.8\n\
+         \x20                       hybrids, K=0 or DSpine; needs the table from --kv-calibrate)\n\
+         \x20 --kv-scales <file>    K/V calibration the FP8 scale tables are made from (default:\n\
+         \x20                       <model_dir>-gaudium-pc/kv_scales.txt)\n\
          \x20 --moe-form <f>        MoE expert execution: dense (default: one masked wide MLP per layer)\n\
          \x20                       or routed (stacked BF16 experts, only the routed ones are read;\n\
          \x20                       faster decode, more device memory, its own token stream: the\n\
@@ -518,7 +532,23 @@ fn print_usage() {
          \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default: 4096)\n\
          \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
          \x20 --no-cache            Disable on-disk compiled recipe cache\n\
-         \x20 --verbose             Print HBM, recipe compile, and per-site diagnostics"
+         \x20 --verbose             Print HBM, recipe compile, and per-site diagnostics\n\
+         \n\
+         K/V calibration options (prefill only, BF16 caches; writes `layer <l> k <amax..> v <amax..>`\n\
+         lines, the largest |K| and |V| per kv head; FP8 K/V takes its V multipliers from them):\n\
+         \x20 --model <dir>         Model directory (or GAUDIUM_MODEL)\n\
+         \x20 --kernels <dir>       Built TPC-C kernels & glue dir (or GAUDIUM_KERNELS)\n\
+         \x20 --prompt-ids-file <p> Calibration prompt as token IDs (repeatable)\n\
+         \x20 --prompt-file <path>  Calibration prompt as text (repeatable)\n\
+         \x20 --out <file>          Table to write (default: <model_dir>-gaudium-pc/kv_scales.txt)\n\
+         \x20 --max-ctx <N>         Context capacity, multiple of 4096 (default: the longest prompt)\n\
+         \x20 --precision <p>       Weight precision of the measuring load, as the served one: auto\n\
+         \x20                       (default), bf16 or fp8\n\
+         \x20 --fp8-act <file>      FP8 activation-scale table of an fp8 load\n\
+         \x20 --fp8-cache <dir>     Cache directory for the quantised FP8 matrices\n\
+         \x20 --cache-dir <dir>     Recipe cache directory (or GAUDIUM_RECIPE_CACHE)\n\
+         \x20 --no-cache            Disable on-disk compiled recipe cache\n\
+         \x20 --verbose             Print HBM, recipe compile, and per-layer diagnostics"
     );
 }
 
@@ -587,6 +617,8 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let mut precision = WeightPrecision::Auto;
     let mut fp8_act: Option<PathBuf> = None;
     let mut fp8_cache: Option<PathBuf> = None;
+    let mut kv_dtype = gaudium::verified::KvDtype::KvBf16;
+    let mut kv_scales: Option<PathBuf> = None;
     let mut moe_routed = false;
     let mut prefill_opts: Option<String> = None;
     let mut params = Qwen3GenParams::default();
@@ -835,6 +867,12 @@ fn run_generate(args: &[String]) -> Result<(), String> {
             }
             "--fp8-act" => fp8_act = Some(PathBuf::from(next_val(&mut i, "--fp8-act")?)),
             "--fp8-cache" => fp8_cache = Some(PathBuf::from(next_val(&mut i, "--fp8-cache")?)),
+            "--kv-cache" => {
+                let s = next_val(&mut i, "--kv-cache")?;
+                kv_dtype = gaudium::core::kv_cache::parse_kv_dtype(&s)
+                    .ok_or_else(|| format!("invalid --kv-cache '{s}' (bf16, fp8)"))?;
+            }
+            "--kv-scales" => kv_scales = Some(PathBuf::from(next_val(&mut i, "--kv-scales")?)),
             "--moe-form" => {
                 moe_routed = match next_val(&mut i, "--moe-form")?.as_str() {
                     "dense" => false,
@@ -976,6 +1014,8 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     cfg.precision = precision;
     cfg.fp8_act = fp8_act;
     cfg.fp8_cache = fp8_cache;
+    cfg.kv_dtype = kv_dtype;
+    cfg.kv_scales = kv_scales;
     cfg.moe_routed = moe_routed;
     cfg.prefill_warm_rows = prefill_warm;
     cfg.request_reset = request_reset;
@@ -1669,6 +1709,177 @@ fn run_fp8_calibrate(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// K/V calibration pass: a cold prefill of every given prompt on BF16 caches, after each of which
+/// the trunk's caches are read back for their per-head maxima (`core/kv_cache.rs`); writes the
+/// table an `--kv-cache fp8` load builds its scale tables from.
+fn run_kv_calibrate(args: &[String]) -> Result<(), String> {
+    let mut model_dir: Option<PathBuf> = env::var_os("GAUDIUM_MODEL").map(PathBuf::from);
+    let mut kernels_dir: Option<PathBuf> = env::var_os("GAUDIUM_KERNELS").map(PathBuf::from);
+    let mut id_files: Vec<String> = Vec::new();
+    let mut text_files: Vec<String> = Vec::new();
+    let mut out: Option<PathBuf> = None;
+    let mut max_ctx: Option<u64> = None;
+    let mut precision = WeightPrecision::Auto;
+    let mut fp8_act: Option<PathBuf> = None;
+    let mut fp8_cache: Option<PathBuf> = None;
+    let mut cache_dir: Option<PathBuf> = None;
+    let mut no_cache = false;
+    let mut verbose = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let next_val = |idx: &mut usize, name: &str| -> Result<String, String> {
+            *idx += 1;
+            args.get(*idx)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match flag {
+            "--kv-calibrate" => {}
+            "--model" => model_dir = Some(PathBuf::from(next_val(&mut i, "--model")?)),
+            "--kernels" => kernels_dir = Some(PathBuf::from(next_val(&mut i, "--kernels")?)),
+            "--prompt-ids-file" => id_files.push(next_val(&mut i, "--prompt-ids-file")?),
+            "--prompt-file" => text_files.push(next_val(&mut i, "--prompt-file")?),
+            "--out" => out = Some(PathBuf::from(next_val(&mut i, "--out")?)),
+            "--max-ctx" => {
+                max_ctx = Some(
+                    next_val(&mut i, "--max-ctx")?
+                        .parse()
+                        .map_err(|_| "invalid --max-ctx".to_string())?,
+                );
+            }
+            "--precision" => {
+                let s = next_val(&mut i, "--precision")?;
+                precision = WeightPrecision::parse(&s)
+                    .ok_or_else(|| format!("invalid --precision '{s}' (auto, bf16, fp8)"))?;
+            }
+            "--fp8-act" => fp8_act = Some(PathBuf::from(next_val(&mut i, "--fp8-act")?)),
+            "--fp8-cache" => fp8_cache = Some(PathBuf::from(next_val(&mut i, "--fp8-cache")?)),
+            "--cache-dir" => cache_dir = Some(PathBuf::from(next_val(&mut i, "--cache-dir")?)),
+            "--no-cache" => no_cache = true,
+            "--verbose" | "-v" => verbose = true,
+            other => return Err(format!("unknown --kv-calibrate argument '{other}'")),
+        }
+        i += 1;
+    }
+    let model_dir =
+        model_dir.ok_or_else(|| "missing --model <dir> (or GAUDIUM_MODEL env var)".to_string())?;
+    let kernels_dir = kernels_dir
+        .ok_or_else(|| "missing --kernels <dir> (or GAUDIUM_KERNELS env var)".to_string())?;
+    let out = out.unwrap_or_else(|| gaudium::core::kv_cache::default_table_path(&model_dir));
+    let prompts = calibration_prompts(&model_dir, &id_files, &text_files)?;
+    if prompts.is_empty() {
+        return Err("--kv-calibrate needs at least one --prompt-ids-file or --prompt-file".into());
+    }
+    let longest = prompts
+        .iter()
+        .map(|(_, ids)| ids.len() as u64)
+        .max()
+        .unwrap_or(1);
+
+    let mut cfg = Qwen3Config::new(model_dir.clone(), kernels_dir);
+    // one more row than the longest prompt: the readout's token
+    cfg.max_ctx = max_ctx.unwrap_or(longest + 1).max(longest + 1);
+    cfg.cache_dir = cache_dir;
+    cfg.no_cache = no_cache;
+    cfg.verbose = verbose;
+    cfg.precision = precision;
+    cfg.fp8_act = fp8_act;
+    cfg.fp8_cache = fp8_cache;
+    cfg.kv_calibrate = true;
+
+    gaudium::signals::install();
+    let mut engine: Box<dyn GenEngine> = load_engine(&cfg)?;
+    let params = Qwen3GenParams {
+        max_new: 1,
+        stop_on_eos: false,
+        cache_prompt: false,
+        ..Qwen3GenParams::default()
+    };
+    let mut rows = 0usize;
+    for (name, ids) in &prompts {
+        if gaudium::signals::term_requested() {
+            return Err("cancelled before every prompt was measured: no table written".into());
+        }
+        let report = engine.generate_cancellable(
+            ids,
+            &params,
+            Some(gaudium::signals::term_flag()),
+            &mut |_| {},
+        )?;
+        if report.stopped_by_cancel {
+            return Err("cancelled before every prompt was measured: no table written".into());
+        }
+        engine.kv_measure(ids.len() as u64)?;
+        rows += ids.len();
+        eprintln!(
+            "[kv-calibrate] {name}: {} prompt tokens, prefill {:.1} ms",
+            ids.len(),
+            report.ttft_ms
+        );
+    }
+    let mut table = engine
+        .kv_calibration()
+        .ok_or_else(|| "this model's engine has no K/V calibration pass".to_string())?;
+    let model_name = model_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    table.notes.push(format!(
+        "model {model_name}, {} prompts, {rows} rows, weights {:?}",
+        prompts.len(),
+        precision
+    ));
+    table.store(&out)?;
+    if verbose {
+        for (l, a) in &table.layers {
+            eprintln!("[kv-calibrate] layer {l}: K {:?} V {:?}", a.k, a.v);
+        }
+    }
+    println!(
+        "KV CALIBRATION OK: {} layers from {} prompts ({} rows) -> {}",
+        table.layers.len(),
+        prompts.len(),
+        rows,
+        out.display()
+    );
+    Ok(())
+}
+
+/// The prompts of a calibration run: token-id files and text files (encoded with the model's
+/// tokenizer), each with the path it came from.
+fn calibration_prompts(
+    model_dir: &Path,
+    id_files: &[String],
+    text_files: &[String],
+) -> Result<Vec<(String, Vec<i32>)>, String> {
+    let mut prompts: Vec<(String, Vec<i32>)> = Vec::new();
+    for path in id_files {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("read --prompt-ids-file {path}: {e}"))?;
+        let ids = raw
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                s.trim()
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid token id '{s}' in {path}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        prompts.push((path.clone(), ids));
+    }
+    if !text_files.is_empty() {
+        let tok = gaudium::model_text::ModelText::open(model_dir)?.tokenizer()?;
+        for path in text_files {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("read --prompt-file {path}: {e}"))?;
+            prompts.push((path.clone(), tok.encode(&text, true)));
+        }
+    }
+    Ok(prompts)
+}
+
 /// Host-only FP8 pre-pack: quantises a Gemma 4 checkpoint's matrices into `--fp8-cache <dir>`.
 fn run_fp8_pack(args: &[String]) -> Result<(), String> {
     let mut model_dir: Option<PathBuf> = env::var_os("GAUDIUM_MODEL").map(PathBuf::from);
@@ -1978,6 +2189,22 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 let (opts, path) = model_opt(&mut per_model, &raw, "--fp8-cache")?;
                 opts.fp8_cache = Some(path);
             }
+            "--kv-cache" => {
+                let raw = next_val(&mut i, "--kv-cache")?;
+                let (opts, d) = model_opt(&mut per_model, &raw, "--kv-cache")?;
+                opts.kv_dtype = Some(
+                    d.to_str()
+                        .and_then(gaudium::core::kv_cache::parse_kv_dtype)
+                        .ok_or_else(|| {
+                            format!("--kv-cache expects <model id>=bf16|fp8, got '{raw}'")
+                        })?,
+                );
+            }
+            "--kv-scales" => {
+                let raw = next_val(&mut i, "--kv-scales")?;
+                let (opts, path) = model_opt(&mut per_model, &raw, "--kv-scales")?;
+                opts.kv_scales = Some(path);
+            }
             "--draft-k" => {
                 draft_k = next_val(&mut i, "--draft-k")?
                     .split(',')
@@ -2195,6 +2422,13 @@ fn main() {
     if args.iter().any(|a| a == "--fp8-calibrate") {
         if let Err(e) = run_fp8_calibrate(&args[1..]) {
             eprintln!("FP8 CALIBRATE FAIL: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--kv-calibrate") {
+        if let Err(e) = run_kv_calibrate(&args[1..]) {
+            eprintln!("KV CALIBRATE FAIL: {e}");
             process::exit(1);
         }
         return;

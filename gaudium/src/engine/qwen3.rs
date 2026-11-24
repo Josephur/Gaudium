@@ -48,6 +48,9 @@ pub mod prefix_cache;
 pub mod host_tier;
 #[path = "request_reset.rs"]
 mod request_reset;
+// [kv8] FP8 K/V caches of the trunk's attention
+#[path = "kv8.rs"]
+pub mod kv8;
 mod vision_hooks;
 
 /// KV cache chunk length (matches `CHUNK = 4096` in `attn_prep_gaudi2.c`).
@@ -113,6 +116,14 @@ pub struct Qwen3Config {
     /// The host-RAM tier of prefix reuse: the server's store (`cache_ram.rs`). `None`: this
     /// engine keeps nothing in host memory.
     pub host_cache: Option<Arc<crate::cache_ram::SharedCache>>,
+    /// [kv8] Element type of the trunk's K/V caches (`--kv-cache`).
+    pub kv_dtype: crate::verified::KvDtype,
+    /// [kv8] The K/V calibration an FP8 load builds its scale tables from (`--kv-scales`);
+    /// `None`: `<model_dir>-gaudium-pc/kv_scales.txt`.
+    pub kv_scales: Option<PathBuf>,
+    /// [kv8] Calibration load (`gaudium --kv-calibrate`): BF16 caches, read back after every
+    /// prefill for their per-head maxima.
+    pub kv_calibrate: bool,
 }
 
 impl Qwen3Config {
@@ -142,6 +153,9 @@ impl Qwen3Config {
             step: crate::engine::step_opts::StepOpts::from_env(),
             prefix_slots: 0,
             host_cache: None,
+            kv_dtype: crate::verified::KvDtype::KvBf16,
+            kv_scales: None,
+            kv_calibrate: false,
         }
     }
 }
@@ -568,22 +582,18 @@ fn append_attn_layer(
 
     let qn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}qn_w"), SynDataType::Float, &[dh]);
     let kn_w = gb.get_or_add_persistent_tensor(format!("{lpfx}kn_w"), SynDataType::Float, &[dh]);
-    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), SynDataType::Bf16, &[dh, r, b]);
-    let kcache = gb.add_persistent_tensor(
-        format!("{lpfx}kcache"),
-        SynDataType::Bf16,
-        &[dh, KV_CHUNK, b],
-    );
-    let vcache = gb.add_persistent_tensor(
-        format!("{lpfx}vcache"),
-        SynDataType::Bf16,
-        &[dh, KV_CHUNK, b],
-    );
+    // [kv8] the cache dtype of this layer (q block, caches and P) and its scale table
+    let kv = kv8::AttnKv::of(gb, spec, lpfx);
+    let qb = gb.add_persistent_tensor(format!("{lpfx}qb"), kv.dt, &[dh, r, b]);
+    let kcache =
+        gb.add_persistent_tensor(format!("{lpfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
+    let vcache =
+        gb.add_persistent_tensor(format!("{lpfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
     let prep_params = u32_params(&[0u32]); // coff = 0
     gb.add_node(
         g_aprep,
         format!("{lpfx}attn_prep"),
-        &[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor],
+        &kv.inputs(&[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor]),
         &[qb, kcache, vcache],
         &prep_params,
     );
@@ -595,14 +605,14 @@ fn append_attn_layer(
     );
     gb.op_batch_gemm(format!("{lpfx}qk"), qb, kcache, scores, false, true);
 
-    let pm = gb.add_persistent_tensor(format!("{lpfx}P"), SynDataType::Bf16, &[KV_CHUNK, r, b]);
+    let pm = gb.add_persistent_tensor(format!("{lpfx}P"), kv.dt, &[KV_CHUNK, r, b]);
     let stats =
         gb.add_persistent_tensor(format!("{lpfx}stats"), SynDataType::Float, &[64, 2, r, b]);
     let sm_params = u32_params(&[t as u32, nch as u32, 0u32, 0u32]);
     gb.add_node(
         "gaudium_attn_softmax_chunk",
         format!("{lpfx}softmax"),
-        &[scores, cursor],
+        &kv.inputs(&[scores, cursor]),
         &[pm, stats],
         &sm_params,
     );
@@ -1060,6 +1070,11 @@ pub struct Qwen3Engine {
     vision_req: vision_hooks::VisionRequestState,
     /// [fp8 hook] calibration load: running maxima of the GEMM input sites
     calib: Option<crate::engine::fp8_graph::ActCalibrator>,
+    /// [kv8] K/V calibration load: running per-head maxima of the trunk's caches
+    kv_calib: Option<crate::core::kv_cache::KvCalibration>,
+    /// [kv8] What the FP8 scale tables were made from (`none` for BF16 caches): part of the
+    /// identity the host-RAM tier stamps entries with.
+    kv8_id: String,
     /// [step] device-trace windows (`--profile-steps`)
     prof: Option<prof_rt::ProfRt>,
 
@@ -1111,6 +1126,8 @@ impl Qwen3Engine {
             .map_err(|e| format!("verified ModelSpec validation failed: {e}"))?;
         // [moe/fp8 hook] run precision (and the FP8 calibration table) before any graph is built
         let fp8_act_table = crate::engine::fp8_pack::resolve_precision(cfg, &mut spec)?;
+        // [kv8] the trunk's K/V dtype (and the FP8 calibration), before any graph is built
+        let kv8_cal = kv8::resolve(cfg, &mut spec)?;
 
         let required_elfs: &[&str] = match spec.family {
             ModelFamily::Qwen3
@@ -1158,7 +1175,11 @@ impl Qwen3Engine {
 
         // 2. Configure TPC-C kernel ELFs & Synapse GC glue BEFORE opening SynapseAI
         let kenv = KernelEnv::configure_from_dir(&cfg.kernels_dir)?;
-        let elf_hashes = kenv.fingerprint_hashes(required_elfs)?;
+        let mut required_elfs: Vec<&str> = required_elfs.to_vec();
+        if crate::verified::kv_is_fp8(spec.kv_dtype) {
+            required_elfs.extend_from_slice(kv8::KV8_ELFS); // [kv8]
+        }
+        let elf_hashes = kenv.fingerprint_hashes(&required_elfs)?;
         // [prefill] the tile forms of this model; `prefill_tile` is the widest candidate until
         // the HBM plan below settles the width
         let mut pf = prefill::TileRt::new(pf_opts, &spec, &kenv, &elf_hashes)?;
@@ -2080,6 +2101,7 @@ impl Qwen3Engine {
         );
         let mut packer = WeightPacker::new(&store, &spec);
         packer.ext = Some(&ext_packer);
+        packer.kv8 = kv8_cal.as_ref().map(|(c, _)| c); // [kv8] the layers' scale tables
 
         let mut stage_upload = dev
             .alloc_pinned(STAGE_BUF_BYTES)
@@ -2382,6 +2404,12 @@ impl Qwen3Engine {
             calib: cfg
                 .fp8_calibrate
                 .then(crate::engine::fp8_graph::ActCalibrator::new),
+            kv_calib: cfg
+                .kv_calibrate
+                .then(crate::core::kv_cache::KvCalibration::default),
+            kv8_id: kv8_cal
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |(c, _)| c.id()),
             prof: prof.map(prof_rt::ProfRt::new),
             dev,
         };

@@ -134,6 +134,10 @@ pub struct ModelSpec {
     /// [moe] Run form chosen at load: the routed experts run through the vendor expert-select
     /// node on stacked BF16 expert tensors instead of the dense-masked wide MLP (`engine/moe.rs`).
     pub moe_routed: bool,
+    /// [kv8] Element type of the trunk's K/V caches, chosen at load (`--kv-cache`; not a
+    /// checkpoint property): FP8 caches go with the `-DKV8` attention kernels and a scale table
+    /// (`core/kv_cache.rs`, `engine/kv8.rs`).
+    pub kv_dtype: crate::verified::KvDtype,
     pub gemma4: Option<Gemma4Spec>,
     pub inkling2: Option<Inkling2Spec>,
 }
@@ -505,6 +509,7 @@ impl ModelSpec {
             fp8_quantized,
             fp8_weights: false,
             moe_routed: false,
+            kv_dtype: crate::verified::KvDtype::KvBf16,
             gemma4,
             inkling2,
         };
