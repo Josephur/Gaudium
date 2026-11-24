@@ -134,8 +134,9 @@ Serve options:
                         with checkpoint every lane steps at the narrowest. Other
                         models are
                         served with one lane (the log says why). /props total_slots
-                        and /slots show the lanes. Not with --cache-ram yet (the
-                        host-RAM tier is off for a model served with lanes)
+                        and /slots show the lanes. With --cache-ram every lane saves
+                        to and restores from the one host-RAM store (an entry one
+                        lane saved is restored into any lane)
   --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a
                         conversation: after another conversation, another model, or
                         the idle release (--idle-park). What a request could resume

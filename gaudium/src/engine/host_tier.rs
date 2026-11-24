@@ -1170,47 +1170,12 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         }
         return Ok(());
     }
-    // the trunk K/V caches: one size, chunk-major, `n_kv_heads` heads of BF16 rows
-    let cache_names: Vec<String> = eng.kv_addr.keys().cloned().collect();
-    let caches: Vec<u64> = eng.kv_addr.values().map(|&(a, _)| a).collect();
-    let cache_bytes = eng.kv_addr.values().next().map_or(0, |&(_, b)| b);
-    if eng.kv_addr.values().any(|&(_, b)| b != cache_bytes) {
-        eprintln!("[cache-ram] off for this engine: its K/V caches differ in size");
-        return Ok(());
-    }
-    // [kv8] one head's row of one position in the caches' own dtype, and its V block
-    let kv_dt = super::kv8::trunk_dtype(&eng.spec);
-    let rows = match RowLayout::with_block(
-        caches,
-        cache_bytes,
-        eng.max_chunks,
-        KV_CHUNK,
-        eng.spec.n_kv_heads,
-        crate::core::kv_cache::row_bytes(1, eng.spec.head_dim, kv_dt),
-        eng.prefill_tile,
-        crate::verified::kv_vperm_rows(kv_dt),
-    ) {
-        Ok(r) => r,
+    let (cache_names, rows, slots, ring) = match layout_of_active(eng) {
+        Ok(l) => l,
         Err(why) => {
             eprintln!("[cache-ram] off for this engine: {why}");
             return Ok(());
         }
-    };
-    let slots: Vec<Vec<(u64, u64)>> = eng
-        .prefix_slots
-        .iter()
-        .map(|m| {
-            m.iter()
-                .flat_map(|(l, &(s, cs))| {
-                    let st = &eng.gdn_state[l];
-                    [(s, st.s_bytes), (cs, st.cs_bytes)]
-                })
-                .collect()
-        })
-        .collect();
-    let ring: Vec<(u64, u64)> = match eng.specdec.as_ref() {
-        Some(sd) if sd.context_rows() > 0 => sd.cache_regions(),
-        _ => Vec::new(),
     };
     // the identity never holds a device address (`layout_fingerprint`)
     let layout = layout_fingerprint(
@@ -1219,6 +1184,37 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
         slots.first().map_or(&[][..], |s| s.as_slice()),
         &ring,
     );
+    // [lanes] every other lane's share of the tier: its own device addresses, the same layout
+    // (and so the same identity: an entry one lane saved is restored into any lane)
+    let n_lanes = eng.lanes.as_ref().map_or(1, |rt| rt.lanes());
+    let mut others = Vec::with_capacity(n_lanes.saturating_sub(1));
+    for lane in 1..n_lanes {
+        super::lanes_rt::activate(eng, lane);
+        let l = layout_of_active(eng).and_then(|(names, rows, slots, ring)| {
+            let same = layout_fingerprint(
+                &names,
+                &rows,
+                slots.first().map_or(&[][..], |s| s.as_slice()),
+                &ring,
+            ) == layout;
+            if same {
+                Ok((rows, slots, ring))
+            } else {
+                Err(format!("lane {lane}'s device layout differs from lane 0's"))
+            }
+        });
+        others.push(l);
+    }
+    if n_lanes > 1 {
+        super::lanes_rt::activate(eng, 0);
+    }
+    let others = match others.into_iter().collect::<Result<Vec<_>, String>>() {
+        Ok(o) => o,
+        Err(why) => {
+            eprintln!("[cache-ram] off for this engine: {why}");
+            return Ok(());
+        }
+    };
     let id = identity_of(&engine_text(cfg, eng), &layout);
     // The ring: a few buffers of untouched memory, each mapped for the device on its own (the
     // one pinned host memory of the tier, planned when the server started). An engine that
@@ -1300,9 +1296,94 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
             gib(tier.rates.to_device),
         );
     }
+    let rates = tier.facts().rates;
     eng.xfer = Some(xfer);
     eng.host = Some(tier);
+    for (i, (rows, slots, ring)) in others.into_iter().enumerate() {
+        super::lanes_rt::activate(eng, i + 1);
+        let mut t = HostTier::new(Arc::clone(&cache), id, rows, slots, ring, cfg.verbose);
+        t.set_rates(rates);
+        eng.host = Some(t);
+    }
+    if n_lanes > 1 {
+        super::lanes_rt::activate(eng, 0);
+        if cfg.verbose {
+            eprintln!("[cache-ram] every one of the {n_lanes} lanes saves and restores through the tier");
+        }
+    }
     Ok(())
+}
+
+/// The device layout the host tier copies for the active lane: the trunk K/V cache names and rows,
+/// the kept positions' state ranges and the drafter's context rings.
+#[allow(clippy::type_complexity)]
+fn layout_of_active(
+    eng: &Qwen3Engine,
+) -> Result<(Vec<String>, RowLayout, Vec<Vec<(u64, u64)>>, Vec<(u64, u64)>), String> {
+    // the trunk K/V caches: one size, chunk-major, `n_kv_heads` heads of BF16 rows
+    let cache_names: Vec<String> = eng.kv_addr.keys().cloned().collect();
+    let caches: Vec<u64> = eng.kv_addr.values().map(|&(a, _)| a).collect();
+    let cache_bytes = eng.kv_addr.values().next().map_or(0, |&(_, b)| b);
+    if eng.kv_addr.values().any(|&(_, b)| b != cache_bytes) {
+        return Err("its K/V caches differ in size".into());
+    }
+    // [kv8] one head's row of one position in the caches' own dtype, and its V block
+    let kv_dt = super::kv8::trunk_dtype(&eng.spec);
+    let rows = RowLayout::with_block(
+        caches,
+        cache_bytes,
+        eng.max_chunks,
+        KV_CHUNK,
+        eng.spec.n_kv_heads,
+        crate::core::kv_cache::row_bytes(1, eng.spec.head_dim, kv_dt),
+        eng.prefill_tile,
+        crate::verified::kv_vperm_rows(kv_dt),
+    )?;
+    let slots: Vec<Vec<(u64, u64)>> = eng
+        .prefix_slots
+        .iter()
+        .map(|m| {
+            m.iter()
+                .flat_map(|(l, &(s, cs))| {
+                    let st = &eng.gdn_state[l];
+                    [(s, st.s_bytes), (cs, st.cs_bytes)]
+                })
+                .collect()
+        })
+        .collect();
+    let ring: Vec<(u64, u64)> = match eng.specdec.as_ref() {
+        Some(sd) if sd.context_rows() > 0 => sd.cache_regions(),
+        _ => Vec::new(),
+    };
+    Ok((cache_names, rows, slots, ring))
+}
+
+/// The end of the engine's request on the active lane: what it wrote no longer equals anything
+/// saved; what it left is to be saved (after the response: `idle_work`). Returns the tier's report
+/// of the request.
+pub(super) fn end_request(
+    eng: &mut Qwen3Engine,
+    res: &Result<Qwen3GenReport, String>,
+    reused: u64,
+    written_end: u64,
+) -> Option<TierReport> {
+    let tier = eng.host.as_mut()?;
+    let (prefilled, secs) = res.as_ref().map_or((0, 0.0), |r| {
+        (
+            (r.prompt_tokens as u64).saturating_sub(reused),
+            // the restore is inside the prefill clock, not part of the prefill itself
+            (r.ttft_ms - tier.last().restore_ms - tier.last().save_ms).max(0.0) / 1e3,
+        )
+    });
+    let cancelled = res.as_ref().is_ok_and(|r| r.stopped_by_cancel);
+    tier.end_request(
+        res.is_ok(),
+        reused,
+        written_end,
+        if cancelled { 0 } else { prefilled },
+        secs,
+    );
+    Some(tier.last())
 }
 
 /// [`HostTier::begin_request`] for the engine's request.
