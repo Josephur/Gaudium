@@ -102,7 +102,8 @@ Serve options:
                         a request with images runs alone. Each lane holds the full
                         context (--max-ctx / --model-ctx): a load that cannot plan N
                         lanes of it is refused with the numbers. A request goes to the
-                        free lane that holds the most of its prompt. Dense Qwen3 /
+                        free lane where it takes over the most of its prompt for the
+                        least of another conversation's rows. Dense Qwen3 /
                         Qwen3.5 / Qwen3.8 models without a drafter; other models are
                         served with one lane (the log says why). /props total_slots
                         and /slots show the lanes. Not with --cache-ram yet (the
