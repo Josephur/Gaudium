@@ -672,7 +672,6 @@ dd0df277e44fd2b1  ln_lane_io_counts_each  law ln_lane_io_counts_each : for + c :
 # promise ln_lane_io_counts_each: the plan counts every io scalar of the batched steps.
 ceb04216f442329f  ln_lane_io_counts_rounded  law ln_lane_io_counts_rounded : for + c : Nat for + e : Nat { Nat.is_le ( Nat.mul ( c , ln_lane_buf_bytes ( e ) ) , ln_lane_io_bytes ( c , e ) ) == True { } : Bool }
 # promise ln_lane_io_counts_rounded: the plan counts every io buffer of the batched steps as the arena allocates it.
-
 60cd9d5a4cd02577  ln_lane_width_is_asked  law ln_lane_width_is_asked : for + a : Nat for + b : Nat { Bool.or ( Nat.is_eq ( ln_lane_width_pick ( a , b ) , a ) , Nat.is_eq ( ln_lane_width_pick ( a , b ) , b ) ) == True { } : Bool }
 # promise ln_lane_width_is_asked: lanes step at a draft width that was asked for.
 3ba7a01ca8594135  ln_lanes_fit_fits  law ln_lanes_fit_fits : for + bp : Nat for + sh : Nat for + u : Nat { Bool.or ( Nat.is_lt ( u , sh ) , ln_plan_fits ( ln_lanes_fit ( 1n + bp , sh , u ) , 1n + bp , sh , u ) ) == True { } : Bool }
@@ -683,6 +682,10 @@ c3fa29078370a38d  ln_lanes_need_engine  law ln_lanes_need_engine : for + d : Lan
 # promise ln_lanes_need_engine: an engine without batched steps is never given lanes, whatever its drafter.
 640e1ce3eba53008  ln_lanes_never_calibrating  law ln_lanes_never_calibrating : for + e : Bool for + d : LaneDrafter { ln_lanes_ok ( e , d , True { } ) == False { } : Bool }
 # promise ln_lanes_never_calibrating: a calibration load is never given lanes.
+7cb9217959f79de5  ln_ld_is_dspine_of_dspine  law ln_ld_is_dspine_of_dspine : { ln_ld_is_dspine ( LdDSpine { } ) == True { } : Bool }
+# promise ln_ld_is_dspine_of_dspine: the lane rule's DSpine check holds for DSpine.
+5ab7020dd1efa237  ln_ld_is_none_of_none  law ln_ld_is_none_of_none : { ln_ld_is_none ( LdNone { } ) == True { } : Bool }
+# promise ln_ld_is_none_of_none: the lane rule's plain-decode check holds for plain decode.
 9077088cb191c7e0  ln_never_passes_younger  law ln_never_passes_younger : for + r : Nat for + e : Nat { ln_passes_over ( Nat.add ( r , e ) , r ) == False { } : Bool }
 # promise ln_never_passes_younger: a request never counts as passing over a waiter for the card that arrived after it.
 ec1806058792e6c2  ln_next_admits_only_waiting  law ln_next_admits_only_waiting : for + i : Bool for + b : Bool { ln_sm_admits ( ln_session_next ( i , False { } , b ) ) == False { } : Bool }
