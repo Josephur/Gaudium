@@ -663,6 +663,11 @@ impl Run {
         )
     }
 
+    /// Notes a cancellation of the request; whether it ends is then [`Run::done`]'s decision.
+    fn observe_cancel(&mut self) {
+        self.stopped_by_cancel |= self.cancel.load(Ordering::Relaxed);
+    }
+
     /// Takes one generated token as the single-stream decode loop does.
     fn emit(&mut self, tok: i32) {
         if self.first_pending {
@@ -870,9 +875,8 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
             run.prefill_tok_s = f.prefill_tok_s;
             run.ttft_recipe_ms = f.ttft_recipe_ms;
             run.t_decode = Some(Instant::now());
-            if run.cancel.load(Ordering::Relaxed) {
-                run.stopped_by_cancel = true;
-            } else if !run.done() {
+            run.observe_cancel();
+            if !run.done() {
                 eng.live.first_token(Some(f.ttft_ms), 1);
                 run.emit(f.first_tok);
             }
@@ -1230,9 +1234,8 @@ fn serve_loop(
                 run.parity ^= 1;
                 run.cursor += 1;
                 run.steps += 1;
-                if run.cancel.load(Ordering::Relaxed) {
-                    run.stopped_by_cancel = true;
-                } else {
+                run.observe_cancel();
+                if !run.done() {
                     run.emit(tok);
                 }
                 if run.done() {

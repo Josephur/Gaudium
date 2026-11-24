@@ -828,6 +828,25 @@ law ln_lanes_need_engine:
 def ln_lanes_need_engine(d, c):
   {==}
 
+# promise: a load whose drafter has no batched steps is never given lanes.
+law ln_lanes_need_drafter:
+  for +e: Bool
+  for +d: LaneDrafter
+  for +c: Bool
+  {Bool.and(ln_lanes_ok(e, d, c), Bool.not(ln_drafter_ok(d))) == False{} : Bool}
+
+def ln_lanes_need_drafter(e, d, c):
+  match e d c:
+    case True{} LdNone{} True{}: {==}
+    case True{} LdNone{} False{}: {==}
+    case True{} LdDSpine{} True{}: {==}
+    case True{} LdDSpine{} False{}: {==}
+    case True{} LdOther{} True{}: {==}
+    case True{} LdOther{} False{}: {==}
+    case False{} LdNone{} _: {==}
+    case False{} LdDSpine{} _: {==}
+    case False{} LdOther{} _: {==}
+
 # promise: a slot's cursor in the host staging buffer never lies inside the step's token ids.
 law ln_stage_cursor_after_ids:
   for +b: Nat
