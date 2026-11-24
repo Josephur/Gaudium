@@ -1689,8 +1689,6 @@ law ln_sa_done_of_done:
 def ln_sa_done_of_done():
   {==}
 
-  L.nat_le_refl(Nat.mul(c, e))
-
 # promise: a speculative lane takes a batched step only when all the step's rows fit in its context.
 law ln_spec_batched_fits:
   for +c: Nat
@@ -1758,3 +1756,17 @@ def ln_other_never_dspine(b):
   match b:
     case True{}: {==}
     case False{}: {==}
+
+# promise: the lane rule's plain-decode check holds for plain decode.
+law ln_ld_is_none_of_none:
+  {ln_ld_is_none(LdNone{}) == True{} : Bool}
+
+def ln_ld_is_none_of_none():
+  {==}
+
+# promise: the lane rule's DSpine check holds for DSpine.
+law ln_ld_is_dspine_of_dspine:
+  {ln_ld_is_dspine(LdDSpine{}) == True{} : Bool}
+
+def ln_ld_is_dspine_of_dspine():
+  {==}
