@@ -2472,6 +2472,12 @@ impl Inkling2Engine {
                     break;
                 }
             }
+            // readout: the drafter's context pass was queued behind the verify; the step's tokens
+            // are out, so it is synchronised before the step closes (its bytes are charged to this
+            // step, and its time with them)
+            if use_mtp {
+                self.sync_compute("drafter context")?;
+            }
             self.live.step(emitted, n_drafts as u64, accepted as u64);
             if out.stopped_by_eos {
                 break;

@@ -44,10 +44,11 @@ fn kind_of_name(name: &str) -> Kind {
 /// chunks]` with `nkv` key / value heads: a sliding ring's slots, or a cache's chunk rows times its
 /// chunks (the main model's and the drafter's alike). `None` for any other tensor.
 fn kv_positions_of(name: &str, dims: &[u64], nkv: u64) -> Option<u64> {
-    if !(is_kv_name(name) || name.starts_with("mts_")) || dims.len() != 3 || nkv == 0 {
+    if !(is_kv_name(name) || name.starts_with("mts_")) || dims.len() != 3 {
         return None;
     }
-    Some(dims[1].saturating_mul((dims[2] / nkv).max(1)))
+    // the count is the verified one (`verified/inkling2_readout.bend`); `None` on overflow
+    crate::verified::ik_state_positions(dims[1], dims[2], nkv)
 }
 
 /// One launch of `gb`: `rows` rows per pass, global caches of `nch` chunks, `nkv` key / value
@@ -287,6 +288,11 @@ mod tests {
         assert_eq!(pos(&one, "A5_kcache"), IK_CHUNK);
         assert_eq!(pos(&many, "A5_vcache"), 64 * IK_CHUNK);
         assert_eq!(kv_positions_of("L7_W_gate", &[128, 4096, 16], d.nkv), None);
+        // today's arithmetic, pinned here: chunks = cols / nkv (at least one), a ring is one
+        assert_eq!(kv_positions_of("A0_kring", &[128, 2048, 8], 8), Some(2048));
+        assert_eq!(kv_positions_of("A5_kcache", &[128, 4096, 24], 8), Some(3 * 4096));
+        assert_eq!(kv_positions_of("A0_kring", &[128, 2048, 8], 0), Some(2048));
+        assert_eq!(kv_positions_of("A5_kcache", &[128, u64::MAX, 16], 8), None);
         // the drafter: a local layer's ring, the global layer's chunks
         let g = geom(&d);
         let blk = build_block_graph(&g, 4, &[]).persistent_tensor_specs();
