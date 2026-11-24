@@ -99,7 +99,17 @@ export function placementOf(desc) {
   const layersText = p.layers.length ? p.layers.map((x) => (p.mode === 'host' ? `${x.layer}` : `${x.layer}:${x.slots}`)).join(' ') : '';
   const short = `${gb(p.cardGb)} card${p.hostGb ? ` · ${gb(p.hostGb)} host` : ''}`;
   return { mode: p.mode, cardGb: p.cardGb, hostGb: p.hostGb, share, headline, layersText, layers: p.layers.length, promoteEvery, cache, short,
-    experts: m.experts, topK: m.topK, form: m.form, text: `${gb(p.cardGb)} on the card${p.hostGb ? ` · ${gb(p.hostGb)} on the host` : ''}` };
+    experts: m.experts, topK: m.topK, form: m.form, text: `${gb(p.cardGb)} on the card${p.hostGb ? ` · ${gb(p.hostGb)} on the host` : ''}`,
+    split: expertsSplit(p) };
+}
+
+// Whether the experts are held in more than one place: the card and host RAM today (hybrid or host layers, the expert cache), the
+// card and another device later (any placement mode other than 'card'). Only then do the readout's placement bars say something;
+// with every expert on the card they are left out.
+export function expertsSplit(placement) {
+  const p = placement;
+  if (!p || typeof p !== 'object') return false;
+  return (p.mode || 'card') !== 'card' || (typeof p.hostGb === 'number' && p.hostGb > 0);
 }
 
 // Short facts for the hello page and the card dialog: what this model has that the readout will show.

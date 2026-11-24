@@ -14,7 +14,7 @@ import { McpClient, toOpenAiTools, BUILTIN, isNetworkError, connectFailureText }
 import { newConversation, addChild, update, activePath, pathTo, siblings, switchSibling, removeSubtree, titleFrom, toApiMessages, uid,
   insertAbove, spliceOut, compactableCount, compactionMessages, displayCut, countMessages, isCompaction, nodeSummary, usableSummary, SUMMARY_PREFILL } from './lib/tree.js';
 import { finalStats, methodInfo, greedyOnly, setDfName, fmtInt, contextUsed } from './lib/stats.js';
-import { modelDesc, modelFacts, precisionShort, hasDrafter, dfFamilyName, effortLevels, effortFor } from './lib/model.js';
+import { modelDesc, modelFacts, precisionShort, hasDrafter, dfFamilyName, effortLevels, effortFor, expertsSplit } from './lib/model.js';
 import { reserveTokens, compactPercent, projection, summaryMaxTokens, usedLive, estimateMessages, estimateText, longestText, elideMessage, setVisionLimits } from './lib/context.js';
 import { visionLimits } from './lib/media.js';
 import { newSegment } from './lib/stream.js';
@@ -682,7 +682,8 @@ export async function boot() {
 function helloText(desc) {
   const parts = ['tokens per second'];
   if (!desc.known || desc.drafters.length) parts.push('tokens per decode step and how many drafts were accepted', desc.known && !hasDrafter(desc, 'df') && !hasDrafter(desc, 'ds') ? 'which head proposes them' : 'which drafter is proposing them');
-  if (desc.moe) parts.push(desc.moe.placement && desc.moe.placement.mode !== 'card' ? 'where the experts run (card or host) and the host work per step' : 'where the experts live');
+  // the expert placement is shown only when the experts are split between the card and another place
+  if (desc.moe && expertsSplit(desc.moe.placement)) parts.push('where the experts run (card or host) and the host work per step');
   parts.push("how much of the card's HBM bandwidth each step uses");
   return `Every reply shows what the engine is doing while it writes: ${parts.slice(0, -1).join(', ')}, and ${parts[parts.length - 1]}.`;
 }

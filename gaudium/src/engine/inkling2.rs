@@ -84,6 +84,9 @@ mod reuse;
 // The block drafter of the checkpoint's `mtp.safetensors` (speculative decoding).
 #[path = "inkling2_mtp.rs"]
 pub mod mtp;
+// readout: the drafter facts and the byte model of the launches for the live profile
+#[path = "inkling2_readout.rs"]
+mod readout;
 
 /// Rows of one chunk of a global layer's K / V cache (the softmax kernel stages one chunk).
 pub const IK_CHUNK: u64 = 4096;
@@ -2182,8 +2185,15 @@ impl Inkling2Engine {
     }
 
     /// Runs one pass of the decode step over `toks` at positions `cursor ..` (the recipe of
-    /// `toks.len()` rows must be compiled) and returns each row's arg-max token.
-    fn run_rows(&mut self, toks: &[i32], cursor: u64, bucket: u64) -> Result<Vec<i32>, String> {
+    /// `toks.len()` rows must be compiled) and returns each row's arg-max token. `mark`: the
+    /// pass is the live record's launch (readout: a drafter's step marks its group itself).
+    fn run_rows(
+        &mut self,
+        toks: &[i32],
+        cursor: u64,
+        bucket: u64,
+        mark: bool,
+    ) -> Result<Vec<i32>, String> {
         let rows = toks.len();
         // reuse: every row of the pass is written, accepted or not
         self.reuse.will_write(cursor + rows as u64);
@@ -2201,12 +2211,21 @@ impl Inkling2Engine {
         self.dev
             .copy_h2d_pinned_batch_sync(&self.stage_io, &[(0, rows * 4, ids), (coff, 4, cur)])
             .map_err(|e| format!("write step inputs H2D: {e}"))?;
+        if mark {
+            // readout: the byte model of this pass (built once per recipe shape)
+            let (d, lmax, r) = (&self.dims, self.max_ctx, rows as u64);
+            self.live
+                .launch_begin_with(readout::step_key(r, bucket, None), || {
+                    readout::verify(d, lmax, r, bucket)
+                });
+        }
         let (recipe, prepared) = &self.step_recipes[&(rows as u64, bucket)];
-        self.live.launch_begin();
         recipe
             .launch_prepared(&self.dev, prepared)
             .map_err(|e| format!("launch decode step (cursor={cursor}, {rows} rows): {e}"))?;
-        self.live.launch_submitted();
+        if mark {
+            self.live.launch_submitted();
+        }
         self.sync_compute("decode step")?;
         self.dev
             .copy_d2h_pinned_sync(tokens, &mut self.stage_io, rows * 4)
@@ -2227,7 +2246,7 @@ impl Inkling2Engine {
         bucket: u64,
         params: &GenParams,
     ) -> Result<i32, String> {
-        let greedy = self.run_rows(&[tok], cursor, bucket)?[0];
+        let greedy = self.run_rows(&[tok], cursor, bucket, true)?[0];
         if params.temperature > 0.0 {
             let logits = self.step_act_addr["logits"].0;
             self.sample_from_logits(logits, params, cursor as u32)
@@ -2272,7 +2291,7 @@ impl Inkling2Engine {
             let bucket = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
             self.ensure_step(rows as u64, bucket)?;
             let t0 = Instant::now();
-            let got = self.run_rows(&generated[b..b + rows], cursor, bucket)?;
+            let got = self.run_rows(&generated[b..b + rows], cursor, bucket, false)?;
             pass_ms += t0.elapsed().as_secs_f64() * 1000.0;
             let logits = self.read_step_logits(rows)?;
             for k in 0..rows {
@@ -2366,10 +2385,31 @@ impl Inkling2Engine {
                 continue;
             }
             let mut toks = vec![generated[gi]];
+            let need = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
             if use_mtp {
                 // drafts of the block drafter anchored on the last emitted token (a recipe
                 // compiled on first use is not decode time)
                 compile_ms += self.mtp_prepare_block(cursor)?;
+                // readout: every recipe of the step (the verify pass of this bucket, the
+                // drafter's context pass) is ready before its launch group is timed, so a
+                // first-use compile is never counted as device time
+                let tc = Instant::now();
+                if need != bucket {
+                    self.ensure_step(rows as u64, need)?;
+                    bucket = need;
+                }
+                self.mtp_ensure_ctx(rows as u64, true)?;
+                compile_ms += tc.elapsed().as_secs_f64() * 1000.0;
+                // readout: one step is the drafter's block, the verify pass and the drafter's
+                // context pass; the group is marked from the block's launch on
+                // the verify's bucket: `bucket`, made ready above
+                let vb = bucket;
+                let db = self.mtp_bucket(cursor);
+                let (d, lmax, r, g) = (&self.dims, self.max_ctx, rows as u64, &self.mtp_ref().g);
+                self.live
+                    .launch_begin_with(readout::step_key(r, vb, Some(db)), || {
+                        readout::spec_step(d, lmax, r, vb, Some((g, db)))
+                    });
                 let t_d = Instant::now();
                 let d = self.mtp_draft(generated[gi], cursor)?;
                 self.mtp_mut().stats.draft_ms += t_d.elapsed().as_secs_f64() * 1000.0;
@@ -2384,7 +2424,6 @@ impl Inkling2Engine {
             }
             let n_drafts = toks.len() - 1;
             toks.resize(rows, 0);
-            let need = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
             if need != bucket {
                 let tc = Instant::now();
                 self.ensure_step(rows as u64, need)?;
@@ -2392,7 +2431,7 @@ impl Inkling2Engine {
                 bucket = need;
             }
             let t_v = Instant::now();
-            let mut got = self.run_rows(&toks, cursor, bucket)?;
+            let mut got = self.run_rows(&toks, cursor, bucket, !use_mtp)?;
             if params.temperature > 0.0 {
                 // a sampled request: each row's token is its position's own sample. Rows after the
                 // first one whose sample is not the next draft are never emitted: they are not
@@ -2433,6 +2472,12 @@ impl Inkling2Engine {
                     out.stopped_by_eos = true;
                     break;
                 }
+            }
+            // readout: the drafter's context pass was queued behind the verify; the step's tokens
+            // are out, so it is synchronised before the step closes (its bytes are charged to this
+            // step, and its time with them)
+            if use_mtp {
+                self.sync_compute("drafter context")?;
             }
             self.live.step(emitted, n_drafts as u64, accepted as u64);
             if out.stopped_by_eos {
@@ -2485,11 +2530,7 @@ impl Inkling2Engine {
         let is_eos = |tok: i32| eos_ids.contains(&tok);
         let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
 
-        let method_label = if params.temperature > 0.0 {
-            format!("K=0 BF16 T={:.2}", params.temperature)
-        } else {
-            "K=0 BF16 greedy".to_string()
-        };
+        let method_label = self.live_method_label(params);
         self.live
             .begin_request(prompt_ids.len() as u64, &method_label, "");
         self.live.prefill_progress(0);
@@ -2595,7 +2636,15 @@ impl Inkling2Engine {
             self.sync_compute("prefill tile")?;
             pos += tv as usize;
             self.reuse.rows_in(pos);
-            self.live.prefill_progress(pos as u64);
+            // readout: the tile's launches (the last one also carries the prompt's readout)
+            let (d, lmax, g) = (&self.dims, self.max_ctx, self.mtp.as_ref().map(|m| &m.g));
+            let last = pos >= prompt_ids.len();
+            self.live.prefill_tile(
+                pos as u64,
+                readout::prefill_tile_launches(d, g.is_some(), last),
+                readout::tile_key(t, nch, g.is_some(), last),
+                || readout::prefill_tile(d, lmax, t, nch, g, last),
+            );
         }
 
         // final mix and norm over the last tile, then the readout of its last row
@@ -2734,8 +2783,7 @@ impl Inkling2Engine {
 
         // ---- DECODE, speculative: an engine loaded with a drafter, unless the request asks
         // for the plain loop (the K = 0 reference of `--compare-k0`) ----
-        if self.draft.is_some()
-            && !params.non_speculative
+        if crate::verified::ik_decode_runs_drafter(self.draft.is_some(), params.non_speculative)
             && !stopped_by_eos
             && !stopped_by_cancel
             && !generated.is_empty()
@@ -2862,7 +2910,7 @@ impl Inkling2Engine {
 mod tests {
     use super::*;
 
-    fn mini() -> ModelSpec {
+    pub(super) fn mini() -> ModelSpec {
         let local: Vec<String> = (0..24u32)
             .filter(|l| (l + 1) % 6 != 0)
             .map(|l| l.to_string())

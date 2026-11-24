@@ -97,7 +97,8 @@ function MethodHead({ info, switchStep, desc, spec }) {
 }
 
 // What the model adds to the readout (docs/server.md 7.8), from its description and this request's optional sections: where the
-// experts live and the host work per step (MoE), QSA's regime, the n-gram rows. Nothing at all for a model without them.
+// experts live and the host work per step (MoE, only when the experts are split between the card and another place: model.js
+// expertsSplit), QSA's regime, the n-gram rows. Nothing at all for a model without them.
 export function ModelPanel({ desc, sec, mode }) {
   const pl = desc ? placementOf(desc) : null;
   const m = sec && sec.moe;
@@ -108,27 +109,27 @@ export function ModelPanel({ desc, sec, mode }) {
   if (sec && sec.ple) chips.push([`n-gram rows: host${sec.ple.msPerStep != null ? ` ${fmt2(sec.ple.msPerStep)} ms/step` : ''}`, 'the n-gram embedding is gathered on the host for every step (the time includes the wait for the previous step)']);
   else if (f.ple) chips.push(['n-gram rows: host', `the n-gram embedding (before layer ${f.ple.layer}) is gathered on the host for every step`]);
   if (f.hc && f.hc.streams) chips.push([`${f.hc.streams} HC streams`, `hyper-connections: the residual is ${f.hc.streams} streams wide`]);
-  if (!pl && !chips.length) return null;
-  const hybrid = pl && pl.mode !== 'card';
-  const cache = hybrid && pl.cache ? pl.cache : null;   // the expert cache: the right bar shows its hit rate, not the host twin's work
+  const bars = !!(pl && pl.split);   // every expert on the card: the bars would say nothing
+  if (!bars && !chips.length) return null;
+  const cache = bars && pl.cache ? pl.cache : null;   // the expert cache: the right bar shows its hit rate, not the host twin's work
   const c = m && m.cache;
   const cacheTitle = c ? `Means per decode step over this reply. ${fmtPct(c.hitRate)} of the ${fmtInt(c.routed)} expert assignments in the ${pl.layers} cached layers found their expert on the card; per step ${fmt1(c.missedPerStep)} missed, ${fmt1(c.waitsPerStep)} layers waited at their miss gate for the copy, ${fmt1(c.fillsPerStep)} experts were copied from host RAM to the card (${fmtInt(c.evictions)} evictions in all)` : '';
   const hostTitle = m ? `${fmt1(m.hostRowsPerStep)} expert-rows on the host per step over ${fmt1(m.boundariesPerStep)} layer boundaries; ${fmt2(m.hostMsPerPart)} ms of host work each (routing down, the twin, the result up); the boundaries take ${fmt1(m.boundaryMsPerStep)} ms per step including the wait for each device segment${m.promotions ? `; ${m.promotions} hot-expert promotions, ${fmt2(m.promoMsEach)} ms each` : ''}` : '';
   return html`<div class="ro-model">
-    ${pl ? html`<div class="ro-bars">
+    ${bars ? html`<div class="ro-bars">
       <div class="ro-bar">
-        <div class="k"><span>experts <b>${pl.mode === 'card' ? 'all on the card' : pl.share != null ? `${Math.round(100 * pl.share)}% card` : pl.mode}</b></span><span title=${pl.text}>${pl.mode === 'card' ? pl.text : pl.short}</span></div>
+        <div class="k"><span>experts <b>${pl.share != null ? `${Math.round(100 * pl.share)}% card` : pl.mode}</b></span><span title=${pl.text}>${pl.short}</span></div>
         <div class="meter" title=${`${pl.headline}${pl.layersText ? ` (layer:slots ${pl.layersText})` : ''}; ${pl.experts} experts per layer, top-${pl.topK}`}><div class="fill" style=${`width:${pl.share != null ? 100 * pl.share : 0}%;background:var(--seg2)`}></div></div>
-        <div class="seg-legend"><span>${pl.experts} experts · top-${pl.topK}</span>${hybrid && pl.layersText ? html`<span title=${`layer:slots ${pl.layersText}`}>${pl.layers} ${pl.mode === 'host' ? 'host' : 'hybrid'} layer${pl.layers === 1 ? '' : 's'}</span>` : null}${pl.promoteEvery ? html`<span>promotion every ${pl.promoteEvery} steps</span>` : null}</div>
+        <div class="seg-legend"><span>${pl.experts} experts · top-${pl.topK}</span>${pl.layersText ? html`<span title=${`layer:slots ${pl.layersText}`}>${pl.layers} ${pl.mode === 'host' ? 'host' : 'hybrid'} layer${pl.layers === 1 ? '' : 's'}</span>` : null}${pl.promoteEvery ? html`<span>promotion every ${pl.promoteEvery} steps</span>` : null}</div>
       </div>
       ${cache ? html`<div class="ro-bar">
         <div class="k"><span>expert cache <b>${c && c.hitRate != null ? `${fmtPct(c.hitRate)} hit` : '–'}</b></span><span title=${cacheTitle}>${c ? `${fmtInt(Math.round(c.waitsPerStep))}/${pl.layers} layers wait · ${fmtInt(Math.round(c.fillsPerStep))} copies` : (mode === 'live' ? 'waiting for totals' : 'not reported')}</span></div>
         <div class="meter" title=${cacheTitle}><div class="fill" style=${`width:${c && c.hitRate != null ? 100 * c.hitRate : 0}%;background:var(--seg3)`}></div></div>
         <div class="seg-legend"><span title=${cacheTitle}>per step (mean) · misses ${c ? fmtInt(Math.round(c.missedPerStep)) : '–'}</span><span>${cache.policy || 'lru'} slots · ${cache.reserve} kept free per layer</span></div>
       </div>` : html`<div class="ro-bar">
-        <div class="k"><span>host per step <b>${!hybrid ? 'none' : m && m.hostMsPerStep != null ? `${fmt1(m.hostMsPerStep)} ms` : '–'}</b></span><span title=${hostTitle}>${!hybrid ? 'every expert on the card' : m ? `${fmt1(m.hostRowsPerStep)} rows · ${fmt1(m.boundariesPerStep)} cuts` : (mode === 'live' ? 'waiting for totals' : 'not reported')}</span></div>
-        <div class="segbar" role="img" aria-label="Host work per step" title=${hostTitle}>${hybrid && m && m.boundaryMsPerStep ? html`<div style=${`flex-grow:${Math.max(0.0001, m.hostMsPerStep || 0)};background:var(--seg3)`}></div><div style=${`flex-grow:${Math.max(0.0001, m.boundaryMsPerStep - (m.hostMsPerStep || 0))};background:var(--line2)`}></div>` : html`<div style="flex-grow:1;background:var(--sunk)"></div>`}</div>
-        ${hybrid ? html`<div class="seg-legend"><span><i style="background:var(--seg3)"></i>host work ${m ? fmt1(m.hostMsPerStep) : '–'}</span><span><i style="background:var(--line2)"></i>device wait ${m && m.boundaryMsPerStep != null ? fmt1(Math.max(0, m.boundaryMsPerStep - (m.hostMsPerStep || 0))) : '–'}</span><span>promotions ${m ? fmtInt(m.promotions) : '–'}</span></div>` : null}
+        <div class="k"><span>host per step <b>${m && m.hostMsPerStep != null ? `${fmt1(m.hostMsPerStep)} ms` : '–'}</b></span><span title=${hostTitle}>${m ? `${fmt1(m.hostRowsPerStep)} rows · ${fmt1(m.boundariesPerStep)} cuts` : (mode === 'live' ? 'waiting for totals' : 'not reported')}</span></div>
+        <div class="segbar" role="img" aria-label="Host work per step" title=${hostTitle}>${m && m.boundaryMsPerStep ? html`<div style=${`flex-grow:${Math.max(0.0001, m.hostMsPerStep || 0)};background:var(--seg3)`}></div><div style=${`flex-grow:${Math.max(0.0001, m.boundaryMsPerStep - (m.hostMsPerStep || 0))};background:var(--line2)`}></div>` : html`<div style="flex-grow:1;background:var(--sunk)"></div>`}</div>
+        <div class="seg-legend"><span><i style="background:var(--seg3)"></i>host work ${m ? fmt1(m.hostMsPerStep) : '–'}</span><span><i style="background:var(--line2)"></i>device wait ${m && m.boundaryMsPerStep != null ? fmt1(Math.max(0, m.boundaryMsPerStep - (m.hostMsPerStep || 0))) : '–'}</span><span>promotions ${m ? fmtInt(m.promotions) : '–'}</span></div>
       </div>`}
     </div>` : null}
     ${chips.length ? html`<div class="ro-chips">${chips.map(([t, title]) => html`<span class="ro-chip" title=${title}>${t}</span>`)}</div>` : null}

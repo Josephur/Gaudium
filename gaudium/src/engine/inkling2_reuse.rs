@@ -185,6 +185,7 @@ impl Inkling2Engine {
             ru.stats.hits += 1;
             ru.stats.reused_rows += start as u64;
         }
+        let t_back = std::time::Instant::now();
         match pick {
             IkResume::IrFresh => {
                 ru.keys.clear();
@@ -209,12 +210,13 @@ impl Inkling2Engine {
         }
         if self.verbose {
             eprintln!(
-                "[gaudium] inkling2 prefix: {lcp} of {rows} prompt rows equal the rows held; prefill starts at {start} ({})",
+                "[gaudium] inkling2 prefix: {lcp} of {rows} prompt rows equal the rows held; prefill starts at {start} ({}, {:.2} ms)",
                 match pick {
                     IkResume::IrFresh => "nothing taken over",
                     IkResume::IrLive => "live rings",
-                    IkResume::IrSnap => "ring copy of the last prompt",
-                }
+                    IkResume::IrSnap => "ring copy of the last prompt given back",
+                },
+                t_back.elapsed().as_secs_f64() * 1000.0
             );
         }
         Ok((start, lcp))
