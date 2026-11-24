@@ -158,6 +158,55 @@ fn the_position_tables_refuse_grids_past_their_rows() {
 }
 
 #[test]
+fn the_rotary_tables_follow_the_reference_axial_layout() {
+    // the reference's layout, built the way it builds it: the head's dh / 4 axial frequencies
+    // f[i / 2] = theta^(-i / (dh / 2)) for even i < dh / 2, times the patch's axis-0 position
+    // (its column) and its axis-1 position (its row), concatenated [a0, a0, a1, a1] over the head
+    let d = G4vDims::from_config_json(TOWER_31B).unwrap();
+    let (gh, gw) = (6, 9);
+    let (cs, sn) = tower_rope(&d, gh, gw);
+    let (dh, nh) = (d.dh as usize, d.nh as usize);
+    let spatial = dh / 2;
+    let inv: Vec<f32> = (0..spatial)
+        .step_by(2)
+        .map(|i| 1.0f32 / (d.theta as f32).powf(i as f32 / spatial as f32))
+        .collect();
+    let order = pooling_order(gh, gw, d.pool as usize);
+    assert_eq!(cs.len(), order.len() * nh * dh);
+    for (p, &(y, x)) in order.iter().enumerate() {
+        let a0: Vec<f32> = inv.iter().map(|f| x as f32 * f).collect();
+        let a1: Vec<f32> = inv.iter().map(|f| y as f32 * f).collect();
+        let ang: Vec<f32> = [&a0, &a0, &a1, &a1].into_iter().flatten().copied().collect();
+        assert_eq!(ang.len(), dh);
+        for h in 0..nh {
+            for (k, a) in ang.iter().enumerate() {
+                let at = (p * nh + h) * dh + k;
+                assert_eq!(cs[at], crate::fp8::f32_to_bf16_rne(a.cos()), "patch {p} head {h} channel {k}");
+                assert_eq!(sn[at], crate::fp8::f32_to_bf16_rne(a.sin()), "patch {p} head {h} channel {k}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_rotate_half_weight_is_the_reference_rotate_half_of_each_half() {
+    // the reference: split the head into its two axis halves, rotate each as cat(-x2, x1)
+    let bf = crate::fp8::bf16_to_f32;
+    for dh in [4usize, 8, 64, 72] {
+        let w: Vec<f32> = super::run::rot_weight(dh as u64).into_iter().map(bf).collect();
+        let v: Vec<f32> = (0..dh).map(|i| (i as f32 + 1.0) * if i % 3 == 0 { -0.5 } else { 0.25 }).collect();
+        let mut want = Vec::with_capacity(dh);
+        for part in v.chunks(dh / 2) {
+            let (x1, x2) = part.split_at(dh / 4);
+            want.extend(x2.iter().map(|a| -a));
+            want.extend_from_slice(x1);
+        }
+        let got: Vec<f32> = (0..dh).map(|o| (0..dh).map(|i| w[o * dh + i] * v[i]).sum()).collect();
+        assert_eq!(got, want, "dh {dh}");
+    }
+}
+
+#[test]
 fn the_pooling_weight_sums_each_channel_of_a_token_s_patches() {
     // entry (o, j h + c) is one exactly when c == o: output channel o sums channel o of each of
     // the token's patches j, nothing else

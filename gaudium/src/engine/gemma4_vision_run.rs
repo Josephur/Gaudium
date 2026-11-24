@@ -255,6 +255,21 @@ fn lanes(vals: &[u16]) -> Vec<f32> {
     out
 }
 
+/// The rotary heads' rotate-half as a signed permutation `{dh x dh}` (BF16), row `o` the output
+/// channel: the reference's rotate-half `cat(-x2, x1)` on each half of the head (the column half
+/// and the row half), so `out[o] = -in[o + dh/4]` in the first quarter of a half and
+/// `+in[o - dh/4]` in its second.
+pub(crate) fn rot_weight(dh: u64) -> Vec<u16> {
+    let (half, quart) = (dh / 2, dh / 4);
+    let mut w = vec![0u16; (dh * dh) as usize];
+    for o in 0..dh {
+        let lo = (o % half) < quart;
+        let i = if lo { o + quart } else { o - quart };
+        w[(o * dh + i) as usize] = crate::fp8::f32_to_bf16_rne(if lo { -1.0 } else { 1.0 });
+    }
+    w
+}
+
 /// The pooling GEMM's `{h x h ppt}` 0 / 1 weight (`one` its BF16 one), row by row: the verified
 /// `g4v_pool_w_one` places every one.
 pub(crate) fn pool_weight(h: u64, ppt: u64, one: u16) -> Vec<u16> {
@@ -276,17 +291,7 @@ pub fn pack_weight(store: &SafetensorsStore, geo: &G4vGeo, name: &str) -> Result
         "V_proj_W" | "U_proj_W" => bf16_of(store, "model.embed_vision.embedding_projection.weight", d.out * h)?.into_owned(),
         "V_one" | "U_one" => u16_bytes(std::iter::repeat_n(one, h as usize)),
         "V_oned" => u16_bytes(std::iter::repeat_n(one, dh as usize)),
-        "V_rot_W" => {
-            // out[o] = -in[o + dh/4] in the first quarter of each half, +in[o - dh/4] in the second
-            let (half, quart) = (dh / 2, dh / 4);
-            let mut w = vec![0u16; (dh * dh) as usize];
-            for o in 0..dh {
-                let lo = (o % half) < quart;
-                let i = if lo { o + quart } else { o - quart };
-                w[(o * dh + i) as usize] = crate::fp8::f32_to_bf16_rne(if lo { -1.0 } else { 1.0 });
-            }
-            u16_bytes(w.into_iter())
-        }
+        "V_rot_W" => u16_bytes(rot_weight(dh).into_iter()),
         "V_pool_W" => u16_bytes(pool_weight(h, d.ppt(), one).into_iter()),
         "V_pool_s" => f32_bytes(std::iter::once(1.0 / d.ppt() as f32)),
         "V_root" => f32_bytes(std::iter::once((h as f64).sqrt() as f32)),
