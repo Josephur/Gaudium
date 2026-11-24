@@ -19,11 +19,12 @@
 use super::*;
 use crate::engine::qwen3::lanes_rt::slot_pfx;
 
-/// Name of a batched speculative step recipe.
-pub fn batched_spec_name(b: u64, t: u64, nch: u64, sampled: bool) -> String {
+/// Name of a batched speculative step recipe (`r`: the replay form of the DeltaNet verify rows).
+pub fn batched_spec_name(b: u64, t: u64, nch: u64, sampled: bool, replay: bool) -> String {
     format!(
-        "g_spec_ds{}_B{b}_T{t}_C{nch}",
-        if sampled { "s" } else { "" }
+        "g_spec_ds{}{}_B{b}_T{t}_C{nch}",
+        if sampled { "s" } else { "" },
+        if replay { "r" } else { "" }
     )
 }
 
@@ -60,7 +61,10 @@ pub fn build_batched_spec_step_graph(
     sampled: bool,
 ) -> GraphBuilder {
     let gdn_fast = elf_hashes.iter().any(|(k, _)| k == GDNV_ELF);
-    let mut gb = GraphBuilder::new(batched_spec_name(b, t, nch, sampled));
+    // the replay form of the DeltaNet verify rows (no per-row state checkpoints) when the step
+    // family carries its kernel, as in the single-stream steps
+    let gdn_replay = replay::enabled(elf_hashes);
+    let mut gb = GraphBuilder::new(batched_spec_name(b, t, nch, sampled, gdn_replay));
     gb.set_fp8_weights(spec.fp8_weights);
     for (k, h) in elf_hashes {
         gb.record_kernel_elf_hash(k, h);
@@ -83,6 +87,14 @@ pub fn build_batched_spec_step_graph(
     let a_in: Vec<TensorId> = (0..b)
         .map(|j| gb.add_persistent_tensor(format!("{}a_in", slot_pfx(j)), SynDataType::Int32, &[1]))
         .collect();
+    // replay form: per slot, its lane's first-step cursor (the first step replays nothing)
+    let rp_first: Vec<TensorId> = if gdn_replay {
+        (0..b)
+            .map(|j| gb.add_persistent_tensor(format!("{}rp_first", slot_pfx(j)), SynDataType::Int32, &[1]))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let all_ids = gb.add_intermediate("ids_all", SynDataType::Int32, &[rows]);
     gb.op_concat("ids_cat", &ids, all_ids, 0);
     let mut x = gb.add_persistent_tensor("x0", SynDataType::Bf16, &[hid, rows]);
@@ -104,33 +116,35 @@ pub fn build_batched_spec_step_graph(
             let qgs = split_groups(&mut gb, qg, SynDataType::Bf16, spec.qg_dim(), b, t, &format!("{lpfx}qg"));
             let ks = split_groups(&mut gb, k, SynDataType::Bf16, spec.kv_dim(), b, t, &format!("{lpfx}k"));
             let vs = split_groups(&mut gb, v, SynDataType::Bf16, spec.kv_dim(), b, t, &format!("{lpfx}v"));
-            let cores: Vec<TensorId> = (0..b as usize)
-                .map(|j| {
-                    let spfx = format!("{}{lpfx}", slot_pfx(j as u64));
-                    append_attn_core(
-                        &mut gb, spec, qgs[j], ks[j], vs[j], cursors[j], rope_c, rope_s, &lpfx,
-                        &spfx, t, nch,
-                    )
+            // every slot on its own rows, cursor and caches, stage by stage across the slots
+            let slots: Vec<AttnSlot> = (0..b as usize)
+                .map(|j| AttnSlot {
+                    qg: qgs[j],
+                    k: ks[j],
+                    v: vs[j],
+                    cursor: cursors[j],
+                    spfx: format!("{}{lpfx}", slot_pfx(j as u64)),
+                    t: t,
                 })
                 .collect();
+            let cores = append_attn_core_slots(&mut gb, spec, &slots, rope_c, rope_s, &lpfx, nch);
             let core = gb.add_intermediate(format!("{lpfx}core"), SynDataType::Bf16, &[nh * dh, rows]);
             gb.op_concat(format!("{lpfx}core_cat"), &cores, core, 1);
             add_linear_bf16(&mut gb, core, &format!("{lpfx}W_o"), nh * dh, hid, rows, &format!("{lpfx}attn"))
         } else {
             let (hv, dl) = (spec.gdn_v_heads, spec.gdn_v_dim);
             let (qkvz, ba) = append_linear_proj(&mut gb, spec, x, h_pre, &lpfx, rows);
-            let qs = split_groups(&mut gb, qkvz, SynDataType::Bf16, spec.gdn_qkvz_dim(), b, t, &format!("{lpfx}qkvz"));
-            let bs = split_groups(&mut gb, ba, SynDataType::Bf16, spec.gdn_ba_dim(), b, t, &format!("{lpfx}ba"));
-            let cores: Vec<TensorId> = (0..b as usize)
-                .map(|j| {
-                    let spfx = format!("{}{lpfx}", slot_pfx(j as u64));
-                    append_gdn_ckpt_core(
-                        &mut gb, spec, qs[j], bs[j], a_in[j], &lpfx, &spfx, t, ns, gdn_fast,
-                    )
-                })
-                .collect();
-            let core = gb.add_intermediate(format!("{lpfx}core"), SynDataType::Bf16, &[hv * dl, rows]);
-            gb.op_concat(format!("{lpfx}core_cat"), &cores, core, 1);
+            let spfx: Vec<String> = (0..b).map(|j| format!("{}{lpfx}", slot_pfx(j))).collect();
+            let widths = vec![t; b as usize];
+            let core = if gdn_replay {
+                replay::append_gdn_replay_slots(
+                    &mut gb, spec, qkvz, ba, &a_in, &cursors, &rp_first, &lpfx, &spfx, &widths, ns,
+                )
+            } else {
+                append_gdn_ckpt_slots(
+                    &mut gb, spec, qkvz, ba, &a_in, &lpfx, &spfx, &widths, ns, gdn_fast,
+                )
+            };
             add_linear_bf16(&mut gb, core, &format!("{lpfx}W_o"), hv * dl, hid, rows, &format!("{lpfx}attn"))
         };
         let (out_x, next) = append_post_and_mlp(
@@ -267,7 +281,9 @@ pub fn spec_slot_bound(name: &str) -> Option<(usize, &str)> {
         || own.ends_with("_S_in")
         || own.ends_with("_S_ckpt")
         || own.ends_with("_cs_in")
-        || own.ends_with("_cs_ckpt");
+        || own.ends_with("_cs_ckpt")
+        || own == "rp_first"
+        || replay::is_parity_name(own);
     lane_owned.then_some((j, own))
 }
 
@@ -310,6 +326,11 @@ mod tests {
             assert_eq!(count(&views, guid), 3 * count(&solo_views, guid), "{guid}");
         }
         assert_eq!(count(&views, "argmax_fwd_bf16"), 1);
+        // the DeltaNet gate and output norm compute each row on its own: once for all slots
+        for guid in ["gaudium_gdn_gate", "gaudium_gdn_post"] {
+            assert_eq!(count(&views, guid), count(&solo_views, guid), "{guid}");
+        }
+        assert_eq!(count(&views, "gaudium_gdn_prep"), 3 * count(&solo_views, "gaudium_gdn_prep"));
         // the drafter's weights are read as often as in the solo step: once per launch for all
         // three slots (its context pass, its block projections, MLPs, bridge and readout)
         let readers = |v: &[crate::synapse::graph::NodeIoView<'_>], w: &str| {
@@ -339,6 +360,35 @@ mod tests {
             assert_eq!(spec_slot_bound(&format!("s{j}_emitted")), Some((j, "emitted")));
         }
         assert_eq!(spec_slot_bound("s1_blk_scores"), None);
+        // the output norm in calls of at most 32 rows: 8 slots of 8 rows are two calls a layer
+        let g8 = build_batched_spec_step_graph(&spec, 16384, 1, 8, 16, 8, &dc, &[], false);
+        assert_eq!(count(&g8.node_io_views(), "gaudium_gdn_post"), 2 * 48);
+        for n in g8.node_io_views().iter().filter(|n| n.guid == "gaudium_gdn_post") {
+            assert_eq!(n.inputs[0].dims[2], 32, "{}", n.name);
+        }
+        // the replay form: per slot its lane's single states, update buffers and first cursor
+        let rp: Vec<(String, String)> = vec![
+            ("GAUDIUM_ACCEPTT_ELF".into(), "00".into()),
+            (super::replay::GDNR_ELF.into(), "11".into()),
+        ];
+        let r = build_batched_spec_step_graph(&spec, 16384, 1, 8, 16, 3, &dc, &rp, false);
+        assert_eq!(r.recipe_name(), "g_spec_dsr_B3_T8_C1");
+        let rspecs = r.persistent_tensor_specs();
+        let rdims = |n: &str| rspecs.iter().find(|s| s.0 == n).map(|s| s.2.clone());
+        for j in 0..3 {
+            assert_eq!(rdims(&format!("s{j}_L0_S_in")), Some(vec![64, 256, 48]));
+            assert_eq!(rdims(&format!("s{j}_L0_S_base")), Some(vec![64, 256, 48]));
+            assert_eq!(rdims(&format!("s{j}_L0_rpk_in")), Some(vec![128, 48, 16]));
+            assert_eq!(rdims(&format!("s{j}_L0_rpd_out")), Some(vec![64, 8, 48, 8]));
+            assert_eq!(rdims(&format!("s{j}_rp_first")), Some(vec![1]));
+            for n in ["L0_S_base", "L0_rpk_in", "L0_rpk_out", "L0_rpd_in", "L0_rpd_out", "L0_rpg_in", "L0_rpg_out", "rp_first"] {
+                assert_eq!(spec_slot_bound(&format!("s{j}_{n}")), Some((j, n)), "{n}");
+            }
+        }
+        assert!(!rspecs.iter().any(|s| s.0.ends_with("_S_ckpt")));
+        let rviews = r.node_io_views();
+        assert_eq!(count(&rviews, "gaudium_gdn_f32r"), 3 * 48);
+        assert_eq!(count(&rviews, "gaudium_gdn_post"), 48);
         // the drafter's weights are the solo step's names
         for (name, ..) in &specs {
             if dspine::is_drafter_weight(name) && !name.ends_with("df_nofix") {

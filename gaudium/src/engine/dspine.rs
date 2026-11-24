@@ -710,11 +710,13 @@ fn append_spine_layer(
     let vs = split_slot_cols(gb, v, SynDataType::Bf16, D_KVD, &widths, &format!("{ap}v_split"), |j| {
         format!("{}D{l}_v", slots[j].pfx)
     });
-    let mut cores = Vec::with_capacity(slots.len());
+    // each slot's attention on its own block and its lane's context caches, stage by stage across
+    // the slots (one slot's matrix stage beside another's vector stage)
+    let rows = dc.ctx_rows(lmax);
+    let sap = |sl: &BlkSlot| format!("{}D{l}_", sl.pfx);
+    let mut prep = Vec::with_capacity(slots.len());
     for (j, sl) in slots.iter().enumerate() {
-        let ap = format!("{}D{l}_", sl.pfx);
-        let (q, k, v, cur_blk, fix) = (qs[j], ks[j], vs[j], sl.cur_blk, sl.fix);
-        let t = tb;
+        let ap = sap(sl);
         let qb = gb.add_persistent_tensor(format!("{ap}qb"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
         let kblk =
             gb.add_persistent_tensor(format!("{ap}kblk"), SynDataType::Bf16, &[D_DH, 128, D_NKV]);
@@ -723,12 +725,16 @@ fn append_spine_layer(
         gb.add_node(
             "gaudium_df_attn_prep",
             format!("{ap}attn_prep"),
-            &[q, k, v, qn_w, kn_w, rope_c, rope_s, cur_blk],
+            &[qs[j], ks[j], vs[j], qn_w, kn_w, rope_c, rope_s, sl.cur_blk],
             &[qb, kblk, vblk],
             &[],
         );
+        prep.push((qb, kblk, vblk));
+    }
+    let mut scs = Vec::with_capacity(slots.len());
+    for (sl, &(qb, kblk, _)) in slots.iter().zip(&prep) {
+        let ap = sap(sl);
         // the context keys: one row per position, or the ring of the window (`dc.ring`)
-        let rows = dc.ctx_rows(lmax);
         let kcache = gb.get_or_add_persistent_tensor(
             format!("{ap}kcache"),
             SynDataType::Bf16,
@@ -743,6 +749,11 @@ fn append_spine_layer(
         let sb = gb.add_persistent_tensor(format!("{ap}sb"), SynDataType::Float, &[128, r4, D_NKV]);
         gb.op_batch_gemm(format!("{ap}qk_ctx"), qb, kcache, sc, false, true);
         gb.op_batch_gemm(format!("{ap}qk_blk"), qb, kblk, sb, false, true);
+        scs.push((sc, sb, vcache));
+    }
+    let mut ps = Vec::with_capacity(slots.len());
+    for (sl, &(sc, sb, _)) in slots.iter().zip(&scs) {
+        let ap = sap(sl);
         let pc = gb.add_persistent_tensor(format!("{ap}Pc"), SynDataType::Bf16, &[rows, r4, D_NKV]);
         let pb = gb.add_persistent_tensor(format!("{ap}Pb"), SynDataType::Bf16, &[128, r4, D_NKV]);
         gb.add_node(
@@ -752,17 +763,27 @@ fn append_spine_layer(
                 "gaudium_ds_softmax"
             },
             format!("{ap}softmax"),
-            &[sc, sb, cur_blk, fix],
+            &[sc, sb, sl.cur_blk, sl.fix],
             &[pc, pb],
-            &u32_params(&[t as u32, dc.window as u32]),
+            &u32_params(&[tb as u32, dc.window as u32]),
         );
+        ps.push((pc, pb));
+    }
+    let mut aos = Vec::with_capacity(slots.len());
+    for (((sl, &(pc, pb)), &(_, _, vcache)), &(_, _, vblk)) in slots.iter().zip(&ps).zip(&scs).zip(&prep) {
+        let ap = sap(sl);
         let aoc = gb.add_persistent_tensor(format!("{ap}aoc"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
         let aob = gb.add_persistent_tensor(format!("{ap}aob"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
         let ao = gb.add_persistent_tensor(format!("{ap}ao"), SynDataType::Bf16, &[D_DH, r4, D_NKV]);
         gb.op_batch_gemm(format!("{ap}pv_ctx"), pc, vcache, aoc, false, false);
         gb.op_batch_gemm(format!("{ap}pv_blk"), pb, vblk, aob, false, false);
         gb.op_add_bf16(format!("{ap}ao_add"), aoc, aob, ao);
-        let core = gb.add_persistent_tensor(format!("{ap}core"), SynDataType::Bf16, &[D_QD, t]);
+        aos.push(ao);
+    }
+    let mut cores = Vec::with_capacity(slots.len());
+    for (sl, &ao) in slots.iter().zip(&aos) {
+        let ap = sap(sl);
+        let core = gb.add_persistent_tensor(format!("{ap}core"), SynDataType::Bf16, &[D_QD, tb]);
         gb.add_node(
             "gaudium_df_post",
             format!("{ap}attn_post"),

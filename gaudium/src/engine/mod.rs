@@ -439,18 +439,21 @@ pub fn lanes_supported(spec: &ModelSpec) -> bool {
 }
 
 /// The kind of drafter the verified lane rule (`ln_drafter_ok`) judges: none, DSpine with the
-/// checkpoint form of the verify rows (the form the batched speculative steps are built for), or
-/// another. `dspine`: whether the load has a drafter, and whether it is DSpine. The engine and the
+/// checkpoint or the replay form of the verify rows (the forms the batched speculative steps are
+/// built for), or another. `dspine`: whether the load has a drafter, and whether it is DSpine. The engine and the
 /// server both ask this, so they agree on which loads get lanes.
 pub fn lane_drafter(
     dspine: Option<bool>,
     verify: step_opts::GdnVerify,
 ) -> crate::verified::LaneDrafter {
-    // (the batched speculative steps are built for the checkpointed verify rows)
+    // (the batched speculative steps are built for the checkpointed and the replayed verify rows)
     crate::verified::ln_lane_drafter_of(
         dspine.is_some(),
         dspine == Some(true),
-        verify == step_opts::GdnVerify::Checkpoint,
+        matches!(
+            verify,
+            step_opts::GdnVerify::Checkpoint | step_opts::GdnVerify::Replay
+        ),
     )
 }
 
@@ -556,10 +559,11 @@ mod lane_drafter_tests {
     use crate::verified::LaneDrafter;
 
     #[test]
-    fn only_dspine_with_checkpointed_verify_rows_counts_as_a_lane_drafter() {
+    fn only_dspine_with_checkpointed_or_replayed_verify_rows_counts_as_a_lane_drafter() {
         assert!(matches!(lane_drafter(None, GdnVerify::Checkpoint), LaneDrafter::LdNone));
         assert!(matches!(lane_drafter(Some(true), GdnVerify::Checkpoint), LaneDrafter::LdDSpine));
-        assert!(matches!(lane_drafter(Some(true), GdnVerify::Replay), LaneDrafter::LdOther));
+        assert!(matches!(lane_drafter(Some(true), GdnVerify::Replay), LaneDrafter::LdDSpine));
+        assert!(matches!(lane_drafter(Some(true), GdnVerify::Mme), LaneDrafter::LdOther));
         assert!(matches!(lane_drafter(Some(false), GdnVerify::Checkpoint), LaneDrafter::LdOther));
     }
 }

@@ -129,15 +129,18 @@ pub fn build_batched_step_graph(
                 b,
                 &format!("{lpfx}v"),
             );
-            let cores: Vec<TensorId> = (0..b as usize)
-                .map(|j| {
-                    let spfx = format!("{}{lpfx}", slot_pfx(j as u64));
-                    append_attn_core(
-                        &mut gb, spec, qgs[j], ks[j], vs[j], cursors[j], rope_c, rope_s, &lpfx,
-                        &spfx, 1, nch,
-                    )
+            // every slot on its own rows, cursor and caches, stage by stage across the slots
+            let slots: Vec<AttnSlot> = (0..b as usize)
+                .map(|j| AttnSlot {
+                    qg: qgs[j],
+                    k: ks[j],
+                    v: vs[j],
+                    cursor: cursors[j],
+                    spfx: format!("{}{lpfx}", slot_pfx(j as u64)),
+                    t: 1,
                 })
                 .collect();
+            let cores = append_attn_core_slots(&mut gb, spec, &slots, rope_c, rope_s, &lpfx, nch);
             let core = gb.add_intermediate(format!("{lpfx}core"), SynDataType::Bf16, &[nh * dh, b]);
             gb.op_concat(format!("{lpfx}core_cat"), &cores, core, 1);
             add_linear_bf16(
@@ -299,7 +302,13 @@ impl LaneFamily {
     fn name(&self, b: u64, nch: u64, sampled: bool) -> String {
         match self {
             Self::K0 { .. } => batched_step_name(b, nch, sampled),
-            Self::Spec(g) => spec::lanes::batched_spec_name(b, g.t, nch, sampled),
+            Self::Spec(g) => spec::lanes::batched_spec_name(
+                b,
+                g.t,
+                nch,
+                sampled,
+                spec::replay::enabled(&g.hashes),
+            ),
         }
     }
 
@@ -531,6 +540,60 @@ pub(super) struct LaneRt {
     launched: u64,
     /// Batched recipes compiled on first use bypass the recipe cache (`--profile-steps`).
     fresh: bool,
+    /// Where a lane session's wall time goes (report only: `--verbose`).
+    timing: StepTiming,
+}
+
+/// The wall time of a lane session's batched launches, split at the launch and its sync.
+#[derive(Debug, Default)]
+struct StepTiming {
+    launches: u64,
+    /// Before the launch: the slot table, the recipe and its prepared bindings, the inputs.
+    before_ms: f64,
+    /// From the launch to the end of its sync: the device.
+    device_ms: f64,
+    /// After the sync: the read-back of each slot's tokens.
+    after_ms: f64,
+    /// From one launch's read-back to the next launch's start: the loop's own work (tokens,
+    /// admissions, prefills of new requests).
+    between_ms: f64,
+    last_end: Option<Instant>,
+}
+
+impl StepTiming {
+    fn begin(&mut self) -> Instant {
+        let now = Instant::now();
+        if let Some(e) = self.last_end {
+            self.between_ms += (now - e).as_secs_f64() * 1e3;
+        }
+        now
+    }
+
+    fn end(&mut self, t0: Instant, launched: Instant, synced: Instant) {
+        let now = Instant::now();
+        self.launches += 1;
+        self.before_ms += (launched - t0).as_secs_f64() * 1e3;
+        self.device_ms += (synced - launched).as_secs_f64() * 1e3;
+        self.after_ms += (now - synced).as_secs_f64() * 1e3;
+        self.last_end = Some(now);
+    }
+
+    /// The split per launch, then a fresh count.
+    fn report(&mut self) -> Option<String> {
+        let n = self.launches;
+        let line = (n > 0).then(|| {
+            let per = |ms: f64| ms / n as f64;
+            format!(
+                "[gaudium] lanes: {n} batched launches: per launch {:.2} ms before the launch, {:.2} ms on the device, {:.2} ms reading back, {:.2} ms between launches",
+                per(self.before_ms),
+                per(self.device_ms),
+                per(self.after_ms),
+                per(self.between_ms)
+            )
+        });
+        *self = Self::default();
+        line
+    }
 }
 
 /// Prepared launches kept before the cache is cleared.
@@ -574,6 +637,7 @@ impl LaneRt {
             table: LaneTable::new(n),
             launched: 0,
             fresh: plan.fresh,
+            timing: StepTiming::default(),
         }
     }
 
@@ -1040,7 +1104,14 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
                     sd.step_addr(&format!("sp_cur{p}")),
                     sd.step_addr(&format!("sp_ids{p}")),
                 );
-                spec::write_i32s(eng, &[(a, &[0]), (c, &[run.cursor as i32]), (i, &ids)])?;
+                let cur0 = [run.cursor as i32];
+                let mut writes: Vec<(u64, &[i32])> = vec![(a, &[0]), (c, &cur0), (i, &ids)];
+                // the replay form: the lane's first step replays nothing (its cursor is the
+                // first-step cursor)
+                if let Some(r) = sd.lane_rp_first() {
+                    writes.push((r, &cur0));
+                }
+                spec::write_i32s(eng, &writes)?;
             }
             Ok(Some(run))
         }
@@ -1218,6 +1289,7 @@ fn prepare(
     let rt = eng.lanes.as_ref().expect("lanes");
     let mut pool = rt.base.clone();
     let spec_family = matches!(rt.family, LaneFamily::Spec(_));
+    let replay = matches!(&rt.family, LaneFamily::Spec(g) if spec::replay::enabled(&g.hashes));
     for (j, (&lane, &p)) in lanes.iter().zip(parities).enumerate() {
         let sp = slot_pfx(j as u64);
         // the state buffer the step writes: the one its lane's next step reads
@@ -1280,6 +1352,18 @@ fn prepare(
                 pool.insert(format!("{sp}L{l}_cs_in"), st.cs[p]);
                 pool.insert(format!("{sp}L{l}_cs_ckpt"), st.cs[q]);
             }
+            if replay {
+                // the replay form: the state the step starts from is written once (`S_base`),
+                // the update buffers alternate by parity like the rest of the lane's step state
+                pool.insert(format!("{sp}rp_first"), own("sp_rp_first"));
+                for &l in gdn.keys() {
+                    pool.insert(format!("{sp}L{l}_S_base"), gdn[&l].s[q]);
+                    for what in ["rpk", "rpd", "rpg"] {
+                        pool.insert(format!("{sp}L{l}_{what}_in"), own(&format!("sp_{what}{p}_L{l}")));
+                        pool.insert(format!("{sp}L{l}_{what}_out"), own(&format!("sp_{what}{q}_L{l}")));
+                    }
+                }
+            }
         } else {
             pool.insert(format!("{sp}cursor"), rt.io_cursor[j]);
             for (&l, st) in gdn {
@@ -1310,6 +1394,7 @@ fn step(
     runs: &[Option<Run>],
     sampled: bool,
 ) -> Result<Vec<i32>, String> {
+    let t0 = eng.lanes.as_mut().expect("lanes").timing.begin();
     let b = lanes.len() as u64;
     let slots: Vec<(u64, u64)> = lanes
         .iter()
@@ -1375,19 +1460,23 @@ fn step(
             .launch_prepared(&eng.dev, &rt.launches[&lk])
             .map_err(|e| format!("launch {}: {e}", batched_step_name(b, nch, sampled)))?;
     }
+    let launched = Instant::now();
     // SAFETY: the compute stream belongs to `eng.dev`.
     unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
         .map_err(|e| format!("sync {}: {e}", batched_step_name(b, nch, sampled)))?;
+    let synced = Instant::now();
     eng.dev
         .copy_d2h_pinned_sync(io_tokens, &mut eng.stage_io, 4 * lanes.len())
         .map_err(|e| format!("read batched step tokens D2H: {e}"))?;
     let raw = &eng.stage_io.as_slice()[..4 * lanes.len()];
-    Ok(raw
+    let toks = raw
         .as_chunks::<4>()
         .0
         .iter()
         .map(|c| i32::from_le_bytes(*c))
-        .collect())
+        .collect();
+    eng.lanes.as_mut().expect("lanes").timing.end(t0, launched, synced);
+    Ok(toks)
 }
 
 /// Before every batched launch: the device-trace windows of `--profile-steps` (by the count of
@@ -1409,6 +1498,7 @@ fn spec_step(
     runs: &[Option<Run>],
     sampled: bool,
 ) -> Result<Vec<Vec<i32>>, String> {
+    let t0 = eng.lanes.as_mut().expect("lanes").timing.begin();
     let b = lanes.len() as u64;
     let t = eng.lanes.as_ref().expect("lanes").family.rows();
     let slots: Vec<(u64, u64)> = lanes
@@ -1447,9 +1537,11 @@ fn spec_step(
             .launch_prepared(&eng.dev, &rt.launches[&lk])
             .map_err(|e| format!("launch {}: {e}", rt.family.name(b, nch, sampled)))?;
     }
+    let launched = Instant::now();
     // SAFETY: the compute stream belongs to `eng.dev`.
     unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
         .map_err(|e| format!("sync batched speculative step: {e}"))?;
+    let synced = Instant::now();
     let mut out = Vec::with_capacity(lanes.len());
     for (&lane, &p) in lanes.iter().zip(&parities) {
         let name = format!("sp_emit{p}");
@@ -1463,6 +1555,7 @@ fn spec_step(
         };
         out.push(spec::read_i32s(eng, addr, t as usize)?);
     }
+    eng.lanes.as_mut().expect("lanes").timing.end(t0, launched, synced);
     Ok(out)
 }
 
@@ -1491,6 +1584,11 @@ pub(super) fn serve(eng: &mut Qwen3Engine, feed: &mut dyn LaneFeed) -> Result<()
     let n = eng.lanes.as_ref().expect("lanes").n;
     let mut runs: Vec<Option<Run>> = (0..n).map(|_| None).collect();
     let res = serve_loop(eng, feed, &mut runs);
+    if let Some(line) = eng.lanes.as_mut().expect("lanes").timing.report() {
+        if eng.verbose {
+            eprintln!("{line}");
+        }
+    }
     let launched = eng.lanes.as_ref().expect("lanes").launched;
     let res = res.and(prof_rt::end_lanes(eng, launched));
     if let Err(e) = &res {

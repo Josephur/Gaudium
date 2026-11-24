@@ -125,9 +125,11 @@ Serve options:
                         free lane where it takes over the most of its prompt for the
                         least of another conversation's rows. Dense Qwen3 /
                         Qwen3.5 / Qwen3.8 models without a drafter or with a DSpine
-                        drafter whose verify rows are checkpointed (--gdn-verify
-                        checkpoint, the default); every lane verifies and drafts at
-                        the narrowest --draft-k width. Other models are
+                        drafter whose verify rows are checkpointed or replayed
+                        (--gdn-verify checkpoint, the default, or replay, which keeps
+                        no per-row state copies: about 1.7 GiB less per lane on the
+                        27B); every lane verifies and drafts at the narrowest
+                        --draft-k width. Other models are
                         served with one lane (the log says why). /props total_slots
                         and /slots show the lanes. Not with --cache-ram yet (the
                         host-RAM tier is off for a model served with lanes)

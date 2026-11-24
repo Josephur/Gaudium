@@ -152,9 +152,11 @@ fn print_usage() {
          \x20                       free lane where it takes over the most of its prompt for the\n\
          \x20                       least of another conversation's rows. Dense Qwen3 /\n\
          \x20                       Qwen3.5 / Qwen3.8 models without a drafter or with a DSpine\n\
-         \x20                       drafter whose verify rows are checkpointed (--gdn-verify\n\
-         \x20                       checkpoint, the default); every lane verifies and drafts at\n\
-         \x20                       the narrowest --draft-k width. Other models are\n\
+         \x20                       drafter whose verify rows are checkpointed or replayed\n\
+         \x20                       (--gdn-verify checkpoint, the default, or replay, which keeps\n\
+         \x20                       no per-row state copies: about 1.7 GiB less per lane on the\n\
+         \x20                       27B); every lane verifies and drafts at the narrowest\n\
+         \x20                       --draft-k width. Other models are\n\
          \x20                       served with one lane (the log says why). /props total_slots\n\
          \x20                       and /slots show the lanes. Not with --cache-ram yet (the\n\
          \x20                       host-RAM tier is off for a model served with lanes)\n\

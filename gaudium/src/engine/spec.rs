@@ -373,6 +373,195 @@ pub(crate) fn append_gdn_ckpt_core(
     core
 }
 
+/// [lanes] The checkpoint-form DeltaNet core of several slots side by side (`widths[j]` rows of
+/// slot `j`, in slot order, in `qkvz` / `ba`): the same kernels as [`append_gdn_ckpt_core`] on
+/// each slot's rows, emitted stage by stage across the slots so that no slot's stage waits on
+/// its own previous one: every slot's conv prep, then the gate of every row at once, every
+/// slot's recurrence, then the output norm and gate of every row at once (the gate and the
+/// post kernel compute each row on its own). `slots[j]` = slot `j`'s ring slot to read,
+/// `spfx[j]` its tensors' prefix (which also names its lane's state buffers).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_gdn_ckpt_slots(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    qkvz: TensorId,
+    ba: TensorId,
+    slots: &[TensorId],
+    wpfx: &str,
+    spfx: &[String],
+    widths: &[u64],
+    ns: u64,
+    fast_rows: bool,
+) -> TensorId {
+    let hv = spec.gdn_v_heads;
+    let dl = spec.gdn_v_dim;
+    let qkv = spec.gdn_qkv_dim();
+    let hvp = spec.gdn_hvp();
+    let rows: u64 = widths.iter().sum();
+    let f32t = SynDataType::Float;
+    let split = |gb: &mut GraphBuilder, x: TensorId, dims: &[u64], axis: usize, name: &str| -> Vec<TensorId> {
+        let parts: Vec<TensorId> = widths
+            .iter()
+            .enumerate()
+            .map(|(j, &w)| {
+                let mut d = dims.to_vec();
+                d[axis] = w;
+                gb.add_intermediate(format!("{}{name}", spfx[j]), f32t, &d)
+            })
+            .collect();
+        gb.op_split(format!("{wpfx}{name}_split"), x, &parts, axis as u32);
+        parts
+    };
+    let qkvzs: Vec<TensorId> = {
+        let parts: Vec<TensorId> = widths
+            .iter()
+            .enumerate()
+            .map(|(j, &w)| gb.add_intermediate(format!("{}qkvz", spfx[j]), SynDataType::Bf16, &[spec.gdn_qkvz_dim(), w]))
+            .collect();
+        gb.op_split(format!("{wpfx}qkvz_split"), qkvz, &parts, 1);
+        parts
+    };
+
+    // 1. every slot's conv prep (its own conv state ring)
+    let conv_w = gb.get_or_add_persistent_tensor(format!("{wpfx}conv_w"), f32t, &[qkv, 4]);
+    let conv_b = gb.get_or_add_persistent_tensor(format!("{wpfx}conv_b"), f32t, &[qkv]);
+    let mut qkv_s = Vec::with_capacity(widths.len());
+    for (j, &t) in widths.iter().enumerate() {
+        let sp = &spfx[j];
+        let cs_in = gb.add_persistent_tensor(format!("{sp}cs_in"), f32t, &[qkv, 3, ns]);
+        let cs_out = gb.add_persistent_tensor(format!("{sp}cs_out"), f32t, &[qkv, 3]);
+        let cs_ckpt = gb.add_persistent_tensor(format!("{sp}cs_ckpt"), f32t, &[qkv, 3, t]);
+        let q = gb.add_persistent_tensor(format!("{sp}q"), f32t, &[dl, hv, t]);
+        let k = gb.add_persistent_tensor(format!("{sp}k"), f32t, &[dl, hv, t]);
+        let v = gb.add_persistent_tensor(format!("{sp}v"), f32t, &[dl, hv, t]);
+        gb.add_node(
+            "gaudium_gdn_prep",
+            format!("{sp}gdn_prep"),
+            &[qkvzs[j], conv_w, cs_in, conv_b, slots[j]],
+            &[q, k, v, cs_out, cs_ckpt],
+            &u32_params(&[2 | 16]),
+        );
+        qkv_s.push((q, k, v));
+    }
+
+    // 2. the gate of every row
+    let a_log = gb.get_or_add_persistent_tensor(format!("{wpfx}A_log"), f32t, &[hvp]);
+    let dt_bias = gb.get_or_add_persistent_tensor(format!("{wpfx}dt_bias"), f32t, &[hvp]);
+    let eg = gb.add_persistent_tensor(format!("{wpfx}eg"), f32t, &[hvp, rows]);
+    let beta = gb.add_persistent_tensor(format!("{wpfx}beta"), f32t, &[hvp, rows]);
+    gb.add_node(
+        "gaudium_gdn_gate",
+        format!("{wpfx}gdn_gate"),
+        &[ba, a_log, dt_bias],
+        &[eg, beta],
+        &[],
+    );
+    let egs = split(gb, eg, &[hvp, rows], 1, "eg");
+    let betas = split(gb, beta, &[hvp, rows], 1, "beta");
+
+    // 3. every slot's recurrence (its own state ring, one checkpoint per row)
+    let gdn_guid = if fast_rows {
+        "gaudium_gdn_f32v"
+    } else {
+        "gaudium_gdn_f32"
+    };
+    let mut os = Vec::with_capacity(widths.len());
+    for (j, &t) in widths.iter().enumerate() {
+        let sp = &spfx[j];
+        let (q, k, v) = qkv_s[j];
+        let s_in = gb.add_persistent_tensor(format!("{sp}S_in"), f32t, &[64, 256, hv, ns]);
+        let s_out = gb.add_persistent_tensor(format!("{sp}S_out"), f32t, &[64, 256, hv]);
+        let s_ckpt = gb.add_persistent_tensor(format!("{sp}S_ckpt"), f32t, &[64, 256, hv, t]);
+        let o = gb.add_persistent_tensor(format!("{sp}o"), f32t, &[dl, hv, t]);
+        gb.add_node(
+            gdn_guid,
+            format!("{sp}gdn"),
+            &[s_in, q, k, v, egs[j], betas[j], slots[j]],
+            &[o, s_out, s_ckpt],
+            &u32_params(&[1 | 16]),
+        );
+        os.push(o);
+    }
+
+    // 4. the output norm and gate of every row
+    append_gdn_post_groups(gb, spec, &os, qkvz, wpfx, widths)
+}
+
+/// Rows one call of the DeltaNet output norm covers in the batched steps: the kernel's build for
+/// decode and verify rows takes at most this many (more rows get the prefill build, which
+/// switches its function tables row by row).
+pub(crate) const GDN_POST_ROWS: u64 = SPEC_MAX_ROWS;
+
+/// [lanes] The output norm and gate of every slot's rows (`os[j]` = slot `j`'s recurrence
+/// output, `widths[j]` rows; `qkvz` = every slot's projection rows in slot order): consecutive
+/// slots are grouped into calls of at most [`GDN_POST_ROWS`] rows (each row is normed on its own)
+/// -> `core {hv * dl, rows}`.
+pub(crate) fn append_gdn_post_groups(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    os: &[TensorId],
+    qkvz: TensorId,
+    wpfx: &str,
+    widths: &[u64],
+) -> TensorId {
+    let hv = spec.gdn_v_heads;
+    let dl = spec.gdn_v_dim;
+    let f32t = SynDataType::Float;
+    let rows: u64 = widths.iter().sum();
+    // consecutive slots, as many as the call's rows allow
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0u64;
+    for (j, &w) in widths.iter().enumerate() {
+        if j > start && acc + w > GDN_POST_ROWS {
+            groups.push(start..j);
+            start = j;
+            acc = 0;
+        }
+        acc += w;
+    }
+    groups.push(start..widths.len());
+    let norm_w = gb.get_or_add_persistent_tensor(format!("{wpfx}norm_w"), f32t, &[dl]);
+    let core = gb.add_persistent_tensor(format!("{wpfx}core"), SynDataType::Bf16, &[hv * dl, rows]);
+    if groups.len() == 1 {
+        let o_all = gb.add_intermediate(format!("{wpfx}o_all"), f32t, &[dl, hv, rows]);
+        gb.op_concat(format!("{wpfx}o_cat"), os, o_all, 2);
+        gb.add_node(
+            "gaudium_gdn_post",
+            format!("{wpfx}gdn_post"),
+            &[o_all, qkvz, norm_w],
+            &[core],
+            &u32_params(&[0u32]),
+        );
+        return core;
+    }
+    let g_rows: Vec<u64> = groups.iter().map(|g| widths[g.clone()].iter().sum()).collect();
+    let qkvz_dim = spec.gdn_qkvz_dim();
+    let zs: Vec<TensorId> = g_rows
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| gb.add_intermediate(format!("{wpfx}qkvz_g{i}"), SynDataType::Bf16, &[qkvz_dim, r]))
+        .collect();
+    gb.op_split(format!("{wpfx}qkvz_gsplit"), qkvz, &zs, 1);
+    let mut cores = Vec::with_capacity(groups.len());
+    for (i, g) in groups.iter().enumerate() {
+        let r = g_rows[i];
+        let o_g = gb.add_intermediate(format!("{wpfx}o_g{i}"), f32t, &[dl, hv, r]);
+        gb.op_concat(format!("{wpfx}o_g{i}_cat"), &os[g.clone()], o_g, 2);
+        let c = gb.add_intermediate(format!("{wpfx}core_g{i}"), SynDataType::Bf16, &[hv * dl, r]);
+        gb.add_node(
+            "gaudium_gdn_post",
+            format!("{wpfx}gdn_post_g{i}"),
+            &[o_g, zs[i], norm_w],
+            &[c],
+            &u32_params(&[0u32]),
+        );
+        cores.push(c);
+    }
+    gb.op_concat(format!("{wpfx}core_cat"), &cores, core, 1);
+    core
+}
+
 /// Builds the speculative step graph for `t` verify rows over `nch` KV chunks.
 ///
 /// `ns` = slots of the DeltaNet state rings (the widest step's rows), `drafter` = the device
@@ -753,6 +942,14 @@ impl SpecRuntime {
         if let Some(&b) = self.weight_specs.get("df_nofix") {
             v.push(("df_nofix".to_string(), b));
         }
+        // the replay form: the update buffers of both parities and the first-step cursor
+        if self.gdn_replay {
+            for (n, &b) in &self.act_specs {
+                if n.starts_with("sp_rp") {
+                    v.push((n.clone(), b));
+                }
+            }
+        }
         v
     }
 
@@ -792,6 +989,14 @@ impl SpecRuntime {
         if let Some(d) = self.drafter.as_mut() {
             d.swap_lane(&mut lane.ds);
         }
+    }
+
+    /// [lanes] The active lane's first-step cursor of the replay form (`None` in the checkpoint
+    /// form).
+    pub(super) fn lane_rp_first(&self) -> Option<u64> {
+        self.gdn_replay
+            .then(|| self.addr.get("sp_rp_first").copied())
+            .flatten()
     }
 
     /// [lanes] Address of a step buffer of the active lane (`sp_ids0`, ...).

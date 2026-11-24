@@ -640,11 +640,48 @@ pub(crate) fn append_attn_core(
     t: u64,
     nch: u64,
 ) -> TensorId {
+    let slot = AttnSlot {
+        qg,
+        k,
+        v,
+        cursor,
+        spfx: spfx.to_string(),
+        t,
+    };
+    append_attn_core_slots(gb, spec, &[slot], rope_c, rope_s, wpfx, nch)
+        .pop()
+        .expect("one slot")
+}
+
+/// One slot of [`append_attn_core_slots`]: its rows' projections, its cursor, the prefix of its
+/// tensors (its lane's caches among them) and its row count.
+pub(crate) struct AttnSlot {
+    pub qg: TensorId,
+    pub k: TensorId,
+    pub v: TensorId,
+    pub cursor: TensorId,
+    pub spfx: String,
+    pub t: u64,
+}
+
+/// The attention cores of several slots of one layer, each on its own rows, cursor and caches
+/// (the kernels of [`append_attn_core`]), emitted stage by stage across the slots (every slot's
+/// prep, then every slot's scores, softmax, PV, combine and gate) so that one slot's matrix
+/// stage can run beside another's vector stage. One slot is [`append_attn_core`]'s graph.
+/// Returns each slot's `core {nh * dh, t}`.
+pub(crate) fn append_attn_core_slots(
+    gb: &mut GraphBuilder,
+    spec: &ModelSpec,
+    slots: &[AttnSlot],
+    rope_c: TensorId,
+    rope_s: TensorId,
+    wpfx: &str,
+    nch: u64,
+) -> Vec<TensorId> {
     let nh = spec.n_heads;
     let nkv = spec.n_kv_heads;
     let dh = spec.head_dim;
     let gq = nh / nkv;
-    let r = gq * t;
     let b = nkv * nch;
 
     let g_aprep = if dh == 128 {
@@ -668,56 +705,87 @@ pub(crate) fn append_attn_core(
     // [kv8] the cache dtype of this layer (q block, caches and P) and its scale table (the
     // layer's, shared by every slot)
     let kv = kv8::AttnKv::of(gb, spec, wpfx);
-    let qb = gb.add_persistent_tensor(format!("{spfx}qb"), kv.dt, &[dh, r, b]);
-    let kcache =
-        gb.add_persistent_tensor(format!("{spfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
-    let vcache =
-        gb.add_persistent_tensor(format!("{spfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
-    let prep_params = u32_params(&[0u32]); // coff = 0
-    gb.add_node(
-        g_aprep,
-        format!("{spfx}attn_prep"),
-        &kv.inputs(&[qg, k, v, qn_w, kn_w, rope_c, rope_s, cursor]),
-        &[qb, kcache, vcache],
-        &prep_params,
-    );
+    let mut st: Vec<(TensorId, TensorId, TensorId)> = Vec::with_capacity(slots.len());
+    for sl in slots {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let qb = gb.add_persistent_tensor(format!("{spfx}qb"), kv.dt, &[dh, r, b]);
+        let kcache =
+            gb.add_persistent_tensor(format!("{spfx}kcache"), kv.dt, &[dh, KV_CHUNK, b]);
+        let vcache =
+            gb.add_persistent_tensor(format!("{spfx}vcache"), kv.dt, &[dh, KV_CHUNK, b]);
+        let prep_params = u32_params(&[0u32]); // coff = 0
+        gb.add_node(
+            g_aprep,
+            format!("{spfx}attn_prep"),
+            &kv.inputs(&[sl.qg, sl.k, sl.v, qn_w, kn_w, rope_c, rope_s, sl.cursor]),
+            &[qb, kcache, vcache],
+            &prep_params,
+        );
+        st.push((qb, kcache, vcache));
+    }
 
-    let scores = gb.add_persistent_tensor(
-        format!("{spfx}scores"),
-        SynDataType::Float,
-        &[KV_CHUNK, r, b],
-    );
-    gb.op_batch_gemm(format!("{spfx}qk"), qb, kcache, scores, false, true);
+    let mut scores_s = Vec::with_capacity(slots.len());
+    for (sl, &(qb, kcache, _)) in slots.iter().zip(&st) {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let scores = gb.add_persistent_tensor(
+            format!("{spfx}scores"),
+            SynDataType::Float,
+            &[KV_CHUNK, r, b],
+        );
+        gb.op_batch_gemm(format!("{spfx}qk"), qb, kcache, scores, false, true);
+        scores_s.push(scores);
+    }
 
-    let pm = gb.add_persistent_tensor(format!("{spfx}P"), kv.dt, &[KV_CHUNK, r, b]);
-    let stats =
-        gb.add_persistent_tensor(format!("{spfx}stats"), SynDataType::Float, &[64, 2, r, b]);
-    let sm_params = u32_params(&[t as u32, nch as u32, 0u32, 0u32]);
-    gb.add_node(
-        "gaudium_attn_softmax_chunk",
-        format!("{spfx}softmax"),
-        &kv.inputs(&[scores, cursor]),
-        &[pm, stats],
-        &sm_params,
-    );
+    let mut pm_s = Vec::with_capacity(slots.len());
+    for (sl, &scores) in slots.iter().zip(&scores_s) {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let pm = gb.add_persistent_tensor(format!("{spfx}P"), kv.dt, &[KV_CHUNK, r, b]);
+        let stats =
+            gb.add_persistent_tensor(format!("{spfx}stats"), SynDataType::Float, &[64, 2, r, b]);
+        let sm_params = u32_params(&[sl.t as u32, nch as u32, 0u32, 0u32]);
+        gb.add_node(
+            "gaudium_attn_softmax_chunk",
+            format!("{spfx}softmax"),
+            &kv.inputs(&[scores, sl.cursor]),
+            &[pm, stats],
+            &sm_params,
+        );
+        pm_s.push((pm, stats));
+    }
 
-    let ao_part =
-        gb.add_persistent_tensor(format!("{spfx}ao_part"), SynDataType::Float, &[dh, r, b]);
-    gb.op_batch_gemm(format!("{spfx}pv"), pm, vcache, ao_part, false, false);
+    let mut part_s = Vec::with_capacity(slots.len());
+    for ((sl, &(_, _, vcache)), &(pm, _)) in slots.iter().zip(&st).zip(&pm_s) {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let ao_part =
+            gb.add_persistent_tensor(format!("{spfx}ao_part"), SynDataType::Float, &[dh, r, b]);
+        gb.op_batch_gemm(format!("{spfx}pv"), pm, vcache, ao_part, false, false);
+        part_s.push(ao_part);
+    }
 
-    let ao = gb.add_persistent_tensor(format!("{spfx}ao"), SynDataType::Float, &[dh, r, nkv]);
-    let comb_params = u32_params(&[nch as u32]);
-    gb.add_node(
-        g_acomb,
-        format!("{spfx}combine"),
-        &[ao_part, stats],
-        &[ao],
-        &comb_params,
-    );
+    let mut ao_s = Vec::with_capacity(slots.len());
+    for ((sl, &ao_part), &(_, stats)) in slots.iter().zip(&part_s).zip(&pm_s) {
+        let (spfx, r) = (&sl.spfx, gq * sl.t);
+        let ao = gb.add_persistent_tensor(format!("{spfx}ao"), SynDataType::Float, &[dh, r, nkv]);
+        let comb_params = u32_params(&[nch as u32]);
+        gb.add_node(
+            g_acomb,
+            format!("{spfx}combine"),
+            &[ao_part, stats],
+            &[ao],
+            &comb_params,
+        );
+        ao_s.push(ao);
+    }
 
-    let core = gb.add_persistent_tensor(format!("{spfx}core"), SynDataType::Bf16, &[nh * dh, t]);
-    gb.add_node(g_apost, format!("{spfx}attn_post"), &[ao, qg], &[core], &[]);
-    core
+    let mut cores = Vec::with_capacity(slots.len());
+    for (sl, &ao) in slots.iter().zip(&ao_s) {
+        let spfx = &sl.spfx;
+        let core =
+            gb.add_persistent_tensor(format!("{spfx}core"), SynDataType::Bf16, &[nh * dh, sl.t]);
+        gb.add_node(g_apost, format!("{spfx}attn_post"), &[ao, sl.qg], &[core], &[]);
+        cores.push(core);
+    }
+    cores
 }
 
 /// Appends one Gated DeltaNet (`linear_attention`) layer (`Qwen3.5/3.8`).
