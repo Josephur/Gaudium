@@ -482,6 +482,24 @@ def ln_spec_batched(cursor: Nat, rows: Nat, max_ctx: Nat) -> Bool:
 def ln_lane_width_pick(+a: Nat, +b: Nat) -> Nat:
   Nat.min(a, b)
 
+# The kind of drafter the lane rule judges, for a load with a drafter (`has`) or not, a DSpine
+# drafter (`dspine`) or another, whose verify rows are in a form the batched speculative steps are
+# built for (`batched_form`: today the checkpointed DeltaNet verify rows) or not.
+def ln_lane_drafter_of(has: Bool, dspine: Bool, batched_form: Bool) -> LaneDrafter:
+  match has:
+    case False{}:
+      LdNone{}
+    case True{}:
+      match dspine:
+        case True{}:
+          match batched_form:
+            case True{}:
+              LdDSpine{}
+            case False{}:
+              LdOther{}
+        case False{}:
+          LdOther{}
+
 # Does a load get lanes? Its engine has batched steps (`engine_ok`), its drafter has, and it is
 # not a calibration load (which runs one request at a time).
 def ln_lanes_ok(engine_ok: Bool, d: LaneDrafter, calibrating: Bool) -> Bool:
@@ -1695,3 +1713,13 @@ law ln_lane_width_is_asked:
 
 def ln_lane_width_is_asked(a, b):
   ln_min_is_input(a, b)
+
+# promise: a load whose drafter verifies its rows in a form the batched speculative steps are not built for never gets lanes.
+law ln_unbatched_verify_no_lanes:
+  for +d: Bool
+  {ln_drafter_ok(ln_lane_drafter_of(True{}, d, False{})) == False{} : Bool}
+
+def ln_unbatched_verify_no_lanes(d):
+  match d:
+    case True{}: {==}
+    case False{}: {==}

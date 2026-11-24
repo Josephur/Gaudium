@@ -431,12 +431,12 @@ pub fn lane_drafter(
     dspine: Option<bool>,
     verify: step_opts::GdnVerify,
 ) -> crate::verified::LaneDrafter {
-    use crate::verified::LaneDrafter;
-    match dspine {
-        None => LaneDrafter::LdNone,
-        Some(true) if verify == step_opts::GdnVerify::Checkpoint => LaneDrafter::LdDSpine,
-        Some(_) => LaneDrafter::LdOther,
-    }
+    // (the batched speculative steps are built for the checkpointed verify rows)
+    crate::verified::ln_lane_drafter_of(
+        dspine.is_some(),
+        dspine == Some(true),
+        verify == step_opts::GdnVerify::Checkpoint,
+    )
 }
 
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
