@@ -252,6 +252,19 @@ pub(super) fn ensure_step(eng: &mut Qwen3Engine, nch: u64) -> Result<f64, String
     Ok(t0.elapsed().as_secs_f64() * 1000.0)
 }
 
+/// Launches the sampled decode step of `nch` chunks with the bindings of `pool` (a lane's).
+pub(super) fn launch_step_with(
+    eng: &Qwen3Engine,
+    nch: u64,
+    pool: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    let step = &eng.samp.as_ref().expect("on-card sampler").steps[&nch];
+    let exact = select_exact_bindings(&step.recipe, pool)?;
+    step.recipe
+        .launch_checked(&eng.dev, &exact)
+        .map_err(|e| format!("launch sampled decode step (chunks={nch}): {e}"))
+}
+
 /// Launches the sampled decode step of `nch` chunks for state parity `parity`.
 pub(super) fn launch_step(eng: &Qwen3Engine, nch: u64, parity: usize) -> Result<(), String> {
     let step = &eng.samp.as_ref().expect("on-card sampler").steps[&nch];

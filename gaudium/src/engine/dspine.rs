@@ -351,22 +351,9 @@ pub fn fp8_site(l: usize, what: &str) -> String {
 /// A drafter-layer projection `y {n, t} = W {k, n}^T . x {k, t}`: BF16, or FP8 with the cast of
 /// input site `site` shared by every GEMM that reads it.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn d_gemm(
-    gb: &mut GraphBuilder,
-    dc: &DSpineCfg,
-    x: TensorId,
-    w_name: &str,
-    k: u64,
-    n: u64,
-    t: u64,
-    y_name: &str,
-    site: &str,
-) -> TensorId {
-    d_gemm_p(gb, "", dc, x, w_name, k, n, t, y_name, site)
-}
-
-/// [`d_gemm`] whose input cast is named after `pfx` (one per lane in a batched step).
+/// A drafter-layer projection `y {n, t} = W {k, n}^T . x {k, t}`: BF16, or FP8 with the cast of
+/// input site `site` shared by every GEMM that reads it (the cast named after `pfx`, one per lane
+/// in a batched step).
 #[allow(clippy::too_many_arguments)]
 fn d_gemm_p(
     gb: &mut GraphBuilder,
@@ -1116,6 +1103,17 @@ pub struct DSpine {
     calib: Option<(std::path::PathBuf, crate::engine::fp8_graph::ActCalibrator)>,
     /// The context bound on the device (`lim[0]` of the ring softmax; -1 = none, as loaded).
     ctx_floor: i32,
+    /// [lanes] the pool's lane-owned entries (context caches, context bound) change with the
+    /// active lane: the first block binds them at each launch instead of a prepared launch.
+    lanes_on: bool,
+}
+
+/// [lanes] What one lane owns of the drafter: the addresses of its context caches and context
+/// bound (by the pool's names), and the bound's value on the device.
+#[derive(Debug, Clone, Default)]
+pub struct DSpineLane {
+    pub pool: BTreeMap<String, u64>,
+    pub ctx_floor: i32,
 }
 
 /// Default location of a drafter's FP8 files (activation-scale table, quantised matrices).
@@ -1229,6 +1227,7 @@ impl DSpine {
             f8_dir: None,
             calib: None,
             ctx_floor: -1,
+            lanes_on: false,
         };
         d.check_checkpoint()?;
         Ok(d)
@@ -1865,6 +1864,30 @@ impl DSpine {
         Ok(())
     }
 
+    /// [lanes] Names of the pool entries a lane owns: its context caches and context bound.
+    pub fn lane_pool_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .pool
+            .keys()
+            .filter(|n| is_drafter_kv(n))
+            .cloned()
+            .collect();
+        v.push("df_nofix".to_string());
+        v
+    }
+
+    /// [lanes] Exchanges the lane-owned pool entries and the cached context bound with `lane`
+    /// (the active lane's values go into `lane`, `lane`'s become the drafter's).
+    pub fn swap_lane(&mut self, lane: &mut DSpineLane) {
+        self.lanes_on = true;
+        for (name, addr) in lane.pool.iter_mut() {
+            if let Some(a) = self.pool.get_mut(name) {
+                std::mem::swap(a, addr);
+            }
+        }
+        std::mem::swap(&mut self.ctx_floor, &mut lane.ctx_floor);
+    }
+
     /// A calibration run reads the block's site buffers back after every launch.
     pub fn calibrating(&self) -> bool {
         self.calib.is_some()
@@ -1969,8 +1992,13 @@ impl DSpine {
                 self.blk0_launch.as_ref().expect("block0 launch"),
             ),
         };
-        r.launch_prepared(dev, launch)
-            .map_err(|e| format!("launch dspine block0: {e}"))?;
+        if self.lanes_on {
+            let exact = select_exact_bindings(r, &self.pool)?;
+            r.launch_checked(dev, &exact)
+        } else {
+            r.launch_prepared(dev, launch)
+        }
+        .map_err(|e| format!("launch dspine block0: {e}"))?;
         unsafe { dev.sync_stream(dev.compute_stream()) }
             .map_err(|e| format!("sync dspine block0: {e}"))?;
         let n = blk - 1;
@@ -1998,10 +2026,10 @@ pub(super) fn bf16_round(x: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    pub(super) const CFG_27B: &str = r#"{
+    pub(crate) const CFG_27B: &str = r#"{
       "architectures": ["DFlashDraftModel"], "block_size": 16,
       "code_bridge_second_pass": {"first_exact": 4, "head_topk": 16, "mode": "serial_table"},
       "dflash_config": {
@@ -2249,6 +2277,21 @@ mod tests {
             default_fp8_dir(Path::new("/m/Drafter-b16")),
             Path::new("/m/Drafter-b16-gaudium-pc")
         );
+    }
+
+        #[test]
+    fn tmp_ds_fingerprints() {
+        let spec = target_27b();
+        let mut dc = DSpineCfg::from_json(CFG_27B).unwrap();
+        let fp = |g: GraphBuilder| g.fingerprint("x");
+        println!("DSFP step {}", fp(super::super::build_spec_step_graph(&spec, 4096, 1, 8, 16, Some(&dc), &[])));
+        println!("DSFP sstep {}", fp(super::super::build_spec_step_graph_as(&spec, 4096, 2, 16, 16, Some(&dc), &[], true)));
+        println!("DSFP ctx {}", fp(build_ctx_graph(&spec, &dc, 512, 4096, &[])));
+        println!("DSFP blk0 {}", fp(build_block0_graph(&spec, &dc, 4096, &[], false)));
+        println!("DSFP blk0s {}", fp(build_block0_graph(&spec, &dc, 4096, &[], true)));
+        dc.fp8 = true; dc.nvd = 98304; dc.fp8_head = true; dc.ring = 8448;
+        println!("DSFP step8 {}", fp(super::super::build_spec_step_graph(&spec, 4096, 1, 8, 16, Some(&dc), &[])));
+        println!("DSFP sstep8 {}", fp(super::super::build_spec_step_graph_as(&spec, 4096, 1, 16, 16, Some(&dc), &[], true)));
     }
 
     #[test]

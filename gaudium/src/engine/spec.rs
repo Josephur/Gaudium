@@ -52,6 +52,9 @@ pub mod replay;
 #[path = "spec_vmme.rs"]
 pub mod vmme;
 // --- readout: runtime description and the step launches' byte model (host-only) ---
+// --- lanes: batched speculative steps of several requests (`--parallel`) ---
+#[path = "spec_lanes.rs"]
+pub mod lanes;
 #[path = "spec_readout.rs"]
 pub mod readout;
 
@@ -717,7 +720,142 @@ fn is_parity_tensor(name: &str) -> bool {
         || vmme::is_parity_name(name)
 }
 
+/// [lanes] What one lane owns of the speculative runtime: its step buffers of both parities and
+/// the drafter's context caches and context bound, by name.
+#[derive(Debug, Clone, Default)]
+pub struct SpecLane {
+    pub addr: BTreeMap<String, u64>,
+    pub ds: dspine::DSpineLane,
+}
+
 impl SpecRuntime {
+    /// [lanes] Does this runtime have batched steps for several lanes? A DSpine drafter with the
+    /// checkpoint form of the DeltaNet verify rows.
+    pub fn lanes_ok(&self) -> bool {
+        self.drafter.is_some()
+            && self.dflash2.is_none()
+            && self.mtp.is_none()
+            && self.tree.is_none()
+            && !self.gdn_replay
+            && self.vmconv.is_none()
+    }
+
+    /// [lanes] Rows of a batched step: the narrowest verify width (the one the lanes step at).
+    pub fn lane_rows(&self) -> u64 {
+        self.widths
+            .iter()
+            .copied()
+            .filter(|&t| t > 1)
+            .min()
+            .unwrap_or(1)
+    }
+
+    /// [lanes] The buffers a lane owns, `(name, bytes)`: the step buffers of both parities, the
+    /// drafter's context caches and its context bound.
+    pub(super) fn lane_buffers(&self) -> Vec<(String, u64)> {
+        let mut v = Vec::new();
+        for p in 0..2 {
+            for n in ["sp_ids", "sp_cur", "sp_a", "sp_emit"] {
+                let name = format!("{n}{p}");
+                if let Some(&b) = self.act_specs.get(&name) {
+                    v.push((name, b));
+                }
+            }
+        }
+        for (n, &b) in &self.kv_specs {
+            v.push((n.clone(), b));
+        }
+        if let Some(&b) = self.weight_specs.get("df_nofix") {
+            v.push(("df_nofix".to_string(), b));
+        }
+        v
+    }
+
+    /// [lanes] A lane's share of this runtime at the addresses `addr` (by the names of
+    /// [`Self::lane_buffers`]); its context bound starts as loaded (none).
+    pub(super) fn lane_at(&self, addr: BTreeMap<String, u64>) -> SpecLane {
+        let names = self
+            .drafter
+            .as_ref()
+            .map(|d| d.lane_pool_names())
+            .unwrap_or_default();
+        let pool = names
+            .into_iter()
+            .filter_map(|n| addr.get(&n).map(|&a| (n, a)))
+            .collect();
+        SpecLane {
+            addr,
+            ds: dspine::DSpineLane {
+                pool,
+                ctx_floor: -1,
+            },
+        }
+    }
+
+    /// [lanes] Exchanges the active lane's buffers with `lane`'s.
+    pub(super) fn swap_lane(&mut self, lane: &mut SpecLane) {
+        for (name, a) in lane.addr.iter_mut() {
+            if let Some(x) = self.addr.get_mut(name) {
+                std::mem::swap(x, a);
+            }
+        }
+        self.kv_addr = self
+            .kv_specs
+            .iter()
+            .map(|(n, &b)| (self.addr[n], b))
+            .collect();
+        if let Some(d) = self.drafter.as_mut() {
+            d.swap_lane(&mut lane.ds);
+        }
+    }
+
+    /// [lanes] Address of a step buffer of the active lane (`sp_ids0`, ...).
+    pub(super) fn step_addr(&self, name: &str) -> u64 {
+        self.addr[name]
+    }
+
+    /// [lanes] Everything a batched step binds the same way for every slot: the runtime's own
+    /// weights and buffers.
+    pub(super) fn shared_addrs(&self) -> &BTreeMap<String, u64> {
+        &self.addr
+    }
+
+    /// [lanes] Names the runtime binds as weights or tables (never a lane's).
+    pub(super) fn is_weight(&self, name: &str) -> bool {
+        self.weight_specs.contains_key(name)
+    }
+
+    /// [lanes] What the batched steps at the lanes' width are built from.
+    pub(super) fn lane_graph(&self) -> lanes::SpecLaneGraph {
+        lanes::SpecLaneGraph {
+            lmax: self.lmax,
+            ns: self.ns,
+            t: self.lane_rows(),
+            dc: self
+                .drafter
+                .as_ref()
+                .expect("lanes need a DSpine drafter")
+                .cfg
+                .clone(),
+            hashes: self.elf_hashes.clone(),
+            samp_hashes: self.samp_elf_hashes.clone(),
+        }
+    }
+
+    /// [lanes] The first block of a lane's request (anchor = the prefill's token at `cursor`):
+    /// its drafts.
+    pub(super) fn lane_block0(
+        &mut self,
+        dev: &HpuDevice,
+        stage_io: &mut PinnedBuf,
+        first: i32,
+        cursor: u64,
+        sampled: bool,
+    ) -> Result<Vec<i32>, String> {
+        let d = self.drafter.as_mut().expect("lanes need a DSpine drafter");
+        d.launch_block0(dev, stage_io, first, cursor as i32, sampled)
+    }
+
     pub fn gdn_slots(&self) -> u64 {
         self.ns
     }
@@ -1987,7 +2125,7 @@ fn ensure_step_as(eng: &mut Qwen3Engine, sampled: bool, t: u64, nch: u64) -> Res
     Ok(())
 }
 
-fn write_i32s(eng: &mut Qwen3Engine, writes: &[(u64, &[i32])]) -> Result<(), String> {
+pub(super) fn write_i32s(eng: &mut Qwen3Engine, writes: &[(u64, &[i32])]) -> Result<(), String> {
     let mut transfers = Vec::with_capacity(writes.len());
     let mut off = 0usize;
     let buf = eng.stage_io.as_mut_slice();
@@ -2003,7 +2141,7 @@ fn write_i32s(eng: &mut Qwen3Engine, writes: &[(u64, &[i32])]) -> Result<(), Str
         .map_err(|e| format!("spec H2D: {e}"))
 }
 
-fn read_i32s(eng: &mut Qwen3Engine, addr: u64, n: usize) -> Result<Vec<i32>, String> {
+pub(super) fn read_i32s(eng: &mut Qwen3Engine, addr: u64, n: usize) -> Result<Vec<i32>, String> {
     eng.dev
         .copy_d2h_pinned_sync(addr, &mut eng.stage_io, n * 4)
         .map_err(|e| format!("spec D2H: {e}"))?;

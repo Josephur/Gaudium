@@ -461,12 +461,14 @@ type LaneDrafter is Data:
   LdDSpine{}
   LdOther{}
 
-# Which kinds of decode have batched steps for several lanes.
+# Which kinds of decode have batched steps for several lanes: plain decode, and DSpine.
 def ln_drafter_ok(d: LaneDrafter) -> Bool:
   match d:
     case LdNone{}:
       True{}
-    case _:
+    case LdDSpine{}:
+      True{}
+    case LdOther{}:
       False{}
 
 # Does a load get lanes? Its engine has batched steps (`engine_ok`), its drafter has, and it is
