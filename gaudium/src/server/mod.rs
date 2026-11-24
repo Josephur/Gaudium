@@ -4170,6 +4170,27 @@ mod tests {
     }
 
     #[test]
+    fn taking_the_turn_charges_only_the_waiters_that_arrived_first() {
+        let q = TurnQueue::default();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        {
+            let mut st = q.mu.lock().unwrap();
+            st.waiting = waiters(&[1, 2], t0);
+            st.waiting[1].since = t1;
+            st.next_id = 2;
+        }
+        let lim = TurnLimits::default();
+        // the loaded model's waiter arrives with the second one: it passes over the first only
+        let turn = q.acquire_from(0, t1, || Some(0), || lim);
+        {
+            let st = q.mu.lock().unwrap();
+            assert_eq!(st.waiting.iter().map(|w| w.skips).collect::<Vec<_>>(), vec![1, 0]);
+        }
+        drop(turn);
+    }
+
+    #[test]
     fn a_lane_waiter_queued_from_an_earlier_arrival_takes_its_place_in_line() {
         let q = TurnQueue::default();
         let t0 = Instant::now();
