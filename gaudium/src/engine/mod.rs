@@ -320,6 +320,16 @@ impl GenEngine for qwen3::Qwen3Engine {
     fn host_tier_facts(&self) -> Option<qwen3::host_tier::TierFacts> {
         qwen3::Qwen3Engine::host_tier_facts(self)
     }
+    fn lanes(&self) -> usize {
+        qwen3::Qwen3Engine::lanes(self)
+    }
+    fn serve_lanes(&mut self, feed: &mut dyn LaneFeed) -> Result<(), String> {
+        if qwen3::Qwen3Engine::lanes(self) > 1 {
+            qwen3::Qwen3Engine::serve_lanes(self, feed)
+        } else {
+            serve_lanes_serially(self, feed)
+        }
+    }
 }
 
 impl GenEngine for gemma4::Gemma4Engine {

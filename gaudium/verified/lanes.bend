@@ -140,6 +140,25 @@ def ln_slot_chunks(+cursor: Nat, +rows: Nat, +chunk: Nat) -> Nat:
 def ln_batch_chunks(+acc: Nat, +cursor: Nat, +rows: Nat, +chunk: Nat) -> Nat:
   Nat.max(acc, ln_slot_chunks(cursor, rows, chunk))
 
+# The smallest power of two at least `n`, searched from `p` by doubling at most `fuel` times
+# (`done`: `p` is already at least `n`).
+def ln_pow2_up(fuel: Nat, done: Bool, +p: Nat, +n: Nat) -> Nat:
+  match fuel:
+    case 0n:
+      p
+    case 1n+f:
+      match done:
+        case True{}:
+          p
+        case False{}:
+          ln_pow2_up(f, Nat.is_ge(Nat.add(p, p), n), Nat.add(p, p), n)
+
+# The chunks a batched step covers when its slots need `need`: rounded up to a power of two, so
+# one recipe serves every count up to it (a slot's chunks past its cursor are fully masked), and
+# never past the lane's own `lane_chunks`.
+def ln_step_chunks(+need: Nat, +lane_chunks: Nat) -> Nat:
+  Nat.min(lane_chunks, Nat.max(need, ln_pow2_up(need, Nat.is_ge(1n, need), 1n, need)))
+
 # May a slot run in a step over `nch` chunks? Its rows inside the chunks, the chunks inside its lane.
 def ln_slot_fits(+cursor: Nat, +rows: Nat, +nch: Nat, +chunk: Nat, +lane_chunks: Nat) -> Bool:
   Bool.and(Nat.is_le(nch, lane_chunks), Nat.is_le(Nat.add(cursor, rows), Nat.mul(nch, chunk)))
@@ -213,6 +232,26 @@ def ln_le_iff_sub_zero(+a: Nat, +b: Nat) -> {Nat.is_le(a, b) == Nat.is_eq(Nat.su
       {==}
     case 1n+ap 1n+bp:
       ln_le_iff_sub_zero(ap, bp)
+
+def ln_min_ge(+a: Nat, +b: Nat, +c: Nat, ha: {Nat.is_le(c, a) == True{} : Bool}, hb: {Nat.is_le(c, b) == True{} : Bool}) -> {Nat.is_le(c, Nat.min(a, b)) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      ha
+    case 1n+ap 0n:
+      hb
+    case 1n+ap 1n+bp:
+      match c:
+        case 0n:
+          {==}
+        case 1n+cp:
+          ln_min_ge(ap, bp, cp, ha, hb)
+
+def ln_cover_aux(+need: Nat, +lc: Nat, b: Bool, e: {Nat.is_lt(lc, need) == b : Bool}) -> {Bool.or(b, Nat.is_le(need, ln_step_chunks(need, lc))) == True{} : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      ln_min_ge(lc, Nat.max(need, ln_pow2_up(need, Nat.is_ge(1n, need), 1n, need)), need, L.nat_not_lt_imp_le(lc, need, e), L.nat_max_ge_l(need, ln_pow2_up(need, Nat.is_ge(1n, need), 1n, need)))
 
 def ln_fit_within(
   +c: Nat,
@@ -468,3 +507,21 @@ def ln_served_lanes_within_request(r, ok):
         case True{}:
           L.nat_le_refl(1n+1n+rp)
         case False{}: {==}
+
+# promise: a batched step never covers more chunks than a lane owns.
+law ln_step_chunks_within_lane:
+  for +need: Nat
+  for +lc: Nat
+  {Nat.is_le(ln_step_chunks(need, lc), lc) == True{} : Bool}
+
+def ln_step_chunks_within_lane(need, lc):
+  L.nat_min_le_l(lc, Nat.max(need, ln_pow2_up(need, Nat.is_ge(1n, need), 1n, need)))
+
+# promise: a batched step covers every chunk its slots need whenever a lane can hold them.
+law ln_step_chunks_cover_need:
+  for +need: Nat
+  for +lc: Nat
+  {Bool.or(Nat.is_lt(lc, need), Nat.is_le(need, ln_step_chunks(need, lc))) == True{} : Bool}
+
+def ln_step_chunks_cover_need(need, lc):
+  ln_cover_aux(need, lc, Nat.is_lt(lc, need), {==})

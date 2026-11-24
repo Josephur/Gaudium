@@ -92,10 +92,28 @@ pub fn append_sampler(
     at: &SamplerAt,
     name: &str,
 ) -> TensorId {
+    append_sampler_as(gb, logits, vocab, t, at, name, SAMP_F, SAMP_I, None)
+}
+
+/// [`append_sampler`] reading the request parameters from the tensors named `samp_f` / `samp_i`
+/// (one request's parameters per readout, e.g. one per lane of a batched step) and writing the
+/// tokens into `out` when given (otherwise a new persistent tensor named `name`).
+#[allow(clippy::too_many_arguments)]
+pub fn append_sampler_as(
+    gb: &mut GraphBuilder,
+    logits: TensorId,
+    vocab: u64,
+    t: u64,
+    at: &SamplerAt,
+    name: &str,
+    samp_f: &str,
+    samp_i: &str,
+    out: Option<TensorId>,
+) -> TensorId {
     let f32s = SynDataType::Float;
     let nb = vocab.div_ceil(SAMP_BLOCK);
-    let spf = gb.get_or_add_persistent_tensor(SAMP_F, f32s, &[8]);
-    let spi = gb.get_or_add_persistent_tensor(SAMP_I, SynDataType::Int32, &[8]);
+    let spf = gb.get_or_add_persistent_tensor(samp_f, f32s, &[8]);
+    let spi = gb.get_or_add_persistent_tensor(samp_i, SynDataType::Int32, &[8]);
     let rsel = gb.get_or_add_persistent_tensor(SAMP_RSEL, SynDataType::Int32, &[1]);
 
     let bm = gb.add_intermediate(format!("{name}_sbm"), f32s, &[64, nb, t]);
@@ -142,7 +160,7 @@ pub fn append_sampler(
         &[gp],
         &u32_params(&[at.off, at.role, 1]),
     );
-    let tok = gb.add_persistent_tensor(name, SynDataType::Int32, &[1, t]);
+    let tok = out.unwrap_or_else(|| gb.add_persistent_tensor(name, SynDataType::Int32, &[1, t]));
     gb.add_node(
         "gaudium_samp_final",
         format!("{name}_sfinal"),

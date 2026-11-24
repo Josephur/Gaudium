@@ -41,11 +41,6 @@ impl LaneHub {
         !std::mem::replace(&mut m.active, true)
     }
 
-    /// Requests of model `idx` waiting for a lane.
-    pub fn waiting(&self, idx: usize) -> usize {
-        self.mu.lock().unwrap()[idx].queue.len()
-    }
-
     /// The lanes of model `idx` as its session last reported them.
     pub fn view(&self, idx: usize) -> Vec<LaneView> {
         self.mu.lock().unwrap()[idx].view.clone()
@@ -184,9 +179,8 @@ mod tests {
         let (a, ra) = job(1, true);
         assert!(!a.exclusive());
         assert!(hub.submit(1, a));
-        assert_eq!(hub.waiting(1), 1);
         hub.fail_waiting(1, "no card");
-        assert_eq!(hub.waiting(1), 0);
+        assert_eq!(hub.feed(1).head(false), FeedHead::Empty);
         match ra.recv().unwrap() {
             LaneOut::Done(d) => assert_eq!(d.report.unwrap_err(), "no card"),
             _ => panic!("expected the end of the request"),

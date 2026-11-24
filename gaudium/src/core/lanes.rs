@@ -8,7 +8,7 @@
 use crate::verified::{
     lane_can_admit, ln_batch_chunks, ln_in_batch, ln_is_drain, ln_is_free, ln_plan_bytes,
     ln_plan_fits, ln_plan_shortfall, ln_route_better, ln_route_eligible, ln_slot_fits, ln_step,
-    LaneEvent, LaneState,
+    ln_step_chunks, LaneEvent, LaneState,
 };
 
 /// A transition the lane lifecycle does not allow (the lane is left as it was).
@@ -189,6 +189,20 @@ pub fn batch_chunks(slots: &[(u64, u64)], chunk: u64) -> u64 {
         .fold(0, |acc, &(c, r)| ln_batch_chunks(acc, c, r, chunk))
 }
 
+/// Chunks a batched step covers when its slots need `need` (a lane owns `lane_chunks`).
+pub fn step_chunks(need: u64, lane_chunks: u64) -> u64 {
+    ln_step_chunks(need, lane_chunks)
+}
+
+/// Every chunk count a batched step can cover in a lane of `lane_chunks` (one recipe each).
+pub fn step_chunk_counts(lane_chunks: u64) -> Vec<u64> {
+    let mut v: Vec<u64> = (1..=lane_chunks.max(1))
+        .map(|need| ln_step_chunks(need, lane_chunks.max(1)))
+        .collect();
+    v.dedup();
+    v
+}
+
 /// May a slot (`cursor`, `rows`) run in a step over `nch` chunks of a lane of `lane_chunks`?
 pub fn slot_fits(cursor: u64, rows: u64, nch: u64, chunk: u64, lane_chunks: u64) -> bool {
     ln_slot_fits(cursor, rows, nch, chunk, lane_chunks)
@@ -268,6 +282,13 @@ mod tests {
         assert_eq!(batch_chunks(&[(4095, 1), (10, 1)], 4096), 1);
         assert_eq!(batch_chunks(&[(4095, 2), (10, 1)], 4096), 2);
         assert_eq!(batch_chunks(&[(100, 16), (8191, 1)], 4096), 2);
+        assert_eq!(
+            (1..=9).map(|n| step_chunks(n, 8)).collect::<Vec<_>>(),
+            vec![1, 2, 4, 4, 8, 8, 8, 8, 8]
+        );
+        assert_eq!(step_chunk_counts(8), vec![1, 2, 4, 8]);
+        assert_eq!(step_chunk_counts(6), vec![1, 2, 4, 6]);
+        assert_eq!(step_chunk_counts(1), vec![1]);
         assert!(slot_fits(4095, 1, 1, 4096, 4));
         assert!(!slot_fits(4096, 1, 1, 4096, 4));
         assert!(!slot_fits(0, 1, 5, 4096, 4), "the step reaches past the lane");
