@@ -25,7 +25,7 @@ tier (`--cache-ram`).
 
 Only the Python standard library is used. Results go to stdout and, with `--out`, to a JSON file.
 The exit status is 1 when a check fails (a mismatching or failed stream, a next turn that reused
-nothing), else 0.
+nothing, a `--park` wait the server never answered by releasing the card), else 0.
 """
 
 import argparse
@@ -354,8 +354,11 @@ def main():
                 content = r1["content"]
                 hist = [{"role": "user", "content": PROMPTS[i]}, {"role": "assistant", "content": content}]
                 turns.append((i, hist))
-            if a.park:
-                wait_parked(a.base, a.park)
+            if a.park and not wait_parked(a.base, a.park):
+                # a host restore alone does not show the card was released: a conversation a
+                # lane let go of comes back from host memory too, with the engine loaded
+                bad += 1
+                out["park_timeout"] = True
             res2 = [None] * len(turns)
 
             def turn2(j):
@@ -381,7 +384,8 @@ def main():
     if a.out:
         with open(a.out, "w") as f:
             json.dump(out, f, indent=1)
-    # a failed check (a mismatching or failed stream, a next turn that reused nothing) fails
+    # a failed check (a mismatching or failed stream, a next turn that reused nothing, a card
+    # never released for --park) fails
     return 1 if out.get("mismatches") else 0
 
 
