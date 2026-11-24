@@ -500,6 +500,18 @@ def ln_lane_drafter_of(has: Bool, dspine: Bool, batched_form: Bool) -> LaneDraft
         case False{}:
           LdOther{}
 
+def ln_ld_is_none(d: LaneDrafter) -> Bool:
+  match d:
+    case LdNone{}: True{}
+    case LdDSpine{}: False{}
+    case LdOther{}: False{}
+
+def ln_ld_is_dspine(d: LaneDrafter) -> Bool:
+  match d:
+    case LdNone{}: False{}
+    case LdDSpine{}: True{}
+    case LdOther{}: False{}
+
 # Does a load get lanes? Its engine has batched steps (`engine_ok`), its drafter has, and it is
 # not a calibration load (which runs one request at a time).
 def ln_lanes_ok(engine_ok: Bool, d: LaneDrafter, calibrating: Bool) -> Bool:
@@ -1721,5 +1733,28 @@ law ln_unbatched_verify_no_lanes:
 
 def ln_unbatched_verify_no_lanes(d):
   match d:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: a load with a drafter is never judged as plain decode by the lane rule.
+law ln_drafter_never_plain:
+  for +d: Bool
+  for +b: Bool
+  {ln_ld_is_none(ln_lane_drafter_of(True{}, d, b)) == False{} : Bool}
+
+def ln_drafter_never_plain(d, b):
+  match d b:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a drafter other than DSpine is never judged as DSpine by the lane rule.
+law ln_other_never_dspine:
+  for +b: Bool
+  {ln_ld_is_dspine(ln_lane_drafter_of(True{}, False{}, b)) == False{} : Bool}
+
+def ln_other_never_dspine(b):
+  match b:
     case True{}: {==}
     case False{}: {==}
