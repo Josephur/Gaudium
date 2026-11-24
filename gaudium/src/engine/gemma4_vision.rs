@@ -29,7 +29,10 @@
 
 use crate::fp8::f32_to_bf16_rne;
 use crate::json::{parse_json, JsonValue};
-use crate::verified::{g4v_size_ok, g4v_soft_budget, g4v_target_h, g4v_target_w, g4v_tokens};
+use crate::verified::{
+    g4v_grid_ok, g4v_size_ok, g4v_soft_budget, g4v_target_h, g4v_target_w, g4v_tokens, g4v_tower_ok,
+    g4v_width_ok,
+};
 use crate::vision::preprocess::{resize_rgb, PreparedImage, RgbImage};
 use crate::vision::{ImageProcessor, VisionSpec};
 
@@ -195,30 +198,26 @@ impl G4vDims {
         Ok(d)
     }
 
-    /// Shape rules the graphs and the host layout rely on.
+    /// Shape rules the graphs and the host layout rely on (the verified guards).
     pub fn validate(&self) -> Result<(), String> {
-        if self.patch == 0 || self.pool == 0 || self.npos == 0 || self.out == 0 {
-            return Err("vision_config: patch, pooling, position table and output sizes must be positive".into());
+        if !g4v_grid_ok(self.patch, self.pool, self.npos) {
+            return Err("vision_config: patch, pooling and position table sizes must be positive".into());
         }
-        if !self.hid.is_multiple_of(128) || !self.out.is_multiple_of(128) {
+        if !g4v_width_ok(self.hid) || !g4v_width_ok(self.out) {
             return Err(format!(
-                "vision widths {} / {} must be multiples of 128 (the family's norm kernels)",
+                "vision widths {} / {} must be whole blocks of 128 channels (the family's norm kernels)",
                 self.hid, self.out
             ));
         }
         if self.kind == G4vKind::Tower {
-            if self.layers == 0 || self.nh == 0 || self.inter == 0 || self.nh * self.dh != self.hid {
-                return Err("vision_config: layers, heads and widths do not make a tower".into());
+            if !g4v_tower_ok(self.layers, self.inter) {
+                return Err("vision_config: a tower needs layers and an MLP".into());
             }
-            if !self.dh.is_multiple_of(4) {
-                return Err(format!(
-                    "vision head width {}: the 2-D rotary code needs a multiple of 4",
-                    self.dh
-                ));
-            }
-        } else if !self.row_len().is_multiple_of(128) {
+            crate::core::gemma4::validate_gemma4_vision_heads(self.nh, self.dh, self.hid)
+                .map_err(|e| format!("vision_config: {e:?}"))?;
+        } else if !g4v_width_ok(self.row_len()) {
             return Err(format!(
-                "a merged patch of {} values: the LayerNorm kernel needs a multiple of 128",
+                "a merged patch of {} values: the LayerNorm kernel needs whole blocks of 128",
                 self.row_len()
             ));
         }

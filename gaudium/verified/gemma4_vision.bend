@@ -88,6 +88,23 @@ def g4v_size_ok(+th: Nat, +tw: Nat, +patch: Nat, +merge: Nat, max_soft: Nat) -> 
   Bool.and(Bool.and(Nat.is_eq(Nat.mod(th, Nat.mul(patch, merge)), 0n), Nat.is_eq(Nat.mod(tw, Nat.mul(patch, merge)), 0n)), VB.media_canvas_ok(Nat.div(Nat.div(tw, patch), merge), Nat.div(Nat.div(th, patch), merge), max_soft))
 
 # ============================================================================
+# 1b. Geometry the image path's graphs take
+# ============================================================================
+
+# A width the family's row kernels take (`gaudium_ga_rmsnorm`, `gaudium_ga_lnorm`): whole blocks
+# of 128 channels, not empty.
+def g4v_width_ok(+c: Nat) -> Bool:
+  Bool.and(Nat.is_gt(c, 0n), Nat.is_eq(Nat.mod(c, 128n), 0n))
+
+# The processor's and the position table's sizes: a patch, a pooling, a table row per axis.
+def g4v_grid_ok(+patch: Nat, +pool: Nat, +npos: Nat) -> Bool:
+  Bool.and(Nat.is_gt(patch, 0n), Bool.and(Nat.is_gt(pool, 0n), Nat.is_gt(npos, 0n)))
+
+# A tower has layers and an MLP.
+def g4v_tower_ok(+layers: Nat, +inter: Nat) -> Bool:
+  Bool.and(Nat.is_gt(layers, 0n), Nat.is_gt(inter, 0n))
+
+# ============================================================================
 # 2b. Capacity of the image path (sizes the up-front plan)
 # ============================================================================
 
@@ -504,3 +521,30 @@ law g4v_add_part_covers:
 
 def g4v_add_part_covers(t, b):
   L.nat_add_le_mono(t, t, b, g4v_part_bytes(b), L.nat_le_refl(t), L.nat_le_trans(b, Nat.max(b, 256n), g4v_part_bytes(b), L.nat_max_ge_l(b, 256n), TB.align_up_never_shrinks(Nat.max(b, 256n), 256n)))
+
+# LAW G4V.9
+# promise: an empty width is never taken by the row kernels.
+law g4v_empty_width_refused:
+  {g4v_width_ok(0n) == False{} : Bool}
+
+def g4v_empty_width_refused():
+  {==}
+
+# LAW G4V.10
+# promise: an image path without a patch size is refused.
+law g4v_zero_patch_refused:
+  for +q: Nat
+  for +n: Nat
+  {g4v_grid_ok(0n, q, n) == False{} : Bool}
+
+def g4v_zero_patch_refused(q, n):
+  {==}
+
+# LAW G4V.11
+# promise: a tower without layers is refused.
+law g4v_layerless_tower_refused:
+  for +i: Nat
+  {g4v_tower_ok(0n, i) == False{} : Bool}
+
+def g4v_layerless_tower_refused(i):
+  {==}
