@@ -636,6 +636,8 @@ be0740605e54f74d  ln_free_left_only_by_admit  law ln_free_left_only_by_admit : f
 # promise ln_free_left_only_by_admit: a free lane leaves the free state only when a request is admitted to it.
 3ba7a01ca8594135  ln_lanes_fit_fits  law ln_lanes_fit_fits : for + bp : Nat for + sh : Nat for + u : Nat { Bool.or ( Nat.is_lt ( u , sh ) , ln_plan_fits ( ln_lanes_fit ( 1n + bp , sh , u ) , 1n + bp , sh , u ) ) == True { } : Bool }
 # promise ln_lanes_fit_fits: the lane count a refused plan reports as fitting does fit, whenever the shared part does.
+af6ef3a569dc3bf7  ln_lanes_need_drafter  law ln_lanes_need_drafter : for + e : Bool for + d : LaneDrafter for + c : Bool { Bool.and ( ln_lanes_ok ( e , d , c ) , Bool.not ( ln_drafter_ok ( d ) ) ) == False { } : Bool }
+# promise ln_lanes_need_drafter: a load whose drafter has no batched steps is never given lanes.
 c3fa29078370a38d  ln_lanes_need_engine  law ln_lanes_need_engine : for + d : LaneDrafter for + c : Bool { ln_lanes_ok ( False { } , d , c ) == False { } : Bool }
 # promise ln_lanes_need_engine: an engine without batched steps is never given lanes, whatever its drafter.
 640e1ce3eba53008  ln_lanes_never_calibrating  law ln_lanes_never_calibrating : for + e : Bool for + d : LaneDrafter { ln_lanes_ok ( e , d , True { } ) == False { } : Bool }
@@ -670,6 +672,8 @@ b154f53da1686da6  ln_served_lanes_within_max  law ln_served_lanes_within_max : f
 # promise ln_served_lanes_within_max: a model is never served with more lanes than the batched step graphs are built for.
 e72d1ee9144841c2  ln_served_lanes_within_request  law ln_served_lanes_within_request : for + r : Nat for + m : Nat for + ok : Bool { Nat.is_le ( ln_served_lanes ( 1n + r , m , ok ) , 1n + r ) == True { } : Bool }
 # promise ln_served_lanes_within_request: a model is never served with more lanes than were asked for.
+61d68b15d279d63c  ln_session_keeps_busy_lanes  law ln_session_keeps_busy_lanes : for + d : Bool { ln_session_yields ( False { } , d ) == False { } : Bool }
+# promise ln_session_keeps_busy_lanes: a lane session never hands the card's turn back while one of its lanes is busy.
 2f00db09731c6af6  ln_session_never_neither  law ln_session_never_neither : for + a : Bool { Bool.or ( a , ln_session_starts ( a ) ) == True { } : Bool }
 # promise ln_session_never_neither: a request that arrives while no session runs for its model starts one, so it is never left without one.
 7560d94867a8f9cd  ln_session_once  law ln_session_once : { ln_session_starts ( True { } ) == False { } : Bool }
@@ -1025,6 +1029,10 @@ d6f5f339fd83fcd8  tool_invalid_choice_never_forces  law tool_invalid_choice_neve
 8bbd01462fd1da03  top_k_clamped_to_vocab  law top_k_clamped_to_vocab : for + k : Nat for + v : Nat { Nat.is_le ( clamp_top_k ( k , v ) , v ) == True { } : Bool }
 fb48a38269eaafac  tree_over_max_nodes_rejected  law tree_over_max_nodes_rejected : for + mn : Nat for + extra : Nat for + sp : Nat for md : Nat for tk : Nat { tree_shape_bounds_valid ( Nat.add ( mn , 1n + extra ) , sp , mn , md , tk ) == False { } : Bool }
 f438ba027c288a28  tree_self_parent_rejected  law tree_self_parent_rejected : for + i : Nat for + d : Nat for pd : Nat for r : Nat for + sp : Nat for tk : Nat { tree_node_valid ( i , i , d , pd , r , sp , tk ) == False { } : Bool }
+de268a1486c5450c  turn_due_after_max_skips  law turn_due_after_max_skips : for + w : Nat for + mw : Nat for + ms : Nat for + e : Nat { turn_due ( w , mw , Nat.add ( ms , e ) , ms ) == True { } : Bool }
+# promise turn_due_after_max_skips: a waiter passed over its maximum number of times is due: no request passes it over any more.
+5b87da18e5435668  turn_due_after_max_wait  law turn_due_after_max_wait : for + w : Nat for + e : Nat for + s : Nat for + ms : Nat { turn_due ( Nat.add ( w , e ) , w , s , ms ) == True { } : Bool }
+# promise turn_due_after_max_wait: a waiter that has waited its maximum wait is due: no request passes it over any more.
 09ae686fe3d30743  unsupported_method_refuses_sampling  law unsupported_method_refuses_sampling : { sampling_request_admitted ( False { } , True { } ) == False { } : Bool }
 95d8e8e470b18e0a  vid_frame_index_in_range  law vid_frame_index_in_range : for + raw : Nat for + p : Nat { Nat.is_le ( vid_frame_index ( raw , 1n + p ) , p ) == True { } : Bool }
 673301e5bd807518  vid_group_frame_in_range  law vid_group_frame_in_range : for + g : Nat for + s : Nat for + t : Nat for + p : Nat { Nat.is_le ( vid_group_frame ( g , s , t , 1n + p ) , p ) == True { } : Bool }

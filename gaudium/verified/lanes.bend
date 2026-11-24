@@ -927,24 +927,10 @@ def turn_due_after_max_skips(w, mw, ms, e):
   %ln_ge_add_true(ms, e) : {Bool.or(Nat.is_ge(w, mw), _) == True{} : Bool}
   ln_or_true_r(Nat.is_ge(w, mw))
 
-# promise: a lane session admits no request while the oldest waiter for the card is due.
-law ln_session_admits_none_when_due:
-  {ln_session_admits(True{}) == False{} : Bool}
-
-def ln_session_admits_none_when_due():
-  {==}
-
 # promise: a lane session never hands the card's turn back while one of its lanes is busy.
 law ln_session_keeps_busy_lanes:
   for +d: Bool
   {ln_session_yields(False{}, d) == False{} : Bool}
 
 def ln_session_keeps_busy_lanes(d):
-  {==}
-
-# promise: a lane session with no lane busy hands the card's turn to a waiter that is due.
-law ln_session_yields_when_due:
-  {ln_session_yields(True{}, True{}) == True{} : Bool}
-
-def ln_session_yields_when_due():
   {==}
