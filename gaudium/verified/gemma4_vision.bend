@@ -144,6 +144,14 @@ def g4v_pad_cols(unified: Bool, budget: Nat) -> Nat:
     case False{}:
       0n
 
+# Patches of the whole tokens `p` patches hold (tokens of `ppt` patches each).
+def g4v_whole_token_patches(p: Nat, +ppt: Nat) -> Nat:
+  Nat.mul(Nat.div(p, ppt), ppt)
+
+# Whether a grid of `gh x gw` (patches or merged patches) has a position-table row on each axis.
+def g4v_table_holds(+gh: Nat, +gw: Nat, +npos: Nat) -> Bool:
+  Bool.and(Nat.is_le(gh, npos), Nat.is_le(gw, npos))
+
 # Device bytes one buffer of `bytes` takes in a sealed arena: at least 256, a whole number of
 # 256-byte steps (what the arena's sub-allocation consumes for it).
 def g4v_part_bytes(+bytes: Nat) -> Nat:
@@ -547,4 +555,35 @@ law g4v_layerless_tower_refused:
   {g4v_tower_ok(0n, i) == False{} : Bool}
 
 def g4v_layerless_tower_refused(i):
+  {==}
+
+# LAW G4V.12
+# promise: flooring a patch count to whole tokens never raises it.
+law g4v_whole_token_patches_within:
+  for +p: Nat
+  for +kp: Nat
+  {Nat.is_le(g4v_whole_token_patches(p, 1n+kp), p) == True{} : Bool}
+
+def g4v_whole_token_patches_within(p, kp):
+  g4v_div_mul_le(p, kp)
+
+# 1 + n + k <= n never holds.
+def g4v_past_not_le(+n: Nat, +k: Nat) -> {Nat.is_le(1n+Nat.add(n, k), n) == False{} : Bool}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+np:
+      g4v_past_not_le(np, k)
+
+# LAW G4V.13
+# promise: a grid taller than the position table is refused.
+# harm: the host would read position rows past the end of the table.
+law g4v_table_refuses_tall_grid:
+  for +n: Nat
+  for +k: Nat
+  for +w: Nat
+  {g4v_table_holds(1n+Nat.add(n, k), w, n) == False{} : Bool}
+
+def g4v_table_refuses_tall_grid(n, k, w):
+  %Equal.sym(Bool, Nat.is_le(1n+Nat.add(n, k), n), False{}, g4v_past_not_le(n, k)) : {Bool.and(_, Nat.is_le(w, n)) == False{} : Bool}
   {==}

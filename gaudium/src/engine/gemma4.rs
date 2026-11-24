@@ -1634,7 +1634,13 @@ impl Gemma4Engine {
         } else {
             None
         };
-        if vis_geo.is_some() && spec_cfg.as_ref().is_some_and(|s| s.reads_prompt_rows()) {
+        // the drafter must be one that runs beside the image path (the verified table): the
+        // size's assistant reads the target's states and keys only, a block drafter embeds
+        // prompt rows of its own
+        let drafter_kind = spec_cfg
+            .as_ref()
+            .map(|s| if s.reads_prompt_rows() { "dflash2" } else { "mtp" });
+        if vis_geo.is_some() && !crate::core::vision::drafter_runs_with_vision(drafter_kind, true) {
             return Err("image input with a block drafter is not implemented: load without --vision-max-patches or with the size's own -assistant drafter".into());
         }
 

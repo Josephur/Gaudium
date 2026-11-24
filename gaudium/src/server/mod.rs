@@ -1365,7 +1365,7 @@ fn vision_serve_of(
     let ppt = spec.patches_per_token();
     // a model whose tokens are 3 x 3 patches (Gemma 4) plans whole tokens of the patch count
     let patches = if matches!(spec.processor, crate::vision::ImageProcessor::Gemma4 { .. }) {
-        patches - patches % ppt
+        crate::verified::g4v_whole_token_patches(patches, ppt)
     } else {
         patches
     };

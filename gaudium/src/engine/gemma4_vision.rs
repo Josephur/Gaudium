@@ -30,7 +30,7 @@
 use crate::fp8::f32_to_bf16_rne;
 use crate::json::{parse_json, JsonValue};
 use crate::verified::{
-    g4v_grid_ok, g4v_size_ok, g4v_soft_budget, g4v_target_h, g4v_target_w, g4v_tokens, g4v_tower_ok,
+    g4v_grid_ok, g4v_size_ok, g4v_table_holds, g4v_soft_budget, g4v_target_h, g4v_target_w, g4v_tokens, g4v_tower_ok,
     g4v_width_ok,
 };
 use crate::vision::preprocess::{resize_rgb, PreparedImage, RgbImage};
@@ -532,7 +532,7 @@ pub fn prepare_image(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, S
 /// table `[2][npos][hid]` (axis 0 the columns, axis 1 the rows), summed in f32 and rounded once
 /// (the reference adds the two BF16 rows in BF16).
 pub fn tower_positions(table: &[u16], npos: usize, hid: usize, gh: usize, gw: usize, pool: usize) -> Result<Vec<u16>, String> {
-    if gh > npos || gw > npos {
+    if !g4v_table_holds(gh as u64, gw as u64, npos as u64) {
         return Err(format!(
             "an image of {gh} x {gw} patches: the position table has {npos} rows per axis"
         ));
@@ -552,7 +552,7 @@ pub fn tower_positions(table: &[u16], npos: usize, hid: usize, gh: usize, gw: us
 /// Position rows of the unified embedder's merged patches in raster order: `bf16(pos[x][0] +
 /// pos[y][1])` of the table `[npos][2][hid]`.
 pub fn merged_positions(table: &[u16], npos: usize, hid: usize, mh: usize, mw: usize) -> Result<Vec<u16>, String> {
-    if mh > npos || mw > npos {
+    if !g4v_table_holds(mh as u64, mw as u64, npos as u64) {
         return Err(format!(
             "an image of {mh} x {mw} merged patches: the position table has {npos} rows per axis"
         ));

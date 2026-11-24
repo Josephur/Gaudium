@@ -42,6 +42,8 @@ pub struct G4vGeo {
     /// Tower: the largest image in patches. Unified: the rows of its one recipe (the soft tokens
     /// of the largest image).
     pub max_n: u64,
+    /// Soft tokens one image may hold.
+    pub budget: u64,
     /// Image tokens one request may hold.
     pub max_tokens: u64,
     /// Columns of the feature buffer.
@@ -89,6 +91,7 @@ impl G4vGeo {
         Ok(Some(Self {
             d,
             spec,
+            budget,
             max_n,
             max_tokens,
             feat_cols,
@@ -482,10 +485,8 @@ impl G4Vision {
                 self.geo.max_tokens
             ));
         }
-        let max_patches = match self.geo.d.kind {
-            G4vKind::Tower => self.geo.max_n,
-            G4vKind::Unified => self.geo.max_n * self.geo.d.ppt(),
-        };
+        // the patches of an image of the budget
+        let max_patches = g4v_recipe_rows(false, self.geo.budget, self.geo.d.ppt());
         for im in &images {
             if !vis_grid_fits(im.grid_h as u64, im.grid_w as u64, max_patches) || im.pixels.is_empty() {
                 return Err(format!(
