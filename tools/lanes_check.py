@@ -12,6 +12,8 @@ Two steps, against a running server:
 Modes: `greedy` (temperature 0) and `sampled` (temperature 1.0, top-k 20, top-p 0.95 and a fixed
 seed per prompt): a seeded sampled stream must equal its reference as exactly as a greedy one.
 
+`--serial` checks every prompt alone, one after another (a single-stream server's streams).
+
 Options add prompts: `--long 6000,10000` long prompts of about that many words (their streams
 cover several KV chunks), `--image` one prompt with a generated PNG (an image request runs alone
 on a lane server). `--turns` checks routing after the concurrent runs: every long prompt's next
@@ -144,6 +146,7 @@ def main():
     ap.add_argument("--long", default="", help="extra long prompts of about these many words")
     ap.add_argument("--image", action="store_true", help="one extra prompt with an image")
     ap.add_argument("--turns", action="store_true", help="next turns of the long prompts must reuse rows")
+    ap.add_argument("--serial", action="store_true", help="with --check: every prompt alone, one after another")
     a = ap.parse_args()
     modes = [m for m in a.modes.split(",") if m]
     n = min(a.prompts, len(PROMPTS))
@@ -174,12 +177,13 @@ def main():
             ref = json.load(f)
         runs = []
         bad = 0
-        for c in [int(x) for x in a.concurrency.split(",") if x]:
+        plan = [(1, [i]) for i in range(n)] if a.serial else [(int(x), None) for x in a.concurrency.split(",") if x]
+        for c, only in plan:
             for m in modes:
                 # the extra prompts (long, image) always take part: their streams are the hard ones
                 extra = list(range(first_long, n))
                 order = extra + [i for i in range(n) if i not in extra]
-                idx = [order[j % n] for j in range(c)]
+                idx = only if only is not None else [order[j % n] for j in range(c)]
                 res = [None] * c
                 errs = [None] * c
 
