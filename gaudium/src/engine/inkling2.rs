@@ -2385,10 +2385,21 @@ impl Inkling2Engine {
                 continue;
             }
             let mut toks = vec![generated[gi]];
+            let need = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
             if use_mtp {
                 // drafts of the block drafter anchored on the last emitted token (a recipe
                 // compiled on first use is not decode time)
                 compile_ms += self.mtp_prepare_block(cursor)?;
+                // readout: every recipe of the step (the verify pass of this bucket, the
+                // drafter's context pass) is ready before its launch group is timed, so a
+                // first-use compile is never counted as device time
+                let tc = Instant::now();
+                if need != bucket {
+                    self.ensure_step(rows as u64, need)?;
+                    bucket = need;
+                }
+                self.mtp_ensure_ctx(rows as u64, true)?;
+                compile_ms += tc.elapsed().as_secs_f64() * 1000.0;
                 // readout: one step is the drafter's block, the verify pass and the drafter's
                 // context pass; the group is marked from the block's launch on
                 let vb = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
@@ -2412,7 +2423,6 @@ impl Inkling2Engine {
             }
             let n_drafts = toks.len() - 1;
             toks.resize(rows, 0);
-            let need = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
             if need != bucket {
                 let tc = Instant::now();
                 self.ensure_step(rows as u64, need)?;

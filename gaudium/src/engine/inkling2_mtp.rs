@@ -1187,7 +1187,7 @@ impl Inkling2Engine {
         Ok(())
     }
 
-    fn mtp_ensure_ctx(&mut self, t: u64, decode: bool) -> Result<(), String> {
+    pub(super) fn mtp_ensure_ctx(&mut self, t: u64, decode: bool) -> Result<(), String> {
         if !self.mtp_ref().ctx_recipes.contains_key(&t) {
             let gb = build_ctx_graph(&self.mtp_ref().g, t, &self.mtp_ref().elf_hashes);
             let r = self.compile(&gb, &format!("drafter context T={t}"))?;

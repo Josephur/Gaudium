@@ -162,14 +162,9 @@ pub(super) fn prefill_tile(
     tr
 }
 
-/// Launches of [`prefill_tile`].
+/// Launches of [`prefill_tile`] (the verified count: `verified/inkling2_readout.bend`).
 pub(super) fn prefill_tile_launches(d: &IkDims, drafter: bool, last: bool) -> u64 {
-    let n = 1 + d.n_apps as u64 + if drafter { 2 } else { 0 };
-    n + match (last, drafter) {
-        (false, _) => 0,
-        (true, true) => 1,
-        (true, false) => 2,
-    }
+    crate::verified::ik_tile_launches(d.n_apps as u64, drafter, last)
 }
 
 /// Key of [`prefill_tile`] in the live reporter's cache.
