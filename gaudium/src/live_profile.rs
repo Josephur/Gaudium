@@ -172,6 +172,19 @@ impl Traffic {
         rules: TrafficRules,
         kind_fn: &dyn Fn(&str) -> Kind,
     ) -> Self {
+        Self::from_graph_positions(gb, rules, kind_fn, &|_, _| None)
+    }
+
+    /// [`Traffic::from_graph_kinds`] for a graph whose attention state tensors hold different
+    /// numbers of positions (fixed rings beside chunked caches): `positions_fn(name, dims)` gives
+    /// the positions one [`Kind::Kv`] output holds (`None`: `rules.kv_positions`), and its write
+    /// is charged for the pass's rows out of those.
+    pub fn from_graph_positions(
+        gb: &GraphBuilder,
+        rules: TrafficRules,
+        kind_fn: &dyn Fn(&str) -> Kind,
+        positions_fn: &dyn Fn(&str, &[u64]) -> Option<u64>,
+    ) -> Self {
         let mut tr = Self::default();
         let rows = rules.rows.max(1) as f64;
         for node in gb.node_io_views() {
@@ -222,8 +235,13 @@ impl Traffic {
                 seen.push(t.id);
                 let mut by = t.bytes as f64;
                 let k = kind_fn(t.name);
-                if k == Kind::Kv && rules.kv_positions > 0 {
-                    let pos = rules.kv_positions as f64;
+                let kv_pos = if k == Kind::Kv {
+                    positions_fn(t.name, t.dims).unwrap_or(rules.kv_positions)
+                } else {
+                    0
+                };
+                if kv_pos > 0 {
+                    let pos = kv_pos as f64;
                     by = by * rows.min(pos) / pos;
                 } else if (t.name.ends_with("S_ckpt") || t.name.ends_with("cs_ckpt"))
                     && t.dims.len() >= 3

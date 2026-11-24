@@ -40,9 +40,21 @@ fn kind_of_name(name: &str) -> Kind {
     }
 }
 
-/// One launch of `gb`: `rows` rows per pass, global caches of `nch` chunks.
-fn charge(gb: &GraphBuilder, rows: u64, nch: u64) -> Traffic {
-    Traffic::from_graph_kinds(
+/// Positions one attention state tensor holds, from its shape `[lanes, slot rows, heads x
+/// chunks]` with `nkv` key / value heads: a sliding ring's slots, or a cache's chunk rows times its
+/// chunks (the main model's and the drafter's alike). `None` for any other tensor.
+fn kv_positions_of(name: &str, dims: &[u64], nkv: u64) -> Option<u64> {
+    if !(is_kv_name(name) || name.starts_with("mts_")) || dims.len() != 3 || nkv == 0 {
+        return None;
+    }
+    Some(dims[1].saturating_mul((dims[2] / nkv).max(1)))
+}
+
+/// One launch of `gb`: `rows` rows per pass, global caches of `nch` chunks, `nkv` key / value
+/// heads. A state tensor's write is charged for the pass's rows out of the positions that tensor
+/// holds (a ring's slots stay the same whatever the bucket).
+fn charge(gb: &GraphBuilder, rows: u64, nch: u64, nkv: u64) -> Traffic {
+    Traffic::from_graph_positions(
         gb,
         TrafficRules {
             rows,
@@ -50,6 +62,7 @@ fn charge(gb: &GraphBuilder, rows: u64, nch: u64) -> Traffic {
             experts_per_row: 0,
         },
         &kind_of_name,
+        &|name, dims| kv_positions_of(name, dims, nkv),
     )
 }
 
@@ -75,7 +88,7 @@ fn fold_phases(mut tr: Traffic, keep: Option<Phase>, to: Phase) -> Traffic {
 pub(super) fn verify(d: &IkDims, lmax: u64, rows: u64, bucket: u64) -> Traffic {
     let gb = build_step_graph(d, lmax, bucket, rows, &[]);
     fold_phases(
-        charge(&gb, rows, bucket),
+        charge(&gb, rows, bucket, d.nkv),
         Some(Phase::Readout),
         Phase::Verify,
     )
@@ -84,13 +97,13 @@ pub(super) fn verify(d: &IkDims, lmax: u64, rows: u64, bucket: u64) -> Traffic {
 /// One launch of the drafter's block recipe whose global layer reads `nch` chunks.
 pub(super) fn draft_block(g: &MtpGeom, nch: u64) -> Traffic {
     let gb = build_block_graph(g, nch, &[]);
-    fold_phases(charge(&gb, g.c.block, nch), None, Phase::Draft)
+    fold_phases(charge(&gb, g.c.block, nch, g.c.nkv), None, Phase::Draft)
 }
 
 /// One launch of the drafter's context recipe over `rows` rows.
 pub(super) fn draft_ctx(g: &MtpGeom, rows: u64) -> Traffic {
     let gb = build_ctx_graph(g, rows, &[]);
-    fold_phases(charge(&gb, rows, g.max_chunks), None, Phase::Draft)
+    fold_phases(charge(&gb, rows, g.max_chunks, g.c.nkv), None, Phase::Draft)
 }
 
 /// The launches one `step` of the decode loop consumes: the verify pass of `rows` rows over
@@ -130,7 +143,7 @@ pub(super) fn prefill_tile(
     drafter: Option<&MtpGeom>,
     last: bool,
 ) -> Traffic {
-    let mut tr = charge(&build_embed_graph(d, t, &[]), t, nch);
+    let mut tr = charge(&build_embed_graph(d, t, &[]), t, nch, d.nkv);
     let mut kinds: Vec<(IkKind, f64)> = Vec::new();
     for app in d.run_apps() {
         let k = IkKind {
@@ -144,11 +157,11 @@ pub(super) fn prefill_tile(
     }
     for (k, n) in kinds {
         tr.add(
-            &charge(&build_app_graph(d, k, t, lmax, nch, &[]), t, nch),
+            &charge(&build_app_graph(d, k, t, lmax, nch, &[]), t, nch, d.nkv),
             n,
         );
     }
-    let fin = charge(&build_final_graph(d, t, &[]), t, nch);
+    let fin = charge(&build_final_graph(d, t, &[]), t, nch, d.nkv);
     if let Some(g) = drafter {
         tr.add(&fin, 1.0);
         tr.add(&draft_ctx(g, t), 1.0);
@@ -157,7 +170,7 @@ pub(super) fn prefill_tile(
         if drafter.is_none() {
             tr.add(&fin, 1.0);
         }
-        tr.add(&charge(&build_head_graph(d, &[]), 1, nch), 1.0);
+        tr.add(&charge(&build_head_graph(d, &[]), 1, nch, d.nkv), 1.0);
     }
     tr
 }
@@ -253,6 +266,40 @@ mod tests {
 
     const GB: f64 = 1e9;
     const W: usize = Kind::Weight as usize;
+
+    /// A state tensor's write is charged against the positions that tensor holds: a sliding
+    /// ring's slots (the same in every bucket), a cache's chunk rows times its chunks; the
+    /// drafter's rings and caches alike.
+    #[test]
+    fn state_writes_scale_by_their_own_positions() {
+        let d = dims(8);
+        let one = build_step_graph(&d, CTX, 1, 8, &[]).persistent_tensor_specs();
+        let many = build_step_graph(&d, CTX, 64, 8, &[]).persistent_tensor_specs();
+        let pos = |specs: &[(String, SynDataType, Vec<u64>, u64)], n: &str| {
+            let t = specs
+                .iter()
+                .find(|t| t.0 == n)
+                .unwrap_or_else(|| panic!("{n}"));
+            kv_positions_of(&t.0, &t.2, d.nkv).unwrap()
+        };
+        assert_eq!(pos(&one, "A0_kring"), d.ring);
+        assert_eq!(pos(&many, "A0_kring"), d.ring);
+        assert_eq!(pos(&one, "A5_kcache"), IK_CHUNK);
+        assert_eq!(pos(&many, "A5_vcache"), 64 * IK_CHUNK);
+        assert_eq!(kv_positions_of("L7_W_gate", &[128, 4096, 16], d.nkv), None);
+        // the drafter: a local layer's ring, the global layer's chunks
+        let g = geom(&d);
+        let blk = build_block_graph(&g, 4, &[]).persistent_tensor_specs();
+        let dpos = |n: &str| {
+            let t = blk
+                .iter()
+                .find(|t| t.0 == n)
+                .unwrap_or_else(|| panic!("{n}"));
+            kv_positions_of(&t.0, &t.2, g.c.nkv).unwrap()
+        };
+        assert_eq!(dpos("mts_L0_k"), g.ring);
+        assert_eq!(dpos("mts_L1_v"), 4 * IK_CHUNK);
+    }
 
     #[test]
     fn names_take_their_kinds() {
