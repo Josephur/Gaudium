@@ -477,6 +477,11 @@ def ln_drafter_ok(d: LaneDrafter) -> Bool:
 def ln_spec_batched(cursor: Nat, rows: Nat, max_ctx: Nat) -> Bool:
   Nat.is_le(Nat.add(cursor, rows), max_ctx)
 
+# Of two draft widths asked for, the one lanes step at (every lane verifies the same rows in a
+# launch, and the state rings are sized for it); folded over every width asked for.
+def ln_lane_width_pick(+a: Nat, +b: Nat) -> Nat:
+  Nat.min(a, b)
+
 # Does a load get lanes? Its engine has batched steps (`engine_ok`), its drafter has, and it is
 # not a calibration load (which runs one request at a time).
 def ln_lanes_ok(engine_ok: Bool, d: LaneDrafter, calibrating: Bool) -> Bool:
@@ -1672,3 +1677,21 @@ law ln_other_drafter_no_lanes:
 
 def ln_other_drafter_no_lanes():
   {==}
+
+def ln_min_is_input(+a: Nat, +b: Nat) -> {Bool.or(Nat.is_eq(Nat.min(a, b), a), Nat.is_eq(Nat.min(a, b), b)) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      {==}
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      ln_min_is_input(ap, bp)
+
+# promise: lanes step at a draft width that was asked for.
+law ln_lane_width_is_asked:
+  for +a: Nat
+  for +b: Nat
+  {Bool.or(Nat.is_eq(ln_lane_width_pick(a, b), a), Nat.is_eq(ln_lane_width_pick(a, b), b)) == True{} : Bool}
+
+def ln_lane_width_is_asked(a, b):
+  ln_min_is_input(a, b)

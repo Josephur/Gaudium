@@ -327,6 +327,13 @@ pub fn stage_cursor(b: u64, j: u64) -> u64 {
     crate::verified::ln_stage_cursor(b, j)
 }
 
+/// The draft width lanes step at, of the widths asked for (`None`: none was).
+pub fn lane_width(widths: impl IntoIterator<Item = u64>) -> Option<u64> {
+    widths
+        .into_iter()
+        .reduce(crate::verified::ln_lane_width_pick)
+}
+
 /// Does a speculative lane at `cursor` take the batched step of `rows` rows in a context of
 /// `max_ctx` rows (or single-row steps to the end of its request)?
 pub fn spec_batched(cursor: u64, rows: u64, max_ctx: u64) -> bool {
@@ -533,6 +540,13 @@ mod tests {
         assert_eq!(ln_lane_cursor_next(70, 9, 8), 78, "never past the rows written");
         assert_eq!(ln_lane_parity_next(0), 1);
         assert_eq!(ln_lane_parity_next(1), 0);
+    }
+
+    #[test]
+    fn lanes_step_at_the_narrowest_width_asked_for() {
+        assert_eq!(lane_width([15, 7]), Some(7));
+        assert_eq!(lane_width([7]), Some(7));
+        assert_eq!(lane_width([]), None);
     }
 
     #[test]

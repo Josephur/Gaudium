@@ -731,12 +731,8 @@ pub struct SpecLane {
 impl SpecRuntime {
     /// [lanes] Rows of a batched step: the narrowest verify width (the one the lanes step at).
     pub fn lane_rows(&self) -> u64 {
-        self.widths
-            .iter()
-            .copied()
-            .filter(|&t| t > 1)
-            .min()
-            .unwrap_or(1)
+        // (the single-row width is every runtime's fallback, not a width asked for)
+        crate::core::lanes::lane_width(self.widths.iter().copied().filter(|&t| t > 1)).unwrap_or(1)
     }
 
     /// [lanes] The buffers a lane owns, `(name, bytes)`: the step buffers of both parities, the

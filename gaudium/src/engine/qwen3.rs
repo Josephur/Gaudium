@@ -1521,7 +1521,9 @@ impl Qwen3Engine {
                 // for it): every lane verifies the same rows in a launch
                 &if n_lanes > 1 {
                     let mut one = sc.clone();
-                    one.draft_k = vec![sc.draft_k.iter().copied().min().unwrap_or(1)];
+                    one.draft_k = vec![
+                        crate::core::lanes::lane_width(sc.draft_k.iter().copied()).unwrap_or(1),
+                    ];
                     one
                 } else {
                     sc.clone()
