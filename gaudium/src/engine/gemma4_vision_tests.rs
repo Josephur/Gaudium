@@ -80,6 +80,25 @@ fn the_two_image_paths_parse() {
     assert!(G4vDims::from_config_json(&grouped).is_err());
 }
 
+#[test]
+fn the_host_processor_takes_one_rgb_frame_and_a_budget_of_a_token() {
+    // today's processor: one frame per patch, 3 channels, at least one 48x48 square of budget
+    let s = spec(TOWER_31B);
+    assert!(s.validate().is_ok());
+    let side = s.resize_factor();
+    for (what, v) in [
+        ("two frames", VisionSpec { temporal: 2, ..s.clone() }),
+        ("one channel", VisionSpec { in_channels: 1, ..s.clone() }),
+        ("no patch", VisionSpec { patch: 0, ..s.clone() }),
+        ("no pooling", VisionSpec { merge: 0, ..s.clone() }),
+        ("a budget below one token", VisionSpec { max_pixels: side * side - 1, ..s.clone() }),
+        ("sizes that overflow", VisionSpec { patch: 1 << 40, merge: 1 << 30, ..s.clone() }),
+    ] {
+        assert!(v.validate().is_err(), "{what}");
+    }
+    assert!(VisionSpec { max_pixels: side * side, ..s.clone() }.validate().is_ok());
+}
+
 /// Resized sizes the reference processor gave for the fixed image set (patch grids from its
 /// dumps), and the edge cases of its rule.
 #[test]

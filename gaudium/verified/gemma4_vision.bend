@@ -118,6 +118,14 @@ def g4v_tower_ok(+layers: Nat, +inter: Nat) -> Bool:
 def g4v_soft_budget(max_pixels: Nat, +side: Nat) -> Nat:
   Nat.div(max_pixels, Nat.mul(side, side))
 
+# Whether the host processor takes a vision config: one frame per patch, 3 channels, and a pixel
+# budget that holds at least one soft token (a square of `patch * merge` pixels a side; a zero
+# patch or pooling size holds none). Refused on overflow: the sizes come from a checkpoint's
+# config.
+# rusty-bends: total
+def g4v_processor_ok(+patch: Nat, +merge: Nat, +frames: Nat, +channels: Nat, max_pixels: Nat) -> Bool:
+  Bool.and(Bool.and(Nat.is_eq(frames, 1n), Nat.is_eq(channels, 3n)), Nat.is_gt(g4v_soft_budget(max_pixels, Nat.mul(patch, merge)), 0n))
+
 # Soft tokens one image may hold: the checkpoint's own budget, lowered to the tokens of `ppt`
 # patches that the tower planned for `planned_patches` patches holds.
 def g4v_image_budget(model_tokens: Nat, planned_patches: Nat, +ppt: Nat) -> Nat:
@@ -834,3 +842,29 @@ law g4u_two_way_with_block:
 
 def g4u_two_way_with_block(be):
   {==}
+
+# a and (n > 0), and n == 0, is false.
+def g4v_processor_budget_go(a: Bool, +n: Nat) -> {Bool.and(Bool.and(a, Nat.is_gt(n, 0n)), Nat.is_eq(n, 0n)) == False{} : Bool}:
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      match n:
+        case 0n:
+          {==}
+        case 1n+_:
+          {==}
+
+# LAW G4V.16
+# promise: a vision config the host processor takes has a pixel budget of at least one soft token (so a positive patch and pooling size).
+# harm: every image would resize to no tokens or be refused, with a tower planned for none.
+law g4v_processor_budget_holds_a_token:
+  for +p: Nat
+  for +m: Nat
+  for +f: Nat
+  for +c: Nat
+  for +px: Nat
+  {Bool.and(g4v_processor_ok(p, m, f, c, px), Nat.is_eq(g4v_soft_budget(px, Nat.mul(p, m)), 0n)) == False{} : Bool}
+
+def g4v_processor_budget_holds_a_token(p, m, f, c, px):
+  g4v_processor_budget_go(Bool.and(Nat.is_eq(f, 1n), Nat.is_eq(c, 3n)), g4v_soft_budget(px, Nat.mul(p, m)))

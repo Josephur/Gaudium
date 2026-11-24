@@ -363,11 +363,19 @@ impl VisionSpec {
     pub fn validate(&self) -> Result<(), String> {
         if let ImageProcessor::Gemma4 { .. } = self.processor {
             // the family's own reader checked the tower's sizes; what the host pipeline relies on
-            if self.patch == 0 || self.merge == 0 || self.temporal != 1 || self.in_channels != 3 {
-                return Err("a Gemma 4 vision_config needs a positive patch and pooling size, one frame, 3 channels".into());
-            }
-            if self.max_pixels < self.resize_factor() * self.resize_factor() {
-                return Err("the image budget holds no soft token".into());
+            // is the verified `g4v_processor_ok` (`None`: the sizes overflow)
+            let ok = crate::verified::g4v_processor_ok(
+                self.patch,
+                self.merge,
+                self.temporal,
+                self.in_channels,
+                self.max_pixels,
+            );
+            if ok != Some(true) {
+                return Err(format!(
+                    "a Gemma 4 vision_config needs a positive patch ({}) and pooling size ({}), one frame ({}), 3 channels ({}), and an image budget ({} pixels) of at least one soft token",
+                    self.patch, self.merge, self.temporal, self.in_channels, self.max_pixels
+                ));
             }
             return Ok(());
         }
