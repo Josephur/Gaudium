@@ -2402,7 +2402,8 @@ impl Inkling2Engine {
                 compile_ms += tc.elapsed().as_secs_f64() * 1000.0;
                 // readout: one step is the drafter's block, the verify pass and the drafter's
                 // context pass; the group is marked from the block's launch on
-                let vb = step_bucket((cursor + rows as u64).div_ceil(IK_CHUNK), self.max_chunks);
+                // the verify's bucket: `bucket`, made ready above
+                let vb = bucket;
                 let db = self.mtp_bucket(cursor);
                 let (d, lmax, r, g) = (&self.dims, self.max_ctx, rows as u64, &self.mtp_ref().g);
                 self.live
@@ -2782,8 +2783,7 @@ impl Inkling2Engine {
 
         // ---- DECODE, speculative: an engine loaded with a drafter, unless the request asks
         // for the plain loop (the K = 0 reference of `--compare-k0`) ----
-        if self.draft.is_some()
-            && !params.non_speculative
+        if crate::verified::ik_decode_runs_drafter(self.draft.is_some(), params.non_speculative)
             && !stopped_by_eos
             && !stopped_by_cancel
             && !generated.is_empty()

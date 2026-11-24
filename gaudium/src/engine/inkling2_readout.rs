@@ -70,11 +70,20 @@ fn charge(gb: &GraphBuilder, rows: u64, nch: u64, nkv: u64) -> Traffic {
 
 /// Moves the bytes and FLOPs of every phase except `keep` and `to` into `to`.
 fn fold_phases(mut tr: Traffic, keep: Option<Phase>, to: Phase) -> Traffic {
+    use crate::verified::{ik_phase_moves, IkPhase};
+    let ph = |p: Phase| match p {
+        Phase::Verify => IkPhase::PhVerify,
+        Phase::Draft => IkPhase::PhDraft,
+        Phase::Readout => IkPhase::PhReadout,
+        Phase::Other => IkPhase::PhOther,
+    };
     let t = to as usize;
-    for p in 0..4 {
-        if p == t || keep.is_some_and(|k| k as usize == p) {
+    for phase in [Phase::Verify, Phase::Draft, Phase::Readout, Phase::Other] {
+        // the verified routing: which phases' bytes move into the launch's phase
+        if !ik_phase_moves(ph(phase), ph(to), ph(keep.unwrap_or(to)), keep.is_some()) {
             continue;
         }
+        let p = phase as usize;
         for k in 0..4 {
             tr.bytes[t][k] += tr.bytes[p][k];
             tr.bytes[p][k] = 0.0;
@@ -128,6 +137,7 @@ pub(super) fn spec_step(
 
 /// Key of [`spec_step`]'s launches in the live reporter's cache.
 pub(super) fn step_key(rows: u64, bucket: u64, draft_chunks: Option<u64>) -> u64 {
+    debug_assert!(rows <= 0xffff && bucket <= 0xffff && draft_chunks.is_none_or(|n| n < 0xffff));
     ((rows & 0xffff) << 32)
         | ((bucket & 0xffff) << 16)
         | draft_chunks.map_or(0, |n| (n + 1) & 0xffff)
@@ -161,15 +171,18 @@ pub(super) fn prefill_tile(
             tr.add(app_tr, 1.0);
         }
     }
-    let fin = charge(&build_final_graph(d, t, &[]), t, nch, d.nkv);
-    if let Some(g) = drafter {
-        tr.add(&fin, 1.0);
-        tr.add(&draft_ctx(g, t), 1.0);
+    // the tile's launches beyond its applications follow the verified plan (the same one its
+    // launch count follows)
+    let has_drafter = drafter.is_some();
+    if crate::verified::ik_tile_runs_final(has_drafter, last) {
+        tr.add(&charge(&build_final_graph(d, t, &[]), t, nch, d.nkv), 1.0);
     }
-    if last {
-        if drafter.is_none() {
-            tr.add(&fin, 1.0);
+    if crate::verified::ik_tile_runs_ctx(has_drafter) {
+        if let Some(g) = drafter {
+            tr.add(&draft_ctx(g, t), 1.0);
         }
+    }
+    if crate::verified::ik_tile_runs_head(last) {
         tr.add(&charge(&build_head_graph(d, &[]), 1, nch, d.nkv), 1.0);
     }
     tr
@@ -182,6 +195,10 @@ pub(super) fn prefill_tile_launches(d: &IkDims, drafter: bool, last: bool) -> u6
 
 /// Key of [`prefill_tile`] in the live reporter's cache.
 pub(super) fn tile_key(t: u64, nch: u64, drafter: bool, last: bool) -> u64 {
+    debug_assert!(
+        t <= 0xffff && nch <= 0xffff,
+        "tile key fields: {t} rows, {nch} chunks"
+    );
     (t & 0xffff) | ((nch & 0xffff) << 16) | (u64::from(drafter) << 32) | (u64::from(last) << 33)
 }
 
@@ -237,7 +254,9 @@ impl Inkling2Engine {
     /// The live record's method label of a request: what its decode runs (a request that asks
     /// for the plain loop runs `K = 0` on an engine with a drafter).
     pub(super) fn live_method_label(&self, params: &GenParams) -> String {
-        let sc = self.draft.as_ref().filter(|_| !params.non_speculative);
+        let runs =
+            crate::verified::ik_decode_runs_drafter(self.draft.is_some(), params.non_speculative);
+        let sc = self.draft.as_ref().filter(|_| runs);
         live_label_of(sc, self.spec_rows, params.temperature)
     }
 }
