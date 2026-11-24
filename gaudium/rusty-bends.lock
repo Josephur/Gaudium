@@ -947,6 +947,13 @@ d4381dc700340734  vid_rows_budget_zero_groups  law vid_rows_budget_zero_groups :
 73ee8edd604e0b3e  vis_pixel_cap_le_model  law vis_pixel_cap_le_model : for + mx : Nat for + tp : Nat for + ps : Nat { Nat.is_le ( vis_pixel_cap ( mx , tp , ps ) , mx ) == True { } : Bool }
 2288b811fd20aa18  vis_pixel_cap_le_tower  law vis_pixel_cap_le_tower : for + mx : Nat for + tp : Nat for + ps : Nat { Nat.is_le ( vis_pixel_cap ( mx , tp , ps ) , Nat.mul ( tp , ps ) ) == True { } : Bool }
 96dfc9ae72184595  vis_plain_decode_always_ok  law vis_plain_decode_always_ok : { vis_drafter_ok ( VdNone { } ) == True { } : Bool }
+553f6a83e188fa01  vis_plan_covers_need  law vis_plan_covers_need : for + p : Nat for + n : Nat { Nat.is_le ( n , vis_plan_raise ( p , n ) ) == True { } : Bool }
+# promise vis_plan_covers_need: the tower plan raised for a request's or an image's need always covers that need.
+# harm vis_plan_covers_need: the tower or its embedding buffer could be planned too small for an image request of the run.
+fb6c210645fe5d7b  vis_plan_keeps_earlier  law vis_plan_keeps_earlier : for + p : Nat for + n : Nat { Nat.is_le ( p , vis_plan_raise ( p , n ) ) == True { } : Bool }
+# promise vis_plan_keeps_earlier: raising the tower plan for one more need never shrinks what it covered before.
+4f4494b9557ea579  vis_request_count_grows  law vis_request_count_grows : for + c : Nat for + i : Nat { Nat.is_le ( c , vis_request_tokens ( c , i ) ) == True { } : Bool }
+# promise vis_request_count_grows: counting one more image never lowers the image tokens already counted for the request.
 0d8da77fa48e204f  vis_rows_full_refuses  law vis_rows_full_refuses : for + cap : Nat for + extra : Nat { vis_rows_fit ( cap , 1n + extra , cap ) == False { } : Bool }
 9c1d124ed35699fb  vis_rows_left_le_cap  law vis_rows_left_le_cap : for + used : Nat for + cap : Nat { Nat.is_le ( vis_rows_left ( used , cap ) , cap ) == True { } : Bool }
 ed5641dd62da3f42  vis_rows_take_le_cap  law vis_rows_take_le_cap : for + used : Nat for + add : Nat for + cap : Nat { Nat.is_le ( vis_rows_take ( used , add , cap ) , cap ) == True { } : Bool }
