@@ -75,14 +75,16 @@ def g4v_target_h(+th0: Nat, +tw0: Nat, qh: Nat, side: Nat, max_side: Nat) -> Nat
 def g4v_target_w(+th0: Nat, +tw0: Nat, qw: Nat, side: Nat, max_side: Nat) -> Nat:
   g4v_pick_w(Nat.is_eq(th0, 0n), Nat.is_eq(tw0, 0n), tw0, qw, side, max_side)
 
-# Soft tokens of a resized image of `th x tw` pixels: one per square of `side` pixels.
-def g4v_tokens(th: Nat, tw: Nat, +side: Nat) -> Nat:
-  Nat.mul(Nat.div(tw, side), Nat.div(th, side))
+# Soft tokens of a resized image of `th x tw` pixels: the tokens of its grid of `patch`-pixel
+# patches under a `merge x merge` pooling, counted as every image of the request is counted.
+def g4v_tokens(th: Nat, tw: Nat, +patch: Nat, +merge: Nat) -> Nat:
+  VB.vis_grid_tokens(Nat.div(th, patch), Nat.div(tw, patch), merge)
 
-# Whether a resized size is taken: both sides whole squares, neither empty, and at most
-# `max_soft` squares (the overflow-free canvas test of the media check).
-def g4v_size_ok(+th: Nat, +tw: Nat, +side: Nat, max_soft: Nat) -> Bool:
-  Bool.and(Bool.and(Nat.is_eq(Nat.mod(th, side), 0n), Nat.is_eq(Nat.mod(tw, side), 0n)), VB.media_canvas_ok(Nat.div(tw, side), Nat.div(th, side), max_soft))
+# Whether a resized size is taken: both sides whole squares of `patch * merge` pixels, neither
+# empty, and at most `max_soft` tokens (the overflow-free canvas test of the media check, on the
+# token grid the count uses).
+def g4v_size_ok(+th: Nat, +tw: Nat, +patch: Nat, +merge: Nat, max_soft: Nat) -> Bool:
+  Bool.and(Bool.and(Nat.is_eq(Nat.mod(th, Nat.mul(patch, merge)), 0n), Nat.is_eq(Nat.mod(tw, Nat.mul(patch, merge)), 0n)), VB.media_canvas_ok(Nat.div(Nat.div(tw, patch), merge), Nat.div(Nat.div(th, patch), merge), max_soft))
 
 # ============================================================================
 # 3. Prefill units of the two-way image blocks
@@ -105,9 +107,29 @@ def g4u_join(cross: Bool, +tiles: Nat, max_tiles: Nat) -> Bool:
   Bool.and(cross, Nat.is_lt(tiles, max_tiles))
 
 # Whether a tile of a unit is final when the image blocks over it end at `end` (the largest
-# end) and the unit's keys end at `u`: its rows then attended the whole of their blocks.
-def g4u_final(+end: Nat, u: Nat) -> Bool:
-  Nat.is_le(end, u)
+# end) and the unit's keys end at `u`: a two-way unit's tile once its rows attended the whole of
+# their blocks; a causal unit's tile always (its rows attend nothing after their own).
+def g4u_final(two_way: Bool, +end: Nat, u: Nat) -> Bool:
+  match two_way:
+    case True{}:
+      Nat.is_le(end, u)
+    case False{}:
+      True{}
+
+# Tiles a prefill unit holds buffers for, when its tiles have `t` rows and an image block has at
+# most `b`: the tiles a block can reach from any row of a tile, its own tile included (at least
+# one). A shorter count only makes units end sooner; the tile that starts a unit is final
+# either way or the prefill refuses (`g4u_final`).
+def g4u_unit_tiles(+t: Nat, +b: Nat) -> Nat:
+  Nat.max(1n, Nat.div(Nat.add(Nat.add(Nat.sub(t, 1n), b), Nat.sub(t, 1n)), t))
+
+# Whether row `p` lies in the image block of `n` rows from row `s`.
+def g4u_in_block(+s: Nat, +n: Nat, +p: Nat) -> Bool:
+  Bool.and(Nat.is_le(s, p), Nat.is_lt(p, Nat.add(s, n)))
+
+# Whether the image block of `n` rows from row `s` has a row in the rows `[a, b)`.
+def g4u_overlaps(+s: Nat, +n: Nat, +a: Nat, +b: Nat) -> Bool:
+  Bool.and(Nat.is_lt(s, b), Nat.is_lt(a, Nat.add(s, n)))
 
 # Positions after its own that the prefill row at position `p` attends in a sliding layer: a row
 # of an image block the rest of its block (which ends before `e`), cut at `u`, the end of the keys
@@ -191,12 +213,14 @@ def g4u_fits_succ(+r: Nat, +wp: Nat, +n: Nat, b1: Bool, e1: {Nat.is_lt(wp, r) ==
 law g4v_size_within_budget:
   for +th: Nat
   for +tw: Nat
-  for +side: Nat
+  for +patch: Nat
+  for +merge: Nat
   for +m: Nat
-  {Bool.and(g4v_size_ok(th, tw, side, m), Nat.is_lt(m, g4v_tokens(th, tw, side))) == False{} : Bool}
+  {Bool.and(g4v_size_ok(th, tw, patch, merge, m), Nat.is_lt(m, g4v_tokens(th, tw, patch, merge))) == False{} : Bool}
 
-def g4v_size_within_budget(th, tw, side, m):
-  g4v_and3_false(Bool.and(Nat.is_eq(Nat.mod(th, side), 0n), Nat.is_eq(Nat.mod(tw, side), 0n)), VB.media_canvas_ok(Nat.div(tw, side), Nat.div(th, side), m), Nat.is_lt(m, g4v_tokens(th, tw, side)), VB.media_canvas_within_limit(Nat.div(tw, side), Nat.div(th, side), m))
+def g4v_size_within_budget(th, tw, patch, merge, m):
+  %Equal.sym(Nat, Nat.mul(Nat.div(Nat.div(th, patch), merge), Nat.div(Nat.div(tw, patch), merge)), Nat.mul(Nat.div(Nat.div(tw, patch), merge), Nat.div(Nat.div(th, patch), merge)), L.nat_mul_comm(Nat.div(Nat.div(th, patch), merge), Nat.div(Nat.div(tw, patch), merge))) : {Bool.and(Bool.and(Bool.and(Nat.is_eq(Nat.mod(th, Nat.mul(patch, merge)), 0n), Nat.is_eq(Nat.mod(tw, Nat.mul(patch, merge)), 0n)), VB.media_canvas_ok(Nat.div(Nat.div(tw, patch), merge), Nat.div(Nat.div(th, patch), merge), m)), Nat.is_lt(m, _)) == False{} : Bool}
+  g4v_and3_false(Bool.and(Nat.is_eq(Nat.mod(th, Nat.mul(patch, merge)), 0n), Nat.is_eq(Nat.mod(tw, Nat.mul(patch, merge)), 0n)), VB.media_canvas_ok(Nat.div(Nat.div(tw, patch), merge), Nat.div(Nat.div(th, patch), merge), m), Nat.is_lt(m, Nat.mul(Nat.div(Nat.div(tw, patch), merge), Nat.div(Nat.div(th, patch), merge))), VB.media_canvas_within_limit(Nat.div(Nat.div(tw, patch), merge), Nat.div(Nat.div(th, patch), merge), m))
 
 # LAW G4U.1
 # promise: a prefill unit the ring is said to fit keeps its rows and the window of its first row inside the ring (rows + window <= ring + 1).
@@ -235,7 +259,7 @@ def g4u_join_within_buffers(c, n, m):
 law g4u_final_refuses_past_end:
   for +u: Nat
   for +k: Nat
-  {g4u_final(1n+Nat.add(u, k), u) == False{} : Bool}
+  {g4u_final(True{}, 1n+Nat.add(u, k), u) == False{} : Bool}
 
 def g4u_final_refuses_past_end(u, k):
   g4u_past_not_le(u, k)
@@ -256,3 +280,95 @@ def g4u_ext_within_unit(b, p, e, k):
       g4u_ext_lt(p, Nat.min(e, 1n+Nat.add(p, k)), k, L.nat_min_le_r(e, 1n+Nat.add(p, k)))
     case False{}:
       g4u_lt_self_add(p, k)
+
+# LAW G4U.5
+# promise: a tile of a causal unit (no two-way image block) is always final, so the prefill always moves past it.
+# harm: the small sizes' image prompts would be refused whenever an image crosses a tile boundary.
+law g4u_causal_tile_final:
+  for +e: Nat
+  for u: Nat
+  {g4u_final(False{}, e, u) == True{} : Bool}
+
+def g4u_causal_tile_final(e, u):
+  {==}
+
+# LAW G4U.6
+# promise: a prefill unit always holds at least the tile it starts with.
+law g4u_unit_tiles_at_least_one:
+  for +t: Nat
+  for +b: Nat
+  {Nat.is_le(1n, g4u_unit_tiles(t, b)) == True{} : Bool}
+
+def g4u_unit_tiles_at_least_one(t, b):
+  L.nat_max_ge_l(1n, Nat.div(Nat.add(Nat.add(Nat.sub(t, 1n), b), Nat.sub(t, 1n)), t))
+
+# LAW G4U.7
+# promise: a text row attends nothing after its own position.
+law g4u_text_row_causal:
+  for +p: Nat
+  for e: Nat
+  for u: Nat
+  {g4u_ext(False{}, p, e, u) == 0n : Nat}
+
+def g4u_text_row_causal(p, e, u):
+  {==}
+
+# LAW G4U.8
+# promise: a row of an image block never attends a position past the end of its own block.
+# harm: it would attend text or another image that the reference keeps causal.
+law g4u_ext_within_block:
+  for +p: Nat
+  for +k: Nat
+  for +u: Nat
+  {Nat.is_lt(Nat.add(p, g4u_ext(True{}, p, 1n+Nat.add(p, k), u)), 1n+Nat.add(p, k)) == True{} : Bool}
+
+def g4u_ext_within_block(p, k, u):
+  g4u_ext_lt(p, Nat.min(1n+Nat.add(p, k), u), k, L.nat_min_le_l(1n+Nat.add(p, k), u))
+
+# s + n < s + n never holds.
+def g4u_lt_self_false(+x: Nat) -> {Nat.is_lt(x, x) == False{} : Bool}:
+  match x:
+    case 0n:
+      {==}
+    case 1n+xp:
+      g4u_lt_self_false(xp)
+
+# a and false is false.
+def g4u_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW G4U.9
+# promise: the row right after an image block is not in it.
+law g4u_block_end_row_outside:
+  for +s: Nat
+  for +n: Nat
+  {g4u_in_block(s, n, Nat.add(s, n)) == False{} : Bool}
+
+def g4u_block_end_row_outside(s, n):
+  %Equal.sym(Bool, Nat.is_lt(Nat.add(s, n), Nat.add(s, n)), False{}, g4u_lt_self_false(Nat.add(s, n))) : {Bool.and(Nat.is_le(s, Nat.add(s, n)), _) == False{} : Bool}
+  g4u_and_false_r(Nat.is_le(s, Nat.add(s, n)))
+
+# x < x + k never holds the other way: x + k < x is false.
+def g4u_add_lt_false(+x: Nat, +k: Nat) -> {Nat.is_lt(Nat.add(x, k), x) == False{} : Bool}:
+  match x:
+    case 0n:
+      match k:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+xp:
+      g4u_add_lt_false(xp, k)
+
+# LAW G4U.10
+# promise: an image block that ends at or before the first of some rows has no row among them.
+law g4u_block_before_rows_outside:
+  for +s: Nat
+  for +n: Nat
+  for +k: Nat
+  for +b: Nat
+  {g4u_overlaps(s, n, Nat.add(Nat.add(s, n), k), b) == False{} : Bool}
+
+def g4u_block_before_rows_outside(s, n, k, b):
+  %Equal.sym(Bool, Nat.is_lt(Nat.add(Nat.add(s, n), k), Nat.add(s, n)), False{}, g4u_add_lt_false(Nat.add(s, n), k)) : {Bool.and(Nat.is_lt(s, b), _) == False{} : Bool}
+  g4u_and_false_r(Nat.is_lt(s, b))

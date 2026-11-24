@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use super::vision::graphs::build_embed_vis_graph;
 use super::*;
-use crate::verified::{g4u_ext, g4u_final, g4u_fits, g4u_join};
+use crate::verified::{ikv_feat_row, g4u_ext, g4u_final, g4u_fits, g4u_in_block, g4u_join, g4u_overlaps, g4u_unit_tiles};
 
 /// The vision recipes of the decoder, by kind and tile rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,7 +57,7 @@ impl VisLoad {
             }
             // the tiles the largest block reaches from any row of a tile (its first tile included)
             let block = super::vision::soft_budget(&geo.spec);
-            unit_tiles = (tile - 1 + block).div_ceil(tile);
+            unit_tiles = g4u_unit_tiles(tile, block);
             if !g4u_fits(d.ring, d.window, unit_tiles * tile) {
                 return Err(format!(
                     "an image block of {block} rows reaches {unit_tiles} prefill tiles of {tile} rows: with a window of {} that needs more than the {}-slot ring",
@@ -112,7 +112,7 @@ pub(super) fn split_tiles(len: u64, tile: u64) -> Vec<Tile> {
 pub(super) fn block_end(blocks: &[(usize, usize)], a: u64, b: u64) -> u64 {
     blocks
         .iter()
-        .filter(|&&(s, n)| (s as u64) < b && (s + n) as u64 > a)
+        .filter(|&&(s, n)| g4u_overlaps(s as u64, n as u64, a, b))
         .map(|&(s, n)| (s + n) as u64)
         .max()
         .unwrap_or(0)
@@ -158,7 +158,7 @@ pub(super) fn plan_unit(
     let next = unit
         .iter()
         .copied()
-        .find(|&j| !g4u_final(block_end(blocks, tiles[j].pos, tiles[j].end()), end))
+        .find(|&j| !g4u_final(two_way, block_end(blocks, tiles[j].pos, tiles[j].end()), end))
         .unwrap_or(unit[unit.len() - 1] + 1);
     if next == i {
         return Err(format!(
@@ -178,7 +178,7 @@ pub(super) fn plan_unit(
 pub(super) fn row_ext(blocks: &[(usize, usize)], p: u64, unit_end: u64) -> u64 {
     let blk = blocks
         .iter()
-        .find(|&&(s, n)| (s as u64) <= p && p < (s + n) as u64);
+        .find(|&&(s, n)| g4u_in_block(s as u64, n as u64, p));
     g4u_ext(blk.is_some(), p, blk.map_or(0, |&(s, n)| (s + n) as u64), unit_end)
 }
 
@@ -194,6 +194,8 @@ pub(super) struct TileBufs {
 impl Gemma4Engine {
     fn unit_bufs(&self, j: usize) -> TileBufs {
         if j == 0 {
+            // `ext` is planned whenever two-way blocks are (`VisLoad::sizing_graphs`); 0 (none)
+            // is refused by `prefill_vis` before it uploads a table
             TileBufs {
                 x: self.pf_x,
                 ids: self.pf_ids,
@@ -261,7 +263,8 @@ impl Gemma4Engine {
     /// keep flags). Synced (the next tile's inputs reuse the staging buffers).
     fn embed_tile(&mut self, ids: &[i32], fidx: &[i32], tl: Tile, b: &TileBufs) -> Result<f64, String> {
         let (p0, t) = (tl.pos as usize, tl.t as usize);
-        let has_img = fidx[p0..p0 + t].iter().any(|&f| f != 0);
+        let text_col = ikv_feat_row(false, 0) as i32;
+        let has_img = fidx[p0..p0 + t].iter().any(|&f| f != text_col);
         let t_rec = Instant::now();
         if has_img {
             self.ensure_vis(VisRecipe::Embed, tl.t)?;
@@ -273,7 +276,7 @@ impl Gemma4Engine {
         {
             let st = self.stage_io.as_mut_slice();
             for k in 0..t {
-                let id = if fidx[p0 + k] != 0 { pad } else { ids[p0 + k] };
+                let id = if fidx[p0 + k] != text_col { pad } else { ids[p0 + k] };
                 st[k * 4..k * 4 + 4].copy_from_slice(&id.to_le_bytes());
             }
         }
@@ -296,7 +299,7 @@ impl Gemma4Engine {
             let one = crate::fp8::f32_to_bf16_rne(1.0);
             for &f in &fidx[p0..p0 + t] {
                 fb.extend_from_slice(&f.to_le_bytes());
-                kb.extend_from_slice(&(if f == 0 { one } else { 0u16 }).to_le_bytes());
+                kb.extend_from_slice(&(if f == text_col { one } else { 0u16 }).to_le_bytes());
             }
             self.dev
                 .copy_h2d_sync(&fb, self.pf_scratch["vis_fidx"])
@@ -383,6 +386,9 @@ impl Gemma4Engine {
                     ext.extend_from_slice(&(row_ext(&req.blocks, p, unit_end) as i32).to_le_bytes());
                 }
                 let b = self.unit_bufs(k);
+                if b.ext == 0 {
+                    return Err("the plan holds no extension table for two-way image blocks".into());
+                }
                 self.dev
                     .copy_h2d_sync(&ext, b.ext)
                     .map_err(|e| format!("upload block extensions: {e}"))?;
@@ -435,7 +441,7 @@ mod tests {
     fn walk(len: u64, tile: u64, blocks: &[(usize, usize)], ring: u64, w: u64) -> Vec<Unit> {
         let tiles = split_tiles(len, tile);
         let block = blocks.iter().map(|b| b.1 as u64).max().unwrap_or(1);
-        let max_tiles = (tile - 1 + block).div_ceil(tile);
+        let max_tiles = g4u_unit_tiles(tile, block);
         assert!(g4u_fits(ring, w, max_tiles * tile));
         let mut done = vec![false; tiles.len()];
         let mut units = Vec::new();
@@ -494,6 +500,35 @@ mod tests {
     fn a_text_prompt_never_runs_two_way() {
         let u = walk(1000, 256, &[], 2048, 1024);
         assert!(u.iter().all(|u| !u.two_way && u.tiles.len() == 1));
+    }
+
+    #[test]
+    fn causal_sizes_move_tile_by_tile_over_a_block_boundary() {
+        // a size whose image rows attend causally: one tile per unit, every tile final, also
+        // when an image block runs over the tile's end
+        let tiles = split_tiles(700, 256);
+        let blocks = [(200, 280)];
+        let mut i = 0;
+        let mut seen = 0;
+        while i < tiles.len() {
+            let u = plan_unit(&tiles, &blocks, i, false, 1).unwrap();
+            assert_eq!(u.tiles, vec![i]);
+            assert!(!u.two_way);
+            assert_eq!(u.next, i + 1);
+            i = u.next;
+            seen += 1;
+        }
+        assert_eq!(seen, tiles.len());
+    }
+
+    #[test]
+    fn unit_tiles_cover_the_largest_block() {
+        for (t, b) in [(256, 280), (256, 1), (128, 280), (16, 280), (1, 0), (1, 280), (512, 280)] {
+            let n = g4u_unit_tiles(t, b);
+            assert!(n >= 1);
+            // a block of b rows from the last row of a tile ends inside n tiles
+            assert!(t - 1 + b <= n * t, "t {t} b {b}: {n} tiles");
+        }
     }
 
     #[test]

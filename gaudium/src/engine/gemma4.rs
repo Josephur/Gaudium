@@ -1296,7 +1296,7 @@ impl G4Plan {
             // and the two-way block recipes
             graphs.extend(v.sizing_graphs(d, tile, max_ctx));
             p.vis = Some(v.geo.plan_bytes());
-            p.unit_extra = v.unit_tiles - 1;
+            p.unit_extra = v.unit_tiles.saturating_sub(1);
         }
         for gb in &graphs {
             for (name, _dt, _dims, bytes) in gb.persistent_tensor_specs() {

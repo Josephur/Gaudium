@@ -25,7 +25,7 @@ use crate::synapse::graph::{CompiledRecipe, GraphBuilder};
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
     g4_lane, ikv_feat_cols, ikv_feat_next, ikv_feat_row, ikv_feat_start, ikv_feat_write_safe,
-    ikv_rows_match,
+    ikv_rows_match, vis_grid_fits, vis_rows_fit,
 };
 use crate::vision::preprocess::PreparedImage;
 use crate::vision::{VisionReport, VisionSpec};
@@ -473,7 +473,7 @@ impl G4Vision {
     /// Takes the images of the next request, in prompt order.
     pub fn set_request_images(&mut self, images: Vec<PreparedImage>) -> Result<(), String> {
         let tokens: u64 = images.iter().map(|i| i.n_tokens() as u64).sum();
-        if tokens > self.geo.max_tokens {
+        if !vis_rows_fit(0, tokens, self.geo.max_tokens) {
             return Err(format!(
                 "the request's images hold {tokens} image tokens; this engine is planned for {} (--vision-max-tokens)",
                 self.geo.max_tokens
@@ -484,7 +484,7 @@ impl G4Vision {
             G4vKind::Unified => self.geo.max_n * self.geo.d.ppt(),
         };
         for im in &images {
-            if im.n_patches() as u64 > max_patches || im.pixels.is_empty() {
+            if !vis_grid_fits(im.grid_h as u64, im.grid_w as u64, max_patches) || im.pixels.is_empty() {
                 return Err(format!(
                     "an image of {} patches: the image path is planned for {max_patches}",
                     im.n_patches()
@@ -531,7 +531,7 @@ impl G4Vision {
             ));
         }
         for (k, (r, im)) in runs.iter().zip(&images).enumerate() {
-            if r.1 != im.n_tokens() {
+            if !ikv_rows_match(r.1 as u64, im.n_tokens() as u64) {
                 return Err(format!(
                     "image {k}: {} placeholder rows for {} tokens",
                     r.1,
@@ -539,7 +539,7 @@ impl G4Vision {
                 ));
             }
         }
-        let mut fidx = vec![0i32; prompt_ids.len()];
+        let mut fidx = vec![ikv_feat_row(false, 0) as i32; prompt_ids.len()];
         let mut rank = 0u64;
         for &(s, n) in &runs {
             for row in fidx.iter_mut().skip(s).take(n) {

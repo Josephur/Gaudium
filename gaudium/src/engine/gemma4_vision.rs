@@ -387,7 +387,7 @@ pub fn target_size(width: usize, height: usize, vs: &VisionSpec) -> Result<(usiz
     let max_side = max_soft * side;
     let th = g4v_target_h(th0, tw0, h / w, side, max_side);
     let tw = g4v_target_w(th0, tw0, w / h, side, max_side);
-    if !g4v_size_ok(th, tw, side, max_soft) {
+    if !g4v_size_ok(th, tw, vs.patch, vs.merge, max_soft) {
         return Err(format!(
             "an image of {width}x{height} pixels has no size within {max_soft} soft tokens of {side}x{side} pixels"
         ));
@@ -397,7 +397,7 @@ pub fn target_size(width: usize, height: usize, vs: &VisionSpec) -> Result<(usiz
 
 /// Soft tokens of an image resized to `rh x rw` pixels.
 pub fn image_tokens(rh: usize, rw: usize, vs: &VisionSpec) -> u64 {
-    g4v_tokens(rh as u64, rw as u64, vs.resize_factor())
+    g4v_tokens(rh as u64, rw as u64, vs.patch, vs.merge)
 }
 
 /// The processor's value of pixel byte `v`: the byte times the rescale factor, in f32.
