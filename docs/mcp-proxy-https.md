@@ -194,7 +194,8 @@ the two), the flags to start the server with, and how to trust the authority.
   without the flag. A directory with only one of `ca.crt` and `ca.key` is refused. Files are
   written under temporary names and put in place only when the new certificate has been checked
   as a client checks it (signature, validity, server purpose, the authority's name constraints,
-  every name).
+  every name). A replaced file is kept aside until all of them are in place: a run that fails
+  half way puts the old ones back, so a key and its certificate never come apart.
 
 **Later: a new address or name, or a renewal.** Run the same command with `--cert-overwrite`
 (and the new `--cert-names`), then restart the server: the authority stays, so the devices need

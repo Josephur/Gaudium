@@ -393,3 +393,43 @@ fn clients_that_trust_the_authority_accept_the_server() {
         .unwrap_err();
     assert!(e.contains("was not accepted"), "{e}");
 }
+
+#[test]
+fn a_run_that_fails_while_putting_files_in_place_leaves_the_directory_as_it_was() {
+    if !available() {
+        return;
+    }
+    let fail_at = |p: Option<PathBuf>| FAIL_COMMIT.with(|f| *f.borrow_mut() = p);
+    let names_in = |dir: &Path| {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    // a renewal whose certificate cannot be put in place: the old key and certificate stay
+    let t = temp_dir();
+    make_cert(&opts(&t.0, "gaudium.example.lan")).unwrap();
+    let before = bytes(&t.0);
+    let mut o = opts(&t.0, "gaudium.example.lan,10.20.30.40");
+    o.overwrite = true;
+    fail_at(Some(t.0.join(SERVER_CERT)));
+    let e = make_cert(&o).unwrap_err();
+    fail_at(None);
+    assert!(e.contains("refused (test)"), "{e}");
+    assert_eq!(bytes(&t.0), before, "the old pair is back");
+    assert_eq!(mode(&t.0.join(SERVER_KEY)), 0o600);
+    assert_eq!(names_in(&t.0), [CA_CERT, CA_KEY, SERVER_CERT, SERVER_KEY]);
+    // and the same renewal then succeeds
+    make_cert(&o).unwrap();
+    assert!(server_covers(&t.0, "10.20.30.40"));
+    assert_eq!(names_in(&t.0), [CA_CERT, CA_KEY, SERVER_CERT, SERVER_KEY]);
+
+    // a first run that fails at its last file: nothing of it is left
+    let t = temp_dir();
+    fail_at(Some(t.0.join(SERVER_CERT)));
+    assert!(make_cert(&opts(&t.0, "gaudium.example.lan")).is_err());
+    fail_at(None);
+    assert!(names_in(&t.0).is_empty(), "{:?}", names_in(&t.0));
+}

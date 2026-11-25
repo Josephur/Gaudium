@@ -819,7 +819,9 @@ impl Crypto {
 // Files
 // ------------------------------------------------------------------------------------------------
 
-/// A file written in this run under a temporary name, put in place by [`Staged::commit`].
+/// A file written in this run under a temporary name, put in place by [`Staged::commit`]. A
+/// file it replaces is kept under a backup name until every file of the run is in place, so a
+/// failed run leaves the directory as it found it.
 struct Staged {
     tmp: PathBuf,
     path: PathBuf,
@@ -827,6 +829,8 @@ struct Staged {
     committed: bool,
     /// The file did not exist before this run (removed again if a later step fails).
     created: bool,
+    /// Where the file this one replaced waits until the run succeeds (put back if it fails).
+    backup: Option<PathBuf>,
 }
 
 impl Drop for Staged {
@@ -837,25 +841,71 @@ impl Drop for Staged {
     }
 }
 
+/// A name beside `path` for one of this run's own files (`.<name>.<what>-<pid>`).
+fn beside(path: &Path, what: &str) -> PathBuf {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    path.with_file_name(format!(".{file_name}.{what}-{}", std::process::id()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the commit of this path fails, as a file system can refuse a rename.
+    static FAIL_COMMIT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 impl Staged {
-    /// Puts the file in place: over the old one when replacing, otherwise only if the name is
-    /// still free.
+    /// Puts the file in place: over the old one when replacing (the old one kept aside),
+    /// otherwise only if the name is still free.
     fn commit(&mut self) -> Result<(), String> {
-        let r = if self.replace {
-            fs::rename(&self.tmp, &self.path)
+        #[cfg(test)]
+        if FAIL_COMMIT.with(|f| f.borrow().as_deref() == Some(self.path.as_path())) {
+            return Err(format!("{}: refused (test)", self.path.display()));
+        }
+        let fail = |e: io::Error| format!("{}: {e}", self.path.display());
+        if self.replace && exists(&self.path) {
+            let backup = beside(&self.path, "old");
+            fs::rename(&self.path, &backup).map_err(fail)?;
+            if let Err(e) = fs::rename(&self.tmp, &self.path) {
+                // the old file back at once
+                let _ = fs::rename(&backup, &self.path);
+                return Err(fail(e));
+            }
+            self.backup = Some(backup);
         } else {
             match fs::hard_link(&self.tmp, &self.path) {
-                Ok(()) => fs::remove_file(&self.tmp),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+                Ok(()) => fs::remove_file(&self.tmp).map_err(fail)?,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(fail(e)),
                 // a file system without hard links: the name was free a moment ago
-                Err(_) if !exists(&self.path) => fs::rename(&self.tmp, &self.path),
-                Err(e) => Err(e),
+                Err(_) if !exists(&self.path) => fs::rename(&self.tmp, &self.path).map_err(fail)?,
+                Err(e) => return Err(fail(e)),
             }
-        };
-        r.map_err(|e| format!("{}: {e}", self.path.display()))?;
+            self.created = true;
+        }
         self.committed = true;
-        self.created = !self.replace;
         Ok(())
+    }
+
+    /// A later file of the run failed: the old file is put back, or the new one removed.
+    fn undo(&mut self) {
+        if !self.committed {
+            return;
+        }
+        match self.backup.take() {
+            Some(b) => {
+                let _ = fs::rename(&b, &self.path);
+            }
+            None if self.created => {
+                let _ = fs::remove_file(&self.path);
+            }
+            None => {}
+        }
+    }
+
+    /// Every file of the run is in place: the replaced file is removed.
+    fn finish(&mut self) {
+        if let Some(b) = self.backup.take() {
+            let _ = fs::remove_file(b);
+        }
     }
 }
 
@@ -872,8 +922,7 @@ fn stage(
     replace: bool,
     fill: impl FnOnce(P) -> bool,
 ) -> Result<Staged, String> {
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let tmp = beside(path, "tmp");
     let file: File = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -886,6 +935,7 @@ fn stage(
         replace,
         committed: false,
         created: false,
+        backup: None,
     };
     // exactly `mode`, whatever the umask left of it
     fs::set_permissions(&staged.tmp, fs::Permissions::from_mode(mode))
@@ -1126,14 +1176,15 @@ pub fn make_cert(opts: &MakeCertOptions) -> Result<MakeCertReport, String> {
     })?);
     for i in 0..staged.len() {
         if let Err(e) = staged[i].commit() {
-            // files this run created are removed again; replaced ones cannot be brought back
-            for s in &staged[..i] {
-                if s.created {
-                    let _ = fs::remove_file(&s.path);
-                }
+            // the directory as it was: replaced files back, created ones removed
+            for s in staged[..i].iter_mut().rev() {
+                s.undo();
             }
             return Err(e);
         }
+    }
+    for s in &mut staged {
+        s.finish();
     }
 
     Ok(MakeCertReport {
