@@ -267,13 +267,28 @@ fn print_usage() {
          \x20                       shown under instructions_source in GET /gaudium/a2ui\n\
          \x20 --tls-cert <file>     Serve HTTPS as well: the PEM certificate (with its chain) for\n\
          \x20 --tls-key <file>      the server, and its unencrypted PEM private key. HTTP and HTTPS\n\
-         \x20                       then share the port: http://host:port and https://host:port both\n\
-         \x20                       answer, and clients that used plain HTTP go on working. Opened\n\
-         \x20                       over https the Web UI may use the microphone and the clipboard\n\
-         \x20                       from other machines. TLS comes from the system's OpenSSL 3\n\
-         \x20                       (libssl.so.3), loaded when asked for: without it the server\n\
-         \x20                       starts, says that HTTPS is not offered, and serves plain HTTP.\n\
-         \x20                       Behind a front end that ends TLS itself give neither option\n\
+         \x20                       then share the port, and a plain-HTTP request is answered with a\n\
+         \x20                       redirect to https on the same host and port (see --tls-http).\n\
+         \x20                       Opened over https the Web UI may use the microphone and the\n\
+         \x20                       clipboard from other machines. TLS comes from the system's\n\
+         \x20                       OpenSSL 3 (libssl.so.3), loaded when asked for: without it the\n\
+         \x20                       server starts, says that HTTPS is not offered, and serves plain\n\
+         \x20                       HTTP. Behind a front end that ends TLS itself give neither option\n\
+         \x20 --tls-http <mode>     What plain-HTTP requests get while HTTPS is served: redirect\n\
+         \x20                       (default) sends clients on other machines to https with a 308\n\
+         \x20                       (method and body kept; a missing or malformed Host header is a\n\
+         \x20                       400) and answers clients on this machine's loopback interface\n\
+         \x20                       (local tools; their traffic never leaves the machine); strict\n\
+         \x20                       redirects every client, loopback included; allow answers plain\n\
+         \x20                       HTTP from every client as well (tools elsewhere that cannot\n\
+         \x20                       speak HTTPS)\n\
+         \x20 --hsts-max-age <secs>  max-age of the Strict-Transport-Security header every response\n\
+         \x20                       over HTTPS carries (default: 86400, one day; at most 63072000).\n\
+         \x20                       A browser that saw it uses https for this host name, on every\n\
+         \x20                       port, until it expires; 0 tells browsers to forget it. No\n\
+         \x20                       includeSubDomains, no preload. On --port 80 the default is 0\n\
+         \x20                       and a nonzero value is refused (browsers would send http://\n\
+         \x20                       links to port 443)\n\
          \x20 --mcp-proxy           Offer the MCP proxy (/cors-proxy) to the Web UI: the server\n\
          \x20                       makes the requests to an MCP server instead of the browser (for\n\
          \x20                       servers without CORS headers, servers only this machine\n\
@@ -2439,7 +2454,7 @@ fn run_make_cert(args: &[String]) -> Result<(), String> {
     println!(
         "Start the server with\n\
          \x20 gaudium --serve ... --tls-cert {} --tls-key {}\n\
-         and open https://{host}:<port>/ (plain HTTP keeps answering on the same port).\n\
+         and open https://{host}:<port>/ (plain HTTP on the same port is sent there; see --tls-http).\n\
          \n\
          Trust the authority once on each device; every server certificate it signs is then trusted:\n\
          {}\n\
@@ -2486,6 +2501,8 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut mcp_proxy = ProxyOptions::default();
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
+    let mut tls_http = gaudium::core::listener::PlainHttpMode::LsHttpRedirect;
+    let mut hsts_max_age: Option<u64> = None;
     let mut per_model: Vec<(String, ModelRunOptions)> = Vec::new();
     let mut draft_k: Vec<u64> = Vec::new();
     let mut build_cache = false;
@@ -2738,6 +2755,31 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             }
             "--tls-cert" => tls_cert = Some(PathBuf::from(next_val(&mut i, "--tls-cert")?)),
             "--tls-key" => tls_key = Some(PathBuf::from(next_val(&mut i, "--tls-key")?)),
+            "--tls-http" => {
+                use gaudium::core::listener::PlainHttpMode as M;
+                let s = next_val(&mut i, "--tls-http")?;
+                tls_http = match s.as_str() {
+                    "redirect" => M::LsHttpRedirect,
+                    "allow" => M::LsHttpAllow,
+                    "strict" => M::LsHttpStrict,
+                    _ => {
+                        return Err(format!(
+                            "invalid --tls-http '{s}' (expected redirect, allow or strict)"
+                        ))
+                    }
+                };
+            }
+            "--hsts-max-age" => {
+                let s = next_val(&mut i, "--hsts-max-age")?;
+                hsts_max_age = Some(
+                    s.parse()
+                        .ok()
+                        .filter(|&n: &u64| n <= 63_072_000)
+                        .ok_or_else(|| {
+                            format!("invalid --hsts-max-age '{s}' (seconds, 0 to 63072000)")
+                        })?,
+                );
+            }
             "--mcp-proxy" => mcp_proxy.enabled = true,
             "--mcp-proxy-allow" => mcp_proxy
                 .allow
@@ -2810,6 +2852,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         }
     };
 
+    let hsts_max_age =
+        gaudium::server::hsts_max_age_for(tls_cert.is_some(), port, hsts_max_age)?;
+
     if !profile.is_empty() {
         // as for --generate: the template before the device opens (the batched lane recipes
         // compile in the process, the others load from the recipe cache)
@@ -2840,6 +2885,8 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         mcp_proxy,
         tls_cert,
         tls_key,
+        tls_http,
+        hsts_max_age,
         cache_ram_bytes,
         parallel,
         cache_trim,

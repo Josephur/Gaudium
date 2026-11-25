@@ -1662,6 +1662,7 @@ impl McpProxy {
              X-Accel-Buffering: no\r\n\
              Connection: close\r\n",
         );
+        out.push_str(stream.hsts_line());
         if framing == Framing::Empty || framing == Framing::Length(0) {
             out.push_str("Content-Length: 0\r\n\r\n");
             if let Err(e) = self.write_page(stream, out.as_bytes(), started) {
@@ -1928,8 +1929,10 @@ fn write_proxy_error(stream: &mut Conn, status: u16, kind: &str, message: &str) 
          Content-Type: application/json; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
+         {}\
          Connection: close\r\n\r\n",
-        body.len()
+        body.len(),
+        stream.hsts_line()
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body.as_bytes());

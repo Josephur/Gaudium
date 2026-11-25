@@ -1,11 +1,14 @@
 //! Rust Shell wrappers for the HTTPS listener decisions of `verified/tls_listener.bend`.
 //!
-//! Whether the server serves TLS and which protocol an accepted connection speaks both delegate
-//! to the verified core; nothing here decides.
+//! Whether the server serves TLS, which protocol an accepted connection speaks, whether a
+//! plain-HTTP request is answered or sent to HTTPS, and which responses carry
+//! Strict-Transport-Security all delegate to the verified core; nothing here decides.
 
+pub use crate::verified::LsHttpMode as PlainHttpMode;
 pub use crate::verified::LsStart as TlsStart;
 use crate::verified::{
-    ls_is_hello, ls_proto, ls_start, ls_start_refuses, ls_start_serves_tls, ls_start_warns, LsProto,
+    ls_is_hello, ls_plain_act, ls_plain_served, ls_proto, ls_sends_hsts, ls_start,
+    ls_start_refuses, ls_start_serves_tls, ls_start_warns, LsProto,
 };
 
 /// What the certificate and key flags mean on this machine. `cert`, `key`: the files were given;
@@ -47,6 +50,31 @@ pub fn conn_protocol(first_byte: u8, tls_ready: bool) -> ConnProtocol {
     }
 }
 
+fn ls_of(p: ConnProtocol) -> LsProto {
+    match p {
+        ConnProtocol::Plain => LsProto::LsPlain,
+        ConnProtocol::Tls => LsProto::LsTls,
+        ConnProtocol::Drop => LsProto::LsDrop,
+    }
+}
+
+/// A request on a connection of protocol `p` is answered (`false`: it is sent to HTTPS).
+/// `tls_ready`: the server serves TLS; `mode`: `--tls-http`; `loopback`: the client connected
+/// over the loopback interface.
+pub fn request_served(
+    p: ConnProtocol,
+    tls_ready: bool,
+    mode: PlainHttpMode,
+    loopback: bool,
+) -> bool {
+    ls_plain_served(ls_plain_act(ls_of(p), tls_ready, mode, loopback))
+}
+
+/// Responses on a connection of this protocol carry Strict-Transport-Security.
+pub fn sends_hsts(p: ConnProtocol) -> bool {
+    ls_sends_hsts(ls_of(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +99,26 @@ mod tests {
         // no library: the server runs, plain HTTP only, and says so
         let s = tls_start(true, true, false, false);
         assert!(start_warns(s) && !start_refused(s) && !serves_tls(s));
+    }
+
+    #[test]
+    fn plain_http_beside_tls_of_today() {
+        use PlainHttpMode::*;
+        let plain = |t, m, l| request_served(ConnProtocol::Plain, t, m, l);
+        for mode in [LsHttpRedirect, LsHttpAllow, LsHttpStrict] {
+            for lo in [false, true] {
+                // no TLS: plain HTTP is all there is
+                assert!(plain(false, mode, lo));
+                // a TLS request is answered in every mode
+                assert!(request_served(ConnProtocol::Tls, true, mode, lo));
+            }
+        }
+        // the default: other machines go to HTTPS, this machine's loopback clients are answered
+        assert!(!plain(true, LsHttpRedirect, false));
+        assert!(plain(true, LsHttpRedirect, true));
+        assert!(plain(true, LsHttpAllow, false));
+        assert!(!plain(true, LsHttpStrict, true));
+        assert!(sends_hsts(ConnProtocol::Tls));
+        assert!(!sends_hsts(ConnProtocol::Plain) && !sends_hsts(ConnProtocol::Drop));
     }
 }

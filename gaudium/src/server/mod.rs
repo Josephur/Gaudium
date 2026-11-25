@@ -12,7 +12,9 @@
 //!   see `proxy.rs`)
 //!
 //! HTTP and HTTPS share the port (`--tls-cert`, `--tls-key`; see `conn.rs`): the first byte of a
-//! connection says which of the two the client speaks.
+//! connection says which of the two the client speaks. With HTTPS served, a plain-HTTP request is
+//! answered or sent to HTTPS as `--tls-http` says (`verified/tls_listener.bend`, `ls_plain_act`),
+//! and responses over TLS carry Strict-Transport-Security (`--hsts-max-age`).
 //!
 //! Single-card safety & verified core invariants:
 //! - Uses `core::lifecycle::can_switch_resident_model` before switching resident models or parking.
@@ -57,6 +59,28 @@ mod readout;
 mod stream_out;
 
 use chat::{ChatPrompt, ChatTemplate};
+
+/// Default of `--hsts-max-age`: one day. A browser that saw it goes to HTTPS for this host name
+/// for a day, on every port; short, so that a server whose HTTPS is turned off again strands a
+/// browser for a day at most.
+pub const DEFAULT_HSTS_MAX_AGE: u64 = 86_400;
+
+/// The HSTS max-age the server sends, from `--hsts-max-age` (`None` when not given), whether TLS
+/// is on, and the listening port. A browser that has the header rewrites `http://host/` and
+/// `http://host:80/` to port 443 (RFC 6797, section 8.3), so on port 80 a nonzero max-age would
+/// send saved HTTP links to a port this listener does not serve: there the default is 0
+/// (`max-age=0`, which also clears an earlier one), and an explicit nonzero value is refused.
+pub fn hsts_max_age_for(tls: bool, port: u16, requested: Option<u64>) -> Result<u64, String> {
+    match (tls && port == 80, requested) {
+        (true, Some(n)) if n > 0 => Err(format!(
+            "--hsts-max-age {n} with HTTPS on port 80: browsers that saw the header would send \
+             http:// links for this host to port 443, which this server does not serve; use \
+             another --port, or --hsts-max-age 0"
+        )),
+        (true, _) => Ok(0),
+        (false, r) => Ok(r.unwrap_or(DEFAULT_HSTS_MAX_AGE)),
+    }
+}
 use conn::Conn;
 pub use proxy::ProxyOptions;
 use outparse::{Delta, OutputFormat, OutputParser};
@@ -120,6 +144,11 @@ pub struct ServerConfig {
     pub tls_cert: Option<PathBuf>,
     /// PEM private key of the HTTPS listener (`--tls-key`). Only its path is held here.
     pub tls_key: Option<PathBuf>,
+    /// What plain-HTTP requests get while HTTPS is served (`--tls-http`).
+    pub tls_http: crate::core::listener::PlainHttpMode,
+    /// `max-age` of the Strict-Transport-Security header of responses over TLS, in seconds
+    /// (`--hsts-max-age`; 0 tells browsers to forget an earlier one).
+    pub hsts_max_age: u64,
     /// Budget of the host-RAM tier of prefix reuse in bytes (`--cache-ram`): `None` = a share
     /// of the host memory available at start, `Some(0)` = off.
     pub cache_ram_bytes: Option<u64>,
@@ -1811,7 +1840,13 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
         "[server] listening on http://{0}/{1} (models: {2}, lazy={3}, idle_park={4}s, ui={5})",
         addr,
         if state.tls.is_some() {
-            format!(" and https://{addr}/ (same port)")
+            use crate::core::listener::PlainHttpMode as M;
+            let plain = match cfg.tls_http {
+                M::LsHttpRedirect => "redirected to https, loopback clients answered",
+                M::LsHttpStrict => "redirected to https",
+                M::LsHttpAllow => "answered",
+            };
+            format!(" and https://{addr}/ (same port; plain HTTP {plain}; --tls-http)")
         } else {
             String::new()
         },
@@ -1863,6 +1898,8 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
 
 struct HttpRequest {
     method: String,
+    /// The request target as sent (path and query, not decoded).
+    target: String,
     path: String,
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
@@ -1900,7 +1937,12 @@ fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let k = k.trim().to_ascii_lowercase();
+            // RFC 9112: a request with more than one Host is refused (which one would count?)
+            if k == "host" && headers.contains_key("host") {
+                return Err("more than one Host header".into());
+            }
+            headers.insert(k, v.trim().to_string());
         }
     }
 
@@ -1944,8 +1986,10 @@ fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
         }
     }
 
+    let target = raw_target.to_string();
     Ok(Some(HttpRequest {
         method,
+        target,
         path,
         query,
         headers,
@@ -1969,8 +2013,10 @@ fn write_response_with_body(
          Access-Control-Allow-Origin: *\r\n\
          Access-Control-Allow-Methods: GET, HEAD, POST, DELETE, OPTIONS\r\n\
          Access-Control-Allow-Headers: Content-Type, Authorization, X-Api-Key\r\n\
+         {}\
          Connection: close\r\n\r\n",
-        body.len()
+        body.len(),
+        stream.hsts_line()
     );
     let _ = stream.write_all(head.as_bytes());
     if send_body && !body.is_empty() {
@@ -2021,13 +2067,17 @@ fn write_error(stream: &mut Conn, status: u16, err_type: &str, msg: &str) {
 }
 
 fn write_sse_headers(stream: &mut Conn) -> std::io::Result<()> {
-    let head = "HTTP/1.1 200 OK\r\n\
-                Content-Type: text/event-stream; charset=utf-8\r\n\
-                Transfer-Encoding: chunked\r\n\
-                Cache-Control: no-cache, no-store\r\n\
-                X-Accel-Buffering: no\r\n\
-                Access-Control-Allow-Origin: *\r\n\
-                Connection: close\r\n\r\n";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream; charset=utf-8\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Cache-Control: no-cache, no-store\r\n\
+         X-Accel-Buffering: no\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         {}\
+         Connection: close\r\n\r\n",
+        stream.hsts_line()
+    );
     stream.write_all(head.as_bytes())?;
     stream.flush()
 }
@@ -2069,15 +2119,100 @@ fn check_auth(cfg: &ServerConfig, req: &HttpRequest) -> bool {
 /// Serves one accepted socket: plain HTTP, or TLS when the client opens with a handshake and the
 /// server has a certificate.
 fn handle_connection(state: Arc<AppState>, tcp: TcpStream) {
-    if let Some(stream) = Conn::open(tcp, state.tls.as_ref()) {
-        handle_request(Arc::clone(&state), stream);
+    // An address that cannot be read counts as another machine's (the request is redirected).
+    let loopback = tcp
+        .peer_addr()
+        .is_ok_and(|a| a.ip().to_canonical().is_loopback());
+    if let Some(stream) = Conn::open(tcp, state.tls.as_ref(), state.cfg.hsts_max_age) {
+        handle_request(Arc::clone(&state), stream, loopback);
     }
     // The connection is closed: nothing of a response waits for what follows. After a chat
     // request the engine now gets its idle time (the host-RAM tier's save).
     state.idle_work();
 }
 
-fn handle_request(state: Arc<AppState>, mut stream: Conn) {
+/// The `Location` that sends a plain-HTTP request to HTTPS on the same host and port: `host` is
+/// the request's `Host` header, `target` its request target. `None` when either cannot be used
+/// as given (nothing the client sent is reflected unchecked): `host` must be a DNS name, an IPv4
+/// address or a bracketed IPv6 address, with an optional port of 1 to 65535; `target` must be a
+/// path (`/...`) of visible ASCII. HTTPS answers on the port plain HTTP came in on, so the port
+/// is kept, and a `Host` without one means the default HTTP port, 80.
+fn https_location(host: &str, target: &str) -> Option<String> {
+    let host = host.trim();
+    let (name, port) = if let Some(rest) = host.strip_prefix('[') {
+        let (addr, after) = rest.split_once(']')?;
+        addr.parse::<std::net::Ipv6Addr>().ok()?;
+        let port = match after {
+            "" => None,
+            p => Some(p.strip_prefix(':')?),
+        };
+        (format!("[{}]", addr.to_ascii_lowercase()), port)
+    } else {
+        let (name, port) = match host.split_once(':') {
+            Some((n, p)) => (n, Some(p)),
+            None => (host, None),
+        };
+        let label_ok = |l: &str| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        };
+        let bare = name.strip_suffix('.').unwrap_or(name);
+        if bare.is_empty() || name.len() > 253 || !bare.split('.').all(label_ok) {
+            return None;
+        }
+        (name.to_ascii_lowercase(), port)
+    };
+    let port: u16 = match port {
+        None => 80,
+        Some(p) if !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()) => {
+            p.parse().ok().filter(|&n| n != 0)?
+        }
+        Some(_) => return None,
+    };
+    let target_ok = target.starts_with('/') && target.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    if !target_ok {
+        return None;
+    }
+    Some(format!("https://{name}:{port}{target}"))
+}
+
+/// Sends a plain-HTTP request to HTTPS: 308 keeps the method and the body for every request
+/// (a 301 lets a client turn a POST into a GET). The answer is not cached (`no-store`, like
+/// every answer of this server), so a server whose HTTPS is turned off again is reached at once.
+fn write_https_redirect(stream: &mut Conn, req: &HttpRequest) {
+    let host = req.headers.get("host").map_or("", String::as_str);
+    let Some(location) = https_location(host, &req.target) else {
+        write_error(
+            stream,
+            400,
+            "invalid_request_error",
+            "this server answers plain HTTP with a redirect to HTTPS, and needs a valid Host \
+             header and a path to build it: open the https:// address instead",
+        );
+        return;
+    };
+    let body = format!("Use HTTPS: {location}\n");
+    let head = format!(
+        "HTTP/1.1 308 Permanent Redirect\r\n\
+         Location: {location}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    if req.method != "HEAD" {
+        let _ = stream.write_all(body.as_bytes());
+    }
+    let _ = stream.flush();
+}
+
+/// `loopback`: the client connected over this machine's loopback interface.
+fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let req = match read_http_request(&mut stream) {
         Ok(Some(r)) => r,
@@ -2088,6 +2223,16 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn) {
         }
     };
     let _ = stream.set_read_timeout(None);
+
+    if !crate::core::listener::request_served(
+        stream.protocol(),
+        state.tls.is_some(),
+        state.cfg.tls_http,
+        loopback,
+    ) {
+        write_https_redirect(&mut stream, &req);
+        return;
+    }
 
     if req.method == "OPTIONS" {
         write_response(&mut stream, 204, "No Content", "text/plain", &[]);

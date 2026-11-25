@@ -240,13 +240,28 @@ Serve options:
                         shown under instructions_source in GET /gaudium/a2ui
   --tls-cert <file>     Serve HTTPS as well: the PEM certificate (with its chain) for
   --tls-key <file>      the server, and its unencrypted PEM private key. HTTP and HTTPS
-                        then share the port: http://host:port and https://host:port both
-                        answer, and clients that used plain HTTP go on working. Opened
-                        over https the Web UI may use the microphone and the clipboard
-                        from other machines. TLS comes from the system's OpenSSL 3
-                        (libssl.so.3), loaded when asked for: without it the server
-                        starts, says that HTTPS is not offered, and serves plain HTTP.
-                        Behind a front end that ends TLS itself give neither option
+                        then share the port, and a plain-HTTP request is answered with a
+                        redirect to https on the same host and port (see --tls-http).
+                        Opened over https the Web UI may use the microphone and the
+                        clipboard from other machines. TLS comes from the system's
+                        OpenSSL 3 (libssl.so.3), loaded when asked for: without it the
+                        server starts, says that HTTPS is not offered, and serves plain
+                        HTTP. Behind a front end that ends TLS itself give neither option
+  --tls-http <mode>     What plain-HTTP requests get while HTTPS is served: redirect
+                        (default) sends clients on other machines to https with a 308
+                        (method and body kept; a missing or malformed Host header is a
+                        400) and answers clients on this machine's loopback interface
+                        (local tools; their traffic never leaves the machine); strict
+                        redirects every client, loopback included; allow answers plain
+                        HTTP from every client as well (tools elsewhere that cannot
+                        speak HTTPS)
+  --hsts-max-age <secs>  max-age of the Strict-Transport-Security header every response
+                        over HTTPS carries (default: 86400, one day; at most 63072000).
+                        A browser that saw it uses https for this host name, on every
+                        port, until it expires; 0 tells browsers to forget it. No
+                        includeSubDomains, no preload. On --port 80 the default is 0
+                        and a nonzero value is refused (browsers would send http://
+                        links to port 443)
   --mcp-proxy           Offer the MCP proxy (/cors-proxy) to the Web UI: the server
                         makes the requests to an MCP server instead of the browser (for
                         servers without CORS headers, servers only this machine
