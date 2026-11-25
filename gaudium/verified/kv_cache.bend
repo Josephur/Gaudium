@@ -32,7 +32,6 @@
 import Base
 import nat_lemmas.bend as L
 import tensor_bounds.bend as T
-import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper lemmas (erased before Rust codegen)
@@ -805,8 +804,8 @@ def kv8_accepted_decode(kc, ac, m, n, w, k, r, s, f, ok):
 # ============================================================================
 
 # The proofs below derive the bounds and the injectivity of the V row order from Euclidean
-# division (`lemmas.bend`): lane128 and kv8_vpos128 place a residue mod 128 one-to-one inside a
-# 128-row block, and lane256 / kv8_vpos keep the block of a row.
+# division (the split lemmas of `nat_lemmas.bend`): lane128 and kv8_vpos128 place a residue
+# mod 128 one-to-one inside a 128-row block, and lane256 / kv8_vpos keep the block of a row.
 
 # A residue's half and quarter: (c % 128) / 2 < 64, (c % 128) / 4 < 32.
 def kc_half_lt(+c: Nat) -> {Nat.is_lt(Nat.div(Nat.mod(c, 128n), 2n), 64n) == True{} : Bool}:
@@ -860,7 +859,7 @@ def kc_lane128_if_lt(+h: Nat, +even: Bool, lt: {Nat.is_lt(h, 64n) == True{} : Bo
     case True{}:
       L.nat_lt_trans(h, 64n, 128n, lt, {==})
     case False{}:
-      G.lem_add_lt_l(64n, h, 64n, lt)
+      L.nat_add_lt_l(64n, h, 64n, lt)
 
 def kc_lane128_lt(+c: Nat) -> {Nat.is_lt(T.lane128(c), 128n) == True{} : Bool}:
   kc_lane128_if_lt(Nat.div(Nat.mod(c, 128n), 2n), Nat.is_eq(Nat.mod(Nat.mod(c, 128n), 2n), 0n), kc_half_lt(c))
@@ -890,12 +889,12 @@ def kc_lane128_if_inj(
     case False{} False{}:
       %Equal.sym(Nat, px, 1n, kc_odd_is_one(px, eqx, px2)) : {Nat.add(Nat.mul(hx, 2n), _) == Nat.add(Nat.mul(hy, 2n), py) : Nat}
       %Equal.sym(Nat, py, 1n, kc_odd_is_one(py, eqy, py2)) : {Nat.add(Nat.mul(hx, 2n), 1n) == Nat.add(Nat.mul(hy, 2n), _) : Nat}
-      %G.lem_add_cancel_l(64n, hx, hy, e) : {Nat.add(Nat.mul(hx, 2n), 1n) == Nat.add(Nat.mul(_, 2n), 1n) : Nat}
+      %L.nat_add_cancel_l(64n, hx, hy, e) : {Nat.add(Nat.mul(hx, 2n), 1n) == Nat.add(Nat.mul(_, 2n), 1n) : Nat}
       {==}
     case True{} False{}:
-      Empty.absurd({Nat.add(Nat.mul(hx, 2n), px) == Nat.add(Nat.mul(hy, 2n), py) : Nat}, G.lem_add_not_lt_l(64n, hy, G.lem_lt_subst_l(hx, Nat.add(64n, hy), 64n, e, ltx)))
+      Empty.absurd({Nat.add(Nat.mul(hx, 2n), px) == Nat.add(Nat.mul(hy, 2n), py) : Nat}, L.nat_add_not_lt_l(64n, hy, L.nat_lt_subst_l(hx, Nat.add(64n, hy), 64n, e, ltx)))
     case False{} True{}:
-      Empty.absurd({Nat.add(Nat.mul(hx, 2n), px) == Nat.add(Nat.mul(hy, 2n), py) : Nat}, G.lem_add_not_lt_l(64n, hx, G.lem_lt_subst_l(hy, Nat.add(64n, hx), 64n, Equal.sym(Nat, Nat.add(64n, hx), hy, e), lty)))
+      Empty.absurd({Nat.add(Nat.mul(hx, 2n), px) == Nat.add(Nat.mul(hy, 2n), py) : Nat}, L.nat_add_not_lt_l(64n, hx, L.nat_lt_subst_l(hy, Nat.add(64n, hx), 64n, Equal.sym(Nat, Nat.add(64n, hx), hy, e), lty)))
 
 # Two channels on the same lane have the same residue mod 128.
 def kc_lane128_inj(+x: Nat, +y: Nat, e: {T.lane128(x) == T.lane128(y) : Nat}) -> {Nat.mod(x, 128n) == Nat.mod(y, 128n) : Nat}:
@@ -918,19 +917,19 @@ def kc_lane128_inj(+x: Nat, +y: Nat, e: {T.lane128(x) == T.lane128(y) : Nat}) ->
 
 # Two channels of a 128-channel head on the same lane are the same channel.
 def kc_lane128_distinct(+a: Nat, +b: Nat, ha: {Nat.is_lt(a, 128n) == True{} : Bool}, hb: {Nat.is_lt(b, 128n) == True{} : Bool}, e: {T.lane128(a) == T.lane128(b) : Nat}) -> {a == b : Nat}:
-  %G.lem_mod_small(a, 127n, ha) : {_ == b : Nat}
-  %G.lem_mod_small(b, 127n, hb) : {Nat.mod(a, 128n) == _ : Nat}
+  %L.nat_mod_small(a, 127n, ha) : {_ == b : Nat}
+  %L.nat_mod_small(b, 127n, hb) : {Nat.mod(a, 128n) == _ : Nat}
   kc_lane128_inj(a, b, e)
 
 # --- lane256: the block of c, then lane128 inside it ---
 
 def kc_lane256_lt(+c: Nat, ok: {Nat.is_lt(c, 256n) == True{} : Bool}) -> {Nat.is_lt(T.lane256(c), 256n) == True{} : Bool}:
-  G.lem_split_lt(Nat.div(c, 128n), T.lane128(c), 2n, 127n, L.nat_div_lt_of_lt_mul(c, 2n, 127n, ok), kc_lane128_lt(c))
+  L.nat_split_lt(Nat.div(c, 128n), T.lane128(c), 2n, 127n, L.nat_div_lt_of_lt_mul(c, 2n, 127n, ok), kc_lane128_lt(c))
 
 def kc_lane256_inj(+a: Nat, +b: Nat, +e: {T.lane256(a) == T.lane256(b) : Nat}) -> {a == b : Nat}:
-  G.lem_eq_of_div_mod(a, b, 127n,
-    G.lem_split_unique_q(Nat.div(a, 128n), T.lane128(a), Nat.div(b, 128n), T.lane128(b), 127n, kc_lane128_lt(a), kc_lane128_lt(b), e),
-    kc_lane128_inj(a, b, G.lem_split_unique_r(Nat.div(a, 128n), T.lane128(a), Nat.div(b, 128n), T.lane128(b), 127n, kc_lane128_lt(a), kc_lane128_lt(b), e)))
+  L.nat_eq_of_div_mod(a, b, 127n,
+    L.nat_split_unique_q(Nat.div(a, 128n), T.lane128(a), Nat.div(b, 128n), T.lane128(b), 127n, kc_lane128_lt(a), kc_lane128_lt(b), e),
+    kc_lane128_inj(a, b, L.nat_split_unique_r(Nat.div(a, 128n), T.lane128(a), Nat.div(b, 128n), T.lane128(b), 127n, kc_lane128_lt(a), kc_lane128_lt(b), e)))
 
 # --- kv8_vpos128: residue m = 4 * i + j; j < 2 to the low half, the others to the high half ---
 
@@ -944,9 +943,9 @@ def kc_vpos128_if_lt(
 ) -> {Nat.is_lt(T.kv8_vpos128_if(i, j, low), 128n) == True{} : Bool}:
   match low:
     case True{}:
-      L.nat_lt_trans(Nat.add(Nat.mul(2n, i), j), 64n, 128n, kc_two_lt(i, j, 64n, G.lem_split_lt(i, j, 32n, 1n, li, Equal.sym(Bool, True{}, Nat.is_lt(j, 2n), eql))), {==})
+      L.nat_lt_trans(Nat.add(Nat.mul(2n, i), j), 64n, 128n, kc_two_lt(i, j, 64n, L.nat_split_lt(i, j, 32n, 1n, li, Equal.sym(Bool, True{}, Nat.is_lt(j, 2n), eql))), {==})
     case False{}:
-      G.lem_add_lt_l(64n, Nat.add(Nat.mul(2n, i), Nat.sub(j, 2n)), 64n, kc_two_lt(i, Nat.sub(j, 2n), 64n, G.lem_split_lt(i, Nat.sub(j, 2n), 32n, 1n, li, G.lem_sub_lt(j, 2n, 2n, {==}, lj))))
+      L.nat_add_lt_l(64n, Nat.add(Nat.mul(2n, i), Nat.sub(j, 2n)), 64n, kc_two_lt(i, Nat.sub(j, 2n), 64n, L.nat_split_lt(i, Nat.sub(j, 2n), 32n, 1n, li, L.nat_sub_lt(j, 2n, 2n, {==}, lj))))
 
 def kc_vpos128_lt(+q: Nat) -> {Nat.is_lt(T.kv8_vpos128(q), 128n) == True{} : Bool}:
   kc_vpos128_if_lt(Nat.div(Nat.mod(q, 128n), 4n), Nat.mod(Nat.mod(q, 128n), 4n), Nat.is_lt(Nat.mod(Nat.mod(q, 128n), 4n), 2n), {==}, kc_quarter_lt(q), L.nat_mod_lt(Nat.mod(q, 128n), 3n))
@@ -979,20 +978,20 @@ def kc_vpos128_if_inj(
       +hx = Equal.sym(Bool, True{}, Nat.is_lt(jx, 2n), eqx)
       +hy = Equal.sym(Bool, True{}, Nat.is_lt(jy, 2n), eqy)
       +e2 = kc_two_swap(ix, iy, jx, jy, e)
-      %G.lem_split_unique_q(ix, jx, iy, jy, 1n, hx, hy, e2) : {Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(_, 4n), jy) : Nat}
-      %G.lem_split_unique_r(ix, jx, iy, jy, 1n, hx, hy, e2) : {Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(ix, 4n), _) : Nat}
+      %L.nat_split_unique_q(ix, jx, iy, jy, 1n, hx, hy, e2) : {Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(_, 4n), jy) : Nat}
+      %L.nat_split_unique_r(ix, jx, iy, jy, 1n, hx, hy, e2) : {Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(ix, 4n), _) : Nat}
       {==}
     case False{} False{}:
-      +hx = G.lem_sub_lt(jx, 2n, 2n, {==}, ljx)
-      +hy = G.lem_sub_lt(jy, 2n, 2n, {==}, ljy)
-      +e2 = kc_two_swap(ix, iy, Nat.sub(jx, 2n), Nat.sub(jy, 2n), G.lem_add_cancel_l(64n, Nat.add(Nat.mul(2n, ix), Nat.sub(jx, 2n)), Nat.add(Nat.mul(2n, iy), Nat.sub(jy, 2n)), e))
-      %G.lem_split_unique_q(ix, Nat.sub(jx, 2n), iy, Nat.sub(jy, 2n), 1n, hx, hy, e2) : {Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(_, 4n), jy) : Nat}
-      %kc_sub2_eq(jx, jy, L.nat_not_lt_imp_le(jx, 2n, Equal.sym(Bool, False{}, Nat.is_lt(jx, 2n), eqx)), L.nat_not_lt_imp_le(jy, 2n, Equal.sym(Bool, False{}, Nat.is_lt(jy, 2n), eqy)), G.lem_split_unique_r(ix, Nat.sub(jx, 2n), iy, Nat.sub(jy, 2n), 1n, hx, hy, e2)) : {Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(ix, 4n), _) : Nat}
+      +hx = L.nat_sub_lt(jx, 2n, 2n, {==}, ljx)
+      +hy = L.nat_sub_lt(jy, 2n, 2n, {==}, ljy)
+      +e2 = kc_two_swap(ix, iy, Nat.sub(jx, 2n), Nat.sub(jy, 2n), L.nat_add_cancel_l(64n, Nat.add(Nat.mul(2n, ix), Nat.sub(jx, 2n)), Nat.add(Nat.mul(2n, iy), Nat.sub(jy, 2n)), e))
+      %L.nat_split_unique_q(ix, Nat.sub(jx, 2n), iy, Nat.sub(jy, 2n), 1n, hx, hy, e2) : {Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(_, 4n), jy) : Nat}
+      %kc_sub2_eq(jx, jy, L.nat_not_lt_imp_le(jx, 2n, Equal.sym(Bool, False{}, Nat.is_lt(jx, 2n), eqx)), L.nat_not_lt_imp_le(jy, 2n, Equal.sym(Bool, False{}, Nat.is_lt(jy, 2n), eqy)), L.nat_split_unique_r(ix, Nat.sub(jx, 2n), iy, Nat.sub(jy, 2n), 1n, hx, hy, e2)) : {Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(ix, 4n), _) : Nat}
       {==}
     case True{} False{}:
-      Empty.absurd({Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(iy, 4n), jy) : Nat}, G.lem_add_not_lt_l(64n, Nat.add(Nat.mul(2n, iy), Nat.sub(jy, 2n)), G.lem_lt_subst_l(Nat.add(Nat.mul(2n, ix), jx), Nat.add(64n, Nat.add(Nat.mul(2n, iy), Nat.sub(jy, 2n))), 64n, e, kc_two_lt(ix, jx, 64n, G.lem_split_lt(ix, jx, 32n, 1n, lix, Equal.sym(Bool, True{}, Nat.is_lt(jx, 2n), eqx))))))
+      Empty.absurd({Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(iy, 4n), jy) : Nat}, L.nat_add_not_lt_l(64n, Nat.add(Nat.mul(2n, iy), Nat.sub(jy, 2n)), L.nat_lt_subst_l(Nat.add(Nat.mul(2n, ix), jx), Nat.add(64n, Nat.add(Nat.mul(2n, iy), Nat.sub(jy, 2n))), 64n, e, kc_two_lt(ix, jx, 64n, L.nat_split_lt(ix, jx, 32n, 1n, lix, Equal.sym(Bool, True{}, Nat.is_lt(jx, 2n), eqx))))))
     case False{} True{}:
-      Empty.absurd({Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(iy, 4n), jy) : Nat}, G.lem_add_not_lt_l(64n, Nat.add(Nat.mul(2n, ix), Nat.sub(jx, 2n)), G.lem_lt_subst_l(Nat.add(Nat.mul(2n, iy), jy), Nat.add(64n, Nat.add(Nat.mul(2n, ix), Nat.sub(jx, 2n))), 64n, Equal.sym(Nat, Nat.add(64n, Nat.add(Nat.mul(2n, ix), Nat.sub(jx, 2n))), Nat.add(Nat.mul(2n, iy), jy), e), kc_two_lt(iy, jy, 64n, G.lem_split_lt(iy, jy, 32n, 1n, liy, Equal.sym(Bool, True{}, Nat.is_lt(jy, 2n), eqy))))))
+      Empty.absurd({Nat.add(Nat.mul(ix, 4n), jx) == Nat.add(Nat.mul(iy, 4n), jy) : Nat}, L.nat_add_not_lt_l(64n, Nat.add(Nat.mul(2n, ix), Nat.sub(jx, 2n)), L.nat_lt_subst_l(Nat.add(Nat.mul(2n, iy), jy), Nat.add(64n, Nat.add(Nat.mul(2n, ix), Nat.sub(jx, 2n))), 64n, Equal.sym(Nat, Nat.add(64n, Nat.add(Nat.mul(2n, ix), Nat.sub(jx, 2n))), Nat.add(Nat.mul(2n, iy), jy), e), kc_two_lt(iy, jy, 64n, L.nat_split_lt(iy, jy, 32n, 1n, liy, Equal.sym(Bool, True{}, Nat.is_lt(jy, 2n), eqy))))))
 
 def kc_vpos128_inj(+x: Nat, +y: Nat, e: {T.kv8_vpos128(x) == T.kv8_vpos128(y) : Nat}) -> {Nat.mod(x, 128n) == Nat.mod(y, 128n) : Nat}:
   %L.nat_div_mod_r(Nat.mod(x, 128n), 3n) : {_ == Nat.mod(y, 128n) : Nat}
@@ -1015,12 +1014,12 @@ def kc_vpos128_inj(+x: Nat, +y: Nat, e: {T.kv8_vpos128(x) == T.kv8_vpos128(y) : 
 # --- kv8_vpos: the block of q, then kv8_vpos128 inside it ---
 
 def kc_vpos_lt(+q: Nat, ok: {Nat.is_lt(q, 256n) == True{} : Bool}) -> {Nat.is_lt(T.kv8_vpos(q), 256n) == True{} : Bool}:
-  G.lem_split_lt(Nat.div(q, 128n), T.kv8_vpos128(q), 2n, 127n, L.nat_div_lt_of_lt_mul(q, 2n, 127n, ok), kc_vpos128_lt(q))
+  L.nat_split_lt(Nat.div(q, 128n), T.kv8_vpos128(q), 2n, 127n, L.nat_div_lt_of_lt_mul(q, 2n, 127n, ok), kc_vpos128_lt(q))
 
 def kc_vpos_inj(+a: Nat, +b: Nat, +e: {T.kv8_vpos(a) == T.kv8_vpos(b) : Nat}) -> {a == b : Nat}:
-  G.lem_eq_of_div_mod(a, b, 127n,
-    G.lem_split_unique_q(Nat.div(a, 128n), T.kv8_vpos128(a), Nat.div(b, 128n), T.kv8_vpos128(b), 127n, kc_vpos128_lt(a), kc_vpos128_lt(b), e),
-    kc_vpos128_inj(a, b, G.lem_split_unique_r(Nat.div(a, 128n), T.kv8_vpos128(a), Nat.div(b, 128n), T.kv8_vpos128(b), 127n, kc_vpos128_lt(a), kc_vpos128_lt(b), e)))
+  L.nat_eq_of_div_mod(a, b, 127n,
+    L.nat_split_unique_q(Nat.div(a, 128n), T.kv8_vpos128(a), Nat.div(b, 128n), T.kv8_vpos128(b), 127n, kc_vpos128_lt(a), kc_vpos128_lt(b), e),
+    kc_vpos128_inj(a, b, L.nat_split_unique_r(Nat.div(a, 128n), T.kv8_vpos128(a), Nat.div(b, 128n), T.kv8_vpos128(b), 127n, kc_vpos128_lt(a), kc_vpos128_lt(b), e)))
 
 # promise: every channel of a 256-channel head lands on a row of that head in its V projection
 # harm: a V channel would be packed outside its head, over another head's rows or past the weight
