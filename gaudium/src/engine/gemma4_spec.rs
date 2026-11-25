@@ -1410,6 +1410,63 @@ pub(super) fn prefill_tile_hook(eng: &mut Gemma4Engine, pos: u64, t: u64) -> Res
     res
 }
 
+/// `--build-cache`: compiles the drafter's recipes a decode launches at each chunk bucket of
+/// `buckets` (the verify-and-draft steps of every pair of widths; the verify-only steps and the
+/// first blocks of every narrower width, which a sampled decode takes as its budget runs out),
+/// and a block drafter's context recipes of the prefill tiles of `rows`. Each recipe goes to
+/// `note` and is dropped.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_cache_recipes(
+    rt: &G4SpecRt,
+    d: &G4Dims,
+    max_ctx: u64,
+    buckets: &[u64],
+    rows: &[u64],
+    api: &Arc<SynapseApi>,
+    cache: &RecipeCache,
+    driver_version: &str,
+    note: &mut impl FnMut(&CompiledRecipe),
+) -> Result<(), String> {
+    let ks = &rt.cfg.ks;
+    let kmax = ks.iter().copied().max().unwrap_or(0);
+    let compile = |gb: GraphBuilder, what: String| -> Result<CompiledRecipe, String> {
+        gb.compile(Arc::clone(api), cache, driver_version)
+            .map_err(|e| format!("compile {what}: {e}"))
+    };
+    for &nch in buckets {
+        let mut steps: Vec<(u64, u64)> = Vec::new();
+        for &kv in ks {
+            for &kd in ks {
+                steps.push((kv + 1, kd));
+            }
+        }
+        steps.extend((1..=kmax + 1).map(|t| (t, 0)));
+        steps.sort_unstable();
+        steps.dedup();
+        for (t, kd) in steps {
+            note(&compile(
+                build_spec_step_graph(d, &rt.cfg, max_ctx, nch, t, kd),
+                format!("spec step T={t} D={kd} C={nch}"),
+            )?);
+        }
+        for kd in 1..=kmax {
+            note(&compile(
+                build_block0_graph(d, &rt.cfg, max_ctx, nch, kd),
+                format!("first block D={kd} C={nch}"),
+            )?);
+        }
+    }
+    if let G4Drafter::DFlash(c) = &rt.cfg.drafter {
+        for &t in rows {
+            note(&compile(
+                dflash::build_ctx_graph(d, c, t, max_ctx, rt.cfg.df_ring(), &rt.cfg.elf_hashes),
+                format!("drafter context T={t}"),
+            )?);
+        }
+    }
+    Ok(())
+}
+
 /// Compiles (or loads) the step recipe `(t, kd, nch)` on first use.
 fn ensure_step(eng: &mut Gemma4Engine, t: u64, kd: u64, nch: u64) -> Result<(), String> {
     let mut rt = eng.specrt.take().expect("spec runtime");

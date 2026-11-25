@@ -44,7 +44,8 @@ Usage:
   gaudium --generate [options]              Run live Gaudi 2 LLM generation
   gaudium --build-cache [generate options]  Compile every recipe of that configuration into
                                             the recipe cache and print its exact HBM plan,
-                                            without opening the card (Qwen engines)
+                                            without opening the card (Qwen and Gemma 4
+                                            engines)
   gaudium --serve [options]                 Start OpenAI HTTP/SSE + Gaudium Web UI server
   gaudium --fp8-calibrate [options]         Measure a model's FP8 activation scales (BF16 graphs)
   gaudium --kv-calibrate [options]          Measure the K/V maxima a model's FP8 K/V scale tables
@@ -512,7 +513,11 @@ Generate options:
   --no-cache            Disable on-disk compiled recipe cache
   --build-cache         Compile every recipe an engine load with these options uses
                         into the recipe cache, print the exact HBM plan and exit,
-                        WITHOUT opening the card (runs beside a process that owns it)
+                        WITHOUT opening the card (runs beside a process that owns it).
+                        Gemma 4: also the decode steps of every context bucket, the
+                        full-tile prefill of every chunk count, and what the given
+                        prompts and images launch (their last tiles, image tiles and
+                        image sizes); it plans the widest prefill tile
   --build-cache-chunks <csv>  With --build-cache and --spec on a mixture-of-experts
                         model: compile the speculative step recipes of exactly these KV
                         chunk counts (ceil(position / 4096)) instead of all of them;

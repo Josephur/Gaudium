@@ -30,8 +30,9 @@
 use crate::fp8::f32_to_bf16_rne;
 use crate::json::{parse_json, JsonValue};
 use crate::verified::{
-    g4v_grid_ok, g4v_pool_count, g4v_pool_x, g4v_pool_y, g4v_size_ok, g4v_table_holds, g4v_soft_budget, g4v_target_h,
-    g4v_target_w, g4v_tokens, g4v_tower_ok, g4v_unified_ok, g4v_width_ok,
+    g4v_grid_ok, g4v_pool_count, g4v_pool_x, g4v_pool_y, g4v_rope_freq, g4v_rope_row_axis, g4v_rot_quarter,
+    g4v_row_values, g4v_size_ok, g4v_soft_budget, g4v_table_holds, g4v_target_h, g4v_target_w, g4v_token_patches,
+    g4v_token_pixels, g4v_token_side, g4v_tokens, g4v_tower_ok, g4v_unified_ok, g4v_width_ok,
 };
 use crate::vision::preprocess::{resize_rgb, PreparedImage, RgbImage};
 use crate::vision::{ImageProcessor, VisionSpec};
@@ -104,6 +105,11 @@ pub struct G4vDims {
     pub standardize: bool,
     pub eps: f32,
     pub theta: f64,
+    /// The input sizes `with_sizes` derives (side of a soft token's square, its patches, the
+    /// values of one input row).
+    side: u64,
+    ppt: u64,
+    row_len: u64,
 }
 
 impl G4vDims {
@@ -163,6 +169,9 @@ impl G4vDims {
                         .unwrap_or(false),
                     eps,
                     theta,
+                    side: 0,
+                    ppt: 0,
+                    row_len: 0,
                 }
             }
             Some("gemma4_unified_vision") => {
@@ -201,12 +210,35 @@ impl G4vDims {
                     standardize: false,
                     eps,
                     theta: 0.0,
+                    side: 0,
+                    ppt: 0,
+                    row_len: 0,
                 }
             }
             other => return Err(format!("vision_config.model_type {other:?} is not a Gemma 4 image path")),
         };
+        let d = d.with_sizes()?;
         d.validate()?;
         Ok(d)
+    }
+
+    /// The derived input sizes, from the verified total functions: a config whose sizes overflow
+    /// 64 bits is refused here, before anything multiplies them.
+    fn with_sizes(mut self) -> Result<Self, String> {
+        let merged = self.kind == G4vKind::Unified;
+        let sizes = (
+            g4v_token_side(self.patch, self.pool),
+            g4v_token_patches(self.pool),
+            g4v_row_values(merged, self.patch, self.pool),
+        );
+        let (Some(side), Some(ppt), Some(row_len)) = sizes else {
+            return Err(format!(
+                "vision_config: patch_size {} and pooling_kernel_size {} give input sizes past 64 bits",
+                self.patch, self.pool
+            ));
+        };
+        (self.side, self.ppt, self.row_len) = (side, ppt, row_len);
+        Ok(self)
     }
 
     /// Shape rules the graphs and the host layout rely on (the verified guards).
@@ -235,30 +267,30 @@ impl G4vDims {
         Ok(())
     }
 
-    /// Pixel side of one soft token's square.
+    /// Pixel side of one soft token's square (`g4v_token_side`).
     pub fn side(&self) -> u64 {
-        self.patch * self.pool
+        self.side
     }
 
-    /// Patches that make one soft token.
+    /// Patches that make one soft token (`g4v_token_patches`).
     pub fn ppt(&self) -> u64 {
-        self.pool * self.pool
+        self.ppt
     }
 
-    /// Values of one input row: a patch (tower) or a merged patch (unified), channel last.
+    /// Values of one input row: a patch (tower) or a merged patch (unified), channel last
+    /// (`g4v_row_values`).
     pub fn row_len(&self) -> u64 {
-        match self.kind {
-            G4vKind::Tower => 3 * self.patch * self.patch,
-            G4vKind::Unified => 3 * self.side() * self.side(),
-        }
+        self.row_len
     }
 }
 
-/// Values of one prepared input row of a checkpoint's processor.
+/// Values of one prepared input row of a checkpoint's processor. For Gemma 4 the verified
+/// `g4v_row_values`, which never overflows for a spec `VisionSpec::validate` took (0 marks one it
+/// did not take).
 pub fn row_len(vs: &VisionSpec) -> usize {
     match vs.processor {
-        ImageProcessor::Gemma4 { merged: true } => {
-            (3 * vs.resize_factor() * vs.resize_factor()) as usize
+        ImageProcessor::Gemma4 { merged } => {
+            g4v_row_values(merged, vs.patch, vs.merge).map_or(0, |v| v as usize)
         }
         _ => vs.patch_row() as usize,
     }
@@ -333,7 +365,10 @@ pub fn vision_spec(
     let pad = token_text(tok.as_ref(), "image_token", IMAGE_TOKEN);
     let boi = token_text(tok.as_ref(), "boi_token", BOI_TOKEN);
     let eoi = token_text(tok.as_ref(), "eoi_token", EOI_TOKEN);
-    let side = d.side();
+    // pixels of a soft token's square (`with_sizes` took the same sizes, so this is no refusal in
+    // practice)
+    let px = g4v_token_pixels(d.patch, d.pool)
+        .ok_or("vision_config: a soft token's square has more pixels than 64 bits hold")?;
     let s = VisionSpec {
         processor: ImageProcessor::Gemma4 {
             merged: d.kind == G4vKind::Unified,
@@ -359,8 +394,8 @@ pub fn vision_spec(
         vision_start_id: id("boi_token_id")?,
         vision_end_id: id("eoi_token_id")?,
         mrope_section: [0; 3],
-        min_pixels: side * side,
-        max_pixels: max_soft.saturating_mul(side * side),
+        min_pixels: px,
+        max_pixels: max_soft.saturating_mul(px),
         image_mean: [0.0; 3],
         image_std: [1.0; 3],
         video: None,
@@ -519,7 +554,7 @@ pub fn prepare_image(img: &RgbImage, vs: &VisionSpec) -> Result<PreparedImage, S
         }
     }
     let row_len = row_len(vs);
-    debug_assert_eq!(pixels.len() % row_len, 0);
+    debug_assert!(row_len > 0 && pixels.len().is_multiple_of(row_len));
     Ok(PreparedImage {
         src_width: img.width,
         src_height: img.height,
@@ -577,16 +612,17 @@ pub fn merged_positions(table: &[u16], npos: usize, hid: usize, mh: usize, mw: u
 }
 
 /// The tower's rotation tables `{dh, nh N}` (BF16, as the reference casts them) of its patches
-/// in pooling order: channel `d` of a head turns with the patch's column in the first half of the
-/// head and with its row in the second; inside a half, channels `j` and `j + dh / 4` are a pair
+/// in pooling order: channel `k` of a head turns with the patch's column or row
+/// (`g4v_rope_row_axis`: the first half of the head the column, the second the row) by the
+/// frequency `g4v_rope_freq` selects; inside a half, channels `j` and `j + dh / 4` are a pair
 /// with the frequency `theta^(-2 j / (dh / 2))` (in f32, as the reference computes it). Returns
 /// `(cos, sin)`, each patch's row repeated for every head.
 pub fn tower_rope(d: &G4vDims, gh: usize, gw: usize) -> (Vec<u16>, Vec<u16>) {
     let dh = d.dh as usize;
-    let half = dh / 2;
-    let quart = dh / 4;
+    let quart = g4v_rot_quarter(d.dh);
+    // the reference's frequencies, `theta^(-2 j / (dh / 2))` over the places of a quarter
     let inv: Vec<f32> = (0..quart)
-        .map(|j| 1.0f32 / (d.theta as f32).powf((2 * j) as f32 / half as f32))
+        .map(|j| 1.0f32 / (d.theta as f32).powf((2 * j) as f32 / (dh / 2) as f32))
         .collect();
     let order = pooling_order(gh, gw, d.pool as usize);
     let nh = d.nh as usize;
@@ -596,8 +632,8 @@ pub fn tower_rope(d: &G4vDims, gh: usize, gw: usize) -> (Vec<u16>, Vec<u16>) {
     let mut s1 = vec![0u16; dh];
     for &(y, x) in &order {
         for k in 0..dh {
-            let pos = if k < half { x } else { y } as f32;
-            let ang = pos * inv[(k % half) % quart];
+            let pos = if g4v_rope_row_axis(k as u64, quart) { y } else { x } as f32;
+            let ang = pos * inv[g4v_rope_freq(k as u64, quart) as usize];
             c1[k] = f32_to_bf16_rne(ang.cos());
             s1[k] = f32_to_bf16_rne(ang.sin());
         }

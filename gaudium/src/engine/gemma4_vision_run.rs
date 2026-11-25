@@ -25,7 +25,8 @@ use crate::synapse::graph::{CompiledRecipe, GraphBuilder};
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
     g4_lane, ikv_feat_cols, ikv_feat_next, ikv_feat_row, ikv_feat_start, ikv_feat_write_safe,
-    g4v_add_part, g4v_image_budget, g4v_pad_cols, g4v_pool_w_one, g4v_recipe_rows, g4v_request_tokens, ikv_rows_match,
+    g4v_add_part, g4v_image_budget, g4v_pad_cols, g4v_pool_w_one, g4v_recipe_rows, g4v_request_tokens, g4v_rot_neg,
+    g4v_rot_quarter, g4v_rot_src, ikv_rows_match,
     vis_grid_fits, vis_rows_fit,
 };
 use crate::vision::preprocess::PreparedImage;
@@ -258,16 +259,17 @@ fn lanes(vals: &[u16]) -> Vec<f32> {
 /// The rotary heads' rotate-half as a signed permutation `{dh x dh}` (BF16), row `o` the output
 /// channel: the reference's rotate-half `cat(-x2, x1)` on each half of the head (the column half
 /// and the row half), so `out[o] = -in[o + dh/4]` in the first quarter of a half and
-/// `+in[o - dh/4]` in its second.
+/// `+in[o - dh/4]` in its second. The verified `g4v_rot_src` / `g4v_rot_neg` choose each row's
+/// channel and sign; the row is one entry of magnitude one at that channel.
 pub(crate) fn rot_weight(dh: u64) -> Vec<u16> {
-    let (half, quart) = (dh / 2, dh / 4);
-    let mut w = vec![0u16; (dh * dh) as usize];
-    for o in 0..dh {
-        let lo = (o % half) < quart;
-        let i = if lo { o + quart } else { o - quart };
-        w[(o * dh + i) as usize] = crate::fp8::f32_to_bf16_rne(if lo { -1.0 } else { 1.0 });
-    }
-    w
+    let q = g4v_rot_quarter(dh);
+    let (minus, plus) = (crate::fp8::f32_to_bf16_rne(-1.0), crate::fp8::f32_to_bf16_rne(1.0));
+    (0..dh)
+        .flat_map(|o| {
+            let (src, v) = (g4v_rot_src(o, q), if g4v_rot_neg(o, q) { minus } else { plus });
+            (0..dh).map(move |c| if c == src { v } else { 0 })
+        })
+        .collect()
 }
 
 /// The pooling GEMM's `{h x h ppt}` 0 / 1 weight (`one` its BF16 one), row by row: the verified
@@ -369,6 +371,34 @@ pub struct VisRequest {
     pub blocks: Vec<(usize, usize)>,
 }
 
+/// The runs of image-pad rows of a prompt (`(first row, rows)`, in order): one per image.
+pub fn pad_runs(prompt_ids: &[i32], pad: i32) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (i, &t) in prompt_ids.iter().enumerate() {
+        if t == pad {
+            match runs.last_mut() {
+                Some((s, n)) if *s + *n == i => *n += 1,
+                _ => runs.push((i, 1)),
+            }
+        }
+    }
+    runs
+}
+
+/// The feature column of each of a prompt's `len` rows: the soft token of an image row (the
+/// runs' rows in order), the text column elsewhere (the verified `ikv_feat_row`).
+pub fn feature_rows(len: usize, runs: &[(usize, usize)]) -> Vec<i32> {
+    let mut fidx = vec![ikv_feat_row(false, 0) as i32; len];
+    let mut rank = 0u64;
+    for &(s, n) in runs {
+        for row in fidx.iter_mut().skip(s).take(n) {
+            *row = ikv_feat_row(true, rank) as i32;
+            rank += 1;
+        }
+    }
+    fidx
+}
+
 pub struct G4Vision {
     pub geo: G4vGeo,
     elf: Vec<(String, String)>,
@@ -413,6 +443,15 @@ impl G4Vision {
 
     pub fn elf(&self) -> &[(String, String)] {
         &self.elf
+    }
+
+    /// The size of the image path's recipes for an image: its patches (the tower), or the one
+    /// recipe of fixed rows (the unified embedder).
+    pub fn image_rows(&self, im: &PreparedImage) -> u64 {
+        match self.geo.d.kind {
+            G4vKind::Tower => im.n_patches() as u64,
+            G4vKind::Unified => self.geo.max_n,
+        }
     }
 
     /// Compiles the recipes of the largest planned size before the workspace is sized (returns
@@ -514,16 +553,7 @@ impl G4Vision {
         let images = std::mem::take(&mut self.pending);
         self.req = None;
         self.report = None;
-        let pad = self.geo.spec.image_token_id;
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for (i, &t) in prompt_ids.iter().enumerate() {
-            if t == pad {
-                match runs.last_mut() {
-                    Some((s, n)) if *s + *n == i => *n += 1,
-                    _ => runs.push((i, 1)),
-                }
-            }
-        }
+        let runs = pad_runs(prompt_ids, self.geo.spec.image_token_id);
         if images.is_empty() {
             if !runs.is_empty() {
                 return Err("the prompt holds image placeholders but the request has no image".into());
@@ -548,14 +578,7 @@ impl G4Vision {
                 ));
             }
         }
-        let mut fidx = vec![ikv_feat_row(false, 0) as i32; prompt_ids.len()];
-        let mut rank = 0u64;
-        for &(s, n) in &runs {
-            for row in fidx.iter_mut().skip(s).take(n) {
-                *row = ikv_feat_row(true, rank) as i32;
-                rank += 1;
-            }
-        }
+        let fidx = feature_rows(prompt_ids.len(), &runs);
         self.req = Some(VisRequest { fidx, blocks: runs });
         Ok(images)
     }
@@ -575,10 +598,7 @@ impl G4Vision {
         };
         let mut off = ikv_feat_start();
         for im in images {
-            let n = match self.geo.d.kind {
-                G4vKind::Tower => im.n_patches() as u64,
-                G4vKind::Unified => self.geo.max_n,
-            };
+            let n = self.image_rows(im);
             let t0 = Instant::now();
             if !self.recipes.contains_key(&n) {
                 let mut v = Vec::new();

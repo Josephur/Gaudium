@@ -361,9 +361,10 @@ impl VisionSpec {
 
     /// Shape rules the graphs, the merge order and the M-RoPE layout rely on.
     pub fn validate(&self) -> Result<(), String> {
-        if let ImageProcessor::Gemma4 { .. } = self.processor {
+        if let ImageProcessor::Gemma4 { merged } = self.processor {
             // the family's own reader checked the tower's sizes; what the host pipeline relies on
-            // is the verified `g4v_processor_ok` (`None`: the sizes overflow)
+            // is the verified `g4v_processor_ok`, and an input row whose size the verified
+            // `g4v_row_values` gives (`None`: the sizes overflow)
             let ok = crate::verified::g4v_processor_ok(
                 self.patch,
                 self.merge,
@@ -371,9 +372,10 @@ impl VisionSpec {
                 self.in_channels,
                 self.max_pixels,
             );
-            if ok != Some(true) {
+            let row = crate::verified::g4v_row_values(merged, self.patch, self.merge);
+            if ok != Some(true) || row.is_none() {
                 return Err(format!(
-                    "a Gemma 4 vision_config needs a positive patch ({}) and pooling size ({}), one frame ({}), 3 channels ({}), and an image budget ({} pixels) of at least one soft token",
+                    "a Gemma 4 vision_config needs a positive patch ({}) and pooling size ({}), one frame ({}), 3 channels ({}), an image budget ({} pixels) of at least one soft token, and input rows whose size fits 64 bits",
                     self.patch, self.merge, self.temporal, self.in_channels, self.max_pixels
                 ));
             }

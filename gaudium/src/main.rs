@@ -71,7 +71,8 @@ fn print_usage() {
          \x20 gaudium --generate [options]              Run live Gaudi 2 LLM generation\n\
          \x20 gaudium --build-cache [generate options]  Compile every recipe of that configuration into\n\
          \x20                                           the recipe cache and print its exact HBM plan,\n\
-         \x20                                           without opening the card (Qwen engines)\n\
+         \x20                                           without opening the card (Qwen and Gemma 4\n\
+         \x20                                           engines)\n\
          \x20 gaudium --serve [options]                 Start OpenAI HTTP/SSE + Gaudium Web UI server\n\
          \x20 gaudium --fp8-calibrate [options]         Measure a model's FP8 activation scales (BF16 graphs)\n\
          \x20 gaudium --kv-calibrate [options]          Measure the K/V maxima a model's FP8 K/V scale tables\n\
@@ -539,7 +540,11 @@ fn print_usage() {
          \x20 --no-cache            Disable on-disk compiled recipe cache\n\
          \x20 --build-cache         Compile every recipe an engine load with these options uses\n\
          \x20                       into the recipe cache, print the exact HBM plan and exit,\n\
-         \x20                       WITHOUT opening the card (runs beside a process that owns it)\n\
+         \x20                       WITHOUT opening the card (runs beside a process that owns it).\n\
+         \x20                       Gemma 4: also the decode steps of every context bucket, the\n\
+         \x20                       full-tile prefill of every chunk count, and what the given\n\
+         \x20                       prompts and images launch (their last tiles, image tiles and\n\
+         \x20                       image sizes); it plans the widest prefill tile\n\
          \x20 --build-cache-chunks <csv>  With --build-cache and --spec on a mixture-of-experts\n\
          \x20                       model: compile the speculative step recipes of exactly these KV\n\
          \x20                       chunk counts (ceil(position / 4096)) instead of all of them;\n\
@@ -1376,7 +1381,22 @@ fn run_generate(args: &[String]) -> Result<(), String> {
         if !build_cache_chunks.is_empty() {
             return gaudium::engine::qwen3::build_cache(&cfg, &build_cache_chunks);
         }
-        return gaudium::engine::build_cache(&cfg);
+        // the requests (in `all_prompts` order, then the --after request), for an engine whose
+        // recipes depend on them
+        let none: &[gaudium::vision::PreparedImage] = &[];
+        let requests: Vec<gaudium::engine::BuildRequest> = all_prompts
+            .iter()
+            .enumerate()
+            .map(|(r, p)| gaudium::engine::BuildRequest {
+                prompt: p,
+                images: request_images[r].as_ref().map_or(none, |v| &v.images),
+            })
+            .chain(after_ids.iter().map(|p| gaudium::engine::BuildRequest {
+                prompt: p,
+                images: none,
+            }))
+            .collect();
+        return gaudium::engine::build_cache(&cfg, &requests);
     }
     if !build_cache_chunks.is_empty() {
         return Err("--build-cache-chunks needs --build-cache".into());
