@@ -1102,8 +1102,24 @@ f8533147dc62d652  ln_younger_waiter_never_blocks  law ln_younger_waiter_never_bl
 # promise ln_younger_waiter_never_blocks: a waiter that arrived after a session's next request never blocks its admission.
 1d7a0b64d1763db8  ls_hello_byte_recognised  law ls_hello_byte_recognised : { ls_is_hello ( 22n ) == True { } : Bool }
 e0bc2b3a6b6233d4  ls_hello_never_plain  law ls_hello_never_plain : for + t : Bool { ls_proto_is_plain ( ls_proto ( True { } , t ) ) == False { } : Bool }
+bf93288fe2d92a34  ls_hsts_on_tls  law ls_hsts_on_tls : { ls_sends_hsts ( LsTls { } ) == True { } : Bool }
+# promise ls_hsts_on_tls: every response sent over TLS carries Strict-Transport-Security
+# harm ls_hsts_on_tls: a browser that once reached the server over HTTPS would go on trying plain HTTP first, where the first request can be read or redirected by anyone on the path
+6e23197734cafeff  ls_hsts_only_over_tls  law ls_hsts_only_over_tls : { Bool.or ( ls_sends_hsts ( LsPlain { } ) , ls_sends_hsts ( LsDrop { } ) ) == False { } : Bool }
+# promise ls_hsts_only_over_tls: Strict-Transport-Security is never sent on a connection that is not TLS
 bc58a58ba0b50f25  ls_no_tls_without_listener  law ls_no_tls_without_listener : for + h : Bool { ls_proto_is_tls ( ls_proto ( h , False { } ) ) == False { } : Bool }
+0e3d8b9fbb5e8d26  ls_plain_allow_serves_all  law ls_plain_allow_serves_all : for + l : Bool { ls_plain_served ( ls_plain_act ( LsPlain { } , True { } , LsHttpAllow { } , l ) ) == True { } : Bool }
+# promise ls_plain_allow_serves_all: when plain HTTP is allowed beside TLS, every client is answered over plain HTTP
+# harm ls_plain_allow_serves_all: local tooling that cannot speak HTTPS, run from another machine, would stop working although the opt-out was given
 72cff5c8c40f4989  ls_plain_never_handshakes  law ls_plain_never_handshakes : for t : Bool { ls_proto_is_tls ( ls_proto ( False { } , t ) ) == False { } : Bool }
+94f918196dfebfed  ls_plain_remote_redirected  law ls_plain_remote_redirected : { ls_plain_served ( ls_plain_act ( LsPlain { } , True { } , LsHttpRedirect { } , False { } ) ) == False { } : Bool }
+# promise ls_plain_remote_redirected: with TLS served and plain HTTP not allowed, a client on another machine is never answered over plain HTTP
+# harm ls_plain_remote_redirected: prompts, answers and the API key would cross the network in the clear although HTTPS is offered
+54fb1d45606a0caf  ls_plain_served_without_tls  law ls_plain_served_without_tls : for + p : LsProto for m : LsHttpMode for l : Bool { ls_plain_served ( ls_plain_act ( p , False { } , m , l ) ) == True { } : Bool }
+# promise ls_plain_served_without_tls: a server that does not serve TLS answers every plain-HTTP request, whatever --tls-http says and wherever the client is
+# harm ls_plain_served_without_tls: with HTTPS asked for and not offered (no TLS library), every client would be sent to a port that does not speak TLS and could reach nothing
+945c84e15e2a366c  ls_plain_strict_redirects_all  law ls_plain_strict_redirects_all : for + l : Bool { ls_plain_served ( ls_plain_act ( LsPlain { } , True { } , LsHttpStrict { } , l ) ) == False { } : Bool }
+# promise ls_plain_strict_redirects_all: in strict mode no plain-HTTP request is answered while TLS is served, loopback clients included
 4cc1cd7957044300  ls_start_asked_never_silent  law ls_start_asked_never_silent : for + l : Bool for + f : Bool { Bool.or ( ls_start_serves_tls ( ls_start ( True { } , True { } , l , f ) ) , Bool.or ( ls_start_refuses ( ls_start ( True { } , True { } , l , f ) ) , ls_start_warns ( ls_start ( True { } , True { } , l , f ) ) ) ) == True { } : Bool }
 d7ddac32019087d5  ls_start_cert_alone_never_serves  law ls_start_cert_alone_never_serves : for l : Bool for f : Bool { ls_start_serves_tls ( ls_start ( True { } , False { } , l , f ) ) == False { } : Bool }
 0898c9a43b327758  ls_start_key_alone_never_serves  law ls_start_key_alone_never_serves : for l : Bool for f : Bool { ls_start_serves_tls ( ls_start ( False { } , True { } , l , f ) ) == False { } : Bool }
@@ -1111,6 +1127,9 @@ d7ddac32019087d5  ls_start_cert_alone_never_serves  law ls_start_cert_alone_neve
 3dab07e66c425e4f  ls_start_needs_library  law ls_start_needs_library : for + c : Bool for + k : Bool for f : Bool { ls_start_serves_tls ( ls_start ( c , k , False { } , f ) ) == False { } : Bool }
 a07804e4088df0fd  ls_start_off_without_files  law ls_start_off_without_files : for l : Bool for f : Bool { ls_start ( False { } , False { } , l , f ) == LsStOff { } : LsStart }
 6342ac690f2c6c42  ls_start_serve_xor_refuse  law ls_start_serve_xor_refuse : for + s : LsStart { Bool.and ( ls_start_serves_tls ( s ) , ls_start_refuses ( s ) ) == False { } : Bool }
+2a5a49e54db23152  ls_tls_request_served  law ls_tls_request_served : for t : Bool for m : LsHttpMode for l : Bool { ls_plain_served ( ls_plain_act ( LsTls { } , t , m , l ) ) == True { } : Bool }
+# promise ls_tls_request_served: a request that came over TLS is always answered, never redirected, whatever --tls-http says and wherever the client is
+# harm ls_tls_request_served: an HTTPS client would be sent to the address it already uses, again and again, and reach nothing
 45e9542dfddbb97c  mb_call_closes_at_marker  law mb_call_closes_at_marker : for + s : MbState for + e : MbEvent for + split : Bool { Bool.or ( Bool.not ( mb_is_call ( s ) ) , Bool.or ( mb_is_words ( e ) , mb_closes_call ( mb_act ( s , e , split ) ) ) ) == True { } : Bool }
 # promise mb_call_closes_at_marker: every marker that arrives inside a tool-call block closes that call (it is read or dropped, never left open)
 # harm mb_call_closes_at_marker: a call would stay open across a new block and swallow its text
