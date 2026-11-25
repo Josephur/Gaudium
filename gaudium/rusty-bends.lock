@@ -48,6 +48,9 @@ c969518b535cece3  call_fragment_needs_header  law call_fragment_needs_header : f
 # promise cg_made_days_positive: a server certificate that is made is valid for at least one day
 38aee2513c8dd21f  cg_overwrite_replaces  law cg_overwrite_replaces : for + a : Bool for + c : Bool for + d : Bool { cg_writes_server ( cg_plan ( a , a , c , d , True { } ) ) == True { } : Bool }
 # promise cg_overwrite_replaces: with the overwrite flag the server's files are replaced whenever the authority is whole or absent
+1c2273de588e1fa9  cg_room_makes_certificate  law cg_room_makes_certificate : for + a : Nat for + l : Nat { cg_valid_refused ( cg_validity ( 1n + a , 1n + l ) ) == False { } : Bool }
+# promise cg_room_makes_certificate: the validity decision never refuses a request for at least one day whose authority has at least a whole day left
+# harm cg_room_makes_certificate: the command would refuse every certificate although nothing stands in its way
 bf64e42c2d2741d7  cg_server_kept_without_overwrite  law cg_server_kept_without_overwrite : for + a : Bool for + b : Bool for + c : Bool for + d : Bool { Bool.and ( cg_writes_server ( cg_plan ( a , b , c , d , False { } ) ) , Bool.or ( c , d ) ) == False { } : Bool }
 # promise cg_server_kept_without_overwrite: without the overwrite flag a run never writes the server's files while either of them exists
 # harm cg_server_kept_without_overwrite: a working certificate and key would be replaced without being asked

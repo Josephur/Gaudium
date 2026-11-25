@@ -360,7 +360,7 @@ def cg_made_days_positive(a, l):
       {==}
 
 # LAW 2.4
-# promise: a request for at least one day, signed by an authority with at least a whole day left, always gets a certificate
+# promise: the validity decision never refuses a request for at least one day whose authority has at least a whole day left
 # harm: the command would refuse every certificate although nothing stands in its way
 # catches: every request refused (cg_validity always CgNoDaysAsked{})
 law cg_room_makes_certificate:
