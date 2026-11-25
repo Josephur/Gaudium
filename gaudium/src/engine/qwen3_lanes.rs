@@ -577,7 +577,7 @@ struct WidthCosts {
     narrow_ms: HashMap<(u64, u64, bool), f64>,
     /// (slot count, sampled) -> (extra time of a wide slot, the launch that last measured it).
     extra_ms: HashMap<(u64, bool), (f64, u64)>,
-    /// Launches observed (the clock of `extra_ms`).
+    /// Launches observed (the clock of `extra_ms`, the verified `ln_cost_clock_next`).
     launches: u64,
     /// Slot steps of the session at the wide width, and in all; launches with a wide slot;
     /// estimates dropped unmeasured; lane choices whose cost the K/V chunks their wide rows add
@@ -611,8 +611,12 @@ impl WidthCosts {
     /// (`ln_cost_measures_narrow`, `ln_cost_measures_extra`); which estimates it leaves standing,
     /// too (`ln_cost_kept`).
     fn observe(&mut self, b: u64, nch: u64, sampled: bool, wide: u64, ms: f64) {
-        use crate::verified::{ln_cost_kept, ln_cost_measures_extra, ln_cost_measures_narrow};
-        self.launches += 1;
+        use crate::verified::{
+            ln_cost_clock_next, ln_cost_kept, ln_cost_measures_extra, ln_cost_measures_narrow,
+        };
+        // the clock estimates are stamped with (the verified step; it stops at the end of the
+        // arithmetic, where estimates then stand as before this rule)
+        self.launches = ln_cost_clock_next(self.launches).unwrap_or(self.launches);
         let now = self.launches;
         self.wide_slots += wide;
         self.slots += b;
@@ -2319,6 +2323,9 @@ mod tests {
 
     #[test]
     fn a_high_extra_time_is_dropped_when_nothing_measures_it_again() {
+        // the clock: one launch a step today, and it stops at the end of the arithmetic
+        assert_eq!(crate::verified::ln_cost_clock_next(5), Some(6));
+        assert_eq!(crate::verified::ln_cost_clock_next(u64::MAX), None);
         let mut w = WidthCosts::default();
         w.observe(8, 1, false, 0, 36.0);
         // one high early sample: 9 ms a wide slot

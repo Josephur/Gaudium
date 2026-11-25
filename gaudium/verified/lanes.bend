@@ -2387,10 +2387,10 @@ def ln_tier_write_voids_earlier(m, e):
 #
 # A wide slot's extra time is measured only by launches that have a wide slot (section 11). A
 # slot count whose estimate came out high keeps its lanes narrow, and then nothing measures it
-# again. So the model counts its launches and keeps, with each extra-time estimate, the launch
-# that last measured it: an estimate not measured again within `limit` launches is dropped. The
-# count then borrows another count's estimate again, or none, and a lane that expects more from
-# the wide step tries it, which measures the estimate afresh.
+# again. So the model counts its launches (`ln_cost_clock_next`) and keeps, with each extra-time
+# estimate, the launch that last measured it: an estimate not measured again within `limit`
+# launches is dropped. The count then borrows another count's estimate again, or none, and a
+# lane that expects more from the wide step tries it, which measures the estimate afresh.
 #
 # A lane's wide rows can also take a batched step past the chunk count of its narrow step: every
 # slot of that step then reads one more power of two of K/V chunks. The wide step's cost counts
@@ -2431,6 +2431,28 @@ def ln_cost_dropped_when_old(a, l, k):
       {==}
     case 1n+p:
       ln_cost_dropped_when_old(p, l, k)
+
+# The width model's launch count after one more launch, from `now` (the clock estimates are
+# stamped with).
+# rusty-bends: total
+def ln_cost_clock_next(now: Nat) -> Nat:
+  Nat.add(now, 1n)
+
+def ln_gt_add_one(+n: Nat) -> {True{} == Nat.is_gt(Nat.add(n, 1n), n) : Bool}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+p:
+      ln_gt_add_one(p)
+
+# promise: every launch moves the width model's clock forward, so an extra-time estimate not measured again grows older until it is dropped.
+law ln_cost_clock_moves:
+  for +n: Nat
+  {Nat.is_gt(ln_cost_clock_next(n), n) == True{} : Bool}
+
+def ln_cost_clock_moves(n):
+  %ln_gt_add_one(n) : {_ == True{} : Bool}
+  {==}
 
 # The extra time of a lane's wide step (microseconds), or not known.
 type WideCost is Data:
