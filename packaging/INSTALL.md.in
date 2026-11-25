@@ -68,6 +68,21 @@ bin/gaudium --serve --model <model_dir> --kernels "$PWD/build/kernels" --ui-dir 
 `--cache-dir` keeps the compiled recipes between starts; without it every start compiles them
 again. Use a new cache directory after installing another SDK release.
 
+## HTTPS
+
+Opened from another machine, the Web UI needs HTTPS for the microphone and the clipboard. The
+server serves HTTPS on the same port once it has a certificate, and `--make-cert` makes one
+(it needs the system's OpenSSL 3, `libssl3`):
+
+```bash
+bin/gaudium --make-cert <dir> --cert-names <host name>,<address>    # once
+bin/gaudium --serve ... --tls-cert <dir>/server.crt --tls-key <dir>/server.key
+```
+
+`--make-cert` prints the certificate's fingerprints and how to trust `<dir>/ca.crt` on each
+kind of device (once per device). For a new name or address later, run it again with
+`--cert-overwrite`: the devices need nothing new. `docs/mcp-proxy-https.md` has the details.
+
 The engine loads `libSynapse.so` from `/usr/lib/habanalabs/` or the loader's search path
 (set `GAUDIUM_SYNAPSE_LIB` to use another file). Only one process may open the card at a time.
 

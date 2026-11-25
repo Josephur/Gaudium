@@ -87,6 +87,10 @@ fn print_usage() {
          \x20                                           Remove the least recently used recipes of the\n\
          \x20                                           recipe cache until it fits N GiB (host only;\n\
          \x20                                           safe beside a server using the directory)\n\
+         \x20 gaudium --make-cert <dir> [options]       Make the server's HTTPS certificate (host only): a\n\
+         \x20                                           local certificate authority, made once and trusted\n\
+         \x20                                           once on each device, and a server certificate\n\
+         \x20                                           signed by it, for --tls-cert and --tls-key\n\
          \x20 gaudium --fp8-pack --model <dir> --fp8-cache <dir>\n\
          \x20                                           Quantise a Gemma 4 BF16 checkpoint's matrices into an\n\
          \x20                                           FP8 cache directory (host only, no card)\n\
@@ -634,6 +638,24 @@ fn print_usage() {
          \x20 --cache-keep-days <D> Entries used within D days stay even over the budget (default: 1;\n\
          \x20                       an entry dated ahead of the clock counts as just used)\n\
          \x20 --dry-run             Print what would be freed, remove nothing\n\
+         \n\
+         Certificate options (--make-cert <dir>: writes ca.crt and ca.key, the authority, when the\n\
+         directory has neither of them, and server.crt (the chain) and server.key, signed by it; the\n\
+         keys get mode 0600 and no file is replaced without --cert-overwrite; prints the SHA-256\n\
+         fingerprints and how to trust ca.crt on each kind of device; docs/mcp-proxy-https.md):\n\
+         \x20 --cert-names <list>   Names and addresses the Web UI is opened by, comma separated\n\
+         \x20                       (repeatable): host names (gaudium.lan) and IPv4 or IPv6 addresses.\n\
+         \x20                       localhost, 127.0.0.1 and ::1 are always added. Default: this\n\
+         \x20                       machine's host name and the address of its default route. A new\n\
+         \x20                       authority may sign only for these names (and names under them),\n\
+         \x20                       loopback and local-network addresses\n\
+         \x20 --cert-days <N>       Days the server certificate is valid (default and most: 825, the\n\
+         \x20                       longest Apple's systems accept; never past the end of the\n\
+         \x20                       authority, which is valid for 10 years)\n\
+         \x20 --cert-overwrite      Replace the server certificate and key that are there (a new name\n\
+         \x20                       or address, or a renewal). The authority is never replaced: for a\n\
+         \x20                       name it does not cover, move ca.crt and ca.key away to make a new\n\
+         \x20                       one, and trust it again on each device\n\
          \n\
          Vision suite options (a row = one model and one method of the suite file; per row the\n\
          text request, every image case and the text request again, greedy and seeded sampled,\n\
@@ -2315,6 +2337,122 @@ fn run_trim_cache(args: &[String]) -> Result<bool, String> {
     Ok(rep.errors.is_empty())
 }
 
+/// `gaudium --make-cert <dir> [--cert-names <list>] [--cert-days <N>] [--cert-overwrite]`.
+fn run_make_cert(args: &[String]) -> Result<(), String> {
+    use gaudium::tls_cert::{
+        detect_names, make_cert, parse_names, trust_steps, MakeCertOptions, CA_CERT, CA_DAYS,
+        CA_KEY, DEFAULT_SERVER_DAYS, MAX_SERVER_DAYS, SERVER_CERT, SERVER_KEY,
+    };
+    let mut dir: Option<PathBuf> = None;
+    let mut names = Vec::new();
+    let mut names_given = false;
+    let mut days = DEFAULT_SERVER_DAYS;
+    let mut overwrite = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let next_val = |idx: &mut usize, name: &str| -> Result<String, String> {
+            *idx += 1;
+            args.get(*idx)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match args[i].as_str() {
+            "--make-cert" => dir = Some(PathBuf::from(next_val(&mut i, "--make-cert")?)),
+            "--cert-names" => {
+                names.extend(parse_names(&next_val(&mut i, "--cert-names")?)?);
+                names_given = true;
+            }
+            "--cert-days" => {
+                let v = next_val(&mut i, "--cert-days")?;
+                days = match v.parse::<u64>() {
+                    Ok(d) if (1..=MAX_SERVER_DAYS).contains(&d) => d,
+                    _ => {
+                        return Err(format!(
+                            "--cert-days must be a whole number from 1 to {MAX_SERVER_DAYS} (got '{v}')"
+                        ))
+                    }
+                };
+            }
+            "--cert-overwrite" => overwrite = true,
+            other => return Err(format!("unknown --make-cert option '{other}'")),
+        }
+        i += 1;
+    }
+    let dir = dir.ok_or("--make-cert <dir>: the directory for the certificate files")?;
+    let dir = std::path::absolute(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !names_given {
+        names = detect_names();
+        let shown: Vec<String> = names.iter().map(ToString::to_string).collect();
+        println!(
+            "No --cert-names given: using this machine's name and address ({}). Give --cert-names to name others.\n",
+            if shown.is_empty() { "none found".into() } else { shown.join(", ") }
+        );
+    }
+    let r = make_cert(&MakeCertOptions {
+        dir: dir.clone(),
+        names: names.clone(),
+        days,
+        overwrite,
+        ca_days: CA_DAYS,
+    })?;
+    let shown: Vec<String> = r.names.iter().map(ToString::to_string).collect();
+    if r.made_ca {
+        println!("Made a new certificate authority and a server certificate in {}:", dir.display());
+    } else {
+        println!(
+            "Made a new server certificate in {}, signed by the authority already there{}:",
+            dir.display(),
+            if r.replaced_server { " (the old server files are replaced)" } else { "" }
+        );
+    }
+    println!(
+        "  {CA_CERT}      the authority: trust it once on each device that opens the Web UI (below)\n\
+         \x20 {CA_KEY}      its key (mode 0600): it stays on this machine, never copy it\n\
+         \x20 {SERVER_CERT}  the server's certificate, then the authority's (for --tls-cert)\n\
+         \x20 {SERVER_KEY}  the server's key (mode 0600, for --tls-key)\n\
+         \n\
+         Server certificate\n\
+         \x20 names        {}\n\
+         \x20 valid until  {} ({} days)\n\
+         \x20 SHA-256      {}\n\
+         Certificate authority (a device shows this fingerprint when the certificate is installed)\n\
+         \x20 name         {}\n\
+         \x20 valid until  {}\n\
+         \x20 SHA-256      {}\n",
+        shown.join(", "),
+        r.server.not_after,
+        r.server_days,
+        r.server.sha256,
+        r.ca.subject,
+        r.ca.not_after,
+        r.ca.sha256,
+    );
+    for n in names.iter().filter(|n| n.looks_public()) {
+        println!(
+            "Note: {n} looks like a public name or address. A server that is reached from the internet under it\n\
+             is better served by a certificate from a public authority (or a TLS front end): this authority is\n\
+             trusted only by the devices it is installed on.\n"
+        );
+    }
+    let host = names.first().map(ToString::to_string).unwrap_or_else(|| "localhost".into());
+    let host = if host.contains(':') { format!("[{host}]") } else { host };
+    println!(
+        "Start the server with\n\
+         \x20 gaudium --serve ... --tls-cert {} --tls-key {}\n\
+         and open https://{host}:<port>/ (plain HTTP keeps answering on the same port).\n\
+         \n\
+         Trust the authority once on each device; every server certificate it signs is then trusted:\n\
+         {}\n\
+         \n\
+         A new name or address, or the renewal before the date above: run the same command with\n\
+         --cert-overwrite. The authority stays, so the devices need nothing new.",
+        r.server.path.display(),
+        r.server_key.display(),
+        trust_steps(&r.ca.path),
+    );
+    Ok(())
+}
+
 fn run_serve(args: &[String]) -> Result<(), String> {
     let mut host = env::var("GAUDIUM_SERVE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let mut port: u16 = env::var("GAUDIUM_SERVE_PORT")
@@ -2809,6 +2947,13 @@ fn main() {
     if args.iter().any(|a| a == "--kv-calibrate") {
         if let Err(e) = run_kv_calibrate(&args[1..]) {
             eprintln!("KV CALIBRATE FAIL: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--make-cert") {
+        if let Err(e) = run_make_cert(&args[1..]) {
+            eprintln!("MAKE CERT FAIL: {e}");
             process::exit(1);
         }
         return;

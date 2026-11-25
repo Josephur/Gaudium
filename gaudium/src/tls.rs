@@ -32,7 +32,7 @@ const LIBRARY_NAMES: &[&str] = &["libssl.so.3", "libssl.so"];
 
 type SslCtx = c_void;
 type Ssl = c_void;
-type PasswdCb = extern "C" fn(*mut c_char, c_int, c_int, *mut c_void) -> c_int;
+pub(crate) type PasswdCb = extern "C" fn(*mut c_char, c_int, c_int, *mut c_void) -> c_int;
 
 /// The functions of `libssl` / `libcrypto` this module calls.
 struct Api {
@@ -89,7 +89,7 @@ const SSL_ERROR_ZERO_RETURN: c_int = 6;
 const X509_V_OK: c_long = 0;
 const OPENSSL_VERSION_TEXT: c_int = 0;
 
-mod dl {
+pub(crate) mod dl {
     use std::ffi::{c_char, c_int, c_void};
     extern "C" {
         pub fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
@@ -101,7 +101,7 @@ mod dl {
 }
 
 /// Looks one function up. `T` must be the function-pointer type of the C function `name`.
-unsafe fn lookup<T: Copy>(handle: *mut c_void, name: &str) -> Result<T, String> {
+pub(crate) unsafe fn lookup<T: Copy>(handle: *mut c_void, name: &str) -> Result<T, String> {
     assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
     let c = CString::new(name).map_err(|_| format!("bad symbol name {name}"))?;
     // SAFETY: `handle` is a live `dlopen` handle and `c` a NUL-terminated name.
@@ -293,14 +293,14 @@ impl Drop for Ctx {
     }
 }
 
-fn c_path(path: &Path) -> Result<CString, String> {
+pub(crate) fn c_path(path: &Path) -> Result<CString, String> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| format!("{}: the path holds a NUL byte", path.display()))
 }
 
 /// An encrypted key file would make the library ask for its passphrase on the terminal; the
 /// server has none, so the question is answered with "no passphrase" and the load fails.
-extern "C" fn gaudium_tls_no_passphrase(
+pub(crate) extern "C" fn gaudium_tls_no_passphrase(
     _buf: *mut c_char,
     _size: c_int,
     _rwflag: c_int,

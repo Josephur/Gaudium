@@ -106,10 +106,12 @@ gaudium                             # verified-core self-check
 gaudium --hpu-smoke                 # small live test on the card
 gaudium --serve --model <model_dir> --kernels <kernel_build_dir> --ui-dir ui \
         --max-ctx 32768             # API + Web UI on port 8090
+gaudium --make-cert <dir> --cert-names <host>,<address>   # a certificate for HTTPS (below)
 ```
 
 [`docs/reference.md`](docs/reference.md) has the full `--help` text and every environment
-variable; [`docs/mcp-proxy-https.md`](docs/mcp-proxy-https.md) covers the MCP proxy and HTTPS;
+variable; [`docs/mcp-proxy-https.md`](docs/mcp-proxy-https.md) covers the MCP proxy and HTTPS
+(with the certificate `--make-cert` makes and how to trust it on each device);
 [`docs/vision-suite.md`](docs/vision-suite.md) the vision regression suite
 (`gaudium --vision-suite`).
 
