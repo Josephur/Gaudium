@@ -1071,7 +1071,10 @@ pub fn make_cert(opts: &MakeCertOptions) -> Result<MakeCertReport, String> {
         c.add_ext(&cert, cert.1, "subjectKeyIdentifier", "hash")?;
         c.add_ext(&cert, cert.1, "nameConstraints", &name_constraints(&names))?;
         c.sign(&cert, &key)?;
-        (cert, key, opts.ca_days)
+        // the days left read from the certificate itself, as for an existing authority (the
+        // clock has moved since it started)
+        let (_, left) = c.not_after(&cert)?;
+        (cert, key, u64::try_from(left).unwrap_or(0))
     } else {
         let cert = c.read_cert(&ca_cert)?;
         let key = c.read_key(&ca_key)?;

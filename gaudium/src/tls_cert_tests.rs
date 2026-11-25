@@ -307,7 +307,33 @@ fn the_server_certificate_never_outlives_its_authority() {
     o.ca_days = 10;
     let r = make_cert(&o).unwrap();
     assert!(r.server.days_left <= r.ca.days_left, "{r:?}");
-    assert!((9..=10).contains(&r.server.days_left), "{r:?}");
+    assert!(r.server_days < 10 && r.server.days_left >= 8, "{r:?}");
+    // asked for exactly the authority's days: still ends no later than the authority
+    let t2 = temp_dir();
+    let mut o2 = opts(&t2.0, "gaudium.example.lan");
+    o2.ca_days = 5;
+    o2.days = 5;
+    let r2 = make_cert(&o2).unwrap();
+    let c = crypto().unwrap();
+    let (ca, srv) = (
+        c.read_cert(&t2.0.join(CA_CERT)).unwrap(),
+        c.read_cert(&t2.0.join(SERVER_CERT)).unwrap(),
+    );
+    // SAFETY: both certificates are live; the times belong to them.
+    let (mut day, mut sec) = (0, 0);
+    let ok = unsafe {
+        (c.asn1_time_diff)(
+            &mut day,
+            &mut sec,
+            (c.x509_get0_not_after)(srv.1),
+            (c.x509_get0_not_after)(ca.1),
+        )
+    };
+    assert_eq!(ok, 1);
+    assert!(
+        day > 0 || (day == 0 && sec >= 0),
+        "server ends after its authority: {day} d {sec} s, {r2:?}"
+    );
     // renewed with the same authority: bounded by what the authority has left
     o.overwrite = true;
     o.ca_days = CA_DAYS;

@@ -5,7 +5,9 @@
 //! verified core; nothing here decides.
 
 pub use crate::verified::CgPlan as CertPlan;
-use crate::verified::{cg_plan, cg_validity, cg_writes_ca, cg_writes_server, CgValid};
+use crate::verified::{
+    cg_plan, cg_valid_days, cg_valid_refused, cg_validity, cg_writes_ca, cg_writes_server, CgValid,
+};
 
 /// Which files exist in the certificate directory, and whether the operator asked for the
 /// server's two files to be replaced.
@@ -51,12 +53,16 @@ pub enum Validity {
 }
 
 /// `asked`: the days the operator asked for; `ca_left`: whole days the authority that signs the
-/// certificate is still valid.
+/// certificate is still valid. Whether a certificate is made, and for how many days, is read
+/// through the accessors the laws are stated with; the refusal's kind only picks its message.
 pub fn validity(asked: u64, ca_left: u64) -> Validity {
-    match cg_validity(asked, ca_left) {
+    let v = cg_validity(asked, ca_left);
+    if !cg_valid_refused(v) {
+        return Validity::Days(cg_valid_days(v));
+    }
+    match v {
         CgValid::CgNoDaysAsked => Validity::NoDaysAsked,
-        CgValid::CgCaSpent => Validity::AuthoritySpent,
-        CgValid::CgValidFor(d) => Validity::Days(d),
+        _ => Validity::AuthoritySpent,
     }
 }
 
