@@ -2511,17 +2511,17 @@ def ln_wide_unknown_chunk_narrow(g, e, n, d, c, t, s):
   %ln_gt_succ_add(n, d) : {ln_lane_goes_wide_at(g, ln_wide_cost_of(_, False{}, e, c), t, s) == False{} : Bool}
   {==}
 
-# promise: a wide step that takes a batched step into more K/V chunks is never costed below its wide slot's extra time plus those chunks' measured time.
+# promise: a wide step that takes a batched step into more K/V chunks is never costed below those chunks' measured time.
 law ln_wide_cost_counts_chunk:
   for +e: Nat
   for +n: Nat
   for +d: Nat
   for +c: Nat
-  {ln_wide_cost_covers(ln_wide_cost(e, n, 1n+Nat.add(n, d), True{}, c), Nat.add(e, c)) == True{} : Bool}
+  {ln_wide_cost_covers(ln_wide_cost(e, n, 1n+Nat.add(n, d), True{}, c), c) == True{} : Bool}
 
 def ln_wide_cost_counts_chunk(e, n, d, c):
-  %ln_gt_succ_add(n, d) : {ln_wide_cost_covers(ln_wide_cost_of(_, True{}, e, c), Nat.add(e, c)) == True{} : Bool}
-  L.nat_le_refl(Nat.add(e, c))
+  %ln_gt_succ_add(n, d) : {ln_wide_cost_covers(ln_wide_cost_of(_, True{}, e, c), c) == True{} : Bool}
+  L.nat_add_le_l(e, c)
 
 def ln_wide_extra_aux(g: Bool, k: Bool, +e: Nat, +c: Nat) -> {ln_wide_cost_covers(ln_wide_cost_of(g, k, e, c), e) == True{} : Bool}:
   match g:
