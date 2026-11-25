@@ -72,6 +72,20 @@ def rt_gone_bytes(recipe_bytes: Nat, recipe_gone: Bool, meta_bytes: Nat, meta_go
 def rt_may_remove_recipe(meta_present: Bool, meta_gone: Bool) -> Bool:
   Bool.or(Bool.not(meta_present), meta_gone)
 
+# Bytes, as counted at the scan, of an entry's files that the second look no longer finds on disk
+# (`recipe_on_disk`, `meta_on_disk`: what that look found). They come off the count of held bytes
+# whatever becomes of the entry: removed, gone or kept, a file that is gone is not held. `None`
+# past 64 bits.
+# rusty-bends: total
+def rt_off_disk_bytes(recipe_bytes: Nat, recipe_on_disk: Bool, meta_bytes: Nat, meta_on_disk: Bool) -> Nat:
+  rt_gone_bytes(recipe_bytes, Bool.not(recipe_on_disk), meta_bytes, Bool.not(meta_on_disk))
+
+# Bytes, as counted at the scan, of an entry's files that the second look still finds on disk:
+# what removing the entry would free (the figure a dry run reports). `None` past 64 bits.
+# rusty-bends: total
+def rt_on_disk_bytes(recipe_bytes: Nat, recipe_on_disk: Bool, meta_bytes: Nat, meta_on_disk: Bool) -> Nat:
+  rt_gone_bytes(recipe_bytes, recipe_on_disk, meta_bytes, meta_on_disk)
+
 # Bytes still held after `bytes` bytes of entries left the disk.
 def rt_after(+held: Nat, bytes: Nat) -> Nat:
   Nat.sub(held, bytes)
@@ -642,3 +656,65 @@ law rt_recheck_over_target_removes:
 def rt_recheck_over_target_removes(t, x, m):
   %Equal.sym(Bool, Nat.is_lt(t, Nat.add(t, 1n+x)), True{}, rt_lt_add_succ(t, x)) : {rt_recheck_removes(rt_recheck_pick(True{}, Bool.and(True{}, _))) == True{} : Bool}
   {==}
+
+# promise: when both files of an entry are still on disk at the second look, none of its bytes come off the count of held bytes.
+# harm: bytes still on disk would be counted as freed and the trim would stop over budget
+law rt_off_disk_none_gone:
+  for +r: Nat
+  for +m: Nat
+  {rt_off_disk_bytes(r, True{}, m, True{}) == 0n : Nat}
+
+def rt_off_disk_none_gone(r, m):
+  {==}
+
+# promise: when an entry's recipe file is gone at the second look and its sidecar is on disk, exactly the recipe's counted bytes come off the count, whatever then becomes of the entry.
+# harm: a kept entry whose recipe someone else removed would stay counted and the trim would remove up to a recipe more than its budget asks
+law rt_off_disk_recipe_gone:
+  for +r: Nat
+  for +m: Nat
+  {rt_off_disk_bytes(r, False{}, m, True{}) == r : Nat}
+
+def rt_off_disk_recipe_gone(r, m):
+  L.nat_add_zero_r(r)
+
+# promise: when an entry's sidecar is gone at the second look and its recipe file is on disk, exactly the sidecar's counted bytes come off the count, whatever then becomes of the entry.
+# harm: a kept entry whose sidecar someone else removed would stay counted and the trim would remove more than its budget asks
+law rt_off_disk_sidecar_gone:
+  for +r: Nat
+  for +m: Nat
+  {rt_off_disk_bytes(r, True{}, m, False{}) == m : Nat}
+
+def rt_off_disk_sidecar_gone(r, m):
+  {==}
+
+# promise: when neither file of an entry is on disk at the second look, all of its counted bytes come off the count.
+# harm: an entry someone else removed would stay counted and the trim would remove more than its budget asks
+law rt_off_disk_both_gone:
+  for +r: Nat
+  for +m: Nat
+  {rt_off_disk_bytes(r, False{}, m, False{}) == rt_entry_bytes(r, m) : Nat}
+
+def rt_off_disk_both_gone(r, m):
+  {==}
+
+# promise: the bytes the second look finds gone and the bytes it finds still on disk add up to exactly the entry's counted bytes, so what a removal would free holds no byte that is already gone.
+# harm: a dry run would report as freed bytes that someone else had already freed, or leave out bytes it would free
+law rt_off_and_on_disk_make_the_entry:
+  for +r: Nat
+  for +rd: Bool
+  for +m: Nat
+  for +md: Bool
+  {Nat.add(rt_off_disk_bytes(r, rd, m, md), rt_on_disk_bytes(r, rd, m, md)) == rt_entry_bytes(r, m) : Nat}
+
+def rt_off_and_on_disk_make_the_entry(r, rd, m, md):
+  match rd md:
+    case True{} True{}:
+      {==}
+    case True{} False{}:
+      %Equal.sym(Nat, Nat.add(r, 0n), r, L.nat_add_zero_r(r)) : {Nat.add(m, _) == Nat.add(r, m) : Nat}
+      L.nat_add_comm(m, r)
+    case False{} True{}:
+      %Equal.sym(Nat, Nat.add(r, 0n), r, L.nat_add_zero_r(r)) : {Nat.add(_, m) == Nat.add(r, m) : Nat}
+      {==}
+    case False{} False{}:
+      L.nat_add_zero_r(Nat.add(r, m))

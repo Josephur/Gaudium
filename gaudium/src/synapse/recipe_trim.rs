@@ -32,8 +32,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::synapse::recipe_cache::{in_use_registry, refresh_recency, RECIPE_EXT, SHA256_EXT};
 use crate::verified::{
     rt_after, rt_count_add, rt_entry_bytes, rt_evict_before, rt_gone_bytes, rt_last_used,
-    rt_may_remove_recipe, rt_protected, rt_recheck, rt_recheck_gone, rt_recheck_removes,
-    rt_should_evict,
+    rt_may_remove_recipe, rt_off_disk_bytes, rt_on_disk_bytes, rt_protected, rt_recheck,
+    rt_recheck_gone, rt_recheck_removes, rt_should_evict,
 };
 
 /// Default keep window of `--cache-keep-days`, in days.
@@ -295,7 +295,18 @@ pub(crate) fn trim_at(
     now: u64,
     honour_in_use: bool,
 ) -> io::Result<TrimReport> {
-    let scan = scan(dir)?;
+    walk(dir, opts, now, honour_in_use, scan(dir)?)
+}
+
+/// The walk of [`trim_at`] over the entries a scan of `dir` found (the files may have changed
+/// since: each entry is read again just before it would be removed).
+fn walk(
+    dir: &Path,
+    opts: &TrimOptions,
+    now: u64,
+    honour_in_use: bool,
+    scan: Scan,
+) -> io::Result<TrimReport> {
     let mut rep = TrimReport {
         entries: scan.entries.len() as u64,
         unknown_files: scan.unknown_files,
@@ -358,30 +369,37 @@ pub(crate) fn trim_at(
             |r: &Removal, m: &Removal| rt_gone_bytes(r_bytes, r.gone(), m_bytes, m.gone());
         // the times as they are now decide, not the scan's
         let protected = rt_protected(fresh.last_used(), now, opts.keep_secs, in_use);
+        let (recipe_on_disk, meta_on_disk) = (fresh.recipe.is_some(), fresh.sidecar.is_some());
         let recheck = rt_recheck(
             held,
             opts.target_bytes,
-            fresh.recipe.is_some(),
-            fresh.sidecar.is_some(),
+            recipe_on_disk,
+            meta_on_disk,
             protected,
         );
+        // the files someone else removed since the scan: not held, whatever becomes of the entry
+        let off_disk = rt_off_disk_bytes(r_bytes, recipe_on_disk, m_bytes, meta_on_disk)
+            .ok_or_else(overflow)?;
         if rt_recheck_gone(recheck) {
             // another process removed it since the scan: its bytes are gone, not freed here
             drop(held_set);
-            let bytes = gone_bytes(&Removal::Absent, &Removal::Absent).ok_or_else(overflow)?;
-            held = rt_after(held, bytes);
+            held = rt_after(held, off_disk);
             rep.gone_meanwhile += 1;
             continue;
         }
         if !rt_recheck_removes(recheck) {
+            drop(held_set);
+            held = rt_after(held, off_disk);
             rep.protected_over_budget += 1;
             continue;
         }
         if opts.dry_run {
-            let bytes = gone_bytes(&Removal::Absent, &Removal::Absent).ok_or_else(overflow)?;
-            held = rt_after(held, bytes);
+            // what the removal would free: the files still on disk, not those already gone
+            let on_disk = rt_on_disk_bytes(r_bytes, recipe_on_disk, m_bytes, meta_on_disk)
+                .ok_or_else(overflow)?;
+            held = rt_after(rt_after(held, off_disk), on_disk);
             rep.evicted += 1;
-            rep.freed_bytes = add(rep.freed_bytes, bytes)?;
+            rep.freed_bytes = add(rep.freed_bytes, on_disk)?;
             continue;
         }
         // Sidecar first: from here on the entry is not a hit for anyone. The files are the ones
@@ -788,6 +806,83 @@ mod tests {
         assert_eq!(rt_recheck(10, 5, false, true, true), RtRecheckKeep);
         assert_eq!(rt_recheck(5, 5, true, false, false), RtRecheckKeep);
         assert_eq!(rt_recheck(10, 5, false, false, true), RtRecheckGone);
+    }
+
+    /// An entry kept at the second look while someone else already removed one of its files: only
+    /// the file still on disk stays counted, so the walk removes no more than the budget asks.
+    #[test]
+    fn kept_entry_counts_only_what_is_on_disk() {
+        let d = tmp("keptgone");
+        let sha = 65;
+        entry(&d, "a", H1, 1000, NOW - 30 * DAY);
+        entry(&d, "b", H2, 1000, NOW - 20 * DAY);
+        entry(&d, "c", H3, 1000, NOW - 10 * DAY);
+        let found = scan(&d).unwrap();
+        // since the scan: a hit refreshed a's sidecar (a is now recent) and someone else removed
+        // a's recipe
+        set_time(&d.join(format!("a-{H1}.sha256")), NOW);
+        fs::remove_file(d.join(format!("a-{H1}.recipe"))).unwrap();
+        let budget = (1000 + sha) + sha;
+        let rep = walk(&d, &opts(budget, DAY), NOW, false, found).unwrap();
+        assert_eq!(rep.bytes_before, 3 * (1000 + sha));
+        assert_eq!(rep.protected_over_budget, 1);
+        assert_eq!((rep.evicted, rep.freed_bytes), (1, 1000 + sha));
+        // a's sidecar and c are what is left, and that is the budget: c stays
+        assert_eq!(rep.bytes_after, budget);
+        assert!(exists(&d, &format!("a-{H1}.sha256")));
+        assert!(!exists(&d, &format!("b-{H2}.recipe")));
+        assert!(exists(&d, &format!("c-{H3}.recipe")) && exists(&d, &format!("c-{H3}.sha256")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A dry run whose entry lost a file to someone else after the scan reports only the bytes it
+    /// would free itself, as the real trim does.
+    #[test]
+    fn dry_run_does_not_count_bytes_already_gone() {
+        let d = tmp("drygone");
+        let sha = 65;
+        entry(&d, "a", H1, 1000, NOW - 30 * DAY);
+        entry(&d, "b", H2, 1000, NOW - 20 * DAY);
+        let mut o = opts(0, DAY);
+        o.dry_run = true;
+        let found = scan(&d).unwrap();
+        fs::remove_file(d.join(format!("a-{H1}.sha256"))).unwrap();
+        let dry = walk(&d, &o, NOW, false, found).unwrap();
+        assert_eq!(
+            (dry.evicted, dry.freed_bytes, dry.bytes_after),
+            (2, 1000 + (1000 + sha), 0)
+        );
+        assert!(exists(&d, &format!("a-{H1}.recipe")) && exists(&d, &format!("b-{H2}.sha256")));
+        // the real trim from the same scan frees the same
+        let mut found = scan(&d).unwrap();
+        found.entries.get_mut(&format!("a-{H1}")).unwrap().sidecar = Some(FileStat {
+            bytes: sha,
+            mtime: NOW - 30 * DAY,
+        });
+        o.dry_run = false;
+        let real = walk(&d, &o, NOW, false, found).unwrap();
+        assert_eq!(
+            (real.evicted, real.freed_bytes, real.bytes_after),
+            (dry.evicted, dry.freed_bytes, dry.bytes_after)
+        );
+        assert!(real.errors.is_empty(), "{:?}", real.errors);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bytes_off_and_on_disk_of_today() {
+        // the laws make these exact; pinned here as the shell sees them (`None` past 64 bits)
+        assert_eq!(rt_off_disk_bytes(1000, true, 65, true), Some(0));
+        assert_eq!(rt_off_disk_bytes(1000, false, 65, true), Some(1000));
+        assert_eq!(rt_off_disk_bytes(1000, true, 65, false), Some(65));
+        assert_eq!(rt_off_disk_bytes(1000, false, 65, false), Some(1065));
+        assert_eq!(rt_on_disk_bytes(1000, true, 65, true), Some(1065));
+        assert_eq!(rt_on_disk_bytes(1000, false, 65, true), Some(65));
+        assert_eq!(rt_on_disk_bytes(1000, true, 65, false), Some(1000));
+        assert_eq!(rt_on_disk_bytes(1000, false, 65, false), Some(0));
+        assert_eq!(rt_on_disk_bytes(u64::MAX, true, 1, true), None);
+        assert_eq!(rt_off_disk_bytes(u64::MAX, false, 1, false), None);
+        assert_eq!(rt_on_disk_bytes(u64::MAX, true, 1, false), Some(u64::MAX));
     }
 
     #[test]
