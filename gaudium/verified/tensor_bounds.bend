@@ -6,6 +6,7 @@
 #   - Speculative draft-tree bounds (<= 32 nodes, acyclic DAG) & lane state-block relocation
 
 import Base
+import nat_lemmas.bend as L
 
 # ============================================================================
 # 1. Helper Nat arithmetic lemmas (erased before Rust codegen)
@@ -625,3 +626,61 @@ law ds_no_draft_rows_no_map:
 
 def ds_no_draft_rows_no_map(v):
   {==}
+
+def tn_sub_le_self(+a: Nat, +b: Nat) -> {Nat.is_le(Nat.sub(a, b), a) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      {==}
+    case 1n+ap 0n:
+      L.nat_le_refl(1n+ap)
+    case 1n+ap 1n+bp:
+      L.nat_le_succ_r(Nat.sub(ap, bp), ap, tn_sub_le_self(ap, bp))
+
+def tn_align_up_nz_sum(+x: Nat, +ap: Nat, +rem: Nat, erem: {rem == Nat.mod(x, 1n+ap) : Nat}, h_lt: {Nat.is_lt(rem, 1n+ap) == True{} : Bool}) -> {Nat.add(x, Nat.sub(1n+ap, rem)) == Nat.mul(1n+Nat.div(x, 1n+ap), 1n+ap) : Nat}:
+  +q = Nat.div(x, 1n+ap)
+  %L.nat_div_mod_r(x, ap) : {Nat.add(_, Nat.sub(1n+ap, rem)) == Nat.mul(1n+q, 1n+ap) : Nat}
+  %erem : {Nat.add(Nat.add(Nat.mul(q, 1n+ap), _), Nat.sub(1n+ap, rem)) == Nat.mul(1n+q, 1n+ap) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.mul(q, 1n+ap), rem), Nat.sub(1n+ap, rem)), Nat.add(Nat.mul(q, 1n+ap), Nat.add(rem, Nat.sub(1n+ap, rem))), L.nat_add_assoc(Nat.mul(q, 1n+ap), rem, Nat.sub(1n+ap, rem))) : {_ == Nat.mul(1n+q, 1n+ap) : Nat}
+  %L.nat_add_comm(Nat.sub(1n+ap, rem), rem) : {Nat.add(Nat.mul(q, 1n+ap), _) == Nat.mul(1n+q, 1n+ap) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.sub(1n+ap, rem), rem), 1n+ap, L.nat_sub_add_cancel(1n+ap, rem, L.nat_lt_imp_le(rem, 1n+ap, h_lt))) : {Nat.add(Nat.mul(q, 1n+ap), _) == Nat.mul(1n+q, 1n+ap) : Nat}
+  L.nat_add_comm(Nat.mul(q, 1n+ap), 1n+ap)
+
+def tn_align_up_mod_aux(+x: Nat, +ap: Nat, +rem: Nat, erem1: {rem == Nat.mod(x, 1n+ap) : Nat}, erem2: {rem == Nat.mod(x, 1n+ap) : Nat}) -> {Nat.mod(align_up_rem_if(x, 1n+ap, rem, Nat.is_eq(rem, 0n)), 1n+ap) == 0n : Nat}:
+  match rem:
+    case 0n:
+      Equal.sym(Nat, 0n, Nat.mod(x, 1n+ap), erem1)
+    case 1n+rp:
+      +h_lt = L.nat_lt_subst_l(Nat.mod(x, 1n+ap), 1n+rp, 1n+ap, Equal.sym(Nat, 1n+rp, Nat.mod(x, 1n+ap), erem1), L.nat_mod_lt(x, ap))
+      +sum_eq = tn_align_up_nz_sum(x, ap, 1n+rp, erem2, h_lt)
+      %Equal.sym(Nat, Nat.add(x, Nat.sub(1n+ap, 1n+rp)), Nat.mul(1n+Nat.div(x, 1n+ap), 1n+ap), sum_eq) : {Nat.mod(_, 1n+ap) == 0n : Nat}
+      L.nat_mod_mul(1n+Nat.div(x, 1n+ap), ap)
+
+# LAW TN.20: Aligning x up to any positive alignment yields an exact multiple of that alignment.
+# promise: align_up with a positive alignment always yields a multiple of that alignment
+# catches: align_up returns x unchanged without rounding up
+law align_up_is_multiple:
+  for +x: Nat
+  for +ap: Nat
+  {Nat.mod(align_up(x, 1n+ap), 1n+ap) == 0n : Nat}
+
+def align_up_is_multiple(x, ap):
+  tn_align_up_mod_aux(x, ap, Nat.mod(x, 1n+ap), {==}, {==})
+
+def tn_align_up_tight_aux(+x: Nat, +ap: Nat, +rem: Nat) -> {Nat.is_lt(align_up_rem_if(x, 1n+ap, rem, Nat.is_eq(rem, 0n)), Nat.add(x, 1n+ap)) == True{} : Bool}:
+  match rem:
+    case 0n:
+      Equal.sym(Bool, True{}, Nat.is_lt(x, Nat.add(x, 1n+ap)), tn_lt_add_succ_true(x, ap))
+    case 1n+rp:
+      +h_sub = L.nat_le_lt_trans(Nat.sub(ap, rp), ap, 1n+ap, tn_sub_le_self(ap, rp), L.nat_lt_succ_self(ap))
+      L.nat_add_lt_l(x, Nat.sub(ap, rp), 1n+ap, h_sub)
+
+# LAW TN.21: Aligning x up to a positive alignment adds strictly less than the alignment.
+# promise: align_up(x, 1+ap) is always strictly less than x + (1+ap)
+# catches: align_up adds a full alignment when x is already aligned (or adds align twice)
+law align_up_tight:
+  for +x: Nat
+  for +ap: Nat
+  {Nat.is_lt(align_up(x, 1n+ap), Nat.add(x, 1n+ap)) == True{} : Bool}
+
+def align_up_tight(x, ap):
+  tn_align_up_tight_aux(x, ap, Nat.mod(x, 1n+ap))

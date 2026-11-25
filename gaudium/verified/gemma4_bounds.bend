@@ -6,6 +6,7 @@
 #   - Atomic chunked host-memory pinning (synHostMap extents) rollback & hugepage ratio guards
 
 import Base
+import nat_lemmas.bend as L
 
 # ============================================================================
 # 1. Helper Nat arithmetic lemmas (erased before Rust codegen)
@@ -300,3 +301,114 @@ law pin_partial_never_usable:
 
 def pin_partial_never_usable(m):
   {==}
+
+def g4_lane_if_lt(+half: Nat, is_even: Bool, hh: {Nat.is_lt(half, 64n) == True{} : Bool}) -> {Nat.is_lt(g4_lane_if(half, is_even), 128n) == True{} : Bool}:
+  match is_even:
+    case True{}:
+      L.nat_lt_trans(half, 64n, 128n, hh, {==})
+    case False{}:
+      L.nat_add_lt_l(64n, half, 64n, hh)
+
+# LAW G4.11: Deinterleaved channel position g4_lane(c) always lands inside a 128-channel block (< 128).
+# promise: g4_lane always returns a position strictly below 128
+# catches: g4_lane omits Nat.mod(c, 128n) or maps odd channels past 127
+law g4_lane_in_block:
+  for +c: Nat
+  {Nat.is_lt(g4_lane(c), 128n) == True{} : Bool}
+
+def g4_lane_in_block(c):
+  +r = Nat.mod(c, 128n)
+  +hh = L.nat_div_lt_of_lt_mul(r, 64n, 1n, L.nat_mod_lt(c, 127n))
+  g4_lane_if_lt(Nat.div(r, 2n), Nat.is_eq(Nat.mod(r, 2n), 0n), hh)
+
+def g4_p_lt_128(+h: Nat, +j: Nat, hh: {Nat.is_lt(h, 2n) == True{} : Bool}, hj: {Nat.is_lt(j, 64n) == True{} : Bool}) -> {Nat.is_lt(Nat.add(Nat.mul(2n, j), h), 128n) == True{} : Bool}:
+  %L.nat_mul_comm(j, 2n) : {Nat.is_lt(Nat.add(_, h), 128n) == True{} : Bool}
+  L.nat_split_lt(j, h, 64n, 1n, hj, hh)
+
+def g4_nat_lo_lt_128(+p: Nat, hp64: {Nat.is_lt(p, 64n) == True{} : Bool}) -> {Nat.is_lt(Nat.mul(2n, p), 128n) == True{} : Bool}:
+  %L.nat_mul_comm(p, 2n) : {Nat.is_lt(_, 128n) == True{} : Bool}
+  %L.nat_add_zero_r(Nat.mul(p, 2n)) : {Nat.is_lt(_, 128n) == True{} : Bool}
+  L.nat_split_lt(p, 0n, 64n, 1n, hp64, {==})
+
+def g4_nat_hi_lt_128(+p: Nat, hp: {Nat.is_lt(p, 128n) == True{} : Bool}) -> {Nat.is_lt(Nat.add(Nat.mul(2n, Nat.sub(p, 64n)), 1n), 128n) == True{} : Bool}:
+  +r = Nat.sub(p, 64n)
+  +hr = L.nat_sub_lt(p, 64n, 64n, {==}, hp)
+  %L.nat_mul_comm(r, 2n) : {Nat.is_lt(Nat.add(_, 1n), 128n) == True{} : Bool}
+  L.nat_split_lt(r, 1n, 64n, 1n, hr, {==})
+
+def g4_nat_if_lt_128(+p: Nat, hp: {Nat.is_lt(p, 128n) == True{} : Bool}, b: Bool, eb: {b == Nat.is_lt(p, 64n) : Bool}) -> {Nat.is_lt(g4_nat_if(p, b), 128n) == True{} : Bool}:
+  match b:
+    case True{}:
+      g4_nat_lo_lt_128(p, Equal.sym(Bool, True{}, Nat.is_lt(p, 64n), eb))
+    case False{}:
+      g4_nat_hi_lt_128(p, hp)
+
+# LAW G4.12: Low TPC half g4_nat(0, j) for j < 64 always stays inside 0..128.
+# promise: g4_nat for half 0 and any lane j < 64 stays strictly below 128
+# catches: g4_nat_if doubles p without subtracting 64 when p >= 64
+law g4_nat_in_block_lo:
+  for +j: Nat
+  for hj: {Nat.is_lt(j, 64n) == True{} : Bool}
+  {Nat.is_lt(g4_nat(0n, j), 128n) == True{} : Bool}
+
+def g4_nat_in_block_lo(j, hj):
+  +p = Nat.add(Nat.mul(2n, j), 0n)
+  g4_nat_if_lt_128(p, g4_p_lt_128(0n, j, {==}, hj), Nat.is_lt(p, 64n), {==})
+
+# LAW G4.13: High TPC half g4_nat(1, j) for j < 64 always stays inside 0..128.
+# promise: g4_nat for half 1 and any lane j < 64 stays strictly below 128
+# catches: g4_nat adds 2n instead of 1n or omits - 64n offset on the high half
+law g4_nat_in_block_hi:
+  for +j: Nat
+  for hj: {Nat.is_lt(j, 64n) == True{} : Bool}
+  {Nat.is_lt(g4_nat(1n, j), 128n) == True{} : Bool}
+
+def g4_nat_in_block_hi(j, hj):
+  +p = Nat.add(Nat.mul(2n, j), 1n)
+  g4_nat_if_lt_128(p, g4_p_lt_128(1n, j, {==}, hj), Nat.is_lt(p, 64n), {==})
+
+def g4_lane_nat_if_id(+p: Nat, hp: {Nat.is_lt(p, 128n) == True{} : Bool}, b: Bool, eb: {b == Nat.is_lt(p, 64n) : Bool}) -> {g4_lane(g4_nat_if(p, b)) == p : Nat}:
+  match b:
+    case True{}:
+      +v = Nat.mul(2n, p)
+      +hv = g4_nat_lo_lt_128(p, Equal.sym(Bool, True{}, Nat.is_lt(p, 64n), eb))
+      %Equal.sym(Nat, Nat.mod(v, 128n), v, L.nat_mod_small(v, 127n, hv)) : {g4_lane_if(Nat.div(_, 2n), Nat.is_eq(Nat.mod(_, 2n), 0n)) == p : Nat}
+      %L.nat_mul_comm(p, 2n) : {g4_lane_if(Nat.div(_, 2n), Nat.is_eq(Nat.mod(_, 2n), 0n)) == p : Nat}
+      %Equal.sym(Nat, Nat.mod(Nat.mul(p, 2n), 2n), 0n, L.nat_mod_mul(p, 1n)) : {g4_lane_if(Nat.div(Nat.mul(p, 2n), 2n), Nat.is_eq(_, 0n)) == p : Nat}
+      L.nat_div_mul(p, 1n)
+    case False{}:
+      +r = Nat.sub(p, 64n)
+      +v = Nat.add(Nat.mul(2n, r), 1n)
+      +hv = g4_nat_hi_lt_128(p, hp)
+      +hge = L.nat_not_lt_imp_le(p, 64n, Equal.sym(Bool, False{}, Nat.is_lt(p, 64n), eb))
+      %Equal.sym(Nat, Nat.mod(v, 128n), v, L.nat_mod_small(v, 127n, hv)) : {g4_lane_if(Nat.div(_, 2n), Nat.is_eq(Nat.mod(_, 2n), 0n)) == p : Nat}
+      %L.nat_mul_comm(r, 2n) : {g4_lane_if(Nat.div(Nat.add(_, 1n), 2n), Nat.is_eq(Nat.mod(Nat.add(_, 1n), 2n), 0n)) == p : Nat}
+      %Equal.sym(Nat, Nat.mod(Nat.add(Nat.mul(r, 2n), 1n), 2n), 1n, L.nat_mod_split(r, 1n, 1n, {==})) : {g4_lane_if(Nat.div(Nat.add(Nat.mul(r, 2n), 1n), 2n), Nat.is_eq(_, 0n)) == p : Nat}
+      %Equal.sym(Nat, Nat.div(Nat.add(Nat.mul(r, 2n), 1n), 2n), r, L.nat_div_split(r, 1n, 1n, {==})) : {Nat.add(64n, _) == p : Nat}
+      %L.nat_add_comm(r, 64n) : {_ == p : Nat}
+      L.nat_sub_add_cancel(p, 64n, hge)
+
+# LAW G4.14: Deinterleaving g4_nat(0, j) recovers channel 2*j identically.
+# promise: g4_lane(g4_nat(0, j)) equals 2*j for every lane j < 64
+# catches: g4_nat swaps even and odd halves or shifts channel indices
+law g4_lane_nat_roundtrip_lo:
+  for +j: Nat
+  for hj: {Nat.is_lt(j, 64n) == True{} : Bool}
+  {g4_lane(g4_nat(0n, j)) == Nat.mul(2n, j) : Nat}
+
+def g4_lane_nat_roundtrip_lo(j, hj):
+  +p = Nat.add(Nat.mul(2n, j), 0n)
+  %L.nat_add_zero_r(Nat.mul(2n, j)) : {g4_lane(g4_nat_if(p, Nat.is_lt(p, 64n))) == _ : Nat}
+  g4_lane_nat_if_id(p, g4_p_lt_128(0n, j, {==}, hj), Nat.is_lt(p, 64n), {==})
+
+# LAW G4.15: Deinterleaving g4_nat(1, j) recovers channel 2*j + 1 identically.
+# promise: g4_lane(g4_nat(1, j)) equals 2*j + 1 for every lane j < 64
+# catches: g4_nat drops +h or omits +1n on odd channels
+law g4_lane_nat_roundtrip_hi:
+  for +j: Nat
+  for hj: {Nat.is_lt(j, 64n) == True{} : Bool}
+  {g4_lane(g4_nat(1n, j)) == Nat.add(Nat.mul(2n, j), 1n) : Nat}
+
+def g4_lane_nat_roundtrip_hi(j, hj):
+  +p = Nat.add(Nat.mul(2n, j), 1n)
+  g4_lane_nat_if_id(p, g4_p_lt_128(1n, j, {==}, hj), Nat.is_lt(p, 64n), {==})

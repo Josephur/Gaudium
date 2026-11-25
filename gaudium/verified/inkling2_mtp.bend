@@ -141,3 +141,70 @@ def mtp_frnn_row_in_pass(r, n):
   %Equal.sym(Nat, Nat.sub(n, 0n), n, L.nat_sub_zero_r(n)) : {Nat.is_lt(Nat.min(r, _), 1n+n) == True{} : Bool}
   %Equal.sym(Bool, Nat.is_lt(Nat.min(r, n), 1n+n), Nat.is_le(Nat.min(r, n), n), L.nat_lt_succ_eq_le(Nat.min(r, n), n)) : {_ == True{} : Bool}
   L.nat_min_le_r(r, n)
+
+def im_not_le_imp_lt(+a: Nat, +b: Nat, h: {Nat.is_le(a, b) == False{} : Bool}) -> {Nat.is_lt(b, a) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      L.bool_absurd_tf({Nat.is_lt(0n, 0n) == True{} : Bool}, h)
+    case 0n 1n+bp:
+      L.bool_absurd_tf({Nat.is_lt(1n+bp, 0n) == True{} : Bool}, h)
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      im_not_le_imp_lt(ap, bp, h)
+
+def im_succ_le_inner(+b: Nat, +a: Nat, h: {Nat.is_lt(b, a) == True{} : Bool}) -> {Nat.is_le(Nat.add(b, 1n), a) == True{} : Bool}:
+  match b a:
+    case 0n 0n:
+      L.bool_absurd({Nat.is_le(1n, 0n) == True{} : Bool}, h)
+    case 0n 1n+ap:
+      L.nat_le_zero(ap)
+    case 1n+bp 0n:
+      L.bool_absurd({Nat.is_le(Nat.add(1n+bp, 1n), 0n) == True{} : Bool}, h)
+    case 1n+bp 1n+ap:
+      im_succ_le_inner(bp, ap, h)
+
+def im_ceil_le_r(
+  +p: Nat,
+  +cm1: Nat,
+  +q: Nat,
+  eqq: {q == Nat.div(Nat.add(p, cm1), 1n+cm1) : Nat},
+  hadd1: {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+cm1), 1n), cm1), Nat.add(p, cm1)) == True{} : Bool}
+) -> {Nat.is_le(Nat.add(Nat.mul(q, 1n+cm1), 1n+cm1), Nat.add(Nat.mul(q, 1n+cm1), Nat.mod(Nat.add(p, cm1), 1n+cm1))) == True{} : Bool}:
+  %L.nat_add_assoc(Nat.mul(q, 1n+cm1), 1n, cm1) : {Nat.is_le(_, Nat.add(Nat.mul(q, 1n+cm1), Nat.mod(Nat.add(p, cm1), 1n+cm1))) == True{} : Bool}
+  %Equal.sym(Nat, q, Nat.div(Nat.add(p, cm1), 1n+cm1), eqq) : {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+cm1), 1n), cm1), Nat.add(Nat.mul(_, 1n+cm1), Nat.mod(Nat.add(p, cm1), 1n+cm1))) == True{} : Bool}
+  %Equal.sym(Nat, Nat.add(Nat.mul(Nat.div(Nat.add(p, cm1), 1n+cm1), 1n+cm1), Nat.mod(Nat.add(p, cm1), 1n+cm1)), Nat.add(p, cm1), L.nat_div_mod_r(Nat.add(p, cm1), cm1)) : {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+cm1), 1n), cm1), _) == True{} : Bool}
+  hadd1
+
+def im_ceil_le_aux(
+  +p: Nat,
+  +cm1: Nat,
+  +q: Nat,
+  b: Bool,
+  eb: {b == Nat.is_le(p, Nat.mul(q, 1n+cm1)) : Bool},
+  eqq: {q == Nat.div(Nat.add(p, cm1), 1n+cm1) : Nat}
+) -> {Nat.is_le(p, Nat.mul(q, 1n+cm1)) == True{} : Bool}:
+  match b:
+    case True{}:
+      Equal.sym(Bool, True{}, Nat.is_le(p, Nat.mul(q, 1n+cm1)), eb)
+    case False{}:
+      +x = Nat.mul(q, 1n+cm1)
+      +hlt = im_not_le_imp_lt(p, x, Equal.sym(Bool, False{}, Nat.is_le(p, x), eb))
+      +hsle = im_succ_le_inner(x, p, hlt)
+      +hadd1 = L.nat_add_le_mono(Nat.add(x, 1n), p, cm1, cm1, hsle, L.nat_le_refl(cm1))
+      +hle_bad = im_ceil_le_r(p, cm1, q, eqq, hadd1)
+      +hlt_bad = L.nat_add_lt_l(x, Nat.mod(Nat.add(p, cm1), 1n+cm1), 1n+cm1, L.nat_mod_lt(Nat.add(p, cm1), cm1))
+      Empty.absurd({Nat.is_le(p, x) == True{} : Bool}, L.nat_lt_not_le(Nat.add(x, Nat.mod(Nat.add(p, cm1), 1n+cm1)), Nat.add(x, 1n+cm1), hlt_bad, hle_bad))
+
+# promise: chunk count multiplied by chunk size always covers every position before anchor p
+# catches: mtp_ctx_chunks omits the Nat.sub(chunk, 1n) ceiling term
+law mtp_ctx_chunks_covers_prompt:
+  for +p: Nat
+  for +cm1: Nat
+  {Nat.is_le(p, Nat.mul(mtp_ctx_chunks(p, 1n+cm1), 1n+cm1)) == True{} : Bool}
+
+def mtp_ctx_chunks_covers_prompt(p, cm1):
+  %Equal.sym(Nat, Nat.sub(cm1, 0n), cm1, L.nat_sub_zero_r(cm1)) : {Nat.is_le(p, Nat.mul(Nat.max(1n, Nat.div(Nat.add(p, _), 1n+cm1)), 1n+cm1)) == True{} : Bool}
+  +q = Nat.div(Nat.add(p, cm1), 1n+cm1)
+  L.nat_le_trans(p, Nat.mul(q, 1n+cm1), Nat.mul(Nat.max(1n, q), 1n+cm1), im_ceil_le_aux(p, cm1, q, Nat.is_le(p, Nat.mul(q, 1n+cm1)), {==}, {==}), L.nat_mul_le_mono_r(q, Nat.max(1n, q), 1n+cm1, L.nat_max_ge_r(1n, q)))
+

@@ -1282,3 +1282,63 @@ def kv_batches_apart(c1, g1, c2, g2, n, h, h1, h2):
     kc_idx_tri(c1, g1, c2, g2, n, h1, h2),
     {==},
     {==})
+
+def kc_eq_add_succ_false(+row: Nat, +d: Nat) -> {Nat.is_eq(Nat.add(row, 1n+d), row) == False{} : Bool}:
+  match row:
+    case 0n: {==}
+    case 1n+rp:
+      kc_eq_add_succ_false(rp, d)
+
+# promise: FP8 attention shape validation rejects any head_dim strictly larger than row
+# catches: kv8_shape_ok checks head_dim >= row instead of equality
+law kv8_shape_rejects_larger_head_dim:
+  for +row: Nat
+  for +d: Nat
+  for nkv: Nat
+  for slots: Nat
+  {kv8_shape_ok(Nat.add(row, 1n+d), nkv, row, slots) == False{} : Bool}
+
+def kv8_shape_rejects_larger_head_dim(row, d, nkv, slots):
+  %Equal.sym(Bool, Nat.is_eq(Nat.add(row, 1n+d), row), False{}, kc_eq_add_succ_false(row, d)) : {Bool.and(_, Bool.and(Nat.is_gt(nkv, 0n), Nat.is_le(nkv, slots))) == False{} : Bool}
+  {==}
+
+def kc_eq_succ_add_false(+hd: Nat, +d: Nat) -> {Nat.is_eq(hd, Nat.add(hd, 1n+d)) == False{} : Bool}:
+  match hd:
+    case 0n: {==}
+    case 1n+hp:
+      kc_eq_succ_add_false(hp, d)
+
+# promise: FP8 attention shape validation rejects any head_dim strictly smaller than row
+# catches: kv8_shape_ok checks head_dim <= row instead of equality
+law kv8_shape_rejects_smaller_head_dim:
+  for +hd: Nat
+  for +d: Nat
+  for nkv: Nat
+  for slots: Nat
+  {kv8_shape_ok(hd, nkv, Nat.add(hd, 1n+d), slots) == False{} : Bool}
+
+def kv8_shape_rejects_smaller_head_dim(hd, d, nkv, slots):
+  %Equal.sym(Bool, Nat.is_eq(hd, Nat.add(hd, 1n+d)), False{}, kc_eq_succ_add_false(hd, d)) : {Bool.and(_, Bool.and(Nat.is_gt(nkv, 0n), Nat.is_le(nkv, slots))) == False{} : Bool}
+  {==}
+
+# promise: BF16 K/V caches are always accepted by every engine regardless of FP8 attention support
+# catches: kv_setting_taken rejects BF16 when fp8_attention is False
+law kv_bf16_always_taken:
+  for +fp8_att: Bool
+  {kv_setting_taken(fp8_att, KvBf16{}) == True{} : Bool}
+
+def kv_bf16_always_taken(fp8_att):
+  match fp8_att:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: kv_vperm_rows always returns a positive multiple of 128 for every KV cache dtype
+# catches: kv_vperm_rows returns 0n or a non-multiple of 128
+law kv_vperm_rows_positive:
+  for +d: KvDtype
+  {Bool.and(Nat.is_gt(kv_vperm_rows(d), 0n), Nat.is_eq(Nat.mod(kv_vperm_rows(d), 128n), 0n)) == True{} : Bool}
+
+def kv_vperm_rows_positive(d):
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
