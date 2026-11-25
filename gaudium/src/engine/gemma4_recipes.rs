@@ -31,11 +31,20 @@ pub(super) enum PfRecipe {
     Vis(VisRecipe, u64),
 }
 
+/// The key a load keeps a layer recipe under: a sliding layer reads no global chunks, so one
+/// recipe serves every chunk count.
+pub(super) fn layer_key(kind: G4LayerKind, t: u64, nch: u64) -> (G4LayerKind, u64, u64) {
+    (kind, t, if kind.is_global() { nch } else { 0 })
+}
+
 impl PfRecipe {
-    /// The key a load keeps the recipe under: a sliding layer reads no global chunks.
+    /// The key a load keeps the recipe under (`layer_key` for a layer).
     fn key(self) -> Self {
         match self {
-            Self::Layer(kind, t, _) if !kind.is_global() => Self::Layer(kind, t, 0),
+            Self::Layer(kind, t, nch) => {
+                let (k, t, n) = layer_key(kind, t, nch);
+                Self::Layer(k, t, n)
+            }
             r => r,
         }
     }

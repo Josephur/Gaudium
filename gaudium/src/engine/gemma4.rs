@@ -1820,8 +1820,7 @@ impl Gemma4Engine {
                         .map_err(|e| format!("compile prefill layer {kind:?}: {e}"))?;
                     note(&r);
                     max_ws = max_ws.max(r.ws_size);
-                    let key = (kind, prefill_tile, if kind.is_global() { nch } else { 0 });
-                    pre_layers.push((key, r));
+                    pre_layers.push((recipes::layer_key(kind, prefill_tile, nch), r));
                 }
             }
         }
@@ -2420,7 +2419,7 @@ impl Gemma4Engine {
     }
 
     fn ensure_layer(&mut self, kind: G4LayerKind, t: u64, nch: u64) -> Result<(), String> {
-        let key = (kind, t, if kind.is_global() { nch } else { 0 });
+        let key = recipes::layer_key(kind, t, nch);
         if !self.layer_recipes.contains_key(&key) {
             let gb = self.pf_graph(recipes::PfRecipe::Layer(kind, t, nch))?;
             let r = self.compile(&gb, &format!("prefill layer {kind:?} T={t} C={nch}"))?;
@@ -2445,8 +2444,9 @@ impl Gemma4Engine {
         let d = &self.dims;
         let kind = d.kind(l);
         let glob = kind.is_global();
-        let nkey = if glob { nch } else { 0 };
-        let recipe = &self.layer_recipes[&(kind, t, nkey)];
+        let key = recipes::layer_key(kind, t, nch);
+        let nkey = key.2;
+        let recipe = &self.layer_recipes[&key];
         let fresh = !matches!(&self.pf_prepared[l], Some((pt, pn, _)) if *pt == t && *pn == nkey);
         if fresh {
             let mut pool = self.pf_scratch.clone();
