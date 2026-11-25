@@ -52,12 +52,57 @@
       ]
     },
     {
+      "name": "gemma4-e2b-bf16",
+      "model": "gemma-4-E2B-it",
+      "args": ["--precision", "bf16"],
+      "methods": [
+        {"name": "k0", "args": []},
+        {"name": "assistant", "args": ["--spec", "assistant", "--draft-model", "{models}/gemma-4-E2B-it-assistant", "--draft-k", "4"]}
+      ]
+    },
+    {
+      "name": "gemma4-e4b-bf16",
+      "model": "gemma-4-E4B-it",
+      "args": ["--precision", "bf16"],
+      "methods": [
+        {"name": "k0", "args": []},
+        {"name": "assistant", "args": ["--spec", "assistant", "--draft-model", "{models}/gemma-4-E4B-it-assistant", "--draft-k", "4"]}
+      ]
+    },
+    {
       "name": "gemma4-12b-bf16",
       "model": "gemma-4-12B-it",
       "args": ["--precision", "bf16"],
       "methods": [
         {"name": "k0", "args": []},
         {"name": "assistant", "args": ["--spec", "assistant", "--draft-model", "{models}/gemma-4-12B-it-assistant", "--draft-k", "4"]}
+      ]
+    },
+    {
+      "name": "gemma4-31b-bf16",
+      "model": "gemma-4-31B-it",
+      "args": ["--precision", "bf16"],
+      "methods": [
+        {"name": "k0", "args": []},
+        {"name": "assistant", "args": ["--spec", "assistant", "--draft-model", "{models}/gemma-4-31B-it-assistant", "--draft-k", "4"]}
+      ]
+    },
+    {
+      "name": "gemma4-12b-fp8",
+      "model": "gemma-4-12B-it",
+      "args": ["--precision", "fp8", "--fp8-act", "{models}/gemma-4-12B-it-gaudium-pc/act_scales_lc.txt", "--fp8-cache", "{models}/gemma-4-12B-it-gaudium-pc/cache"],
+      "methods": [
+        {"name": "k0", "args": []},
+        {"name": "assistant", "args": ["--spec", "assistant", "--draft-model", "{models}/gemma-4-12B-it-assistant", "--draft-k", "4"]}
+      ]
+    },
+    {
+      "name": "gemma4-31b-fp8",
+      "model": "gemma-4-31B-it",
+      "args": ["--precision", "fp8", "--fp8-act", "{models}/gemma-4-31B-it-gaudium-pc/act_scales_lc.txt", "--fp8-cache", "{models}/gemma-4-31B-it-gaudium-pc/cache"],
+      "methods": [
+        {"name": "k0", "args": []},
+        {"name": "assistant", "args": ["--spec", "assistant", "--draft-model", "{models}/gemma-4-31B-it-assistant", "--draft-k", "4"]}
       ]
     }
   ]

@@ -20,6 +20,9 @@
 
 use std::time::Instant;
 
+use super::recipes::{
+    embed_recipe, layer_key, layer_plain, layer_recipes, pf_graph, tile_chunks, tile_has_image, PfRecipe,
+};
 use super::vision::graphs::build_embed_vis_graph;
 use super::*;
 use crate::verified::{
@@ -28,7 +31,7 @@ use crate::verified::{
 };
 
 /// The vision recipes of the decoder, by kind and tile rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum VisRecipe {
     Embed,
     SlidingExt,
@@ -225,18 +228,18 @@ impl Gemma4Engine {
         }
     }
 
-    fn ensure_vis(&mut self, kind: VisRecipe, t: u64) -> Result<(), String> {
+    pub(super) fn ensure_vis(&mut self, kind: VisRecipe, t: u64) -> Result<(), String> {
         if self.vis_recipes.contains_key(&(kind, t)) {
             return Ok(());
         }
         let v = self.vision.as_ref().ok_or("no image input")?;
-        let mut elf = self.elf_hashes.clone();
-        elf.extend_from_slice(v.elf());
-        let gb = match kind {
-            VisRecipe::Embed => build_embed_vis_graph(&self.dims, v.geo.feat_cols, t, &elf),
-            VisRecipe::SlidingExt => build_sliding_vis_graph(&self.dims, t, self.max_ctx, false, &elf),
-            VisRecipe::SlidingKv => build_sliding_vis_graph(&self.dims, t, self.max_ctx, true, &elf),
-        };
+        let gb = pf_graph(
+            &self.dims,
+            self.max_ctx,
+            &self.elf_hashes,
+            Some((v.geo.feat_cols, v.elf())),
+            PfRecipe::Vis(kind, t),
+        )?;
         let r = self.compile(&gb, &format!("vision {kind:?} T={t}"))?;
         self.vis_recipes.insert((kind, t), r);
         Ok(())
@@ -282,13 +285,11 @@ impl Gemma4Engine {
     fn embed_tile(&mut self, ids: &[i32], fidx: &[i32], tl: Tile, b: &TileBufs) -> Result<f64, String> {
         let (p0, t) = (tl.pos as usize, tl.t as usize);
         let text_col = ikv_feat_row(false, 0) as i32;
-        let has_img = fidx[p0..p0 + t].iter().any(|&f| f != text_col);
+        // The verified choice of embedding recipe decides both what is staged and what runs.
+        let rec = embed_recipe(tile_has_image(fidx, tl), tl.t);
+        let image_embed = matches!(rec, PfRecipe::Vis(VisRecipe::Embed, _));
         let t_rec = Instant::now();
-        if has_img {
-            self.ensure_vis(VisRecipe::Embed, tl.t)?;
-        } else {
-            self.ensure_embed(tl.t)?;
-        }
+        self.ensure_pf(rec)?;
         let recipe_ms = t_rec.elapsed().as_secs_f64() * 1000.0;
         let pad = self.spec.gemma4.as_ref().map_or(0, |g| g.pad_id.max(0));
         {
@@ -311,7 +312,7 @@ impl Gemma4Engine {
         pool.insert("ids".into(), b.ids);
         pool.insert("x0".into(), b.x[0]);
         pool.insert("ple_out".into(), self.pf_ple);
-        if has_img {
+        if image_embed {
             let mut fb = Vec::with_capacity(t * 4);
             let mut kb = Vec::with_capacity(t * 2);
             let one = crate::fp8::f32_to_bf16_rne(1.0);
@@ -371,22 +372,16 @@ impl Gemma4Engine {
             }
             let t_rec = Instant::now();
             for &j in &unit {
-                let (t, nch) = (tiles[j].t, tiles[j].end().div_ceil(G4_CHUNK).clamp(1, self.max_chunks));
-                for &kind in &kinds {
-                    if !(two_way && kind == G4LayerKind::Sliding) {
-                        self.ensure_layer(kind, t, nch)?;
-                    }
-                }
-                if two_way {
-                    self.ensure_vis(VisRecipe::SlidingExt, t)?;
-                    self.ensure_vis(VisRecipe::SlidingKv, t)?;
+                let (t, nch) = (tiles[j].t, tile_chunks(tiles[j].end(), self.max_chunks));
+                for r in layer_recipes(&kinds, t, nch, two_way) {
+                    self.ensure_pf(r)?;
                 }
             }
             recipe_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
             if !two_way {
                 // a text tile (or a size whose image rows attend causally): the plain launches
                 let tl = tiles[i];
-                let nch = tl.end().div_ceil(G4_CHUNK).clamp(1, self.max_chunks);
+                let nch = tile_chunks(tl.end(), self.max_chunks);
                 for l in 0..n_layers {
                     self.launch_prefill_layer(l, tl.t, nch)?;
                 }
@@ -412,8 +407,10 @@ impl Gemma4Engine {
                     .map_err(|e| format!("upload block extensions: {e}"))?;
             }
             for l in 0..n_layers {
-                let glob = self.dims.is_global(l);
-                if !glob {
+                // the plain recipe, or the image recipes (`layer_plain`, as `layer_recipes` ensured)
+                let kind = self.dims.kind(l);
+                let plain = layer_plain(two_way, kind);
+                if !plain {
                     for (k, &j) in unit.iter().enumerate().skip(1) {
                         let b = self.unit_bufs(k);
                         let pool = self.layer_pool(l, b.x[l % 2], b.x[(l + 1) % 2], &b);
@@ -425,9 +422,9 @@ impl Gemma4Engine {
                     let tl = tiles[j];
                     let b = self.unit_bufs(k);
                     let pool = self.layer_pool(l, b.x[l % 2], b.x[(l + 1) % 2], &b);
-                    let r = if glob {
-                        let nch = tl.end().div_ceil(G4_CHUNK).clamp(1, self.max_chunks);
-                        &self.layer_recipes[&(G4LayerKind::Global, tl.t, nch)]
+                    let r = if plain {
+                        let nch = tile_chunks(tl.end(), self.max_chunks);
+                        &self.layer_recipes[&layer_key(kind, tl.t, nch)]
                     } else {
                         &self.vis_recipes[&(VisRecipe::SlidingExt, tl.t)]
                     };

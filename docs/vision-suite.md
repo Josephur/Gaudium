@@ -72,7 +72,16 @@ fails when its stream differs from its reference or its answer lacks the case's 
 A new family is one more entry of `models` in the suite file, a new drafter one more entry of a
 model's `methods`, with the options its `gaudium --generate` run takes. Nothing in the runner is
 specific to a model family. Once the rows of a pairing pass, its case of `vis_drafter_ok` may
-become `True{}`. The Gemma 4 12B rows (K=0 and its `-assistant` drafter) are in the suite file; that drafter's case is `True{}` on the strength of the same K=0 comparison made by hand on the card, ahead of a full suite run.
+become `True{}`. The suite file holds Gemma 4 rows for all four sizes (E2B, E4B, 12B and 31B
+with BF16 weights, 12B and 31B with FP8 weights and the activation tables beside the
+checkpoints), each with K=0 and the size's `-assistant` drafter; that drafter's case of
+`vis_drafter_ok` is `True{}` on the strength of these rows.
+
+`--build-cache` runs each selected row as a `--build-cache` process instead of a `--generate`
+one. For Gemma 4 that process compiles what a load compiles, the decode steps of every context
+bucket, the full-tile prefill of every chunk count, and what the row's requests launch: their
+last prefill tiles, their image tiles and units, and the image path at their images' sizes. The
+card run that follows then compiles nothing.
 
 ## How the drafters see an image
 

@@ -51,7 +51,7 @@ use crate::synapse::ffi::{SynDataType, SynapseApi};
 use crate::synapse::graph::{CompiledRecipe, GraphBuilder, PreparedLaunch, TensorId};
 use crate::synapse::ops::{as_param_bytes, u32_params, TransposeParams};
 use crate::synapse::recipe_cache::RecipeCache;
-use crate::verified::{align_up, g4v_arena_step, g4v_part_bytes, HbmCat};
+use crate::verified::{align_up, g4v_arena_step, g4v_part_bytes, g4v_take_bytes, HbmCat};
 
 #[path = "gemma4_spec.rs"]
 pub mod spec;
@@ -63,6 +63,10 @@ pub mod vision;
 // blocks of the sliding layers.
 #[path = "gemma4_units.rs"]
 mod units;
+// The prefill recipes a request launches (picked here for the prefill and for `--build-cache`),
+// and `--build-cache`.
+#[path = "gemma4_recipes.rs"]
+mod recipes;
 
 /// Rows of one chunk of a global layer's K / V cache (the chunked softmax kernel's `C`).
 pub const G4_CHUNK: u64 = 4096;
@@ -1226,12 +1230,12 @@ fn is_prefill_special(name: &str) -> bool {
     )
 }
 
-/// One buffer of `bytes` out of a sealed arena: it starts on the arena's step and takes at least
-/// one step (`g4v_arena_step`), which is what the plan counts for it (`g4v_part_bytes`).
+/// One buffer of `bytes` out of a sealed arena: it starts on the arena's step (`g4v_arena_step`)
+/// and takes what `g4v_take_bytes` says (at least one step), which the plan's `g4v_part_bytes`
+/// holds.
 fn arena_take(arena: &mut HbmArena, bytes: u64) -> Result<u64, String> {
-    let step = g4v_arena_step();
     let (addr, _off) = arena
-        .suballoc(bytes.max(step), step)
+        .suballoc(g4v_take_bytes(bytes), g4v_arena_step())
         .map_err(|e| format!("arena suballoc: {e}"))?;
     Ok(addr)
 }
@@ -1527,9 +1531,34 @@ unsafe impl Send for Gemma4Engine {}
 impl Gemma4Engine {
     /// Opens the card, validates the model, plans and seals device memory, uploads the weights.
     pub fn load(cfg: &EngineConfig) -> Result<Self, String> {
+        Self::load_or_plan(cfg, None)?
+            .ok_or_else(|| "internal error: the load produced no engine".to_string())
+    }
+
+    /// Fills the recipe cache for `cfg` and prints its device memory plan WITHOUT opening the
+    /// card (graph compilation needs only an initialized SynapseAI): every recipe a load
+    /// compiles, and the ones it compiles on first use (`recipes::build_further`), for the
+    /// configuration and for `requests`. Safe to run while another process owns the card.
+    pub fn build_cache(cfg: &EngineConfig, requests: &[crate::engine::BuildRequest]) -> Result<(), String> {
+        if cfg.no_cache {
+            return Err("--build-cache writes the recipe cache: drop --no-cache".into());
+        }
+        Self::load_or_plan(cfg, Some(requests)).map(|_| ())
+    }
+
+    /// `build`: the requests of a `--build-cache` run; stop after the recipes and the memory plan
+    /// (`Ok(None)`), with no device.
+    fn load_or_plan(
+        cfg: &EngineConfig,
+        build: Option<&[crate::engine::BuildRequest]>,
+    ) -> Result<Option<Self>, String> {
         let t_start = Instant::now();
-        let live =
-            LiveReporter::from_env("gaudium-rust", env!("CARGO_PKG_VERSION"), "engine", true);
+        let plan_only = build.is_some();
+        let live = if plan_only {
+            LiveReporter::disabled()
+        } else {
+            LiveReporter::from_env("gaudium-rust", env!("CARGO_PKG_VERSION"), "engine", true)
+        };
         let model_name = cfg
             .model_dir
             .file_name()
@@ -1622,11 +1651,31 @@ impl Gemma4Engine {
         let api =
             Arc::new(SynapseApi::load_default().map_err(|e| format!("load libSynapse.so: {e}"))?);
         let driver_version = api.driver_version().unwrap_or_else(|_| "unknown".into());
-        let mut dev = HpuDevice::open_gaudi2(Arc::clone(&api))
-            .map_err(|e| format!("open Gaudi 2 device: {e}"))?;
-        let (free_hbm, total_hbm) = dev
-            .memory_info()
-            .map_err(|e| format!("query HBM info: {e}"))?;
+        // `--build-cache`: SynapseAI without a device. Declared before every recipe: recipes are
+        // dropped before the session.
+        let _compile_session = if plan_only {
+            Some(
+                crate::synapse::device::CompileSession::open(Arc::clone(&api))
+                    .map_err(|e| format!("initialize SynapseAI (no device): {e}"))?,
+            )
+        } else {
+            None
+        };
+        let dev_opt = if plan_only {
+            eprintln!("[gaudium] build-cache: SynapseAI initialized without a device; the card is not opened");
+            None
+        } else {
+            Some(
+                HpuDevice::open_gaudi2(Arc::clone(&api))
+                    .map_err(|e| format!("open Gaudi 2 device: {e}"))?,
+            )
+        };
+        let (free_hbm, total_hbm) = match &dev_opt {
+            Some(dev) => dev
+                .memory_info()
+                .map_err(|e| format!("query HBM info: {e}"))?,
+            None => (0, 0),
+        };
 
         let cache = if cfg.no_cache {
             RecipeCache::disabled()
@@ -1669,8 +1718,14 @@ impl Gemma4Engine {
             };
             let p = G4Plan::build(&d, max_ctx, max_chunks, tile, spec_cfg.as_ref(), vl.as_ref());
             let total = p.total(MIN_SHARED_WORKSPACE_BYTES);
-            match dev.check_plan_fits(total, HBM_HEADROOM_BYTES) {
-                Ok(_) => break (d, p, vl),
+            // `--build-cache`: the widest tile (a load that finds it does not fit settles on a
+            // narrower one and compiles that width's recipes on the card)
+            let fits = match &dev_opt {
+                Some(dev) => dev.check_plan_fits(total, HBM_HEADROOM_BYTES).map(|_| ()),
+                None => Ok(()),
+            };
+            match fits {
+                Ok(()) => break (d, p, vl),
                 Err(e) if tile <= G4_MIN_PREFILL_TILE => {
                     return Err(format!(
                         "HBM plan does not fit at max_ctx={max_ctx} even with a {tile}-row prefill tile: planned {:.2} GiB (weights {:.2}, global KV {:.2}, rings {:.2}, activations {:.2}, workspace {:.2}) of {:.2} GiB free: {e}",
@@ -1765,8 +1820,7 @@ impl Gemma4Engine {
                         .map_err(|e| format!("compile prefill layer {kind:?}: {e}"))?;
                     note(&r);
                     max_ws = max_ws.max(r.ws_size);
-                    let key = (kind, prefill_tile, if kind.is_global() { nch } else { 0 });
-                    pre_layers.push((key, r));
+                    pre_layers.push((recipes::layer_key(kind, prefill_tile, nch), r));
                 }
             }
         }
@@ -1849,6 +1903,40 @@ impl Gemma4Engine {
         let ring_bytes = plan.ring_bytes();
         let act_bytes = plan.act_bytes();
         let planned_total = plan.total(ws_bytes);
+        let Some(mut dev) = dev_opt else {
+            // `--build-cache`: the plan, and the recipes a load compiles on first use
+            eprintln!(
+                "[gaudium] build-cache: HBM plan {:.2} GiB with a {prefill_tile}-row prefill tile (weights {:.2}, global KV {:.2}, rings {:.2}, activations {:.2}, workspace {:.2}); the card is not opened, so its free memory is unknown",
+                gib(planned_total),
+                gib(weights_bytes),
+                gib(kv_bytes),
+                gib(ring_bytes),
+                gib(act_bytes),
+                gib(ws_bytes),
+            );
+            recipes::build_further(
+                &recipes::BuildCtx {
+                    api: &api,
+                    cache: &cache,
+                    driver: &driver_version,
+                    dims: &dims,
+                    max_ctx,
+                    max_chunks,
+                    tile: prefill_tile,
+                    elf: &elf_hashes,
+                    vision: vision.as_ref().zip(vis_load.as_ref()),
+                    specrt: specrt.as_ref(),
+                    ws_bytes,
+                    verbose: cfg.verbose,
+                },
+                build.unwrap_or(&[]),
+            )?;
+            eprintln!(
+                "[gaudium] build-cache: done in {:.1}s",
+                t_start.elapsed().as_secs_f64()
+            );
+            return Ok(None);
+        };
         dev.check_plan_fits(planned_total, HBM_HEADROOM_BYTES)
             .map_err(|e| format!("HBM plan check failed: {e}"))?;
         if cfg.verbose {
@@ -2147,7 +2235,7 @@ impl Gemma4Engine {
         engine.step_recipes.insert(1, (step1, prepared));
         spec::finish(&mut engine)?;
         engine.live.set_phase("idle", "ready");
-        Ok(engine)
+        Ok(Some(engine))
     }
 
     pub fn spec(&self) -> &ModelSpec {
@@ -2297,9 +2385,24 @@ impl Gemma4Engine {
         Ok(())
     }
 
+    /// Compiles (or loads) a prefill recipe on first use.
+    fn ensure_pf(&mut self, r: recipes::PfRecipe) -> Result<(), String> {
+        use recipes::PfRecipe;
+        match r {
+            PfRecipe::Embed(t) => self.ensure_embed(t),
+            PfRecipe::Final(t) => self.ensure_final(t),
+            PfRecipe::Layer(kind, t, nch) => self.ensure_layer(kind, t, nch),
+            PfRecipe::Vis(kind, t) => self.ensure_vis(kind, t),
+        }
+    }
+
+    fn pf_graph(&self, r: recipes::PfRecipe) -> Result<GraphBuilder, String> {
+        recipes::pf_graph(&self.dims, self.max_ctx, &self.elf_hashes, None, r)
+    }
+
     fn ensure_embed(&mut self, t: u64) -> Result<(), String> {
         if !self.embed_recipes.contains_key(&t) {
-            let gb = build_embed_graph(&self.dims, t, &self.elf_hashes);
+            let gb = self.pf_graph(recipes::PfRecipe::Embed(t))?;
             let r = self.compile(&gb, &format!("embed T={t}"))?;
             self.embed_recipes.insert(t, r);
         }
@@ -2308,7 +2411,7 @@ impl Gemma4Engine {
 
     fn ensure_final(&mut self, t: u64) -> Result<(), String> {
         if !self.final_recipes.contains_key(&t) {
-            let gb = build_final_graph(&self.dims, t, &self.elf_hashes);
+            let gb = self.pf_graph(recipes::PfRecipe::Final(t))?;
             let r = self.compile(&gb, &format!("final norm T={t}"))?;
             self.final_recipes.insert(t, r);
         }
@@ -2316,9 +2419,9 @@ impl Gemma4Engine {
     }
 
     fn ensure_layer(&mut self, kind: G4LayerKind, t: u64, nch: u64) -> Result<(), String> {
-        let key = (kind, t, if kind.is_global() { nch } else { 0 });
+        let key = recipes::layer_key(kind, t, nch);
         if !self.layer_recipes.contains_key(&key) {
-            let gb = build_layer_graph(&self.dims, kind, t, self.max_ctx, nch, &self.elf_hashes);
+            let gb = self.pf_graph(recipes::PfRecipe::Layer(kind, t, nch))?;
             let r = self.compile(&gb, &format!("prefill layer {kind:?} T={t} C={nch}"))?;
             self.layer_recipes.insert(key, r);
         }
@@ -2341,8 +2444,9 @@ impl Gemma4Engine {
         let d = &self.dims;
         let kind = d.kind(l);
         let glob = kind.is_global();
-        let nkey = if glob { nch } else { 0 };
-        let recipe = &self.layer_recipes[&(kind, t, nkey)];
+        let key = recipes::layer_key(kind, t, nch);
+        let nkey = key.2;
+        let recipe = &self.layer_recipes[&key];
         let fresh = !matches!(&self.pf_prepared[l], Some((pt, pn, _)) if *pt == t && *pn == nkey);
         if fresh {
             let mut pool = self.pf_scratch.clone();
@@ -2570,15 +2674,16 @@ impl Gemma4Engine {
             if is_cancelled() {
                 return Ok(cancelled_report(t_prefill.elapsed().as_secs_f64() * 1000.0));
             }
+            // (the tiles of `units::split_tiles`, which `--build-cache` plans with)
             let t = (prompt_ids.len() - pos).min(self.prefill_tile as usize) as u64;
             let end_pos = pos as u64 + t;
-            let nch = end_pos.div_ceil(G4_CHUNK).clamp(1, self.max_chunks);
+            let nch = recipes::tile_chunks(end_pos, self.max_chunks);
             last_tile = t;
 
             let t_rec = Instant::now();
-            self.ensure_embed(t)?;
-            for &kind in &kinds {
-                self.ensure_layer(kind, t, nch)?;
+            self.ensure_pf(recipes::embed_recipe(false, t))?;
+            for r in recipes::layer_recipes(&kinds, t, nch, false) {
+                self.ensure_pf(r)?;
             }
             recipe_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
 

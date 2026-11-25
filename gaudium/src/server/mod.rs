@@ -1480,17 +1480,14 @@ pub fn build_cache(cfg: &ServerConfig, only: &[String]) -> Result<(), String> {
             .and_then(|t| t.spec())
             .map(|s| s.family)
             .map_err(|e| format!("model description of '{}': {e}", entry.id))?;
-        if !matches!(
-            family,
-            ModelFamily::Qwen3 | ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
-        ) {
+        if !crate::engine::has_offcard_build(family) {
             eprintln!(
                 "[server] build-cache: model '{}' skipped: no off-card build for family {family:?} (its recipes compile on its first load)",
                 entry.id
             );
             continue;
         }
-        if let Err(e) = crate::engine::build_cache(&qcfg) {
+        if let Err(e) = crate::engine::build_cache(&qcfg, &[]) {
             eprintln!("[server] build-cache: model '{}' FAILED: {e}", entry.id);
             failed.push(entry.id.clone());
         }

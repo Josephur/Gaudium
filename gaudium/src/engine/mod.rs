@@ -512,14 +512,37 @@ pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
     }
 }
 
+/// One request of a `--build-cache` run (`--generate` options): its prompt, with the image rows
+/// laid out, and its images. An engine whose recipes depend on a request compiles that request's
+/// recipes too.
+pub struct BuildRequest<'a> {
+    pub prompt: &'a [i32],
+    pub images: &'a [crate::vision::PreparedImage],
+}
+
+/// Whether `family` has an off-card build (`build_cache`).
+pub fn has_offcard_build(family: ModelFamily) -> bool {
+    matches!(
+        family,
+        ModelFamily::Qwen3 | ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe | ModelFamily::Gemma4
+    )
+}
+
 /// Fills the recipe cache for `cfg` and prints its device memory plan without opening the card
-/// (`qwen3::Qwen3Engine::build_cache`). Available for the Qwen3 / Qwen3.5 / Qwen3.8 engine.
-pub fn build_cache(cfg: &EngineConfig) -> Result<(), String> {
+/// (`qwen3::Qwen3Engine::build_cache`, `gemma4::Gemma4Engine::build_cache`). Available for the
+/// Qwen3 / Qwen3.5 / Qwen3.8 engine and the Gemma 4 engine; the Gemma 4 build also compiles
+/// the recipes of `requests` (the Qwen build covers every last tile of the first chunk itself).
+pub fn build_cache(cfg: &EngineConfig, requests: &[BuildRequest]) -> Result<(), String> {
     let spec = ModelSpec::from_config_file(cfg.model_dir.join("config.json"))
         .map_err(|e| format!("load config.json: {e}"))?;
     match spec.family {
         ModelFamily::Qwen3 | ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe => {
             qwen3::Qwen3Engine::build_cache(cfg)
+        }
+        ModelFamily::Gemma4 => {
+            // [kv8] these engines' graphs have no FP8 attention (as `load_engine`)
+            crate::core::kv_cache::check_setting_taken(false, cfg.kv_dtype, "Gemma 4")?;
+            gemma4::Gemma4Engine::build_cache(cfg, requests)
         }
         other => Err(format!(
             "--build-cache is not available for model family {other:?} yet"

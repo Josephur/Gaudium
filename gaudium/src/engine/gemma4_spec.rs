@@ -1410,6 +1410,73 @@ pub(super) fn prefill_tile_hook(eng: &mut Gemma4Engine, pos: u64, t: u64) -> Res
     res
 }
 
+/// `--build-cache`: compiles the drafter's recipes a decode launches at each chunk bucket of
+/// `buckets` (the last is the context's top bucket), and a block drafter's context recipes of the
+/// prefill tiles of `rows`. Each recipe goes to `note` and is dropped. The steps, `(t, kd)`:
+/// - a step verifies the drafts it was handed, `t - 1` of them: any count up to the widest width
+///   (a first block is narrowed by the request's budget, a step near the end of the context by
+///   its room);
+/// - it drafts one of the widths, or none (the verify-only step of a sampled decode);
+/// - near the end of the context, which only the top bucket reaches, it drafts as many as the
+///   room holds: any count up to the widest.
+///
+/// The first blocks draft any count up to the widest.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_cache_recipes(
+    rt: &G4SpecRt,
+    d: &G4Dims,
+    max_ctx: u64,
+    buckets: &[u64],
+    rows: &[u64],
+    api: &Arc<SynapseApi>,
+    cache: &RecipeCache,
+    driver_version: &str,
+    note: &mut impl FnMut(&CompiledRecipe),
+) -> Result<(), String> {
+    let ks = &rt.cfg.ks;
+    let kmax = ks.iter().copied().max().unwrap_or(0);
+    let compile = |gb: GraphBuilder, what: String| -> Result<CompiledRecipe, String> {
+        gb.compile(Arc::clone(api), cache, driver_version)
+            .map_err(|e| format!("compile {what}: {e}"))
+    };
+    let top = buckets.last().copied();
+    for &nch in buckets {
+        for (t, kd) in build_steps(ks, Some(nch) == top) {
+            note(&compile(
+                build_spec_step_graph(d, &rt.cfg, max_ctx, nch, t, kd),
+                format!("spec step T={t} D={kd} C={nch}"),
+            )?);
+        }
+        for kd in 1..=kmax {
+            note(&compile(
+                build_block0_graph(d, &rt.cfg, max_ctx, nch, kd),
+                format!("first block D={kd} C={nch}"),
+            )?);
+        }
+    }
+    if let G4Drafter::DFlash(c) = &rt.cfg.drafter {
+        for &t in rows {
+            note(&compile(
+                dflash::build_ctx_graph(d, c, t, max_ctx, rt.cfg.df_ring(), &rt.cfg.elf_hashes),
+                format!("drafter context T={t}"),
+            )?);
+        }
+    }
+    Ok(())
+}
+
+/// The `(rows, drafts)` of the steps `build_cache_recipes` compiles at one chunk bucket (`top`:
+/// the context's top bucket): the verified `g4c_build_step` picks them. Its laws keep every
+/// pick within 1..=widest + 1 rows and 0..=widest drafts, so the candidates below hold all of
+/// them.
+fn build_steps(ks: &[u64], top: bool) -> Vec<(u64, u64)> {
+    let kmax = ks.iter().copied().max().unwrap_or(0);
+    (0..=kmax + 1)
+        .flat_map(|t| (0..=kmax).map(move |kd| (t, kd)))
+        .filter(|&(t, kd)| crate::verified::g4c_build_step(t, kd, kmax, ks.contains(&kd), top))
+        .collect()
+}
+
 /// Compiles (or loads) the step recipe `(t, kd, nch)` on first use.
 fn ensure_step(eng: &mut Gemma4Engine, t: u64, kd: u64, nch: u64) -> Result<(), String> {
     let mut rt = eng.specrt.take().expect("spec runtime");
@@ -1941,6 +2008,24 @@ pub(super) fn decode_sampled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_build_takes_every_step_a_decode_can_reach() {
+        // one width: every verify count up to the widest, the width or no drafts
+        let s = build_steps(&[4], false);
+        assert_eq!(s.len(), 10);
+        for t in 1..=5 {
+            assert!(s.contains(&(t, 4)) && s.contains(&(t, 0)), "{t}");
+        }
+        // at the top bucket also every narrower draft count (a step near the end of the context)
+        let s = build_steps(&[4], true);
+        assert!(s.contains(&(5, 2)) && s.contains(&(3, 1)));
+        assert_eq!(s.len(), 25);
+        // two widths
+        let s = build_steps(&[7, 3], false);
+        assert!(s.contains(&(8, 3)) && s.contains(&(4, 7)) && s.contains(&(1, 0)) && !s.contains(&(8, 5)));
+        assert!(build_steps(&[7, 3], true).contains(&(8, 5)));
+    }
 
     fn assist_json(
         hid: u64,

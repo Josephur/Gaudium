@@ -18,6 +18,7 @@ import nat_lemmas.bend as L
 import vision_budget.bend as VB
 import tensor_bounds.bend as TB
 import inkling2.bend as IK
+import gemma4_bounds.bend as GB
 
 # ============================================================================
 # 1. Helper lemmas (erased before Rust codegen)
@@ -109,6 +110,32 @@ def g4v_grid_ok(+patch: Nat, +pool: Nat, +npos: Nat) -> Bool:
 # A tower has layers and an MLP.
 def g4v_tower_ok(+layers: Nat, +inter: Nat) -> Bool:
   Bool.and(Nat.is_gt(layers, 0n), Nat.is_gt(inter, 0n))
+
+# The input sizes of the image path, from the processor's patch and pooling sizes. Each is refused
+# on overflow: the sizes come from a checkpoint's config. The pixel side of a soft token's square:
+# rusty-bends: total
+def g4v_token_side(+patch: Nat, +pool: Nat) -> Nat:
+  Nat.mul(patch, pool)
+
+# ... the patches of one soft token:
+# rusty-bends: total
+def g4v_token_patches(+pool: Nat) -> Nat:
+  Nat.mul(pool, pool)
+
+# ... the pixels of a soft token's square:
+# rusty-bends: total
+def g4v_token_pixels(+patch: Nat, +pool: Nat) -> Nat:
+  Nat.mul(g4v_token_side(patch, pool), g4v_token_side(patch, pool))
+
+# ... and the values of one input row, 3 a pixel: a patch (the tower) or a soft token's merged
+# patch (`merged`: the unified embedder).
+# rusty-bends: total
+def g4v_row_values(merged: Bool, +patch: Nat, +pool: Nat) -> Nat:
+  match merged:
+    case True{}:
+      Nat.mul(3n, g4v_token_pixels(patch, pool))
+    case False{}:
+      Nat.mul(3n, Nat.mul(patch, patch))
 
 # A size the config may give (`has`): when it does, it is `want`.
 def g4v_given_eq(has: Bool, +v: Nat, +want: Nat) -> Bool:
@@ -214,10 +241,48 @@ def g4v_pool_count(nby: Nat, nbx: Nat, +pool: Nat) -> Nat:
 def g4v_pool_row(+y: Nat, +x: Nat, nbx: Nat, +pool: Nat) -> Nat:
   Nat.add(Nat.mul(Nat.add(Nat.mul(Nat.div(y, pool), nbx), Nat.div(x, pool)), Nat.mul(pool, pool)), Nat.add(Nat.mul(Nat.mod(y, pool), pool), Nat.mod(x, pool)))
 
-# Device bytes one buffer of `bytes` takes in a sealed arena: at least one step, a whole number
-# of steps (what the arena's sub-allocation consumes for it).
+# The tower's 2-D rotary code over a head of `dh` channels: the first half of a head turns with
+# the patch's column, the second with its row, and inside each half rotate-half (`cat(-x2, x1)`)
+# pairs each channel of the first quarter of the half with the channel a quarter ahead. The
+# channels of a quarter (the verified head guard takes only heads of whole quarters):
+def g4v_rot_quarter(+dh: Nat) -> Nat:
+  Nat.div(dh, 4n)
+
+# Whether output channel `o` of rotate-half takes its partner negated (`q`: the quarter): it lies
+# in the first quarter of its half.
+def g4v_rot_neg(+o: Nat, +q: Nat) -> Bool:
+  Nat.is_lt(Nat.mod(o, Nat.add(q, q)), q)
+
+def g4v_rot_src_go(neg: Bool, +o: Nat, +q: Nat) -> Nat:
+  match neg:
+    case True{}:
+      Nat.add(o, q)
+    case False{}:
+      Nat.sub(o, q)
+
+# The channel rotate-half reads for output channel `o`: its partner, a quarter ahead in the first
+# quarter of a half and a quarter back in the second.
+def g4v_rot_src(+o: Nat, +q: Nat) -> Nat:
+  g4v_rot_src_go(g4v_rot_neg(o, q), o, q)
+
+# Whether channel `k` of a head turns with the patch's row (the head's second half; the first
+# turns with its column).
+def g4v_rope_row_axis(+k: Nat, +q: Nat) -> Bool:
+  Nat.is_lt(0n, Nat.div(k, Nat.add(q, q)))
+
+# The frequency of channel `k`: its place in its quarter, the frequency table's index.
+def g4v_rope_freq(+k: Nat, +q: Nat) -> Nat:
+  Nat.mod(Nat.mod(k, Nat.add(q, q)), q)
+
+# Device bytes the arena's sub-allocation takes for one buffer of `bytes`: the buffer, and at
+# least one step, so that every buffer has an address of its own (`arena_take` asks for this).
+def g4v_take_bytes(+bytes: Nat) -> Nat:
+  Nat.max(bytes, g4v_arena_step())
+
+# Device bytes one buffer of `bytes` takes in a sealed arena: what the sub-allocation takes,
+# rounded up to whole steps (where the next buffer starts).
 def g4v_part_bytes(+bytes: Nat) -> Nat:
-  TB.align_up(Nat.max(bytes, g4v_arena_step()), g4v_arena_step())
+  TB.align_up(g4v_take_bytes(bytes), g4v_arena_step())
 
 # A plan's running total after one more buffer of `bytes`.
 def g4v_add_part(total: Nat, +bytes: Nat) -> Nat:
@@ -236,6 +301,33 @@ def g4u_fits(+ring: Nat, +w: Nat, +rows: Nat) -> Bool:
       Nat.is_le(rows, ring)
     case 1n+wp:
       Bool.and(Nat.is_lt(wp, ring), Nat.is_le(rows, Nat.sub(ring, wp)))
+
+# Chunks of `chunk` rows of a global layer's K / V cache that a prefill tile whose rows end at row
+# `end` reads: the chunks that hold the keys before `end` (`ceil(end / chunk)`), at least one, at
+# most the `max_chunks` the cache holds.
+def g4u_tile_chunks(+end: Nat, +chunk: Nat, +max_chunks: Nat) -> Nat:
+  Nat.max(1n, Nat.min(Nat.div(Nat.add(end, Nat.sub(chunk, 1n)), chunk), max_chunks))
+
+# Whether a tile's embedding stage runs the image recipe: it holds image rows (their soft tokens
+# take the place of the token embedding there).
+def g4u_embed_image(has_img: Bool) -> Bool:
+  has_img
+
+# Whether a layer of a prefill unit runs the plain, causal layer recipe: every layer of a causal
+# unit, and the global layers of a two-way unit (the reference keeps them causal). The other
+# layers, the sliding layers of a two-way unit, run the image recipes (the later tiles' key write
+# and the softmax extended to the end of each row's block).
+def g4u_layer_plain(two_way: Bool, sliding: Bool) -> Bool:
+  Bool.not(Bool.and(two_way, sliding))
+
+# Whether `--build-cache` compiles the drafter's step that verifies `t` rows and drafts `kd`
+# tokens at one chunk bucket, for widths whose widest is `kmax` (`listed`: `kd` is one of them;
+# `top`: the context's top bucket). Every verify count from 1 to the widest + 1 (a first block
+# narrowed by the request's budget, or one a narrowed step handed on), drafting a listed width or
+# none (the verify-only step of a sampled decode); at the top bucket also any draft count up to
+# the widest (a step near the end of the context, which only the top bucket reaches).
+def g4c_build_step(+t: Nat, +kd: Nat, +kmax: Nat, listed: Bool, top: Bool) -> Bool:
+  Bool.and(Bool.and(Nat.is_lt(0n, t), Nat.is_le(t, 1n+kmax)), Bool.and(Nat.is_le(kd, kmax), Bool.or(Bool.or(listed, Nat.is_eq(kd, 0n)), top)))
 
 # Whether the next tile joins a unit of `tiles` tiles: an image block runs from the unit's last
 # tile into it (`cross`), and the unit has room for one more tile of the `max_tiles` the plan
@@ -1148,3 +1240,584 @@ law g4v_pool_w_takes_every_patch:
 
 def g4v_pool_w_takes_every_patch(o, j, hp):
   g4v_pool_w_every_go(o, j, hp, Nat.is_le(o, hp), {==})
+
+# ----------------------------------------------------------------------------
+# Follow-ups of the #62 reviews: block membership, the whole-token floor, the arena's take
+# ----------------------------------------------------------------------------
+
+# LAW G4U.19
+# promise: every row of an image block is in it.
+# harm: a row of an image would attend causally or take no extension to the rest of its block.
+law g4u_block_rows_inside:
+  for +s: Nat
+  for +j: Nat
+  for +k: Nat
+  {g4u_in_block(s, 1n+Nat.add(j, k), Nat.add(s, j)) == True{} : Bool}
+
+def g4u_block_rows_inside(s, j, k):
+  %Equal.sym(Bool, Nat.is_le(s, Nat.add(s, j)), True{}, L.nat_add_le_r(s, j)) : {Bool.and(_, Nat.is_lt(Nat.add(s, j), Nat.add(s, 1n+Nat.add(j, k)))) == True{} : Bool}
+  g4v_lt_add_l(s, j, 1n+Nat.add(j, k), g4u_lt_succ_add(j, k))
+
+# LAW G4V.26
+# promise: flooring a patch count to whole tokens drops fewer patches than one token holds, so every whole token is kept.
+# harm: the largest image would be planned for fewer soft tokens than its patches hold.
+law g4v_whole_token_patches_keeps_tokens:
+  for +p: Nat
+  for +kp: Nat
+  {Nat.is_lt(p, Nat.add(g4v_whole_token_patches(p, 1n+kp), 1n+kp)) == True{} : Bool}
+
+def g4v_whole_token_patches_keeps_tokens(p, kp):
+  %L.nat_div_mod_r(p, kp) : {Nat.is_lt(_, Nat.add(Nat.mul(Nat.div(p, 1n+kp), 1n+kp), 1n+kp)) == True{} : Bool}
+  g4v_lt_add_l(Nat.mul(Nat.div(p, 1n+kp), 1n+kp), Nat.mod(p, 1n+kp), 1n+kp, L.nat_mod_lt(p, kp))
+
+# LAW G4V.27a
+# promise: the arena's sub-allocation takes at least a buffer's bytes for it.
+# harm: a buffer would run into the next one.
+law g4v_take_holds_buffer:
+  for +b: Nat
+  {Nat.is_le(b, g4v_take_bytes(b)) == True{} : Bool}
+
+def g4v_take_holds_buffer(b):
+  L.nat_max_ge_l(b, g4v_arena_step())
+
+# LAW G4V.27b
+# promise: the arena's sub-allocation takes at least one step for every buffer, an empty one's included.
+# harm: two buffers would share an address, which a launch refuses.
+law g4v_take_holds_a_step:
+  for +b: Nat
+  {Nat.is_le(g4v_arena_step(), g4v_take_bytes(b)) == True{} : Bool}
+
+def g4v_take_holds_a_step(b):
+  L.nat_max_ge_r(b, g4v_arena_step())
+
+# LAW G4V.27c
+# promise: the bytes planned for a buffer hold what the arena's sub-allocation takes for it.
+# harm: a sealed arena would run out before the last buffer of the plan.
+law g4v_part_holds_take:
+  for +b: Nat
+  {Nat.is_le(g4v_take_bytes(b), g4v_part_bytes(b)) == True{} : Bool}
+
+def g4v_part_holds_take(b):
+  TB.align_up_never_shrinks(g4v_take_bytes(b), g4v_arena_step())
+
+# LAW G4V.28
+# promise: an input row of a positive patch and pooling size is never empty.
+# harm: the image path's first product would take rows of no values.
+law g4v_row_never_empty:
+  for m: Bool
+  for +p: Nat
+  for +q: Nat
+  {Nat.is_lt(0n, g4v_row_values(m, 1n+p, 1n+q)) == True{} : Bool}
+
+def g4v_row_never_empty(m, p, q):
+  match m:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# ----------------------------------------------------------------------------
+# The tower's 2-D rotary code: the channel layout of a head
+# ----------------------------------------------------------------------------
+#
+# Proofs below take a head's quarter as `q = 1 + j + m` and its half as `h = q + q`, and a channel
+# of half `a` as `a h + j` (the first quarter of the half) or `a h + q + j` (its second quarter):
+# every channel has one of the two forms.
+
+# j <= h - 1: a place in the first quarter lies inside the half.
+def g4v_rq_le1(+j: Nat, +m: Nat) -> {Nat.is_le(j, Nat.add(Nat.add(j, m), 1n+Nat.add(j, m))) == True{} : Bool}:
+  L.nat_le_trans(j, Nat.add(j, m), Nat.add(Nat.add(j, m), 1n+Nat.add(j, m)), L.nat_add_le_r(j, m), L.nat_add_le_r(Nat.add(j, m), 1n+Nat.add(j, m)))
+
+# q + j <= h - 1: a place in the second quarter lies inside the half.
+def g4v_rq_le2(+j: Nat, +m: Nat) -> {Nat.is_le(Nat.add(1n+Nat.add(j, m), j), Nat.add(Nat.add(j, m), 1n+Nat.add(j, m))) == True{} : Bool}:
+  %Equal.sym(Nat, Nat.add(Nat.add(j, m), 1n+Nat.add(j, m)), 1n+Nat.add(Nat.add(j, m), Nat.add(j, m)), L.nat_add_succ_r(Nat.add(j, m), Nat.add(j, m))) : {Nat.is_le(Nat.add(1n+Nat.add(j, m), j), _) == True{} : Bool}
+  L.nat_add_le_mono(Nat.add(j, m), Nat.add(j, m), j, Nat.add(j, m), L.nat_le_refl(Nat.add(j, m)), L.nat_add_le_r(j, m))
+
+# The place and the half of a first-quarter channel ...
+def g4v_rot_mod1(+a: Nat, +j: Nat, +m: Nat) -> {Nat.mod(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))) == j : Nat}:
+  g4v_mod_qr(a, Nat.add(Nat.add(j, m), 1n+Nat.add(j, m)), j, g4v_rq_le1(j, m))
+
+def g4v_rot_div1(+a: Nat, +j: Nat, +m: Nat) -> {Nat.div(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))) == a : Nat}:
+  g4v_div_qr(a, Nat.add(Nat.add(j, m), 1n+Nat.add(j, m)), j, g4v_rq_le1(j, m))
+
+# ... and of a second-quarter channel.
+def g4v_rot_mod2(+a: Nat, +j: Nat, +m: Nat) -> {Nat.mod(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))) == Nat.add(1n+Nat.add(j, m), j) : Nat}:
+  g4v_mod_qr(a, Nat.add(Nat.add(j, m), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), j), g4v_rq_le2(j, m))
+
+def g4v_rot_div2(+a: Nat, +j: Nat, +m: Nat) -> {Nat.div(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))) == a : Nat}:
+  g4v_div_qr(a, Nat.add(Nat.add(j, m), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), j), g4v_rq_le2(j, m))
+
+# A first-quarter channel takes its partner negated, a second-quarter channel does not.
+def g4v_rot_neg1(+a: Nat, +j: Nat, +m: Nat) -> {g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)) == True{} : Bool}:
+  %Equal.sym(Nat, Nat.mod(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j, g4v_rot_mod1(a, j, m)) : {Nat.is_lt(_, 1n+Nat.add(j, m)) == True{} : Bool}
+  g4u_lt_succ_add(j, m)
+
+def g4v_rot_neg2(+a: Nat, +j: Nat, +m: Nat) -> {g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)) == False{} : Bool}:
+  %Equal.sym(Nat, Nat.mod(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j), g4v_rot_mod2(a, j, m)) : {Nat.is_lt(_, 1n+Nat.add(j, m)) == False{} : Bool}
+  g4u_add_lt_false(Nat.add(j, m), j)
+
+# The partner of a first-quarter channel is the channel a quarter ahead, and back.
+def g4v_rot_src1(+a: Nat, +j: Nat, +m: Nat) -> {g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)) : Nat}:
+  %Equal.sym(Bool, g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), True{}, g4v_rot_neg1(a, j, m)) : {g4v_rot_src_go(_, Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(j, 1n+Nat.add(j, m))), L.nat_add_assoc(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j, 1n+Nat.add(j, m))) : {_ == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)) : Nat}
+  %L.nat_add_comm(1n+Nat.add(j, m), j) : {Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), _) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)) : Nat}
+  {==}
+
+def g4v_rot_src2(+a: Nat, +j: Nat, +m: Nat) -> {g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j) : Nat}:
+  %Equal.sym(Bool, g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), False{}, g4v_rot_neg2(a, j, m)) : {g4v_rot_src_go(_, Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j) : Nat}
+  %L.nat_add_comm(j, 1n+Nat.add(j, m)) : {Nat.sub(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), _), 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j) : Nat}
+  %L.nat_add_assoc(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j, 1n+Nat.add(j, m)) : {Nat.sub(_, 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j) : Nat}
+  L.nat_add_sub_cancel_r(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))
+
+# Both channels of a pair have the frequency of place j.
+def g4v_rot_freq1(+a: Nat, +j: Nat, +m: Nat) -> {g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)) == j : Nat}:
+  %Equal.sym(Nat, Nat.mod(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j, g4v_rot_mod1(a, j, m)) : {Nat.mod(_, 1n+Nat.add(j, m)) == j : Nat}
+  g4v_mod_qr(0n, Nat.add(j, m), j, L.nat_add_le_r(j, m))
+
+def g4v_rot_freq2(+a: Nat, +j: Nat, +m: Nat) -> {g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)) == j : Nat}:
+  %Equal.sym(Nat, Nat.mod(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j), g4v_rot_mod2(a, j, m)) : {Nat.mod(_, 1n+Nat.add(j, m)) == j : Nat}
+  %L.nat_add_zero_r(1n+Nat.add(j, m)) : {Nat.mod(Nat.add(_, j), 1n+Nat.add(j, m)) == j : Nat}
+  g4v_mod_qr(1n, Nat.add(j, m), j, L.nat_add_le_r(j, m))
+
+# The partner's half is the channel's half.
+def g4v_rot_divs1(+a: Nat, +j: Nat, +m: Nat) -> {Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))) == a : Nat}:
+  %Equal.sym(Nat, g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), g4v_rot_src1(a, j, m)) : {Nat.div(_, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))) == a : Nat}
+  g4v_rot_div2(a, j, m)
+
+def g4v_rot_divs2(+a: Nat, +j: Nat, +m: Nat) -> {Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))) == a : Nat}:
+  %Equal.sym(Nat, g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), g4v_rot_src2(a, j, m)) : {Nat.div(_, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))) == a : Nat}
+  g4v_rot_div1(a, j, m)
+
+# x == y gives is_eq(x, y).
+def g4v_is_eq_of(+x: Nat, +y: Nat, e: {x == y : Nat}) -> {Nat.is_eq(x, y) == True{} : Bool}:
+  %Equal.sym(Nat, x, y, e) : {Nat.is_eq(_, y) == True{} : Bool}
+  g4v_is_eq_refl(y)
+
+# b1 and b2, both true.
+def g4v_and_true(b1: Bool, b2: Bool, e1: {b1 == True{} : Bool}, e2: {b2 == True{} : Bool}) -> {Bool.and(b1, b2) == True{} : Bool}:
+  %Equal.sym(Bool, b1, True{}, e1) : {Bool.and(_, b2) == True{} : Bool}
+  e2
+
+# b1 or b2, both false.
+def g4v_or_false(b1: Bool, b2: Bool, e1: {b1 == False{} : Bool}, e2: {b2 == False{} : Bool}) -> {Bool.or(b1, b2) == False{} : Bool}:
+  %Equal.sym(Bool, b1, False{}, e1) : {Bool.or(_, b2) == False{} : Bool}
+  e2
+
+# b xor b is false.
+def g4v_xor_self(b: Bool) -> {Bool.xor(b, b) == False{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW G4V.30
+# promise: rotate-half reads every channel's partner inside the channel's own half of the head, the half that turns with one position axis.
+# harm: a channel would turn with a channel of the other axis or of another head.
+law g4v_rot_src_keeps_half:
+  for +a: Nat
+  for +j: Nat
+  for +m: Nat
+  {Bool.and(Nat.is_eq(Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a), Nat.is_eq(Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a)) == True{} : Bool}
+
+def g4v_rot_src_keeps_half(a, j, m):
+  g4v_and_true(Nat.is_eq(Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a), Nat.is_eq(Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a), g4v_is_eq_of(Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a, g4v_rot_divs1(a, j, m)), g4v_is_eq_of(Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a, g4v_rot_divs2(a, j, m)))
+
+# The partner's partner is the channel.
+def g4v_rot_pair1(+a: Nat, +j: Nat, +m: Nat) -> {g4v_rot_src(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j) : Nat}:
+  %Equal.sym(Nat, g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), g4v_rot_src1(a, j, m)) : {g4v_rot_src(_, 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j) : Nat}
+  g4v_rot_src2(a, j, m)
+
+def g4v_rot_pair2(+a: Nat, +j: Nat, +m: Nat) -> {g4v_rot_src(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)) : Nat}:
+  %Equal.sym(Nat, g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), g4v_rot_src2(a, j, m)) : {g4v_rot_src(_, 1n+Nat.add(j, m)) == Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)) : Nat}
+  g4v_rot_src1(a, j, m)
+
+# LAW G4V.31
+# promise: rotate-half pairs the channels of a head: the partner of a channel's partner is the channel, so every channel is read exactly once.
+# harm: a channel would be read twice and another not at all, so the rotation would not be one.
+law g4v_rot_src_pairs:
+  for +a: Nat
+  for +j: Nat
+  for +m: Nat
+  {Bool.and(Nat.is_eq(g4v_rot_src(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j)), Nat.is_eq(g4v_rot_src(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)))) == True{} : Bool}
+
+def g4v_rot_src_pairs(a, j, m):
+  g4v_and_true(Nat.is_eq(g4v_rot_src(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j)), Nat.is_eq(g4v_rot_src(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j))), g4v_is_eq_of(g4v_rot_src(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), g4v_rot_pair1(a, j, m)), g4v_is_eq_of(g4v_rot_src(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), g4v_rot_pair2(a, j, m)))
+
+# One of a pair is negated.
+def g4v_rot_flip1(+a: Nat, +j: Nat, +m: Nat) -> {Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), g4v_rot_neg(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m))) == True{} : Bool}:
+  %Equal.sym(Nat, g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), g4v_rot_src1(a, j, m)) : {Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), g4v_rot_neg(_, 1n+Nat.add(j, m))) == True{} : Bool}
+  %Equal.sym(Bool, g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), False{}, g4v_rot_neg2(a, j, m)) : {Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), _) == True{} : Bool}
+  %Equal.sym(Bool, g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), True{}, g4v_rot_neg1(a, j, m)) : {Bool.xor(_, False{}) == True{} : Bool}
+  {==}
+
+def g4v_rot_flip2(+a: Nat, +j: Nat, +m: Nat) -> {Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), g4v_rot_neg(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m))) == True{} : Bool}:
+  %Equal.sym(Nat, g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), g4v_rot_src2(a, j, m)) : {Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), g4v_rot_neg(_, 1n+Nat.add(j, m))) == True{} : Bool}
+  %Equal.sym(Bool, g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), True{}, g4v_rot_neg1(a, j, m)) : {Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), _) == True{} : Bool}
+  %Equal.sym(Bool, g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), False{}, g4v_rot_neg2(a, j, m)) : {Bool.xor(_, True{}) == True{} : Bool}
+  {==}
+
+# LAW G4V.32
+# promise: of every rotate-half pair exactly one channel is taken negated, so the pair turns as a rotation.
+# harm: a pair would be scaled or reflected instead of rotated.
+law g4v_rot_sign_flips:
+  for +a: Nat
+  for +j: Nat
+  for +m: Nat
+  {Bool.and(Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), g4v_rot_neg(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m))), Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), g4v_rot_neg(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)))) == True{} : Bool}
+
+def g4v_rot_sign_flips(a, j, m):
+  g4v_and_true(Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), g4v_rot_neg(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m))), Bool.xor(g4v_rot_neg(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), g4v_rot_neg(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m))), g4v_rot_flip1(a, j, m), g4v_rot_flip2(a, j, m))
+
+# A pair turns with one axis.
+def g4v_rot_axis1(+a: Nat, +j: Nat, +m: Nat) -> {Bool.xor(g4v_rope_row_axis(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_row_axis(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))) == False{} : Bool}:
+  %Equal.sym(Nat, Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a, g4v_rot_divs1(a, j, m)) : {Bool.xor(Nat.is_lt(0n, _), g4v_rope_row_axis(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))) == False{} : Bool}
+  %Equal.sym(Nat, Nat.div(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a, g4v_rot_div1(a, j, m)) : {Bool.xor(Nat.is_lt(0n, a), Nat.is_lt(0n, _)) == False{} : Bool}
+  g4v_xor_self(Nat.is_lt(0n, a))
+
+def g4v_rot_axis2(+a: Nat, +j: Nat, +m: Nat) -> {Bool.xor(g4v_rope_row_axis(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_row_axis(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m))) == False{} : Bool}:
+  %Equal.sym(Nat, Nat.div(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a, g4v_rot_divs2(a, j, m)) : {Bool.xor(Nat.is_lt(0n, _), g4v_rope_row_axis(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m))) == False{} : Bool}
+  %Equal.sym(Nat, Nat.div(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), a, g4v_rot_div2(a, j, m)) : {Bool.xor(Nat.is_lt(0n, a), Nat.is_lt(0n, _)) == False{} : Bool}
+  g4v_xor_self(Nat.is_lt(0n, a))
+
+# LAW G4V.33
+# promise: the two channels of a rotate-half pair turn with the same position axis of the patch.
+# harm: a pair would mix the patch's column and row into one rotation.
+law g4v_rope_pair_shares_axis:
+  for +a: Nat
+  for +j: Nat
+  for +m: Nat
+  {Bool.or(Bool.xor(g4v_rope_row_axis(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_row_axis(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))), Bool.xor(g4v_rope_row_axis(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_row_axis(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)))) == False{} : Bool}
+
+def g4v_rope_pair_shares_axis(a, j, m):
+  g4v_or_false(Bool.xor(g4v_rope_row_axis(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_row_axis(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))), Bool.xor(g4v_rope_row_axis(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_row_axis(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m))), g4v_rot_axis1(a, j, m), g4v_rot_axis2(a, j, m))
+
+# A pair shares a frequency.
+def g4v_rot_fq1(+a: Nat, +j: Nat, +m: Nat) -> {Nat.is_eq(g4v_rope_freq(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))) == True{} : Bool}:
+  %Equal.sym(Nat, g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), g4v_rot_src1(a, j, m)) : {Nat.is_eq(g4v_rope_freq(_, 1n+Nat.add(j, m)), g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))) == True{} : Bool}
+  %Equal.sym(Nat, g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), j, g4v_rot_freq2(a, j, m)) : {Nat.is_eq(_, g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))) == True{} : Bool}
+  %Equal.sym(Nat, g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), j, g4v_rot_freq1(a, j, m)) : {Nat.is_eq(j, _) == True{} : Bool}
+  g4v_is_eq_refl(j)
+
+def g4v_rot_fq2(+a: Nat, +j: Nat, +m: Nat) -> {Nat.is_eq(g4v_rope_freq(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m))) == True{} : Bool}:
+  %Equal.sym(Nat, g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), g4v_rot_src2(a, j, m)) : {Nat.is_eq(g4v_rope_freq(_, 1n+Nat.add(j, m)), g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m))) == True{} : Bool}
+  %Equal.sym(Nat, g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), j, g4v_rot_freq1(a, j, m)) : {Nat.is_eq(_, g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m))) == True{} : Bool}
+  %Equal.sym(Nat, g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), j, g4v_rot_freq2(a, j, m)) : {Nat.is_eq(j, _) == True{} : Bool}
+  g4v_is_eq_refl(j)
+
+# LAW G4V.34
+# promise: the two channels of a rotate-half pair turn with the same frequency.
+# harm: a pair would turn at two speeds, which is no rotation.
+law g4v_rope_pair_shares_freq:
+  for +a: Nat
+  for +j: Nat
+  for +m: Nat
+  {Bool.and(Nat.is_eq(g4v_rope_freq(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))), Nat.is_eq(g4v_rope_freq(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)))) == True{} : Bool}
+
+def g4v_rope_pair_shares_freq(a, j, m):
+  g4v_and_true(Nat.is_eq(g4v_rope_freq(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), j), 1n+Nat.add(j, m))), Nat.is_eq(g4v_rope_freq(g4v_rot_src(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m)), 1n+Nat.add(j, m)), g4v_rope_freq(Nat.add(Nat.mul(a, Nat.add(1n+Nat.add(j, m), 1n+Nat.add(j, m))), Nat.add(1n+Nat.add(j, m), j)), 1n+Nat.add(j, m))), g4v_rot_fq1(a, j, m), g4v_rot_fq2(a, j, m))
+
+# LAW G4V.35
+# promise: a channel's frequency index stays inside the table of a quarter's frequencies.
+# harm: the host would read a frequency past the end of its table.
+law g4v_rope_freq_within:
+  for +k: Nat
+  for +qp: Nat
+  {Nat.is_lt(g4v_rope_freq(k, 1n+qp), 1n+qp) == True{} : Bool}
+
+def g4v_rope_freq_within(k, qp):
+  L.nat_mod_lt(Nat.mod(k, Nat.add(1n+qp, 1n+qp)), qp)
+
+# LAW G4V.36
+# promise: the four quarters of a head never reach past the head's channels.
+# harm: a channel's rotate-half partner or frequency would lie outside the head.
+law g4v_rot_quarter_within:
+  for +dh: Nat
+  {Nat.is_le(Nat.mul(g4v_rot_quarter(dh), 4n), dh) == True{} : Bool}
+
+def g4v_rot_quarter_within(dh):
+  g4v_div_mul_le(dh, 3n)
+
+# ----------------------------------------------------------------------------
+# The chunks a prefill tile reads
+# ----------------------------------------------------------------------------
+
+# k + a <= k + b gives a <= b.
+def g4u_le_cancel_l(+k: Nat, +a: Nat, +b: Nat, h: {Nat.is_le(Nat.add(k, a), Nat.add(k, b)) == True{} : Bool}) -> {Nat.is_le(a, b) == True{} : Bool}:
+  match k:
+    case 0n:
+      h
+    case 1n+kp:
+      g4u_le_cancel_l(kp, a, b, h)
+
+# e + cp <= ceil(e / c) c + cp (c = 1 + cp).
+def g4u_ceil_h(+e: Nat, +cp: Nat) -> {Nat.is_le(Nat.add(e, cp), Nat.add(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), cp)) == True{} : Bool}:
+  %L.nat_div_mod_r(Nat.add(e, cp), cp) : {Nat.is_le(_, Nat.add(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), cp)) == True{} : Bool}
+  L.nat_add_le_mono(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), Nat.mod(Nat.add(e, cp), 1n+cp), cp, L.nat_le_refl(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp)), g4v_mod_le(Nat.add(e, cp), cp))
+
+def g4u_ceil_hl(+e: Nat, +cp: Nat) -> {Nat.is_le(Nat.add(cp, e), Nat.add(cp, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp))) == True{} : Bool}:
+  %L.nat_add_comm(e, cp) : {Nat.is_le(_, Nat.add(cp, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp))) == True{} : Bool}
+  %L.nat_add_comm(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), cp) : {Nat.is_le(Nat.add(e, cp), _) == True{} : Bool}
+  g4u_ceil_h(e, cp)
+
+# e <= ceil(e / c) c: the chunks of a ceiling hold the rows.
+def g4u_ceil_ge(+e: Nat, +cp: Nat) -> {Nat.is_le(e, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp)) == True{} : Bool}:
+  g4u_le_cancel_l(cp, e, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), g4u_ceil_hl(e, cp))
+
+# min(x, m) == x when x <= m.
+def g4u_min_of_le(+x: Nat, +m: Nat, h: {Nat.is_le(x, m) == True{} : Bool}) -> {Nat.min(x, m) == x : Nat}:
+  match x m:
+    case 0n _:
+      {==}
+    case 1n+xp 0n:
+      L.bool_absurd({Nat.min(1n+xp, 0n) == 1n+xp : Nat}, h)
+    case 1n+xp 1n+mp:
+      %Equal.sym(Nat, Nat.min(xp, mp), xp, g4u_min_of_le(xp, mp, h)) : {1n+_ == 1n+xp : Nat}
+      {==}
+
+# min(x, m) == m when x > m.
+def g4u_min_of_gt(+x: Nat, +m: Nat, h: {Nat.is_le(x, m) == False{} : Bool}) -> {Nat.min(x, m) == m : Nat}:
+  match x m:
+    case 0n 0n:
+      {==}
+    case 0n 1n+mp:
+      L.bool_absurd_tf({Nat.min(0n, 1n+mp) == 1n+mp : Nat}, h)
+    case 1n+xp 0n:
+      {==}
+    case 1n+xp 1n+mp:
+      %Equal.sym(Nat, Nat.min(xp, mp), mp, g4u_min_of_gt(xp, mp, h)) : {1n+_ == 1n+mp : Nat}
+      {==}
+
+# max(1, y) <= 1 + mp when y <= 1 + mp.
+def g4u_max1_le(+y: Nat, +mp: Nat, h: {Nat.is_le(y, 1n+mp) == True{} : Bool}) -> {Nat.is_le(Nat.max(1n, y), 1n+mp) == True{} : Bool}:
+  match y:
+    case 0n:
+      L.nat_le_zero(mp)
+    case 1n+yp:
+      h
+
+# l and (p < e) is false when e <= p.
+def g4u_and_lt_false(l: Bool, +p: Nat, +e: Nat, h: {Nat.is_le(e, p) == True{} : Bool}) -> {Bool.and(l, Nat.is_lt(p, e)) == False{} : Bool}:
+  %Equal.sym(Bool, Nat.is_lt(p, e), False{}, L.nat_le_lt_false(p, e, h)) : {Bool.and(l, _) == False{} : Bool}
+  g4u_and_false_r(l)
+
+# (e <= p) and (p < e) is false.
+def g4u_le_lt_false(+e: Nat, +p: Nat, l: Bool, el: {Nat.is_le(e, p) == l : Bool}) -> {Bool.and(l, Nat.is_lt(p, e)) == False{} : Bool}:
+  match l:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_le_lt_false(p, e, el)
+
+# The cover law once the ceiling is known to fit the cache or not (b says which).
+def g4u_cover_go(+e: Nat, +cp: Nat, +mp: Nat, b: Bool, eb: {Nat.is_le(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp) == b : Bool}) -> {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, Nat.min(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp)), 1n+cp), e)) == False{} : Bool}:
+  match b:
+    case True{}:
+      %Equal.sym(Nat, Nat.min(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp), Nat.div(Nat.add(e, cp), 1n+cp), g4u_min_of_le(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp, eb)) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, _), 1n+cp), e)) == False{} : Bool}
+      g4u_and_lt_false(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.mul(Nat.max(1n, Nat.div(Nat.add(e, cp), 1n+cp)), 1n+cp), e, L.nat_le_trans(e, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), Nat.mul(Nat.max(1n, Nat.div(Nat.add(e, cp), 1n+cp)), 1n+cp), g4u_ceil_ge(e, cp), L.nat_mul_le_mono_r(Nat.div(Nat.add(e, cp), 1n+cp), Nat.max(1n, Nat.div(Nat.add(e, cp), 1n+cp)), 1n+cp, L.nat_max_ge_r(1n, Nat.div(Nat.add(e, cp), 1n+cp)))))
+    case False{}:
+      %Equal.sym(Nat, Nat.min(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp), 1n+mp, g4u_min_of_gt(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp, eb)) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, _), 1n+cp), e)) == False{} : Bool}
+      %L.nat_mul_comm(1n+cp, 1n+mp) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(_, e)) == False{} : Bool}
+      g4u_le_lt_false(e, Nat.mul(1n+cp, 1n+mp), Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), {==})
+
+# LAW G4U.20
+# promise: a prefill tile reads at least one chunk of the global caches.
+# harm: a global layer would attend no keys at all.
+law g4u_tile_chunks_at_least_one:
+  for +e: Nat
+  for +c: Nat
+  for +m: Nat
+  {Nat.is_le(1n, g4u_tile_chunks(e, c, m)) == True{} : Bool}
+
+def g4u_tile_chunks_at_least_one(e, c, m):
+  L.nat_max_ge_l(1n, Nat.min(Nat.div(Nat.add(e, Nat.sub(c, 1n)), c), m))
+
+# LAW G4U.21
+# promise: a prefill tile never reads more chunks than the global caches hold.
+# harm: the tile's recipe would read K / V rows past the end of the cache.
+law g4u_tile_chunks_within_cache:
+  for +e: Nat
+  for +c: Nat
+  for +mp: Nat
+  {Nat.is_le(g4u_tile_chunks(e, c, 1n+mp), 1n+mp) == True{} : Bool}
+
+def g4u_tile_chunks_within_cache(e, c, mp):
+  g4u_max1_le(Nat.min(Nat.div(Nat.add(e, Nat.sub(c, 1n)), c), 1n+mp), mp, L.nat_min_le_r(Nat.div(Nat.add(e, Nat.sub(c, 1n)), c), 1n+mp))
+
+# LAW G4U.22
+# promise: a prefill tile whose rows fit the global caches reads every chunk that holds the keys up to its last row.
+# harm: a global layer would miss the keys of the chunks it does not read.
+law g4u_tile_chunks_cover:
+  for +e: Nat
+  for +cp: Nat
+  for +mp: Nat
+  {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(g4u_tile_chunks(e, 1n+cp, 1n+mp), 1n+cp), e)) == False{} : Bool}
+
+def g4u_tile_chunks_cover(e, cp, mp):
+  %Equal.sym(Nat, Nat.sub(cp, 0n), cp, L.nat_sub_zero_r(cp)) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, Nat.min(Nat.div(Nat.add(e, _), 1n+cp), 1n+mp)), 1n+cp), e)) == False{} : Bool}
+  g4u_cover_go(e, cp, mp, Nat.is_le(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp), {==})
+
+# ----------------------------------------------------------------------------
+# The recipes a prefill unit runs
+# ----------------------------------------------------------------------------
+
+# LAW G4U.23
+# promise: a prefill tile that holds image rows embeds them with the image recipe, which takes their soft tokens.
+# harm: the image rows would take the pad token's embedding and the image would be lost.
+law g4u_image_tile_embeds_image:
+  {g4u_embed_image(True{}) == True{} : Bool}
+
+def g4u_image_tile_embeds_image():
+  {==}
+
+# LAW G4U.24
+# promise: a two-way unit never runs a sliding layer with the causal recipe.
+# harm: the unit's image rows would attend causally in that layer, unlike the reference.
+law g4u_two_way_sliding_not_plain:
+  {g4u_layer_plain(True{}, True{}) == False{} : Bool}
+
+def g4u_two_way_sliding_not_plain():
+  {==}
+
+# LAW G4U.25
+# promise: a global layer always runs the causal recipe, in every unit.
+# harm: a global layer would read the sliding ring through the image recipe instead of its own cache.
+law g4u_global_layer_plain:
+  for tw: Bool
+  {g4u_layer_plain(tw, False{}) == True{} : Bool}
+
+def g4u_global_layer_plain(tw):
+  match tw:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# LAW G4U.26
+# promise: every layer of a causal unit runs the causal recipe.
+# harm: a causal unit would run the image recipe, which reads an extension table only two-way units upload.
+law g4u_causal_unit_plain:
+  for sl: Bool
+  {g4u_layer_plain(False{}, sl) == True{} : Bool}
+
+def g4u_causal_unit_plain(sl):
+  {==}
+
+# ----------------------------------------------------------------------------
+# A head the guard takes has a quarter
+# ----------------------------------------------------------------------------
+
+# The quotient of a division never drops below the count it started from.
+def g4v_dm_ge(+n: Nat, +m: Nat, +d: Nat, +r: Nat) -> {Nat.is_le(d, Pair.fst(Nat, Nat, Nat.divmod.go(n, m, d, r))) == True{} : Bool}:
+  match n m:
+    case 0n _:
+      L.nat_le_refl(d)
+    case 1n+np 0n:
+      L.nat_le_trans(d, 1n+d, Pair.fst(Nat, Nat, Nat.divmod.go(np, r, 1n+d, 0n)), L.nat_le_succ_r(d, d, L.nat_le_refl(d)), g4v_dm_ge(np, r, 1n+d, 0n))
+    case 1n+np 1n+mp:
+      g4v_dm_ge(np, mp, d, 1n+r)
+
+# (g and (e and false)) and q is false.
+def g4v_guard_small(g: Bool, e: Bool, q: Bool) -> {Bool.and(Bool.and(g, Bool.and(e, False{})), q) == False{} : Bool}:
+  %Equal.sym(Bool, Bool.and(e, False{}), False{}, g4u_and_false_r(e)) : {Bool.and(Bool.and(g, _), q) == False{} : Bool}
+  %Equal.sym(Bool, Bool.and(g, False{}), False{}, g4u_and_false_r(g)) : {Bool.and(_, q) == False{} : Bool}
+  {==}
+
+# LAW G4V.37
+# promise: a vision head that the head guard takes has at least one channel in each of its quarters, so the rotary frequency table is never empty.
+# harm: the rotary tables would read a frequency from an empty table.
+law g4v_guarded_head_has_a_quarter:
+  for +nh: Nat
+  for +dh: Nat
+  for +hid: Nat
+  {Bool.and(GB.g4_vision_heads_valid(nh, dh, hid), Nat.is_lt(g4v_rot_quarter(dh), 1n)) == False{} : Bool}
+
+def g4v_guarded_head_has_a_quarter(nh, dh, hid):
+  match dh:
+    case 0n:
+      %Equal.sym(Bool, Bool.and(Nat.is_gt(nh, 0n), False{}), False{}, g4u_and_false_r(Nat.is_gt(nh, 0n))) : {Bool.and(_, Nat.is_lt(g4v_rot_quarter(0n), 1n)) == False{} : Bool}
+      {==}
+    case 1n+d1:
+      match d1:
+        case 0n:
+          g4v_guard_small(Nat.is_gt(nh, 0n), Nat.is_eq(Nat.mul(nh, 1n), hid), Nat.is_lt(g4v_rot_quarter(1n), 1n))
+        case 1n+d2:
+          match d2:
+            case 0n:
+              g4v_guard_small(Nat.is_gt(nh, 0n), Nat.is_eq(Nat.mul(nh, 2n), hid), Nat.is_lt(g4v_rot_quarter(2n), 1n))
+            case 1n+d3:
+              match d3:
+                case 0n:
+                  g4v_guard_small(Nat.is_gt(nh, 0n), Nat.is_eq(Nat.mul(nh, 3n), hid), Nat.is_lt(g4v_rot_quarter(3n), 1n))
+                case 1n+k:
+                  %Equal.sym(Bool, Nat.is_lt(g4v_rot_quarter(1n+1n+1n+1n+k), 1n), False{}, L.nat_le_lt_false(Pair.fst(Nat, Nat, Nat.divmod.go(k, 3n, 1n, 0n)), 1n, g4v_dm_ge(k, 3n, 1n, 0n))) : {Bool.and(GB.g4_vision_heads_valid(nh, 1n+1n+1n+1n+k, hid), _) == False{} : Bool}
+                  g4u_and_false_r(GB.g4_vision_heads_valid(nh, 1n+1n+1n+1n+k, hid))
+
+# ----------------------------------------------------------------------------
+# The drafter steps --build-cache compiles
+# ----------------------------------------------------------------------------
+
+# ((a and b) and r) and c is false when b and c is.
+def g4c_and_mid(a: Bool, b: Bool, r: Bool, c: Bool, h: {Bool.and(b, c) == False{} : Bool}) -> {Bool.and(Bool.and(Bool.and(a, b), r), c) == False{} : Bool}:
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      match b:
+        case False{}:
+          {==}
+        case True{}:
+          %Equal.sym(Bool, c, False{}, h) : {Bool.and(r, _) == False{} : Bool}
+          g4u_and_false_r(r)
+
+# (t and (d and o)) and c is false when d and c is.
+def g4c_and_inner(t: Bool, d: Bool, o: Bool, c: Bool, h: {Bool.and(d, c) == False{} : Bool}) -> {Bool.and(Bool.and(t, Bool.and(d, o)), c) == False{} : Bool}:
+  match t:
+    case False{}:
+      {==}
+    case True{}:
+      match d:
+        case False{}:
+          {==}
+        case True{}:
+          %Equal.sym(Bool, c, False{}, h) : {Bool.and(o, _) == False{} : Bool}
+          g4u_and_false_r(o)
+
+# LAW G4C.1
+# promise: --build-cache never asks for a drafter step that verifies no rows.
+# harm: the off-card build would ask for a malformed step graph and fail.
+law g4c_build_step_has_rows:
+  for +kd: Nat
+  for +kmax: Nat
+  for l: Bool
+  for tp: Bool
+  {g4c_build_step(0n, kd, kmax, l, tp) == False{} : Bool}
+
+def g4c_build_step_has_rows(kd, kmax, l, tp):
+  {==}
+
+# LAW G4C.2
+# promise: --build-cache never asks for a drafter step that verifies more rows than the widest width's step.
+# harm: the off-card build would compile steps wider than the speculative buffers are planned for.
+law g4c_build_step_rows_within:
+  for +t: Nat
+  for +kd: Nat
+  for +kmax: Nat
+  for l: Bool
+  for tp: Bool
+  {Bool.and(g4c_build_step(t, kd, kmax, l, tp), Nat.is_lt(1n+kmax, t)) == False{} : Bool}
+
+def g4c_build_step_rows_within(t, kd, kmax, l, tp):
+  g4c_and_mid(Nat.is_lt(0n, t), Nat.is_le(t, 1n+kmax), Bool.and(Nat.is_le(kd, kmax), Bool.or(Bool.or(l, Nat.is_eq(kd, 0n)), tp)), Nat.is_lt(1n+kmax, t), g4u_le_lt_false(t, 1n+kmax, Nat.is_le(t, 1n+kmax), {==}))
+
+# LAW G4C.3
+# promise: --build-cache never asks for a drafter step that drafts more tokens than the widest width.
+# harm: the off-card build would compile steps that draft past the drafter's planned width.
+law g4c_build_step_drafts_within:
+  for +t: Nat
+  for +kd: Nat
+  for +kmax: Nat
+  for l: Bool
+  for tp: Bool
+  {Bool.and(g4c_build_step(t, kd, kmax, l, tp), Nat.is_lt(kmax, kd)) == False{} : Bool}
+
+def g4c_build_step_drafts_within(t, kd, kmax, l, tp):
+  g4c_and_inner(Bool.and(Nat.is_lt(0n, t), Nat.is_le(t, 1n+kmax)), Nat.is_le(kd, kmax), Bool.or(Bool.or(l, Nat.is_eq(kd, 0n)), tp), Nat.is_lt(kmax, kd), g4u_le_lt_false(kd, kmax, Nat.is_le(kd, kmax), {==}))
