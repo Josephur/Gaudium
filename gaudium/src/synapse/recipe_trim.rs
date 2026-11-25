@@ -14,7 +14,8 @@
 //! The decisions are the verified core's (`verified/recipe_trim.bend`): what is protected (an
 //! entry this process holds, one used within the keep window, one dated ahead of the clock), the
 //! eviction order (least recently used first), when the walk removes the next entry (only while
-//! the cache is over its budget) and the count of the bytes still held. This file scans, reads
+//! the cache is over its budget), what the second look at an entry's files makes of it (gone,
+//! kept or removed) and the count of the bytes still held. This file scans, reads
 //! times and removes files.
 //!
 //! Running beside a server on the same directory is safe: a trim that removes an entry a load is
@@ -31,7 +32,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::synapse::recipe_cache::{in_use_registry, refresh_recency, RECIPE_EXT, SHA256_EXT};
 use crate::verified::{
     rt_after, rt_count_add, rt_entry_bytes, rt_evict_before, rt_gone_bytes, rt_last_used,
-    rt_may_remove_recipe, rt_protected, rt_should_evict,
+    rt_may_remove_recipe, rt_protected, rt_recheck, rt_recheck_gone, rt_recheck_removes,
+    rt_should_evict,
 };
 
 /// Default keep window of `--cache-keep-days`, in days.
@@ -354,7 +356,16 @@ pub(crate) fn trim_at(
         );
         let gone_bytes =
             |r: &Removal, m: &Removal| rt_gone_bytes(r_bytes, r.gone(), m_bytes, m.gone());
-        if fresh.recipe.is_none() && fresh.sidecar.is_none() {
+        // the times as they are now decide, not the scan's
+        let protected = rt_protected(fresh.last_used(), now, opts.keep_secs, in_use);
+        let recheck = rt_recheck(
+            held,
+            opts.target_bytes,
+            fresh.recipe.is_some(),
+            fresh.sidecar.is_some(),
+            protected,
+        );
+        if rt_recheck_gone(recheck) {
             // another process removed it since the scan: its bytes are gone, not freed here
             drop(held_set);
             let bytes = gone_bytes(&Removal::Absent, &Removal::Absent).ok_or_else(overflow)?;
@@ -362,9 +373,7 @@ pub(crate) fn trim_at(
             rep.gone_meanwhile += 1;
             continue;
         }
-        // the times as they are now decide, not the scan's
-        let protected = rt_protected(fresh.last_used(), now, opts.keep_secs, in_use);
-        if !rt_should_evict(held, opts.target_bytes, protected) {
+        if !rt_recheck_removes(recheck) {
             rep.protected_over_budget += 1;
             continue;
         }
@@ -767,6 +776,18 @@ mod tests {
         assert_eq!(fs::read(p).unwrap_err().kind(), io::ErrorKind::NotFound);
         assert!(cache.lookup_verified("s", &fp).is_none());
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn second_look_of_today() {
+        use crate::verified::RtRecheck::*;
+        // the laws bound this; what they leave open is pinned here: an entry with only its
+        // sidecar on disk goes like any other, and one that is kept is kept whatever is on disk
+        assert_eq!(rt_recheck(10, 5, false, true, false), RtRecheckRemove);
+        assert_eq!(rt_recheck(10, 5, true, true, false), RtRecheckRemove);
+        assert_eq!(rt_recheck(10, 5, false, true, true), RtRecheckKeep);
+        assert_eq!(rt_recheck(5, 5, true, false, false), RtRecheckKeep);
+        assert_eq!(rt_recheck(10, 5, false, false, true), RtRecheckGone);
     }
 
     #[test]
