@@ -762,10 +762,16 @@ c4187b93477568c1  ln_batch_lane_busy  law ln_batch_lane_busy : for + s : LaneSta
 # promise ln_batch_lane_busy: a free lane never takes part in a step.
 3f79c9a164d9c2e1  ln_busy_ignores_admit  law ln_busy_ignores_admit : for + s : LaneState { Bool.or ( ln_is_free ( s ) , ln_eq ( ln_step ( s , EvLnAdmit { } ) , s ) ) == True { } : Bool }
 # promise ln_busy_ignores_admit: a lane that holds a request is never given a second one: admission changes only a free lane.
+6a1b4d7cfae1a2d2  ln_cost_clock_moves  law ln_cost_clock_moves : for + n : Nat { Nat.is_gt ( ln_cost_clock_next ( n ) , n ) == True { } : Bool }
+# promise ln_cost_clock_moves: every launch moves the width model's clock forward, so an extra-time estimate not measured again grows older until it is dropped.
+e46f69e19eb31946  ln_cost_dropped_when_old  law ln_cost_dropped_when_old : for + a : Nat for + l : Nat for + k : Nat { ln_cost_kept ( Nat.add ( a , Nat.add ( l , k ) ) , a , l ) == False { } : Bool }
+# promise ln_cost_dropped_when_old: an extra-time estimate not measured again for `limit` launches is dropped, so its slot count's lanes can try the wide step again.
 cac00c761b09ef1b  ln_cost_extra_needs_narrow  law ln_cost_extra_needs_narrow : for + w : Nat { ln_cost_measures_extra ( False { } , w ) == False { } : Bool }
 # promise ln_cost_extra_needs_narrow: a wide slot's extra time is measured only against a measured narrow step of the same shape.
 912f909f195604b3  ln_cost_extra_needs_wide  law ln_cost_extra_needs_wide : for + k : Bool { ln_cost_measures_extra ( k , 0n ) == False { } : Bool }
 # promise ln_cost_extra_needs_wide: a launch with no wide slot never measures a wide slot's extra time (nothing to divide by).
+92b9a8965a554c89  ln_cost_kept_fresh  law ln_cost_kept_fresh : for + n : Nat for + l : Nat { ln_cost_kept ( n , n , 1n + l ) == True { } : Bool }
+# promise ln_cost_kept_fresh: an extra-time estimate measured in the launch just counted is kept, whenever estimates are kept at all.
 5c5b9131773f59ad  ln_cost_narrow_has_no_wide  law ln_cost_narrow_has_no_wide : for + w : Nat { ln_cost_measures_narrow ( 1n + w ) == False { } : Bool }
 # promise ln_cost_narrow_has_no_wide: a launch with a wide slot is never taken as the time of the narrow step.
 c385df6ef65fb240  ln_cost_own_kept  law ln_cost_own_kept : for + b : Nat for + c : Nat { ln_cost_takes ( b , c , b ) == False { } : Bool }
@@ -794,6 +800,8 @@ c4d0890ac614d952  ln_free_lane_routable  law ln_free_lane_routable : for + s : L
 # promise ln_free_lane_routable: every free lane is one routing may send a request to.
 be0740605e54f74d  ln_free_left_only_by_admit  law ln_free_left_only_by_admit : for + ev : LaneEvent { Bool.or ( ln_ev_is_admit ( ev ) , ln_is_free ( ln_step ( LnFree { } , ev ) ) ) == True { } : Bool }
 # promise ln_free_left_only_by_admit: a free lane leaves the free state only when a request is admitted to it.
+59b43359a29cb0f7  ln_goes_wide_at_needs_gain  law ln_goes_wide_at_needs_gain : for w : WideCost for + t : Nat for + s : Nat { ln_lane_goes_wide_at ( 0n , w , t , s ) == False { } : Bool }
+# promise ln_goes_wide_at_needs_gain: a lane that expects no more tokens from the wide step never goes wide, whatever its wide step costs.
 c6c45063af08372d  ln_goes_wide_needs_gain  law ln_goes_wide_needs_gain : for + d : Nat for + t : Nat for + s : Nat { ln_lane_goes_wide ( 0n , d , t , s ) == False { } : Bool }
 # promise ln_goes_wide_needs_gain: a lane that expects no more tokens from the wide step never goes wide.
 bb557c04a151fa5f  ln_host_tier_never_with_lanes  law ln_host_tier_never_with_lanes : for + k : Nat { ln_host_tier_ok ( Nat.add ( 2n , k ) , False { } ) == False { } : Bool }
@@ -818,6 +826,12 @@ d0f1610aab0ce1f9  ln_lane_verify_mme_only_given  law ln_lane_verify_mme_only_giv
 # promise ln_lane_width_is_asked: lanes step at a draft width that was asked for.
 678444468e66a037  ln_lane_width_wide_is_asked  law ln_lane_width_wide_is_asked : for + a : Nat for + b : Nat { Bool.or ( Nat.is_eq ( ln_lane_width_wide ( a , b ) , a ) , Nat.is_eq ( ln_lane_width_wide ( a , b ) , b ) ) == True { } : Bool }
 # promise ln_lane_width_wide_is_asked: the widest draft width a lane may verify at is one that was asked for.
+be680b4dc4fda51f  ln_lanes_arg_never_zero  law ln_lanes_arg_never_zero : for + m : Nat { ln_lanes_arg_ok ( 0n , m ) == False { } : Bool }
+# promise ln_lanes_arg_never_zero: the command line never accepts a count of zero lanes.
+304577934b52e62e  ln_lanes_arg_served_as_asked  law ln_lanes_arg_served_as_asked : for + n : Nat for + m : Nat { Bool.or ( Bool.not ( ln_lanes_arg_ok ( n , m ) ) , Nat.is_eq ( ln_served_lanes ( n , m , True { } ) , n ) ) == True { } : Bool }
+# promise ln_lanes_arg_served_as_asked: a lane count the command line accepts is the count a model whose engine and drafter have batched steps is served with.
+550e9897c1d4b4ad  ln_lanes_arg_within_max  law ln_lanes_arg_within_max : for + m : Nat for + k : Nat { ln_lanes_arg_ok ( Nat.add ( m , 1n + k ) , m ) == False { } : Bool }
+# promise ln_lanes_arg_within_max: the command line never accepts more lanes than the batched steps are built for.
 3ba7a01ca8594135  ln_lanes_fit_fits  law ln_lanes_fit_fits : for + bp : Nat for + sh : Nat for + u : Nat { Bool.or ( Nat.is_lt ( u , sh ) , ln_plan_fits ( ln_lanes_fit ( 1n + bp , sh , u ) , 1n + bp , sh , u ) ) == True { } : Bool }
 # promise ln_lanes_fit_fits: the lane count a refused plan reports as fitting does fit, whenever the shared part does.
 af6ef3a569dc3bf7  ln_lanes_need_drafter  law ln_lanes_need_drafter : for + e : Bool for + d : LaneDrafter for + c : Bool { Bool.and ( ln_lanes_ok ( e , d , c ) , Bool.not ( ln_drafter_ok ( d ) ) ) == False { } : Bool }
@@ -878,6 +892,8 @@ e6d2224aaf980fef  ln_plan_counts_shared  law ln_plan_counts_shared : for + n : N
 # promise ln_post_call_opens_with_slot: a call of the output norm that a slot opens holds exactly that slot's rows.
 46925de39c5f3fe2  ln_post_call_rows_within  law ln_post_call_rows_within : for + a : Nat for + w : Nat for + l : Nat { Bool.or ( ln_post_call_opens ( a , w , l ) , Nat.is_le ( ln_post_call_rows ( a , w , l ) , l ) ) == True { } : Bool }
 # promise ln_post_call_rows_within: a call of the output norm that a slot joined never holds more rows than the limit.
+329cf2f9ec2b1d05  ln_prefix_arg_within_max  law ln_prefix_arg_within_max : for + m : Nat for + k : Nat { ln_prefix_arg_ok ( Nat.add ( m , 1n + k ) , m ) == False { } : Bool }
+# promise ln_prefix_arg_within_max: the command line never accepts more kept prefix positions than its bound.
 4daa72327243e704  ln_prefix_per_lane_within_grant  law ln_prefix_per_lane_within_grant : for + g : Nat for + np : Nat { Nat.is_le ( Nat.mul ( ln_prefix_per_lane ( g , 1n + np ) , 1n + np ) , g ) == True { } : Bool }
 # promise ln_prefix_per_lane_within_grant: the lanes together never get more kept prefix positions than were granted for them.
 c06abd2451430893  ln_queue_ahead_fits  law ln_queue_ahead_fits : for + w : Bool for + s : Bool { ln_queue_ahead ( w , s , False { } ) == False { } : Bool }
@@ -940,6 +956,10 @@ bfa338a9ab5398d1  ln_spec_batched_fits  law ln_spec_batched_fits : for + c : Nat
 # promise ln_step_chunks_cover_need: a batched step covers every chunk its slots need whenever a lane can hold them.
 a0c03e484928dc40  ln_step_chunks_within_lane  law ln_step_chunks_within_lane : for + need : Nat for + lc : Nat { Nat.is_le ( ln_step_chunks ( need , lc ) , lc ) == True { } : Bool }
 # promise ln_step_chunks_within_lane: a batched step never covers more chunks than a lane owns.
+70dc1ad3976b591e  ln_step_kept_not_bonus  law ln_step_kept_not_bonus : for + r : Nat for + e : Nat { Nat.is_lt ( ln_step_kept ( r , 1n + e ) , 1n + e ) == True { } : Bool }
+# promise ln_step_kept_not_bonus: the token a speculative step emits after its kept drafts is never counted as a kept draft.
+2b7561f7077ae224  ln_step_kept_within_drafted  law ln_step_kept_within_drafted : for + r : Nat for + e : Nat { Nat.is_le ( ln_step_kept ( r , e ) , ln_step_drafted ( r ) ) == True { } : Bool }
+# promise ln_step_kept_within_drafted: a speculative step never counts more kept drafts than drafts it verified.
 0c7b843488bcffde  ln_step_rows_in_ctx  law ln_step_rows_in_ctx : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_gt ( Nat.add ( c , n ) , m ) , Nat.is_le ( Nat.add ( c , ln_lane_step_rows ( g , n , w , r , c , m ) ) , m ) ) == True { } : Bool }
 # promise ln_step_rows_in_ctx: a lane never verifies rows past the end of its context in a batched step, whenever its narrow rows fit it.
 cd5590e07b5dcccf  ln_step_rows_in_ring  law ln_step_rows_in_ring : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_gt ( n , r ) , Nat.is_le ( ln_lane_step_rows ( g , n , w , r , c , m ) , r ) ) == True { } : Bool }
@@ -948,16 +968,38 @@ cd5590e07b5dcccf  ln_step_rows_in_ring  law ln_step_rows_in_ring : for + g : Boo
 # promise ln_step_rows_is_asked: a lane verifies at the narrow or at the wide width asked for, never at another.
 ad3088743b14ce44  ln_step_rows_unchosen_narrow  law ln_step_rows_unchosen_narrow : for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { ln_lane_step_rows ( False { } , n , w , r , c , m ) == n : Nat }
 # promise ln_step_rows_unchosen_narrow: a lane not chosen to go wide verifies at the narrow width.
+99a83cbabba09828  ln_tally_drafted_never_drops  law ln_tally_drafted_never_drops : for + d : Nat for + r : Nat { Nat.is_le ( d , ln_tally_drafted ( d , r ) ) == True { } : Bool }
+# promise ln_tally_drafted_never_drops: a request's count of verified drafts never goes back.
+3be077fe5f25de0a  ln_tally_kept_never_drops  law ln_tally_kept_never_drops : for + k : Nat for + r : Nat for + e : Nat { Nat.is_le ( k , ln_tally_kept ( k , r , e ) ) == True { } : Bool }
+# promise ln_tally_kept_never_drops: a request's count of kept drafts never goes back.
+39e4056282776247  ln_tally_kept_within_drafted  law ln_tally_kept_within_drafted : for + k : Nat for + d : Nat for + r : Nat for + e : Nat { Bool.or ( Nat.is_gt ( k , d ) , Nat.is_le ( ln_tally_kept ( k , r , e ) , ln_tally_drafted ( d , r ) ) ) == True { } : Bool }
+# promise ln_tally_kept_within_drafted: a lane's request never counts more kept drafts than drafts its steps verified.
 29a0d191c7382a25  ln_tier_record_void_after_write  law ln_tier_record_void_after_write : for + m : Nat for + e : Nat { ln_tier_record_trusted ( m , Nat.add ( m , 1n + e ) ) == False { } : Bool }
 # promise ln_tier_record_void_after_write: a lane never trusts its record of a host-RAM entry that was written again after it recorded it.
 2afe0b633b18c224  ln_tier_write_voids_earlier  law ln_tier_write_voids_earlier : for + m : Nat for + e : Nat { ln_tier_record_trusted ( m , ln_tier_write_count ( Nat.add ( m , e ) ) ) == False { } : Bool }
 # promise ln_tier_write_voids_earlier: a write into a host-RAM entry voids every lane's record of the entry taken before it.
 6fee86abb8400a0c  ln_unbatched_verify_no_lanes  law ln_unbatched_verify_no_lanes : for + d : Bool { ln_drafter_ok ( ln_lane_drafter_of ( True { } , d , False { } ) ) == False { } : Bool }
 # promise ln_unbatched_verify_no_lanes: a load whose drafter verifies its rows in a form the batched speculative steps are not built for never gets lanes.
+c5d3b802711454af  ln_wide_cost_counts_chunk  law ln_wide_cost_counts_chunk : for + e : Nat for + n : Nat for + d : Nat for + c : Nat { ln_wide_cost_covers ( ln_wide_cost ( e , n , 1n + Nat.add ( n , d ) , True { } , c ) , c ) == True { } : Bool }
+# promise ln_wide_cost_counts_chunk: a wide step that takes a batched step into more K/V chunks is never costed below those chunks' measured time.
+4a0123e64dce595f  ln_wide_cost_counts_extra  law ln_wide_cost_counts_extra : for + e : Nat for + n : Nat for + w : Nat for + k : Bool for + c : Nat { ln_wide_cost_covers ( ln_wide_cost ( e , n , w , k , c ) , e ) == True { } : Bool }
+# promise ln_wide_cost_counts_extra: a lane's wide step is never costed below its wide slot's extra time.
 1d47a3ea1689a045  ln_wide_held_in_ring  law ln_wide_held_in_ring : for + n : Nat for + w : Nat for + r : Nat { Bool.or ( Nat.is_gt ( Nat.add ( n , 1n ) , r ) , Nat.is_le ( Nat.add ( ln_lane_wide_held ( n , w , r ) , 1n ) , r ) ) == True { } : Bool }
 # promise ln_wide_held_in_ring: a lane is never given a draft width whose verify rows its state rings cannot hold, whenever they hold the narrow width's.
 d460c8070aa7e22e  ln_wide_held_is_asked  law ln_wide_held_is_asked : for + n : Nat for + w : Nat for + r : Nat { Bool.or ( Nat.is_eq ( ln_lane_wide_held ( n , w , r ) , n ) , Nat.is_eq ( ln_lane_wide_held ( n , w , r ) , w ) ) == True { } : Bool }
 # promise ln_wide_held_is_asked: the widest width a lane is given is one of the widths asked for.
+ee4d7d07db0e432e  ln_wide_unknown_chunk_narrow  law ln_wide_unknown_chunk_narrow : for + g : Nat for + e : Nat for + n : Nat for + d : Nat for + c : Nat for + t : Nat for + s : Nat { ln_lane_goes_wide_at ( g , ln_wide_cost ( e , n , 1n + Nat.add ( n , d ) , False { } , c ) , t , s ) == False { } : Bool }
+# promise ln_wide_unknown_chunk_narrow: a lane never goes wide into K/V chunks whose cost the model has not measured.
+dfa1c1aa4e1c5269  ln_wt_chunk_sound  law ln_wt_chunk_sound : for t : WidthTally for + m : Bool { Bool.or ( Bool.not ( ln_wt_sound ( t ) ) , ln_wt_sound ( ln_wt_chunk ( t , m ) ) ) == True { } : Bool }
+# promise ln_wt_chunk_sound: a chunk choice never leaves the width report with more choices kept narrow unmeasured than chunk choices.
+1e5b52891a88effa  ln_wt_dropped_never_drops  law ln_wt_dropped_never_drops : for t : WidthTally for + n : Nat { Nat.is_le ( ln_wt_dropped_of ( t ) , ln_wt_dropped_of ( ln_wt_dropped ( t , n ) ) ) == True { } : Bool }
+# promise ln_wt_dropped_never_drops: the width report's count of dropped estimates never goes back within a report.
+83ce339767d0cb8d  ln_wt_empty_sound  law ln_wt_empty_sound : { ln_wt_sound ( ln_wt_empty ( ) ) == True { } : Bool }
+# promise ln_wt_empty_sound: a width report starts with counts that hold together.
+97b56b556d9bfaa6  ln_wt_launch_counted  law ln_wt_launch_counted : for t : WidthTally for + b : Nat for + k : Nat { Nat.is_gt ( ln_wt_launches_of ( ln_wt_launch ( t , b , k ) ) , ln_wt_launches_of ( t ) ) == True { } : Bool }
+# promise ln_wt_launch_counted: every launch is counted in the width report.
+1bd69633d9e76989  ln_wt_launch_sound  law ln_wt_launch_sound : for t : WidthTally for + b : Nat for + k : Nat { Bool.or ( Bool.not ( ln_wt_sound ( t ) ) , ln_wt_sound ( ln_wt_launch ( t , b , k ) ) ) == True { } : Bool }
+# promise ln_wt_launch_sound: a launch never leaves the width report with more wide slot steps than slot steps, or more launches with a wide slot than launches.
 f8533147dc62d652  ln_younger_waiter_never_blocks  law ln_younger_waiter_never_blocks : for + d : Bool for + r : Nat for + e : Nat { ln_admission_blocked ( d , Nat.add ( r , e ) , r ) == False { } : Bool }
 # promise ln_younger_waiter_never_blocks: a waiter that arrived after a session's next request never blocks its admission.
 1d7a0b64d1763db8  ls_hello_byte_recognised  law ls_hello_byte_recognised : { ls_is_hello ( 22n ) == True { } : Bool }

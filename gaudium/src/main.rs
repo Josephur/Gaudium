@@ -1053,7 +1053,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                 prefix_slots = s
                     .parse()
                     .ok()
-                    .filter(|&n| n <= MAX_PREFIX_SLOTS)
+                    .filter(|&n| gaudium::verified::ln_prefix_arg_ok(n, MAX_PREFIX_SLOTS))
                     .ok_or_else(|| {
                         format!("invalid --prefix-cache '{s}' (0..={MAX_PREFIX_SLOTS} positions)")
                     })?;
@@ -2542,7 +2542,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 prefix_slots = s
                     .parse()
                     .ok()
-                    .filter(|&n| n <= MAX_PREFIX_SLOTS)
+                    .filter(|&n| gaudium::verified::ln_prefix_arg_ok(n, MAX_PREFIX_SLOTS))
                     .ok_or_else(|| {
                         format!("invalid --prefix-cache '{s}' (0..={MAX_PREFIX_SLOTS} positions)")
                     })?;
@@ -2552,7 +2552,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 parallel = s
                     .parse()
                     .ok()
-                    .filter(|n| (1..=gaudium::engine::MAX_LANES).contains(n))
+                    .filter(|&n| gaudium::verified::ln_lanes_arg_ok(n, gaudium::engine::MAX_LANES))
                     .ok_or_else(|| {
                         format!(
                             "invalid --parallel '{s}' (1 to {} lanes)",
