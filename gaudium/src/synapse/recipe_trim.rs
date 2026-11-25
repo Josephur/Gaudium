@@ -31,9 +31,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::synapse::recipe_cache::{in_use_registry, refresh_recency, RECIPE_EXT, SHA256_EXT};
 use crate::verified::{
-    rt_after, rt_count_add, rt_entry_bytes, rt_evict_before, rt_gone_bytes, rt_last_used,
-    rt_may_remove_recipe, rt_off_disk_bytes, rt_on_disk_bytes, rt_protected, rt_recheck,
-    rt_recheck_gone, rt_recheck_removes, rt_should_evict,
+    rt_after, rt_count_add, rt_entry_bytes, rt_evict_before, rt_gone_after, rt_gone_bytes,
+    rt_last_used, rt_may_remove_recipe, rt_off_disk_bytes, rt_on_disk_bytes, rt_protected,
+    rt_recheck, rt_recheck_gone, rt_recheck_removes, rt_should_evict,
 };
 
 /// Default keep window of `--cache-keep-days`, in days.
@@ -365,8 +365,6 @@ fn walk(
             seen.recipe.map_or(0, |f| f.bytes),
             seen.sidecar.map_or(0, |f| f.bytes),
         );
-        let gone_bytes =
-            |r: &Removal, m: &Removal| rt_gone_bytes(r_bytes, r.gone(), m_bytes, m.gone());
         // the times as they are now decide, not the scan's
         let protected = rt_protected(fresh.last_used(), now, opts.keep_secs, in_use);
         let (recipe_on_disk, meta_on_disk) = (fresh.recipe.is_some(), fresh.sidecar.is_some());
@@ -377,7 +375,8 @@ fn walk(
             meta_on_disk,
             protected,
         );
-        // the files someone else removed since the scan: not held, whatever becomes of the entry
+        // the files someone else removed since the scan: not held (a removal counts them through
+        // `rt_gone_after`)
         let off_disk = rt_off_disk_bytes(r_bytes, recipe_on_disk, m_bytes, meta_on_disk)
             .ok_or_else(overflow)?;
         if rt_recheck_gone(recheck) {
@@ -411,7 +410,16 @@ fn walk(
             Removal::Kept
         };
         drop(held_set);
-        held = rt_after(held, gone_bytes(&recipe, &side).ok_or_else(overflow)?);
+        // gone afterwards: removed now, found gone, or not on disk at the second look (a recipe
+        // that was not tried because its sidecar stayed is still gone if someone else removed it)
+        let off = rt_gone_bytes(
+            r_bytes,
+            rt_gone_after(recipe_on_disk, recipe.gone()),
+            m_bytes,
+            rt_gone_after(meta_on_disk, side.gone()),
+        )
+        .ok_or_else(overflow)?;
+        held = rt_after(held, off);
         let freed = rt_gone_bytes(r_bytes, recipe.removed(), m_bytes, side.removed())
             .ok_or_else(overflow)?;
         rep.freed_bytes = add(rep.freed_bytes, freed)?;
@@ -867,6 +875,46 @@ mod tests {
         );
         assert!(real.errors.is_empty(), "{:?}", real.errors);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Someone else removed an entry's recipe after the scan, and this trim then fails to remove
+    /// its sidecar: the recipe is not tried, but its bytes are gone and come off the count.
+    #[cfg(unix)]
+    #[test]
+    fn failed_sidecar_removal_still_counts_a_recipe_already_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("sidefail");
+        let sha = 65;
+        entry(&d, "a", H1, 1000, NOW - 30 * DAY);
+        entry(&d, "b", H2, 1000, NOW - 20 * DAY);
+        let found = scan(&d).unwrap();
+        fs::remove_file(d.join(format!("a-{H1}.recipe"))).unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+        // a privileged user can remove files from a read-only directory: nothing to show then
+        let probe = d.join(format!("b-{H2}.sha256"));
+        let read_only = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(d.join("probe"))
+            .is_err();
+        let rep = walk(&d, &opts(0, 0), NOW, false, found);
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        let rep = rep.unwrap();
+        if read_only && probe.exists() {
+            assert_eq!(rep.errors.len(), 2, "{:?}", rep.errors);
+            assert_eq!(rep.evicted, 0);
+            // what is on disk: a's sidecar and b
+            assert_eq!(rep.bytes_after, sha + (1000 + sha));
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn gone_after_of_today() {
+        assert!(rt_gone_after(false, false));
+        assert!(rt_gone_after(false, true));
+        assert!(rt_gone_after(true, true));
+        assert!(!rt_gone_after(true, false));
     }
 
     #[test]
