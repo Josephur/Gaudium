@@ -120,11 +120,10 @@ gaudium --serve ... --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 ```
 
 `--tls-cert` is the server's PEM certificate with its chain, `--tls-key` its unencrypted PEM
-private key. HTTP and HTTPS then share the port: `http://host:port` and `https://host:port`
-both answer. The first byte of a connection says which protocol the client speaks (a TLS
-handshake record, or the first letter of an HTTP request), so existing clients and saved URLs go
-on working and no second port has to be opened. Without the two options the server is plain HTTP
-as before.
+private key. HTTP and HTTPS then share the port: the first byte of a connection says which
+protocol the client speaks (a TLS handshake record, or the first letter of an HTTP request), so
+no second port has to be opened, and a saved `http://host:port` address is sent on to
+`https://host:port` (below). Without the two options the server is plain HTTP as before.
 
 TLS comes from the system's OpenSSL 3 (`libssl.so.3`), loaded when it is asked for; the engine
 links no TLS library. On a machine without it the server starts, says that HTTPS is not
@@ -140,6 +139,45 @@ local network, `gaudium --make-cert` makes one.
 
 At every start with a certificate the server logs its end date, and warns from 30 days before
 it ends.
+
+### Plain HTTP beside HTTPS: `--tls-http`, `--hsts-max-age`
+
+While HTTPS is served, what a plain-HTTP request gets depends on where the client is and on
+`--tls-http`:
+
+| `--tls-http` | Client on another machine | Client on this machine's loopback interface |
+|---|---|---|
+| `redirect` (default) | sent to HTTPS | answered over plain HTTP |
+| `strict` | sent to HTTPS | sent to HTTPS |
+| `allow` | answered over plain HTTP | answered over plain HTTP |
+
+Loopback clients are answered by default because their traffic never leaves the machine, so
+plain HTTP there exposes nothing on the network, and local tools (scripts, health checks, a
+front end on the same machine) keep working without HTTPS. `strict` closes that too; `allow` is
+for tools on other machines that cannot speak HTTPS, and leaves their traffic readable on the
+network. Without HTTPS (no options, or no TLS library) plain HTTP is answered in every mode. The
+rule is `ls_plain_act` in `gaudium/verified/tls_listener.bend`.
+
+A client sent to HTTPS gets `308 Permanent Redirect` to the same host, port and target with
+scheme `https`, and the connection is closed. 308 keeps the method and the body, so a POST is
+repeated as a POST (a 301 lets clients turn it into a GET). The answer says `Cache-Control:
+no-store`, so a browser does not remember it if HTTPS is turned off again. The `Location` is
+built from the request's `Host` header, checked first: a DNS name, an IPv4 address or a
+bracketed IPv6 address, with an optional port; a `Host` without a port means the default HTTP
+port, 80, where HTTPS then answers too. A missing or malformed `Host`, or a target that is not a
+path, gets a 400 instead: nothing the client sent is reflected unchecked.
+
+Every response over HTTPS carries `Strict-Transport-Security: max-age=<secs>` (`--hsts-max-age`,
+default 86400, one day), without `includeSubDomains` or `preload`. A browser that has seen it uses
+https for that host name until it expires, on every port of the name, so other plain-HTTP
+services under the same name are reached over https by that browser too: keep the age short or
+give such services another name. Browsers ignore the header for an address (`https://192.0.2.7`)
+and over plain HTTP, where the server never sends it. `--hsts-max-age 0` tells browsers to forget
+an earlier one.
+
+A front end on another machine that ends TLS and forwards plain HTTP to a server that has the TLS
+options too would be redirected again and again: give such a server neither option (below), or
+`--tls-http allow`.
 
 ### A certificate for the local network: `--make-cert`
 
@@ -230,7 +268,8 @@ browser does not let an HTTPS page call it directly.
 
 A reverse proxy, a tunnel or a forwarded router port may end TLS and pass plain HTTP on. Give
 neither TLS option then. Nothing in the server is configured with the public name: the Web UI
-uses relative paths only, the server builds no URL from a name, no check pins `Host`, and the
+uses relative paths only, without the TLS options the server builds no URL from a name (the
+redirect above is the one that does), no check pins `Host`, and the
 proxy's site rule compares the request with itself (above).
 
 A front end usually cuts a connection that carries nothing for a while (60 to 100 s are common

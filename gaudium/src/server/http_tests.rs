@@ -315,6 +315,8 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             mcp_proxy: ProxyOptions::default(),
             tls_cert: None,
             tls_key: None,
+            tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
+            hsts_max_age: super::DEFAULT_HSTS_MAX_AGE,
             cache_ram_bytes: Some(0),
             parallel: 1,
             cache_trim: None,
@@ -1418,6 +1420,8 @@ fn served_engine_configuration_follows_the_server_options() {
         mcp_proxy: ProxyOptions::default(),
         tls_cert: None,
         tls_key: None,
+        tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
+        hsts_max_age: super::DEFAULT_HSTS_MAX_AGE,
         cache_ram_bytes: Some(0),
         parallel: 1,
         cache_trim: None,
@@ -1973,6 +1977,8 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         mcp_proxy: ProxyOptions::default(),
         tls_cert: None,
         tls_key: None,
+        tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
+        hsts_max_age: super::DEFAULT_HSTS_MAX_AGE,
         cache_ram_bytes: Some(0),
         parallel: 1,
         cache_trim: None,
@@ -2387,7 +2393,7 @@ fn http_and_https_share_the_port() {
         split_response(&raw)
     };
 
-    // plain HTTP goes on working beside HTTPS
+    // plain HTTP from this machine goes on working beside HTTPS (the default --tls-http)
     let (status, _, body) = plain("GET /health HTTP/1.1\r\nHost: localhost", "");
     assert_eq!((status, body.as_str()), (200, "{\"status\":\"ok\"}"));
 
@@ -2674,4 +2680,178 @@ fn lane_requests_run_through_the_lane_session() {
         s(&v, &["choices", "0", "message", "reasoning_content"]),
         "Delta."
     );
+}
+
+// ------------------------------------------------------------------------------------------------
+// Plain HTTP beside HTTPS: the redirect and Strict-Transport-Security
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+fn https_location_keeps_host_port_and_target_and_reflects_nothing_unchecked() {
+    let ok = |h: &str, t: &str| https_location(h, t);
+    assert_eq!(ok("gaudium.lan:8090", "/").as_deref(), Some("https://gaudium.lan:8090/"));
+    assert_eq!(
+        ok("Gaudium.LAN:8090", "/v1/models?x=1&y=%20").as_deref(),
+        Some("https://gaudium.lan:8090/v1/models?x=1&y=%20")
+    );
+    // no port: the client came in on the default HTTP port, where HTTPS answers too
+    assert_eq!(ok("192.0.2.7", "/a").as_deref(), Some("https://192.0.2.7:80/a"));
+    assert_eq!(ok("[2001:DB8::1]:9000", "/").as_deref(), Some("https://[2001:db8::1]:9000/"));
+    assert_eq!(ok("[::1]", "/").as_deref(), Some("https://[::1]:80/"));
+    assert_eq!(ok("host.example.", "/").as_deref(), Some("https://host.example.:80/"));
+    // a path that starts with two slashes stays a path of this host
+    assert_eq!(ok("h:1", "//evil.example/").as_deref(), Some("https://h:1//evil.example/"));
+    for bad_host in [
+        "",
+        " ",
+        "a b",
+        "evil.example/x",
+        "user@host",
+        "host:",
+        "host:0",
+        "host:65536",
+        "host:80:80",
+        "host:+80",
+        "-host",
+        "host-.example",
+        "a..b",
+        ".",
+        "[::1",
+        "[not-v6]:80",
+        "[fe80::1%25eth0]",
+        "[::1]80",
+        "h\r\nSet-Cookie: x=1",
+        "h\u{e9}",
+    ] {
+        assert_eq!(ok(bad_host, "/"), None, "{bad_host:?}");
+    }
+    let long_label = "a".repeat(64);
+    assert_eq!(ok(&long_label, "/"), None);
+    for bad_target in ["", "*", "http://h/x", "x", "/a b", "/a\r\nX: y", "/\u{7f}", "/\u{e9}"] {
+        assert_eq!(ok("h:1", bad_target), None, "{bad_target:?}");
+    }
+}
+
+/// The harness with an HTTPS listener (when the test certificate can be made) and `--tls-http`.
+fn mode_harness(
+    tls: Option<crate::tls::TlsServer>,
+    mode: crate::core::listener::PlainHttpMode,
+) -> Harness {
+    let Harness {
+        state,
+        replies,
+        prompts,
+        images,
+        tier,
+    } = net_harness(loopback_proxy(false), tls, None);
+    let mut st = Arc::try_unwrap(state).ok().expect("the harness owns its state");
+    st.cfg.tls_http = mode;
+    Harness {
+        state: Arc::new(st),
+        replies,
+        prompts,
+        images,
+        tier,
+    }
+}
+
+/// One plain-HTTP exchange with a server on `addr`: `(status, head in lower case, body)`.
+fn plain_at(addr: std::net::SocketAddr, head: &str, body: &str) -> (u16, String, String) {
+    let mut c = TcpStream::connect(addr).unwrap();
+    write!(c, "{head}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    let mut raw = Vec::new();
+    let _ = c.read_to_end(&mut raw);
+    split_response(&raw)
+}
+
+#[test]
+fn plain_http_is_sent_to_https_and_https_answers_carry_hsts() {
+    use crate::core::listener::PlainHttpMode::*;
+    let Some(tc) = crate::tls::test_util::test_cert(&["DNS:localhost", "IP:127.0.0.1"]) else {
+        return;
+    };
+    let client = crate::tls::TlsClient::new(Some(&tc.cert)).unwrap();
+
+    // strict: the test's client is on the loopback interface, and is redirected all the same
+    let h = mode_harness(Some(crate::tls::TlsServer::new(&tc.cert, &tc.key).unwrap()), LsHttpStrict);
+    let addr = serve(&h.state, 16);
+    let (status, head, body) = plain_at(addr, "GET /v1/models?a=1 HTTP/1.1\r\nHost: localhost:8090", "");
+    assert_eq!(status, 308, "{head}");
+    assert!(head.contains("\r\nlocation: https://localhost:8090/v1/models?a=1\r\n"), "{head}");
+    assert!(head.contains("connection: close") && head.contains("cache-control: no-store"), "{head}");
+    // nothing was served: no model list, no header of the server's answers
+    assert!(!body.contains("\"data\"") && !head.contains("access-control-allow-origin"), "{body}");
+    // the redirect is not marked as HSTS (a browser ignores the header over plain HTTP)
+    assert!(!head.contains("strict-transport-security"), "{head}");
+    // a POST keeps its method and body through a 308; the chat never runs
+    let (status, head, _) = plain_at(
+        addr,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nContent-Type: application/json",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
+    );
+    assert_eq!(status, 308, "{head}");
+    assert!(head.contains("location: https://127.0.0.1:8090/v1/chat/completions\r\n"), "{head}");
+    assert!(h.prompts.lock().unwrap().is_empty());
+    // a preflight, too, before it is answered
+    let (status, _, _) = plain_at(addr, "OPTIONS /v1/models HTTP/1.1\r\nHost: localhost:8090", "");
+    assert_eq!(status, 308);
+    // HEAD: the head of the redirect only
+    let (status, _, body) = plain_at(addr, "HEAD / HTTP/1.1\r\nHost: localhost:8090", "");
+    assert_eq!((status, body.as_str()), (308, ""));
+    // without a usable Host the client is refused, not sent anywhere
+    for bad in ["GET / HTTP/1.1", "GET / HTTP/1.1\r\nHost: a b", "GET / HTTP/1.1\r\nHost: x/y"] {
+        let (status, head, _) = plain_at(addr, bad, "");
+        assert_eq!(status, 400, "{bad}: {head}");
+        assert!(!head.contains("location:"), "{bad}: {head}");
+    }
+    // over TLS every answer carries Strict-Transport-Security, a stream included
+    let (status, head, _) =
+        tls_exchange(&client, addr, "localhost", "GET /health HTTP/1.1\r\nHost: localhost", "");
+    assert_eq!(status, 200);
+    assert!(head.contains("\r\nstrict-transport-security: max-age=86400\r\n"), "{head}");
+    assert!(!head.contains("includesubdomains") && !head.contains("preload"), "{head}");
+    h.script("</think>\n\nHi.");
+    let (status, head, _) = tls_exchange(
+        &client,
+        addr,
+        "localhost",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json",
+        "{\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
+    );
+    assert_eq!(status, 200);
+    assert!(head.contains("strict-transport-security: max-age=86400"), "{head}");
+    let (status, head, _) = tls_exchange(
+        &client,
+        addr,
+        "localhost",
+        "GET /cors-proxy?url=http%3A%2F%2F192.0.2.1%2F HTTP/1.1\r\nHost: localhost",
+        "",
+    );
+    assert_ne!(status, 200);
+    assert!(head.contains("strict-transport-security: max-age=86400"), "{head}");
+
+    // the default: a loopback client is answered over plain HTTP, without the header
+    let h = mode_harness(Some(crate::tls::TlsServer::new(&tc.cert, &tc.key).unwrap()), LsHttpRedirect);
+    let addr = serve(&h.state, 2);
+    let (status, head, body) = plain_at(addr, "GET /health HTTP/1.1\r\nHost: localhost", "");
+    assert_eq!((status, body.as_str()), (200, "{\"status\":\"ok\"}"));
+    assert!(!head.contains("strict-transport-security"), "{head}");
+
+    // allow: answered as well
+    let h = mode_harness(Some(crate::tls::TlsServer::new(&tc.cert, &tc.key).unwrap()), LsHttpAllow);
+    let addr = serve(&h.state, 1);
+    let (status, _, _) = plain_at(addr, "GET /health HTTP/1.1\r\nHost: localhost", "");
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn without_tls_plain_http_is_answered_in_every_mode() {
+    use crate::core::listener::PlainHttpMode::*;
+    for mode in [LsHttpRedirect, LsHttpAllow, LsHttpStrict] {
+        let h = mode_harness(None, mode);
+        let addr = serve(&h.state, 1);
+        let (status, head, _) = plain_at(addr, "GET /health HTTP/1.1\r\nHost: localhost", "");
+        assert_eq!(status, 200, "{mode:?}");
+        assert!(!head.contains("location:") && !head.contains("strict-transport-security"));
+    }
 }

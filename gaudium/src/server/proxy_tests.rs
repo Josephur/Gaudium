@@ -271,7 +271,8 @@ fn open(p: &Arc<McpProxy>, raw: String, key_ok: bool) -> TcpStream {
     let p = Arc::clone(p);
     thread::spawn(move || {
         let (tcp, _) = l.accept().unwrap();
-        let mut conn = Conn::open(tcp, None).expect("a plain connection");
+        let mut conn =
+            Conn::open(tcp, None, super::super::DEFAULT_HSTS_MAX_AGE).expect("a plain connection");
         let req = super::super::read_http_request(&mut conn)
             .unwrap()
             .expect("a request");
@@ -1637,7 +1638,8 @@ fn a_page_that_stops_reading(tls: Option<(TlsServer, crate::tls::TlsClient)>) {
     let handler = Arc::clone(&p);
     thread::spawn(move || {
         let (tcp, _) = l.accept().unwrap();
-        let mut conn = Conn::open(tcp, server.as_ref()).expect("a connection");
+        let mut conn = Conn::open(tcp, server.as_ref(), super::super::DEFAULT_HSTS_MAX_AGE)
+            .expect("a connection");
         let req = super::super::read_http_request(&mut conn)
             .unwrap()
             .expect("a request");
