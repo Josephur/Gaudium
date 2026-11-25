@@ -9,11 +9,13 @@
 //!     rusty_bends_build::verify_and_emit("verified");
 //! }
 
+pub mod coverage;
 pub mod emit;
 pub mod law_test;
 pub mod lock;
 pub mod mutate;
 
+pub use lock::LockUpdateMode;
 pub use mutate::MutateMode;
 
 use std::env;
@@ -41,6 +43,7 @@ impl VerdictMode {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Config {
     pub verified_dir: PathBuf,
     pub bend_bin: String,
@@ -52,12 +55,22 @@ pub struct Config {
     pub pinned_version: Option<String>,
     pub out_dir: PathBuf,
     pub allow_lock_update: bool,
+    pub lock_update: LockUpdateMode,
     pub emit_rust: bool,
     pub mutate_mode: MutateMode,
     pub list_laws: bool,
     /// `RUSTY_BENDS_LIST_PANICS=1`: print every checked-growth panic site as
     /// `function: op at file:line` (Issue #13).
     pub list_panics: bool,
+    /// `RUSTY_BENDS_LIST_COVERAGE=1`: print which emitted functions each law covers,
+    /// which emitted functions no law reaches, and which laws name only uncalled functions.
+    pub list_coverage: bool,
+    /// Optional crate root (`CARGO_MANIFEST_DIR`) scanned under `list_coverage` for `src/`,
+    /// `tests/`, and `benches/` call-site checks.
+    pub crate_root: Option<PathBuf>,
+    /// `RUSTY_BENDS_NO_CACHE=1`: bypass the incremental build cache in `OUT_DIR`
+    /// and re-run verification and code generation.
+    pub no_cache: bool,
 }
 
 impl Default for Config {
@@ -80,6 +93,13 @@ impl Default for Config {
         };
         let list_laws = env_flag("RUSTY_BENDS_LIST_LAWS");
         let list_panics = env_flag("RUSTY_BENDS_LIST_PANICS");
+        let list_coverage = env_flag("RUSTY_BENDS_LIST_COVERAGE");
+        let no_cache = env_flag("RUSTY_BENDS_NO_CACHE");
+        let crate_root = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+        let lock_update = env::var("RUSTY_BENDS_UPDATE_LAWS")
+            .map(|v| LockUpdateMode::parse(&v))
+            .unwrap_or(LockUpdateMode::None);
+        let allow_lock_update = lock_update == LockUpdateMode::All;
         Self {
             verified_dir: PathBuf::from("verified"),
             bend_bin: resolve_bend_bin(
@@ -96,11 +116,25 @@ impl Default for Config {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             out_dir: PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| "target".to_string())),
-            allow_lock_update: env::var("RUSTY_BENDS_UPDATE_LAWS").ok().as_deref() == Some("1"),
+            allow_lock_update,
+            lock_update,
             emit_rust: true,
             mutate_mode,
             list_laws,
             list_panics,
+            list_coverage,
+            crate_root,
+            no_cache,
+        }
+    }
+}
+
+impl Config {
+    fn effective_lock_update(&self) -> LockUpdateMode {
+        if self.allow_lock_update && self.lock_update == LockUpdateMode::None {
+            LockUpdateMode::All
+        } else {
+            self.lock_update.clone()
         }
     }
 }
@@ -182,21 +216,34 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_MUTATE");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_LAWS");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_PANICS");
+    println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_COVERAGE");
+    println!("cargo:rerun-if-env-changed=RUSTY_BENDS_NO_CACHE");
     println!("cargo:rerun-if-env-changed=BEND_BIN");
     println!("cargo:rerun-if-env-changed=BEND_PIN_VERSION");
+    println!("cargo:rerun-if-env-changed=BEND_CHECK_FLAG");
+    println!("cargo:rerun-if-env-changed=BEND_VERDICT_FLAG");
     println!("cargo:rerun-if-env-changed=BEND_VERDICT");
     println!("cargo:rerun-if-env-changed=BENDTT");
 
-    // Verify Bend CLI version pin if bend.pin or BEND_PIN_VERSION is configured
-    if let Some(expected_pin) = read_active_pin(cfg)? {
+    // Verify Bend CLI version pin if bend.pin or BEND_PIN_VERSION is configured,
+    // and capture the active Bend version so upgrades invalidate the build cache.
+    let bend_version = if let Some(expected_pin) = read_active_pin(cfg)? {
         let actual_ver = query_bend_version(&cfg.bend_bin)?;
         verify_bend_version_str(&expected_pin, &actual_ver)?;
-    }
+        Some(actual_ver)
+    } else {
+        query_bend_version(&cfg.bend_bin).ok()
+    };
 
-    run_with_checker(cfg, |file, has_laws| {
-        println!("cargo:rerun-if-changed={}", file.display());
-        verify_with_bend_cli(cfg, file, has_laws)
-    })
+    run_pipeline(
+        cfg,
+        bend_version.as_deref(),
+        has_verdict_runtime(),
+        |file, has_laws| {
+            println!("cargo:rerun-if-changed={}", file.display());
+            verify_with_bend_cli(cfg, file, has_laws)
+        },
+    )
 }
 
 /// Reads an active version pin from BEND_PIN_VERSION or non-comment lines in bend.pin.
@@ -277,10 +324,81 @@ fn query_bend_version(bend_bin: &str) -> Result<String, String> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictApplied {
+    Ran,
+    Skipped,
+    Off,
+}
+
+impl VerdictApplied {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ran => "ran",
+            Self::Skipped => "skipped",
+            Self::Off => "off",
+        }
+    }
+}
+
+fn expected_verdict_applied(cfg: &Config, verdict_runtime_available: bool) -> VerdictApplied {
+    if cfg.verdict_mode == VerdictMode::Off || cfg.verdict_flag.trim().is_empty() {
+        VerdictApplied::Off
+    } else if cfg.verdict_mode == VerdictMode::Auto && !verdict_runtime_available {
+        VerdictApplied::Skipped
+    } else {
+        VerdictApplied::Ran
+    }
+}
+
+fn sanitize_cache_field(s: &str) -> String {
+    s.replace(['\r', '\n'], " ").trim().to_string()
+}
+
+fn format_cache_stamp(
+    cfg: &Config,
+    files_hash: &str,
+    verdict: VerdictApplied,
+    bend_version: &str,
+) -> String {
+    format!(
+        "v3\nhash={files_hash}\nverdict={}\nbend_bin={}\nbend_version={}\ncheck_flag={}\nverdict_flag={}\n",
+        verdict.as_str(),
+        sanitize_cache_field(&cfg.bend_bin),
+        sanitize_cache_field(bend_version),
+        sanitize_cache_field(&cfg.check_flag),
+        sanitize_cache_field(&cfg.verdict_flag),
+    )
+}
+
+fn is_bend_cli_invocation_error(err: &str) -> bool {
+    err.starts_with("[E_BEND_MISSING]")
+        || is_missing_lean_error(err)
+        || err.contains("unknown option")
+        || err.contains("see bend --help")
+}
+
 /// Core pipeline with pluggable 'bend' runner for deterministic unit testing.
 pub fn run_with_checker<F>(cfg: &Config, mut checker: F) -> Result<Option<PathBuf>, String>
 where
     F: FnMut(&Path, bool) -> Result<(), String>,
+{
+    let runtime_ok = has_verdict_runtime();
+    let expected = expected_verdict_applied(cfg, runtime_ok);
+    run_pipeline(cfg, Some(""), runtime_ok, |file, has_laws| {
+        checker(file, has_laws)?;
+        Ok(expected)
+    })
+}
+
+fn run_pipeline<F>(
+    cfg: &Config,
+    bend_version: Option<&str>,
+    verdict_runtime_available: bool,
+    mut checker: F,
+) -> Result<Option<PathBuf>, String>
+where
+    F: FnMut(&Path, bool) -> Result<VerdictApplied, String>,
 {
     if !cfg.verified_dir.exists() {
         return Err(format!(
@@ -304,11 +422,16 @@ where
     let pre_locked_laws = lock::read_locked_law_names(&cfg.lock_file);
 
     // 1. Check AST/token-canonical LAWS lock (defer writing until Bend & mutation checks pass)
-    let lock_report = lock::check_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
+    let effective_lock_mode = cfg.effective_lock_update();
+    let lock_report =
+        lock::check_law_lock_with_mode(&cfg.lock_file, &bend_files, &effective_lock_mode)?;
     let law_count = lock_report.current.len();
 
     for w in &lock_report.warnings {
         println!("cargo:warning={w}");
+    }
+    if effective_lock_mode != LockUpdateMode::None && !lock_report.needs_write {
+        println!("cargo:warning=RustyBends lock: no lock changes to write");
     }
     if cfg.list_laws {
         let listing = lock::format_law_list(&lock_report.current);
@@ -317,21 +440,28 @@ where
         }
     }
 
-    // 2. Check incremental content-hash cache for fast no-op rebuilds
+    // 2. Check incremental build cache (includes file contents, verdict mode/status, flags, and bend version)
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
     let cache_file = cfg.out_dir.join("rusty-bends.cache");
     let verified_rs = cfg.out_dir.join("verified.rs");
     let combined_hash = hash_files(&bend_files)?;
+    let expected_verdict = expected_verdict_applied(cfg, verdict_runtime_available);
+    let expected_stamp =
+        bend_version.map(|ver| format_cache_stamp(cfg, &combined_hash, expected_verdict, ver));
 
-    let cache_hit = fs::read_to_string(&cache_file)
-        .map(|s| s.trim() == combined_hash)
-        .unwrap_or(false);
+    let cache_hit = !cfg.no_cache
+        && expected_stamp.as_ref().is_some_and(|stamp| {
+            fs::read_to_string(&cache_file)
+                .map(|s| s == *stamp)
+                .unwrap_or(false)
+        });
     if cache_hit
         && (!cfg.emit_rust || verified_rs.exists())
         && !lock_report.needs_write
         && lock_report.new_names.is_empty()
         && cfg.mutate_mode == MutateMode::NewOnly
         && !cfg.list_panics
+        && !cfg.list_coverage
     {
         return Ok(if cfg.emit_rust {
             Some(verified_rs)
@@ -350,6 +480,7 @@ where
         file_sources.push((file, text));
     }
 
+    let mut saw_verdict_skipped = false;
     for (file, text) in &file_sources {
         let is_laws_file = file
             .file_name()
@@ -358,28 +489,48 @@ where
             .unwrap_or(false);
         let has_laws = is_laws_file || !lock::extract_laws_from_source(text).is_empty();
 
-        if let Err(err) = checker(file, has_laws) {
-            let file_laws = law_test::parse_laws(text);
-            if !file_laws.is_empty() {
-                let target_names = match law_test::extract_failed_def_name(&err) {
-                    Some(failed) if file_laws.iter().any(|l| l.name == failed) => vec![failed],
-                    _ => file_laws.iter().map(|l| l.name.clone()).collect(),
-                };
-                if let Ok(outcomes) = law_test::evaluate_laws_for_counterexamples(
-                    &combined_source,
-                    &target_names,
-                    &cfg.out_dir,
-                ) {
-                    let diagnosis =
-                        law_test::format_counterexample_diagnosis(&outcomes, &pre_locked_laws);
-                    if !diagnosis.is_empty() {
-                        return Err(format!("{diagnosis}\n\n{err}"));
+        match checker(file, has_laws) {
+            Ok(VerdictApplied::Skipped) => {
+                saw_verdict_skipped = true;
+            }
+            Ok(VerdictApplied::Ran | VerdictApplied::Off) => {}
+            Err(err) => {
+                if !is_bend_cli_invocation_error(&err) {
+                    let file_laws = law_test::parse_laws(text);
+                    if !file_laws.is_empty() {
+                        let target_names = match law_test::extract_failed_def_name(&err) {
+                            Some(failed) if file_laws.iter().any(|l| l.name == failed) => {
+                                vec![failed]
+                            }
+                            _ => file_laws.iter().map(|l| l.name.clone()).collect(),
+                        };
+                        if let Ok(outcomes) = law_test::evaluate_laws_for_counterexamples(
+                            &combined_source,
+                            &target_names,
+                            &cfg.out_dir,
+                        ) {
+                            let diagnosis = law_test::format_counterexample_diagnosis(
+                                &outcomes,
+                                &pre_locked_laws,
+                            );
+                            if !diagnosis.is_empty() {
+                                return Err(format!("{diagnosis}\n\n{err}"));
+                            }
+                        }
                     }
                 }
+                return Err(err);
             }
-            return Err(err);
         }
     }
+    let applied_verdict =
+        if cfg.verdict_mode == VerdictMode::Off || cfg.verdict_flag.trim().is_empty() {
+            VerdictApplied::Off
+        } else if saw_verdict_skipped {
+            VerdictApplied::Skipped
+        } else {
+            VerdictApplied::Ran
+        };
 
     // 4. Mutation-check every unlocked/new law before sealing (and report all locked laws under RUSTY_BENDS_MUTATE=all)
     let mut_summary = mutate::run_mutation_checks(
@@ -395,6 +546,9 @@ where
     // 5. Persist rusty-bends.lock only after Bend proofs and mutation checks succeed
     if lock_report.needs_write {
         lock::write_law_lock(&cfg.lock_file, &lock_report)?;
+        for note in lock::format_lock_update_notes(&lock_report.update_summary) {
+            println!("cargo:warning={note}");
+        }
     }
 
     // 6. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
@@ -412,6 +566,12 @@ where
             println!("cargo:warning={line}");
         }
     }
+    if cfg.list_coverage {
+        let cov = coverage::analyze_coverage(&combined_source, cfg.crate_root.as_deref())?;
+        for line in coverage::format_coverage_report(&cov) {
+            println!("cargo:warning={line}");
+        }
+    }
     let emitted_path = match summary {
         Some(summary) if cfg.emit_rust => {
             fs::write(&verified_rs, summary.rust_source).map_err(|e| e.to_string())?;
@@ -420,36 +580,49 @@ where
         _ => None,
     };
 
-    // 7. Persist passing content hash
-    fs::write(&cache_file, &combined_hash).map_err(|e| e.to_string())?;
+    // 7. Persist passing build cache stamp (skip if Bend version could not be read so stale runs never hit)
+    if let Some(ver) = bend_version {
+        let stamp = format_cache_stamp(cfg, &combined_hash, applied_verdict, ver);
+        fs::write(&cache_file, stamp).map_err(|e| e.to_string())?;
+    }
     Ok(emitted_path)
 }
 
-fn verify_with_bend_cli(cfg: &Config, file: &Path, has_laws: bool) -> Result<(), String> {
+fn verify_with_bend_cli(
+    cfg: &Config,
+    file: &Path,
+    has_laws: bool,
+) -> Result<VerdictApplied, String> {
     run_bend_step(&cfg.bend_bin, &cfg.check_flag, file)?;
-    if !has_laws || cfg.verdict_flag.trim().is_empty() || cfg.verdict_mode == VerdictMode::Off {
-        return Ok(());
+    if cfg.verdict_mode == VerdictMode::Off || cfg.verdict_flag.trim().is_empty() {
+        return Ok(VerdictApplied::Off);
+    }
+    if !has_laws {
+        return Ok(expected_verdict_applied(cfg, has_verdict_runtime()));
     }
 
     match cfg.verdict_mode {
-        VerdictMode::Off => Ok(()),
-        VerdictMode::Require => run_bend_step(&cfg.bend_bin, &cfg.verdict_flag, file),
+        VerdictMode::Off => Ok(VerdictApplied::Off),
+        VerdictMode::Require => {
+            run_bend_step(&cfg.bend_bin, &cfg.verdict_flag, file)?;
+            Ok(VerdictApplied::Ran)
+        }
         VerdictMode::Auto => {
             if !has_verdict_runtime() {
                 println!(
                     "cargo:warning=RustyBends: {} passed --check-only; skipping optional --verdict Lean cross-check (install Lean/elan or set BEND_VERDICT=require in CI).",
                     file.display()
                 );
-                return Ok(());
+                return Ok(VerdictApplied::Skipped);
             }
             match run_bend_step(&cfg.bend_bin, &cfg.verdict_flag, file) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(VerdictApplied::Ran),
                 Err(err) if is_missing_lean_error(&err) => {
                     println!(
                         "cargo:warning=RustyBends: {} passed --check-only; skipping optional --verdict (Lean kernel unavailable). Set BEND_VERDICT=require to enforce.",
                         file.display()
                     );
-                    Ok(())
+                    Ok(VerdictApplied::Skipped)
                 }
                 Err(err) => Err(err),
             }
@@ -694,10 +867,14 @@ mod tests {
             pinned_version: None,
             out_dir: root.join("out"),
             allow_lock_update: false,
+            lock_update: LockUpdateMode::None,
             emit_rust: true,
             mutate_mode: MutateMode::NewOnly,
             list_laws: false,
             list_panics: false,
+            list_coverage: false,
+            crate_root: Some(root.to_path_buf()),
+            no_cache: false,
         }
     }
 
@@ -1432,6 +1609,416 @@ def chunk_in_bounds(t, chunks, per, h):
             String::from_utf8_lossy(&run_tests.stdout),
             String::from_utf8_lossy(&run_tests.stderr)
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn euclidean_division_lemmas_verify_with_verdict_and_run_rust_tests() {
+        let root = temp_workspace("issue22_euclidean");
+        let _ = write_nat_lemmas(root.join("verified"))
+            .expect("write_nat_lemmas should populate verified/");
+        let grid_file = root.join("verified/grid.bend");
+        fs::write(
+            &grid_file,
+            r#"import Base
+import nat_lemmas.bend as L
+
+def slot_of(+i: Nat) -> Nat:
+  Nat.mod(i, 4n)
+
+def row_of(+i: Nat) -> Nat:
+  Nat.div(i, 4n)
+
+def make_index(+q: Nat, +r: Nat) -> Nat:
+  Nat.add(Nat.mul(q, 4n), r)
+
+# promise: the slot of row q and slot r (r < 4) is r
+law slot_of_split:
+  for +q: Nat
+  for +r: Nat
+  for h: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {slot_of(make_index(q, r)) == r : Nat}
+
+def slot_of_split(q, r, h):
+  L.nat_mod_split(q, r, 3n, h)
+
+# promise: the row of row q and slot r (r < 4) is q
+law row_of_split:
+  for q: Nat
+  for r: Nat
+  for h: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {row_of(make_index(q, r)) == q : Nat}
+
+def row_of_split(q, r, h):
+  L.nat_div_split(q, r, 3n, h)
+
+# promise: an index below four keeps its value as its slot
+law slot_of_small:
+  for a: Nat
+  for h: {Nat.is_lt(a, 4n) == True{} : Bool}
+  {slot_of(a) == a : Nat}
+
+def slot_of_small(a, h):
+  L.nat_mod_small(a, 3n, h)
+
+# promise: an index below four has row zero
+law row_of_small:
+  for a: Nat
+  for h: {Nat.is_lt(a, 4n) == True{} : Bool}
+  {row_of(a) == 0n : Nat}
+
+def row_of_small(a, h):
+  L.nat_div_small(a, 3n, h)
+
+# promise: two indices with the same row and slot are equal
+law eq_of_row_and_slot:
+  for a: Nat
+  for c: Nat
+  for hq: {row_of(a) == row_of(c) : Nat}
+  for hr: {slot_of(a) == slot_of(c) : Nat}
+  {a == c : Nat}
+
+def eq_of_row_and_slot(a, c, hq, hr):
+  L.nat_eq_of_div_mod(a, c, 3n, hq, hr)
+
+# promise: row q below n with slot r below 4 stays below n * 4
+law split_in_bounds:
+  for q: Nat
+  for r: Nat
+  for n: Nat
+  for hq: {Nat.is_lt(q, n) == True{} : Bool}
+  for hr: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {Nat.is_lt(make_index(q, r), Nat.mul(n, 4n)) == True{} : Bool}
+
+def split_in_bounds(q, r, n, hq, hr):
+  L.nat_split_lt(q, r, n, 3n, hq, hr)
+
+# promise: multiples of four have slot zero
+law aligned_slot_zero:
+  for q: Nat
+  {slot_of(Nat.mul(q, 4n)) == 0n : Nat}
+
+def aligned_slot_zero(q):
+  L.nat_mod_mul(q, 3n)
+
+# promise: dividing a multiple of four recovers the row
+law aligned_row:
+  for q: Nat
+  {row_of(Nat.mul(q, 4n)) == q : Nat}
+
+def aligned_row(q):
+  L.nat_div_mul(q, 3n)
+
+# promise: the aligned-down index never exceeds the original index
+law align_down_le:
+  for a: Nat
+  {Nat.is_le(Nat.mul(row_of(a), 4n), a) == True{} : Bool}
+
+def align_down_le(a):
+  L.nat_align_down_le(a, 3n)
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = if has_verdict_runtime() {
+            VerdictMode::Require
+        } else {
+            VerdictMode::Off
+        };
+
+        let out_rs = run(&cfg)
+            .expect("Euclidean division laws must pass bend, verdict, mutation check, and emit")
+            .expect("expected emitted verified.rs");
+        let emitted = fs::read_to_string(&out_rs).unwrap();
+        assert!(emitted.contains("pub fn slot_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn row_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn make_index("), "got:\n{emitted}");
+        for leaked in [
+            "nat_mod_split",
+            "nat_div_split",
+            "nat_split_unique_q",
+            "nat_split_unique_r",
+            "nat_eq_of_div_mod",
+            "nat_align_down_le",
+        ] {
+            assert!(
+                !emitted.contains(leaked),
+                "emitted leaked proof helper {leaked}:\n{emitted}"
+            );
+        }
+
+        let bin_path = root.join("out/test_bin");
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&out_rs)
+            .output()
+            .expect("rustc --test must execute");
+        assert!(
+            compile.status.success(),
+            "rustc --test failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_tests = Command::new(&bin_path)
+            .output()
+            .expect("generated law test binary must run");
+        assert!(
+            run_tests.status.success(),
+            "generated law tests failed:\n{}{}",
+            String::from_utf8_lossy(&run_tests.stdout),
+            String::from_utf8_lossy(&run_tests.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_rejects_verdict_require_after_off_or_skipped_build_and_tracks_flags() {
+        let root = temp_workspace("issue18_cache");
+        let _ = write_nat_lemmas(root.join("verified")).unwrap();
+        let ledger = root.join("verified/ledger.bend");
+        fs::write(
+            &ledger,
+            r#"import Base
+import nat_lemmas.bend as L
+
+def total_items(+a: Nat, +b: Nat) -> Nat:
+  Nat.add(a, b)
+
+def bump(+n: Nat) -> Nat:
+  1n+n
+
+# promise: the total never drops below the first delivery
+law total_covers_first:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_le(a, total_items(a, b)) == True{} : Bool}
+
+def total_covers_first(a, b):
+  L.nat_add_le_r(a, b)
+
+# promise: a write always changes the stamp
+law bump_changes:
+  for +m: Nat
+  {Nat.is_eq(m, bump(m)) == False{} : Bool}
+
+def bump_changes(m):
+  match m:
+    case 0n:
+      {==}
+    case 1n+mp:
+      bump_changes(mp)
+"#,
+        )
+        .unwrap();
+
+        let real_bend = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+
+        // 1. Failing --verdict invocation (unknown flag) fails directly without misleading proof note.
+        let mut bad_req = make_cfg(&root);
+        bad_req.bend_bin = real_bend.clone();
+        bad_req.verdict_mode = VerdictMode::Require;
+        bad_req.verdict_flag = "--no-such-flag".to_string();
+        let err1 = run(&bad_req).expect_err("unknown verdict flag must fail");
+        assert!(err1.contains("unknown option --no-such-flag"), "{err1}");
+        assert!(
+            !err1.contains("the proof is what failed"),
+            "CLI error must not misdiagnose proof failure:\n{err1}"
+        );
+
+        // 2. BEND_VERDICT=off succeeds and records verdict=off in cache.
+        let mut off_cfg = make_cfg(&root);
+        off_cfg.bend_bin = real_bend.clone();
+        off_cfg.verdict_mode = VerdictMode::Off;
+        run(&off_cfg).expect("off build passes");
+        let cache_off = fs::read_to_string(root.join("out/rusty-bends.cache")).unwrap();
+        assert!(cache_off.contains("verdict=off\n"), "{cache_off}");
+
+        // 3. Subsequent BEND_VERDICT=require with bad flag must NOT hit cache.
+        let err2 = run(&bad_req).expect_err("require build after off build must miss cache");
+        assert!(err2.contains("unknown option --no-such-flag"), "{err2}");
+
+        // 4. Skipped Auto verdict (no Lean runtime) followed by Require must also miss cache.
+        let mut auto_cfg = make_cfg(&root);
+        auto_cfg.verdict_mode = VerdictMode::Auto;
+        let mut calls = 0usize;
+        run_pipeline(&auto_cfg, Some("bend 2.0.40"), false, |_file, _has_laws| {
+            calls += 1;
+            Ok(VerdictApplied::Skipped)
+        })
+        .expect("auto skipped build passes");
+        assert_eq!(calls, 2);
+        let cache_skip = fs::read_to_string(root.join("out/rusty-bends.cache")).unwrap();
+        assert!(cache_skip.contains("verdict=skipped\n"), "{cache_skip}");
+
+        let mut req_cfg = make_cfg(&root);
+        req_cfg.verdict_mode = VerdictMode::Require;
+        run_pipeline(&req_cfg, Some("bend 2.0.40"), true, |_file, _has_laws| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .expect("require build runs checker");
+        assert_eq!(calls, 4, "require after skipped must miss cache");
+
+        // Repeating Require with identical config hits cache.
+        run_pipeline(&req_cfg, Some("bend 2.0.40"), true, |_file, _has_laws| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .expect("matching require build hits cache");
+        assert_eq!(calls, 4);
+
+        // 5. Changing flags, bend_bin, bend_version, or no_cache misses cache.
+        let mut diff_check = req_cfg.clone();
+        diff_check.check_flag = "--check-only-alt".to_string();
+        run_pipeline(&diff_check, Some("bend 2.0.40"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 6);
+
+        let mut diff_verdict_flag = req_cfg.clone();
+        diff_verdict_flag.verdict_flag = "--verdict-alt".to_string();
+        run_pipeline(&diff_verdict_flag, Some("bend 2.0.40"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 8);
+
+        let mut diff_bin = req_cfg.clone();
+        diff_bin.bend_bin = "/opt/bend".to_string();
+        run_pipeline(&diff_bin, Some("bend 2.0.40"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 10);
+
+        run_pipeline(&diff_bin, Some("bend 2.0.41"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 12);
+
+        let mut no_cache_cfg = diff_bin.clone();
+        no_cache_cfg.no_cache = true;
+        run_pipeline(&no_cache_cfg, Some("bend 2.0.41"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 14);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn selective_lock_update_blocks_vacuous_named_law_without_touching_lock() {
+        let root = temp_workspace("issue17_e2e");
+        let core = root.join("verified/core.bend");
+        fs::write(
+            &core,
+            "import Base\n\ndef inc(+n: Nat) -> Nat:\n  Nat.add(n, 1n)\n\n# promise: zero increments to one\nlaw inc_zero:\n  {inc(0n) == 1n : Nat}\n",
+        )
+        .unwrap();
+
+        let cfg = make_cfg(&root);
+        run_with_checker(&cfg, |_, _| Ok(())).expect("initial lock creation");
+        let original_lock = fs::read_to_string(&cfg.lock_file).unwrap();
+
+        fs::write(
+            &core,
+            "import Base\n\ndef inc(+n: Nat) -> Nat:\n  Nat.add(n, 1n)\n\n# promise: zero increments to one\nlaw inc_zero:\n  {inc(0n) == 1n : Nat}\n\n# promise: vacuous identity\nlaw inc_refl:\n  for +n: Nat\n  {inc(n) == inc(n) : Nat}\n",
+        )
+        .unwrap();
+
+        let mut seal_vacuous = make_cfg(&root);
+        seal_vacuous.lock_update = LockUpdateMode::parse("inc_refl");
+        let err = run_with_checker(&seal_vacuous, |_, _| Ok(()))
+            .expect_err("vacuous named law must fail before lock write");
+        assert!(err.contains("E_LAW_VACUOUS"), "{err}");
+        assert_eq!(fs::read_to_string(&cfg.lock_file).unwrap(), original_lock);
+
+        // Replace vacuous law with two valid new laws and seal only one by name.
+        fs::write(
+            &core,
+            "import Base\n\ndef inc(+n: Nat) -> Nat:\n  Nat.add(n, 1n)\n\n# promise: zero increments to one\nlaw inc_zero:\n  {inc(0n) == 1n : Nat}\n\n# promise: one increments to two\nlaw inc_one:\n  {inc(1n) == 2n : Nat}\n\n# promise: two increments to three\nlaw inc_two:\n  {inc(2n) == 3n : Nat}\n",
+        )
+        .unwrap();
+        let mut seal_one = make_cfg(&root);
+        seal_one.lock_update = LockUpdateMode::parse("inc_one");
+        run_with_checker(&seal_one, |_, _| Ok(())).expect("named seal of inc_one succeeds");
+        let lock_after = fs::read_to_string(&cfg.lock_file).unwrap();
+        assert!(lock_after.contains("inc_zero"));
+        assert!(lock_after.contains("inc_one"));
+        assert!(!lock_after.contains("inc_two"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_coverage_runs_through_pipeline_and_bypasses_warm_cache() {
+        let root = temp_workspace("issue21_pipeline");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("verified/ledger.bend"),
+            r#"import Base
+
+def order_fits(+used: Nat, +want: Nat, +cap: Nat) -> Bool:
+  Nat.is_le(want, Nat.sub(cap, used))
+
+def order_fits_spec(+used: Nat, +want: Nat, +cap: Nat) -> Bool:
+  Nat.is_le(Nat.add(used, want), cap)
+
+def round_up(+x: Nat, +step: Nat) -> Nat:
+  Nat.mul(Nat.div(Nat.add(x, Nat.sub(step, 1n)), step), step)
+
+# promise: an empty order always fits
+law order_fits_empty:
+  for +cap: Nat
+  {order_fits_spec(0n, 0n, cap) == True{} : Bool}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() { let _ = (verified::order_fits(3, 4, 10), verified::round_up(5, 4)); }\n",
+        )
+        .unwrap();
+
+        let cfg = make_cfg(&root);
+        let mut calls = 0usize;
+        run_with_checker(&cfg, |_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+
+        // With list_coverage = true, the build bypasses warm cache and runs coverage listing.
+        let mut cov_cfg = make_cfg(&root);
+        cov_cfg.list_coverage = true;
+        run_with_checker(&cov_cfg, |_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
 
         let _ = fs::remove_dir_all(&root);
     }
