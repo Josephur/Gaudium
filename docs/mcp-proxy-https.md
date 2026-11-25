@@ -153,7 +153,10 @@ While HTTPS is served, what a plain-HTTP request gets depends on where the clien
 
 Loopback clients are answered by default because their traffic never leaves the machine, so
 plain HTTP there exposes nothing on the network, and local tools (scripts, health checks, a
-front end on the same machine) keep working without HTTPS. `strict` closes that too; `allow` is
+front end on the same machine) keep working without HTTPS. Anything on this machine that
+forwards other machines' traffic to the port (a reverse proxy, an SSH tunnel, `socat`) is a
+loopback client too, so the traffic it forwards is answered over plain HTTP in this mode: use
+`strict` behind such a forwarder unless the forwarder ends TLS itself. `strict` closes that too; `allow` is
 for tools on other machines that cannot speak HTTPS, and leaves their traffic readable on the
 network. Without HTTPS (no options, or no TLS library) plain HTTP is answered in every mode. The
 rule is `ls_plain_act` in `gaudium/verified/tls_listener.bend`.
@@ -165,7 +168,8 @@ no-store`, so a browser does not remember it if HTTPS is turned off again. The `
 built from the request's `Host` header, checked first: a DNS name, an IPv4 address or a
 bracketed IPv6 address, with an optional port; a `Host` without a port means the default HTTP
 port, 80, where HTTPS then answers too. A missing or malformed `Host`, or a target that is not a
-path, gets a 400 instead: nothing the client sent is reflected unchecked.
+path, or more than one `Host`, gets a 400 instead: nothing the client sent is reflected
+unchecked.
 
 Every response over HTTPS carries `Strict-Transport-Security: max-age=<secs>` (`--hsts-max-age`,
 default 86400, one day), without `includeSubDomains` or `preload`. A browser that has seen it uses

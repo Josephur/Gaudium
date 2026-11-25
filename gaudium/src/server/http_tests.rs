@@ -2799,7 +2799,12 @@ fn plain_http_is_sent_to_https_and_https_answers_carry_hsts() {
     let (status, _, body) = plain_at(addr, "HEAD / HTTP/1.1\r\nHost: localhost:8090", "");
     assert_eq!((status, body.as_str()), (308, ""));
     // without a usable Host the client is refused, not sent anywhere
-    for bad in ["GET / HTTP/1.1", "GET / HTTP/1.1\r\nHost: a b", "GET / HTTP/1.1\r\nHost: x/y"] {
+    for bad in [
+        "GET / HTTP/1.1",
+        "GET / HTTP/1.1\r\nHost: a b",
+        "GET / HTTP/1.1\r\nHost: x/y",
+        "GET / HTTP/1.1\r\nHost: localhost:8090\r\nHost: evil.example",
+    ] {
         let (status, head, _) = plain_at(addr, bad, "");
         assert_eq!(status, 400, "{bad}: {head}");
         assert!(!head.contains("location:"), "{bad}: {head}");

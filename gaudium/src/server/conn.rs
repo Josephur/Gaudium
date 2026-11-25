@@ -19,6 +19,7 @@ const OPENING_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) struct Conn {
     io: Io,
+    proto: ConnProtocol,
     /// The `Strict-Transport-Security` header line responses on this connection carry, with its
     /// CRLF, or empty.
     hsts: Arc<str>,
@@ -40,6 +41,7 @@ impl From<TcpStream> for Conn {
     fn from(s: TcpStream) -> Self {
         Conn {
             io: Io::Plain(s),
+            proto: ConnProtocol::Plain,
             hsts: Arc::from(""),
         }
     }
@@ -73,12 +75,12 @@ impl Conn {
         } else {
             Arc::from("")
         };
-        Some(Conn { io, hsts })
+        Some(Conn { io, proto, hsts })
     }
 
-    /// The connection speaks plain HTTP (not TLS).
-    pub fn is_plain(&self) -> bool {
-        matches!(self.io, Io::Plain(_))
+    /// The protocol the connection speaks.
+    pub fn protocol(&self) -> ConnProtocol {
+        self.proto
     }
 
     /// The `Strict-Transport-Security` header line (with its CRLF) every response head on this
@@ -95,6 +97,7 @@ impl Conn {
         };
         Ok(Conn {
             io,
+            proto: self.proto,
             hsts: Arc::clone(&self.hsts),
         })
     }

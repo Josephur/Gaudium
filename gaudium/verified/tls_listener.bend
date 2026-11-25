@@ -4,7 +4,7 @@
 #     found, the files were accepted), refuses its configuration, or serves plain HTTP only
 #   - Which protocol one accepted connection speaks. HTTP and HTTPS share the port: the first
 #     byte a client sends says which of the two it is
-#   - What a plain-HTTP request gets on a server that serves TLS: an answer, or a redirect to
+#   - What a request gets: an answer, or (plain HTTP on a server that serves TLS) a redirect to
 #     HTTPS; and which connections carry the Strict-Transport-Security header
 
 import Base
@@ -251,27 +251,34 @@ type LsPlainAct is Data:
   LsPlainServe{}
   LsPlainRedirect{}
 
+# What a request on a connection of protocol p gets. A TLS connection is always answered; the
+# rest is about plain HTTP.
+# p:         the connection's protocol (ls_proto)
 # tls_ready: the server serves TLS (ls_start_serves_tls)
 # mode:      --tls-http
 # loopback:  the client connected over this machine's loopback interface
-def ls_plain_act(tls_ready: Bool, mode: LsHttpMode, loopback: Bool) -> LsPlainAct:
-  match tls_ready:
-    case False{}:
+def ls_plain_act(p: LsProto, tls_ready: Bool, mode: LsHttpMode, loopback: Bool) -> LsPlainAct:
+  match p:
+    case LsTls{}:
       LsPlainServe{}
-    case True{}:
-      match mode:
-        case LsHttpAllow{}:
+    case _:
+      match tls_ready:
+        case False{}:
           LsPlainServe{}
-        case LsHttpStrict{}:
-          LsPlainRedirect{}
-        case LsHttpRedirect{}:
-          match loopback:
-            case True{}:
+        case True{}:
+          match mode:
+            case LsHttpAllow{}:
               LsPlainServe{}
-            case False{}:
+            case LsHttpStrict{}:
               LsPlainRedirect{}
+            case LsHttpRedirect{}:
+              match loopback:
+                case True{}:
+                  LsPlainServe{}
+                case False{}:
+                  LsPlainRedirect{}
 
-# The plain-HTTP request is answered (not redirected).
+# The request is answered (not redirected).
 def ls_plain_served(a: LsPlainAct) -> Bool:
   match a:
     case LsPlainServe{}:
@@ -293,19 +300,23 @@ def ls_sends_hsts(p: LsProto) -> Bool:
 # harm: with HTTPS asked for and not offered (no TLS library), every client would be sent to a port that does not speak TLS and could reach nothing
 # catches: the mode looked at before whether TLS is served (strict mode redirects on a server without TLS)
 law ls_plain_served_without_tls:
+  for +p: LsProto
   for m: LsHttpMode
   for l: Bool
-  {ls_plain_served(ls_plain_act(False{}, m, l)) == True{} : Bool}
+  {ls_plain_served(ls_plain_act(p, False{}, m, l)) == True{} : Bool}
 
-def ls_plain_served_without_tls(m, l):
-  {==}
+def ls_plain_served_without_tls(p, m, l):
+  match p:
+    case LsPlain{}: {==}
+    case LsTls{}: {==}
+    case LsDrop{}: {==}
 
 # LAW 3.2
 # promise: with TLS served and plain HTTP not allowed, a client on another machine is never answered over plain HTTP
 # harm: prompts, answers and the API key would cross the network in the clear although HTTPS is offered
 # catches: the loopback test inverted (remote clients answered in the clear, loopback clients redirected)
 law ls_plain_remote_redirected:
-  {ls_plain_served(ls_plain_act(True{}, LsHttpRedirect{}, False{})) == False{} : Bool}
+  {ls_plain_served(ls_plain_act(LsPlain{}, True{}, LsHttpRedirect{}, False{})) == False{} : Bool}
 
 def ls_plain_remote_redirected():
   {==}
@@ -315,7 +326,7 @@ def ls_plain_remote_redirected():
 # catches: the loopback exemption applied in strict mode as well
 law ls_plain_strict_redirects_all:
   for +l: Bool
-  {ls_plain_served(ls_plain_act(True{}, LsHttpStrict{}, l)) == False{} : Bool}
+  {ls_plain_served(ls_plain_act(LsPlain{}, True{}, LsHttpStrict{}, l)) == False{} : Bool}
 
 def ls_plain_strict_redirects_all(l):
   match l:
@@ -328,7 +339,7 @@ def ls_plain_strict_redirects_all(l):
 # catches: the allow mode treated as the default mode (clients on other machines still redirected)
 law ls_plain_allow_serves_all:
   for +l: Bool
-  {ls_plain_served(ls_plain_act(True{}, LsHttpAllow{}, l)) == True{} : Bool}
+  {ls_plain_served(ls_plain_act(LsPlain{}, True{}, LsHttpAllow{}, l)) == True{} : Bool}
 
 def ls_plain_allow_serves_all(l):
   match l:
@@ -336,6 +347,19 @@ def ls_plain_allow_serves_all(l):
     case False{}: {==}
 
 # LAW 3.5
+# promise: a request that came over TLS is always answered, never redirected, whatever --tls-http says and wherever the client is
+# harm: an HTTPS client would be sent to the address it already uses, again and again, and reach nothing
+# catches: the connection's protocol ignored (strict mode redirects HTTPS requests too)
+law ls_tls_request_served:
+  for t: Bool
+  for m: LsHttpMode
+  for l: Bool
+  {ls_plain_served(ls_plain_act(LsTls{}, t, m, l)) == True{} : Bool}
+
+def ls_tls_request_served(t, m, l):
+  {==}
+
+# LAW 3.6
 # promise: Strict-Transport-Security is never sent on a connection that is not TLS
 # catches: the header added to every response, plain HTTP included
 law ls_hsts_only_over_tls:
@@ -344,7 +368,7 @@ law ls_hsts_only_over_tls:
 def ls_hsts_only_over_tls():
   {==}
 
-# LAW 3.6
+# LAW 3.7
 # promise: every response sent over TLS carries Strict-Transport-Security
 # harm: a browser that once reached the server over HTTPS would go on trying plain HTTP first, where the first request can be read or redirected by anyone on the path
 # catches: the header sent on no connection at all (the TLS case answered False)

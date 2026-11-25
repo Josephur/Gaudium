@@ -58,11 +58,16 @@ fn ls_of(p: ConnProtocol) -> LsProto {
     }
 }
 
-/// A plain-HTTP request is answered (`false`: it is sent to HTTPS). `tls_ready`: the server
-/// serves TLS; `mode`: `--tls-http`; `loopback`: the client connected over the loopback
-/// interface.
-pub fn plain_http_served(tls_ready: bool, mode: PlainHttpMode, loopback: bool) -> bool {
-    ls_plain_served(ls_plain_act(tls_ready, mode, loopback))
+/// A request on a connection of protocol `p` is answered (`false`: it is sent to HTTPS).
+/// `tls_ready`: the server serves TLS; `mode`: `--tls-http`; `loopback`: the client connected
+/// over the loopback interface.
+pub fn request_served(
+    p: ConnProtocol,
+    tls_ready: bool,
+    mode: PlainHttpMode,
+    loopback: bool,
+) -> bool {
+    ls_plain_served(ls_plain_act(ls_of(p), tls_ready, mode, loopback))
 }
 
 /// Responses on a connection of this protocol carry Strict-Transport-Security.
@@ -99,17 +104,20 @@ mod tests {
     #[test]
     fn plain_http_beside_tls_of_today() {
         use PlainHttpMode::*;
+        let plain = |t, m, l| request_served(ConnProtocol::Plain, t, m, l);
         for mode in [LsHttpRedirect, LsHttpAllow, LsHttpStrict] {
             for lo in [false, true] {
                 // no TLS: plain HTTP is all there is
-                assert!(plain_http_served(false, mode, lo));
+                assert!(plain(false, mode, lo));
+                // a TLS request is answered in every mode
+                assert!(request_served(ConnProtocol::Tls, true, mode, lo));
             }
         }
         // the default: other machines go to HTTPS, this machine's loopback clients are answered
-        assert!(!plain_http_served(true, LsHttpRedirect, false));
-        assert!(plain_http_served(true, LsHttpRedirect, true));
-        assert!(plain_http_served(true, LsHttpAllow, false));
-        assert!(!plain_http_served(true, LsHttpStrict, true));
+        assert!(!plain(true, LsHttpRedirect, false));
+        assert!(plain(true, LsHttpRedirect, true));
+        assert!(plain(true, LsHttpAllow, false));
+        assert!(!plain(true, LsHttpStrict, true));
         assert!(sends_hsts(ConnProtocol::Tls));
         assert!(!sends_hsts(ConnProtocol::Plain) && !sends_hsts(ConnProtocol::Drop));
     }

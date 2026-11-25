@@ -1920,7 +1920,12 @@ fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let k = k.trim().to_ascii_lowercase();
+            // RFC 9112: a request with more than one Host is refused (which one would count?)
+            if k == "host" && headers.contains_key("host") {
+                return Err("more than one Host header".into());
+            }
+            headers.insert(k, v.trim().to_string());
         }
     }
 
@@ -2202,13 +2207,12 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
     };
     let _ = stream.set_read_timeout(None);
 
-    if stream.is_plain()
-        && !crate::core::listener::plain_http_served(
-            state.tls.is_some(),
-            state.cfg.tls_http,
-            loopback,
-        )
-    {
+    if !crate::core::listener::request_served(
+        stream.protocol(),
+        state.tls.is_some(),
+        state.cfg.tls_http,
+        loopback,
+    ) {
         write_https_redirect(&mut stream, &req);
         return;
     }
