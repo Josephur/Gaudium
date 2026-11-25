@@ -301,6 +301,12 @@ def g4u_fits(+ring: Nat, +w: Nat, +rows: Nat) -> Bool:
     case 1n+wp:
       Bool.and(Nat.is_lt(wp, ring), Nat.is_le(rows, Nat.sub(ring, wp)))
 
+# Chunks of `chunk` rows of a global layer's K / V cache that a prefill tile whose rows end at row
+# `end` reads: the chunks that hold the keys before `end` (`ceil(end / chunk)`), at least one, at
+# most the `max_chunks` the cache holds.
+def g4u_tile_chunks(+end: Nat, +chunk: Nat, +max_chunks: Nat) -> Nat:
+  Nat.max(1n, Nat.min(Nat.div(Nat.add(end, Nat.sub(chunk, 1n)), chunk), max_chunks))
+
 # Whether the next tile joins a unit of `tiles` tiles: an image block runs from the unit's last
 # tile into it (`cross`), and the unit has room for one more tile of the `max_tiles` the plan
 # holds buffers for (the load checks that a unit of `max_tiles` full tiles fits the ring).
@@ -1507,3 +1513,122 @@ law g4v_rot_quarter_within:
 
 def g4v_rot_quarter_within(dh):
   g4v_div_mul_le(dh, 3n)
+
+# ----------------------------------------------------------------------------
+# The chunks a prefill tile reads
+# ----------------------------------------------------------------------------
+
+# k + a <= k + b gives a <= b.
+def g4u_le_cancel_l(+k: Nat, +a: Nat, +b: Nat, h: {Nat.is_le(Nat.add(k, a), Nat.add(k, b)) == True{} : Bool}) -> {Nat.is_le(a, b) == True{} : Bool}:
+  match k:
+    case 0n:
+      h
+    case 1n+kp:
+      g4u_le_cancel_l(kp, a, b, h)
+
+# e + cp <= ceil(e / c) c + cp (c = 1 + cp).
+def g4u_ceil_h(+e: Nat, +cp: Nat) -> {Nat.is_le(Nat.add(e, cp), Nat.add(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), cp)) == True{} : Bool}:
+  %L.nat_div_mod_r(Nat.add(e, cp), cp) : {Nat.is_le(_, Nat.add(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), cp)) == True{} : Bool}
+  L.nat_add_le_mono(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), Nat.mod(Nat.add(e, cp), 1n+cp), cp, L.nat_le_refl(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp)), g4v_mod_le(Nat.add(e, cp), cp))
+
+def g4u_ceil_hl(+e: Nat, +cp: Nat) -> {Nat.is_le(Nat.add(cp, e), Nat.add(cp, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp))) == True{} : Bool}:
+  %L.nat_add_comm(e, cp) : {Nat.is_le(_, Nat.add(cp, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp))) == True{} : Bool}
+  %L.nat_add_comm(Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), cp) : {Nat.is_le(Nat.add(e, cp), _) == True{} : Bool}
+  g4u_ceil_h(e, cp)
+
+# e <= ceil(e / c) c: the chunks of a ceiling hold the rows.
+def g4u_ceil_ge(+e: Nat, +cp: Nat) -> {Nat.is_le(e, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp)) == True{} : Bool}:
+  g4u_le_cancel_l(cp, e, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), g4u_ceil_hl(e, cp))
+
+# min(x, m) == x when x <= m.
+def g4u_min_of_le(+x: Nat, +m: Nat, h: {Nat.is_le(x, m) == True{} : Bool}) -> {Nat.min(x, m) == x : Nat}:
+  match x m:
+    case 0n _:
+      {==}
+    case 1n+xp 0n:
+      L.bool_absurd({Nat.min(1n+xp, 0n) == 1n+xp : Nat}, h)
+    case 1n+xp 1n+mp:
+      %Equal.sym(Nat, Nat.min(xp, mp), xp, g4u_min_of_le(xp, mp, h)) : {1n+_ == 1n+xp : Nat}
+      {==}
+
+# min(x, m) == m when x > m.
+def g4u_min_of_gt(+x: Nat, +m: Nat, h: {Nat.is_le(x, m) == False{} : Bool}) -> {Nat.min(x, m) == m : Nat}:
+  match x m:
+    case 0n 0n:
+      {==}
+    case 0n 1n+mp:
+      L.bool_absurd_tf({Nat.min(0n, 1n+mp) == 1n+mp : Nat}, h)
+    case 1n+xp 0n:
+      {==}
+    case 1n+xp 1n+mp:
+      %Equal.sym(Nat, Nat.min(xp, mp), mp, g4u_min_of_gt(xp, mp, h)) : {1n+_ == 1n+mp : Nat}
+      {==}
+
+# max(1, y) <= 1 + mp when y <= 1 + mp.
+def g4u_max1_le(+y: Nat, +mp: Nat, h: {Nat.is_le(y, 1n+mp) == True{} : Bool}) -> {Nat.is_le(Nat.max(1n, y), 1n+mp) == True{} : Bool}:
+  match y:
+    case 0n:
+      L.nat_le_zero(mp)
+    case 1n+yp:
+      h
+
+# l and (p < e) is false when e <= p.
+def g4u_and_lt_false(l: Bool, +p: Nat, +e: Nat, h: {Nat.is_le(e, p) == True{} : Bool}) -> {Bool.and(l, Nat.is_lt(p, e)) == False{} : Bool}:
+  %Equal.sym(Bool, Nat.is_lt(p, e), False{}, L.nat_le_lt_false(p, e, h)) : {Bool.and(l, _) == False{} : Bool}
+  g4u_and_false_r(l)
+
+# (e <= p) and (p < e) is false.
+def g4u_le_lt_false(+e: Nat, +p: Nat, l: Bool, el: {Nat.is_le(e, p) == l : Bool}) -> {Bool.and(l, Nat.is_lt(p, e)) == False{} : Bool}:
+  match l:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_le_lt_false(p, e, el)
+
+# The cover law once the ceiling is known to fit the cache or not (b says which).
+def g4u_cover_go(+e: Nat, +cp: Nat, +mp: Nat, b: Bool, eb: {Nat.is_le(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp) == b : Bool}) -> {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, Nat.min(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp)), 1n+cp), e)) == False{} : Bool}:
+  match b:
+    case True{}:
+      %Equal.sym(Nat, Nat.min(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp), Nat.div(Nat.add(e, cp), 1n+cp), g4u_min_of_le(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp, eb)) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, _), 1n+cp), e)) == False{} : Bool}
+      g4u_and_lt_false(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.mul(Nat.max(1n, Nat.div(Nat.add(e, cp), 1n+cp)), 1n+cp), e, L.nat_le_trans(e, Nat.mul(Nat.div(Nat.add(e, cp), 1n+cp), 1n+cp), Nat.mul(Nat.max(1n, Nat.div(Nat.add(e, cp), 1n+cp)), 1n+cp), g4u_ceil_ge(e, cp), L.nat_mul_le_mono_r(Nat.div(Nat.add(e, cp), 1n+cp), Nat.max(1n, Nat.div(Nat.add(e, cp), 1n+cp)), 1n+cp, L.nat_max_ge_r(1n, Nat.div(Nat.add(e, cp), 1n+cp)))))
+    case False{}:
+      %Equal.sym(Nat, Nat.min(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp), 1n+mp, g4u_min_of_gt(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp, eb)) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, _), 1n+cp), e)) == False{} : Bool}
+      %L.nat_mul_comm(1n+cp, 1n+mp) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(_, e)) == False{} : Bool}
+      g4u_le_lt_false(e, Nat.mul(1n+cp, 1n+mp), Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), {==})
+
+# LAW G4U.20
+# promise: a prefill tile reads at least one chunk of the global caches.
+# harm: a global layer would attend no keys at all.
+law g4u_tile_chunks_at_least_one:
+  for +e: Nat
+  for +c: Nat
+  for +m: Nat
+  {Nat.is_le(1n, g4u_tile_chunks(e, c, m)) == True{} : Bool}
+
+def g4u_tile_chunks_at_least_one(e, c, m):
+  L.nat_max_ge_l(1n, Nat.min(Nat.div(Nat.add(e, Nat.sub(c, 1n)), c), m))
+
+# LAW G4U.21
+# promise: a prefill tile never reads more chunks than the global caches hold.
+# harm: the tile's recipe would read K / V rows past the end of the cache.
+law g4u_tile_chunks_within_cache:
+  for +e: Nat
+  for +c: Nat
+  for +mp: Nat
+  {Nat.is_le(g4u_tile_chunks(e, c, 1n+mp), 1n+mp) == True{} : Bool}
+
+def g4u_tile_chunks_within_cache(e, c, mp):
+  g4u_max1_le(Nat.min(Nat.div(Nat.add(e, Nat.sub(c, 1n)), c), 1n+mp), mp, L.nat_min_le_r(Nat.div(Nat.add(e, Nat.sub(c, 1n)), c), 1n+mp))
+
+# LAW G4U.22
+# promise: a prefill tile whose rows fit the global caches reads every chunk that holds the keys before its last row.
+# harm: a global layer would miss the keys of the chunks it does not read.
+law g4u_tile_chunks_cover:
+  for +e: Nat
+  for +cp: Nat
+  for +mp: Nat
+  {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(g4u_tile_chunks(e, 1n+cp, 1n+mp), 1n+cp), e)) == False{} : Bool}
+
+def g4u_tile_chunks_cover(e, cp, mp):
+  %Equal.sym(Nat, Nat.sub(cp, 0n), cp, L.nat_sub_zero_r(cp)) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, Nat.min(Nat.div(Nat.add(e, _), 1n+cp), 1n+mp)), 1n+cp), e)) == False{} : Bool}
+  g4u_cover_go(e, cp, mp, Nat.is_le(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp), {==})

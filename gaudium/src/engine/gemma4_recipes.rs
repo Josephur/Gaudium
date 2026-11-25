@@ -41,9 +41,10 @@ impl PfRecipe {
     }
 }
 
-/// Chunks of the global caches a prefill tile that ends at row `end` reads.
+/// Chunks of the global caches a prefill tile that ends at row `end` reads (the verified
+/// `g4u_tile_chunks`: the chunks of its keys, at least one, at most the cache's).
 pub(super) fn tile_chunks(end: u64, max_chunks: u64) -> u64 {
-    end.div_ceil(G4_CHUNK).clamp(1, max_chunks)
+    crate::verified::g4u_tile_chunks(end, G4_CHUNK, max_chunks)
 }
 
 /// The embedding stage of a tile of `t` rows: the image one when it holds image rows.
@@ -329,6 +330,20 @@ mod tests {
         // a sliding layer is kept under one key whatever the chunk count
         assert_eq!(PfRecipe::Layer(G4LayerKind::Sliding, 8, 5).key(), PfRecipe::Layer(G4LayerKind::Sliding, 8, 0));
         assert_eq!(PfRecipe::Layer(G4LayerKind::Global, 8, 5).key(), PfRecipe::Layer(G4LayerKind::Global, 8, 5));
+    }
+
+    #[test]
+    fn a_tile_reads_the_chunks_of_its_keys() {
+        assert_eq!(tile_chunks(1, 64), 1);
+        assert_eq!(tile_chunks(G4_CHUNK, 64), 1);
+        assert_eq!(tile_chunks(G4_CHUNK + 1, 64), 2);
+        assert_eq!(tile_chunks(64 * G4_CHUNK, 64), 64);
+        // never past the cache, never none
+        assert_eq!(tile_chunks(65 * G4_CHUNK, 64), 64);
+        assert_eq!(tile_chunks(0, 64), 1);
+        for end in [1, 255, 4095, 4096, 4097, 8192, 8193, 100_000] {
+            assert_eq!(tile_chunks(end, 64), end.div_ceil(G4_CHUNK).clamp(1, 64));
+        }
     }
 
     #[test]
