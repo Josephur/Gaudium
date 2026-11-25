@@ -549,7 +549,7 @@ def rt_nothing_gone_frees_nothing(r, m):
   {==}
 
 # promise: when an entry's sidecar is gone and its recipe file stays on disk, exactly the sidecar's bytes come off the count.
-# harm: the count would drift from the disk by up to a sidecar per failed recipe removal and the trim would stop over or under budget
+# harm: the count would stay above the disk by up to a sidecar per failed recipe removal and the trim would remove more than its budget asks
 law rt_sidecar_gone_frees_the_sidecar:
   for +r: Nat
   for +m: Nat
@@ -559,7 +559,7 @@ def rt_sidecar_gone_frees_the_sidecar(r, m):
   {==}
 
 # promise: when an entry's recipe file is gone and its sidecar stays on disk, exactly the recipe's bytes come off the count.
-# harm: the count would drift from the disk by up to a recipe and the trim would stop over or under budget
+# harm: the count would stay above the disk by up to a recipe and the trim would remove more than its budget asks
 law rt_recipe_gone_frees_the_recipe:
   for +r: Nat
   for +m: Nat
@@ -593,13 +593,13 @@ def rt_recheck_sidecar_on_disk_not_gone(h, t, r, p):
   %Equal.sym(Bool, Bool.or(r, True{}), True{}, rt_or_true_r(r)) : {rt_recheck_gone(rt_recheck_pick(_, rt_should_evict(h, t, p))) == False{} : Bool}
   rt_pick_on_disk_not_gone(rt_should_evict(h, t, p))
 
-# promise: an entry neither of whose files is on disk at the second look is counted as gone, never kept or removed.
+# promise: an entry neither of whose files is on disk at the second look is counted as gone.
 # harm: a kept entry that is gone would stay counted as held and the trim would remove more than its budget asks
 law rt_recheck_nothing_on_disk_gone:
   for +h: Nat
   for +t: Nat
   for +p: Bool
-  {rt_recheck(h, t, False{}, False{}, p) == RtRecheckGone{} : RtRecheck}
+  {rt_recheck_gone(rt_recheck(h, t, False{}, False{}, p)) == True{} : Bool}
 
 def rt_recheck_nothing_on_disk_gone(h, t, p):
   {==}

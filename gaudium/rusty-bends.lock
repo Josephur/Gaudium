@@ -1306,6 +1306,9 @@ e84c2b8212c5fdb8  rt_last_used_ge_meta  law rt_last_used_ge_meta : for + r : Nat
 7c975f5873831b6a  rt_last_used_ge_recipe  law rt_last_used_ge_recipe : for + r : Nat for + m : Nat { Nat.is_le ( r , rt_last_used ( r , m ) ) == True { } : Bool }
 # promise rt_last_used_ge_recipe: an entry's last use is never earlier than the time of its recipe file.
 # harm rt_last_used_ge_recipe: an entry read a moment ago through a fresh sidecar would look old and could be removed
+c7ec59d30b2eb04d  rt_nothing_gone_frees_nothing  law rt_nothing_gone_frees_nothing : for + r : Nat for + m : Nat { rt_gone_bytes ( r , False { } , m , False { } ) == 0n : Nat }
+# promise rt_nothing_gone_frees_nothing: when a removal leaves both files of an entry on disk, nothing comes off the count of held bytes.
+# harm rt_nothing_gone_frees_nothing: a failed removal would be counted as freed space and the trim would stop over budget
 f8ca33b5e96a549a  rt_over_target_evicts  law rt_over_target_evicts : for + t : Nat for + x : Nat { rt_should_evict ( Nat.add ( t , 1n + x ) , t , False { } ) == True { } : Bool }
 # promise rt_over_target_evicts: an unprotected entry is removed while the cache is over its target.
 # harm rt_over_target_evicts: a trim could stop early and leave the disk over the budget it was given
@@ -1315,9 +1318,27 @@ a748334acbc1f38e  rt_protected_never_evicted  law rt_protected_never_evicted : f
 fd699613b6bd5e34  rt_recent_protected  law rt_recent_protected : for + u : Nat for + d : Nat for + x : Nat for + f : Bool { rt_protected ( u , Nat.add ( u , d ) , Nat.add ( d , 1n + x ) , f ) == True { } : Bool }
 # promise rt_recent_protected: an entry used less than the keep window ago is protected.
 # harm rt_recent_protected: a trim could remove recipes another process is using right now
+b4b03e68c51ae3aa  rt_recheck_over_target_removes  law rt_recheck_over_target_removes : for + t : Nat for + x : Nat for + m : Bool { rt_recheck_removes ( rt_recheck ( Nat.add ( t , 1n + x ) , t , True { } , m , False { } ) ) == True { } : Bool }
+# promise rt_recheck_over_target_removes: an unprotected entry whose recipe file is on disk at the second look is removed while the cache is over its target.
+# harm rt_recheck_over_target_removes: a trim could stop early and leave the disk over the budget it was given
+aac5669237bd00da  rt_recheck_protected_stays  law rt_recheck_protected_stays : for + h : Nat for + t : Nat for + r : Bool for + m : Bool { rt_recheck_removes ( rt_recheck ( h , t , r , m , True { } ) ) == False { } : Bool }
+# promise rt_recheck_protected_stays: a protected entry is never removed, whatever the second look found.
+# harm rt_recheck_protected_stays: the keep window and the entries a server holds would be ignored by the trim
+f430aee3d388868d  rt_recheck_recipe_on_disk_not_gone  law rt_recheck_recipe_on_disk_not_gone : for + h : Nat for + t : Nat for + m : Bool for + p : Bool { rt_recheck_gone ( rt_recheck ( h , t , True { } , m , p ) ) == False { } : Bool }
+# promise rt_recheck_recipe_on_disk_not_gone: an entry whose recipe file is still on disk at the second look is never counted as gone.
+# harm rt_recheck_recipe_on_disk_not_gone: its bytes would come off the count while still on disk and the trim would stop over budget
+828813eecb5c4826  rt_recheck_sidecar_on_disk_not_gone  law rt_recheck_sidecar_on_disk_not_gone : for + h : Nat for + t : Nat for + r : Bool for + p : Bool { rt_recheck_gone ( rt_recheck ( h , t , r , True { } , p ) ) == False { } : Bool }
+# promise rt_recheck_sidecar_on_disk_not_gone: an entry whose sidecar is still on disk at the second look is never counted as gone.
+# harm rt_recheck_sidecar_on_disk_not_gone: its bytes would come off the count while still on disk and the trim would stop over budget
+1f0e79ecd29349b0  rt_recheck_within_target_stays  law rt_recheck_within_target_stays : for + h : Nat for + x : Nat for + r : Bool for + m : Bool for + p : Bool { rt_recheck_removes ( rt_recheck ( h , Nat.add ( h , x ) , r , m , p ) ) == False { } : Bool }
+# promise rt_recheck_within_target_stays: no entry is removed while the cache is within its target, whatever the second look found.
+# harm rt_recheck_within_target_stays: a trim could empty a cache that already fits and force every recipe to compile again
 f11f0527c6601ab0  rt_recipe_follows_a_gone_sidecar  law rt_recipe_follows_a_gone_sidecar : for + p : Bool { rt_may_remove_recipe ( p , True { } ) == True { } : Bool }
 # promise rt_recipe_follows_a_gone_sidecar: the recipe file of an entry whose sidecar is gone may be removed, so a trim can free recipe bytes.
 # harm rt_recipe_follows_a_gone_sidecar: a trim could remove only sidecars and never bring the cache under its budget
+44e97e4527b93780  rt_recipe_gone_frees_the_recipe  law rt_recipe_gone_frees_the_recipe : for + r : Nat for + m : Nat { rt_gone_bytes ( r , True { } , m , False { } ) == r : Nat }
+# promise rt_recipe_gone_frees_the_recipe: when an entry's recipe file is gone and its sidecar stays on disk, exactly the recipe's bytes come off the count.
+# harm rt_recipe_gone_frees_the_recipe: the count would stay above the disk by up to a recipe and the trim would remove more than its budget asks
 fdf2c0f07fbe8c78  rt_recipe_on_disk_not_counted  law rt_recipe_on_disk_not_counted : for + r : Nat for + m : Nat for + mg : Bool { Nat.is_le ( rt_gone_bytes ( r , False { } , m , mg ) , m ) == True { } : Bool }
 # promise rt_recipe_on_disk_not_counted: a recipe file still on disk is never counted as gone: what a removal takes off is at most the sidecar's bytes.
 # harm rt_recipe_on_disk_not_counted: a failed removal would be counted as freed space and the trim would stop over budget
@@ -1330,6 +1351,9 @@ fdf2c0f07fbe8c78  rt_recipe_on_disk_not_counted  law rt_recipe_on_disk_not_count
 ea0f6b2859fb28c7  rt_removed_frees_its_bytes  law rt_removed_frees_its_bytes : for + h : Nat for + b : Nat { rt_after ( Nat.add ( h , b ) , b ) == h : Nat }
 # promise rt_removed_frees_its_bytes: bytes that left the disk come off the count of held bytes exactly.
 # harm rt_removed_frees_its_bytes: the trim's count would drift from the disk and remove too much or too little
+3aa4a0894e001795  rt_sidecar_gone_frees_the_sidecar  law rt_sidecar_gone_frees_the_sidecar : for + r : Nat for + m : Nat { rt_gone_bytes ( r , False { } , m , True { } ) == m : Nat }
+# promise rt_sidecar_gone_frees_the_sidecar: when an entry's sidecar is gone and its recipe file stays on disk, exactly the sidecar's bytes come off the count.
+# harm rt_sidecar_gone_frees_the_sidecar: the count would stay above the disk by up to a sidecar per failed recipe removal and the trim would remove more than its budget asks
 fb735d95b6786cae  rt_sidecar_on_disk_not_counted  law rt_sidecar_on_disk_not_counted : for + r : Nat for + rg : Bool for + m : Nat { Nat.is_le ( rt_gone_bytes ( r , rg , m , False { } ) , r ) == True { } : Bool }
 # promise rt_sidecar_on_disk_not_counted: a sidecar still on disk is never counted as gone: what a removal takes off is at most the recipe's bytes.
 # harm rt_sidecar_on_disk_not_counted: a failed removal would be counted as freed space and the trim would stop over budget
