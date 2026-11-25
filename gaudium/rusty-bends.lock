@@ -31,6 +31,29 @@ c969518b535cece3  call_fragment_needs_header  law call_fragment_needs_header : f
 81e5f5a57090c670  call_started_never_abandoned  law call_started_never_abandoned : { call_accepts ( CpArgs { } , CeAbandon { } ) == False { } : Bool }
 8a9c1856c1d5424d  call_stopped_absorbing  law call_stopped_absorbing : for ev : CallEvent { call_step ( CpStopped { } , ev ) == CpStopped { } : CallPhase }
 6de60792641ce27a  call_stopped_accepts_nothing  law call_stopped_accepts_nothing : for ev : CallEvent { call_accepts ( CpStopped { } , ev ) == False { } : Bool }
+01fabc218499faf2  cg_ca_never_replaced  law cg_ca_never_replaced : for + a : Bool for + b : Bool for + c : Bool for + d : Bool for + f : Bool { Bool.and ( cg_writes_ca ( cg_plan ( a , b , c , d , f ) ) , Bool.or ( a , b ) ) == False { } : Bool }
+# promise cg_ca_never_replaced: a run never writes the authority's files while either of them exists, whatever the overwrite flag says
+# harm cg_ca_never_replaced: every device that trusts the authority would stop trusting the server, and its key would be lost
+2bf6021d44a3ad77  cg_days_within_asked  law cg_days_within_asked : for + a : Nat for + l : Nat { Nat.is_le ( cg_valid_days ( cg_validity ( a , l ) ) , a ) == True { } : Bool }
+# promise cg_days_within_asked: the server certificate is never valid for longer than the operator asked
+6d0f954a4a2281b6  cg_days_within_ca  law cg_days_within_ca : for + a : Nat for + l : Nat { Nat.is_le ( cg_valid_days ( cg_validity ( a , l ) ) , l ) == True { } : Bool }
+# promise cg_days_within_ca: the server certificate never outlives the authority that signs it
+# harm cg_days_within_ca: browsers would refuse the server once the authority has expired, while its certificate still looks valid
+873eed0ea5c7501b  cg_free_dir_writes  law cg_free_dir_writes : for + a : Bool for + f : Bool { cg_writes_server ( cg_plan ( a , a , False { } , False { } , f ) ) == True { } : Bool }
+# promise cg_free_dir_writes: when the server's files are absent and the authority is whole or absent, a run writes them
+279028bc0b30abd4  cg_half_ca_refused  law cg_half_ca_refused : for + a : Bool for + b : Bool for + c : Bool for + d : Bool for + f : Bool { Bool.and ( Bool.xor ( a , b ) , cg_writes_server ( cg_plan ( a , b , c , d , f ) ) ) == False { } : Bool }
+# promise cg_half_ca_refused: a server certificate is never made when the authority has only one of its two files
+# harm cg_half_ca_refused: a certificate signed by a key that does not match the authority the devices trust
+55b20cfceceb8fb4  cg_made_days_positive  law cg_made_days_positive : for + a : Nat for + l : Nat { Bool.or ( cg_valid_refused ( cg_validity ( a , l ) ) , Nat.is_lt ( 0n , cg_valid_days ( cg_validity ( a , l ) ) ) ) == True { } : Bool }
+# promise cg_made_days_positive: a server certificate that is made is valid for at least one day
+38aee2513c8dd21f  cg_overwrite_replaces  law cg_overwrite_replaces : for + a : Bool for + c : Bool for + d : Bool { cg_writes_server ( cg_plan ( a , a , c , d , True { } ) ) == True { } : Bool }
+# promise cg_overwrite_replaces: with the overwrite flag the server's files are replaced whenever the authority is whole or absent
+bf64e42c2d2741d7  cg_server_kept_without_overwrite  law cg_server_kept_without_overwrite : for + a : Bool for + b : Bool for + c : Bool for + d : Bool { Bool.and ( cg_writes_server ( cg_plan ( a , b , c , d , False { } ) ) , Bool.or ( c , d ) ) == False { } : Bool }
+# promise cg_server_kept_without_overwrite: without the overwrite flag a run never writes the server's files while either of them exists
+# harm cg_server_kept_without_overwrite: a working certificate and key would be replaced without being asked
+9e64dfef12e11303  cg_server_needs_signer  law cg_server_needs_signer : for + a : Bool for + b : Bool for + c : Bool for + d : Bool for + f : Bool { Bool.and ( cg_writes_server ( cg_plan ( a , b , c , d , f ) ) , Bool.not ( Bool.or ( cg_writes_ca ( cg_plan ( a , b , c , d , f ) ) , Bool.and ( a , b ) ) ) ) == False { } : Bool }
+# promise cg_server_needs_signer: a server certificate is only written when its authority is made in the same run or both of the authority's files exist
+# harm cg_server_needs_signer: a server certificate signed by an authority that is not kept, so no device can be told to trust it
 f63d6f88affafb04  ctx_for_prompt_admits  law ctx_for_prompt_admits : for + p : Nat for + extra : Nat { prompt_admitted ( 1n + p , Nat.add ( ctx_for_prompt ( 1n + p ) , extra ) ) == True { } : Bool }
 # promise ctx_for_prompt_admits: a capacity of at least ctx_for_prompt(p) admits a non-empty prompt of p tokens, also after it is rounded up to whole cache chunks
 # harm ctx_for_prompt_admits: a calibration load would refuse its own longest prompt after the engine had loaded
