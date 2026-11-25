@@ -287,7 +287,7 @@ def rt_pick_kept_not_removed(o: Bool) -> {rt_recheck_removes(rt_recheck_pick(o, 
 # ============================================================================
 
 # promise: an entry's last use is never earlier than the time of its recipe file.
-# harm: an entry read a moment ago through a fresh sidecar would look old and could be removed
+# harm: a recipe written a moment ago, beside an older sidecar or none, would look old and could be removed
 law rt_last_used_ge_recipe:
   for +r: Nat
   for +m: Nat
@@ -376,7 +376,7 @@ law rt_over_target_evicts:
 def rt_over_target_evicts(t, x):
   rt_lt_add_succ(t, x)
 
-# promise: no entry leaves before itself, so the eviction order is a strict order.
+# promise: no entry leaves before itself: the eviction order is irreflexive.
 law rt_evict_before_irreflexive:
   for +a: Nat
   {rt_evict_before(a, a) == False{} : Bool}
@@ -489,7 +489,7 @@ def rt_gone_bytes_within_entry(r, rg, m, mg):
       L.nat_le_zero(Nat.add(r, m))
 
 # promise: the recipe file of an entry whose sidecar is still on disk is never removed.
-# harm: a failed sidecar removal followed by the recipe's would leave a sidecar that no load can ever match
+# harm: a failed sidecar removal followed by the recipe's would leave an orphan sidecar on disk until a later trim or a new compile of that recipe replaces it
 law rt_recipe_stays_with_its_sidecar:
   {rt_may_remove_recipe(True{}, False{}) == False{} : Bool}
 
