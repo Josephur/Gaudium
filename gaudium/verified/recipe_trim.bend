@@ -72,9 +72,76 @@ def rt_gone_bytes(recipe_bytes: Nat, recipe_gone: Bool, meta_bytes: Nat, meta_go
 def rt_may_remove_recipe(meta_present: Bool, meta_gone: Bool) -> Bool:
   Bool.or(Bool.not(meta_present), meta_gone)
 
+# Bytes, as counted at the scan, of an entry's files that the second look no longer finds on disk
+# (`recipe_on_disk`, `meta_on_disk`: what that look found). The walk takes them off the count of
+# held bytes when it keeps the entry or finds it gone, and before a dry run's removal; a real
+# removal counts the same files as gone through `rt_gone_after`. `None` past 64 bits.
+# rusty-bends: total
+def rt_off_disk_bytes(recipe_bytes: Nat, recipe_on_disk: Bool, meta_bytes: Nat, meta_on_disk: Bool) -> Nat:
+  rt_gone_bytes(recipe_bytes, Bool.not(recipe_on_disk), meta_bytes, Bool.not(meta_on_disk))
+
+# Bytes, as counted at the scan, of an entry's files that the second look still finds on disk:
+# what removing the entry would free (the figure a dry run reports). `None` past 64 bits.
+# rusty-bends: total
+def rt_on_disk_bytes(recipe_bytes: Nat, recipe_on_disk: Bool, meta_bytes: Nat, meta_on_disk: Bool) -> Nat:
+  rt_gone_bytes(recipe_bytes, recipe_on_disk, meta_bytes, meta_on_disk)
+
+# Is one file of an entry gone once the walk has tried to remove the entry? When the second look
+# did not find it on disk (`on_disk` false), whatever the removal did or did not try, or when the
+# removal found it gone (`gone`: removed now, or already gone when it tried).
+def rt_gone_after(on_disk: Bool, gone: Bool) -> Bool:
+  Bool.or(Bool.not(on_disk), gone)
+
 # Bytes still held after `bytes` bytes of entries left the disk.
 def rt_after(+held: Nat, bytes: Nat) -> Nat:
   Nat.sub(held, bytes)
+
+# What the walk makes of an entry once it has read the entry's files again, just before it would
+# remove them.
+type RtRecheck is Data:
+  # neither file is on disk any more: someone else removed the entry since the scan
+  RtRecheckGone{}
+  # it stays: protected, or the cache is within its target
+  RtRecheckKeep{}
+  # it is removed now
+  RtRecheckRemove{}
+
+def rt_recheck_pick(on_disk: Bool, evict: Bool) -> RtRecheck:
+  match on_disk:
+    case False{}:
+      RtRecheckGone{}
+    case True{}:
+      match evict:
+        case True{}:
+          RtRecheckRemove{}
+        case False{}:
+          RtRecheckKeep{}
+
+# With `held` bytes still counted and a target of `target` bytes, what becomes of an entry whose
+# recipe file is (`recipe_on_disk`) or is not on disk, and whose sidecar is (`meta_on_disk`) or is
+# not, as the second look found them; `protected` is `rt_protected` of the times that look read.
+def rt_recheck(+held: Nat, target: Nat, recipe_on_disk: Bool, meta_on_disk: Bool, protected: Bool) -> RtRecheck:
+  rt_recheck_pick(Bool.or(recipe_on_disk, meta_on_disk), rt_should_evict(held, target, protected))
+
+# Is the entry removed now?
+def rt_recheck_removes(+c: RtRecheck) -> Bool:
+  match c:
+    case RtRecheckGone{}:
+      False{}
+    case RtRecheckKeep{}:
+      False{}
+    case RtRecheckRemove{}:
+      True{}
+
+# Is the entry counted as gone from the disk (its bytes off the count, freed by someone else)?
+def rt_recheck_gone(+c: RtRecheck) -> Bool:
+  match c:
+    case RtRecheckGone{}:
+      True{}
+    case RtRecheckKeep{}:
+      False{}
+    case RtRecheckRemove{}:
+      False{}
 
 # ============================================================================
 # 2. Lemmas
@@ -201,12 +268,26 @@ def rt_before_asym(+a: Nat, +b: Nat) -> {Bool.and(rt_evict_before(a, b), rt_evic
         case 1n+bp:
           rt_before_asym(ap, bp)
 
+def rt_pick_on_disk_not_gone(e: Bool) -> {rt_recheck_gone(rt_recheck_pick(True{}, e)) == False{} : Bool}:
+  match e:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+def rt_pick_kept_not_removed(o: Bool) -> {rt_recheck_removes(rt_recheck_pick(o, False{})) == False{} : Bool}:
+  match o:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
 # ============================================================================
 # 3. Laws
 # ============================================================================
 
 # promise: an entry's last use is never earlier than the time of its recipe file.
-# harm: an entry read a moment ago through a fresh sidecar would look old and could be removed
+# harm: a recipe written a moment ago, beside an older sidecar or none, would look old and could be removed
 law rt_last_used_ge_recipe:
   for +r: Nat
   for +m: Nat
@@ -295,7 +376,7 @@ law rt_over_target_evicts:
 def rt_over_target_evicts(t, x):
   rt_lt_add_succ(t, x)
 
-# promise: no entry leaves before itself, so the eviction order is a strict order.
+# promise: no entry leaves before itself: the eviction order is irreflexive.
 law rt_evict_before_irreflexive:
   for +a: Nat
   {rt_evict_before(a, a) == False{} : Bool}
@@ -408,7 +489,7 @@ def rt_gone_bytes_within_entry(r, rg, m, mg):
       L.nat_le_zero(Nat.add(r, m))
 
 # promise: the recipe file of an entry whose sidecar is still on disk is never removed.
-# harm: a failed sidecar removal followed by the recipe's would leave a sidecar that no load can ever match
+# harm: a failed sidecar removal followed by the recipe's would leave an orphan sidecar on disk until a later trim or a new compile of that recipe replaces it
 law rt_recipe_stays_with_its_sidecar:
   {rt_may_remove_recipe(True{}, False{}) == False{} : Bool}
 
@@ -476,3 +557,200 @@ law rt_after_never_grows:
 
 def rt_after_never_grows(h, b):
   rt_sub_le(h, b)
+
+# promise: when a removal leaves both files of an entry on disk, nothing comes off the count of held bytes.
+# harm: a failed removal would be counted as freed space and the trim would stop over budget
+law rt_nothing_gone_frees_nothing:
+  for +r: Nat
+  for +m: Nat
+  {rt_gone_bytes(r, False{}, m, False{}) == 0n : Nat}
+
+def rt_nothing_gone_frees_nothing(r, m):
+  {==}
+
+# promise: when an entry's sidecar is gone and its recipe file stays on disk, exactly the sidecar's bytes come off the count.
+# harm: the count would stay above the disk by up to a sidecar per failed recipe removal and the trim would remove more than its budget asks
+law rt_sidecar_gone_frees_the_sidecar:
+  for +r: Nat
+  for +m: Nat
+  {rt_gone_bytes(r, False{}, m, True{}) == m : Nat}
+
+def rt_sidecar_gone_frees_the_sidecar(r, m):
+  {==}
+
+# promise: when an entry's recipe file is gone and its sidecar stays on disk, exactly the recipe's bytes come off the count.
+# harm: the count would stay above the disk by up to a recipe and the trim would remove more than its budget asks
+law rt_recipe_gone_frees_the_recipe:
+  for +r: Nat
+  for +m: Nat
+  {rt_gone_bytes(r, True{}, m, False{}) == r : Nat}
+
+def rt_recipe_gone_frees_the_recipe(r, m):
+  L.nat_add_zero_r(r)
+
+# promise: an entry whose recipe file is still on disk at the second look is never counted as gone.
+# harm: its bytes would come off the count while still on disk and the trim would stop over budget
+law rt_recheck_recipe_on_disk_not_gone:
+  for +h: Nat
+  for +t: Nat
+  for +m: Bool
+  for +p: Bool
+  {rt_recheck_gone(rt_recheck(h, t, True{}, m, p)) == False{} : Bool}
+
+def rt_recheck_recipe_on_disk_not_gone(h, t, m, p):
+  rt_pick_on_disk_not_gone(rt_should_evict(h, t, p))
+
+# promise: an entry whose sidecar is still on disk at the second look is never counted as gone.
+# harm: its bytes would come off the count while still on disk and the trim would stop over budget
+law rt_recheck_sidecar_on_disk_not_gone:
+  for +h: Nat
+  for +t: Nat
+  for +r: Bool
+  for +p: Bool
+  {rt_recheck_gone(rt_recheck(h, t, r, True{}, p)) == False{} : Bool}
+
+def rt_recheck_sidecar_on_disk_not_gone(h, t, r, p):
+  %Equal.sym(Bool, Bool.or(r, True{}), True{}, rt_or_true_r(r)) : {rt_recheck_gone(rt_recheck_pick(_, rt_should_evict(h, t, p))) == False{} : Bool}
+  rt_pick_on_disk_not_gone(rt_should_evict(h, t, p))
+
+# promise: an entry neither of whose files is on disk at the second look is counted as gone.
+# harm: an entry someone else removed would be reported as kept over budget, or as one a dry run would remove, and the summary would misstate what the trim did
+law rt_recheck_nothing_on_disk_gone:
+  for +h: Nat
+  for +t: Nat
+  for +p: Bool
+  {rt_recheck_gone(rt_recheck(h, t, False{}, False{}, p)) == True{} : Bool}
+
+def rt_recheck_nothing_on_disk_gone(h, t, p):
+  {==}
+
+# promise: a protected entry is never removed, whatever the second look found.
+# harm: the keep window and the entries a server holds would be ignored by the trim
+law rt_recheck_protected_stays:
+  for +h: Nat
+  for +t: Nat
+  for +r: Bool
+  for +m: Bool
+  {rt_recheck_removes(rt_recheck(h, t, r, m, True{})) == False{} : Bool}
+
+def rt_recheck_protected_stays(h, t, r, m):
+  rt_pick_kept_not_removed(Bool.or(r, m))
+
+# promise: no entry is removed while the cache is within its target, whatever the second look found.
+# harm: a trim could empty a cache that already fits and force every recipe to compile again
+law rt_recheck_within_target_stays:
+  for +h: Nat
+  for +x: Nat
+  for +r: Bool
+  for +m: Bool
+  for +p: Bool
+  {rt_recheck_removes(rt_recheck(h, Nat.add(h, x), r, m, p)) == False{} : Bool}
+
+def rt_recheck_within_target_stays(h, x, r, m, p):
+  %Equal.sym(Bool, Nat.is_lt(Nat.add(h, x), h), False{}, rt_add_lt_false(h, x)) : {rt_recheck_removes(rt_recheck_pick(Bool.or(r, m), Bool.and(Bool.not(p), _))) == False{} : Bool}
+  %Equal.sym(Bool, Bool.and(Bool.not(p), False{}), False{}, rt_and_false_r(Bool.not(p))) : {rt_recheck_removes(rt_recheck_pick(Bool.or(r, m), _)) == False{} : Bool}
+  rt_pick_kept_not_removed(Bool.or(r, m))
+
+# promise: an unprotected entry whose recipe file is on disk at the second look is removed while the cache is over its target.
+# harm: a trim could stop early and leave the disk over the budget it was given
+law rt_recheck_over_target_removes:
+  for +t: Nat
+  for +x: Nat
+  for +m: Bool
+  {rt_recheck_removes(rt_recheck(Nat.add(t, 1n+x), t, True{}, m, False{})) == True{} : Bool}
+
+def rt_recheck_over_target_removes(t, x, m):
+  %Equal.sym(Bool, Nat.is_lt(t, Nat.add(t, 1n+x)), True{}, rt_lt_add_succ(t, x)) : {rt_recheck_removes(rt_recheck_pick(True{}, Bool.and(True{}, _))) == True{} : Bool}
+  {==}
+
+# promise: when both files of an entry are still on disk at the second look, none of its bytes count as gone from the disk.
+# harm: bytes still on disk would be counted as freed and the trim would stop over budget
+law rt_off_disk_none_gone:
+  for +r: Nat
+  for +m: Nat
+  {rt_off_disk_bytes(r, True{}, m, True{}) == 0n : Nat}
+
+def rt_off_disk_none_gone(r, m):
+  {==}
+
+# promise: when an entry's recipe file is gone at the second look and its sidecar is on disk, exactly the recipe's counted bytes count as gone from the disk.
+# harm: a kept entry whose recipe someone else removed would stay counted and the trim would remove up to a recipe more than its budget asks
+law rt_off_disk_recipe_gone:
+  for +r: Nat
+  for +m: Nat
+  {rt_off_disk_bytes(r, False{}, m, True{}) == r : Nat}
+
+def rt_off_disk_recipe_gone(r, m):
+  L.nat_add_zero_r(r)
+
+# promise: when an entry's sidecar is gone at the second look and its recipe file is on disk, exactly the sidecar's counted bytes count as gone from the disk.
+# harm: a kept entry whose sidecar someone else removed would stay counted and the trim would remove more than its budget asks
+law rt_off_disk_sidecar_gone:
+  for +r: Nat
+  for +m: Nat
+  {rt_off_disk_bytes(r, True{}, m, False{}) == m : Nat}
+
+def rt_off_disk_sidecar_gone(r, m):
+  {==}
+
+# promise: when neither file of an entry is on disk at the second look, all of its counted bytes come off the count.
+# harm: an entry someone else removed would stay counted and the trim would remove more than its budget asks
+law rt_off_disk_both_gone:
+  for +r: Nat
+  for +m: Nat
+  {rt_off_disk_bytes(r, False{}, m, False{}) == rt_entry_bytes(r, m) : Nat}
+
+def rt_off_disk_both_gone(r, m):
+  {==}
+
+# promise: the bytes the second look finds gone and the bytes it finds still on disk add up to exactly the entry's counted bytes, so what a removal would free holds no byte that is already gone.
+# harm: a dry run would report as freed bytes that someone else had already freed, or leave out bytes it would free
+law rt_off_and_on_disk_make_the_entry:
+  for +r: Nat
+  for +rd: Bool
+  for +m: Nat
+  for +md: Bool
+  {Nat.add(rt_off_disk_bytes(r, rd, m, md), rt_on_disk_bytes(r, rd, m, md)) == rt_entry_bytes(r, m) : Nat}
+
+def rt_off_and_on_disk_make_the_entry(r, rd, m, md):
+  match rd md:
+    case True{} True{}:
+      {==}
+    case True{} False{}:
+      %Equal.sym(Nat, Nat.add(r, 0n), r, L.nat_add_zero_r(r)) : {Nat.add(m, _) == Nat.add(r, m) : Nat}
+      L.nat_add_comm(m, r)
+    case False{} True{}:
+      %Equal.sym(Nat, Nat.add(r, 0n), r, L.nat_add_zero_r(r)) : {Nat.add(_, m) == Nat.add(r, m) : Nat}
+      {==}
+    case False{} False{}:
+      L.nat_add_zero_r(Nat.add(r, m))
+
+# promise: a file the second look did not find on disk counts as gone after the removal, whatever the removal did or did not try.
+# harm: a recipe someone else removed would stay counted when its sidecar's removal fails, and the trim would remove up to a recipe more than its budget asks
+law rt_gone_after_absent_at_look:
+  for +g: Bool
+  {rt_gone_after(False{}, g) == True{} : Bool}
+
+def rt_gone_after_absent_at_look(g):
+  {==}
+
+# promise: a file the removal found gone counts as gone after it.
+# harm: a removed file would stay counted as held and the trim would remove more than its budget asks
+law rt_gone_after_found_gone:
+  for +o: Bool
+  {rt_gone_after(o, True{}) == True{} : Bool}
+
+def rt_gone_after_found_gone(o):
+  match o:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# promise: a file on disk at the second look that the removal left in place never counts as gone.
+# harm: a failed removal would be counted as freed space and the trim would stop over budget
+law rt_gone_after_still_there:
+  {rt_gone_after(True{}, False{}) == False{} : Bool}
+
+def rt_gone_after_still_there():
+  {==}
