@@ -55,7 +55,7 @@ pub fn parse_laws(source: &str) -> Vec<ParsedLaw> {
 
     while i < lines.len() {
         let stripped = strip_comment(lines[i]).trim();
-        if stripped.starts_with("law ") {
+        if stripped.starts_with("law ") && !lines[i].starts_with([' ', '\t']) {
             let mut block_parts = vec![stripped.to_string()];
             i += 1;
             while i < lines.len() {
@@ -212,8 +212,10 @@ fn split_law_clause(after_for: &str) -> (&str, &str) {
     let mut depth = 0i32;
     let mut saw_colon = false;
     for (idx, ch) in after_for.char_indices() {
+        let is_arrow = ch == '>' && idx > 0 && bytes[idx - 1] == b'-';
         match ch {
             '(' | '[' | '<' => depth += 1,
+            '>' if is_arrow => {}
             ')' | ']' | '>' => depth -= 1,
             '{' => {
                 if depth == 0 && saw_colon {
@@ -324,6 +326,71 @@ fn split_last_top_level_colon(s: &str) -> Option<(&str, &str)> {
     last.map(|idx| (s[..idx].trim(), s[idx + 1..].trim()))
 }
 
+/// Names bound inside `def`: its parameters, `case` pattern binders, and `let` /
+/// `x = e` binders. A token equal to one of these refers to the local, not to a def of
+/// the same name, unless it is called (`name(..)`).
+pub(crate) fn def_local_names(def: &Def) -> HashSet<String> {
+    let mut names: HashSet<String> = def.params.iter().map(|p| p.name.clone()).collect();
+    names.extend(body_binder_names(&def.body));
+    names
+}
+
+/// Names bound inside a def body by `case` patterns and `let` / `x = e` bindings.
+pub(crate) fn body_binder_names(body: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for line in body.lines() {
+        let code = strip_comment(line).trim();
+        if let Some(rest) = code.strip_prefix("case ") {
+            let pat = crate::emit::split_top_level_once(rest, ':').map_or(rest, |(p, _)| p);
+            let toks = lock::tokenize_bend(pat);
+            for (i, t) in toks.iter().enumerate() {
+                let is_ctor = toks.get(i + 1).is_some_and(|n| n == "{" || n == "(");
+                if !is_ctor && t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                    names.insert(t.clone());
+                }
+            }
+        }
+        let binder = code.strip_prefix("let ").unwrap_or(code);
+        if let Some((lhs, _)) = binder.split_once('=') {
+            let lhs = lhs.trim().trim_start_matches(['+', '-', '~']).trim();
+            let is_eq_op = binder[lhs.len()..].trim_start().starts_with("==");
+            if !is_eq_op
+                && !lhs.is_empty()
+                && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                names.insert(lhs.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Defs referenced by `expr`: tokens naming a def, except names in `locals` (a
+/// parameter, binder, or law variable that shadows the def) unless they are called.
+pub(crate) fn referenced_defs(
+    expr: &str,
+    is_def: impl Fn(&str) -> bool,
+    locals: &HashSet<String>,
+) -> Vec<String> {
+    let toks = lock::tokenize_bend(expr);
+    let mut out: Vec<String> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if !is_def(t) || out.contains(t) {
+            continue;
+        }
+        let called = toks.get(i + 1).is_some_and(|n| n == "(");
+        if called || !locals.contains(t) {
+            out.push(t.clone());
+        }
+    }
+    out
+}
+
+/// Law variables (`for x: T`): they shadow defs of the same name in the law's terms.
+pub(crate) fn law_local_names(law: &ParsedLaw) -> HashSet<String> {
+    law.vars.iter().map(|v| v.name.clone()).collect()
+}
+
 /// Computes the transitive live `def` dependency cone referenced by a law.
 pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
     let def_map: HashMap<&str, &Def> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
@@ -338,8 +405,9 @@ pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
                 .flat_map(|h| [h.lhs.as_str(), h.rhs.as_str()]),
         )
     {
-        for tok in lock::tokenize_bend(expr) {
-            if def_map.contains_key(tok.as_str()) && visited.insert(tok.clone()) {
+        let locals = law_local_names(law);
+        for tok in referenced_defs(expr, |t| def_map.contains_key(t), &locals) {
+            if visited.insert(tok.clone()) {
                 queue.push_back(tok);
             }
         }
@@ -347,8 +415,9 @@ pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
 
     while let Some(name) = queue.pop_front() {
         if let Some(def) = def_map.get(name.as_str()) {
-            for tok in lock::tokenize_bend(&def.body) {
-                if def_map.contains_key(tok.as_str()) && visited.insert(tok.clone()) {
+            let locals = def_local_names(def);
+            for tok in referenced_defs(&def.body, |t| def_map.contains_key(t), &locals) {
+                if visited.insert(tok.clone()) {
                     queue.push_back(tok);
                 }
             }
@@ -367,7 +436,8 @@ pub fn cone_is_recursive(cone: &[String], defs: &[Def]) -> bool {
             continue;
         }
         let mut callees = Vec::new();
-        for tok in lock::tokenize_bend(&def.body) {
+        let locals = def_local_names(def);
+        for tok in referenced_defs(&def.body, |t| cone_set.contains(t), &locals) {
             if let Some(&target) = cone_set.get(tok.as_str()) {
                 if !callees.contains(&target) {
                     callees.push(target);
@@ -412,6 +482,7 @@ pub(crate) fn emit_law_tests_module(
     types: &[TypeDef],
     defs: &[Def],
     type_env: &TypeEnv,
+    unchecked_laws: &HashSet<String>,
 ) -> String {
     if laws.is_empty() {
         return String::new();
@@ -437,7 +508,13 @@ pub(crate) fn emit_law_tests_module(
             used_fn_names.insert(fn_name.clone());
         }
         out.push_str(&emit_single_law_test(
-            &fn_name, law, types, defs, &def_map, &type_map, type_env,
+            &fn_name,
+            law,
+            defs,
+            &def_map,
+            &type_map,
+            type_env,
+            unchecked_laws.contains(&law.name),
         ));
         out.push('\n');
     }
@@ -479,15 +556,26 @@ pub(crate) fn emit_pool_runtime_helpers(
         z ^ (z >> 31)
     }
 
-    fn __rb_is_nat_overflow(payload: &(dyn std::any::Any + Send)) -> bool {
-        let msg = if let Some(m) = payload.downcast_ref::<&str>() {
-            *m
+    fn __rb_panic_msg(payload: &(dyn std::any::Any + Send)) -> &str {
+        if let Some(m) = payload.downcast_ref::<&str>() {
+            m
         } else if let Some(m) = payload.downcast_ref::<String>() {
             m.as_str()
         } else {
-            return false;
-        };
-        msg.contains("rusty-bends: Nat overflow") || msg.contains("rusty-bends: step limit")
+            "(non-string panic)"
+        }
+    }
+
+    /// Checked `Nat` growth past `u64`: the input is outside what the Rust code can
+    /// represent, so the case is skipped.
+    fn __rb_is_nat_overflow(payload: &(dyn std::any::Any + Send)) -> bool {
+        __rb_panic_msg(payload).contains("rusty-bends: Nat overflow")
+    }
+
+    /// The evaluation step limit (mutation harnesses only): the code did not terminate
+    /// in time, which kills a mutant instead of skipping the case.
+    fn __rb_is_step_limit(payload: &(dyn std::any::Any + Send)) -> bool {
+        __rb_panic_msg(payload).contains("rusty-bends: step limit")
     }
 "#,
     );
@@ -499,7 +587,10 @@ pub(crate) fn emit_pool_runtime_helpers(
         if recursive {
             (0_u64..=12).collect()
         } else {
-            vec![0_u64, 1, 2, 3, 4, 5, 6, 7, 8, 16, 1000, u64::MAX - 1, u64::MAX]
+            vec![
+                0_u64, 1, 2, 3, 4, 5, 6, 7, 8, 10, 16, 32, 64, 100, 128, 255, 256, 512, 999, 1000,
+                u64::MAX - 1, u64::MAX,
+            ]
         }
     }
 
@@ -535,7 +626,10 @@ pub(crate) fn emit_pool_runtime_helpers(
             }
             v
         } else {
-            let mut v = vec![0_u64, 1, 2, 3, 5, 7, 16, 1000, u64::MAX - 1, u64::MAX];
+            let mut v = vec![
+                0_u64, 1, 2, 3, 5, 7, 10, 16, 32, 64, 100, 128, 255, 256, 512, 999, 1000,
+                u64::MAX - 1, u64::MAX,
+            ];
             for _ in 0..2 {
                 v.push(__rb_next_u64(rng) % 10_000);
             }
@@ -685,14 +779,22 @@ fn emit_adt_pool_fn(
 ) -> String {
     let mut s = format!(
         "    fn __rb_pool_adt_{}(rng: &mut u64, depth: usize, recursive: bool) -> Vec<{}> {{\n",
-        td.name, td.name
+        td.name,
+        rust_ident(&td.name)
     );
     s.push_str("        let mut out = Vec::new();\n");
     for v in &td.variants {
-        let has_adt_field = v
-            .field_types
-            .iter()
-            .any(|ft| type_references_adt(ft, type_map));
+        let ctor_rs = format!("{}::{}", rust_ident(&td.name), rust_ident(&v.name));
+        // Only a field that leads back to this type (a recursive cycle, boxed in Rust)
+        // spends depth; nested non-recursive ADTs always get their full pools.
+        let recursive_variant = type_env
+            .ctor_map
+            .get(&format!("{}.{}", td.name, v.name))
+            .is_some_and(|c| c.boxed_fields.iter().any(|b| *b));
+        let has_adt_field = recursive_variant
+            && v.field_types
+                .iter()
+                .any(|ft| type_references_adt(ft, type_map));
         let indent = if has_adt_field {
             s.push_str("        if depth > 0 {\n");
             "            "
@@ -716,7 +818,7 @@ fn emit_adt_pool_fn(
                 td.name, v.name
             ));
         } else if v.field_types.is_empty() {
-            s.push_str(&format!("{indent}out.push({}::{});\n", td.name, v.name));
+            s.push_str(&format!("{indent}out.push({ctor_rs});\n"));
         } else if v.field_types.len() == 1 {
             let expr = emit_pool_expr(
                 &v.field_types[0],
@@ -727,10 +829,7 @@ fn emit_adt_pool_fn(
             );
             let pushed = wrap_ctor_pool_arg("f0".to_string(), field_is_boxed(0));
             s.push_str(&format!("{indent}for f0 in {expr} {{\n"));
-            s.push_str(&format!(
-                "{indent}    out.push({}::{}({pushed}));\n",
-                td.name, v.name
-            ));
+            s.push_str(&format!("{indent}    out.push({ctor_rs}({pushed}));\n"));
             s.push_str(&format!("{indent}}}\n"));
         } else {
             for (fi, ft) in v.field_types.iter().enumerate() {
@@ -756,10 +855,7 @@ fn emit_adt_pool_fn(
                 .map(|fi| wrap_ctor_pool_arg(format!("__s{fi}.clone()"), field_is_boxed(fi)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            s.push_str(&format!(
-                "{loop_ind}out.push({}::{}({small_args}));\n",
-                td.name, v.name
-            ));
+            s.push_str(&format!("{loop_ind}out.push({ctor_rs}({small_args}));\n"));
             for _ in 0..v.field_types.len() {
                 loop_ind.truncate(loop_ind.len() - 4);
                 s.push_str(&format!("{loop_ind}}}\n"));
@@ -781,8 +877,7 @@ fn emit_adt_pool_fn(
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
-                "{inner_indent}    out.push({}::{}({args_sweep}));\n",
-                td.name, v.name
+                "{inner_indent}    out.push({ctor_rs}({args_sweep}));\n"
             ));
             s.push_str(&format!("{inner_indent}}}\n"));
             let edge_args = (0..v.field_types.len())
@@ -795,8 +890,7 @@ fn emit_adt_pool_fn(
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
-                "{inner_indent}out.push({}::{}({edge_args}));\n",
-                td.name, v.name
+                "{inner_indent}out.push({ctor_rs}({edge_args}));\n"
             ));
             if !eval_mode {
                 s.push_str(&format!("{inner_indent}for _ in 0..4 {{\n"));
@@ -812,8 +906,7 @@ fn emit_adt_pool_fn(
                     .collect::<Vec<_>>()
                     .join(", ");
                 s.push_str(&format!(
-                    "{inner_indent}    out.push({}::{}({args_rng}));\n",
-                    td.name, v.name
+                    "{inner_indent}    out.push({ctor_rs}({args_rng}));\n"
                 ));
                 s.push_str(&format!("{inner_indent}}}\n"));
             }
@@ -963,11 +1056,11 @@ fn emit_tuple_pool_expr(
 fn emit_single_law_test(
     fn_name: &str,
     law: &ParsedLaw,
-    _types: &[TypeDef],
     defs: &[Def],
     def_map: &HashMap<String, &Def>,
     type_map: &HashMap<String, &TypeDef>,
     type_env: &TypeEnv,
+    marked_unchecked: bool,
 ) -> String {
     if let Some(reason) = &law.unsupported_reason {
         return format!("    // Skipped law {}: {reason}\n", law.name);
@@ -1165,9 +1258,16 @@ fn emit_single_law_test(
     s.push_str("            }\n");
     s.push_str("        }\n");
 
-    if law.hypotheses.is_empty() {
+    // A law whose hypotheses no sampled input satisfies proves nothing here; only a
+    // reviewed '# unchecked:' marker lets it pass with zero checked cases.
+    if !marked_unchecked {
+        let why = if law.hypotheses.is_empty() {
+            "non-overflowing test cases"
+        } else {
+            "test cases satisfying its hypotheses"
+        };
         s.push_str(&format!(
-            "        assert!(__checked > 0, \"law {} had 0 non-overflowing test cases\");\n",
+            "        assert!(__checked > 0, \"law {} had 0 {why}\");\n",
             escape_rust_str(&law.name)
         ));
     }
@@ -1449,7 +1549,7 @@ pub(crate) fn emit_eval_law_checker(
     } else if recursive {
         "Nat in 0..=12, Bool in {false, true}, ADT depth <= 2".to_string()
     } else {
-        "Nat in [0..=8, 16, 1000, u64::MAX-1, u64::MAX], Bool in {false, true}, ADT depth <= 2"
+        "Nat in [0..=8, 10, 16, 32, 64, 100, 128, 255, 256, 512, 999, 1000, u64::MAX-1, u64::MAX], Bool in {false, true}, recursive ADT depth <= 2"
             .to_string()
     };
 
@@ -1468,10 +1568,23 @@ pub(crate) fn emit_eval_law_checker(
     } else {
         ""
     };
+    if compact_mutant_mode {
+        // How many sampled cases satisfied every hypothesis and reached the goal on the
+        // last call: the mutation gate requires this to be non-zero on unmutated code.
+        s.push_str("pub static CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);\n");
+    }
     s.push_str(&format!("{vis}fn {fn_name}(){ret_sig} {{\n"));
 
     if runtime_vars.is_empty() {
         s.push_str(&format!("    match {eval_expr} {{\n"));
+        if compact_mutant_mode {
+            s.push_str(
+                "        Ok(Some(_)) => CHECKED.store(1, std::sync::atomic::Ordering::Relaxed),\n",
+            );
+            s.push_str("        _ => CHECKED.store(0, std::sync::atomic::Ordering::Relaxed),\n");
+            s.push_str("    }\n");
+            s.push_str(&format!("    match {eval_expr} {{\n"));
+        }
         s.push_str("        Ok(Some((__lhs, __rhs))) if __lhs != __rhs => {\n");
         if compact_mutant_mode {
             s.push_str("            return Some(format!(\"lhs={:?}, rhs={:?}\", __lhs, __rhs));\n");
@@ -1497,6 +1610,12 @@ pub(crate) fn emit_eval_law_checker(
             ));
         }
         s.push_str("        }\n");
+        if compact_mutant_mode {
+            s.push_str("        Err(__p) if __rb_is_step_limit(&*__p) => return Some(\"did not terminate within the evaluation step limit\".to_string()),\n");
+            s.push_str("        Err(__p) if !__rb_is_nat_overflow(&*__p) => return Some(format!(\"panicked: {}\", __rb_panic_msg(&*__p))),\n");
+        } else {
+            s.push_str("        Err(__p) if !__rb_is_nat_overflow(&*__p) && !__rb_is_step_limit(&*__p) => std::panic::resume_unwind(__p),\n");
+        }
         s.push_str("        _ => {\n");
         if compact_mutant_mode {
             s.push_str("            return None;\n");
@@ -1544,7 +1663,14 @@ pub(crate) fn emit_eval_law_checker(
     }
     s.push_str(&format!("        match {eval_expr} {{\n"));
     s.push_str("            Err(__p) if __rb_is_nat_overflow(&*__p) => false,\n");
-    s.push_str("            Err(__p) => std::panic::resume_unwind(__p),\n");
+    if compact_mutant_mode {
+        // A mutant that loops forever or panics differently is caught, not skipped.
+        s.push_str("            Err(__p) if __rb_is_step_limit(&*__p) => { *__ce_out = Some(\"did not terminate within the evaluation step limit\".to_string()); true }\n");
+        s.push_str("            Err(__p) => { *__ce_out = Some(format!(\"panicked: {}\", __rb_panic_msg(&*__p))); true }\n");
+    } else {
+        s.push_str("            Err(__p) if __rb_is_step_limit(&*__p) => false,\n");
+        s.push_str("            Err(__p) => std::panic::resume_unwind(__p),\n");
+    }
     s.push_str("            Ok(None) => false,\n");
     s.push_str("            Ok(Some((__lhs, __rhs))) => {\n");
     s.push_str("                *__checked += 1;\n");
@@ -1699,6 +1825,7 @@ pub(crate) fn emit_eval_law_checker(
     s.push_str("    }\n");
 
     if compact_mutant_mode {
+        s.push_str("    CHECKED.store(__checked, std::sync::atomic::Ordering::Relaxed);\n");
         s.push_str("    __ce_summary\n");
     } else {
         s.push_str("    if !__found_ce {\n");
@@ -2294,5 +2421,25 @@ law keep_same:
             other => panic!("expected a counterexample, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn function_typed_binders_do_not_break_the_next_clause() {
+        let src = "law apply_twice:
+  for f: (Nat -> Nat)
+  for n: Nat
+  {f(f(n)) == f(f(n)) : Nat}
+";
+        let laws = parse_laws(src);
+        assert_eq!(laws.len(), 1);
+        let law = &laws[0];
+        let vars: Vec<(&str, &str)> = law
+            .vars
+            .iter()
+            .map(|v| (v.name.as_str(), v.ty.as_str()))
+            .collect();
+        assert_eq!(vars, vec![("f", "(Nat -> Nat)"), ("n", "Nat")]);
+        assert_eq!(law.lhs, "f(f(n))");
+        assert_eq!(law.eq_ty, "Nat");
     }
 }

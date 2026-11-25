@@ -339,7 +339,13 @@ pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSumm
     let mut summary = emit_items_to_rust(&types, &defs, &type_env, laws_verified, None, true)?;
 
     if !laws.is_empty() {
-        let test_mod = crate::law_test::emit_law_tests_module(&laws, &types, &defs, &type_env);
+        let unchecked: HashSet<String> = crate::lock::extract_law_doc_comments(source)
+            .into_iter()
+            .filter(|(_, docs)| docs.unchecked.is_some())
+            .map(|(name, _)| name)
+            .collect();
+        let test_mod =
+            crate::law_test::emit_law_tests_module(&laws, &types, &defs, &type_env, &unchecked);
         if !test_mod.is_empty() {
             summary.rust_source.push('\n');
             summary.rust_source.push_str(&test_mod);
@@ -380,6 +386,53 @@ pub(crate) fn collect_law_source_slices(laws: &[crate::law_test::ParsedLaw]) -> 
     slices
 }
 
+/// Adds a `call <callee>` panic site to every non-total def that calls a non-total def
+/// that can panic (directly or through its own callees), so `RUSTY_BENDS_LIST_PANICS`
+/// also names the public entry points whose checked growth happens further down.
+fn add_transitive_panic_sites(
+    defs: &[Def],
+    def_map: &HashMap<String, &Def>,
+    panic_sites: &mut Vec<PanicSite>,
+) {
+    let callees: Vec<(String, Vec<String>)> = defs
+        .iter()
+        .filter(|d| !d.total)
+        .map(|d| {
+            let toks = crate::lock::tokenize_bend(&d.body);
+            let mut called = Vec::new();
+            for (i, tok) in toks.iter().enumerate() {
+                let is_call = toks.get(i + 1).is_some_and(|t| t == "(");
+                let is_callee = def_map
+                    .get(tok)
+                    .is_some_and(|c| !c.total && c.name != d.name);
+                if is_call && is_callee && !called.contains(tok) {
+                    called.push(tok.clone());
+                }
+            }
+            (d.name.clone(), called)
+        })
+        .collect();
+    let mut panicking: HashSet<String> = panic_sites.iter().map(|p| p.function.clone()).collect();
+    let mut recorded: HashSet<(String, String)> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (caller, called) in &callees {
+            for callee in called {
+                if panicking.contains(callee) && recorded.insert((caller.clone(), callee.clone())) {
+                    panic_sites.push(PanicSite {
+                        function: caller.clone(),
+                        op: format!("call {callee}"),
+                    });
+                    changed |= panicking.insert(caller.clone());
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 pub(crate) fn emit_items_to_rust(
     types: &[TypeDef],
     defs: &[Def],
@@ -406,12 +459,33 @@ pub(crate) fn emit_items_to_rust(
         );
     }
 
+    // Types holding an F32 (directly or through another type) cannot derive Eq.
+    let mut float_types: HashSet<&str> = HashSet::new();
+    loop {
+        let before = float_types.len();
+        for td in types {
+            let holds_float = td.variants.iter().any(|v| {
+                v.field_types.iter().any(|ft| {
+                    crate::lock::tokenize_bend(ft)
+                        .iter()
+                        .any(|t| t == "F32" || float_types.contains(t.as_str()))
+                })
+            });
+            if holds_float {
+                float_types.insert(td.name.as_str());
+            }
+        }
+        if float_types.len() == before {
+            break;
+        }
+    }
+
     if emit_types {
         for td in types {
             let mut variants_rs = Vec::new();
             for v in &td.variants {
                 if v.field_types.is_empty() {
-                    variants_rs.push(format!("    {},", v.name));
+                    variants_rs.push(format!("    {},", rust_ident(&v.name)));
                 } else {
                     let info = type_env.ctor_map.get(&format!("{}.{}", td.name, v.name));
                     let mapped: Vec<String> = v
@@ -430,17 +504,35 @@ pub(crate) fn emit_items_to_rust(
                             }
                         })
                         .collect();
-                    variants_rs.push(format!("    {}({}),", v.name, mapped.join(", ")));
+                    variants_rs.push(format!(
+                        "    {}({}),",
+                        rust_ident(&v.name),
+                        mapped.join(", ")
+                    ));
                 }
             }
-            let derive_line = if type_env.non_copy_types.contains(&td.name) {
-                "#[derive(Debug, Clone, PartialEq, Eq)]"
+            let eq = if float_types.contains(td.name.as_str()) {
+                ""
             } else {
-                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]"
+                ", Eq"
+            };
+            let derive_line = if type_env.non_copy_types.contains(&td.name) {
+                format!("#[derive(Debug, Clone, PartialEq{eq})]")
+            } else {
+                format!("#[derive(Debug, Clone, Copy, PartialEq{eq})]")
+            };
+            // Bend allows lowercase type and constructor names; keep them as written.
+            let is_camel =
+                |n: &str| n.starts_with(|c: char| c.is_ascii_uppercase()) && !n.contains('_');
+            let lint_allow = if is_camel(&td.name) && td.variants.iter().all(|v| is_camel(&v.name))
+            {
+                ""
+            } else {
+                "#[allow(non_camel_case_types)]\n"
             };
             blocks.push(format!(
-                "{derive_line}\npub enum {} {{\n{}\n}}",
-                td.name,
+                "{derive_line}\n{lint_allow}pub enum {} {{\n{}\n}}",
+                rust_ident(&td.name),
                 variants_rs.join("\n")
             ));
         }
@@ -470,7 +562,14 @@ pub(crate) fn emit_items_to_rust(
         let generics = if !has_generics {
             String::new()
         } else {
-            format!("<{}>", type_params.join(", "))
+            format!(
+                "<{}>",
+                type_params
+                    .iter()
+                    .map(|t| rust_ident(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
 
         let rust_params = live_params
@@ -511,9 +610,11 @@ pub(crate) fn emit_items_to_rust(
         if !def.total && total_cone.contains(&def.name) {
             variants.push((rust_ident(&total_fn_name(def)), true, false));
         }
+        let param_locals: HashSet<String> = def.params.iter().map(|p| p.name.clone()).collect();
         for (fn_name, total, public) in variants {
             let ops = RefCell::new(Vec::new());
             let ctx = EmitCtx {
+                locals: &param_locals,
                 defs: &def_map,
                 type_env,
                 clone_vars: &clone_vars,
@@ -547,6 +648,8 @@ pub(crate) fn emit_items_to_rust(
             }
         }
     }
+
+    add_transitive_panic_sites(defs, &def_map, &mut panic_sites);
 
     let mut out = String::new();
     out.push_str("// @generated by rusty-bends-build v1 (Verified Core -> Pure Rust)\n");
@@ -879,6 +982,21 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
         i += 1;
     }
 
+    let mut ctor_owner: HashMap<&str, &str> = HashMap::new();
+    for td in &types {
+        for v in &td.variants {
+            if !is_valid_rust_ident_or_wildcard(&v.name) || v.name == "_" {
+                continue;
+            }
+            if let Some(other) = ctor_owner.insert(v.name.as_str(), td.name.as_str()) {
+                return Err(format!(
+                    "[E_NAME_COLLISION] Constructor '{}' is declared by both '{other}' and '{}'.\nHint: RustyBends emits all of verified/ into one Rust module, where bare constructor names must be unique; rename one of them.",
+                    v.name, td.name
+                ));
+            }
+        }
+    }
+
     Ok((types, defs))
 }
 
@@ -1163,12 +1281,15 @@ fn parse_def_header(header: &str, body: String) -> Result<Def, String> {
 pub(crate) enum ArithMode {
     NatChecked,
     Wrapping,
+    /// `F32`: IEEE arithmetic, plain Rust operators on `f32`.
+    Float,
 }
 
 pub(crate) fn arith_mode_for_type(ty: &str, fallback: ArithMode) -> ArithMode {
     match ty.trim() {
         "U32" | "U64" | "I32" | "I64" => ArithMode::Wrapping,
         "Nat" => ArithMode::NatChecked,
+        "F32" => ArithMode::Float,
         _ => fallback,
     }
 }
@@ -1206,8 +1327,10 @@ pub(crate) fn bend_type_to_rust(ty: &str, type_params: &HashSet<String>) -> Stri
         "I32" => "i32".to_string(),
         "I64" => "i64".to_string(),
         "Bool" => "bool".to_string(),
+        "F32" => "f32".to_string(),
         "Unit" | "()" => "()".to_string(),
-        _ if type_params.contains(t) => t.to_string(),
+        _ if type_params.contains(t) => rust_ident(t),
+        _ if t.split('.').all(is_valid_rust_ident_or_wildcard) => rust_path(t),
         _ => t.to_string(),
     }
 }
@@ -1400,27 +1523,29 @@ fn emit_pattern_guard(
     if p == "_" || p == "Unit{}" || p == "()" {
         return Ok("true".to_string());
     }
+    // Guard targets are references (boxed fields, sub-bindings of a borrowed match):
+    // dereference before matching a literal so every Rust edition and version accepts it.
     if p == "true" || p == "True{}" {
-        return Ok(format!("matches!({target}, true)"));
+        return Ok(format!("matches!(*({target}), true)"));
     }
     if p == "false" || p == "False{}" {
-        return Ok(format!("matches!({target}, false)"));
+        return Ok(format!("matches!(*({target}), false)"));
     }
     if p == "[]" {
         return Ok(format!("matches!({target}, List::Nil)"));
     }
     if let Some(nat_pat) = parse_nat_succ_pattern(p)? {
         return Ok(match nat_pat {
-            NatPattern::Const(total) => format!("matches!({target}, {total}_u64)"),
+            NatPattern::Const(total) => format!("matches!(*({target}), {total}_u64)"),
             NatPattern::Succ { offset: 0, .. } => "true".to_string(),
             NatPattern::Succ { offset, .. } => {
-                format!("matches!({target}, {offset}_u64..=u64::MAX)")
+                format!("matches!(*({target}), {offset}_u64..=u64::MAX)")
             }
         });
     }
     if let Some(digits) = p.strip_suffix('n') {
         if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-            return Ok(format!("matches!({target}, {digits}_u64)"));
+            return Ok(format!("matches!(*({target}), {digits}_u64)"));
         }
     }
     if is_wrapped_in_parens(p) {
@@ -1697,9 +1822,18 @@ fn emit_match_pattern(
 
 fn resolve_ctor_path(name: &str, ctors: &HashMap<String, CtorInfo>) -> String {
     if let Some(info) = ctors.get(name) {
-        return format!("{}::{}", info.type_name, info.variant_name);
+        return ctor_rust_path(info);
     }
-    name.replace('.', "::")
+    rust_path(name)
+}
+
+/// Keyword-safe Rust path `Type::Variant` of a constructor.
+fn ctor_rust_path(info: &CtorInfo) -> String {
+    format!(
+        "{}::{}",
+        rust_ident(&info.type_name),
+        rust_ident(&info.variant_name)
+    )
 }
 
 pub(crate) fn leading_indent(line: &str) -> usize {
@@ -1946,6 +2080,9 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) total_cone: &'a HashSet<String>,
     /// Records each panicking checked-growth op emitted (ignored in total mode).
     pub(crate) panic_ops: &'a RefCell<Vec<String>>,
+    /// Names bound in scope (parameters, pattern binders, `let`s): a bare name in this
+    /// set is the local, never a nullary constructor of the same name.
+    pub(crate) locals: &'a HashSet<String>,
 }
 
 const OVERFLOW_EXPECT: &str = ".expect(\"rusty-bends: Nat overflow\")";
@@ -1979,6 +2116,7 @@ pub(crate) fn emit_expr_with_mode(
     mode: ArithMode,
 ) -> Result<String, String> {
     let no_cone = HashSet::new();
+    let no_locals = HashSet::new();
     let ops = RefCell::new(Vec::new());
     let ctx = EmitCtx {
         defs,
@@ -1988,6 +2126,7 @@ pub(crate) fn emit_expr_with_mode(
         total: false,
         total_cone: &no_cone,
         panic_ops: &ops,
+        locals: &no_locals,
     };
     emit_expr_with_ctx(expr, &ctx, mode)
 }
@@ -2002,16 +2141,38 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
 
     let first_trim = lines[0].trim();
 
-    // Multi-line let bindings:
-    //   let x = expr
-    //   body
-    if lines.len() > 1
-        && first_trim.starts_with("let ")
-        && split_top_level_once(first_trim, ';').is_none()
-    {
+    // Bend 2 binding `x = e` / `+x = e` (no `let`); a dead `-x = e` is erased (q=0).
+    let bend2_binding = if lines.len() > 1 && !first_trim.starts_with("let ") {
+        bend2_binding_lhs(first_trim)
+    } else {
+        None
+    };
+    if let Some((_, true)) = bend2_binding {
         let let_indent = leading_indent(lines[0]);
-        if let Some((lhs_raw, val_first)) =
-            split_top_level_once(first_trim.strip_prefix("let ").unwrap(), '=')
+        let mut rest_idx = 1;
+        while rest_idx < lines.len() && leading_indent(lines[rest_idx]) > let_indent {
+            rest_idx += 1;
+        }
+        if rest_idx < lines.len() {
+            return emit_expr_with_ctx(&lines[rest_idx..].join("\n"), ctx, mode);
+        }
+    }
+
+    // Multi-line let bindings:
+    //   let x = expr        (or Bend 2: x = expr)
+    //   body
+    let let_source = if first_trim.starts_with("let ") {
+        first_trim.strip_prefix("let ")
+    } else if let Some((bind_start, false)) = bend2_binding {
+        Some(&first_trim[bind_start..])
+    } else {
+        None
+    };
+    let let_split = let_source
+        .filter(|_| lines.len() > 1 && split_top_level_once(first_trim, ';').is_none())
+        .and_then(|src| split_top_level_once(src, '='));
+    if let Some((lhs_raw, val_first)) = let_split {
+        let let_indent = leading_indent(lines[0]);
         {
             let mut val_lines = Vec::new();
             if !val_first.trim().is_empty() {
@@ -2040,8 +2201,11 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                         }
                     }
                 }
+                let mut body_locals = ctx.locals.clone();
+                body_locals.extend(extract_let_bound_names(lhs_raw));
                 let body_ctx = EmitCtx {
                     clone_vars: &body_clone_vars,
+                    locals: &body_locals,
                     ..*ctx
                 };
                 return Ok(format!(
@@ -2090,18 +2254,22 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 }
                 if !ctx.has_generics {
                     for (var, field_ty) in &pat_state.bound_vars {
+                        // Binders of unknown type (tuple scrutinees, wildcards) may hold a
+                        // non-Copy value: clone on reuse, which is a no-op cost for Copy.
                         let maybe_non_copy = match field_ty.as_deref() {
-                            Some("_") => !ctx.type_env.non_copy_types.is_empty(),
+                            Some("_") | None => !ctx.type_env.non_copy_types.is_empty(),
                             Some(ty) => type_contains_non_copy(ty, &ctx.type_env.non_copy_types),
-                            None => false,
                         };
                         if maybe_non_copy && count_ident_uses(&arm_body, var) > 1 {
                             arm_clone_vars.insert(var.clone());
                         }
                     }
                 }
+                let mut arm_locals = ctx.locals.clone();
+                arm_locals.extend(pat_state.bound_vars.iter().map(|(v, _)| v.clone()));
                 let arm_ctx = EmitCtx {
                     clone_vars: &arm_clone_vars,
+                    locals: &arm_locals,
                     ..*ctx
                 };
                 let emitted_body = emit_expr_with_ctx(&arm_body, &arm_ctx, mode)?;
@@ -2149,6 +2317,15 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
     }
     if s == "Unit{}" || s == "()" {
         return Ok("()".to_string());
+    }
+
+    // String literal: Bend's String maps to an owned Rust String.
+    if is_string_literal(s) {
+        return Ok(format!("String::from({s})"));
+    }
+    // F32 literal (`1.5`), or an integer literal in F32 context.
+    if is_float_literal(s) || (mode == ArithMode::Float && is_int_literal(s)) {
+        return Ok(format!("{s}_f32"));
     }
 
     // Handle conditionals: if cond: then_branch else: else_branch
@@ -2217,8 +2394,11 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                         }
                     }
                 }
+                let mut body_locals = ctx.locals.clone();
+                body_locals.extend(extract_let_bound_names(name));
                 let body_ctx = EmitCtx {
                     clone_vars: &body_clone_vars,
+                    locals: &body_locals,
                     ..*ctx
                 };
                 return Ok(format!(
@@ -2242,8 +2422,46 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
         }
     }
 
+    // String concatenation `a ++ b` (Base String.append).
+    if let Some((_, lhs, rhs)) = split_last_spaced_op(s, &["++"]) {
+        return Ok(format!(
+            "format!(\"{{}}{{}}\", {}, {})",
+            emit_expr_with_ctx(lhs, ctx, mode)?,
+            emit_expr_with_ctx(rhs, ctx, mode)?
+        ));
+    }
+
+    // Bitwise `.|.` < `.^.` < `.&.` < shifts `<<` `>>` (Bend 2 precedence), fixed-width only.
+    for ops in [&[".|."][..], &[".^."], &[".&."], &["<<", ">>"]] {
+        if let Some((op, lhs, rhs)) = split_last_spaced_op(s, ops) {
+            if mode != ArithMode::Wrapping {
+                return Err(format!(
+                    "[E_EMIT_UNSUPPORTED] '{op}' needs a fixed-width type annotation such as '(a {op} b : U32)' in '{s}'"
+                ));
+            }
+            let l = emit_expr_with_ctx(lhs, ctx, mode)?;
+            return Ok(match op {
+                ".|." => format!("({l} | {})", emit_expr_with_ctx(rhs, ctx, mode)?),
+                ".^." => format!("({l} ^ {})", emit_expr_with_ctx(rhs, ctx, mode)?),
+                ".&." => format!("({l} & {})", emit_expr_with_ctx(rhs, ctx, mode)?),
+                // U32.shln / U32.shrn: the shift amount is a Nat; 32 or more gives 0.
+                _ => {
+                    let r = emit_expr_with_ctx(rhs, ctx, ArithMode::NatChecked)?;
+                    let rust_op = if op == "<<" { "<<" } else { ">>" };
+                    format!("{{ let __a = {l}; let __b: u64 = {r}; if __b >= 32 {{ 0 }} else {{ __a {rust_op} __b }} }}")
+                }
+            });
+        }
+    }
+
     // Right-to-left top-level '+' or '-' (checked add / saturating sub for Nat; wrapping for U32/U64/I32/I64)
     if let Some((op, lhs, rhs)) = split_last_additive(s) {
+        // `1n+x` (no spaces) is Bend's Nat successor sugar: Nat whatever the context.
+        let mode = if op == '+' && is_nat_successor(s, lhs) {
+            ArithMode::NatChecked
+        } else {
+            mode
+        };
         let l = emit_expr_with_ctx(lhs, ctx, mode)?;
         let r = emit_expr_with_ctx(rhs, ctx, mode)?;
         return Ok(match (mode, op) {
@@ -2253,6 +2471,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             (ArithMode::NatChecked, '-') => format!("({l}).saturating_sub({r})"),
             (ArithMode::Wrapping, '+') => format!("({l}).wrapping_add({r})"),
             (ArithMode::Wrapping, '-') => format!("({l}).wrapping_sub({r})"),
+            (ArithMode::Float, _) => format!("({l} {op} {r})"),
             _ => unreachable!(),
         });
     }
@@ -2276,8 +2495,10 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 format!("{{ let __a = {l}; let __b = {r}; if __b == 0_u64 {{ __a }} else {{ __a % __b }} }}")
             }
             (ArithMode::Wrapping, '%') => {
-                format!("{{ let __a = {l}; let __b = {r}; if __b == 0 {{ 0 }} else {{ __a.wrapping_rem(__b) }} }}")
+                format!("{{ let __a = {l}; let __b = {r}; if __b == 0 {{ __a }} else {{ __a.wrapping_rem(__b) }} }}")
             }
+            // F32.mod is C fmod, which Rust's '%' on f32 matches.
+            (ArithMode::Float, _) => format!("({l} {op} {r})"),
             _ => unreachable!(),
         });
     }
@@ -2306,7 +2527,10 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 } else {
                     trimmed
                 };
-                let emitted = emit_expr_with_ctx(val, ctx, mode)?;
+                let field_mode = info_opt
+                    .and_then(|i| i.field_types.get(idx))
+                    .map_or(mode, |ty| arith_mode_for_type(ty, mode));
+                let emitted = emit_expr_with_ctx(val, ctx, field_mode)?;
                 let is_boxed = info_opt
                     .and_then(|i| i.boxed_fields.get(idx).copied())
                     .unwrap_or(false);
@@ -2339,7 +2563,11 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             if let Some(info) = ctors.get(callee) {
                 let mut emitted_args = Vec::with_capacity(raw_args.len());
                 for (idx, a) in raw_args.iter().enumerate() {
-                    let emitted = emit_expr_with_ctx(a, ctx, mode)?;
+                    let field_mode = info
+                        .field_types
+                        .get(idx)
+                        .map_or(mode, |ty| arith_mode_for_type(ty, mode));
+                    let emitted = emit_expr_with_ctx(a, ctx, field_mode)?;
                     let is_boxed = info.boxed_fields.get(idx).copied().unwrap_or(false);
                     if is_boxed {
                         emitted_args.push(format!("Box::new({emitted})"));
@@ -2348,9 +2576,8 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                     }
                 }
                 return Ok(format!(
-                    "{}::{}({})",
-                    info.type_name,
-                    info.variant_name,
+                    "{}({})",
+                    ctor_rust_path(info),
                     emitted_args.join(", ")
                 ));
             }
@@ -2358,14 +2585,17 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             let mut emitted_args = Vec::new();
             let target_def = defs.get(callee);
             for (idx, arg) in raw_args.iter().enumerate() {
+                let mut arg_mode = mode;
                 if let Some(def) = target_def {
                     if let Some(param) = def.params.get(idx) {
                         if param.q == Quantity::Dead {
                             continue;
                         }
+                        // Arguments take the callee's parameter type, not the caller's.
+                        arg_mode = arith_mode_for_type(&param.ty, mode);
                     }
                 }
-                emitted_args.push(emit_expr_with_ctx(arg, ctx, mode)?);
+                emitted_args.push(emit_expr_with_ctx(arg, ctx, arg_mode)?);
             }
             if let Some(def) = target_def {
                 if ctx.total && ctx.total_cone.contains(callee) {
@@ -2401,9 +2631,10 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
     }
 
     // Unit ADT constructor (e.g. OrderState.Draft or Draft)
+    // A bare name is a local before it is a nullary constructor (Bend 2 writes those `C{}`).
     if let Some(info) = ctors.get(s) {
-        if info.arity == 0 {
-            return Ok(format!("{}::{}", info.type_name, info.variant_name));
+        if info.arity == 0 && !ctx.locals.contains(s) {
+            return Ok(ctor_rust_path(info));
         }
     }
 
@@ -2638,23 +2869,86 @@ fn split_keyword<'a>(s: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
 pub(crate) fn split_top_level_str<'a>(s: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
     let mut depth = 0i32;
     let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        match bytes[i] {
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
             b'(' | b'{' | b'[' => depth += 1,
             b')' | b'}' | b']' => depth -= 1,
             _ if depth == 0 && i > 0 && s[i..].starts_with(op) => {
-                if (op == "<" || op == ">") && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
-                    continue;
+                let prev = bytes[i - 1];
+                let next = bytes.get(i + op.len()).copied().unwrap_or(b' ');
+                // '<' and '>' alone must not match inside '<=', '>=', '<<', '>>', '->',
+                // '<-', '<>', '<&>', or '=>'.
+                let part_of_longer = match op {
+                    "<" => matches!(next, b'=' | b'<' | b'-' | b'>' | b'&') || prev == b'<',
+                    ">" => {
+                        matches!(next, b'=' | b'>')
+                            || matches!(prev, b'=' | b'-' | b'>' | b'&' | b'<')
+                    }
+                    _ => false,
+                };
+                if !part_of_longer {
+                    return Some((s[..i].trim(), s[i + op.len()..].trim()));
                 }
-                if op == ">" && (bytes[i - 1] == b'=' || bytes[i - 1] == b'-') {
-                    continue;
-                }
-                return Some((s[..i].trim(), s[i + op.len()..].trim()));
             }
             _ => {}
         }
+        i += 1;
     }
     None
+}
+
+/// Splits `s` at the last top-level ` op ` (spaced, as Bend 2 requires for infix
+/// operators) among `ops`, outside brackets and string literals: left-associative.
+fn split_last_spaced_op<'a>(
+    s: &'a str,
+    ops: &[&'static str],
+) -> Option<(&'static str, &'a str, &'a str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut found = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            b' ' if depth == 0 => {
+                for op in ops {
+                    let end = i + 1 + op.len();
+                    if s[i + 1..].starts_with(op) && bytes.get(end) == Some(&b' ') {
+                        found = Some((*op, s[..i].trim(), s[end + 1..].trim()));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    found
 }
 
 fn is_valid_path_ident(s: &str) -> bool {
@@ -2803,16 +3097,106 @@ pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)>
     None
 }
 
+/// For a Bend 2 binding line `x = e`, `+x = e`, `~x = e`, `(a, b) = e`, or a dead
+/// `-x = e`: the byte offset where the binder starts (after its quantity sigil) and
+/// whether the binding is dead (erased).
+fn bend2_binding_lhs(line: &str) -> Option<(usize, bool)> {
+    let (start, dead) = match line.as_bytes().first()? {
+        b'+' | b'~' => (1, false),
+        b'-' => (1, true),
+        _ => (0, false),
+    };
+    let rest = &line[start..];
+    let lhs_end = if rest.starts_with('(') {
+        let close = rest.find(')')?;
+        let inner = &rest[1..close];
+        if !inner
+            .split(',')
+            .all(|p| is_valid_rust_ident_or_wildcard(p.trim()))
+        {
+            return None;
+        }
+        close + 1
+    } else {
+        rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?
+    };
+    let name = &rest[..lhs_end];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let after = rest[lhs_end..].trim_start();
+    let is_bind = after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>");
+    is_bind.then_some((start, dead))
+}
+
+/// `"..."` with no unescaped quote inside.
+fn is_string_literal(s: &str) -> bool {
+    if s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
+        return false;
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return false;
+        }
+    }
+    !escaped
+}
+
+fn is_int_literal(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// `1.5`, `0.25`: digits, one dot, digits.
+fn is_float_literal(s: &str) -> bool {
+    s.split_once('.')
+        .is_some_and(|(a, b)| is_int_literal(a) && is_int_literal(b))
+}
+
+/// True when `s` is `lhs+rhs` written as Bend's Nat successor sugar: `lhs` ends in a
+/// Nat literal (`1n`, `1n+1n`) and the `+` touches both operands. Bend requires spaces and
+/// a type annotation around a real infix `+`, so this form is never fixed-width.
+fn is_nat_successor(s: &str, lhs: &str) -> bool {
+    let lb = lhs.as_bytes();
+    let n = lb.len();
+    let ends_in_nat_lit = n >= 2 && lb[n - 1] == b'n' && lb[n - 2].is_ascii_digit();
+    let tight = s
+        .get(lhs.len()..)
+        .is_some_and(|rest| rest.starts_with('+') && !rest[1..].starts_with(char::is_whitespace));
+    ends_in_nat_lit && tight && !s.starts_with(char::is_whitespace)
+}
+
 pub(crate) fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
     let mut depth = 0i32;
     let mut found = None;
     let bytes = s.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
     for (idx, ch) in s.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '(' | '{' | '[' => depth += 1,
             ')' | '}' | ']' => depth -= 1,
             '+' | '-' if depth == 0 && idx > 0 => {
                 if ch == '-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'>' {
+                    continue;
+                }
+                if ch == '+' && (bytes.get(idx + 1) == Some(&b'+') || bytes[idx - 1] == b'+') {
                     continue;
                 }
                 found = Some((ch, s[..idx].trim(), s[idx + 1..].trim()));
@@ -2826,8 +3210,21 @@ pub(crate) fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
 fn split_last_multiplicative(s: &str) -> Option<(char, &str, &str)> {
     let mut depth = 0i32;
     let mut found = None;
+    let mut in_string = false;
+    let mut escaped = false;
     for (idx, ch) in s.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '(' | '{' | '[' => depth += 1,
             ')' | '}' | ']' => depth -= 1,
             '*' | '/' | '%' if depth == 0 && idx > 0 => {
@@ -3714,16 +4111,28 @@ law zero_width_refused:
             .iter()
             .map(|p| (p.function.as_str(), p.op.as_str()))
             .collect();
-        assert_eq!(sites, vec![("area", "Nat.mul")]);
+        // Callers that reach `area` through non-total calls can panic too.
+        assert_eq!(
+            sites,
+            vec![
+                ("area", "Nat.mul"),
+                ("fits_area_limit", "call area"),
+                ("fits_default_limit", "call fits_area_limit"),
+            ]
+        );
 
         let path = std::path::Path::new("verified/shapes.bend");
         let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, AREA_SRC)]);
         assert_eq!(
-            listing[0],
-            "RustyBends panic [area]: Nat.mul at verified/shapes.bend:4"
+            &listing[..3],
+            &[
+                "RustyBends panic [area]: Nat.mul at verified/shapes.bend:4",
+                "RustyBends panic [fits_area_limit]: call area at verified/shapes.bend:7",
+                "RustyBends panic [fits_default_limit]: call fits_area_limit at verified/shapes.bend:10",
+            ]
         );
-        assert!(listing[1].contains("1 checked-growth panic site(s) in 1 function(s)"));
-        assert!(listing[1].contains("# rusty-bends: total"));
+        assert!(listing[3].contains("3 checked-growth panic site(s) in 3 function(s)"));
+        assert!(listing[3].contains("# rusty-bends: total"));
 
         let none = emit_verified_rust("def id(+n: Nat) -> Nat:\n  n\n", 0).unwrap();
         assert!(none.panic_sites.is_empty());
@@ -3781,6 +4190,70 @@ law zero_width_refused:
         compile_and_run("runtime", &harness, &[]);
     }
 
+    const PANIC_LINES_SRC: &str = r#"import Base
+
+def pick_sum(ok: Bool, a: Nat, b: Nat) -> Nat:
+  match ok:
+    case True{}: Nat.add(a, b)
+    case False{}: a
+
+def tight(a: Nat, b: Nat) -> Nat:
+  (a + b : Nat)
+
+def wraps(a: U32, b: U32) -> U32:
+  (a + b : U32)
+
+def grow(n: Nat) -> Nat:
+  match n:
+    case 0n: 1n
+    case 1n+p: (p * 3n : Nat)
+"#;
+
+    #[test]
+    fn panic_listing_attributes_single_line_case_arms_and_annotated_infix() {
+        if let Some((ok, text)) = reference_check_only("panic_lines", PANIC_LINES_SRC) {
+            assert!(
+                ok,
+                "reference bend must accept the panic-line fixture:\n{text}"
+            );
+        }
+        let summary = emit_verified_rust(PANIC_LINES_SRC, 0).unwrap();
+        let path = std::path::Path::new("verified/lines.bend");
+        let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, PANIC_LINES_SRC)]);
+        assert_eq!(
+            &listing[..listing.len() - 1],
+            &[
+                "RustyBends panic [pick_sum]: Nat.add at verified/lines.bend:5",
+                "RustyBends panic [tight]: Nat.add at verified/lines.bend:9",
+                "RustyBends panic [grow]: Nat.mul at verified/lines.bend:17",
+            ],
+            "{listing:#?}"
+        );
+    }
+
+    #[test]
+    fn panic_listing_matches_alias_qualified_calls() {
+        let lib = "import Base\n\ndef double(n: Nat) -> Nat:\n  Nat.mul(n, 2n)\n";
+        let user = "import Base\nimport lib.bend as L\n\ndef quad(n: Nat) -> Nat:\n  L.double(L.double(n))\n";
+        let combined = format!(
+            "{}\n{}\n",
+            resolve_import_aliases(lib),
+            resolve_import_aliases(user)
+        );
+        let summary = emit_verified_rust(&combined, 0).unwrap();
+        let files = [
+            (std::path::Path::new("verified/lib.bend"), lib),
+            (std::path::Path::new("verified/user.bend"), user),
+        ];
+        let listing = crate::format_panic_sites(&summary.panic_sites, &files);
+        assert!(
+            listing.contains(
+                &"RustyBends panic [quad]: call double at verified/user.bend:5".to_string()
+            ),
+            "{listing:#?}"
+        );
+    }
+
     #[test]
     fn total_function_generated_law_test_still_runs() {
         let summary = emit_verified_rust(&total_area_src(), 1).unwrap();
@@ -3792,5 +4265,280 @@ law zero_width_refused:
         );
         assert!(out.contains("law_zero_width_refused ... ok"), "{out}");
         assert!(out.contains("test result: ok"), "{out}");
+    }
+
+    /// Runs the reference `bend --check-only` on `source` when the binary is
+    /// installed; returns `None` when it is not.
+    fn reference_check_only(tag: &str, source: &str) -> Option<(bool, String)> {
+        let bend_bin = crate::resolve_bend_bin(
+            std::env::var("BEND_BIN").ok(),
+            std::env::var_os("PATH"),
+            std::env::var_os("HOME").map(std::path::PathBuf::from),
+        );
+        let dir = std::env::temp_dir().join(format!("rb_ref_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.bend");
+        std::fs::write(&file, source).unwrap();
+        let out = std::process::Command::new(&bend_bin)
+            .arg(&file)
+            .arg("--check-only")
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some((out.status.success(), text))
+    }
+
+    const U32_DIV_ZERO_SRC: &str = r#"import Base
+
+def rem_u32(a: U32, b: U32) -> U32:
+  (a % b : U32)
+
+def quot_u32(a: U32, b: U32) -> U32:
+  (a / b : U32)
+
+# promise: the remainder by zero is the dividend
+law rem_by_zero_is_dividend:
+  {rem_u32(5, 0) == 5 : U32}
+
+def rem_by_zero_is_dividend():
+  {==}
+
+# promise: the quotient by zero is zero
+law quot_by_zero_is_zero:
+  {quot_u32(5, 0) == 0 : U32}
+
+def quot_by_zero_is_zero():
+  {==}
+"#;
+
+    const SUCC_IN_U32_SRC: &str = r#"import Base
+
+def take_nat(x: Nat) -> U32:
+  match x:
+    case 0n: 0
+    case 1n+_: 1
+
+def check_succ(n: Nat) -> U32:
+  take_nat(1n+n)
+
+def wrap_sum(a: U32, b: U32) -> U32:
+  (a + b : U32)
+
+def nat_sum_small(a: Nat, b: Nat) -> Bool:
+  Nat.is_le((a + b : Nat), 10n)
+
+# promise: the successor of any Nat is not zero
+law succ_not_zero:
+  for n: Nat
+  {check_succ(n) == 1 : U32}
+
+def succ_not_zero(n):
+  {==}
+"#;
+
+    #[test]
+    fn nat_successor_stays_checked_inside_fixed_width_functions() {
+        if let Some((ok, text)) = reference_check_only("succ_u32", SUCC_IN_U32_SRC) {
+            assert!(ok, "reference bend must accept the fixture:\n{text}");
+        }
+        let summary = emit_verified_rust(SUCC_IN_U32_SRC, 1).unwrap();
+        let src = &summary.rust_source;
+        assert!(
+            src.contains("take_nat((1_u64).checked_add(n).expect(\"rusty-bends: Nat overflow\"))"),
+            "{src}"
+        );
+        assert!(!src.contains("(1_u64).wrapping_add"), "{src}");
+        assert!(src.contains("(a).wrapping_add(b)"), "{src}");
+        assert!(src.contains("(a).checked_add(b).expect("), "{src}");
+        assert!(summary
+            .panic_sites
+            .iter()
+            .any(|p| p.function == "check_succ" && p.op == "Nat.add"));
+        let runtime_only = src.split("#[cfg(test)]").next().unwrap();
+        let harness = format!(
+            "{runtime_only}\nfn main() {{\n    assert_eq!(check_succ(5), 1);\n    assert!(std::panic::catch_unwind(|| check_succ(u64::MAX)).is_err());\n    assert_eq!(wrap_sum(u32::MAX, 1), 0);\n    assert!(nat_sum_small(4, 6));\n}}\n"
+        );
+        compile_and_run("succ_u32", &harness, &["-A", "dead_code"]);
+        let out = compile_and_run("succ_u32_laws", src, &["--test", "-A", "dead_code"]);
+        assert!(out.contains("law_succ_not_zero ... ok"), "{out}");
+    }
+
+    const EMITTER_EDGES_SRC: &str = r#"import Base
+
+type Chain is Data:
+  End{}
+  Link{val: Nat, rest: Chain}
+
+type move is Data:
+  ref{}
+  loop{n: Nat}
+
+type Mode is Data:
+  idle{}
+  busy{n: Nat}
+
+type Sample is Data:
+  Reading{at: Nat, value: F32}
+
+def second_is_zero(c: Chain) -> Bool:
+  match c:
+    case Link{_, Link{0n, _}}: True{}
+    case _: False{}
+
+def sh(+a: U32, +b: Nat) -> U32:
+  ((a << b : U32) + (a >> b : U32) : U32)
+
+def bits(+a: U32, +b: U32) -> U32:
+  ((a .&. b : U32) .|. (a .^. b : U32) : U32)
+
+def area(w: F32, h: F32) -> F32:
+  ((w * h : F32) + 1.5 : F32)
+
+def hello(name: String) -> String:
+  ("hi.there " ++ name)
+
+def get(m: move) -> Nat:
+  match m:
+    case ref{}: 0n
+    case loop{n}: n
+
+def keep(idle: Nat) -> Nat:
+  idle
+
+def dup(+a: Chain, +b: Chain) -> Chain & Chain:
+  match a b:
+    case End{} x: (x, x)
+    case _ y: (y, y)
+
+# promise: a chain whose second value is zero is detected
+law second_zero_found:
+  {second_is_zero(Link{1n, Link{0n, End{}}}) == True{} : Bool}
+
+def second_zero_found():
+  {==}
+
+# promise: shifting sums both directions
+law shift_sum:
+  {sh(12, 2n) == 51 : U32}
+
+def shift_sum():
+  {==}
+
+# promise: shifting by 32 or more gives zero
+law shift_far:
+  {sh(1, 40n) == 0 : U32}
+
+def shift_far():
+  {==}
+
+# promise: and-or-xor equals or
+law bits_or:
+  {bits(12, 10) == 14 : U32}
+
+def bits_or():
+  {==}
+
+# promise: greeting prefixes the name
+law greets:
+  {hello("bo") == "hi.there bo" : String}
+
+def greets():
+  {==}
+
+# promise: a keyword-named variant keeps its field
+law loop_get:
+  {get(loop{4n}) == 4n : Nat}
+
+def loop_get():
+  {==}
+
+# promise: a parameter named like a constructor is the parameter
+law keep_param:
+  {keep(7n) == 7n : Nat}
+
+def keep_param():
+  {==}
+
+# promise: dup copies the second chain when the first is empty
+law dup_end:
+  {dup(End{}, Link{1n, End{}}) == (Link{1n, End{}}, Link{1n, End{}}) : Chain & Chain}
+
+def dup_end():
+  {==}
+"#;
+
+    #[test]
+    fn emitter_handles_nested_literals_bit_ops_floats_strings_keyword_types_and_shadowing() {
+        if let Some((ok, text)) = reference_check_only("emitter_edges", EMITTER_EDGES_SRC) {
+            assert!(ok, "reference bend must prove every fixture law:\n{text}");
+        }
+        let summary = emit_verified_rust(EMITTER_EDGES_SRC, 8).unwrap();
+        let src = &summary.rust_source;
+        for expected in [
+            "pub enum r#move",
+            "    r#ref,",
+            "    r#loop(u64),",
+            "pub fn keep(idle: u64) -> u64",
+            "pub fn area(w: f32, h: f32) -> f32",
+            "1.5_f32",
+            "#[derive(Debug, Clone, Copy, PartialEq)]\npub enum Sample",
+            "String::from(\"hi.there \")",
+        ] {
+            assert!(src.contains(expected), "missing {expected:?} in:\n{src}");
+        }
+        let out = compile_and_run("emitter_edges", src, &["--test", "-A", "dead_code"]);
+        for law in [
+            "second_zero_found",
+            "shift_sum",
+            "shift_far",
+            "bits_or",
+            "greets",
+            "loop_get",
+            "keep_param",
+            "dup_end",
+        ] {
+            assert!(out.contains(&format!("law_{law} ... ok")), "{law}:\n{out}");
+        }
+        let runtime_only = src.split("#[cfg(test)]").next().unwrap();
+        let harness = format!(
+            "{runtime_only}\nfn main() {{\n    assert_eq!(area(2.5, 3.0), 9.0);\n    assert_eq!(sh(u32::MAX, 31), 0x8000_0001);\n    assert!(!second_is_zero(Chain::Link(0, Box::new(Chain::End))));\n}}\n"
+        );
+        compile_and_run("emitter_edges_rt", &harness, &["-A", "dead_code"]);
+    }
+
+    #[test]
+    fn constructor_names_shared_by_two_types_are_rejected() {
+        // Bend rejects this within one file; across files it reaches the flat emitter.
+        let a = "import Base\n\ntype Light is Data:\n  Off{}\n  On{level: Nat}\n";
+        let b = "import Base\n\ntype Switch is Data:\n  Off{}\n  Up{}\n";
+        let err = emit_verified_rust(&format!("{a}\n{b}"), 0).unwrap_err();
+        assert!(err.contains("E_NAME_COLLISION"), "{err}");
+        assert!(err.contains("'Off'"), "{err}");
+    }
+
+    #[test]
+    fn u32_remainder_by_zero_matches_reference_semantics() {
+        if let Some((ok, text)) = reference_check_only("u32_div_zero", U32_DIV_ZERO_SRC) {
+            assert!(ok, "reference bend must accept U32 % 0 == a:\n{text}");
+        }
+        let summary = emit_verified_rust(U32_DIV_ZERO_SRC, 2).unwrap();
+        let runtime_only = summary.rust_source.split("#[cfg(test)]").next().unwrap();
+        let harness = format!(
+            "{runtime_only}\nfn main() {{\n    assert_eq!(rem_u32(5, 0), 5);\n    assert_eq!(rem_u32(7, 3), 1);\n    assert_eq!(quot_u32(5, 0), 0);\n    assert_eq!(quot_u32(7, 3), 2);\n}}\n"
+        );
+        compile_and_run("u32_div_zero", &harness, &[]);
+        let out = compile_and_run(
+            "u32_div_zero_laws",
+            &summary.rust_source,
+            &["--test", "-A", "dead_code"],
+        );
+        assert!(out.contains("law_rem_by_zero_is_dividend ... ok"), "{out}");
+        assert!(out.contains("law_quot_by_zero_is_zero ... ok"), "{out}");
     }
 }
