@@ -20,7 +20,9 @@
 
 use std::time::Instant;
 
-use super::recipes::{embed_recipe, layer_recipes, pf_graph, tile_chunks, tile_has_image, PfRecipe};
+use super::recipes::{
+    embed_recipe, layer_key, layer_plain, layer_recipes, pf_graph, tile_chunks, tile_has_image, PfRecipe,
+};
 use super::vision::graphs::build_embed_vis_graph;
 use super::*;
 use crate::verified::{
@@ -403,8 +405,10 @@ impl Gemma4Engine {
                     .map_err(|e| format!("upload block extensions: {e}"))?;
             }
             for l in 0..n_layers {
-                let glob = self.dims.is_global(l);
-                if !glob {
+                // the plain recipe, or the image recipes (`layer_plain`, as `layer_recipes` ensured)
+                let kind = self.dims.kind(l);
+                let plain = layer_plain(two_way, kind);
+                if !plain {
                     for (k, &j) in unit.iter().enumerate().skip(1) {
                         let b = self.unit_bufs(k);
                         let pool = self.layer_pool(l, b.x[l % 2], b.x[(l + 1) % 2], &b);
@@ -416,9 +420,9 @@ impl Gemma4Engine {
                     let tl = tiles[j];
                     let b = self.unit_bufs(k);
                     let pool = self.layer_pool(l, b.x[l % 2], b.x[(l + 1) % 2], &b);
-                    let r = if glob {
+                    let r = if plain {
                         let nch = tile_chunks(tl.end(), self.max_chunks);
-                        &self.layer_recipes[&(G4LayerKind::Global, tl.t, nch)]
+                        &self.layer_recipes[&layer_key(kind, tl.t, nch)]
                     } else {
                         &self.vis_recipes[&(VisRecipe::SlidingExt, tl.t)]
                     };

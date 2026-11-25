@@ -15,7 +15,7 @@ use super::vision::graphs::build_embed_vis_graph;
 use super::vision::run::G4Vision;
 use super::*;
 use crate::engine::BuildRequest;
-use crate::verified::ikv_feat_row;
+use crate::verified::{g4u_embed_image, g4u_layer_plain, ikv_feat_row};
 
 /// A recipe of the decoder's prefill, by kind and tile rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -56,25 +56,32 @@ pub(super) fn tile_chunks(end: u64, max_chunks: u64) -> u64 {
     crate::verified::g4u_tile_chunks(end, G4_CHUNK, max_chunks)
 }
 
-/// The embedding stage of a tile of `t` rows: the image one when it holds image rows.
+/// The embedding stage of a tile of `t` rows: the image one when it holds image rows (the
+/// verified `g4u_embed_image`).
 pub(super) fn embed_recipe(has_img: bool, t: u64) -> PfRecipe {
-    if has_img {
+    if g4u_embed_image(has_img) {
         PfRecipe::Vis(VisRecipe::Embed, t)
     } else {
         PfRecipe::Embed(t)
     }
 }
 
-/// The layer recipes of a tile of `t` rows that reads `nch` chunks: one per layer kind, except
-/// that a two-way unit runs its sliding layers with the image recipes (the key write and the
-/// extended softmax) instead of the plain one.
+/// Whether a layer of kind `kind` in a unit runs the plain layer recipe (the verified
+/// `g4u_layer_plain`); otherwise it runs the image recipes (the later tiles' key write and the
+/// extended softmax).
+pub(super) fn layer_plain(two_way: bool, kind: G4LayerKind) -> bool {
+    g4u_layer_plain(two_way, !kind.is_global())
+}
+
+/// The layer recipes of a tile of `t` rows that reads `nch` chunks: each layer kind's plain
+/// recipe or the image recipes, as `layer_plain` says.
 pub(super) fn layer_recipes(kinds: &[G4LayerKind], t: u64, nch: u64, two_way: bool) -> Vec<PfRecipe> {
     let mut v: Vec<PfRecipe> = kinds
         .iter()
-        .filter(|&&k| !(two_way && k == G4LayerKind::Sliding))
+        .filter(|&&k| layer_plain(two_way, k))
         .map(|&k| PfRecipe::Layer(k, t, nch))
         .collect();
-    if two_way {
+    if kinds.iter().any(|&k| !layer_plain(two_way, k)) {
         v.push(PfRecipe::Vis(VisRecipe::SlidingExt, t));
         v.push(PfRecipe::Vis(VisRecipe::SlidingKv, t));
     }

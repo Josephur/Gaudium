@@ -1411,10 +1411,16 @@ pub(super) fn prefill_tile_hook(eng: &mut Gemma4Engine, pos: u64, t: u64) -> Res
 }
 
 /// `--build-cache`: compiles the drafter's recipes a decode launches at each chunk bucket of
-/// `buckets` (the verify-and-draft steps of every pair of widths; the verify-only steps and the
-/// first blocks of every narrower width, which a sampled decode takes as its budget runs out),
-/// and a block drafter's context recipes of the prefill tiles of `rows`. Each recipe goes to
-/// `note` and is dropped.
+/// `buckets` (the last is the context's top bucket), and a block drafter's context recipes of the
+/// prefill tiles of `rows`. Each recipe goes to `note` and is dropped. The steps, `(t, kd)`:
+/// - a step verifies the drafts it was handed, `t - 1` of them: any count up to the widest width
+///   (a first block is narrowed by the request's budget, a step near the end of the context by
+///   its room);
+/// - it drafts one of the widths, or none (the verify-only step of a sampled decode);
+/// - near the end of the context, which only the top bucket reaches, it drafts as many as the
+///   room holds: any count up to the widest.
+///
+/// The first blocks draft any count up to the widest.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_cache_recipes(
     rt: &G4SpecRt,
@@ -1433,17 +1439,9 @@ pub(super) fn build_cache_recipes(
         gb.compile(Arc::clone(api), cache, driver_version)
             .map_err(|e| format!("compile {what}: {e}"))
     };
+    let top = buckets.last().copied();
     for &nch in buckets {
-        let mut steps: Vec<(u64, u64)> = Vec::new();
-        for &kv in ks {
-            for &kd in ks {
-                steps.push((kv + 1, kd));
-            }
-        }
-        steps.extend((1..=kmax + 1).map(|t| (t, 0)));
-        steps.sort_unstable();
-        steps.dedup();
-        for (t, kd) in steps {
+        for (t, kd) in build_steps(ks, Some(nch) == top) {
             note(&compile(
                 build_spec_step_graph(d, &rt.cfg, max_ctx, nch, t, kd),
                 format!("spec step T={t} D={kd} C={nch}"),
@@ -1465,6 +1463,23 @@ pub(super) fn build_cache_recipes(
         }
     }
     Ok(())
+}
+
+/// The `(rows, drafts)` of the steps a decode may launch at one chunk bucket (`top`: the
+/// context's top bucket), as `build_cache_recipes` lists them.
+fn build_steps(ks: &[u64], top: bool) -> Vec<(u64, u64)> {
+    let kmax = ks.iter().copied().max().unwrap_or(0);
+    let mut steps: Vec<(u64, u64)> = Vec::new();
+    for t in 1..=kmax + 1 {
+        steps.extend(ks.iter().map(|&kd| (t, kd)));
+        steps.push((t, 0));
+        if top {
+            steps.extend((1..=kmax).map(|kd| (t, kd)));
+        }
+    }
+    steps.sort_unstable();
+    steps.dedup();
+    steps
 }
 
 /// Compiles (or loads) the step recipe `(t, kd, nch)` on first use.
@@ -1998,6 +2013,24 @@ pub(super) fn decode_sampled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_build_takes_every_step_a_decode_can_reach() {
+        // one width: every verify count up to the widest, the width or no drafts
+        let s = build_steps(&[4], false);
+        assert_eq!(s.len(), 10);
+        for t in 1..=5 {
+            assert!(s.contains(&(t, 4)) && s.contains(&(t, 0)), "{t}");
+        }
+        // at the top bucket also every narrower draft count (a step near the end of the context)
+        let s = build_steps(&[4], true);
+        assert!(s.contains(&(5, 2)) && s.contains(&(3, 1)));
+        assert_eq!(s.len(), 25);
+        // two widths
+        let s = build_steps(&[7, 3], false);
+        assert!(s.contains(&(8, 3)) && s.contains(&(4, 7)) && s.contains(&(1, 0)) && !s.contains(&(8, 5)));
+        assert!(build_steps(&[7, 3], true).contains(&(8, 5)));
+    }
 
     fn assist_json(
         hid: u64,

@@ -18,6 +18,7 @@ import nat_lemmas.bend as L
 import vision_budget.bend as VB
 import tensor_bounds.bend as TB
 import inkling2.bend as IK
+import gemma4_bounds.bend as GB
 
 # ============================================================================
 # 1. Helper lemmas (erased before Rust codegen)
@@ -306,6 +307,18 @@ def g4u_fits(+ring: Nat, +w: Nat, +rows: Nat) -> Bool:
 # most the `max_chunks` the cache holds.
 def g4u_tile_chunks(+end: Nat, +chunk: Nat, +max_chunks: Nat) -> Nat:
   Nat.max(1n, Nat.min(Nat.div(Nat.add(end, Nat.sub(chunk, 1n)), chunk), max_chunks))
+
+# Whether a tile's embedding stage runs the image recipe: it holds image rows (their soft tokens
+# take the place of the token embedding there).
+def g4u_embed_image(has_img: Bool) -> Bool:
+  has_img
+
+# Whether a layer of a prefill unit runs the plain, causal layer recipe: every layer of a causal
+# unit, and the global layers of a two-way unit (the reference keeps them causal). The other
+# layers, the sliding layers of a two-way unit, run the image recipes (the later tiles' key write
+# and the softmax extended to the end of each row's block).
+def g4u_layer_plain(two_way: Bool, sliding: Bool) -> Bool:
+  Bool.not(Bool.and(two_way, sliding))
 
 # Whether the next tile joins a unit of `tiles` tiles: an image block runs from the unit's last
 # tile into it (`cross`), and the unit has room for one more tile of the `max_tiles` the plan
@@ -1506,7 +1519,7 @@ def g4v_rope_freq_within(k, qp):
 
 # LAW G4V.36
 # promise: the four quarters of a head never reach past the head's channels.
-# harm: the rotate-half weight would place an entry past its row.
+# harm: a channel's rotate-half partner or frequency would lie outside the head.
 law g4v_rot_quarter_within:
   for +dh: Nat
   {Nat.is_le(Nat.mul(g4v_rot_quarter(dh), 4n), dh) == True{} : Bool}
@@ -1621,7 +1634,7 @@ def g4u_tile_chunks_within_cache(e, c, mp):
   g4u_max1_le(Nat.min(Nat.div(Nat.add(e, Nat.sub(c, 1n)), c), 1n+mp), mp, L.nat_min_le_r(Nat.div(Nat.add(e, Nat.sub(c, 1n)), c), 1n+mp))
 
 # LAW G4U.22
-# promise: a prefill tile whose rows fit the global caches reads every chunk that holds the keys before its last row.
+# promise: a prefill tile whose rows fit the global caches reads every chunk that holds the keys up to its last row.
 # harm: a global layer would miss the keys of the chunks it does not read.
 law g4u_tile_chunks_cover:
   for +e: Nat
@@ -1632,3 +1645,99 @@ law g4u_tile_chunks_cover:
 def g4u_tile_chunks_cover(e, cp, mp):
   %Equal.sym(Nat, Nat.sub(cp, 0n), cp, L.nat_sub_zero_r(cp)) : {Bool.and(Nat.is_le(e, Nat.mul(1n+cp, 1n+mp)), Nat.is_lt(Nat.mul(Nat.max(1n, Nat.min(Nat.div(Nat.add(e, _), 1n+cp), 1n+mp)), 1n+cp), e)) == False{} : Bool}
   g4u_cover_go(e, cp, mp, Nat.is_le(Nat.div(Nat.add(e, cp), 1n+cp), 1n+mp), {==})
+
+# ----------------------------------------------------------------------------
+# The recipes a prefill unit runs
+# ----------------------------------------------------------------------------
+
+# LAW G4U.23
+# promise: a prefill tile that holds image rows embeds them with the image recipe, which takes their soft tokens.
+# harm: the image rows would take the pad token's embedding and the image would be lost.
+law g4u_image_tile_embeds_image:
+  {g4u_embed_image(True{}) == True{} : Bool}
+
+def g4u_image_tile_embeds_image():
+  {==}
+
+# LAW G4U.24
+# promise: a two-way unit never runs a sliding layer with the causal recipe.
+# harm: the unit's image rows would attend causally in that layer, unlike the reference.
+law g4u_two_way_sliding_not_plain:
+  {g4u_layer_plain(True{}, True{}) == False{} : Bool}
+
+def g4u_two_way_sliding_not_plain():
+  {==}
+
+# LAW G4U.25
+# promise: a global layer always runs the causal recipe, in every unit.
+# harm: a global layer would read the sliding ring through the image recipe instead of its own cache.
+law g4u_global_layer_plain:
+  for tw: Bool
+  {g4u_layer_plain(tw, False{}) == True{} : Bool}
+
+def g4u_global_layer_plain(tw):
+  match tw:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# LAW G4U.26
+# promise: every layer of a causal unit runs the causal recipe.
+# harm: a causal unit would run the image recipe, which reads an extension table only two-way units upload.
+law g4u_causal_unit_plain:
+  for sl: Bool
+  {g4u_layer_plain(False{}, sl) == True{} : Bool}
+
+def g4u_causal_unit_plain(sl):
+  {==}
+
+# ----------------------------------------------------------------------------
+# A head the guard takes has a quarter
+# ----------------------------------------------------------------------------
+
+# The quotient of a division never drops below the count it started from.
+def g4v_dm_ge(+n: Nat, +m: Nat, +d: Nat, +r: Nat) -> {Nat.is_le(d, Pair.fst(Nat, Nat, Nat.divmod.go(n, m, d, r))) == True{} : Bool}:
+  match n m:
+    case 0n _:
+      L.nat_le_refl(d)
+    case 1n+np 0n:
+      L.nat_le_trans(d, 1n+d, Pair.fst(Nat, Nat, Nat.divmod.go(np, r, 1n+d, 0n)), L.nat_le_succ_r(d, d, L.nat_le_refl(d)), g4v_dm_ge(np, r, 1n+d, 0n))
+    case 1n+np 1n+mp:
+      g4v_dm_ge(np, mp, d, 1n+r)
+
+# (g and (e and false)) and q is false.
+def g4v_guard_small(g: Bool, e: Bool, q: Bool) -> {Bool.and(Bool.and(g, Bool.and(e, False{})), q) == False{} : Bool}:
+  %Equal.sym(Bool, Bool.and(e, False{}), False{}, g4u_and_false_r(e)) : {Bool.and(Bool.and(g, _), q) == False{} : Bool}
+  %Equal.sym(Bool, Bool.and(g, False{}), False{}, g4u_and_false_r(g)) : {Bool.and(_, q) == False{} : Bool}
+  {==}
+
+# LAW G4V.37
+# promise: a vision head that the head guard takes has at least one channel in each of its quarters, so the rotary frequency table is never empty.
+# harm: the rotary tables would read a frequency from an empty table.
+law g4v_guarded_head_has_a_quarter:
+  for +nh: Nat
+  for +dh: Nat
+  for +hid: Nat
+  {Bool.and(GB.g4_vision_heads_valid(nh, dh, hid), Nat.is_lt(g4v_rot_quarter(dh), 1n)) == False{} : Bool}
+
+def g4v_guarded_head_has_a_quarter(nh, dh, hid):
+  match dh:
+    case 0n:
+      %Equal.sym(Bool, Bool.and(Nat.is_gt(nh, 0n), False{}), False{}, g4u_and_false_r(Nat.is_gt(nh, 0n))) : {Bool.and(_, Nat.is_lt(g4v_rot_quarter(0n), 1n)) == False{} : Bool}
+      {==}
+    case 1n+d1:
+      match d1:
+        case 0n:
+          g4v_guard_small(Nat.is_gt(nh, 0n), Nat.is_eq(Nat.mul(nh, 1n), hid), Nat.is_lt(g4v_rot_quarter(1n), 1n))
+        case 1n+d2:
+          match d2:
+            case 0n:
+              g4v_guard_small(Nat.is_gt(nh, 0n), Nat.is_eq(Nat.mul(nh, 2n), hid), Nat.is_lt(g4v_rot_quarter(2n), 1n))
+            case 1n+d3:
+              match d3:
+                case 0n:
+                  g4v_guard_small(Nat.is_gt(nh, 0n), Nat.is_eq(Nat.mul(nh, 3n), hid), Nat.is_lt(g4v_rot_quarter(3n), 1n))
+                case 1n+k:
+                  %Equal.sym(Bool, Nat.is_lt(g4v_rot_quarter(1n+1n+1n+1n+k), 1n), False{}, L.nat_le_lt_false(Pair.fst(Nat, Nat, Nat.divmod.go(k, 3n, 1n, 0n)), 1n, g4v_dm_ge(k, 3n, 1n, 0n))) : {Bool.and(GB.g4_vision_heads_valid(nh, 1n+1n+1n+1n+k, hid), _) == False{} : Bool}
+                  g4u_and_false_r(GB.g4_vision_heads_valid(nh, 1n+1n+1n+1n+k, hid))
