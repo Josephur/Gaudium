@@ -2380,3 +2380,335 @@ def ln_tier_write_voids_earlier(m, e):
       {==}
     case 1n+p:
       ln_tier_write_voids_earlier(p, e)
+
+# ============================================================================
+# 13. The width model over a load
+# ============================================================================
+#
+# A wide slot's extra time is measured only by launches that have a wide slot (section 11). A
+# slot count whose estimate came out high keeps its lanes narrow, and then nothing measures it
+# again. So the model counts its launches and keeps, with each extra-time estimate, the launch
+# that last measured it: an estimate not measured again within `limit` launches is dropped. The
+# count then borrows another count's estimate again, or none, and a lane that expects more from
+# the wide step tries it, which measures the estimate afresh.
+#
+# A lane's wide rows can also take a batched step past the chunk count of its narrow step: every
+# slot of that step then reads one more power of two of K/V chunks. The wide step's cost counts
+# those chunks too: the narrow step's time at the larger chunk count less the one at the smaller,
+# once measured. A lane never goes wide into chunks whose cost is not known: the narrow steps
+# measure it as the lanes' cursors pass the boundary, so trying it would teach nothing.
+
+# Is an extra-time estimate measured in launch `at` kept at launch `now`, when estimates stand
+# `limit` launches without being measured again?
+def ln_cost_kept(now: Nat, at: Nat, limit: Nat) -> Bool:
+  Nat.is_lt(Nat.sub(now, at), limit)
+
+# promise: an extra-time estimate measured in the launch just counted is kept, whenever estimates are kept at all.
+law ln_cost_kept_fresh:
+  for +n: Nat
+  for +l: Nat
+  {ln_cost_kept(n, n, 1n+l) == True{} : Bool}
+
+def ln_cost_kept_fresh(n, l):
+  match n:
+    case 0n:
+      {==}
+    case 1n+p:
+      ln_cost_kept_fresh(p, l)
+
+# promise: an extra-time estimate not measured again for `limit` launches is dropped, so its slot count's lanes can try the wide step again.
+law ln_cost_dropped_when_old:
+  for +a: Nat
+  for +l: Nat
+  for +k: Nat
+  {ln_cost_kept(Nat.add(a, Nat.add(l, k)), a, l) == False{} : Bool}
+
+def ln_cost_dropped_when_old(a, l, k):
+  match a:
+    case 0n:
+      %Equal.sym(Nat, Nat.sub(Nat.add(l, k), 0n), Nat.add(l, k), L.nat_sub_zero_r(Nat.add(l, k))) : {Nat.is_lt(_, l) == False{} : Bool}
+      %ln_lt_add_false(l, k) : {_ == False{} : Bool}
+      {==}
+    case 1n+p:
+      ln_cost_dropped_when_old(p, l, k)
+
+# The extra time of a lane's wide step (microseconds), or not known.
+type WideCost is Data:
+  WcKnown{us: Nat}
+  WcUnknown{}
+
+def ln_wide_cost_of(grows: Bool, known: Bool, +extra: Nat, +chunk: Nat) -> WideCost:
+  match grows:
+    case False{}:
+      WcKnown{extra}
+    case True{}:
+      match known:
+        case True{}:
+          WcKnown{Nat.add(extra, chunk)}
+        case False{}:
+          WcUnknown{}
+
+# The extra time of a lane's wide step: its wide slot's `extra` time and, when its wide rows take
+# the step from the `narrow` chunk count of the narrow step to `wide` chunks, the extra time of
+# those chunks (`chunk`, when `known`: the narrow step at `wide` chunks was measured).
+# rusty-bends: total
+def ln_wide_cost(+extra: Nat, narrow: Nat, wide: Nat, known: Bool, +chunk: Nat) -> WideCost:
+  ln_wide_cost_of(Nat.is_gt(wide, narrow), known, extra, chunk)
+
+# Does a lane go wide in its next step, at the extra time `cost` of its wide step (the comparison
+# of `ln_lane_goes_wide`)? Never at a cost the model does not know.
+# rusty-bends: total
+def ln_lane_goes_wide_at(gain: Nat, cost: WideCost, total: Nat, step: Nat) -> Bool:
+  match cost:
+    case WcKnown{us}:
+      ln_lane_goes_wide(gain, us, total, step)
+    case WcUnknown{}:
+      False{}
+
+# Does `cost` count at least `us` microseconds? (A cost the model does not know is never counted
+# as less: no lane goes wide at it.)
+def ln_wide_cost_covers(cost: WideCost, us: Nat) -> Bool:
+  match cost:
+    case WcKnown{x}:
+      Nat.is_le(us, x)
+    case WcUnknown{}:
+      True{}
+
+# promise: a lane never goes wide into K/V chunks whose cost the model has not measured.
+law ln_wide_unknown_chunk_narrow:
+  for +g: Nat
+  for +e: Nat
+  for +n: Nat
+  for +d: Nat
+  for +c: Nat
+  for +t: Nat
+  for +s: Nat
+  {ln_lane_goes_wide_at(g, ln_wide_cost(e, n, 1n+Nat.add(n, d), False{}, c), t, s) == False{} : Bool}
+
+def ln_wide_unknown_chunk_narrow(g, e, n, d, c, t, s):
+  %ln_gt_succ_add(n, d) : {ln_lane_goes_wide_at(g, ln_wide_cost_of(_, False{}, e, c), t, s) == False{} : Bool}
+  {==}
+
+# promise: a wide step that takes a batched step into more K/V chunks is never costed below its wide slot's extra time plus those chunks' measured time.
+law ln_wide_cost_counts_chunk:
+  for +e: Nat
+  for +n: Nat
+  for +d: Nat
+  for +c: Nat
+  {ln_wide_cost_covers(ln_wide_cost(e, n, 1n+Nat.add(n, d), True{}, c), Nat.add(e, c)) == True{} : Bool}
+
+def ln_wide_cost_counts_chunk(e, n, d, c):
+  %ln_gt_succ_add(n, d) : {ln_wide_cost_covers(ln_wide_cost_of(_, True{}, e, c), Nat.add(e, c)) == True{} : Bool}
+  L.nat_le_refl(Nat.add(e, c))
+
+def ln_wide_extra_aux(g: Bool, k: Bool, +e: Nat, +c: Nat) -> {ln_wide_cost_covers(ln_wide_cost_of(g, k, e, c), e) == True{} : Bool}:
+  match g:
+    case False{}:
+      L.nat_le_refl(e)
+    case True{}:
+      match k:
+        case True{}:
+          L.nat_add_le_r(e, c)
+        case False{}:
+          {==}
+
+# promise: a lane's wide step is never costed below its wide slot's extra time.
+law ln_wide_cost_counts_extra:
+  for +e: Nat
+  for +n: Nat
+  for +w: Nat
+  for +k: Bool
+  for +c: Nat
+  {ln_wide_cost_covers(ln_wide_cost(e, n, w, k, c), e) == True{} : Bool}
+
+def ln_wide_cost_counts_extra(e, n, w, k, c):
+  ln_wide_extra_aux(Nat.is_gt(w, n), k, e, c)
+
+# promise: a lane that expects no more tokens from the wide step never goes wide, whatever its wide step costs.
+law ln_goes_wide_at_needs_gain:
+  for w: WideCost
+  for +t: Nat
+  for +s: Nat
+  {ln_lane_goes_wide_at(0n, w, t, s) == False{} : Bool}
+
+def ln_goes_wide_at_needs_gain(w, t, s):
+  match w:
+    case WcKnown{us}:
+      ln_zero_never_gt(Nat.mul(us, t))
+    case WcUnknown{}:
+      {==}
+
+# ============================================================================
+# 14. The counts the command line accepts
+# ============================================================================
+#
+# `--parallel N` asks for N lanes, at most `max` (the most the batched step graphs are built for);
+# `--prefix-cache N` for N kept prefix positions, at most `max` (a lane plan multiplies them by
+# the lanes and the slot size in checked arithmetic). The parse refuses any other count with a
+# message, before anything is loaded; the shell only reads the number and words the message.
+
+# Does the command line accept a count of `n` lanes, of at most `max`?
+def ln_lanes_arg_ok(+n: Nat, max: Nat) -> Bool:
+  Bool.and(Nat.is_gt(n, 0n), Nat.is_le(n, max))
+
+# Does the command line accept `n` kept prefix positions, of at most `max`?
+def ln_prefix_arg_ok(+n: Nat, max: Nat) -> Bool:
+  Nat.is_le(n, max)
+
+def ln_le_add_succ_false(+m: Nat, +k: Nat) -> {False{} == Nat.is_le(Nat.add(m, 1n+k), m) : Bool}:
+  match m:
+    case 0n:
+      {==}
+    case 1n+mp:
+      ln_le_add_succ_false(mp, k)
+
+# promise: the command line never accepts a count of zero lanes.
+law ln_lanes_arg_never_zero:
+  for +m: Nat
+  {ln_lanes_arg_ok(0n, m) == False{} : Bool}
+
+def ln_lanes_arg_never_zero(m):
+  {==}
+
+# promise: the command line never accepts more lanes than the batched steps are built for.
+law ln_lanes_arg_within_max:
+  for +m: Nat
+  for +k: Nat
+  {ln_lanes_arg_ok(Nat.add(m, 1n+k), m) == False{} : Bool}
+
+def ln_lanes_arg_within_max(m, k):
+  match m:
+    case 0n:
+      {==}
+    case 1n+mp:
+      %ln_le_add_succ_false(mp, k) : {_ == False{} : Bool}
+      {==}
+
+def ln_min_eq_aux(+m: Nat, +n: Nat) -> {Bool.or(Bool.not(Nat.is_le(n, m)), Nat.is_eq(Nat.min(m, n), n)) == True{} : Bool}:
+  match m n:
+    case 0n 0n:
+      {==}
+    case 0n 1n+np:
+      {==}
+    case 1n+mp 0n:
+      {==}
+    case 1n+mp 1n+np:
+      ln_min_eq_aux(mp, np)
+
+# promise: a lane count the command line accepts is the count a model whose engine and drafter have batched steps is served with.
+law ln_lanes_arg_served_as_asked:
+  for +n: Nat
+  for +m: Nat
+  {Bool.or(Bool.not(ln_lanes_arg_ok(n, m)), Nat.is_eq(ln_served_lanes(n, m, True{}), n)) == True{} : Bool}
+
+def ln_lanes_arg_served_as_asked(n, m):
+  match n m:
+    case 0n _:
+      {==}
+    case 1n+np 0n:
+      {==}
+    case 1n+np 1n+mp:
+      ln_min_eq_aux(mp, np)
+
+# promise: the command line never accepts more kept prefix positions than its bound.
+law ln_prefix_arg_within_max:
+  for +m: Nat
+  for +k: Nat
+  {ln_prefix_arg_ok(Nat.add(m, 1n+k), m) == False{} : Bool}
+
+def ln_prefix_arg_within_max(m, k):
+  %ln_le_add_succ_false(m, k) : {_ == False{} : Bool}
+  {==}
+
+# ============================================================================
+# 15. A speculative lane's tally of drafts
+# ============================================================================
+#
+# A speculative step verifies `rows` rows: the row of its last token and `rows - 1` drafts. It
+# emits `emitted` tokens: the drafts it kept, then one token of its own. A lane's request counts
+# the drafts its steps verified and the ones they kept (its report: acceptance, tokens per launch).
+
+# The drafts a step of `rows` verify rows verified.
+def ln_step_drafted(rows: Nat) -> Nat:
+  Nat.sub(rows, 1n)
+
+# The drafts a step of `rows` verify rows kept, when it emitted `emitted` tokens.
+def ln_step_kept(rows: Nat, emitted: Nat) -> Nat:
+  Nat.min(Nat.sub(emitted, 1n), Nat.sub(rows, 1n))
+
+# A request's count of verified drafts after a step of `rows` rows, from `drafted` before it.
+def ln_tally_drafted(drafted: Nat, rows: Nat) -> Nat:
+  Nat.add(drafted, ln_step_drafted(rows))
+
+# A request's count of kept drafts after a step of `rows` rows that emitted `emitted` tokens,
+# from `kept` before it.
+def ln_tally_kept(kept: Nat, rows: Nat, emitted: Nat) -> Nat:
+  Nat.add(kept, ln_step_kept(rows, emitted))
+
+# promise: a speculative step never counts more kept drafts than drafts it verified.
+law ln_step_kept_within_drafted:
+  for +r: Nat
+  for +e: Nat
+  {Nat.is_le(ln_step_kept(r, e), ln_step_drafted(r)) == True{} : Bool}
+
+def ln_step_kept_within_drafted(r, e):
+  L.nat_min_le_r(Nat.sub(e, 1n), Nat.sub(r, 1n))
+
+# promise: the token a speculative step emits after its kept drafts is never counted as a kept draft.
+law ln_step_kept_not_bonus:
+  for +r: Nat
+  for +e: Nat
+  {Nat.is_lt(ln_step_kept(r, 1n+e), 1n+e) == True{} : Bool}
+
+def ln_step_kept_not_bonus(r, e):
+  match e:
+    case 0n:
+      {==}
+    case 1n+ep:
+      L.nat_le_lt_trans(Nat.min(1n+ep, Nat.sub(r, 1n)), 1n+ep, 1n+1n+ep, L.nat_min_le_l(1n+ep, Nat.sub(r, 1n)), L.nat_lt_succ_self(1n+ep))
+
+def ln_le_of_not_gt(+a: Nat, +b: Nat, h: {False{} == Nat.is_gt(a, b) : Bool}) -> {Nat.is_le(a, b) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      L.nat_le_zero(b)
+    case 1n+ap 0n:
+      L.bool_absurd({Nat.is_le(1n+ap, 0n) == True{} : Bool}, h)
+    case 1n+ap 1n+bp:
+      ln_le_of_not_gt(ap, bp, h)
+
+def ln_tally_aux(+k: Nat, +d: Nat, +r: Nat, +e: Nat, b: Bool, h: {b == Nat.is_gt(k, d) : Bool}) -> {Bool.or(b, Nat.is_le(Nat.add(k, ln_step_kept(r, e)), Nat.add(d, ln_step_drafted(r)))) == True{} : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      L.nat_add_le_mono(k, d, ln_step_kept(r, e), ln_step_drafted(r), ln_le_of_not_gt(k, d, h), ln_step_kept_within_drafted(r, e))
+
+# promise: a lane's request never counts more kept drafts than drafts its steps verified.
+law ln_tally_kept_within_drafted:
+  for +k: Nat
+  for +d: Nat
+  for +r: Nat
+  for +e: Nat
+  {Bool.or(Nat.is_gt(k, d), Nat.is_le(ln_tally_kept(k, r, e), ln_tally_drafted(d, r))) == True{} : Bool}
+
+def ln_tally_kept_within_drafted(k, d, r, e):
+  ln_tally_aux(k, d, r, e, Nat.is_gt(k, d), {==})
+
+# promise: a request's count of verified drafts never goes back.
+law ln_tally_drafted_never_drops:
+  for +d: Nat
+  for +r: Nat
+  {Nat.is_le(d, ln_tally_drafted(d, r)) == True{} : Bool}
+
+def ln_tally_drafted_never_drops(d, r):
+  L.nat_add_le_r(d, ln_step_drafted(r))
+
+# promise: a request's count of kept drafts never goes back.
+law ln_tally_kept_never_drops:
+  for +k: Nat
+  for +r: Nat
+  for +e: Nat
+  {Nat.is_le(k, ln_tally_kept(k, r, e)) == True{} : Bool}
+
+def ln_tally_kept_never_drops(k, r, e):
+  L.nat_add_le_r(k, ln_step_kept(r, e))

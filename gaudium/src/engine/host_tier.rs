@@ -841,10 +841,14 @@ impl HostTier {
         }
         // [lanes] nothing of an entry another lane rewrote since is trusted: this save's
         // `note_write` marks this share's record of the entry it opens as current, which a stale
-        // record must not survive into. (Defensive today: the entry it opens is cut to the tiles
-        // the prompt still shares and its clean range is clipped to them below; and the ring
-        // record is always empty here, since `end_request` clears it before any save with work
-        // and a save sets it only after copying the rings whole, when nothing is left unsaved.)
+        // record must not survive into, and a record of another entry is dropped here rather
+        // than at the next request (test: `a_save_drops_a_record_of_an_entry_another_lane_
+        // rewrote_while_this_one_ran`). (Defensive for the tokens today: the entry it opens is cut
+        // to the tiles the prompt still shares and its clean range is clipped to them below; the
+        // next request's check drops a stale record of any other entry before it is read; and the
+        // ring record is always empty here, since `end_request` clears it before any save with
+        // work and a save sets it only after copying the rings whole, when nothing is left
+        // unsaved.)
         self.void_rewritten();
         let kept = table.held_slots();
         let (held, images) = table.held();
@@ -1822,6 +1826,43 @@ mod tests {
         let (rows, state) = Rig::cold(&q2, plan.resume, 4);
         assert!(a.dev.rows_of(0, plan.resume) == rows);
         assert!(a.resume_state(plan.resume) == state);
+    }
+
+    #[test]
+    fn a_save_drops_a_record_of_an_entry_another_lane_rewrote_while_this_one_ran() {
+        // the record check at the start of `HostTier::save`: lane A recorded entry E, ran a
+        // request of its own, and lane B rewrote E before A's save; A's save, which writes
+        // another entry, must not carry its record of E on
+        let cache = Arc::new(SharedCache::new(256 << 20, 0, false, false));
+        let mut a = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        let mut b = rig_on(Arc::clone(&cache), 4, false, [7, 7]);
+        b.tier = std::mem::replace(
+            &mut b.tier,
+            HostTier::new(Arc::clone(&cache), [7, 7], b.dev.layout.clone(), b.dev.slots.clone(), Vec::new(), false),
+        )
+        .sharing_writes_of(&a.tier);
+        let p = prompt(8 * 512 + 100, 1);
+        a.request(&p, true);
+        assert!(a.idle().complete);
+        let e = *a.tier.clean.keys().next().expect("A recorded the entry it saved");
+        // an unrelated request on A: its device keeps P's rows past the ones it wrote, so A
+        // still records part of E (its record was trusted when the request began)
+        a.request(&prompt(2 * 512 + 100, 5), true);
+        assert!(a.tier.has_unsaved());
+        let (lo, hi) = a.tier.clean[&e];
+        assert!(lo < hi && hi == 8, "A records E's tiles past the rows it wrote: {lo}..{hi}");
+        // meanwhile B saves its conversation into E, which it cuts to the four tiles it shares
+        let mut q = p[..4 * 512].to_vec();
+        q.extend(prompt(4 * 512 + 100, 2));
+        b.request(&q, true);
+        assert!(b.idle().complete);
+        assert_eq!(cache.stats().entries, 1, "B's save continued and cut E");
+        // A's save writes a new entry and drops what it recorded of E: E's tiles there are Q's now
+        assert!(a.idle().complete);
+        assert_eq!(cache.stats().entries, 2);
+        assert!(!a.tier.clean.contains_key(&e), "a stale record of E survived A's save");
+        assert!(!a.tier.seen.contains_key(&e));
+        assert!(!a.tier.clean.is_empty(), "A records the entry it just saved");
     }
 
     #[test]

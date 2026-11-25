@@ -568,19 +568,32 @@ pub(super) struct LaneRt {
 
 /// What the lanes' width choices know of a batched speculative step's time (measured,
 /// exponentially averaged): per slot count and chunk count, the launch with every slot at its
-/// narrow width; per slot count, the extra time of one slot at its wide width.
+/// narrow width; per slot count, the extra time of one slot at its wide width, with the launch
+/// that last measured it (an estimate not measured again for a while is dropped: the verified
+/// `ln_cost_kept`).
 #[derive(Debug, Default)]
 struct WidthCosts {
     narrow_ms: HashMap<(u64, u64), f64>,
-    extra_ms: HashMap<u64, f64>,
-    /// Slot steps of the session at the wide width, and in all (report only).
+    /// Slot count -> (extra time of a wide slot, the launch that last measured it).
+    extra_ms: HashMap<u64, (f64, u64)>,
+    /// Launches observed (the clock of `extra_ms`).
+    launches: u64,
+    /// Slot steps of the session at the wide width, and in all; launches with a wide slot;
+    /// estimates dropped unmeasured (report only).
     wide_slots: u64,
     slots: u64,
+    wide_launches: u64,
+    session_launches: u64,
+    dropped: u64,
 }
 
 impl WidthCosts {
     /// Weight of a new launch in the averages.
     const ALPHA: f64 = 0.2;
+    /// Launches an extra-time estimate stands without being measured again (about 1.5 s of
+    /// 8-lane steps, 5 s of one-lane steps): after it, the slot count's lanes may try the wide
+    /// step again (`ln_cost_kept`).
+    const KEEP_LAUNCHES: u64 = 128;
 
     fn ema(slot: &mut Option<f64>, x: f64) {
         *slot = Some(match *slot {
@@ -591,11 +604,15 @@ impl WidthCosts {
 
     /// A launch of `b` slots over `nch` chunks, `wide` of them at their wide width, took `ms`.
     /// What it measures is the verified rule's (`ln_cost_measures_narrow`,
-    /// `ln_cost_measures_extra`).
+    /// `ln_cost_measures_extra`); which estimates it leaves standing, too (`ln_cost_kept`).
     fn observe(&mut self, b: u64, nch: u64, wide: u64, ms: f64) {
-        use crate::verified::{ln_cost_measures_extra, ln_cost_measures_narrow};
+        use crate::verified::{ln_cost_kept, ln_cost_measures_extra, ln_cost_measures_narrow};
+        self.launches += 1;
+        let now = self.launches;
         self.wide_slots += wide;
         self.slots += b;
+        self.session_launches += 1;
+        self.wide_launches += u64::from(wide > 0);
         let narrow = self.narrow_ms.get(&(b, nch)).copied();
         if ln_cost_measures_narrow(wide) {
             let mut m = narrow;
@@ -603,10 +620,14 @@ impl WidthCosts {
             self.narrow_ms.insert((b, nch), m.unwrap_or(ms));
         } else if ln_cost_measures_extra(narrow.is_some(), wide) {
             let t0 = narrow.expect("the verified rule measures against a measured narrow step");
-            let mut m = self.extra_ms.get(&b).copied();
+            let mut m = self.extra_ms.get(&b).map(|&(x, _)| x);
             Self::ema(&mut m, ((ms - t0) / wide as f64).max(0.0));
-            self.extra_ms.insert(b, m.unwrap_or(0.0));
+            self.extra_ms.insert(b, (m.unwrap_or(0.0), now));
         }
+        let before = self.extra_ms.len();
+        self.extra_ms
+            .retain(|_, &mut (_, at)| ln_cost_kept(now, at, Self::KEEP_LAUNCHES));
+        self.dropped += (before - self.extra_ms.len()) as u64;
     }
 
     /// The measured slot count whose extra time stands in for `b` slots (the verified
@@ -622,7 +643,7 @@ impl WidthCosts {
 
     /// What the model holds, for the session report (and a fresh count of the slot steps).
     fn report(&mut self) -> Option<String> {
-        if self.wide_slots == 0 && self.extra_ms.is_empty() {
+        if self.wide_slots == 0 && self.extra_ms.is_empty() && self.dropped == 0 {
             return None;
         }
         let mut bs: Vec<u64> = self.extra_ms.keys().copied().collect();
@@ -633,29 +654,40 @@ impl WidthCosts {
                 format!(
                     "{b} slots: {:.2} ms narrow, +{:.2} ms a wide slot",
                     self.narrow_ms.get(&(*b, 1)).copied().unwrap_or(f64::NAN),
-                    self.extra_ms[b]
+                    self.extra_ms[b].0
                 )
             })
             .collect();
         let line = format!(
-            "[gaudium] lanes: widths: {} of {} slot steps wide; {}",
+            "[gaudium] lanes: widths: {} of {} slot steps wide, {} of {} launches with a wide slot, {} estimate(s) dropped unmeasured; {}",
             self.wide_slots,
             self.slots,
+            self.wide_launches,
+            self.session_launches,
+            self.dropped,
             per_b.join("; ")
         );
         self.wide_slots = 0;
         self.slots = 0;
+        self.wide_launches = 0;
+        self.session_launches = 0;
+        self.dropped = 0;
         Some(line)
+    }
+
+    /// The time in ms of the narrow step of `b` slots over `nch` chunks, once measured.
+    fn narrow(&self, b: u64, nch: u64) -> Option<f64> {
+        self.narrow_ms.get(&(b, nch)).copied()
     }
 
     /// `(time of the narrow step, extra time of one wide slot)` in ms for `b` slots over `nch`
     /// chunks: `None` until the narrow step was measured. The extra time of a slot count not
-    /// measured yet is another measured count's ([`Self::cost_source`]: a wide slot's own work
-    /// hardly depends on the others), and 0 until any was (so a lane that expects more from the
-    /// wide step tries it).
+    /// measured yet (or not lately) is another measured count's ([`Self::cost_source`]: a wide
+    /// slot's own work hardly depends on the others), and 0 until any was (so a lane that
+    /// expects more from the wide step tries it).
     fn estimate(&self, b: u64, nch: u64) -> Option<(f64, f64)> {
-        let t0 = *self.narrow_ms.get(&(b, nch))?;
-        let extra = self.cost_source(b).map(|c| self.extra_ms[&c]);
+        let t0 = self.narrow(b, nch)?;
+        let extra = self.cost_source(b).map(|c| self.extra_ms[&c].0);
         Some((t0, extra.unwrap_or(0.0)))
     }
 }
@@ -1878,11 +1910,15 @@ fn apply_spec(
             ));
         }
         run.advance(n_emit as u64, rows);
-        run.drafted += rows - 1;
-        run.accepted += n_emit as u64 - 1;
-        if rows > 1 {
+        // the request's tally of drafts (the verified `ln_tally_*`), and what the width policy
+        // learns of this step's drafts
+        let n_out = n_emit as u64;
+        run.drafted = crate::verified::ln_tally_drafted(run.drafted, rows);
+        run.accepted = crate::verified::ln_tally_kept(run.accepted, rows, n_out);
+        let drafted = crate::verified::ln_step_drafted(rows);
+        if drafted > 0 {
             if let Some(p) = run.policy.as_mut() {
-                p.observe(rows - 1, n_emit - 1, 0.0);
+                p.observe(drafted, crate::verified::ln_step_kept(rows, n_out) as usize, 0.0);
             }
         }
         run.observe_cancel();
@@ -1906,8 +1942,9 @@ fn apply_spec(
 
 /// The rows each of the speculative lanes `stepping` verifies in its next batched step, widest
 /// first: a lane goes wide when the extra tokens it expects from the wide step beat the batch's
-/// expected tokens per unit of time over the wide step's extra time (the verified rule), and its
-/// wide rows fit its rings and its context.
+/// expected tokens per unit of time over the wide step's extra time (the verified rule: a wide
+/// slot's extra time, plus the K/V chunks its rows may add to the step, never chunks not
+/// measured), and its wide rows fit its rings and its context.
 /// `cursor_of(lane)`: the lane's cursor, or a bound of it for a step queued ahead.
 fn lane_rows_of(
     eng: &Qwen3Engine,
@@ -1919,13 +1956,13 @@ fn lane_rows_of(
     let (narrow, wide) = rt.family.rows();
     let ring = eng.specdec.as_ref().map_or(narrow, |sd| sd.gdn_slots());
     let run = |l: usize| runs[l].as_ref().expect("a decoding lane runs");
+    let b = stepping.len() as u64;
     // the time of this step with every lane narrow, and of one more lane wide
     let narrow_slots: Vec<(u64, u64)> = stepping.iter().map(|&l| (cursor_of(l), narrow)).collect();
-    let nch = step_chunks(batch_chunks(&narrow_slots, KV_CHUNK), eng.max_chunks);
-    let est = (wide > narrow)
-        .then(|| rt.widths.estimate(stepping.len() as u64, nch))
-        .flatten();
-    // expected tokens per lane at each width, in thousandths
+    let need = batch_chunks(&narrow_slots, KV_CHUNK);
+    let nch = step_chunks(need, eng.max_chunks);
+    let est = (wide > narrow).then(|| rt.widths.estimate(b, nch)).flatten();
+    // expected tokens per lane at each width, in thousandths; times in microseconds
     let milli = |x: f64| (x.max(0.0) * 1000.0).round() as u64;
     let expect = |l: usize, rows: u64| run(l).policy.as_ref().map_or(0.0, |p| p.expected_tokens(rows - 1));
     let total: u64 = stepping.iter().map(|&l| milli(expect(l, narrow))).sum();
@@ -1934,7 +1971,15 @@ fn lane_rows_of(
         .map(|&l| {
             let go = est.is_some_and(|(t0, extra)| {
                 let gain = milli(expect(l, wide)).saturating_sub(milli(expect(l, narrow)));
-                crate::core::lanes::lane_goes_wide(gain, milli(extra), total, milli(t0))
+                // the chunks of the step with this lane wide (the others narrow), and what the
+                // narrow step costs at them more than at its own
+                let nch_wide = step_chunks(
+                    crate::verified::ln_batch_chunks(need, cursor_of(l), wide, KV_CHUNK),
+                    eng.max_chunks,
+                );
+                let chunk = rt.widths.narrow(b, nch_wide).map(|t| milli(t - t0));
+                let cost = crate::core::lanes::wide_cost(milli(extra), nch, nch_wide, chunk);
+                crate::core::lanes::lane_goes_wide(gain, cost, total, milli(t0))
             });
             let rows = crate::core::lanes::lane_step_rows(go, narrow, wide, ring, cursor_of(l), eng.max_ctx);
             (l, rows)
@@ -2216,6 +2261,39 @@ mod tests {
         assert_eq!(w.cost_source(16), Some(8));
         w.observe(4, 1, 0, 10.0);
         assert_eq!(w.estimate(4, 1), Some((10.0, 1.0)));
+    }
+
+    #[test]
+    fn a_high_extra_time_is_dropped_when_nothing_measures_it_again() {
+        let mut w = WidthCosts::default();
+        w.observe(8, 1, 0, 36.0);
+        // one high early sample: 9 ms a wide slot
+        w.observe(8, 1, 1, 45.0);
+        assert_eq!(w.estimate(8, 1), Some((36.0, 9.0)));
+        // the lanes stay narrow; the estimate stands for today's 128 launches after the one that
+        // measured it, then goes
+        for _ in 0..WidthCosts::KEEP_LAUNCHES - 1 {
+            w.observe(8, 1, 0, 36.0);
+        }
+        assert_eq!(w.estimate(8, 1), Some((36.0, 9.0)));
+        w.observe(8, 1, 0, 36.0);
+        assert_eq!(w.estimate(8, 1), Some((36.0, 0.0)), "dropped: a lane may try the wide step");
+        // the next wide launch measures it afresh, at full weight
+        w.observe(8, 1, 2, 39.0);
+        assert_eq!(w.estimate(8, 1), Some((36.0, 1.5)));
+        // a count measured lately is borrowed; one not measured lately is not
+        w.observe(2, 1, 0, 12.0);
+        assert_eq!(w.estimate(2, 1), Some((12.0, 1.5)));
+        for _ in 0..WidthCosts::KEEP_LAUNCHES {
+            w.observe(2, 1, 0, 12.0);
+        }
+        assert_eq!(w.estimate(2, 1), Some((12.0, 0.0)));
+        // the narrow step at another chunk count is what a wide step that adds chunks pays for
+        assert_eq!(w.narrow(8, 2), None);
+        w.observe(8, 2, 0, 40.0);
+        assert_eq!(w.narrow(8, 2), Some(40.0));
+        let r = w.report().expect("a report");
+        assert!(r.contains("3 of ") && r.contains("2 of ") && r.contains("2 estimate(s) dropped"), "{r}");
     }
 
     fn qwen38_27b_spec() -> ModelSpec {

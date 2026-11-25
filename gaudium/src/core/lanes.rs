@@ -347,12 +347,20 @@ pub fn lane_ring_rows(narrow: u64, wide: u64, replay: bool) -> u64 {
     crate::verified::ln_lane_ring_rows(narrow, wide, replay)
 }
 
+/// The extra time of a lane's wide step, in microseconds (`None`: not known, or too large for the
+/// arithmetic): its wide slot's `extra` and, when its wide rows take the step from the `nch`
+/// chunks of its narrow step to `nch_wide`, the extra time of the narrow step at `nch_wide`
+/// (`chunk`; `None`: not measured).
+pub fn wide_cost(extra: u64, nch: u64, nch_wide: u64, chunk: Option<u64>) -> Option<crate::verified::WideCost> {
+    crate::verified::ln_wide_cost(extra, nch, nch_wide, chunk.is_some(), chunk.unwrap_or(0))
+}
+
 /// Does a lane go wide in its next step? `gain`: its expected extra tokens from the wide step,
-/// in thousandths; `delta`: the step's extra time with it wide, in microseconds; `total` /
-/// `step`: the batch's expected tokens (thousandths) and its time (microseconds). Values too large
-/// for the arithmetic keep the lane narrow.
-pub fn lane_goes_wide(gain: u64, delta: u64, total: u64, step: u64) -> bool {
-    crate::verified::ln_lane_goes_wide(gain, delta, total, step).unwrap_or(false)
+/// in thousandths; `cost`: the step's extra time with it wide ([`wide_cost`]); `total` /
+/// `step`: the batch's expected tokens (thousandths) and its time (microseconds). A cost not
+/// known, and values too large for the arithmetic, keep the lane narrow.
+pub fn lane_goes_wide(gain: u64, cost: Option<crate::verified::WideCost>, total: u64, step: u64) -> bool {
+    cost.is_some_and(|c| crate::verified::ln_lane_goes_wide_at(gain, c, total, step).unwrap_or(false))
 }
 
 /// The widest draft width a lane is given, of the `narrow` and `wide` widths asked, when its
@@ -589,6 +597,26 @@ mod tests {
     }
 
     #[test]
+    fn the_command_line_counts_and_a_lanes_tally_of_drafts() {
+        use crate::verified::{
+            ln_lanes_arg_ok, ln_prefix_arg_ok, ln_step_drafted, ln_step_kept, ln_tally_drafted,
+            ln_tally_kept,
+        };
+        let max = crate::engine::MAX_LANES;
+        assert!(!ln_lanes_arg_ok(0, max));
+        assert!(ln_lanes_arg_ok(1, max) && ln_lanes_arg_ok(max, max));
+        assert!(!ln_lanes_arg_ok(max + 1, max) && !ln_lanes_arg_ok(u64::MAX, max));
+        assert!(ln_prefix_arg_ok(0, 4096) && ln_prefix_arg_ok(4096, 4096));
+        assert!(!ln_prefix_arg_ok(4097, 4096) && !ln_prefix_arg_ok(u64::MAX, 4096));
+        // 8 rows verify 7 drafts; 4 tokens emitted keep 3 of them; a single-row step drafts none
+        assert_eq!((ln_step_drafted(8), ln_step_kept(8, 4)), (7, 3));
+        assert_eq!((ln_step_drafted(1), ln_step_kept(1, 1)), (0, 0));
+        assert_eq!((ln_tally_drafted(70, 16), ln_tally_kept(40, 16, 16)), (85, 55));
+        // never more kept than verified, whatever the accept kernel reported
+        assert_eq!(ln_step_kept(8, 12), 7);
+    }
+
+    #[test]
     fn lanes_step_at_the_narrowest_width_asked_for() {
         assert_eq!(lane_wide_held(7, 15, 16), 15);
         assert_eq!(lane_wide_held(7, 15, 8), 7);
@@ -607,11 +635,23 @@ mod tests {
     #[test]
     fn a_lane_goes_wide_when_its_gain_beats_the_batch_rate_and_its_rows_fit() {
         // today's rule: gain / delta against the batch's tokens per time
-        assert!(lane_goes_wide(2000, 1500, 30_000, 40_000)); // 1.33 / ms > 0.75 / ms
-        assert!(!lane_goes_wide(500, 1500, 30_000, 40_000));
-        assert!(!lane_goes_wide(0, 0, 30_000, 40_000));
-        assert!(lane_goes_wide(1, 0, 30_000, 40_000)); // a wide step that costs nothing more
-        assert!(!lane_goes_wide(u64::MAX, 2, 1, u64::MAX)); // overflow keeps it narrow
+        let at = |us: u64| wide_cost(us, 1, 1, None);
+        assert!(lane_goes_wide(2000, at(1500), 30_000, 40_000)); // 1.33 / ms > 0.75 / ms
+        assert!(!lane_goes_wide(500, at(1500), 30_000, 40_000));
+        assert!(!lane_goes_wide(0, at(0), 30_000, 40_000));
+        assert!(lane_goes_wide(1, at(0), 30_000, 40_000)); // a wide step that costs nothing more
+        assert!(!lane_goes_wide(u64::MAX, at(2), 1, u64::MAX)); // overflow keeps it narrow
+        // a wide step that adds K/V chunks pays for them (today: their measured time on top),
+        // and never goes wide into chunks not measured yet
+        assert!(lane_goes_wide(2000, wide_cost(1500, 2, 4, Some(0)), 30_000, 40_000));
+        assert!(!lane_goes_wide(2000, wide_cost(1500, 2, 4, Some(2500)), 30_000, 40_000));
+        assert!(!lane_goes_wide(2000, wide_cost(1500, 2, 4, None), 30_000, 40_000));
+        assert!(lane_goes_wide(2000, wide_cost(1500, 4, 4, None), 30_000, 40_000));
+        assert_eq!(
+            wide_cost(1500, 2, 4, Some(2500)),
+            Some(crate::verified::WideCost::WcKnown(4000))
+        );
+        assert_eq!(wide_cost(u64::MAX, 2, 4, Some(1)), None, "overflow: not known");
         // the rows: wide only when chosen, inside the rings and the context
         assert_eq!(lane_step_rows(true, 8, 16, 16, 100, 32768), 16);
         assert_eq!(lane_step_rows(false, 8, 16, 16, 100, 32768), 8);
