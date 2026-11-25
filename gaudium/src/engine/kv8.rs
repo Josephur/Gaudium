@@ -433,13 +433,6 @@ mod tests {
         for c in 0..256u64 {
             assert_eq!(kv_wv_row(c, 256, KvDtype::KvFp8), kv8_vpos(lane256(c)));
             assert_eq!(kv_wv_row(c, 256, KvDtype::KvBf16), lane256(c));
-            // the inverse the laws are proved through
-            for d in [KvDtype::KvBf16, KvDtype::KvFp8] {
-                assert_eq!(crate::verified::kv_wv_chan(kv_wv_row(c, 256, d), 256, d), c);
-                if c < 128 {
-                    assert_eq!(crate::verified::kv_wv_chan(kv_wv_row(c, 128, d), 128, d), c);
-                }
-            }
         }
     }
 

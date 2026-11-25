@@ -51,11 +51,35 @@ Never rely on memory or GPU analogies for Gaudi 2 MME geometry, TPC VLIW/SIMD in
 
 ## 3a. Verified-First Rule (applies to every change)
 
-- **Start in `gaudium/verified/`.** Before writing Rust for a feature or fix, list its decisions: state machines, policies and permission checks, priority and selection rules, counters and accounting, index and bounds arithmetic. Each one is written as a Bend function with `law`s stating what must always hold, and the Rust shell calls that function. Re-implementing a verified rule in Rust (a condition that duplicates it) is a defect.
+- **Start in `gaudium/verified/`.** Before writing Rust for a feature or fix, list the decisions it makes. Each decision of the kinds below is written as a Bend function with `law`s stating what must always hold, and the Rust shell calls that function. Re-implementing a verified rule in Rust (a condition that duplicates it) is a defect.
+- **Must be verified:**
+  - memory and HBM plans;
+  - cache, slot and pool accounting;
+  - admission and lifecycle state machines (requests, batches, lanes, models, devices, recipes);
+  - alignment, index and bounds arithmetic (shapes, strides, offsets, tiles, permutations);
+  - any other policy, permission check or selection rule whose wrong answer can break token identity (section 7) or memory safety.
+- **May stay in Rust with Rust tests.** Reviewers, human or automated, do not ask for these to move into Bend:
+  - counters, timings and telemetry that are only reported (logged, shown, or returned by a status or metrics endpoint) and decide nothing;
+  - parsing of command-line flags, environment variables, config files and request fields, including refusing an out-of-range input before it reaches the engine;
+  - formats defined by an outside reference (tokenizers, chat templates, file and wire formats), with differential tests against that reference where one exists;
+  - I/O, FFI, threads, and byte and text handling.
+- **Where the line falls.** A value leaves the second list as soon as it decides something on the first: a count that admits or refuses work is accounting, and a limit that a memory plan relies on is a bound. The decision is then verified where it is made (in the planner, or in the admission check). The parser that feeds the decision stays in Rust.
 - **A change that adds or alters such logic adds or extends laws in the same change.** "Adding brand-new laws is allowed" (section 5) does not mean optional: a slice without laws is unfinished.
 - **A law states what must hold for every future version of the function, never what the function happens to return today.** A sealed law can never be weakened, so it must not fix a default, a tuning constant, a threshold or an exact formula that a later measurement may change. Seal bounds and safety properties (a result stays inside its range, a count is conserved, a state is never left, an unsafe combination is refused); keep the chosen default, the constant and the formula in the function body and pin today's values with Rust tests, which may change with the code. Before sealing a law, ask what legitimate future change it would forbid: if there is one, weaken the law to the bound behind it.
-- **Only what Bend cannot state stays unproved:** I/O, FFI, byte and text handling, and formats defined by an outside implementation. That code gets Rust tests (differential tests against the reference where one exists).
-- **Report it.** Every hand-off lists the laws added, the Rust call sites that use them, and what was left in the shell and why.
+- **A law constrains the function the Rust shell calls.**
+  - It names that function, or a function proved in Bend to equal it (an equivalence lemma).
+  - A law stated only through a proof helper, a restatement written for the law, or a value the shell computes but never reads does not count.
+  - Where a size or a count has two sides, bound both: it covers what it must, and it stays inside what it may.
+  - Where the exact result is fixed by something outside the engine's tuning (a kernel's byte order, a file format), the law may compare the function with a small reference function written plainly in Bend. Anything a later measurement may change stays a bound.
+- **Every new law names the wrong body it rules out.**
+  - A `# catches:` line in the comment block above the law, beside `# promise:`, names one plausible wrong version of the code that the law refuses. Examples: `# catches: sum replaced by max`, `# catches: alignment of the part offset ignored`.
+  - The author changes the code to that body in a scratch copy and shows `cargo check` failing with `E_LAW_FALSE` and a concrete input. A failed proof with "no counterexample" does not count, because the law may still hold for that body.
+  - RustyBends ignores the line and does not store it in the lock. Adding one, also to a sealed law, never changes `rusty-bends.lock`.
+  - `gaudium/tests/law_comments.rs` fails `cargo test` when a law lands without one.
+- **Report it.** Every hand-off lists:
+  - the laws added, each with its `# catches:` body and the Rust call sites of the function it constrains;
+  - what was left in the shell, and why;
+  - **law findings:** the proof failures that forced a code fix (the law, what was wrong in the code, the commit), and the weak laws found in review (the law, the wrong body that still passed, the fix). Write "none" when there were none. These lines are how the project measures what its laws catch.
 
 ---
 
@@ -83,7 +107,8 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
    - Theorem: `law <name>: for x: T {lhs == rhs : T}`
    - Proof: `def <name>(x): ... {==}` (same name as the `law`), using `%lemma(args) : {goal_with_underscore}` for rewrites.
    - Standalone helper lemmas returning an equality type (`def lemma(...) -> {lhs == rhs : T}:`) are automatically erased before Rust codegen alongside `law`s and proof `def`s.
-   - Every new law has a one-sentence `# promise:` comment directly above it (`# harm:` optional), or the build fails with `E_LAW_NO_PROMISE`. A new law must also be shown false for at least one small mutant of the code it depends on, or the build fails with `E_LAW_VACUOUS`. Each law also runs as a generated Rust test on the emitted code under `cargo test`. When a proof fails, `E_LAW_FALSE` with a concrete input means the code breaks the law; "no counterexample" means only the proof is incomplete.
+   - Every new law has a one-sentence `# promise:` comment directly above it (`# harm:` optional), or the build fails with `E_LAW_NO_PROMISE`. It also has a `# catches:` line (section 3a). A new law must also be shown false for at least one small mutant of the code it depends on, or the build fails with `E_LAW_VACUOUS`. That check stops at the first mutant it catches and names only that one, so passing it does not show that the law rules out the wrong bodies that matter; the `# catches:` body does. Each law also runs as a generated Rust test on the emitted code under `cargo test`. When a proof fails, `E_LAW_FALSE` with a concrete input means the code breaks the law; "no counterexample" means only the proof is incomplete.
+   - **Shared lemmas.** `gaudium/verified/nat_lemmas.bend` is the library RustyBends ships: `build.rs` rewrites it on every build, so never edit it. Gaudium's own reusable lemmas live in `gaudium/verified/lemmas.bend` (`import lemmas.bend as G`). They cover Euclidean division: a split `q * b + r` with `r < b` determines `q` and `r`, its quotient is `q` and its remainder is `r`, and it stays below `n * b` when `q < n`. They also cover multiples of `b` (aligned, with no remainder). When a second file needs a lemma, put it there rather than in a file-local copy under a new prefix. Prove a bound or an injectivity over `Nat.div` / `Nat.mod` with these lemmas, not by evaluating every value: the `--verdict` kernel runs out of fuel on long evaluations. The `kv_wv_row` laws in `kv_cache.bend` are the worked example.
 7. **Multiple `.bend` files in `gaudium/verified/`:**
    - `rusty-bends-build` checks every `.bend` file individually with `bend` and concatenates all `.bend` files into one `OUT_DIR/verified.rs`. Keep top-level type, constructor, function, and law names unique across all files in `gaudium/verified/`.
 
@@ -100,15 +125,26 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
   - `auto` (default): always enforces `bend <file> --check-only`, plus Lean `bend <file> --verdict` whenever compatible Lean is installed.
   - `require`: fails the build if Lean `--verdict` is unavailable (use in CI and whenever Lean matches Bend's expected kernel version).
   - `off`: `--check-only` only (only when compiling on a host without Lean).
+  - **A cached build can skip the verdict.** RustyBends keeps a content hash of the `.bend` files and returns early when it matches, and the hash does not record the verdict mode. After a build with `BEND_VERDICT=off`, or with `auto` and no Lean, `BEND_VERDICT=require cargo check` passes without running `--verdict` until the content of a `.bend` file changes; touching the files is not enough (RustyBends #18). Before quoting a verdict, either run `bend <file> --verdict` directly, or delete the cache file (`rm target/debug/build/gaudium-*/out/rusty-bends.cache`) and touch a `.bend` file so that cargo reruns the build script.
 - **Anti-Cheat Law Lock (`gaudium/rusty-bends.lock`):**
   - Once a `law` is locked in `gaudium/rusty-bends.lock`, **NEVER weaken, edit, comment out, or delete it** to make `cargo check` pass.
   - If `E_BEND_CHECK_FAILED` or `E_LAW_LOCK_TAMPERED` fires, fix the implementation or proof — NOT the law.
   - If a locked law itself contradicts the real hardware or protocol specification, **STOP and ask the user** before touching any locked law.
   - Adding brand-new laws for new slices is allowed; always run `cargo check` *without* `RUSTY_BENDS_UPDATE_LAWS=1` first to confirm zero locked laws changed.
-- **New laws are sealed after an independent review, not by asking the user:**
+  - **What the update flag does.** `RUSTY_BENDS_UPDATE_LAWS=1` turns every lock check off for that build and rewrites the whole lock. It seals every new law and refreshes every promise line, and it also accepts a locked law whose statement changed, without saying so (RustyBends #17). That is why `cargo check` runs without it first, and why the lock's diff is read before it is committed.
+  - **The comments of a sealed law.** A sealed law's `# promise:` and `# harm:` lines are stored in the lock, outside the law's hash. Rewording them is a change to a locked law: ask the user first. A reviewer then confirms that only the comment changed. `cargo check` without the update flag passes and prints `promise wording changed (lock hash unchanged)`, and the lock's diff changes only that law's `# promise` / `# harm` lines (as in #77). Refresh the lock on a tree with no other unsealed law, because the update flag would seal those too. `# catches:` lines are not in the lock, so they may be added to a sealed law without asking.
+- **New laws are sealed after one independent review, not by asking the user:**
+  - **The author checks first.** Before asking for review, the author takes each new law through section 3a:
+    - it belongs in Bend (the "must be verified" list);
+    - it states a bound, not a pinned value;
+    - it names the function the Rust shell calls;
+    - it bounds both sides where there are two;
+    - its `# catches:` body fails with `E_LAW_FALSE`.
+    The author also answers "what wrong body still passes?". Try at least: a sum replaced by a max, a dropped term or condition, an off-by-one, a constant result, and an unaligned value where alignment matters. A survivor that breaks the promise calls for a stronger law before the review.
   - **Who reviews.** A second agent, never the session that wrote the laws, running on the most capable model available to it at high reasoning effort or above. It works from the `.bend` sources and the Rust call sites, not from the author's summary.
-  - **What it checks, law by law.** The law states a bound or a safety property as section 3a requires, and fixes no default, tuning constant, threshold or exact formula. It is not vacuous: it constrains the function it names, and that function is the one the Rust shell calls (no Rust condition restates it). Its proof is checked by `BEND_VERDICT=require cargo check`. The reviewer names the legitimate future change the law would forbid, or says that there is none.
-  - **What happens next.** The reviewer writes its verdict for each law in the pull request. Laws that pass are sealed on that pull request's branch with `RUSTY_BENDS_UPDATE_LAWS=1`, and the lock's diff must only add lines. A law the reviewer doubts is corrected and reviewed again, or left out of the lock with the reason stated; it is never sealed to get the change merged.
+  - **When.** One review, on the final code. It runs after the author's check, and after the other review findings on the change (automated ones included) are settled, not on every push.
+  - **What it checks, law by law.** The law states a bound or a safety property as section 3a requires, and fixes no default, tuning constant, threshold or exact formula. It is not vacuous: it constrains the function it names, and that function is the one the Rust shell calls (no Rust condition restates it). Its proof is checked by `BEND_VERDICT=require cargo check` on a fresh cache (above). The reviewer tries the `# catches:` body and its own "what wrong body still passes?" candidates, and reports each survivor. It names the legitimate future change the law would forbid, or says that there is none.
+  - **What happens next.** The reviewer writes its verdict for each law in the pull request. Laws that pass are sealed on that pull request's branch with `RUSTY_BENDS_UPDATE_LAWS=1`, and the lock's diff must only add lines. A corrected law gets a re-review of that law only, not of the whole change. A law the reviewer doubts and that is not corrected is left out of the lock, with the reason stated; it is never sealed to get the change merged. RustyBends seals every new law at once (RustyBends #17 asks for named sealing), so remove that law's lines from the lock after the update, and check that the lock's diff holds exactly the laws that passed.
   - The user is still asked before any law that is already locked is touched (the rule above), and still approves the merge (section 11).
 - **Incremental vertical slices:** Keep `cargo check` and `cargo test` green after every slice.
 
@@ -117,7 +153,7 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
 ## 6. RustyBends Issues — Do Not Patch Locally, File via `gh`
 
 - **NEVER silently modify `rusty-bends-build/`.**
-- **RustyBends is a general tool, and Gaudium is one of its users.** Ask it only for what any project could use. Gaudium's own rules belong in Gaudium (this file, `gaudium/verified/`, Rust tests), never in RustyBends. An issue states the need in general Bend/Rust terms with a standalone reproducer whose names are neutral (`fits_area_limit`, `Ledger`), never Gaudium code or vocabulary pasted in: RustyBends declines requests that only one project needs.
+- **RustyBends is a general tool, and Gaudium is one of its users.** Ask it only for what any project could use. Gaudium's own rules belong in Gaudium (this file, `gaudium/verified/`, Rust tests), never in RustyBends. An issue states the need in general Bend/Rust terms with a standalone reproducer whose names are neutral (`fits_area_limit`, `Ledger`), never Gaudium code or vocabulary pasted in: RustyBends declines requests that only one project needs. Before filing, ask: "Would a project that has never heard of Gaudium want this?" If not, or if the request only makes sense under Gaudium's own conventions (this file, its review process, its lock workflow), solve it in Gaudium instead. For example, the `# catches:` rule is enforced by a Gaudium test, not by RustyBends.
 - If you hit a bug, missing Bend 2 primitive, emitter limitation, or CLI mismatch in RustyBends:
   1. Write a minimal standalone `.bend` reproducer, with neutral names, and the exact error output.
   2. File an issue directly on the RustyBends repository using `gh`:
@@ -199,7 +235,7 @@ Before ending the session, confirm that the server is up and answers a request f
 
 - **One task, one branch, one PR.** Start each task on a new branch from the latest `main`, in a git worktree of its own under `.worktrees/` (`git worktree add .worktrees/<name> -b <type>/<name> origin/main`). Never edit files in the main checkout, never commit on `main`, and never put two unrelated tasks on one branch.
 - **Name the issue.** The PR description says which issue the change belongs to: `Closes #N` when it meets everything the issue asks for, `Refs #N` when it is a part. Work without an issue gets one first, or one line in the PR on why none is needed.
-- **Green before it is opened for review.** `BEND_VERDICT=require cargo check`, `cargo test` and the Web UI tests (`node --test test/` in `ui/`) pass on the branch. The description carries the hand-off of section 3a (laws added, the Rust call sites that use them, what stayed in the shell and why), says whether `rusty-bends.lock` changed (with the review verdict for every law it seals, section 5), and gives card measurements with their configuration when the change claims any (section 7).
+- **Green before it is opened for review.** `BEND_VERDICT=require cargo check`, `cargo test` and the Web UI tests (`node --test test/` in `ui/`) pass on the branch. The description carries the hand-off of section 3a (laws added with their `# catches:` bodies, the Rust call sites that use them, what stayed in the shell and why, and the law findings), says whether `rusty-bends.lock` changed (with the review verdict for every law it seals, section 5), and gives card measurements with their configuration when the change claims any (section 7).
 - **Squash merge, then clean up.** A PR merges as one commit once its checks pass and the user has approved it; the merge is given its message explicitly (section 9, commit identity). At merge its branch is deleted and its worktree removed (`git worktree remove`).
 - **Nothing is left uncommitted.** At the end of a session everything it wrote is committed and pushed on its branch; unfinished work is a draft PR that says what is missing. A task that is given up has its PR closed with a note and its worktree removed.
 - **Two tasks, one file.** The task that merges second rebases onto `main` and runs the checks again before it merges.
