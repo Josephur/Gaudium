@@ -358,3 +358,15 @@ def cg_made_days_positive(a, l):
       {==}
     case 1n+ap 1n+lp:
       {==}
+
+# LAW 2.4
+# promise: a request for at least one day, signed by an authority with at least a whole day left, always gets a certificate
+# harm: the command would refuse every certificate although nothing stands in its way
+# catches: every request refused (cg_validity always CgNoDaysAsked{})
+law cg_room_makes_certificate:
+  for +a: Nat
+  for +l: Nat
+  {cg_valid_refused(cg_validity(1n+a, 1n+l)) == False{} : Bool}
+
+def cg_room_makes_certificate(a, l):
+  {==}
