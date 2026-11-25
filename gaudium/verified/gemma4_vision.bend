@@ -320,6 +320,15 @@ def g4u_embed_image(has_img: Bool) -> Bool:
 def g4u_layer_plain(two_way: Bool, sliding: Bool) -> Bool:
   Bool.not(Bool.and(two_way, sliding))
 
+# Whether `--build-cache` compiles the drafter's step that verifies `t` rows and drafts `kd`
+# tokens at one chunk bucket, for widths whose widest is `kmax` (`listed`: `kd` is one of them;
+# `top`: the context's top bucket). Every verify count from 1 to the widest + 1 (a first block
+# narrowed by the request's budget, or one a narrowed step handed on), drafting a listed width or
+# none (the verify-only step of a sampled decode); at the top bucket also any draft count up to
+# the widest (a step near the end of the context, which only the top bucket reaches).
+def g4c_build_step(+t: Nat, +kd: Nat, +kmax: Nat, listed: Bool, top: Bool) -> Bool:
+  Bool.and(Bool.and(Nat.is_lt(0n, t), Nat.is_le(t, 1n+kmax)), Bool.and(Nat.is_le(kd, kmax), Bool.or(Bool.or(listed, Nat.is_eq(kd, 0n)), top)))
+
 # Whether the next tile joins a unit of `tiles` tiles: an image block runs from the unit's last
 # tile into it (`cross`), and the unit has room for one more tile of the `max_tiles` the plan
 # holds buffers for (the load checks that a unit of `max_tiles` full tiles fits the ring).
@@ -1741,3 +1750,74 @@ def g4v_guarded_head_has_a_quarter(nh, dh, hid):
                 case 1n+k:
                   %Equal.sym(Bool, Nat.is_lt(g4v_rot_quarter(1n+1n+1n+1n+k), 1n), False{}, L.nat_le_lt_false(Pair.fst(Nat, Nat, Nat.divmod.go(k, 3n, 1n, 0n)), 1n, g4v_dm_ge(k, 3n, 1n, 0n))) : {Bool.and(GB.g4_vision_heads_valid(nh, 1n+1n+1n+1n+k, hid), _) == False{} : Bool}
                   g4u_and_false_r(GB.g4_vision_heads_valid(nh, 1n+1n+1n+1n+k, hid))
+
+# ----------------------------------------------------------------------------
+# The drafter steps --build-cache compiles
+# ----------------------------------------------------------------------------
+
+# ((a and b) and r) and c is false when b and c is.
+def g4c_and_mid(a: Bool, b: Bool, r: Bool, c: Bool, h: {Bool.and(b, c) == False{} : Bool}) -> {Bool.and(Bool.and(Bool.and(a, b), r), c) == False{} : Bool}:
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      match b:
+        case False{}:
+          {==}
+        case True{}:
+          %Equal.sym(Bool, c, False{}, h) : {Bool.and(r, _) == False{} : Bool}
+          g4u_and_false_r(r)
+
+# (t and (d and o)) and c is false when d and c is.
+def g4c_and_inner(t: Bool, d: Bool, o: Bool, c: Bool, h: {Bool.and(d, c) == False{} : Bool}) -> {Bool.and(Bool.and(t, Bool.and(d, o)), c) == False{} : Bool}:
+  match t:
+    case False{}:
+      {==}
+    case True{}:
+      match d:
+        case False{}:
+          {==}
+        case True{}:
+          %Equal.sym(Bool, c, False{}, h) : {Bool.and(o, _) == False{} : Bool}
+          g4u_and_false_r(o)
+
+# LAW G4C.1
+# promise: --build-cache never asks for a drafter step that verifies no rows.
+# harm: the off-card build would ask for a malformed step graph and fail.
+law g4c_build_step_has_rows:
+  for +kd: Nat
+  for +kmax: Nat
+  for l: Bool
+  for tp: Bool
+  {g4c_build_step(0n, kd, kmax, l, tp) == False{} : Bool}
+
+def g4c_build_step_has_rows(kd, kmax, l, tp):
+  {==}
+
+# LAW G4C.2
+# promise: --build-cache never asks for a drafter step that verifies more rows than the widest width's step.
+# harm: the off-card build would compile steps wider than the speculative buffers are planned for.
+law g4c_build_step_rows_within:
+  for +t: Nat
+  for +kd: Nat
+  for +kmax: Nat
+  for l: Bool
+  for tp: Bool
+  {Bool.and(g4c_build_step(t, kd, kmax, l, tp), Nat.is_lt(1n+kmax, t)) == False{} : Bool}
+
+def g4c_build_step_rows_within(t, kd, kmax, l, tp):
+  g4c_and_mid(Nat.is_lt(0n, t), Nat.is_le(t, 1n+kmax), Bool.and(Nat.is_le(kd, kmax), Bool.or(Bool.or(l, Nat.is_eq(kd, 0n)), tp)), Nat.is_lt(1n+kmax, t), g4u_le_lt_false(t, 1n+kmax, Nat.is_le(t, 1n+kmax), {==}))
+
+# LAW G4C.3
+# promise: --build-cache never asks for a drafter step that drafts more tokens than the widest width.
+# harm: the off-card build would compile steps that draft past the drafter's planned width.
+law g4c_build_step_drafts_within:
+  for +t: Nat
+  for +kd: Nat
+  for +kmax: Nat
+  for l: Bool
+  for tp: Bool
+  {Bool.and(g4c_build_step(t, kd, kmax, l, tp), Nat.is_lt(kmax, kd)) == False{} : Bool}
+
+def g4c_build_step_drafts_within(t, kd, kmax, l, tp):
+  g4c_and_inner(Bool.and(Nat.is_lt(0n, t), Nat.is_le(t, 1n+kmax)), Nat.is_le(kd, kmax), Bool.or(Bool.or(l, Nat.is_eq(kd, 0n)), tp), Nat.is_lt(kmax, kd), g4u_le_lt_false(kd, kmax, Nat.is_le(kd, kmax), {==}))

@@ -1465,21 +1465,16 @@ pub(super) fn build_cache_recipes(
     Ok(())
 }
 
-/// The `(rows, drafts)` of the steps a decode may launch at one chunk bucket (`top`: the
-/// context's top bucket), as `build_cache_recipes` lists them.
+/// The `(rows, drafts)` of the steps `build_cache_recipes` compiles at one chunk bucket (`top`:
+/// the context's top bucket): the verified `g4c_build_step` picks them. Its laws keep every
+/// pick within 1..=widest + 1 rows and 0..=widest drafts, so the candidates below hold all of
+/// them.
 fn build_steps(ks: &[u64], top: bool) -> Vec<(u64, u64)> {
     let kmax = ks.iter().copied().max().unwrap_or(0);
-    let mut steps: Vec<(u64, u64)> = Vec::new();
-    for t in 1..=kmax + 1 {
-        steps.extend(ks.iter().map(|&kd| (t, kd)));
-        steps.push((t, 0));
-        if top {
-            steps.extend((1..=kmax).map(|kd| (t, kd)));
-        }
-    }
-    steps.sort_unstable();
-    steps.dedup();
-    steps
+    (0..=kmax + 1)
+        .flat_map(|t| (0..=kmax).map(move |kd| (t, kd)))
+        .filter(|&(t, kd)| crate::verified::g4c_build_step(t, kd, kmax, ks.contains(&kd), top))
+        .collect()
 }
 
 /// Compiles (or loads) the step recipe `(t, kd, nch)` on first use.
