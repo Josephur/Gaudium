@@ -64,6 +64,23 @@ use chat::{ChatPrompt, ChatTemplate};
 /// for a day, on every port; short, so that a server whose HTTPS is turned off again strands a
 /// browser for a day at most.
 pub const DEFAULT_HSTS_MAX_AGE: u64 = 86_400;
+
+/// The HSTS max-age the server sends, from `--hsts-max-age` (`None` when not given), whether TLS
+/// is on, and the listening port. A browser that has the header rewrites `http://host/` and
+/// `http://host:80/` to port 443 (RFC 6797, section 8.3), so on port 80 a nonzero max-age would
+/// send saved HTTP links to a port this listener does not serve: there the default is 0
+/// (`max-age=0`, which also clears an earlier one), and an explicit nonzero value is refused.
+pub fn hsts_max_age_for(tls: bool, port: u16, requested: Option<u64>) -> Result<u64, String> {
+    match (tls && port == 80, requested) {
+        (true, Some(n)) if n > 0 => Err(format!(
+            "--hsts-max-age {n} with HTTPS on port 80: browsers that saw the header would send \
+             http:// links for this host to port 443, which this server does not serve; use \
+             another --port, or --hsts-max-age 0"
+        )),
+        (true, _) => Ok(0),
+        (false, r) => Ok(r.unwrap_or(DEFAULT_HSTS_MAX_AGE)),
+    }
+}
 use conn::Conn;
 pub use proxy::ProxyOptions;
 use outparse::{Delta, OutputFormat, OutputParser};

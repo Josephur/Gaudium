@@ -259,7 +259,9 @@ Serve options:
                         over HTTPS carries (default: 86400, one day; at most 63072000).
                         A browser that saw it uses https for this host name, on every
                         port, until it expires; 0 tells browsers to forget it. No
-                        includeSubDomains, no preload
+                        includeSubDomains, no preload. On --port 80 the default is 0
+                        and a nonzero value is refused (browsers would send http://
+                        links to port 443)
   --mcp-proxy           Offer the MCP proxy (/cors-proxy) to the Web UI: the server
                         makes the requests to an MCP server instead of the browser (for
                         servers without CORS headers, servers only this machine

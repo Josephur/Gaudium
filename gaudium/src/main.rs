@@ -286,7 +286,9 @@ fn print_usage() {
          \x20                       over HTTPS carries (default: 86400, one day; at most 63072000).\n\
          \x20                       A browser that saw it uses https for this host name, on every\n\
          \x20                       port, until it expires; 0 tells browsers to forget it. No\n\
-         \x20                       includeSubDomains, no preload\n\
+         \x20                       includeSubDomains, no preload. On --port 80 the default is 0\n\
+         \x20                       and a nonzero value is refused (browsers would send http://\n\
+         \x20                       links to port 443)\n\
          \x20 --mcp-proxy           Offer the MCP proxy (/cors-proxy) to the Web UI: the server\n\
          \x20                       makes the requests to an MCP server instead of the browser (for\n\
          \x20                       servers without CORS headers, servers only this machine\n\
@@ -2500,7 +2502,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut tls_http = gaudium::core::listener::PlainHttpMode::LsHttpRedirect;
-    let mut hsts_max_age = gaudium::server::DEFAULT_HSTS_MAX_AGE;
+    let mut hsts_max_age: Option<u64> = None;
     let mut per_model: Vec<(String, ModelRunOptions)> = Vec::new();
     let mut draft_k: Vec<u64> = Vec::new();
     let mut build_cache = false;
@@ -2769,13 +2771,14 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             }
             "--hsts-max-age" => {
                 let s = next_val(&mut i, "--hsts-max-age")?;
-                hsts_max_age = s
-                    .parse()
-                    .ok()
-                    .filter(|&n: &u64| n <= 63_072_000)
-                    .ok_or_else(|| {
-                        format!("invalid --hsts-max-age '{s}' (seconds, 0 to 63072000)")
-                    })?;
+                hsts_max_age = Some(
+                    s.parse()
+                        .ok()
+                        .filter(|&n: &u64| n <= 63_072_000)
+                        .ok_or_else(|| {
+                            format!("invalid --hsts-max-age '{s}' (seconds, 0 to 63072000)")
+                        })?,
+                );
             }
             "--mcp-proxy" => mcp_proxy.enabled = true,
             "--mcp-proxy-allow" => mcp_proxy
@@ -2848,6 +2851,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             })
         }
     };
+
+    let hsts_max_age =
+        gaudium::server::hsts_max_age_for(tls_cert.is_some(), port, hsts_max_age)?;
 
     if !profile.is_empty() {
         // as for --generate: the template before the device opens (the batched lane recipes

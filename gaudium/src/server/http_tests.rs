@@ -2860,3 +2860,19 @@ fn without_tls_plain_http_is_answered_in_every_mode() {
         assert!(!head.contains("location:") && !head.contains("strict-transport-security"));
     }
 }
+
+#[test]
+fn hsts_max_age_is_zero_and_explicit_nonzero_refused_on_port_80_with_tls() {
+    use super::{hsts_max_age_for, DEFAULT_HSTS_MAX_AGE};
+    // a browser that has HSTS sends http://host/ and http://host:80/ to port 443
+    assert_eq!(hsts_max_age_for(true, 80, None), Ok(0));
+    assert_eq!(hsts_max_age_for(true, 80, Some(0)), Ok(0));
+    let e = hsts_max_age_for(true, 80, Some(3600)).unwrap_err();
+    assert!(e.contains("port 80") && e.contains("443"), "{e}");
+    // any other port keeps it (http://host:8090/ upgrades to https://host:8090/)
+    assert_eq!(hsts_max_age_for(true, 8090, None), Ok(DEFAULT_HSTS_MAX_AGE));
+    assert_eq!(hsts_max_age_for(true, 443, Some(3600)), Ok(3600));
+    // without TLS nothing is sent; the value is passed through unchanged
+    assert_eq!(hsts_max_age_for(false, 80, Some(3600)), Ok(3600));
+    assert_eq!(hsts_max_age_for(false, 80, None), Ok(DEFAULT_HSTS_MAX_AGE));
+}

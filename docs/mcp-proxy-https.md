@@ -179,6 +179,11 @@ give such services another name. Browsers ignore the header for an address (`htt
 and over plain HTTP, where the server never sends it. `--hsts-max-age 0` tells browsers to forget
 an earlier one.
 
+On `--port 80` the server sends `max-age=0` and refuses a nonzero `--hsts-max-age`: a browser
+that has the header rewrites `http://host/` and `http://host:80/` to port 443 (RFC 6797,
+section 8.3), which this listener does not serve. Every other port keeps its number
+(`http://host:8090/` becomes `https://host:8090/`).
+
 A front end on another machine that ends TLS and forwards plain HTTP to a server that has the TLS
 options too would be redirected again and again: give such a server neither option (below), or
 `--tls-http allow`.
