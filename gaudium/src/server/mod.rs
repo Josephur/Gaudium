@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::budget::SequenceBudget;
 use crate::core::effort::EffortLevels;
-use crate::core::lifecycle::{can_switch_resident_model, RequestGuard};
+use crate::core::lifecycle::{can_switch_resident_model, is_backend_card_released, RequestGuard};
 use crate::core::tool_calls::{finish_reason_name, generation_end, stop_reason_name, GenEnd};
 use crate::core::vision::{drafter_runs_with_vision, planned_image_tokens, MediaLimits};
 use crate::engine::qwen3::{Qwen3Config, Qwen3GenParams, KV_CHUNK};
@@ -997,6 +997,9 @@ impl AppState {
                 s.prefix = None;
                 s.host_tier = None;
                 s.lifecycle = Lifecycle::Parked;
+                if !is_backend_card_released(s.lifecycle.as_backend_state()) {
+                    return Err("verified card-release invariant failed before switching model".into());
+                }
             }
             if !can_switch_resident_model(s.active_requests, s.lifecycle.as_backend_state()) {
                 return Err("verified single-resident guard refused card switch".into());
@@ -1123,7 +1126,7 @@ impl AppState {
     fn park(&self, admin_parked: bool, reason: &str) -> Result<(), String> {
         let _op = self.card_op.lock().unwrap();
         let mut s = self.slot.lock().unwrap();
-        if s.active_requests > 0 {
+        if !can_switch_resident_model(s.active_requests, BackendState::BeParked) {
             return Err("cannot release card while a request is active".into());
         }
         s.admin_parked = admin_parked;
@@ -1145,6 +1148,9 @@ impl AppState {
             s.host_tier = None;
         }
         s.lifecycle = Lifecycle::Parked;
+        if !is_backend_card_released(s.lifecycle.as_backend_state()) {
+            return Err("verified card-release invariant failed after parking".into());
+        }
         s.detail = reason.to_string();
         s.since = Instant::now();
         drop(s);
@@ -3301,10 +3307,17 @@ fn run_chat(
 
     // Verified RequestGuard tracks request lifecycle transitions!
     let mut rguard = RequestGuard::new();
+    fn step_request_guard(rguard: &mut RequestGuard, ev: ReqEvent, req_id: &str) {
+        if let Err(e) = rguard.apply(ev) {
+            eprintln!("[server] request {req_id} invalid lifecycle transition: {e:?}");
+            debug_assert!(false, "request {req_id} invalid lifecycle transition: {e:?}");
+        }
+    }
 
     if stream_mode && write_sse_headers(stream).is_err() {
         state.cancels.lock().unwrap().remove(&req_id);
-        let _ = rguard.cancel();
+        rguard.cancel();
+        debug_assert!(rguard.is_terminal());
         return;
     }
 
@@ -3363,7 +3376,8 @@ fn run_chat(
         };
         if let Some(e) = err {
             state.cancels.lock().unwrap().remove(&req_id);
-            let _ = rguard.apply(ReqEvent::EvReqFail);
+            step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
+            debug_assert!(rguard.is_terminal());
             state.publish_request(format!(
                 "{{{},\"message\":{}}}",
                 req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
@@ -3384,7 +3398,7 @@ fn run_chat(
             s.hbm_bytes
         };
         state.publish_engine_event();
-        let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
+        step_request_guard(&mut rguard, ReqEvent::EvReqStartPrefill, &req_id);
         lane_rx = Some(rx);
         (None, hbm)
     } else {
@@ -3397,7 +3411,7 @@ fn run_chat(
             s.last_activity = Instant::now();
         }
         state.publish_engine_event();
-        let _ = rguard.apply(ReqEvent::EvReqStartPrefill);
+        step_request_guard(&mut rguard, ReqEvent::EvReqStartPrefill, &req_id);
 
         // Take engine temporarily out of slot so status endpoints never block while generating!
         let mut s = state.slot.lock().unwrap();
@@ -3408,6 +3422,8 @@ fn run_chat(
                 s.active_requests = s.active_requests.saturating_sub(1);
                 drop(s);
                 state.cancels.lock().unwrap().remove(&req_id);
+                step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
+                debug_assert!(rguard.is_terminal());
                 let msg = "model unloaded concurrently; retry request";
                 state.publish_request(format!(
                     "{{{},\"message\":{}}}",
@@ -3538,7 +3554,7 @@ fn run_chat(
             };
             if !started_decode {
                 started_decode = true;
-                let _ = rguard.apply(ReqEvent::EvReqPrefillDone);
+                step_request_guard(&mut rguard, ReqEvent::EvReqPrefillDone, &req_id);
                 state.publish_request(format!(
                     "{{{},\"timings\":{}}}",
                     req_base("decode", queued_ms),
@@ -3656,11 +3672,21 @@ fn run_chat(
                 rep.stopped_by_eos,
                 rep.stopped_by_cancel,
             );
-            if end == GenEnd::GeCancelled {
-                let _ = rguard.cancel();
-            } else {
-                let _ = rguard.apply(ReqEvent::EvReqFinishStop);
+            match end {
+                GenEnd::GeCancelled => {
+                    rguard.cancel();
+                }
+                GenEnd::GeLength => {
+                    step_request_guard(&mut rguard, ReqEvent::EvReqFinishLength, &req_id);
+                }
+                GenEnd::GeEos | GenEnd::GeStopString | GenEnd::GeCallLimit => {
+                    if !started_decode {
+                        step_request_guard(&mut rguard, ReqEvent::EvReqPrefillDone, &req_id);
+                    }
+                    step_request_guard(&mut rguard, ReqEvent::EvReqFinishStop, &req_id);
+                }
             }
+            debug_assert!(rguard.is_terminal());
             let finish_reason = finish_reason_name(end, has_calls);
             // the readout's phases are stop / length / cancelled
             let phase = if has_calls && end != GenEnd::GeCancelled {
@@ -3873,7 +3899,8 @@ fn run_chat(
             }
         }
         Err(e) => {
-            let _ = rguard.apply(ReqEvent::EvReqFail);
+            step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
+            debug_assert!(rguard.is_terminal());
             state.publish_request(format!(
                 "{{{},\"message\":{}}}",
                 req_base("error", queued_ms),

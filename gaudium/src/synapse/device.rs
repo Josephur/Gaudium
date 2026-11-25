@@ -333,6 +333,7 @@ impl HpuDevice {
         let mut pin = HostPinGuard::new();
         let mut mapped: Vec<(*const u8, u64)> = Vec::with_capacity(extents.len());
         let mut offset = 0usize;
+        let last_nonzero = extents.iter().rposition(|&sz| sz > 0);
         for (i, &sz) in extents.iter().enumerate() {
             if sz == 0 {
                 continue;
@@ -342,20 +343,29 @@ impl HpuDevice {
             let st = unsafe { (self.api.syn_host_map)(self.dev_id, sz, ptr as *const c_void) };
             if st != SYN_SUCCESS {
                 pin.rollback();
-                for (p, _) in mapped {
-                    unsafe {
-                        (self.api.syn_host_unmap)(self.dev_id, p as *const c_void);
-                    }
-                }
+                self.host_unmap_extents(&mapped);
                 return Err(SynapseError::Status {
                     op: "synHostMap",
                     code: st,
                 });
             }
-            pin.record_extent(i + 1 == extents.len())
-                .map_err(|e| SynapseError::Guard(format!("{e:?}")))?;
+            if let Err(e) = pin.record_extent(Some(i) == last_nonzero) {
+                pin.rollback();
+                unsafe {
+                    (self.api.syn_host_unmap)(self.dev_id, ptr as *const c_void);
+                }
+                self.host_unmap_extents(&mapped);
+                return Err(SynapseError::Guard(format!("{e:?}")));
+            }
             mapped.push((ptr, sz));
             offset += sz as usize;
+        }
+        if !mapped.is_empty() && !pin.is_usable() {
+            pin.rollback();
+            self.host_unmap_extents(&mapped);
+            return Err(SynapseError::Guard(
+                "host pin guard not usable after mapping extents".into(),
+            ));
         }
         Ok(mapped)
     }

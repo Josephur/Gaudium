@@ -480,7 +480,7 @@ def hc_room_pick(can: Bool, fits: Bool) -> HcRoom:
           HcEvict{}
 
 def hc_room(+need: Nat, +free: Nat, evictable: Nat) -> HcRoom:
-  hc_room_pick(Nat.is_le(need, Nat.add(free, evictable)), Nat.is_le(need, free))
+  hc_room_pick(Nat.is_le(Nat.sub(need, free), evictable), Nat.is_le(need, free))
 
 # ============================================================================
 # 8. Device rows that still equal an entry's rows
@@ -916,6 +916,30 @@ law hc_evict_before_irreflexive:
 def hc_evict_before_irreflexive(a):
   hc_lt_refl(a)
 
+def hc_room_sub_add_zero(+n: Nat, x: Nat) -> {0n == Nat.sub(n, Nat.add(n, x)) : Nat}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+p:
+      hc_room_sub_add_zero(p, x)
+
+def hc_room_sub_add_l(+a: Nat, +b: Nat) -> {b == Nat.sub(Nat.add(a, b), a) : Nat}:
+  match a:
+    case 0n:
+      match b:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+p:
+      hc_room_sub_add_l(p, b)
+
+def hc_room_add_assoc(+a: Nat, b: Nat, c: Nat) -> {Nat.add(Nat.add(a, b), c) == Nat.add(a, Nat.add(b, c)) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+p:
+      %hc_room_add_assoc(p, b, c) : {1n+Nat.add(Nat.add(p, b), c) == 1n+_ : Nat}
+      {==}
+
 # LAW HC.28: a save that fits in the free bytes evicts nothing.
 law hc_room_fits_evicts_nothing:
   for +n: Nat
@@ -924,7 +948,8 @@ law hc_room_fits_evicts_nothing:
   {hc_room(n, Nat.add(n, extra), ev) == HcFits{} : HcRoom}
 
 def hc_room_fits_evicts_nothing(n, extra, ev):
-  %hc_le_add_add(n, extra, ev) : {hc_room_pick(_, Nat.is_le(n, Nat.add(n, extra))) == HcFits{} : HcRoom}
+  %hc_room_sub_add_zero(n, extra) : {hc_room_pick(Nat.is_le(_, ev), Nat.is_le(n, Nat.add(n, extra))) == HcFits{} : HcRoom}
+  %Equal.sym(Bool, Nat.is_le(0n, ev), True{}, hc_zero_le(ev)) : {hc_room_pick(_, Nat.is_le(n, Nat.add(n, extra))) == HcFits{} : HcRoom}
   %hc_le_add_r(n, extra) : {hc_room_pick(True{}, _) == HcFits{} : HcRoom}
   {==}
 
@@ -937,7 +962,9 @@ law hc_room_refuses_what_cannot_fit:
   {hc_room(Nat.add(Nat.add(f, ev), 1n+x), f, ev) == HcRefuse{} : HcRoom}
 
 def hc_room_refuses_what_cannot_fit(f, ev, x):
-  %hc_le_add_gt_false(Nat.add(f, ev), x) : {hc_room_pick(_, Nat.is_le(Nat.add(Nat.add(f, ev), 1n+x), f)) == HcRefuse{} : HcRoom}
+  %Equal.sym(Nat, Nat.add(Nat.add(f, ev), 1n+x), Nat.add(f, Nat.add(ev, 1n+x)), hc_room_add_assoc(f, ev, 1n+x)) : {hc_room_pick(Nat.is_le(Nat.sub(_, f), ev), Nat.is_le(Nat.add(Nat.add(f, ev), 1n+x), f)) == HcRefuse{} : HcRoom}
+  %hc_room_sub_add_l(f, Nat.add(ev, 1n+x)) : {hc_room_pick(Nat.is_le(_, ev), Nat.is_le(Nat.add(Nat.add(f, ev), 1n+x), f)) == HcRefuse{} : HcRoom}
+  %hc_le_add_gt_false(ev, x) : {hc_room_pick(_, Nat.is_le(Nat.add(Nat.add(f, ev), 1n+x), f)) == HcRefuse{} : HcRoom}
   {==}
 
 def hc_clean_apart_aux(k: Bool, +lo: Nat, +hi: Nat, +w0: Nat, +w1: Nat) -> {Bool.or(Nat.is_le(w1, hc_clean_lo_if(k, lo, w1)), Nat.is_le(hc_clean_hi_if(k, hi, w0), w0)) == True{} : Bool}:

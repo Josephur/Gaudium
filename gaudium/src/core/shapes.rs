@@ -307,6 +307,7 @@ mod tests {
         assert!(validate_gqa(24, 5, 256).is_err());
         assert!(validate_gqa(24, 4, 64).is_err());
         assert!(validate_gdn(0, 48, 4).is_err());
+        assert!(validate_gdn(16, 0, 4).is_err());
         assert!(validate_gdn(16, 48, 3).is_err());
         assert!(validate_hidden(0, 248_320).is_err());
         assert!(validate_hidden(5120, 248_321).is_err());

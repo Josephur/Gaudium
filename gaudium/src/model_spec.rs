@@ -590,11 +590,11 @@ impl ModelSpec {
                     .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
                 validate_gemma4_kv_share(self.n_layers, g4.kv_shared)
                     .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
-                if g4.has_audio && !g4.unified && g4.a_left > 0 {
+                if g4.has_audio && !g4.unified {
                     validate_gemma4_audio_ctx(g4.a_left, g4.a_right)
                         .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
                 }
-                if self.has_vision && !g4.unified && g4.v_heads > 0 {
+                if self.has_vision && !g4.unified {
                     validate_gemma4_vision_heads(g4.v_heads, g4.v_head_dim, g4.v_hidden)
                         .map_err(|e| SpecError::InvalidDims(format!("{e:?}")))?;
                 }
@@ -736,5 +736,39 @@ mod tests {
         assert_eq!(g.family, ModelFamily::Gemma4);
         assert!(g.gemma4.as_ref().unwrap().k_eq_v);
         g.validate().unwrap();
+
+        let g4_bad_audio = r#"{
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536, "intermediate_size": 6144, "vocab_size": 262144,
+                "num_hidden_layers": 35, "num_attention_heads": 8, "num_key_value_heads": 1,
+                "head_dim": 256, "global_head_dim": 512, "num_global_key_value_heads": 1,
+                "sliding_window": 512, "attention_k_eq_v": false
+            },
+            "audio_config": {"attention_context_left": 0, "attention_context_right": 1}
+        }"#;
+        assert!(ModelSpec::from_config_json(g4_bad_audio)
+            .unwrap()
+            .validate()
+            .is_err());
+
+        let g4_bad_vision = r#"{
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536, "intermediate_size": 6144, "vocab_size": 262144,
+                "num_hidden_layers": 35, "num_attention_heads": 8, "num_key_value_heads": 1,
+                "head_dim": 256, "global_head_dim": 512, "num_global_key_value_heads": 1,
+                "sliding_window": 512, "attention_k_eq_v": false
+            },
+            "vision_config": {"num_attention_heads": 0, "head_dim": 72, "hidden_size": 1152}
+        }"#;
+        assert!(ModelSpec::from_config_json(g4_bad_vision)
+            .unwrap()
+            .validate()
+            .is_err());
     }
 }

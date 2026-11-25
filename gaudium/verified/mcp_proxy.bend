@@ -1221,7 +1221,8 @@ def px_resp_framing_dropped():
 # 9. Size and Time Caps
 # ============================================================================
 
-# A megabyte count as bytes (saturating).
+# A megabyte count as bytes (`None` past 64 bits).
+# rusty-bends: total
 def px_cap_bytes(mb: Nat) -> Nat:
   Nat.mul(Nat.mul(mb, 1024n), 1024n)
 

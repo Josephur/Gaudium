@@ -5,11 +5,11 @@
 
 use crate::verified::{
     be_is_card_released, dev_can_alloc, dev_can_dma, dev_can_launch, dev_drain, dev_step,
-    lane_can_admit, recipe_bind_ws, recipe_can_launch, recipe_step, req_cancel, req_is_terminal,
-    req_step, router_can_switch, slot_begin_fill, slot_begin_retire, slot_is_readable,
-    slot_is_writable, slot_mark_loaded, slot_publish, slot_quiesce, slot_rollback_retire,
-    slot_set_retire_epoch, BackendState, DevEvent, DevState, RecipeEvent, RecipeState, ReqEvent,
-    ReqState, SlotState,
+    lane_can_admit, recipe_bind_shared_ws, recipe_bind_ws, recipe_can_launch, recipe_step,
+    req_cancel, req_is_terminal, req_step, router_can_switch, slot_begin_fill, slot_begin_retire,
+    slot_is_readable, slot_is_writable, slot_mark_loaded, slot_publish, slot_quiesce,
+    slot_rollback_retire, slot_set_retire_epoch, BackendState, DevEvent, DevState, RecipeEvent,
+    RecipeState, ReqEvent, ReqState, SlotState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +127,20 @@ impl RecipeGuard {
         let next = recipe_bind_ws(self.state, fits_shared, alloc_sealed);
         self.state = next;
         if next == RecipeState::RecWsFailed {
+            Err(LifecycleError::RecipeWorkspaceFailed { ws_need, pool_size })
+        } else {
+            Ok(next)
+        }
+    }
+
+    pub fn bind_shared_workspace(
+        &mut self,
+        ws_need: u64,
+        pool_size: u64,
+    ) -> Result<RecipeState, LifecycleError> {
+        let next = recipe_bind_shared_ws(self.state, ws_need, pool_size);
+        self.state = next;
+        if !recipe_can_launch(next) {
             Err(LifecycleError::RecipeWorkspaceFailed { ws_need, pool_size })
         } else {
             Ok(next)
@@ -381,6 +395,21 @@ mod tests {
         assert!(rec_ok.check_launch().is_ok());
         rec_ok.destroy();
         assert!(rec_ok.check_launch().is_err());
+
+        let mut shared_over = RecipeGuard::new();
+        shared_over.compile();
+        assert!(shared_over
+            .bind_shared_workspace(700_000_000, 640_000_000)
+            .is_err());
+        assert_eq!(shared_over.state(), RecipeState::RecWsFailed);
+        assert!(shared_over.check_launch().is_err());
+
+        let mut shared_ok = RecipeGuard::new();
+        shared_ok.compile();
+        shared_ok
+            .bind_shared_workspace(640_000_000, 640_000_000)
+            .unwrap();
+        assert!(shared_ok.check_launch().is_ok());
     }
 
     #[test]

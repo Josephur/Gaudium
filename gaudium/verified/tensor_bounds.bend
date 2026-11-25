@@ -164,8 +164,11 @@ def gdn_dims_valid(+k_heads: Nat, +v_heads: Nat, conv_k: Nat) -> Bool:
   Bool.and(
     Nat.is_gt(k_heads, 0n),
     Bool.and(
-      Nat.is_le(v_heads, 64n),
-      Bool.and(Nat.is_eq(Nat.mod(v_heads, k_heads), 0n), Nat.is_eq(conv_k, 4n))
+      Nat.is_gt(v_heads, 0n),
+      Bool.and(
+        Nat.is_le(v_heads, 64n),
+        Bool.and(Nat.is_eq(Nat.mod(v_heads, k_heads), 0n), Nat.is_eq(conv_k, 4n))
+      )
     )
   )
 
@@ -327,6 +330,19 @@ law gdn_zero_k_rejected:
 
 def gdn_zero_k_rejected(vh, ck):
   {==}
+
+# LAW TN.19: Zero DeltaNet value head count is ALWAYS rejected.
+# promise: zero DeltaNet value head count is always rejected
+# catches: Nat.is_gt(v_heads, 0n) check omitted from gdn_dims_valid
+law gdn_zero_v_heads_rejected:
+  for +k: Nat
+  for ck: Nat
+  {gdn_dims_valid(k, 0n, ck) == False{} : Bool}
+
+def gdn_zero_v_heads_rejected(k, ck):
+  match k:
+    case 0n: {==}
+    case 1n+_: {==}
 
 # LAW TN.6: Zero hidden size is ALWAYS rejected.
 law hidden_zero_rejected:

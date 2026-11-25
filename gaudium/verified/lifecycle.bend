@@ -199,6 +199,36 @@ def recipe_bind_ws(s: RecipeState, fits_shared: Bool, alloc_sealed: Bool) -> Rec
     case other:
       other
 
+def recipe_bind_shared_ws_if(ws_fits: Bool) -> RecipeState:
+  match ws_fits:
+    case True{}:
+      RecWsBound{}
+    case False{}:
+      RecWsFailed{}
+
+def recipe_bind_shared_ws(s: RecipeState, ws_need: Nat, pool_size: Nat) -> RecipeState:
+  match s:
+    case RecCompiled{}:
+      recipe_bind_shared_ws_if(Nat.is_le(ws_need, pool_size))
+    case other:
+      other
+
+def rec_le_add_gt_false(+p: Nat, extra: Nat) -> {False{} == Nat.is_le(Nat.add(p, 1n+extra), p) : Bool}:
+  match p:
+    case 0n:
+      {==}
+    case 1n+pp:
+      rec_le_add_gt_false(pp, extra)
+
+def rec_le_add_r(+a: Nat, b: Nat) -> {True{} == Nat.is_le(a, Nat.add(a, b)) : Bool}:
+  match a:
+    case 0n:
+      match b:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+ap:
+      rec_le_add_r(ap, b)
+
 def recipe_can_launch(s: RecipeState) -> Bool:
   match s:
     case RecWsBound{}:
@@ -211,6 +241,41 @@ law recipe_ws_fail_never_launches:
   {recipe_can_launch(RecWsFailed{}) == False{} : Bool}
 
 def recipe_ws_fail_never_launches():
+  {==}
+
+# LAW 2.4: Binding a compiled recipe to an undersized shared workspace fails and cannot launch.
+# promise: binding a compiled recipe whose workspace exceeds the shared pool transitions to RecWsFailed
+# catches: oversize check ignored so pre-seal shared bind accepts any workspace size
+law recipe_shared_ws_oversize_fails:
+  for +pool: Nat
+  for +extra: Nat
+  {recipe_bind_shared_ws(RecCompiled{}, Nat.add(pool, 1n+extra), pool) == RecWsFailed{} : RecipeState}
+
+def recipe_shared_ws_oversize_fails(pool, extra):
+  %rec_le_add_gt_false(pool, extra) : {recipe_bind_shared_ws_if(_) == RecWsFailed{} : RecipeState}
+  {==}
+
+# LAW 2.5: Binding a compiled recipe whose workspace fits in the shared pool binds for launch.
+# promise: a compiled recipe whose workspace requirement fits in the shared pool becomes launch-ready
+# catches: strict < used instead of <= so exact-fit shared workspace is rejected
+law recipe_shared_ws_fit_binds:
+  for +need: Nat
+  for +slack: Nat
+  {recipe_bind_shared_ws(RecCompiled{}, need, Nat.add(need, slack)) == RecWsBound{} : RecipeState}
+
+def recipe_shared_ws_fit_binds(need, slack):
+  %rec_le_add_r(need, slack) : {recipe_bind_shared_ws_if(_) == RecWsBound{} : RecipeState}
+  {==}
+
+# LAW 2.6: Binding shared workspace outside RecCompiled never makes uncompiled, failed, or destroyed recipes launchable.
+# promise: binding shared workspace on RecBuilding, RecWsFailed, or RecDestroyed never enables launch
+# catches: match arm on s dropped so uncompiled recipes transition to RecWsBound
+law recipe_shared_ws_uncompiled_cannot_launch:
+  for +ws_need: Nat
+  for +pool_size: Nat
+  {Bool.and(Bool.not(recipe_can_launch(recipe_bind_shared_ws(RecBuilding{}, ws_need, pool_size))), Bool.and(Bool.not(recipe_can_launch(recipe_bind_shared_ws(RecWsFailed{}, ws_need, pool_size))), Bool.not(recipe_can_launch(recipe_bind_shared_ws(RecDestroyed{}, ws_need, pool_size))))) == True{} : Bool}
+
+def recipe_shared_ws_uncompiled_cannot_launch(ws_need, pool_size):
   {==}
 
 # LAW 2.2: A destroyed recipe is absorbing across all events.

@@ -959,7 +959,7 @@ impl CompiledRecipe {
     pub fn bind_shared_workspace(&mut self, dev: &HpuDevice) -> Result<(), SynapseError> {
         let (pool_addr, pool_size) = dev.shared_workspace();
         self.guard
-            .bind_workspace(self.ws_size, pool_size, dev.is_sealed())
+            .bind_shared_workspace(self.ws_size, pool_size)
             .map_err(|e| {
                 SynapseError::Guard(format!("recipe {} workspace bind failed: {e:?}", self.name))
             })?;

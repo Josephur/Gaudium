@@ -20,9 +20,9 @@ pub fn type_counts(g: &Gguf) -> BTreeMap<&'static str, TypeCount> {
     let mut m: BTreeMap<&'static str, TypeCount> = BTreeMap::new();
     for t in g.tensors() {
         let c = m.entry(t.ty.name()).or_default();
-        c.tensors = v::gg_count_add(c.tensors, 1);
-        c.params = v::gg_count_add(c.params, t.n_elems);
-        c.bytes = v::gg_count_add(c.bytes, t.nbytes);
+        c.tensors = v::gg_count_add(c.tensors, 1).unwrap_or(u64::MAX);
+        c.params = v::gg_count_add(c.params, t.n_elems).unwrap_or(u64::MAX);
+        c.bytes = v::gg_count_add(c.bytes, t.nbytes).unwrap_or(u64::MAX);
     }
     m
 }
@@ -137,9 +137,9 @@ pub fn inspect(path: &Path) -> Result<String, GgufError> {
             c.bytes,
             if dec { "" } else { "  (no host decoder yet)" }
         );
-        total.tensors = v::gg_count_add(total.tensors, c.tensors);
-        total.params = v::gg_count_add(total.params, c.params);
-        total.bytes = v::gg_count_add(total.bytes, c.bytes);
+        total.tensors = v::gg_count_add(total.tensors, c.tensors).unwrap_or(u64::MAX);
+        total.params = v::gg_count_add(total.params, c.params).unwrap_or(u64::MAX);
+        total.bytes = v::gg_count_add(total.bytes, c.bytes).unwrap_or(u64::MAX);
     }
     let _ = writeln!(
         o,

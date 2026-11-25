@@ -343,9 +343,16 @@ pub struct RetrievedTensorDesc {
     pub dims: Vec<u64>,
 }
 
+use crate::verified::{lb_addr_valid, lb_pair_ok, lb_section_base, lb_ws_ok};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingViolation {
     UnboundTensor(String),
+    AddressBeforeSectionOffset {
+        tensor_name: String,
+        addr: u64,
+        offset_in_section: u64,
+    },
     MissingWorkspace {
         needed: u64,
     },
@@ -355,23 +362,32 @@ pub enum BindingViolation {
         second_section: u32,
         tensor_name: String,
     },
+    MismatchedSectionBase {
+        section: u32,
+        first_base: u64,
+        second_base: u64,
+        tensor_name: String,
+    },
     UnexpectedExtraBinding(String),
 }
 
 /// Pure host-testable checked-launch validator (`AGENTS.md` §8):
 ///   - Refuses any missing binding for a recipe's persistent tensors
 ///   - Refuses missing workspace when `ws_size > 0`
+///   - Refuses binding addresses below `offset_in_section` (prevents section-base underflow)
 ///   - Refuses binding one HBM address to two distinct persistent sections (`synLaunch` status 30)
+///     and refuses two tensors in the same persistent section resolving to different bases
 pub fn verify_launch_bindings(
     recipe_tensors: &[RetrievedTensorDesc],
     bindings: &BTreeMap<String, u64>,
     ws_size: u64,
     ws_addr: u64,
 ) -> Result<(), BindingViolation> {
-    if ws_size > 0 && ws_addr == 0 {
+    if !lb_ws_ok(ws_size, ws_addr) {
         return Err(BindingViolation::MissingWorkspace { needed: ws_size });
     }
-    let mut section_by_addr: BTreeMap<u64, u32> = BTreeMap::new();
+    let mut section_by_base: BTreeMap<u64, u32> = BTreeMap::new();
+    let mut base_by_section: BTreeMap<u32, u64> = BTreeMap::new();
     let mut known_names: BTreeSet<&str> = BTreeSet::new();
 
     for t in recipe_tensors {
@@ -379,13 +395,20 @@ pub fn verify_launch_bindings(
         let Some(&addr) = bindings.get(&t.name) else {
             return Err(BindingViolation::UnboundTensor(t.name.clone()));
         };
-        if addr == 0 {
-            return Err(BindingViolation::UnboundTensor(t.name.clone()));
+        if !lb_addr_valid(addr, t.offset_in_section) {
+            if addr == 0 {
+                return Err(BindingViolation::UnboundTensor(t.name.clone()));
+            }
+            return Err(BindingViolation::AddressBeforeSectionOffset {
+                tensor_name: t.name.clone(),
+                addr,
+                offset_in_section: t.offset_in_section,
+            });
         }
-        // Compute base section address (`addr - offset_in_section`) to detect aliasing across distinct sections
-        let sec_base = addr.saturating_sub(t.offset_in_section);
-        if let Some(&prev_sec) = section_by_addr.get(&sec_base) {
-            if prev_sec != t.section_id {
+        // Compute base section address (`addr - offset_in_section`) via verified helper.
+        let sec_base = lb_section_base(addr, t.offset_in_section);
+        if let Some(&prev_sec) = section_by_base.get(&sec_base) {
+            if !lb_pair_ok(prev_sec as u64, sec_base, t.section_id as u64, sec_base) {
                 return Err(BindingViolation::DuplicatePersistentSectionAddress {
                     addr: sec_base,
                     first_section: prev_sec,
@@ -394,7 +417,19 @@ pub fn verify_launch_bindings(
                 });
             }
         } else {
-            section_by_addr.insert(sec_base, t.section_id);
+            section_by_base.insert(sec_base, t.section_id);
+        }
+        if let Some(&prev_base) = base_by_section.get(&t.section_id) {
+            if !lb_pair_ok(t.section_id as u64, prev_base, t.section_id as u64, sec_base) {
+                return Err(BindingViolation::MismatchedSectionBase {
+                    section: t.section_id,
+                    first_base: prev_base,
+                    second_base: sec_base,
+                    tensor_name: t.name.clone(),
+                });
+            }
+        } else {
+            base_by_section.insert(t.section_id, sec_base);
         }
     }
 
@@ -776,8 +811,33 @@ mod tests {
         let mut aliased = ok_map.clone();
         aliased.insert("in_b".into(), 0x1000_0000);
         assert!(matches!(
-            verify_launch_bindings(&[t1, t2, t3], &aliased, 0, 0),
+            verify_launch_bindings(&[t1.clone(), t2.clone(), t3.clone()], &aliased, 0, 0),
             Err(BindingViolation::DuplicatePersistentSectionAddress { .. })
         ));
+
+        // Address smaller than offset_in_section is rejected instead of underflowing
+        let mut underflow = ok_map.clone();
+        underflow.insert("arena_slice".into(), 2048);
+        assert_eq!(
+            verify_launch_bindings(&[t1.clone(), t2.clone(), t3.clone()], &underflow, 0, 0),
+            Err(BindingViolation::AddressBeforeSectionOffset {
+                tensor_name: "arena_slice".into(),
+                addr: 2048,
+                offset_in_section: 4096,
+            })
+        );
+
+        // Same persistent section resolving to two different base addresses is rejected
+        let mut split_section = ok_map;
+        split_section.insert("arena_slice".into(), 0x3000_1000);
+        assert_eq!(
+            verify_launch_bindings(&[t1, t2, t3], &split_section, 0, 0),
+            Err(BindingViolation::MismatchedSectionBase {
+                section: 10,
+                first_base: 0x1000_0000,
+                second_base: 0x3000_0000,
+                tensor_name: "arena_slice".into(),
+            })
+        );
     }
 }

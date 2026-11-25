@@ -79,7 +79,8 @@ def gg_dim_ok(+acc: Nat, +d: Nat, +limit: Nat) -> Bool:
 def gg_dim_step(acc: Nat, d: Nat) -> Nat:
   Nat.mul(acc, d)
 
-# A sum of counts (tensors over the shards of a split model).
+# A sum of counts (tensors over the shards of a split model); `None` past 64 bits.
+# rusty-bends: total
 def gg_count_add(acc: Nat, n: Nat) -> Nat:
   Nat.add(acc, n)
 
