@@ -571,7 +571,7 @@ pub(super) struct LaneRt {
 /// slot count and chunk count, the launch with every slot at its narrow width; per slot count,
 /// the extra time of one slot at its wide width, with the launch that last measured it (an
 /// estimate not measured again for a while is dropped: the verified `ln_cost_kept`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WidthCosts {
     /// (slot count, chunk count, sampled) -> the narrow step's time.
     narrow_ms: HashMap<(u64, u64, bool), f64>,
@@ -579,16 +579,22 @@ struct WidthCosts {
     extra_ms: HashMap<(u64, bool), (f64, u64)>,
     /// Launches observed (the clock of `extra_ms`, the verified `ln_cost_clock_next`).
     launches: u64,
-    /// Slot steps of the session at the wide width, and in all; launches with a wide slot;
-    /// estimates dropped unmeasured; lane choices whose cost the K/V chunks their wide rows add
-    /// to the step raised, and of them the ones whose chunks were not measured (report only).
-    wide_slots: u64,
-    slots: u64,
-    wide_launches: u64,
-    session_launches: u64,
-    dropped: u64,
-    chunk_choices: std::cell::Cell<u64>,
-    chunk_unknown: std::cell::Cell<u64>,
+    /// The counts of the session report (report only; its steps are the verified `ln_wt_*`):
+    /// slot steps and wide ones, launches and ones with a wide slot, estimates dropped
+    /// unmeasured, lane choices whose cost the K/V chunks of their wide rows raised and the ones
+    /// of them kept narrow because those chunks were not measured.
+    tally: std::cell::Cell<crate::verified::WidthTally>,
+}
+
+impl Default for WidthCosts {
+    fn default() -> Self {
+        Self {
+            narrow_ms: HashMap::new(),
+            extra_ms: HashMap::new(),
+            launches: 0,
+            tally: std::cell::Cell::new(crate::verified::ln_wt_empty()),
+        }
+    }
 }
 
 impl WidthCosts {
@@ -618,10 +624,8 @@ impl WidthCosts {
         // arithmetic, where estimates then stand as before this rule)
         self.launches = ln_cost_clock_next(self.launches).unwrap_or(self.launches);
         let now = self.launches;
-        self.wide_slots += wide;
-        self.slots += b;
-        self.session_launches += 1;
-        self.wide_launches += u64::from(wide > 0);
+        self.tally
+            .set(crate::verified::ln_wt_launch(self.tally.get(), b, wide));
         let narrow = self.narrow(b, nch, sampled);
         if ln_cost_measures_narrow(wide) {
             let mut m = narrow;
@@ -636,7 +640,16 @@ impl WidthCosts {
         let before = self.extra_ms.len();
         self.extra_ms
             .retain(|_, &mut (_, at)| ln_cost_kept(now, at, Self::KEEP_LAUNCHES));
-        self.dropped += (before - self.extra_ms.len()) as u64;
+        let n = (before - self.extra_ms.len()) as u64;
+        self.tally
+            .set(crate::verified::ln_wt_dropped(self.tally.get(), n));
+    }
+
+    /// A lane choice whose cost the K/V chunks of its wide rows raised (`unmeasured`: those
+    /// chunks were not measured, so the lane stayed narrow), for the report.
+    fn note_chunk_choice(&self, unmeasured: bool) {
+        self.tally
+            .set(crate::verified::ln_wt_chunk(self.tally.get(), unmeasured));
     }
 
     /// The measured slot count whose extra time stands in for `b` slots of the readout kind
@@ -656,13 +669,18 @@ impl WidthCosts {
         })
     }
 
-    /// What the model holds, for the session report (and a fresh count of the slot steps).
+    /// What the model holds, for the session report (and fresh counts for the next one).
     fn report(&mut self) -> Option<String> {
-        if self.wide_slots == 0
-            && self.extra_ms.is_empty()
-            && self.dropped == 0
-            && self.chunk_choices.get() == 0
-        {
+        let crate::verified::WidthTally::WidthTally(
+            slots,
+            wide_slots,
+            launches,
+            wide_launches,
+            dropped,
+            chunked,
+            unmeasured,
+        ) = self.tally.replace(crate::verified::ln_wt_empty());
+        if wide_slots == 0 && self.extra_ms.is_empty() && dropped == 0 && chunked == 0 {
             return None;
         }
         let mut bs: Vec<(u64, bool)> = self.extra_ms.keys().copied().collect();
@@ -680,22 +698,15 @@ impl WidthCosts {
             .collect();
         let line = format!(
             "[gaudium] lanes: widths: {} of {} slot steps wide, {} of {} launches with a wide slot, {} estimate(s) dropped unmeasured, {} choice(s) where added K/V chunks raised the cost ({} not measured: narrow); {}",
-            self.wide_slots,
-            self.slots,
-            self.wide_launches,
-            self.session_launches,
-            self.dropped,
-            self.chunk_choices.get(),
-            self.chunk_unknown.get(),
+            wide_slots,
+            slots,
+            wide_launches,
+            launches,
+            dropped,
+            chunked,
+            unmeasured,
             per_b.join("; ")
         );
-        self.wide_slots = 0;
-        self.slots = 0;
-        self.wide_launches = 0;
-        self.session_launches = 0;
-        self.dropped = 0;
-        self.chunk_choices.set(0);
-        self.chunk_unknown.set(0);
         Some(line)
     }
 
@@ -2031,11 +2042,8 @@ fn lane_rows_of(
                 let cost = crate::core::lanes::wide_cost(milli(extra), nch, nch_wide, chunk);
                 // (report only: the cost differs from the wide slot's alone when chunks count)
                 if cost != crate::core::lanes::wide_cost(milli(extra), nch, nch, None) {
-                    let w = &rt.widths;
-                    w.chunk_choices.set(w.chunk_choices.get() + 1);
-                    if cost == Some(crate::verified::WideCost::WcUnknown) {
-                        w.chunk_unknown.set(w.chunk_unknown.get() + 1);
-                    }
+                    rt.widths
+                        .note_chunk_choice(cost == Some(crate::verified::WideCost::WcUnknown));
                 }
                 crate::core::lanes::lane_goes_wide(gain, cost, total, milli(t0))
             });

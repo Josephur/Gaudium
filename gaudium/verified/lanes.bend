@@ -2734,3 +2734,164 @@ law ln_tally_kept_never_drops:
 
 def ln_tally_kept_never_drops(k, r, e):
   L.nat_add_le_r(k, ln_step_kept(r, e))
+
+# ============================================================================
+# 16. The width model's report
+# ============================================================================
+#
+# With `--verbose` a lane session reports what its width choices did: its slot steps, and of
+# them the wide ones; its launches, and of them the ones with a wide slot; the extra-time
+# estimates dropped unmeasured; the lane choices whose cost the K/V chunks of their wide rows
+# raised, and of them the ones kept narrow because those chunks were not measured. Each report
+# starts the counts again.
+
+type WidthTally is Data:
+  WidthTally{slots: Nat, wide_slots: Nat, launches: Nat, wide_launches: Nat, dropped: Nat, chunked: Nat, unmeasured: Nat}
+
+# The counts of a report that has seen nothing yet.
+def ln_wt_empty() -> WidthTally:
+  WidthTally{0n, 0n, 0n, 0n, 0n, 0n, 0n}
+
+# The counts after one more launch of `b` slots, `wide` of them at their wide width.
+def ln_wt_launch(t: WidthTally, +b: Nat, +wide: Nat) -> WidthTally:
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      WidthTally{Nat.add(s, b), Nat.add(w, Nat.min(wide, b)), Nat.add(l, 1n), Nat.add(wl, Nat.min(wide, 1n)), d, c, u}
+
+# The counts after `n` more extra-time estimates were dropped unmeasured.
+def ln_wt_dropped(t: WidthTally, n: Nat) -> WidthTally:
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      WidthTally{s, w, l, wl, Nat.add(d, n), c, u}
+
+def ln_wt_bit(b: Bool) -> Nat:
+  match b:
+    case True{}:
+      1n
+    case False{}:
+      0n
+
+# The counts after one more lane choice whose cost the K/V chunks of its wide rows raised
+# (`unmeasured`: those chunks were not measured, so the lane stayed narrow).
+def ln_wt_chunk(t: WidthTally, unmeasured: Bool) -> WidthTally:
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      WidthTally{s, w, l, wl, d, Nat.add(c, 1n), Nat.add(u, ln_wt_bit(unmeasured))}
+
+# Do the counts hold together? No more wide slot steps than slot steps, launches with a wide slot
+# than launches, chunk choices kept narrow unmeasured than chunk choices.
+def ln_wt_sound(t: WidthTally) -> Bool:
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      Bool.and(Nat.is_le(w, s), Bool.and(Nat.is_le(wl, l), Nat.is_le(u, c)))
+
+def ln_wt_launches_of(t: WidthTally) -> Nat:
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      l
+
+def ln_wt_dropped_of(t: WidthTally) -> Nat:
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      d
+
+def ln_and3_imp(a: Bool, b: Bool, c: Bool, a2: Bool, b2: Bool, c2: Bool, ha: {Bool.or(Bool.not(a), a2) == True{} : Bool}, hb: {Bool.or(Bool.not(b), b2) == True{} : Bool}, hc: {Bool.or(Bool.not(c), c2) == True{} : Bool}) -> {Bool.or(Bool.not(Bool.and(a, Bool.and(b, c))), Bool.and(a2, Bool.and(b2, c2))) == True{} : Bool}:
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      match b:
+        case False{}:
+          {==}
+        case True{}:
+          match c:
+            case False{}:
+              {==}
+            case True{}:
+              match a2:
+                case False{}:
+                  L.bool_absurd({False{} == True{} : Bool}, ha)
+                case True{}:
+                  match b2:
+                    case False{}:
+                      L.bool_absurd({False{} == True{} : Bool}, hb)
+                    case True{}:
+                      match c2:
+                        case False{}:
+                          L.bool_absurd({False{} == True{} : Bool}, hc)
+                        case True{}:
+                          {==}
+
+def ln_le_add_imp(x: Bool, +a: Nat, +b: Nat, +c: Nat, +d: Nat, h: {Nat.is_le(a, b) == x : Bool}, cd: {Nat.is_le(c, d) == True{} : Bool}) -> {Bool.or(Bool.not(x), Nat.is_le(Nat.add(a, c), Nat.add(b, d))) == True{} : Bool}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_add_le_mono(a, b, c, d, h, cd)
+
+def ln_wt_bit_le_one(m: Bool) -> {Nat.is_le(ln_wt_bit(m), 1n) == True{} : Bool}:
+  match m:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# promise: a width report starts with counts that hold together.
+law ln_wt_empty_sound:
+  {ln_wt_sound(ln_wt_empty()) == True{} : Bool}
+
+def ln_wt_empty_sound():
+  {==}
+
+# promise: a launch never leaves the width report with more wide slot steps than slot steps, or more launches with a wide slot than launches.
+law ln_wt_launch_sound:
+  for t: WidthTally
+  for +b: Nat
+  for +k: Nat
+  {Bool.or(Bool.not(ln_wt_sound(t)), ln_wt_sound(ln_wt_launch(t, b, k))) == True{} : Bool}
+
+def ln_wt_launch_aux(+s: Nat, +w: Nat, +l: Nat, +wl: Nat, +d: Nat, +c: Nat, +u: Nat, +b: Nat, +k: Nat) -> {Bool.or(Bool.not(ln_wt_sound(WidthTally{s, w, l, wl, d, c, u})), ln_wt_sound(ln_wt_launch(WidthTally{s, w, l, wl, d, c, u}, b, k))) == True{} : Bool}:
+  ln_and3_imp(Nat.is_le(w, s), Nat.is_le(wl, l), Nat.is_le(u, c), Nat.is_le(Nat.add(w, Nat.min(k, b)), Nat.add(s, b)), Nat.is_le(Nat.add(wl, Nat.min(k, 1n)), Nat.add(l, 1n)), Nat.is_le(u, c), ln_le_add_imp(Nat.is_le(w, s), w, s, Nat.min(k, b), b, {==}, L.nat_min_le_r(k, b)), ln_le_add_imp(Nat.is_le(wl, l), wl, l, Nat.min(k, 1n), 1n, {==}, L.nat_min_le_r(k, 1n)), ln_or_not_self(Nat.is_le(u, c)))
+
+def ln_wt_launch_sound(t, b, k):
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      ln_wt_launch_aux(s, w, l, wl, d, c, u, b, k)
+
+# promise: a chunk choice never leaves the width report with more choices kept narrow unmeasured than chunk choices.
+law ln_wt_chunk_sound:
+  for t: WidthTally
+  for +m: Bool
+  {Bool.or(Bool.not(ln_wt_sound(t)), ln_wt_sound(ln_wt_chunk(t, m))) == True{} : Bool}
+
+def ln_wt_chunk_aux(+s: Nat, +w: Nat, +l: Nat, +wl: Nat, +d: Nat, +c: Nat, +u: Nat, +m: Bool) -> {Bool.or(Bool.not(ln_wt_sound(WidthTally{s, w, l, wl, d, c, u})), ln_wt_sound(ln_wt_chunk(WidthTally{s, w, l, wl, d, c, u}, m))) == True{} : Bool}:
+  ln_and3_imp(Nat.is_le(w, s), Nat.is_le(wl, l), Nat.is_le(u, c), Nat.is_le(w, s), Nat.is_le(wl, l), Nat.is_le(Nat.add(u, ln_wt_bit(m)), Nat.add(c, 1n)), ln_or_not_self(Nat.is_le(w, s)), ln_or_not_self(Nat.is_le(wl, l)), ln_le_add_imp(Nat.is_le(u, c), u, c, ln_wt_bit(m), 1n, {==}, ln_wt_bit_le_one(m)))
+
+def ln_wt_chunk_sound(t, m):
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      ln_wt_chunk_aux(s, w, l, wl, d, c, u, m)
+
+# promise: every launch is counted in the width report.
+law ln_wt_launch_counted:
+  for t: WidthTally
+  for +b: Nat
+  for +k: Nat
+  {Nat.is_gt(ln_wt_launches_of(ln_wt_launch(t, b, k)), ln_wt_launches_of(t)) == True{} : Bool}
+
+def ln_wt_launch_counted(t, b, k):
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      %ln_gt_add_one(l) : {_ == True{} : Bool}
+      {==}
+
+# promise: the width report's count of dropped estimates never goes back within a report.
+law ln_wt_dropped_never_drops:
+  for t: WidthTally
+  for +n: Nat
+  {Nat.is_le(ln_wt_dropped_of(t), ln_wt_dropped_of(ln_wt_dropped(t, n))) == True{} : Bool}
+
+def ln_wt_dropped_never_drops(t, n):
+  match t:
+    case WidthTally{s, w, l, wl, d, c, u}:
+      L.nat_add_le_r(d, n)
