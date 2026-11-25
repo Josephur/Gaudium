@@ -83,6 +83,15 @@ d556bde2ff41c207  g4_heads_zero_kv_rejected  law g4_heads_zero_kv_rejected : for
 b92e3f940df9aed8  g4_kv_share_all_rejected  law g4_kv_share_all_rejected : for + nl : Nat for + extra : Nat { g4_kv_share_valid ( nl , Nat.add ( nl , extra ) ) == False { } : Bool }
 c53430ffbf275392  g4_ple_off_always_valid  law g4_ple_off_always_valid : for pv : Nat for v : Nat { g4_ple_valid ( 0n , pv , v ) == True { } : Bool }
 629829a88fd02c54  g4_rope_vecs_boundary  law g4_rope_vecs_boundary : { Bool.and ( Nat.is_eq ( g4_rope_vecs ( 0n ) , 0n ) , Nat.is_eq ( g4_rope_vecs ( 128n ) , 1n ) ) == True { } : Bool }
+fdd5c6e325f099b2  g4c_build_step_drafts_within  law g4c_build_step_drafts_within : for + t : Nat for + kd : Nat for + kmax : Nat for l : Bool for tp : Bool { Bool.and ( g4c_build_step ( t , kd , kmax , l , tp ) , Nat.is_lt ( kmax , kd ) ) == False { } : Bool }
+# promise g4c_build_step_drafts_within: --build-cache never asks for a drafter step that drafts more tokens than the widest width.
+# harm g4c_build_step_drafts_within: the off-card build would compile steps that draft past the drafter's planned width.
+473781154413afa6  g4c_build_step_has_rows  law g4c_build_step_has_rows : for + kd : Nat for + kmax : Nat for l : Bool for tp : Bool { g4c_build_step ( 0n , kd , kmax , l , tp ) == False { } : Bool }
+# promise g4c_build_step_has_rows: --build-cache never asks for a drafter step that verifies no rows.
+# harm g4c_build_step_has_rows: the off-card build would ask for a malformed step graph and fail.
+68da7df07d3cb466  g4c_build_step_rows_within  law g4c_build_step_rows_within : for + t : Nat for + kd : Nat for + kmax : Nat for l : Bool for tp : Bool { Bool.and ( g4c_build_step ( t , kd , kmax , l , tp ) , Nat.is_lt ( 1n + kmax , t ) ) == False { } : Bool }
+# promise g4c_build_step_rows_within: --build-cache never asks for a drafter step that verifies more rows than the widest width's step.
+# harm g4c_build_step_rows_within: the off-card build would compile steps wider than the speculative buffers are planned for.
 5a668aa3b7995174  g4u_block_after_rows_outside  law g4u_block_after_rows_outside : for + b : Nat for + k : Nat for + n : Nat for + a : Nat { g4u_overlaps ( Nat.add ( b , k ) , n , a , b ) == False { } : Bool }
 # promise g4u_block_after_rows_outside: an image block that starts at or after the end of some rows has no row among them.
 # harm g4u_block_after_rows_outside: a unit would count a later block as its own, and join or refuse tiles for no reason.
@@ -99,6 +108,9 @@ de08dc04d51a72a1  g4u_block_rows_inside  law g4u_block_rows_inside : for + s : N
 e45d92ed19b2ff9f  g4u_causal_tile_final  law g4u_causal_tile_final : for + e : Nat for u : Nat { g4u_final ( False { } , e , u ) == True { } : Bool }
 # promise g4u_causal_tile_final: a tile of a causal unit (no two-way image block) is always final, so the prefill always moves past it.
 # harm g4u_causal_tile_final: the small sizes' image prompts would be refused whenever an image crosses a tile boundary.
+5c7313fe327b0841  g4u_causal_unit_plain  law g4u_causal_unit_plain : for sl : Bool { g4u_layer_plain ( False { } , sl ) == True { } : Bool }
+# promise g4u_causal_unit_plain: every layer of a causal unit runs the causal recipe.
+# harm g4u_causal_unit_plain: a causal unit would run the image recipe, which reads an extension table only two-way units upload.
 18f7833d1bb58b1f  g4u_cross_into_block  law g4u_cross_into_block : for + i : Nat for + k : Nat for + e : Nat for + j : Nat { g4u_cross ( True { } , i , 1n + Nat.add ( i , k ) , 1n + Nat.add ( e , j ) , e ) == True { } : Bool }
 # promise g4u_cross_into_block: in a size whose image blocks attend both ways, a block that runs past a unit's last tile into a later tile always takes that tile into the unit.
 # harm g4u_cross_into_block: an image over a tile boundary would be refused although the plan holds the tiles it needs.
@@ -120,6 +132,12 @@ eab1cc3a920ceb27  g4u_cross_within_tiles  law g4u_cross_within_tiles : for b : B
 e8092380d5d2675c  g4u_fits_within_ring  law g4u_fits_within_ring : for + r : Nat for + w : Nat for + n : Nat { Bool.and ( g4u_fits ( r , w , n ) , Nat.is_lt ( 1n + r , Nat.add ( n , w ) ) ) == False { } : Bool }
 # promise g4u_fits_within_ring: a prefill unit the ring is said to fit keeps its rows and the window of its first row inside the ring (rows + window <= ring + 1).
 # harm g4u_fits_within_ring: a later tile's keys would overwrite keys an earlier tile's rows still attend.
+3fc65d4a41fc388e  g4u_global_layer_plain  law g4u_global_layer_plain : for tw : Bool { g4u_layer_plain ( tw , False { } ) == True { } : Bool }
+# promise g4u_global_layer_plain: a global layer always runs the causal recipe, in every unit.
+# harm g4u_global_layer_plain: a global layer would read the sliding ring through the image recipe instead of its own cache.
+7e3ce2ba784c4d92  g4u_image_tile_embeds_image  law g4u_image_tile_embeds_image : { g4u_embed_image ( True { } ) == True { } : Bool }
+# promise g4u_image_tile_embeds_image: a prefill tile that holds image rows embeds them with the image recipe, which takes their soft tokens.
+# harm g4u_image_tile_embeds_image: the image rows would take the pad token's embedding and the image would be lost.
 cce1a244d6e57d79  g4u_join_within_buffers  law g4u_join_within_buffers : for c : Bool for + n : Nat for + m : Nat { Bool.and ( g4u_join ( c , n , m ) , Nat.is_le ( m , n ) ) == False { } : Bool }
 # promise g4u_join_within_buffers: a unit never takes a tile beyond the tile buffers the plan holds for it.
 b11d2e65e607d41e  g4u_joined_unit_two_way  law g4u_joined_unit_two_way : for b : Bool for + i : Nat for + n : Nat for + be : Nat for + e : Nat for + k : Nat { Bool.and ( g4u_cross ( b , i , n , be , e ) , Bool.not ( g4u_two_way ( b , Nat.add ( be , k ) ) ) ) == False { } : Bool }
@@ -131,7 +149,7 @@ b11d2e65e607d41e  g4u_joined_unit_two_way  law g4u_joined_unit_two_way : for b :
 # promise g4u_tile_chunks_at_least_one: a prefill tile reads at least one chunk of the global caches.
 # harm g4u_tile_chunks_at_least_one: a global layer would attend no keys at all.
 d9b637b7065aada4  g4u_tile_chunks_cover  law g4u_tile_chunks_cover : for + e : Nat for + cp : Nat for + mp : Nat { Bool.and ( Nat.is_le ( e , Nat.mul ( 1n + cp , 1n + mp ) ) , Nat.is_lt ( Nat.mul ( g4u_tile_chunks ( e , 1n + cp , 1n + mp ) , 1n + cp ) , e ) ) == False { } : Bool }
-# promise g4u_tile_chunks_cover: a prefill tile whose rows fit the global caches reads every chunk that holds the keys before its last row.
+# promise g4u_tile_chunks_cover: a prefill tile whose rows fit the global caches reads every chunk that holds the keys up to its last row.
 # harm g4u_tile_chunks_cover: a global layer would miss the keys of the chunks it does not read.
 25d528961b344629  g4u_tile_chunks_within_cache  law g4u_tile_chunks_within_cache : for + e : Nat for + c : Nat for + mp : Nat { Nat.is_le ( g4u_tile_chunks ( e , c , 1n + mp ) , 1n + mp ) == True { } : Bool }
 # promise g4u_tile_chunks_within_cache: a prefill tile never reads more chunks than the global caches hold.
@@ -139,6 +157,9 @@ d9b637b7065aada4  g4u_tile_chunks_cover  law g4u_tile_chunks_cover : for + e : N
 8a14deb6f4f59b62  g4u_two_way_needs_bidir  law g4u_two_way_needs_bidir : for + be : Nat { g4u_two_way ( False { } , be ) == False { } : Bool }
 # promise g4u_two_way_needs_bidir: a size whose reference keeps image rows causal never runs a unit in the two-way form.
 # harm g4u_two_way_needs_bidir: its image rows would attend positions after their own, unlike the reference.
+578d1818f41dbcef  g4u_two_way_sliding_not_plain  law g4u_two_way_sliding_not_plain : { g4u_layer_plain ( True { } , True { } ) == False { } : Bool }
+# promise g4u_two_way_sliding_not_plain: a two-way unit never runs a sliding layer with the causal recipe.
+# harm g4u_two_way_sliding_not_plain: the unit's image rows would attend causally in that layer, unlike the reference.
 1392288440e916e0  g4u_two_way_with_block  law g4u_two_way_with_block : for + be : Nat { g4u_two_way ( True { } , 1n + be ) == True { } : Bool }
 # promise g4u_two_way_with_block: in a size whose image blocks attend both ways, a unit with an image block always runs the two-way form.
 # harm g4u_two_way_with_block: its image rows would attend causally, unlike the reference.
@@ -148,6 +169,9 @@ f6b30e6f9966fc4e  g4u_unit_tiles_at_least_one  law g4u_unit_tiles_at_least_one :
 # promise g4v_add_part_covers: adding a buffer to a plan grows its total by at least the buffer's bytes.
 09b284953e9e5a35  g4v_empty_width_refused  law g4v_empty_width_refused : { g4v_width_ok ( 0n ) == False { } : Bool }
 # promise g4v_empty_width_refused: an empty width is never taken by the row kernels.
+7fefa60feaa5847f  g4v_guarded_head_has_a_quarter  law g4v_guarded_head_has_a_quarter : for + nh : Nat for + dh : Nat for + hid : Nat { Bool.and ( g4_vision_heads_valid ( nh , dh , hid ) , Nat.is_lt ( g4v_rot_quarter ( dh ) , 1n ) ) == False { } : Bool }
+# promise g4v_guarded_head_has_a_quarter: a vision head that the head guard takes has at least one channel in each of its quarters, so the rotary frequency table is never empty.
+# harm g4v_guarded_head_has_a_quarter: the rotary tables would read a frequency from an empty table.
 ba9095e8dd5c8650  g4v_image_budget_within_model  law g4v_image_budget_within_model : for + m : Nat for + p : Nat for + k : Nat { Nat.is_le ( g4v_image_budget ( m , p , k ) , m ) == True { } : Bool }
 # promise g4v_image_budget_within_model: an image's soft-token budget never exceeds the checkpoint's own budget.
 b5e7132dadf28738  g4v_image_budget_within_tower  law g4v_image_budget_within_tower : for + m : Nat for + p : Nat for + kp : Nat { Nat.is_le ( Nat.mul ( g4v_image_budget ( m , p , 1n + kp ) , 1n + kp ) , p ) == True { } : Bool }
@@ -204,7 +228,7 @@ bdfca062616ca300  g4v_pool_x_within  law g4v_pool_x_within : for + i : Nat for +
 # harm g4v_rope_pair_shares_freq: a pair would turn at two speeds, which is no rotation.
 749d384fd1436d55  g4v_rot_quarter_within  law g4v_rot_quarter_within : for + dh : Nat { Nat.is_le ( Nat.mul ( g4v_rot_quarter ( dh ) , 4n ) , dh ) == True { } : Bool }
 # promise g4v_rot_quarter_within: the four quarters of a head never reach past the head's channels.
-# harm g4v_rot_quarter_within: the rotate-half weight would place an entry past its row.
+# harm g4v_rot_quarter_within: a channel's rotate-half partner or frequency would lie outside the head.
 27ebc62bedf86c0e  g4v_rot_sign_flips  law g4v_rot_sign_flips : for + a : Nat for + j : Nat for + m : Nat { Bool.and ( Bool.xor ( g4v_rot_neg ( Nat.add ( Nat.mul ( a , Nat.add ( 1n + Nat.add ( j , m ) , 1n + Nat.add ( j , m ) ) ) , j ) , 1n + Nat.add ( j , m ) ) , g4v_rot_neg ( g4v_rot_src ( Nat.add ( Nat.mul ( a , Nat.add ( 1n + Nat.add ( j , m ) , 1n + Nat.add ( j , m ) ) ) , j ) , 1n + Nat.add ( j , m ) ) , 1n + Nat.add ( j , m ) ) ) , Bool.xor ( g4v_rot_neg ( Nat.add ( Nat.mul ( a , Nat.add ( 1n + Nat.add ( j , m ) , 1n + Nat.add ( j , m ) ) ) , Nat.add ( 1n + Nat.add ( j , m ) , j ) ) , 1n + Nat.add ( j , m ) ) , g4v_rot_neg ( g4v_rot_src ( Nat.add ( Nat.mul ( a , Nat.add ( 1n + Nat.add ( j , m ) , 1n + Nat.add ( j , m ) ) ) , Nat.add ( 1n + Nat.add ( j , m ) , j ) ) , 1n + Nat.add ( j , m ) ) , 1n + Nat.add ( j , m ) ) ) ) == True { } : Bool }
 # promise g4v_rot_sign_flips: of every rotate-half pair exactly one channel is taken negated, so the pair turns as a rotation.
 # harm g4v_rot_sign_flips: a pair would be scaled or reflected instead of rotated.
