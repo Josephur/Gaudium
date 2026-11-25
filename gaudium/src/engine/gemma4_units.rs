@@ -285,9 +285,11 @@ impl Gemma4Engine {
     fn embed_tile(&mut self, ids: &[i32], fidx: &[i32], tl: Tile, b: &TileBufs) -> Result<f64, String> {
         let (p0, t) = (tl.pos as usize, tl.t as usize);
         let text_col = ikv_feat_row(false, 0) as i32;
-        let has_img = tile_has_image(fidx, tl);
+        // The verified choice of embedding recipe decides both what is staged and what runs.
+        let rec = embed_recipe(tile_has_image(fidx, tl), tl.t);
+        let image_embed = matches!(rec, PfRecipe::Vis(VisRecipe::Embed, _));
         let t_rec = Instant::now();
-        self.ensure_pf(embed_recipe(has_img, tl.t))?;
+        self.ensure_pf(rec)?;
         let recipe_ms = t_rec.elapsed().as_secs_f64() * 1000.0;
         let pad = self.spec.gemma4.as_ref().map_or(0, |g| g.pad_id.max(0));
         {
@@ -310,7 +312,7 @@ impl Gemma4Engine {
         pool.insert("ids".into(), b.ids);
         pool.insert("x0".into(), b.x[0]);
         pool.insert("ple_out".into(), self.pf_ple);
-        if has_img {
+        if image_embed {
             let mut fb = Vec::with_capacity(t * 4);
             let mut kb = Vec::with_capacity(t * 2);
             let one = crate::fp8::f32_to_bf16_rne(1.0);
