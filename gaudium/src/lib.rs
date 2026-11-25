@@ -29,6 +29,7 @@ pub mod server;
 pub mod signals;
 pub mod synapse;
 pub mod tls;
+pub mod tls_cert;
 pub mod tokenizer;
 pub mod tree;
 pub mod vision;

@@ -1536,7 +1536,33 @@ fn start_tls(cfg: &ServerConfig) -> Result<Option<crate::tls::TlsServer>, String
     if let Some(Ok(version)) = &lib {
         eprintln!("[server] HTTPS on: {version}");
     }
+    if let Some(c) = cert {
+        log_cert_expiry(c);
+    }
     Ok(server.and_then(Result::ok))
+}
+
+/// Days before its end from which the start-up line warns that the certificate needs renewing.
+const CERT_RENEW_WARN_DAYS: i64 = 30;
+
+/// The start-up line on the end of the HTTPS certificate (reported only; the server serves the
+/// certificate it was given either way).
+fn log_cert_expiry(cert: &Path) {
+    let renew = "renew it (gaudium --make-cert <dir> --cert-overwrite, then restart)";
+    match crate::tls_cert::cert_file_expiry(cert) {
+        Ok((until, days)) if days < 0 => eprintln!(
+            "[server] WARNING: the HTTPS certificate {} has EXPIRED ({until}): browsers refuse it; {renew}",
+            cert.display()
+        ),
+        Ok((until, days)) if days < CERT_RENEW_WARN_DAYS => eprintln!(
+            "[server] WARNING: the HTTPS certificate {} ends in {days} days ({until}): {renew}",
+            cert.display()
+        ),
+        Ok((until, days)) => {
+            eprintln!("[server] HTTPS certificate valid until {until} ({days} days left)")
+        }
+        Err(e) => eprintln!("[server] HTTPS certificate: its end could not be read ({e})"),
+    }
 }
 
 /// Longest wait for a connection before the accept loop looks at the stop request again.

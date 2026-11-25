@@ -2459,6 +2459,58 @@ fn http_and_https_share_the_port() {
 }
 
 #[test]
+fn a_certificate_from_make_cert_serves_the_web_ui_over_https() {
+    use crate::tls_cert::{self, MakeCertOptions, CA_CERT, SERVER_CERT, SERVER_KEY};
+    if let Err(e) = crate::tls::availability() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("gaudium-make-cert-serve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    tls_cert::make_cert(&MakeCertOptions {
+        dir: dir.clone(),
+        names: tls_cert::parse_names("gaudium.example.lan").unwrap(),
+        days: tls_cert::DEFAULT_SERVER_DAYS,
+        overwrite: false,
+        ca_days: tls_cert::CA_DAYS,
+    })
+    .unwrap();
+    let server = crate::tls::TlsServer::new(&dir.join(SERVER_CERT), &dir.join(SERVER_KEY)).unwrap();
+    let h = net_harness(loopback_proxy(false), Some(server), None);
+    let addr = serve(&h.state, 8);
+    // a client that trusts only the authority, as a device that installed ca.crt
+    let client = crate::tls::TlsClient::new(Some(&dir.join(CA_CERT))).unwrap();
+    for name in ["localhost", "127.0.0.1", "gaudium.example.lan"] {
+        let (status, _, body) = tls_exchange(
+            &client,
+            addr,
+            name,
+            &format!("GET /props HTTP/1.1\r\nHost: {name}"),
+            "",
+        );
+        assert_eq!(status, 200, "{name}");
+        let props = json::parse_json(&body).unwrap();
+        assert_eq!(at(&props, &["cors_proxy_enabled"]).as_bool(), Some(true), "{name}");
+    }
+    // curl with only the authority as its trust store, when curl is here
+    let curl = std::process::Command::new("curl")
+        .args(["--silent", "--show-error", "--max-time", "10", "--cacert"])
+        .arg(dir.join(CA_CERT))
+        .arg(format!("https://localhost:{}/health", addr.port()))
+        .output();
+    match curl {
+        Ok(out) => assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "{\"status\":\"ok\"}",
+            "curl: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => eprintln!("skipped the curl check: curl is not available ({e})"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_tls_client_gets_no_http_answer_from_a_server_without_a_certificate() {
     let Some(tc) = crate::tls::test_util::test_cert(&["DNS:localhost"]) else {
         return;

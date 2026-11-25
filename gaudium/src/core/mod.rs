@@ -2,6 +2,7 @@
 
 pub mod a2ui;
 pub mod budget;
+pub mod cert;
 pub mod effort;
 pub mod gemma4;
 pub mod hbm;

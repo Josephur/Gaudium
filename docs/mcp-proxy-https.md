@@ -134,9 +134,97 @@ the start with the reason. The key file is read by the library: the server keeps
 and neither logs nor `/props` nor error messages hold key material.
 
 The certificate decides under which names a browser accepts the server: `localhost` for the same
-machine, the machine's name or address on the local network, a public DNS name. Getting one is
-not part of the server (a certificate from a public authority for a public name; a self-signed
-one or one from a private authority for local use).
+machine, the machine's name or address on the local network, a public DNS name. For a public
+name, use a certificate from a public authority (or a front end that ends TLS, below). For the
+local network, `gaudium --make-cert` makes one.
+
+At every start with a certificate the server logs its end date, and warns from 30 days before
+it ends.
+
+### A certificate for the local network: `--make-cert`
+
+```
+gaudium --make-cert /etc/gaudium/tls --cert-names gaudium.lan,192.168.1.20
+gaudium --serve ... --tls-cert /etc/gaudium/tls/server.crt --tls-key /etc/gaudium/tls/server.key
+```
+
+then open `https://gaudium.lan:8090/` (or the address) from any device that trusts the
+authority (below). The command runs on the host alone: no card, no server.
+
+It writes four files into the directory (made with mode 0700 when it does not exist):
+
+| File | What | Mode |
+|---|---|---|
+| `ca.crt` | A small local certificate authority: what each device trusts | 0644 |
+| `ca.key` | Its private key. It signs the server certificate and stays on this machine | 0600 |
+| `server.crt` | The server's certificate followed by the authority's (the chain `--tls-cert` takes) | 0644 |
+| `server.key` | The server's private key (`--tls-key`) | 0600 |
+
+Then it prints the server certificate's names, end date and SHA-256 fingerprint, the
+authority's name and fingerprint (a device shows it when the certificate is installed: compare
+the two), the flags to start the server with, and how to trust the authority.
+
+- **Names.** `--cert-names` takes host names and IPv4 or IPv6 addresses, comma separated;
+  `localhost`, `127.0.0.1` and `::1` are always in the certificate. Without `--cert-names` the
+  command takes this machine's host name and the address of its default route, and says which
+  ones it took. A name that looks public (not `.lan`, `.local`, `.home.arpa`, `.internal`, ...)
+  or a public address gets a note: a server reached from the internet under that name is better
+  served by a public certificate.
+- **Why an authority, not a self-signed server certificate.** A device trusts the authority once
+  and then accepts every server certificate it signs: a renewal or a new address needs nothing
+  on the devices. Browsers also refuse to use an authority's certificate as a server
+  certificate, so the two are separate.
+- **The authority is limited.** Its certificate carries name constraints: it may sign only for
+  the names it was made for (and names under them, such as `box.gaudium.lan` under
+  `gaudium.lan`), the loopback addresses and the local-network ranges (`10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `169.254.0.0/16`, `fc00::/7`,
+  `fe80::/10`), plus any other address it was made for. Whoever gets `ca.key` cannot make a
+  certificate the devices trust for any other site, on the clients that enforce name
+  constraints in an authority the person installed.
+- **Validity.** The server certificate is valid for 825 days by default and at most
+  (`--cert-days`; Apple's systems refuse a server certificate valid for longer), and never past
+  the authority's end. The authority is valid for 10 years. Both start 5 minutes before they are
+  made, for a device whose clock is a little behind.
+- **Keys.** EC P-256, signatures SHA-256. The system's OpenSSL 3 (`libcrypto.so.3`, loaded at
+  run time as for TLS) makes the keys and writes the key files itself, into files created with
+  mode 0600: no key passes through Gaudium's code, and no key is printed, logged or shown by the
+  server. Keep the directory out of any repository and any backup that others read.
+- **Nothing is overwritten unasked.** With `server.crt` or `server.key` already there the
+  command refuses, unless `--cert-overwrite` is given. The authority is never replaced, with or
+  without the flag. A directory with only one of `ca.crt` and `ca.key` is refused. Files are
+  written under temporary names and put in place only when the new certificate has been checked
+  as a client checks it (signature, validity, server purpose, the authority's name constraints,
+  every name). A replaced file is kept aside until all of them are in place: a run that fails
+  half way puts the old ones back, so a key and its certificate never come apart.
+
+**Later: a new address or name, or a renewal.** Run the same command with `--cert-overwrite`
+(and the new `--cert-names`), then restart the server: the authority stays, so the devices need
+nothing new. A name outside what the authority covers is refused with the reason; to add one,
+move `ca.crt` and `ca.key` away, run the command again (a new authority is made) and trust the
+new `ca.crt` on each device. A directory may also hold a root authority of your own (`ca.crt` and an
+unencrypted `ca.key`): the command then signs with it.
+
+### Trusting the authority on a device
+
+Copy `ca.crt` (only that file; never `ca.key`) to the device, check its SHA-256 fingerprint
+against the one `--make-cert` printed, and trust it:
+
+| Device, browser | Steps |
+|---|---|
+| Firefox (any system) | Settings, Privacy & Security, Certificates, View Certificates, Authorities, Import `ca.crt`, tick "Trust this CA to identify websites". Firefox keeps its own list |
+| Chrome, Edge on Linux | Settings, Privacy and security, Security, Manage certificates: import `ca.crt` as a trusted authority. Or `certutil -d sql:$HOME/.pki/nssdb -A -t C,, -n "Gaudium local CA" -i ca.crt` (package `libnss3-tools`; a new profile of Chrome 146 or later uses `$HOME/.local/share/pki/nssdb`) |
+| macOS (Safari, Chrome) | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.crt`, or open it in Keychain Access and set "Always Trust" |
+| Windows (Edge, Chrome) | `certutil -addstore -user Root ca.crt`, or open it and install it into "Trusted Root Certification Authorities" |
+| iPhone, iPad | Send `ca.crt` to the device (AirDrop, mail, Files) and open it; install the profile in Settings, General, VPN & Device Management; then turn it on in Settings, General, About, Certificate Trust Settings |
+| Android | Settings, Security, Encryption & credentials, Install a certificate, CA certificate, pick `ca.crt` |
+
+A browser that was open while the authority was installed may need a restart. Until a device
+trusts the authority, it shows a warning page for the server.
+
+Opened over HTTPS, the Web UI is a secure context on every device: the microphone and the
+clipboard work, and its requests stay on the page's own origin (all paths are relative). An MCP
+server with a plain-http address is reached through the proxy (`--mcp-proxy`, above), since the
+browser does not let an HTTPS page call it directly.
 
 ### Behind a front end that ends TLS
 

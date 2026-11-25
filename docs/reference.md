@@ -60,6 +60,10 @@ Usage:
                                             Remove the least recently used recipes of the
                                             recipe cache until it fits N GiB (host only;
                                             safe beside a server using the directory)
+  gaudium --make-cert <dir> [options]       Make the server's HTTPS certificate (host only): a
+                                            local certificate authority, made once and trusted
+                                            once on each device, and a server certificate
+                                            signed by it, for --tls-cert and --tls-key
   gaudium --fp8-pack --model <dir> --fp8-cache <dir>
                                             Quantise a Gemma 4 BF16 checkpoint's matrices into an
                                             FP8 cache directory (host only, no card)
@@ -607,6 +611,24 @@ each cache hit sets the sidecar's modification time, so recency needs no access 
   --cache-keep-days <D> Entries used within D days stay even over the budget (default: 1;
                         an entry dated ahead of the clock counts as just used)
   --dry-run             Print what would be freed, remove nothing
+
+Certificate options (--make-cert <dir>: writes ca.crt and ca.key, the authority, when the
+directory has neither of them, and server.crt (the chain) and server.key, signed by it; the
+keys get mode 0600 and no file is replaced without --cert-overwrite; prints the SHA-256
+fingerprints and how to trust ca.crt on each kind of device; docs/mcp-proxy-https.md):
+  --cert-names <list>   Names and addresses the Web UI is opened by, comma separated
+                        (repeatable): host names (gaudium.lan) and IPv4 or IPv6 addresses.
+                        localhost, 127.0.0.1 and ::1 are always added. Default: this
+                        machine's host name and the address of its default route. A new
+                        authority may sign only for these names (and names under them),
+                        loopback and local-network addresses
+  --cert-days <N>       Days the server certificate is valid (default and most: 825, the
+                        longest Apple's systems accept; never past the end of the
+                        authority, which is valid for 10 years)
+  --cert-overwrite      Replace the server certificate and key that are there (a new name
+                        or address, or a renewal). The authority is never replaced: for a
+                        name it does not cover, move ca.crt and ca.key away to make a new
+                        one, and trust it again on each device
 
 Vision suite options (a row = one model and one method of the suite file; per row the
 text request, every image case and the text request again, greedy and seeded sampled,
