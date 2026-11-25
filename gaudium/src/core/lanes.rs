@@ -351,7 +351,12 @@ pub fn lane_ring_rows(narrow: u64, wide: u64, replay: bool) -> u64 {
 /// arithmetic): its wide slot's `extra` and, when its wide rows take the step from the `nch`
 /// chunks of its narrow step to `nch_wide`, the extra time of the narrow step at `nch_wide`
 /// (`chunk`; `None`: not measured).
-pub fn wide_cost(extra: u64, nch: u64, nch_wide: u64, chunk: Option<u64>) -> Option<crate::verified::WideCost> {
+pub fn wide_cost(
+    extra: u64,
+    nch: u64,
+    nch_wide: u64,
+    chunk: Option<u64>,
+) -> Option<crate::verified::WideCost> {
     crate::verified::ln_wide_cost(extra, nch, nch_wide, chunk.is_some(), chunk.unwrap_or(0))
 }
 
@@ -359,8 +364,15 @@ pub fn wide_cost(extra: u64, nch: u64, nch_wide: u64, chunk: Option<u64>) -> Opt
 /// in thousandths; `cost`: the step's extra time with it wide ([`wide_cost`]); `total` /
 /// `step`: the batch's expected tokens (thousandths) and its time (microseconds). A cost not
 /// known, and values too large for the arithmetic, keep the lane narrow.
-pub fn lane_goes_wide(gain: u64, cost: Option<crate::verified::WideCost>, total: u64, step: u64) -> bool {
-    cost.is_some_and(|c| crate::verified::ln_lane_goes_wide_at(gain, c, total, step).unwrap_or(false))
+pub fn lane_goes_wide(
+    gain: u64,
+    cost: Option<crate::verified::WideCost>,
+    total: u64,
+    step: u64,
+) -> bool {
+    cost.is_some_and(|c| {
+        crate::verified::ln_lane_goes_wide_at(gain, c, total, step).unwrap_or(false)
+    })
 }
 
 /// The widest draft width a lane is given, of the `narrow` and `wide` widths asked, when its
@@ -611,7 +623,10 @@ mod tests {
         // 8 rows verify 7 drafts; 4 tokens emitted keep 3 of them; a single-row step drafts none
         assert_eq!((ln_step_drafted(8), ln_step_kept(8, 4)), (7, 3));
         assert_eq!((ln_step_drafted(1), ln_step_kept(1, 1)), (0, 0));
-        assert_eq!((ln_tally_drafted(70, 16), ln_tally_kept(40, 16, 16)), (85, 55));
+        assert_eq!(
+            (ln_tally_drafted(70, 16), ln_tally_kept(40, 16, 16)),
+            (85, 55)
+        );
         // never more kept than verified, whatever the accept kernel reported
         assert_eq!(ln_step_kept(8, 12), 7);
     }
@@ -640,18 +655,43 @@ mod tests {
         assert!(!lane_goes_wide(500, at(1500), 30_000, 40_000));
         assert!(!lane_goes_wide(0, at(0), 30_000, 40_000));
         assert!(lane_goes_wide(1, at(0), 30_000, 40_000)); // a wide step that costs nothing more
-        assert!(!lane_goes_wide(u64::MAX, at(2), 1, u64::MAX)); // overflow keeps it narrow
+        // overflow keeps it narrow
+        assert!(!lane_goes_wide(u64::MAX, at(2), 1, u64::MAX));
         // a wide step that adds K/V chunks pays for them (today: their measured time on top),
         // and never goes wide into chunks not measured yet
-        assert!(lane_goes_wide(2000, wide_cost(1500, 2, 4, Some(0)), 30_000, 40_000));
-        assert!(!lane_goes_wide(2000, wide_cost(1500, 2, 4, Some(2500)), 30_000, 40_000));
-        assert!(!lane_goes_wide(2000, wide_cost(1500, 2, 4, None), 30_000, 40_000));
-        assert!(lane_goes_wide(2000, wide_cost(1500, 4, 4, None), 30_000, 40_000));
+        assert!(lane_goes_wide(
+            2000,
+            wide_cost(1500, 2, 4, Some(0)),
+            30_000,
+            40_000
+        ));
+        assert!(!lane_goes_wide(
+            2000,
+            wide_cost(1500, 2, 4, Some(2500)),
+            30_000,
+            40_000
+        ));
+        assert!(!lane_goes_wide(
+            2000,
+            wide_cost(1500, 2, 4, None),
+            30_000,
+            40_000
+        ));
+        assert!(lane_goes_wide(
+            2000,
+            wide_cost(1500, 4, 4, None),
+            30_000,
+            40_000
+        ));
         assert_eq!(
             wide_cost(1500, 2, 4, Some(2500)),
             Some(crate::verified::WideCost::WcKnown(4000))
         );
-        assert_eq!(wide_cost(u64::MAX, 2, 4, Some(1)), None, "overflow: not known");
+        assert_eq!(
+            wide_cost(u64::MAX, 2, 4, Some(1)),
+            None,
+            "overflow: not known"
+        );
         // the rows: wide only when chosen, inside the rings and the context
         assert_eq!(lane_step_rows(true, 8, 16, 16, 100, 32768), 16);
         assert_eq!(lane_step_rows(false, 8, 16, 16, 100, 32768), 8);
