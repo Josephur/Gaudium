@@ -889,3 +889,30 @@ law force_none_when_not_forced:
 
 def force_none_when_not_forced(r, c):
   {==}
+
+# promise: requiring a tool call when no tools are provided is always refused
+# catches: tool_choice_valid returns True for TcRequired when tools_given is False
+law tool_choice_required_needs_tools:
+  {tool_choice_valid(TcRequired{}, False{}) == False{} : Bool}
+
+def tool_choice_required_needs_tools():
+  {==}
+
+# promise: forcing a named tool when no tools are provided is always refused
+# catches: tool_choice_valid returns True for TcNamed when tools_given is False
+law tool_choice_named_needs_tools:
+  {tool_choice_valid(TcNamed{}, False{}) == False{} : Bool}
+
+def tool_choice_named_needs_tools():
+  {==}
+
+# LAW 5.5: hold_max preserves at least min(buf_len, tag_len - 1) bytes for partial tag matching.
+# promise: hold_max keeps at least min(b, t) bytes when the tag has length 1+t
+# catches: hold_max always returns 0n instead of holding partial tag prefixes
+law hold_max_keeps_partial_tag:
+  for +b: Nat
+  for +t: Nat
+  {Nat.is_le(Nat.min(b, t), hold_max(b, 1n+t)) == True{} : Bool}
+
+def hold_max_keeps_partial_tag(b, t):
+  Equal.sym(Bool, True{}, Nat.is_le(Nat.min(b, t), Nat.min(b, t)), tc_le_refl(Nat.min(b, t)))

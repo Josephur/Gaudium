@@ -355,3 +355,26 @@ law a2ui_prompt_empty_rejected:
 
 def a2ui_prompt_empty_rejected(c):
   {==}
+
+def a2_le_add_succ_false(+cap: Nat, +d: Nat) -> {Nat.is_le(Nat.add(cap, 1n+d), cap) == False{} : Bool}:
+  match cap:
+    case 0n: {==}
+    case 1n+cp:
+      a2_le_add_succ_false(cp, d)
+
+def a2_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW 5.6: A prompt file strictly larger than cap is always rejected by a2ui_prompt_size_ok.
+# promise: a2ui_prompt_size_ok rejects any prompt size strictly exceeding cap
+# catches: a2ui_prompt_size_ok drops Nat.is_le(len, cap) and accepts any non-empty prompt
+law a2ui_prompt_over_cap_rejected:
+  for +cap: Nat
+  for +d: Nat
+  {a2ui_prompt_size_ok(Nat.add(cap, 1n+d), cap) == False{} : Bool}
+
+def a2ui_prompt_over_cap_rejected(cap, d):
+  %Equal.sym(Bool, Nat.is_le(Nat.add(cap, 1n+d), cap), False{}, a2_le_add_succ_false(cap, d)) : {Bool.and(Nat.is_gt(Nat.add(cap, 1n+d), 0n), _) == False{} : Bool}
+  a2_and_false_r(Nat.is_gt(Nat.add(cap, 1n+d), 0n))

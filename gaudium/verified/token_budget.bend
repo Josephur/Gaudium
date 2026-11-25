@@ -392,3 +392,38 @@ law ctx_for_prompt_admits:
 
 def ctx_for_prompt_admits(p, extra):
   tb_lt_succ_add(p, extra)
+
+# LAW TB.12: Bounded requested max_new is never exceeded by effective_max_new.
+# promise: effective_max_new with req_unbounded=False never exceeds req_max_new
+# catches: effective_max_new returns prompt_room ignoring req_max_new
+law effective_max_new_respects_req:
+  for +req: Nat
+  for +p: Nat
+  for +lmax: Nat
+  {Nat.is_le(effective_max_new(False{}, req, p, lmax), req) == True{} : Bool}
+
+def effective_max_new_respects_req(req, p, lmax):
+  tb_min_le_l(req, prompt_room(p, lmax))
+
+# LAW TB.13: Clamped top_k NEVER exceeds the caller's requested top_k.
+# promise: clamp_top_k never exceeds the input top_k
+# catches: clamp_top_k returns vocab without clamping to top_k
+law clamp_top_k_within_input:
+  for +k: Nat
+  for +v: Nat
+  {Nat.is_le(clamp_top_k(k, v), k) == True{} : Bool}
+
+def clamp_top_k_within_input(k, v):
+  tb_min_le_l(k, v)
+
+# LAW TB.14: A method supporting sampling always admits both greedy and sampled requests.
+# promise: sampling_request_admitted returns True whenever method_can_sample is True
+# catches: sampling_request_admitted returns False when method_can_sample and wants_sampling are True
+law sampling_admitted_when_allowed:
+  for +wants: Bool
+  {sampling_request_admitted(True{}, wants) == True{} : Bool}
+
+def sampling_admitted_when_allowed(wants):
+  match wants:
+    case True{}: {==}
+    case False{}: {==}

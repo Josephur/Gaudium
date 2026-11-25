@@ -312,3 +312,41 @@ law mt_cli_no_chat_no_template:
 
 def mt_cli_no_chat_no_template(b):
   {==}
+
+def mt_eq_succ_add_false(+n: Nat, +d: Nat) -> {Nat.is_eq(Nat.add(n, 1n+d), n) == False{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+np:
+      mt_eq_succ_add_false(np, d)
+
+# promise: vocabulary validation rejects files with more token types than tokens
+# catches: mt_vocab_ok checks t >= n instead of t == n
+law mt_vocab_rejects_extra_types:
+  for +n: Nat
+  for +d: Nat
+  for lim: Nat
+  {mt_vocab_ok(n, Nat.add(n, 1n+d), lim) == False{} : Bool}
+
+def mt_vocab_rejects_extra_types(n, d, lim):
+  %Equal.sym(Bool, Nat.is_eq(Nat.add(n, 1n+d), n), False{}, mt_eq_succ_add_false(n, d)) : {Bool.and(Bool.and(Nat.is_gt(n, 0n), _), Nat.is_le(n, lim)) == False{} : Bool}
+  %Equal.sym(Bool, Bool.and(Nat.is_gt(n, 0n), False{}), False{}, mt_and_false_r(Nat.is_gt(n, 0n))) : {Bool.and(_, Nat.is_le(n, lim)) == False{} : Bool}
+  {==}
+
+def mt_eq_add_succ_false(+t: Nat, +d: Nat) -> {Nat.is_eq(t, Nat.add(t, 1n+d)) == False{} : Bool}:
+  match t:
+    case 0n: {==}
+    case 1n+tp:
+      mt_eq_add_succ_false(tp, d)
+
+# promise: vocabulary validation rejects files with fewer token types than tokens
+# catches: mt_vocab_ok checks t <= n instead of t == n
+law mt_vocab_rejects_missing_types:
+  for +t: Nat
+  for +d: Nat
+  for lim: Nat
+  {mt_vocab_ok(Nat.add(t, 1n+d), t, lim) == False{} : Bool}
+
+def mt_vocab_rejects_missing_types(t, d, lim):
+  %Equal.sym(Bool, Nat.is_eq(t, Nat.add(t, 1n+d)), False{}, mt_eq_add_succ_false(t, d)) : {Bool.and(Bool.and(Nat.is_gt(Nat.add(t, 1n+d), 0n), _), Nat.is_le(Nat.add(t, 1n+d), lim)) == False{} : Bool}
+  %Equal.sym(Bool, Bool.and(Nat.is_gt(Nat.add(t, 1n+d), 0n), False{}), False{}, mt_and_false_r(Nat.is_gt(Nat.add(t, 1n+d), 0n))) : {Bool.and(_, Nat.is_le(Nat.add(t, 1n+d), lim)) == False{} : Bool}
+  {==}
