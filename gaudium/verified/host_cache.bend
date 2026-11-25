@@ -20,6 +20,7 @@
 # (`hc_can_evict`) and the byte ledger are in `kv_pool.bend`, beside the rules they build on.
 
 import Base
+import nat_lemmas.bend as L
 
 # ============================================================================
 # 1. Helper Nat / Bool lemmas (erased before Rust codegen)
@@ -3439,3 +3440,109 @@ def hc_host_counted_within_read(k, n, b):
 
 # (That the store counts no host memory at all under an unread limit and an unnamed budget is
 # the same decision, and is left to the Rust tests for the same reason.)
+
+# LAW HC.157: Rounding a resume offset down to a whole tile never lands past resume_rows.
+# promise: hc_written_lo(r, 1+tp) * (1+tp) never exceeds r
+# catches: hc_written_lo adds tp to r like hc_written_hi instead of flooring
+law hc_written_lo_within_resume:
+  for +r: Nat
+  for +tp: Nat
+  {Nat.is_le(Nat.mul(hc_written_lo(r, 1n+tp), 1n+tp), r) == True{} : Bool}
+
+def hc_written_lo_within_resume(r, tp):
+  L.nat_align_down_le(r, tp)
+
+def hc_not_le_imp_lt(+a: Nat, +b: Nat, h: {Nat.is_le(a, b) == False{} : Bool}) -> {Nat.is_lt(b, a) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      L.bool_absurd_tf({Nat.is_lt(0n, 0n) == True{} : Bool}, h)
+    case 0n 1n+bp:
+      L.bool_absurd_tf({Nat.is_lt(1n+bp, 0n) == True{} : Bool}, h)
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      hc_not_le_imp_lt(ap, bp, h)
+
+def hc_lt_succ_le_add1(+b: Nat, +a: Nat, h: {Nat.is_lt(b, a) == True{} : Bool}) -> {Nat.is_le(Nat.add(b, 1n), a) == True{} : Bool}:
+  match b a:
+    case 0n 0n:
+      L.bool_absurd({Nat.is_le(1n, 0n) == True{} : Bool}, h)
+    case 0n 1n+ap:
+      hc_zero_le(ap)
+    case 1n+bp 0n:
+      L.bool_absurd({Nat.is_le(Nat.add(1n+bp, 1n), 0n) == True{} : Bool}, h)
+    case 1n+bp 1n+ap:
+      hc_lt_succ_le_add1(bp, ap, h)
+
+def hc_ceil_le_r(
+  +w: Nat,
+  +tp: Nat,
+  +q: Nat,
+  eqq: {q == Nat.div(Nat.add(w, tp), 1n+tp) : Nat},
+  hadd1: {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+tp), 1n), tp), Nat.add(w, tp)) == True{} : Bool}
+) -> {Nat.is_le(Nat.add(Nat.mul(q, 1n+tp), 1n+tp), Nat.add(Nat.mul(q, 1n+tp), Nat.mod(Nat.add(w, tp), 1n+tp))) == True{} : Bool}:
+  %L.nat_add_assoc(Nat.mul(q, 1n+tp), 1n, tp) : {Nat.is_le(_, Nat.add(Nat.mul(q, 1n+tp), Nat.mod(Nat.add(w, tp), 1n+tp))) == True{} : Bool}
+  %Equal.sym(Nat, q, Nat.div(Nat.add(w, tp), 1n+tp), eqq) : {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+tp), 1n), tp), Nat.add(Nat.mul(_, 1n+tp), Nat.mod(Nat.add(w, tp), 1n+tp))) == True{} : Bool}
+  %Equal.sym(Nat, Nat.add(Nat.mul(Nat.div(Nat.add(w, tp), 1n+tp), 1n+tp), Nat.mod(Nat.add(w, tp), 1n+tp)), Nat.add(w, tp), L.nat_div_mod_r(Nat.add(w, tp), tp)) : {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+tp), 1n), tp), _) == True{} : Bool}
+  hadd1
+
+def hc_ceil_le_aux(
+  +w: Nat,
+  +tp: Nat,
+  +q: Nat,
+  b: Bool,
+  eb: {b == Nat.is_le(w, Nat.mul(q, 1n+tp)) : Bool},
+  eqq: {q == Nat.div(Nat.add(w, tp), 1n+tp) : Nat}
+) -> {Nat.is_le(w, Nat.mul(q, 1n+tp)) == True{} : Bool}:
+  match b:
+    case True{}:
+      Equal.sym(Bool, True{}, Nat.is_le(w, Nat.mul(q, 1n+tp)), eb)
+    case False{}:
+      +x = Nat.mul(q, 1n+tp)
+      +hlt = hc_not_le_imp_lt(w, x, Equal.sym(Bool, False{}, Nat.is_le(w, x), eb))
+      +hsle = hc_lt_succ_le_add1(x, w, hlt)
+      +hadd1 = L.nat_add_le_mono(Nat.add(x, 1n), w, tp, tp, hsle, L.nat_le_refl(tp))
+      +hle_bad = hc_ceil_le_r(w, tp, q, eqq, hadd1)
+      +hlt_bad = L.nat_add_lt_l(x, Nat.mod(Nat.add(w, tp), 1n+tp), 1n+tp, L.nat_mod_lt(Nat.add(w, tp), tp))
+      Empty.absurd({Nat.is_le(w, x) == True{} : Bool}, L.nat_lt_not_le(Nat.add(x, Nat.mod(Nat.add(w, tp), 1n+tp)), Nat.add(x, 1n+tp), hlt_bad, hle_bad))
+
+# LAW HC.158: Rounding written_end up to whole tiles always covers every written row.
+# promise: hc_written_hi(w, 1+tp) * (1+tp) is always at least w
+# catches: hc_written_hi floors like hc_written_lo without adding Nat.sub(tile, 1n)
+law hc_written_hi_covers_end:
+  for +w: Nat
+  for +tp: Nat
+  {Nat.is_le(w, Nat.mul(hc_written_hi(w, 1n+tp), 1n+tp)) == True{} : Bool}
+
+def hc_written_hi_covers_end(w, tp):
+  %Equal.sym(Nat, Nat.sub(tp, 0n), tp, L.nat_sub_zero_r(tp)) : {Nat.is_le(w, Nat.mul(Nat.div(Nat.add(w, _), 1n+tp), 1n+tp)) == True{} : Bool}
+  +q = Nat.div(Nat.add(w, tp), 1n+tp)
+  hc_ceil_le_aux(w, tp, q, Nat.is_le(w, Nat.mul(q, 1n+tp)), {==}, {==})
+
+def hc_layout_eq_refl(a: Nat) -> {Nat.is_eq(a, a) == True{} : Bool}:
+  match a:
+    case 0n: {==}
+    case 1n+ap:
+      hc_layout_eq_refl(ap)
+
+def hc_layout_valid_aux(+ca: Nat, +ch: Nat, +k: Nat, +hd: Nat, +rb: Nat, +bp: Nat, +tp: Nat, etp: {1n+tp == Nat.mul(2n, 1n+bp) : Nat}) -> {hc_layout(1n+ca, 1n+ch, Nat.mul(1n+k, Nat.mul(2n, 1n+bp)), 1n+hd, 1n+rb, Nat.mul(2n, 1n+bp), 1n+bp, Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb)) == HcLayoutOk{} : HcLayout}:
+  %etp : {hc_layout_pick(True{}, Bool.and(Nat.is_eq(Nat.mod(Nat.mul(1n+k, _), _), 0n), Nat.is_eq(Nat.mod(Nat.mul(2n, 1n+bp), 1n+bp), 0n)), Nat.is_eq(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb), Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb))) == HcLayoutOk{} : HcLayout}
+  %Equal.sym(Nat, Nat.mod(Nat.mul(1n+k, 1n+tp), 1n+tp), 0n, L.nat_mod_mul(1n+k, tp)) : {hc_layout_pick(True{}, Bool.and(Nat.is_eq(_, 0n), Nat.is_eq(Nat.mod(Nat.mul(2n, 1n+bp), 1n+bp), 0n)), Nat.is_eq(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb), Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb))) == HcLayoutOk{} : HcLayout}
+  %Equal.sym(Nat, Nat.mod(Nat.mul(2n, 1n+bp), 1n+bp), 0n, L.nat_mod_mul(2n, bp)) : {hc_layout_pick(True{}, Bool.and(True{}, Nat.is_eq(_, 0n)), Nat.is_eq(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb), Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb))) == HcLayoutOk{} : HcLayout}
+  %Equal.sym(Bool, Nat.is_eq(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb), Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb)), True{}, hc_layout_eq_refl(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb))) : {hc_layout_pick(True{}, True{}, _) == HcLayoutOk{} : HcLayout}
+  {==}
+
+# LAW HC.159: A positive cache layout where tile divides chunk_rows, block divides tile, and cache_bytes matches exact dimensions is always accepted.
+# promise: hc_layout accepts any non-empty aligned layout whose cache_bytes equals chunks * heads * chunk_rows * row_bytes
+# catches: hc_layout checks Nat.mod(block, tile) instead of Nat.mod(tile, block) or rejects valid aligned layouts
+law hc_layout_valid_accepted:
+  for +ca: Nat
+  for +ch: Nat
+  for +k: Nat
+  for +hd: Nat
+  for +rb: Nat
+  for +bp: Nat
+  {hc_layout(1n+ca, 1n+ch, Nat.mul(1n+k, Nat.mul(2n, 1n+bp)), 1n+hd, 1n+rb, Nat.mul(2n, 1n+bp), 1n+bp, Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb)) == HcLayoutOk{} : HcLayout}
+
+def hc_layout_valid_accepted(ca, ch, k, hd, rb, bp):
+  hc_layout_valid_aux(ca, ch, k, hd, rb, bp, Nat.add(bp, Nat.add(1n+bp, 0n)), {==})

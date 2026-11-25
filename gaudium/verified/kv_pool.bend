@@ -739,3 +739,44 @@ law pool_free_within_capacity:
 def pool_free_within_capacity(a, f, rel):
   %pool_free_conserved(a, f, rel) : {Nat.is_le(pool_allocated(pool_free(PoolAcct{a, f}, rel)), _) == True{} : Bool}
   Equal.sym(Bool, True{}, Nat.is_le(pool_allocated(pool_free(PoolAcct{a, f}, rel)), pool_total(pool_free(PoolAcct{a, f}, rel))), kv_alloc_le_total(pool_free(PoolAcct{a, f}, rel)))
+
+def kv_bool_and_true_r(b: Bool) -> {Bool.and(b, True{}) == b : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+def kv_reuse_excl_mu(g: Bool, b: Bool, +pos: Nat, +mu: Nat, d: Bool) -> {Bool.and(Bool.and(g, Bool.and(b, Bool.and(Nat.is_le(pos, mu), d))), Nat.is_lt(mu, pos)) == False{} : Bool}:
+  match g:
+    case False{}: {==}
+    case True{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match d:
+            case False{}:
+              %Equal.sym(Bool, Bool.and(Nat.is_le(pos, mu), False{}), False{}, kv_bool_and_false_r(Nat.is_le(pos, mu))) : {Bool.and(_, Nat.is_lt(mu, pos)) == False{} : Bool}
+              {==}
+            case True{}:
+              %Equal.sym(Bool, Bool.and(Nat.is_le(pos, mu), True{}), Nat.is_le(pos, mu), kv_bool_and_true_r(Nat.is_le(pos, mu))) : {Bool.and(_, Nat.is_lt(mu, pos)) == False{} : Bool}
+              kv_le_lt_excl(pos, mu)
+
+# promise: with an MTP head that tracks kept rows, a resume point never lies beyond the rows the MTP head holds
+# catches: pfx_reuse_valid ignores need_mtp / mtp_upto when need_mtp is True
+law pfx_reuse_within_mtp_rows:
+  for +pos: Nat
+  for +lcp: Nat
+  for +p: Nat
+  for +tile: Nat
+  for +mu: Nat
+  for +nd: Bool
+  for +du: Nat
+  {Bool.and(pfx_reuse_valid(pos, lcp, p, tile, True{}, mu, nd, du), Nat.is_lt(mu, pos)) == False{} : Bool}
+
+def pfx_reuse_within_mtp_rows(pos, lcp, p, tile, mu, nd, du):
+  kv_reuse_excl_mu(
+    Bool.and(Nat.is_gt(pos, 0n), Bool.and(Nat.is_gt(tile, 0n), Nat.is_eq(Nat.mod(pos, tile), 0n))),
+    Bool.and(Nat.is_lt(pos, lcp), Nat.is_lt(pos, p)),
+    pos,
+    mu,
+    Bool.or(Bool.not(nd), Nat.is_le(pos, du))
+  )

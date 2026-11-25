@@ -2895,3 +2895,12 @@ def ln_wt_dropped_never_drops(t, n):
   match t:
     case WidthTally{s, w, l, wl, d, c, u}:
       L.nat_add_le_r(d, n)
+
+# promise: activation arena buffer sizing always rounds up to a multiple of 256 bytes
+# catches: ln_lane_buf_bytes returns Nat.max(bytes, 256n) without aligning to 256
+law ln_lane_buf_aligned_256:
+  for +b: Nat
+  {Nat.mod(ln_lane_buf_bytes(b), 256n) == 0n : Nat}
+
+def ln_lane_buf_aligned_256(b):
+  TB.align_up_is_multiple(Nat.max(b, 256n), 255n)
