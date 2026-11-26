@@ -1583,6 +1583,8 @@ f4ab99670b9bfde2  rr_end_ok_clears_unclean_and_keeps_held  law rr_end_ok_clears_
 # promise rr_end_ok_clears_unclean_and_keeps_held: rr_end_ok clears unclean and preserves kept dirty rows from before the request
 02cef989cf6e19a5  rr_end_ok_hw_covers_request  law rr_end_ok_hw_covers_request : for + m : RrMode for hw : Nat for + held : Nat for + u : Bool for + p : Nat for + g : Nat for + sl : Nat for + mc : Nat { Nat.is_le ( rr_high_water ( p , g , sl , mc ) , rr_state_hw ( rr_end_ok ( RrState { m , hw , held , u } , p , g , sl , mc ) ) ) == True { } : Bool }
 # promise rr_end_ok_hw_covers_request: after a successful request, kv_hw still covers every row that request wrote
+67af1d656e3d45e1  rr_end_ok_hw_within_ctx  law rr_end_ok_hw_within_ctx : for + m : RrMode for hw : Nat for + held : Nat for + u : Bool for + p : Nat for + g : Nat for + sl : Nat for + mc : Nat { Nat.is_le ( rr_state_hw ( rr_end_ok ( RrState { m , hw , held , u } , p , g , sl , mc ) ) , Nat.max ( held , mc ) ) == True { } : Bool }
+# promise rr_end_ok_hw_within_ctx: after a successful request, kv_hw stays within the larger of the rows held before it and max_ctx
 9036a753b443755f  rr_end_ok_mode_preserved  law rr_end_ok_mode_preserved : for + m : RrMode for hw : Nat for held : Nat for u : Bool for p : Nat for g : Nat for sl : Nat for mc : Nat { rr_state_mode ( rr_end_ok ( RrState { m , hw , held , u } , p , g , sl , mc ) ) == m : RrMode }
 # promise rr_end_ok_mode_preserved: rr_end_ok preserves the configured reset mode read back by rr_state_mode
 2e0a9223de61454e  rr_full_always_full  law rr_full_always_full : for + u : Bool { rr_scope ( RrModeFull { } , u ) == RrScopeFull { } : RrScope }
