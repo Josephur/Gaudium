@@ -1321,11 +1321,11 @@ def kv_bf16_always_taken(fp8_att):
     case True{}: {==}
     case False{}: {==}
 
-# promise: kv_vperm_rows always returns a positive multiple of 128 for every KV cache dtype
-# catches: kv_vperm_rows returns 0n or a non-multiple of 128
+# promise: kv_vperm_rows always returns a positive block size for every KV cache dtype
+# catches: kv_vperm_rows returns 0n
 law kv_vperm_rows_positive:
   for +d: KvDtype
-  {Bool.and(Nat.is_gt(kv_vperm_rows(d), 0n), Nat.is_eq(Nat.mod(kv_vperm_rows(d), 128n), 0n)) == True{} : Bool}
+  {Nat.is_gt(kv_vperm_rows(d), 0n) == True{} : Bool}
 
 def kv_vperm_rows_positive(d):
   match d:

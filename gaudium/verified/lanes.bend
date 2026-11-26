@@ -372,10 +372,14 @@ def ln_lane_pfx_bytes(per_lane: Nat, slot: Nat, n: Nat) -> Nat:
 def ln_lane_pfx_ask(wanted: Nat, n: Nat) -> Nat:
   Nat.mul(n, wanted)
 
-# Bytes the activation arena gives one buffer of the batched steps (`bytes`): at least 256,
-# rounded up to 256 (the arena's allocation unit).
+# Allocation unit (bytes) of the activation arena (`engine/qwen3.rs::suballoc`).
+def ln_arena_unit() -> Nat:
+  256n
+
+# Bytes the activation arena gives one buffer of the batched steps (`bytes`): at least one arena
+# unit, rounded up to a multiple of it.
 def ln_lane_buf_bytes(bytes: Nat) -> Nat:
-  TB.align_up(Nat.max(bytes, 256n), 256n)
+  TB.align_up(Nat.max(bytes, ln_arena_unit()), ln_arena_unit())
 
 # The total of the batched steps' buffers so far (`acc`), with one more buffer of `bytes`.
 def ln_lane_bufs_add(acc: Nat, bytes: Nat) -> Nat:
@@ -2896,11 +2900,11 @@ def ln_wt_dropped_never_drops(t, n):
     case WidthTally{s, w, l, wl, d, c, u}:
       L.nat_add_le_r(d, n)
 
-# promise: activation arena buffer sizing always rounds up to a multiple of 256 bytes
-# catches: ln_lane_buf_bytes returns Nat.max(bytes, 256n) without aligning to 256
-law ln_lane_buf_aligned_256:
+# promise: activation arena buffer sizing always rounds up to a multiple of ln_arena_unit()
+# catches: ln_lane_buf_bytes returns Nat.max(bytes, ln_arena_unit()) without aligning
+law ln_lane_buf_aligned:
   for +b: Nat
-  {Nat.mod(ln_lane_buf_bytes(b), 256n) == 0n : Nat}
+  {Nat.mod(ln_lane_buf_bytes(b), ln_arena_unit()) == 0n : Nat}
 
-def ln_lane_buf_aligned_256(b):
-  TB.align_up_is_multiple(Nat.max(b, 256n), 255n)
+def ln_lane_buf_aligned(b):
+  TB.align_up_is_multiple(Nat.max(b, ln_arena_unit()), 255n)

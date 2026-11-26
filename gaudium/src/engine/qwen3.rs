@@ -2246,9 +2246,10 @@ impl Qwen3Engine {
             .alloc_arena(act_bytes, HbmCat::CatScratch, "act_arena")
             .map_err(|e| format!("alloc act arena: {e}"))?;
 
+        let act_unit = crate::verified::ln_arena_unit();
         let suballoc = |arena: &mut HbmArena, bytes: u64| -> Result<u64, String> {
             let (addr, _off) = arena
-                .suballoc(bytes.max(256), 256)
+                .suballoc(bytes.max(act_unit), act_unit)
                 .map_err(|e| format!("arena suballoc: {e}"))?;
             Ok(addr)
         };

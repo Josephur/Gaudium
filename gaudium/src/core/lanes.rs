@@ -582,6 +582,7 @@ mod tests {
     #[test]
     fn the_batched_steps_buffers_as_the_arena_allocates_them() {
         use crate::verified::{ln_lane_buf_bytes, ln_lane_bufs_add, ln_lane_io_bytes};
+        assert_eq!(crate::verified::ln_arena_unit(), 256);
         assert_eq!(ln_lane_buf_bytes(1), 256);
         assert_eq!(ln_lane_buf_bytes(256), 256);
         assert_eq!(ln_lane_buf_bytes(257), 512);

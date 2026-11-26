@@ -77,17 +77,16 @@ def lb_underflow_addr_invalid(addr, extra):
     case 1n+ap:
       Equal.sym(Bool, False{}, Nat.is_le(Nat.add(1n+ap, 1n+extra), 1n+ap), lb_le_add_gt_false(1n+ap, extra))
 
-# LAW LB.3: Any non-zero HBM address at or above `offset_in_section` (including `addr == offset_in_section >= 1`) is valid.
-# promise: any positive address >= offset_in_section satisfies lb_addr_valid
-# catches: lb_addr_valid uses strict offset < addr instead of offset <= addr
+# LAW LB.3: Any non-zero HBM address at or above `offset_in_section` (including `offset == 0` and `addr == offset_in_section`) is valid.
+# promise: any positive address >= offset_in_section (including offset == 0 and offset == addr) satisfies lb_addr_valid
+# catches: lb_addr_valid checks offset > 0 instead of addr > 0, or checks strict offset < addr
 law lb_valid_addr_accepted:
-  for +base: Nat
+  for +a_m1: Nat
   for +off: Nat
-  {lb_addr_valid(Nat.add(base, 1n+off), 1n+off) == True{} : Bool}
+  {lb_addr_valid(1n+a_m1, Nat.min(off, 1n+a_m1)) == True{} : Bool}
 
-def lb_valid_addr_accepted(base, off):
-  %Equal.sym(Nat, Nat.add(base, 1n+off), 1n+Nat.add(base, off), L.nat_add_succ_r(base, off)) : {Bool.and(Nat.is_gt(_, 0n), Nat.is_le(1n+off, Nat.add(base, 1n+off))) == True{} : Bool}
-  L.nat_add_le_l(base, 1n+off)
+def lb_valid_addr_accepted(a_m1, off):
+  L.nat_min_le_r(off, 1n+a_m1)
 
 # LAW LB.4: Two distinct persistent sections pointing to the same base address are always rejected.
 # promise: distinct sections sharing the same base address are always rejected

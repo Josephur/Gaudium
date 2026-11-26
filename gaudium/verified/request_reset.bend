@@ -392,65 +392,60 @@ law rr_zero_dirty_clears_nothing:
 def rr_zero_dirty_clears_nothing(cb, chunks, rows, cr, rb):
   {==}
 
-# LAW RR.9: Non-zero dirty rows in a ChunkMajor cache covers at least one chunk.
-# promise: any positive dirty row count clears at least one full chunk
-# catches: rr_div_ceil replaced with floor division so small row counts clear 0 bytes
-law rr_chunk_dirty_covers_first_chunk:
+# LAW RR.9: Non-zero dirty rows in a ChunkMajor cache covers every dirty chunk up to max(1, chunks).
+# promise: rr_chunk_dirty_bytes covers at least (cb / max(1, chunks)) * min(ceil(dirty_rows / max(1, cr)), max(1, chunks)) bytes
+# catches: rr_chunk_dirty_nonzero caps chunks at 1n instead of Nat.min(rr_div_ceil(dirty_rows, chunk_rows), c)
+law rr_chunk_dirty_covers_chunks:
   for +cb: Nat
-  for +chunks: Nat
+  for +c_m1: Nat
   for +r_m1: Nat
-  for +cr: Nat
-  {Nat.is_le(Nat.div(cb, Nat.max(1n, chunks)), rr_chunk_dirty_bytes(cb, chunks, 1n+r_m1, cr)) == True{} : Bool}
+  for +cr_m1: Nat
+  {Nat.is_le(Nat.mul(Nat.div(cb, 1n+c_m1), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), 1n+c_m1)), rr_chunk_dirty_bytes(cb, 1n+c_m1, 1n+r_m1, 1n+cr_m1)) == True{} : Bool}
 
-def rr_zero_ne_succ_bool(+r_m1: Nat, h: {0n == 1n+r_m1 : Nat}) -> {False{} == True{} : Bool}:
-  %Equal.sym(Nat, 0n, 1n+r_m1, h) : {Nat.is_eq(_, 1n+r_m1) == True{} : Bool}
-  G.g_nat_eq_refl(1n+r_m1)
+def rr_succ_mul_eq(+q: Nat, +x: Nat) -> {Nat.add(Nat.mul(q, x), x) == Nat.mul(Nat.add(q, 1n), x) : Nat}:
+  %Equal.sym(Nat, Nat.add(q, 1n), 1n+q, L.nat_add_comm(q, 1n)) : {Nat.add(Nat.mul(q, x), x) == Nat.mul(_, x) : Nat}
+  %L.nat_add_comm(x, Nat.mul(q, x)) : {_ == Nat.mul(1n+q, x) : Nat}
+  {==}
 
-def rr_zero_eq_succ_from_div(+r_m1: Nat, +bm1: Nat, hq: {Nat.div(1n+r_m1, 1n+bm1) == 0n : Nat}, hm: {Nat.mod(1n+r_m1, 1n+bm1) == 0n : Nat}) -> {0n == 1n+r_m1 : Nat}:
-  %hm : {Nat.add(_, Nat.mul(0n, 1n+bm1)) == 1n+r_m1 : Nat}
-  %hq : {Nat.add(Nat.mod(1n+r_m1, 1n+bm1), Nat.mul(_, 1n+bm1)) == 1n+r_m1 : Nat}
-  L.nat_div_mod(1n+r_m1, bm1)
+def rr_split_nz_add(+r_m1: Nat, +cr_m1: Nat, +q: Nat, +mp: Nat, eq: {q == Nat.div(1n+r_m1, 1n+cr_m1) : Nat}, em: {1n+mp == Nat.mod(1n+r_m1, 1n+cr_m1) : Nat}) -> {Nat.add(1n+r_m1, cr_m1) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}:
+  %L.nat_div_mod_r(1n+r_m1, cr_m1) : {Nat.add(_, cr_m1) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %eq : {Nat.add(Nat.add(Nat.mul(_, 1n+cr_m1), Nat.mod(1n+r_m1, 1n+cr_m1)), cr_m1) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %em : {Nat.add(Nat.add(Nat.mul(q, 1n+cr_m1), _), cr_m1) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.mul(q, 1n+cr_m1), 1n+mp), cr_m1), Nat.add(Nat.mul(q, 1n+cr_m1), Nat.add(1n+mp, cr_m1)), L.nat_add_assoc(Nat.mul(q, 1n+cr_m1), 1n+mp, cr_m1)) : {_ == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %Equal.sym(Nat, Nat.add(mp, cr_m1), Nat.add(cr_m1, mp), L.nat_add_comm(mp, cr_m1)) : {Nat.add(Nat.mul(q, 1n+cr_m1), 1n+_) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %L.nat_add_assoc(Nat.mul(q, 1n+cr_m1), 1n+cr_m1, mp) : {_ == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.mul(q, 1n+cr_m1), 1n+cr_m1), Nat.mul(Nat.add(q, 1n), 1n+cr_m1), rr_succ_mul_eq(q, 1n+cr_m1)) : {Nat.add(_, mp) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  {==}
 
-def rr_div_ceil_zero_q(+q: Nat, +r_m1: Nat, +bm1: Nat, hq: {Nat.div(1n+r_m1, 1n+bm1) == q : Nat}, hm: {Nat.mod(1n+r_m1, 1n+bm1) == 0n : Nat}) -> {Nat.is_le(1n, q) == True{} : Bool}:
-  match q:
-    case 1n+qp:
-      L.nat_le_zero(qp)
-    case 0n:
-      L.bool_absurd({Nat.is_le(1n, 0n) == True{} : Bool}, rr_zero_ne_succ_bool(r_m1, rr_zero_eq_succ_from_div(r_m1, bm1, hq, hm)))
+def rr_split_z_add(+r_m1: Nat, +cr_m1: Nat, +q: Nat, eq: {q == Nat.div(1n+r_m1, 1n+cr_m1) : Nat}, em: {0n == Nat.mod(1n+r_m1, 1n+cr_m1) : Nat}) -> {Nat.add(1n+r_m1, cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}:
+  %L.nat_div_mod_r(1n+r_m1, cr_m1) : {Nat.add(_, cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}
+  %eq : {Nat.add(Nat.add(Nat.mul(_, 1n+cr_m1), Nat.mod(1n+r_m1, 1n+cr_m1)), cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}
+  %em : {Nat.add(Nat.add(Nat.mul(q, 1n+cr_m1), _), cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.mul(q, 1n+cr_m1), 0n), Nat.mul(q, 1n+cr_m1), L.nat_add_zero_r(Nat.mul(q, 1n+cr_m1))) : {Nat.add(_, cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}
+  {==}
 
-def rr_div_ceil_nz_step(+q: Nat, +m: Nat, +r_m1: Nat, +bm1: Nat, hq: {Nat.div(1n+r_m1, 1n+bm1) == q : Nat}, hm: {Nat.mod(1n+r_m1, 1n+bm1) == m : Nat}) -> {Nat.is_le(1n, rr_div_ceil_pick(q, Nat.is_gt(m, 0n))) == True{} : Bool}:
+def rr_div_ceil_exact_aux(+r_m1: Nat, +cr_m1: Nat, +q: Nat, +m: Nat, eq: {q == Nat.div(1n+r_m1, 1n+cr_m1) : Nat}, em1: {m == Nat.mod(1n+r_m1, 1n+cr_m1) : Nat}, em2: {m == Nat.mod(1n+r_m1, 1n+cr_m1) : Nat}) -> {rr_div_ceil_pick(q, Nat.is_gt(m, 0n)) == Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1) : Nat}:
   match m:
+    case 0n:
+      %Equal.sym(Nat, Nat.add(1n+r_m1, cr_m1), Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1), rr_split_z_add(r_m1, cr_m1, q, eq, em1)) : {q == Nat.div(_, 1n+cr_m1) : Nat}
+      Equal.sym(Nat, Nat.div(Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1), 1n+cr_m1), q, L.nat_div_split(q, cr_m1, cr_m1, L.nat_lt_succ_self(cr_m1)))
     case 1n+mp:
-      %L.nat_add_comm(1n, q) : {Nat.is_le(1n, _) == True{} : Bool}
-      L.nat_le_zero(q)
-    case 0n:
-      rr_div_ceil_zero_q(q, r_m1, bm1, hq, hm)
+      +hlt_succ = L.nat_lt_subst_l(Nat.mod(1n+r_m1, 1n+cr_m1), 1n+mp, 1n+cr_m1, Equal.sym(Nat, 1n+mp, Nat.mod(1n+r_m1, 1n+cr_m1), em1), L.nat_mod_lt(1n+r_m1, cr_m1))
+      +hlt_mp = L.nat_lt_trans(mp, 1n+mp, 1n+cr_m1, L.nat_lt_succ_self(mp), hlt_succ)
+      %Equal.sym(Nat, Nat.add(1n+r_m1, cr_m1), Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp), rr_split_nz_add(r_m1, cr_m1, q, mp, eq, em2)) : {Nat.add(q, 1n) == Nat.div(_, 1n+cr_m1) : Nat}
+      Equal.sym(Nat, Nat.div(Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp), 1n+cr_m1), Nat.add(q, 1n), L.nat_div_split(Nat.add(q, 1n), mp, cr_m1, hlt_mp))
 
-def rr_div_ceil_pos_nz(+r_m1: Nat, +block: Nat) -> {Nat.is_le(1n, rr_div_ceil(1n+r_m1, block)) == True{} : Bool}:
-  match block:
-    case 0n:
-      L.nat_le_zero(r_m1)
-    case 1n+bm1:
-      rr_div_ceil_nz_step(Nat.div(1n+r_m1, 1n+bm1), Nat.mod(1n+r_m1, 1n+bm1), r_m1, bm1, {==}, {==})
+def rr_div_ceil_eq_ceil_div(+r_m1: Nat, +cr_m1: Nat) -> {rr_div_ceil(1n+r_m1, 1n+cr_m1) == Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1) : Nat}:
+  rr_div_ceil_exact_aux(r_m1, cr_m1, Nat.div(1n+r_m1, 1n+cr_m1), Nat.mod(1n+r_m1, 1n+cr_m1), {==}, {==}, {==})
 
-def rr_chunk_dirty_covers_step(+per_chunk: Nat, +c: Nat, +n_raw: Nat, ha: {Nat.is_le(1n, n_raw) == True{} : Bool}, hb: {Nat.is_le(1n, c) == True{} : Bool}) -> {Nat.is_le(per_chunk, Nat.mul(per_chunk, Nat.min(n_raw, c))) == True{} : Bool}:
-  %L.nat_mul_one_r(per_chunk) : {Nat.is_le(_, Nat.mul(per_chunk, Nat.min(n_raw, c))) == True{} : Bool}
-  L.nat_mul_le_mono_l(per_chunk, 1n, Nat.min(n_raw, c), rr_min_ge_one(n_raw, c, ha, hb))
-
-def rr_chunk_dirty_covers_first_chunk(cb, chunks, r_m1, cr):
+def rr_chunk_dirty_covers_chunks(cb, c_m1, r_m1, cr_m1):
   match cb:
     case 0n:
-      match chunks:
-        case 0n: {==}
-        case 1n+_: {==}
+      {==}
     case 1n+cp:
-      rr_chunk_dirty_covers_step(
-        Nat.div(1n+cp, Nat.max(1n, chunks)),
-        Nat.max(1n, chunks),
-        rr_div_ceil(1n+r_m1, cr),
-        rr_div_ceil_pos_nz(r_m1, cr),
-        rr_ge_one_max1(chunks)
-      )
+      %Equal.sym(Nat, Nat.max(1n, 1n+c_m1), 1n+c_m1, G.g_nat_max_one_succ(c_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, 1n+c_m1), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), 1n+c_m1)), Nat.mul(Nat.div(1n+cp, _), Nat.min(rr_div_ceil(1n+r_m1, 1n+cr_m1), _))) == True{} : Bool}
+      %Equal.sym(Nat, rr_div_ceil(1n+r_m1, 1n+cr_m1), Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), rr_div_ceil_eq_ceil_div(r_m1, cr_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, 1n+c_m1), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), 1n+c_m1)), Nat.mul(Nat.div(1n+cp, 1n+c_m1), Nat.min(_, 1n+c_m1))) == True{} : Bool}
+      L.nat_le_refl(Nat.mul(Nat.div(1n+cp, 1n+c_m1), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), 1n+c_m1)))
 
 # LAW RR.10: HeadMajor dirty rows NEVER exceed `max(1, rows)`.
 # promise: HeadMajor dirty rows stay within [0, max(1, rows)]
@@ -720,20 +715,28 @@ def rr_begin_sets_unclean_and_dirties_auto(hw, held, u, prompt, max_new, slack, 
     case True{}: {==}
     case False{}: {==}
 
-# LAW RR.16: Zeroing scopes (`Dirty`/`Full`) clear `held_hw` to 0 on begin.
-# promise: when begin runs with Dirty or Full scope, held_hw is reset to 0n
-# catches: rr_kept_hw returns old kv_hw for Dirty or Full scopes
+# LAW RR.16: Zeroing scopes (Dirty or Full, including unclean Auto) always clear `held_hw` to 0 on begin.
+# promise: when begin runs with any zeroing scope (Dirty or Full, including unclean Auto), held_hw is reset to 0n
+# catches: rr_kept_hw returns dirty_rows for RrScopeFull{}
 law rr_begin_zeroing_resets_held:
+  for +m: RrMode
   for hw: Nat
   for held: Nat
+  for +u: Bool
   for prompt: Nat
   for new_t: Nat
   for slack: Nat
   for max_ctx: Nat
-  {Nat.is_eq(rr_state_held(rr_begin(RrState{RrModeDirty{}, hw, held, False{}}, prompt, new_t, slack, max_ctx)), 0n) == True{} : Bool}
+  {Bool.or(rr_is_state_only(m, u), Nat.is_eq(rr_state_held(rr_begin(RrState{m, hw, held, u}, prompt, new_t, slack, max_ctx)), 0n)) == True{} : Bool}
 
-def rr_begin_zeroing_resets_held(hw, held, prompt, new_t, slack, max_ctx):
-  {==}
+def rr_begin_zeroing_resets_held(m, hw, held, u, prompt, new_t, slack, max_ctx):
+  match m u:
+    case RrModeAuto{} True{}: {==}
+    case RrModeAuto{} False{}: {==}
+    case RrModeDirty{} True{}: {==}
+    case RrModeDirty{} False{}: {==}
+    case RrModeFull{} True{}: {==}
+    case RrModeFull{} False{}: {==}
 
 # LAW RR.17: Completing a request (`rr_end_ok`) clears `unclean` and preserves `held_hw <= kv_hw`.
 # promise: rr_end_ok clears unclean and preserves kept dirty rows from before the request
@@ -787,6 +790,69 @@ law rr_state_mode_preserved:
   {rr_state_mode(rr_begin(RrState{m, hw, held, u}, p, mn, sl, mc)) == m : RrMode}
 
 def rr_state_mode_preserved(m, hw, held, u, p, mn, sl, mc):
+  match m:
+    case RrModeAuto{}: {==}
+    case RrModeDirty{}: {==}
+    case RrModeFull{}: {==}
+
+# LAW RR.20: Beginning a request sets kv_hw to at least rr_high_water for the incoming request.
+# promise: rr_begin sets kv_hw to at least rr_high_water for the incoming request
+# catches: rr_begin_kept uses Nat.min instead of Nat.max
+law rr_begin_hw_covers_request:
+  for +m: RrMode
+  for +hw: Nat
+  for held: Nat
+  for +u: Bool
+  for +p: Nat
+  for +mn: Nat
+  for +sl: Nat
+  for +mc: Nat
+  {Nat.is_le(rr_high_water(p, mn, sl, mc), rr_state_hw(rr_begin(RrState{m, hw, held, u}, p, mn, sl, mc))) == True{} : Bool}
+
+def rr_begin_hw_covers_request(m, hw, held, u, p, mn, sl, mc):
+  L.nat_max_ge_r(rr_kept_hw(rr_scope(m, u), hw), rr_high_water(p, mn, sl, mc))
+
+# LAW RR.21: In StateOnly scope, rr_begin preserves prior kv_hw in both held_hw and kv_hw.
+# promise: in StateOnly scope, rr_begin preserves prior kv_hw in both held_hw and kv_hw
+# catches: rr_kept_hw returns 0n for RrScopeState{}
+law rr_begin_state_only_keeps_hw:
+  for +hw: Nat
+  for held: Nat
+  for +p: Nat
+  for +mn: Nat
+  for +sl: Nat
+  for +mc: Nat
+  {Bool.and(Nat.is_eq(rr_state_held(rr_begin(RrState{RrModeAuto{}, hw, held, False{}}, p, mn, sl, mc)), hw), Nat.is_le(hw, rr_state_hw(rr_begin(RrState{RrModeAuto{}, hw, held, False{}}, p, mn, sl, mc)))) == True{} : Bool}
+
+def rr_begin_state_only_keeps_hw(hw, held, p, mn, sl, mc):
+  %Equal.sym(Bool, Nat.is_eq(hw, hw), True{}, G.g_nat_eq_refl(hw)) : {Bool.and(_, Nat.is_le(hw, Nat.max(hw, rr_high_water(p, mn, sl, mc)))) == True{} : Bool}
+  L.nat_max_ge_l(hw, rr_high_water(p, mn, sl, mc))
+
+# LAW RR.22: RrModeDirty always selects Dirty scope regardless of unclean.
+# promise: RrModeDirty always selects Dirty scope (not StateOnly and not Full), regardless of unclean
+# catches: RrModeDirty{} maps to RrScopeState{} or RrScopeFull{}
+law rr_dirty_mode_always_dirty:
+  for +u: Bool
+  {Bool.and(Bool.not(rr_is_state_only(RrModeDirty{}, u)), Bool.not(rr_zero_both_rings(rr_scope(RrModeDirty{}, u)))) == True{} : Bool}
+
+def rr_dirty_mode_always_dirty(u):
+  {==}
+
+# LAW RR.23: Completing a request (rr_end_ok) preserves the configured reset mode.
+# promise: rr_end_ok preserves the configured reset mode read back by rr_state_mode
+# catches: rr_end_ok resets mode to RrModeAuto{}
+law rr_end_ok_mode_preserved:
+  for +m: RrMode
+  for hw: Nat
+  for held: Nat
+  for u: Bool
+  for p: Nat
+  for g: Nat
+  for sl: Nat
+  for mc: Nat
+  {rr_state_mode(rr_end_ok(RrState{m, hw, held, u}, p, g, sl, mc)) == m : RrMode}
+
+def rr_end_ok_mode_preserved(m, hw, held, u, p, g, sl, mc):
   match m:
     case RrModeAuto{}: {==}
     case RrModeDirty{}: {==}

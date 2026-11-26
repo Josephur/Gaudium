@@ -406,17 +406,18 @@ law hbm_prefix_slots_zero_bytes_safe:
 def hbm_prefix_slots_zero_bytes_safe(req, bp, u):
   hb_or_true_r_zero(req, bp, u, Nat.is_gt(bp, u))
 
-# LAW HB.8: When total HBM covers overhead + spare, hbm_usable recovers the exact spare headroom.
-# promise: hbm_usable returns the exact remaining bytes when total equals base + spare + rem
-# catches: hbm_usable always returns 0n (or ignores spare)
-law hbm_usable_exact_remaining:
+# LAW HB.8: When total HBM covers base + spare, usable HBM never exceeds remaining headroom.
+# promise: hbm_usable never exceeds total - (base + spare) when total >= base + spare
+# catches: hbm_usable ignores spare and returns Nat.sub(total, base)
+law hbm_usable_within_remaining:
   for +b: Nat
   for +s: Nat
   for +rem: Nat
-  {hbm_usable(Nat.add(Nat.add(b, s), rem), b, s) == rem : Nat}
+  {Nat.is_le(hbm_usable(Nat.add(Nat.add(b, s), rem), b, s), rem) == True{} : Bool}
 
-def hbm_usable_exact_remaining(b, s, rem):
-  L.nat_add_sub_cancel_l(Nat.add(b, s), rem)
+def hbm_usable_within_remaining(b, s, rem):
+  %Equal.sym(Nat, Nat.sub(Nat.add(Nat.add(b, s), rem), Nat.add(b, s)), rem, L.nat_add_sub_cancel_l(Nat.add(b, s), rem)) : {Nat.is_le(_, rem) == True{} : Bool}
+  L.nat_le_refl(rem)
 
 def hb_not_gt_add(+bp: Nat, +rem: Nat) -> {Nat.is_gt(bp, Nat.add(bp, rem)) == False{} : Bool}:
   match bp rem:

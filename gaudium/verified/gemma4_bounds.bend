@@ -412,3 +412,15 @@ law g4_lane_nat_roundtrip_hi:
 def g4_lane_nat_roundtrip_hi(j, hj):
   +p = Nat.add(Nat.mul(2n, j), 1n)
   g4_lane_nat_if_id(p, g4_p_lt_128(1n, j, {==}, hj), Nat.is_lt(p, 64n), {==})
+
+# LAW G4.16: g4_lane depends only on `c mod 128` across all blocks.
+# promise: g4_lane is periodic modulo the 128-channel kernel block width
+# catches: g4_lane uses 129n instead of 128n in Nat.mod
+law g4_lane_periodic_128:
+  for +c: Nat
+  {g4_lane(c) == g4_lane(Nat.mod(c, 128n)) : Nat}
+
+def g4_lane_periodic_128(c):
+  +r = Nat.mod(c, 128n)
+  %Equal.sym(Nat, Nat.mod(r, 128n), r, L.nat_mod_small(r, 127n, L.nat_mod_lt(c, 127n))) : {g4_lane_if(Nat.div(r, 2n), Nat.is_eq(Nat.mod(r, 2n), 0n)) == g4_lane_if(Nat.div(_, 2n), Nat.is_eq(Nat.mod(_, 2n), 0n)) : Nat}
+  {==}
