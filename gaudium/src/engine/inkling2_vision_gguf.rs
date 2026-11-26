@@ -34,7 +34,10 @@ use crate::engine::inkling2::gguf_source;
 use crate::gguf::dequant::{rows_bf16, rows_f32};
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::model_spec::ModelSpec;
-use crate::verified::{mmp_matches, mmp_rank, mmp_step, MmpPick, MmpPrecision};
+use crate::verified::{
+    mmp_fit, mmp_matches, mmp_outcome, mmp_rank, mmp_step, MmpFit, MmpOutcome, MmpPick,
+    MmpPrecision,
+};
 use crate::vision::VisionSpec;
 
 /// The tower of a GGUF model: the projector file it is read from and its geometry.
@@ -107,19 +110,26 @@ fn verdict(g: &Gguf, hidden: u64) -> (bool, u64, Option<String>) {
     let Some(proj) = projection_dim(g) else {
         return (false, rank, Some("no clip.vision.projection_dim".into()));
     };
+    // whether it matches is what the search folds (`mmp_matches`); why not is the same rule's
+    // reason (`mmp_fit`, which agrees with it: `mmp_fit_serves_exactly`)
     let ok = mmp_matches(family, proj, hidden);
-    let why = (!ok).then(|| {
-        if family {
-            format!("projection width {proj}, the model's hidden size is {hidden}")
-        } else {
-            format!(
-                "projector type '{}', not '{}'",
-                projector_type(g),
-                FAMILY.projector_type
-            )
-        }
-    });
-    (ok, rank, why)
+    (ok, rank, refusal(g, mmp_fit(family, proj, hidden), proj, hidden))
+}
+
+/// Why a projector file of width `proj` does not serve a model of hidden size `hidden`, in
+/// words, from the verified reason `fit` (`None` when it serves it).
+fn refusal(g: &Gguf, fit: MmpFit, proj: u64, hidden: u64) -> Option<String> {
+    match fit {
+        MmpFit::MmpServes => None,
+        MmpFit::MmpOtherType => Some(format!(
+            "projector type '{}', not '{}'",
+            projector_type(g),
+            FAMILY.projector_type
+        )),
+        MmpFit::MmpWidth => Some(format!(
+            "projection width {proj}, the model's hidden size is {hidden}"
+        )),
+    }
 }
 
 /// The projector file the model at `model` (hidden size `hidden`) reads its tower from.
@@ -144,14 +154,15 @@ pub fn find_projector(model: &Path, hidden: u64) -> Result<Option<PathBuf>, Stri
         };
         best = mmp_step(ok, best, i as u64, rank);
     }
-    match best {
-        MmpPick::MmpAt(i, _) => cands
+    // the chosen file, text only, or a refusal: the verified outcome of the search
+    match mmp_outcome(cands.len() as u64, best) {
+        MmpOutcome::MmpUse(i) => cands
             .get(i as usize)
             .cloned()
             .map(Some)
             .ok_or_else(|| format!("projector choice {i} of {} files", cands.len())),
-        MmpPick::MmpNone if cands.is_empty() => Ok(None),
-        MmpPick::MmpNone => Err(format!(
+        MmpOutcome::MmpTextOnly => Ok(None),
+        MmpOutcome::MmpNoMatch => Err(format!(
             "no projector file beside the model matches it:\n  {}",
             why.join("\n  ")
         )),
@@ -279,15 +290,15 @@ fn three(g: &Gguf, key: &str) -> Result<[f64; 3], String> {
 }
 
 /// The image spec and geometry of the tower in projector file `proj` for the model `main` of
-/// hidden size `hidden`: a projection that is not the model's width is refused.
+/// hidden size `hidden`: a file the search would refuse (another projector type, or a projection
+/// that is not the model's width) is refused for the same reason, in the same words.
 pub fn tower_spec(main: &Gguf, proj: &Gguf, hidden: u64) -> Result<(VisionSpec, IkvDims), String> {
-    let d = projector_dims(proj)?;
-    if !mmp_matches(true, d.out, hidden) {
-        return Err(format!(
-            "projector projection width {} but the model's hidden size is {hidden}",
-            d.out
-        ));
+    if let (_, _, Some(why)) = verdict(proj, hidden) {
+        return Err(why);
     }
+    // a file the verified rule serves is of the family's type with the model's width
+    // (`mmp_fit_serves_exactly`), so the geometry's own type check and width agree with it
+    let d = projector_dims(proj)?;
     let id = token_id(main, FAMILY.image_token)?;
     let mean = three(proj, "clip.vision.image_mean")?;
     let std = three(proj, "clip.vision.image_std")?;

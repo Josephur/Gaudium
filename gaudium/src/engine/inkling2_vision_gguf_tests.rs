@@ -353,6 +353,11 @@ fn a_projector_that_disagrees_with_its_model_or_itself_is_refused() {
         e.contains("projection width 6") && e.contains("hidden size is 10"),
         "{e}"
     );
+    // a projector of another type is refused for that, in the search's words, whatever its width
+    let o = dir.join("mmproj-other.gguf");
+    std::fs::write(&o, projector_bytes(GgmlType::BF16, 10, "other")).unwrap();
+    let e = tower_spec(&main, &Gguf::open(&o).unwrap(), 10).unwrap_err();
+    assert!(e.contains("projector type 'other', not 'inkling2v'"), "{e}");
 
     // metadata that disagrees with the tensors: one block more than the file holds
     let mut b = Builder::new();

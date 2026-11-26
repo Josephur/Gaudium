@@ -1212,6 +1212,12 @@ ef45a806ccc81bf8  media_zero_height_refused  law media_zero_height_refused : for
 0afeee2dd389f4cb  mmp_choice_is_candidate  law mmp_choice_is_candidate : for ok : Bool for best : MmpPick for + i : Nat for + rank : Nat { mmp_index_from ( mmp_step ( ok , best , i , rank ) , best , i ) == True { } : Bool }
 # promise mmp_choice_is_candidate: the chosen projector file is always the file just seen or the earlier choice, so it is always one of the candidates
 # harm mmp_choice_is_candidate: an index past the candidate list would name no file or another one
+9c084d24f6537a01  mmp_fit_other_type_exactly  law mmp_fit_other_type_exactly : for family : Bool for + proj : Nat for + hidden : Nat { mmp_fit_other_type ( mmp_fit ( family , proj , hidden ) ) == Bool.not ( family ) : Bool }
+# promise mmp_fit_other_type_exactly: a projector file is refused as of another projector type exactly when it is of another type, whatever width it states
+# harm mmp_fit_other_type_exactly: a tower of another architecture would be reported by a width it isn't held to, or a family projector of the wrong width as another type
+c6ea1421a6ff0f67  mmp_fit_serves_exactly  law mmp_fit_serves_exactly : for family : Bool for + proj : Nat for + hidden : Nat { mmp_fit_serves ( mmp_fit ( family , proj , hidden ) ) == mmp_matches ( family , proj , hidden ) : Bool }
+# promise mmp_fit_serves_exactly: a candidate projector file is reported as serving the model exactly when it matches the selection rule (`mmp_matches`), so every file the rule refuses has a reason and a file it can choose has none
+# harm mmp_fit_serves_exactly: the file the search chose would be refused when its tower is read, or a file it passed over would be listed with no reason
 5ba9275418602246  mmp_match_chooses  law mmp_match_chooses : for best : MmpPick for + i : Nat for + rank : Nat { mmp_some ( mmp_step ( True { } , best , i , rank ) ) == True { } : Bool }
 # promise mmp_match_chooses: after a matching projector file has been seen, some file is always chosen
 # harm mmp_match_chooses: a GGUF model with a usable projector beside it would be served text only
@@ -1227,6 +1233,15 @@ f5bea87b0aaf55ba  mmp_never_worse  law mmp_never_worse : for ok : Bool for best 
 77d627c4156f44ad  mmp_other_type_never_matches  law mmp_other_type_never_matches : for + proj : Nat for + hidden : Nat { mmp_matches ( False { } , proj , hidden ) == False { } : Bool }
 # promise mmp_other_type_never_matches: a projector file of another projector type never matches the model
 # harm mmp_other_type_never_matches: a tower of another architecture would be run on this model's images
+e0b228a1608845b0  mmp_outcome_no_files_text_only  law mmp_outcome_no_files_text_only : { mmp_outcome ( 0n , MmpNone { } ) == MmpTextOnly { } : MmpOutcome }
+# promise mmp_outcome_no_files_text_only: the search over no candidate projector files gives the model text only, never a refusal
+# harm mmp_outcome_no_files_text_only: every GGUF model of the family shipped without a projector would refuse to load
+7ec4dc356e1285e6  mmp_outcome_no_match_refused  law mmp_outcome_no_match_refused : for + files : Nat { mmp_outcome ( 1n + files , MmpNone { } ) == MmpNoMatch { } : MmpOutcome }
+# promise mmp_outcome_no_match_refused: a search that chose nothing from one or more candidate projector files refuses the model, never runs it on text alone and never gives it a file
+# harm mmp_outcome_no_match_refused: a model whose projector file doesn't fit would silently lose its images, or read a tower that doesn't serve it
+0b6f11fe53bb2893  mmp_outcome_uses_choice  law mmp_outcome_uses_choice : for + files : Nat for + i : Nat for + rank : Nat { mmp_outcome ( files , MmpAt { i , rank } ) == MmpUse { i } : MmpOutcome }
+# promise mmp_outcome_uses_choice: the file the search chose is always the model's projector
+# harm mmp_outcome_uses_choice: a model with a matching projector beside it would run without images, or read its tower from another file
 bf2525e5de65e5a6  mmp_unmatched_keeps  law mmp_unmatched_keeps : for best : MmpPick for + i : Nat for + rank : Nat { mmp_step ( False { } , best , i , rank ) == best : MmpPick }
 # promise mmp_unmatched_keeps: a projector file that does not match the model leaves the choice exactly as it was, so it is never chosen and nothing is chosen when no file matches
 # harm mmp_unmatched_keeps: a tower of another model (wrong width or type) would be loaded and fed to the text model
