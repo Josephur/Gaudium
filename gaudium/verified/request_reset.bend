@@ -883,3 +883,112 @@ def rr_end_ok_mode_preserved(m, hw, held, u, p, g, sl, mc):
     case RrModeAuto{}: {==}
     case RrModeDirty{}: {==}
     case RrModeFull{}: {==}
+
+# LAW RR.24: A Full reset zeroes both DeltaNet rings, whatever the unclean flag.
+# promise: Full reset mode always clears both DeltaNet rings, not only ring 0
+# catches: rr_zero_both_rings returns False for every scope, so a Full reset clears ring 0 only
+law rr_full_mode_zeroes_both_rings:
+  for +u: Bool
+  {rr_zero_both_rings(rr_scope(RrModeFull{}, u)) == True{} : Bool}
+
+def rr_full_mode_zeroes_both_rings(u):
+  {==}
+
+# LAW RR.25: HeadMajor dirty rows are a whole number of row blocks, or every row of the head.
+# The V rows of a HeadMajor cache are permuted inside row blocks (`row_block`), so zeroing part of
+# a block leaves permuted rows of the old request behind. RR.10 and RR.11 bound the count from
+# above and below; this law fixes where it may end.
+# promise: HeadMajor dirty rows always end on a row-block boundary unless they reach max(1, rows)
+# catches: rr_head_dirty_block returns dirty unrounded (Nat.min(dirty, max(1, rows))), which RR.8, RR.10 and RR.11 accept
+law rr_head_dirty_rows_block_aligned:
+  for +rows: Nat
+  for +dirty: Nat
+  for +bm1: Nat
+  {Bool.or(Nat.is_eq(Nat.mod(rr_head_dirty_rows(rows, dirty, 1n+bm1), 1n+bm1), 0n), Nat.is_eq(rr_head_dirty_rows(rows, dirty, 1n+bm1), Nat.max(1n, rows))) == True{} : Bool}
+
+# The clamp: every row of the head satisfies the law's second disjunct.
+def rr_head_aligned_full(+r: Nat, +bm1: Nat) -> {Bool.or(Nat.is_eq(Nat.mod(r, 1n+bm1), 0n), Nat.is_eq(r, r)) == True{} : Bool}:
+  %Equal.sym(Bool, Nat.is_eq(r, r), True{}, G.g_nat_eq_refl(r)) : {Bool.or(Nat.is_eq(Nat.mod(r, 1n+bm1), 0n), _) == True{} : Bool}
+  G.g_bool_or_true_r(Nat.is_eq(Nat.mod(r, 1n+bm1), 0n))
+
+# Rounding up from the floor lands on the next block boundary: (q * B + B) mod B == 0.
+def rr_head_aligned_next(+q: Nat, +r: Nat, +bm1: Nat) -> {Bool.or(Nat.is_eq(Nat.mod(Nat.add(Nat.mul(q, 1n+bm1), 1n+bm1), 1n+bm1), 0n), Nat.is_eq(Nat.add(Nat.mul(q, 1n+bm1), 1n+bm1), r)) == True{} : Bool}:
+  %Equal.sym(Nat, Nat.add(Nat.mul(q, 1n+bm1), 1n+bm1), Nat.mul(Nat.add(q, 1n), 1n+bm1), rr_succ_mul_eq(q, 1n+bm1)) : {Bool.or(Nat.is_eq(Nat.mod(_, 1n+bm1), 0n), Nat.is_eq(Nat.add(Nat.mul(q, 1n+bm1), 1n+bm1), r)) == True{} : Bool}
+  %Equal.sym(Nat, Nat.mod(Nat.mul(Nat.add(q, 1n), 1n+bm1), 1n+bm1), 0n, L.nat_mod_mul(Nat.add(q, 1n), bm1)) : {Bool.or(Nat.is_eq(_, 0n), Nat.is_eq(Nat.add(Nat.mul(q, 1n+bm1), 1n+bm1), r)) == True{} : Bool}
+  {==}
+
+def rr_head_aligned_pick(+r: Nat, +q: Nat, +bm1: Nat, +fits: Bool) -> {Bool.or(Nat.is_eq(Nat.mod(rr_head_dirty_pick(r, Nat.add(Nat.mul(q, 1n+bm1), 1n+bm1), fits), 1n+bm1), 0n), Nat.is_eq(rr_head_dirty_pick(r, Nat.add(Nat.mul(q, 1n+bm1), 1n+bm1), fits), r)) == True{} : Bool}:
+  match fits:
+    case True{}:
+      rr_head_aligned_next(q, r, bm1)
+    case False{}:
+      rr_head_aligned_full(r, bm1)
+
+def rr_head_aligned_nz(+r: Nat, +dirty: Nat, +bm1: Nat, +rz: Bool, hrz: {Nat.is_eq(Nat.mod(dirty, 1n+bm1), 0n) == rz : Bool}) -> {Bool.or(Nat.is_eq(Nat.mod(rr_head_dirty_align_nz(r, dirty, 1n+bm1, rz, Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1)), 1n+bm1), 0n), Nat.is_eq(rr_head_dirty_align_nz(r, dirty, 1n+bm1, rz, Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1)), r)) == True{} : Bool}:
+  match rz:
+    case True{}:
+      %Equal.sym(Bool, Nat.is_eq(Nat.mod(dirty, 1n+bm1), 0n), True{}, hrz) : {Bool.or(_, Nat.is_eq(dirty, r)) == True{} : Bool}
+      {==}
+    case False{}:
+      rr_head_aligned_pick(r, Nat.div(dirty, 1n+bm1), bm1, Nat.is_le(1n+bm1, Nat.sub(r, Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1))))
+
+def rr_head_aligned_block(+r: Nat, +dirty: Nat, +bm1: Nat) -> {Bool.or(Nat.is_eq(Nat.mod(rr_head_dirty_block(r, dirty, 1n+bm1), 1n+bm1), 0n), Nat.is_eq(rr_head_dirty_block(r, dirty, 1n+bm1), r)) == True{} : Bool}:
+  rr_head_aligned_nz(r, dirty, bm1, Nat.is_eq(Nat.mod(dirty, 1n+bm1), 0n), {==})
+
+def rr_head_aligned_lt(+r: Nat, +dirty: Nat, +bm1: Nat, +w: Bool) -> {Bool.or(Nat.is_eq(Nat.mod(rr_head_dirty_lt(r, dirty, 1n+bm1, w), 1n+bm1), 0n), Nat.is_eq(rr_head_dirty_lt(r, dirty, 1n+bm1, w), r)) == True{} : Bool}:
+  match w:
+    case True{}:
+      rr_head_aligned_block(r, dirty, bm1)
+    case False{}:
+      rr_head_aligned_full(r, bm1)
+
+def rr_head_dirty_rows_block_aligned(rows, dirty, bm1):
+  match dirty:
+    case 0n:
+      {==}
+    case 1n+rp:
+      rr_head_aligned_lt(Nat.max(1n, rows), 1n+rp, bm1, Nat.is_lt(1n+rp, Nat.max(1n, rows)))
+
+# LAW RR.26: Completing a request (`rr_end_ok`) leaves kv_hw at or above that request's high-water mark.
+# The shell reads kv_hw back after `rr_end_ok` (`apply_verified`), and the next reset zeroes from it.
+# RR.17 only keeps the rows held from before the request; RR.20 covers rr_begin only.
+# promise: after a successful request, kv_hw still covers every row that request wrote
+# catches: rr_end_ok_fields sets kv_hw to held, dropping the finished request's rows
+law rr_end_ok_hw_covers_request:
+  for +m: RrMode
+  for hw: Nat
+  for +held: Nat
+  for +u: Bool
+  for +p: Nat
+  for +g: Nat
+  for +sl: Nat
+  for +mc: Nat
+  {Nat.is_le(rr_high_water(p, g, sl, mc), rr_state_hw(rr_end_ok(RrState{m, hw, held, u}, p, g, sl, mc))) == True{} : Bool}
+
+def rr_end_ok_hw_covers_request(m, hw, held, u, p, g, sl, mc):
+  L.nat_max_ge_r(held, rr_high_water(p, g, sl, mc))
+
+# LAW RR.27: Completing a request (`rr_end_ok`) never raises kv_hw above max(held, max_ctx).
+# RR.26 bounds kv_hw from below. `begin_request` takes kv_hw as the next reset's dirty rows,
+# so this keeps that count within the cache; a Rust test pins the exact value.
+# promise: after a successful request, kv_hw stays within the larger of the rows held before it and max_ctx
+# catches: rr_end_ok_fields sets kv_hw to Nat.add(held, rr_high_water(...)), which RR.17 and RR.26 accept
+law rr_end_ok_hw_within_ctx:
+  for +m: RrMode
+  for hw: Nat
+  for +held: Nat
+  for +u: Bool
+  for +p: Nat
+  for +g: Nat
+  for +sl: Nat
+  for +mc: Nat
+  {Nat.is_le(rr_state_hw(rr_end_ok(RrState{m, hw, held, u}, p, g, sl, mc)), Nat.max(held, mc)) == True{} : Bool}
+
+def rr_end_ok_hw_within_ctx(m, hw, held, u, p, g, sl, mc):
+  G.g_nat_max_le(
+    held,
+    rr_high_water(p, g, sl, mc),
+    Nat.max(held, mc),
+    L.nat_max_ge_l(held, mc),
+    L.nat_le_trans(rr_high_water(p, g, sl, mc), mc, Nat.max(held, mc), rr_hw_le_max_ctx(p, g, sl, mc), L.nat_max_ge_r(held, mc))
+  )

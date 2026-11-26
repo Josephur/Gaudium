@@ -174,6 +174,17 @@ def kv_vperm_rows(d: KvDtype) -> Nat:
     case KvFp8{}:
       256n
 
+# Reference, written plainly from the kernels and not tuned: the rows of one block of the attention
+# kernels' V-row permutation. `VPERM` (every BF16 kernel that writes or reads V) keeps a row inside
+# its 128-row block, `VPERM8` (`attn_prep_gaudi2.c`, `kv_commit_gaudi2.c`) inside its 256-row block.
+# Only a kernel change moves these numbers.
+def kv_kernel_vperm_block(d: KvDtype) -> Nat:
+  match d:
+    case KvBf16{}:
+      128n
+    case KvFp8{}:
+      256n
+
 # Whether a prefill tile whose form asks for the half-width core (`asked`: BF16 scores and the
 # core's own V relayout of a BF16 cache) builds it on a cache of dtype `d`. The core reads BF16
 # caches only, so a tile on an FP8 cache builds the full-width core instead.
@@ -1316,6 +1327,20 @@ law kv_vperm_rows_positive:
   {Nat.is_gt(kv_vperm_rows(d), 0n) == True{} : Bool}
 
 def kv_vperm_rows_positive(d):
+  match d:
+    case KvBf16{}: {==}
+    case KvFp8{}: {==}
+
+# The host-RAM tier copies whole `kv_vperm_rows(d)` row blocks (`RowLayout::with_block`), so a
+# block must hold whole kernel permutation blocks, or one kernel block's permuted V rows are split
+# across two copied ranges. A multiple, not the exact value, so a wider copy block stays legal.
+# promise: the V-row block of a cache dtype is always a whole number of that dtype's kernel permutation blocks
+# catches: kv_vperm_rows returns 128n for FP8 (the BF16 block), splitting each 256-row VPERM8 block
+law kv_vperm_rows_whole_kernel_blocks:
+  for +d: KvDtype
+  {Nat.is_eq(Nat.mod(kv_vperm_rows(d), kv_kernel_vperm_block(d)), 0n) == True{} : Bool}
+
+def kv_vperm_rows_whole_kernel_blocks(d):
   match d:
     case KvBf16{}: {==}
     case KvFp8{}: {==}

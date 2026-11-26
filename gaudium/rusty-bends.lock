@@ -882,6 +882,8 @@ b482ee9e4bc6c7e1  kv_tile_rows_nonzero  law kv_tile_rows_nonzero : for + t : Nat
 # harm kv_tile_rows_not_wider: a tile wider than every width asked for (an explicit width or a candidate, at most the engine's widest) would overrun buffers sized for those widths
 243b3ada89973f1d  kv_vperm_rows_positive  law kv_vperm_rows_positive : for + d : KvDtype { Nat.is_gt ( kv_vperm_rows ( d ) , 0n ) == True { } : Bool }
 # promise kv_vperm_rows_positive: kv_vperm_rows always returns a positive block size for every KV cache dtype
+59403fe649f8e8fc  kv_vperm_rows_whole_kernel_blocks  law kv_vperm_rows_whole_kernel_blocks : for + d : KvDtype { Nat.is_eq ( Nat.mod ( kv_vperm_rows ( d ) , kv_kernel_vperm_block ( d ) ) , 0n ) == True { } : Bool }
+# promise kv_vperm_rows_whole_kernel_blocks: the V-row block of a cache dtype is always a whole number of that dtype's kernel permutation blocks
 221a51e4695468d8  kv_wv_row_in_head_128  law kv_wv_row_in_head_128 : for + c : Nat for + d : KvDtype for ok : { Nat.is_lt ( c , 128n ) == True { } : Bool } { Nat.is_lt ( kv_wv_row ( c , 128n , d ) , 128n ) == True { } : Bool }
 # promise kv_wv_row_in_head_128: every channel of a 128-channel head lands on a row of that head in its V projection
 # harm kv_wv_row_in_head_128: a V channel would be packed outside its head, over another head's rows or past the weight
@@ -899,10 +901,14 @@ e8dd4d122e82d747  kv_wv_rows_distinct_256  law kv_wv_rows_distinct_256 : for + a
 4775d7007e9e1d84  lane_full_blocks_shared  law lane_full_blocks_shared : for + cap : Nat for excl : Bool { lane_can_admit ( cap , cap , excl , False { } ) == False { } : Bool }
 dbb5aa603345792f  lb_diff_section_same_base_rejected  law lb_diff_section_same_base_rejected : for + sec_a : Nat for + extra : Nat for + base : Nat { lb_pair_ok ( sec_a , base , Nat.add ( sec_a , 1n + extra ) , base ) == False { } : Bool }
 # promise lb_diff_section_same_base_rejected: distinct sections sharing the same base address are always rejected
+75edca6ecf6e7f30  lb_diff_section_same_base_rejected_rev  law lb_diff_section_same_base_rejected_rev : for + sec_b : Nat for + extra : Nat for + base : Nat { lb_pair_ok ( Nat.add ( sec_b , 1n + extra ) , base , sec_b , base ) == False { } : Bool }
+# promise lb_diff_section_same_base_rejected_rev: distinct sections sharing the same base address are rejected in either argument order
 d65a7ccd2bd078e7  lb_nonzero_ws_needs_addr  law lb_nonzero_ws_needs_addr : for + ws_m1 : Nat { lb_ws_ok ( 1n + ws_m1 , 0n ) == False { } : Bool }
 # promise lb_nonzero_ws_needs_addr: non-zero workspace size requires a non-zero workspace address
 67a2919c7bf3c287  lb_same_section_diff_base_rejected  law lb_same_section_diff_base_rejected : for + sec : Nat for + base_a : Nat for + extra : Nat { lb_pair_ok ( sec , base_a , sec , Nat.add ( base_a , 1n + extra ) ) == False { } : Bool }
 # promise lb_same_section_diff_base_rejected: two tensors in the same persistent section with different computed base addresses are rejected
+5c3f96975e7eb3f2  lb_same_section_diff_base_rejected_rev  law lb_same_section_diff_base_rejected_rev : for + sec : Nat for + base_b : Nat for + extra : Nat { lb_pair_ok ( sec , Nat.add ( base_b , 1n + extra ) , sec , base_b ) == False { } : Bool }
+# promise lb_same_section_diff_base_rejected_rev: two tensors in the same persistent section with different base addresses are rejected in either order
 64b7c6a3a66e077f  lb_same_section_same_base_ok  law lb_same_section_same_base_ok : for + sec : Nat for + base : Nat { lb_pair_ok ( sec , base , sec , base ) == True { } : Bool }
 # promise lb_same_section_same_base_ok: two tensors sharing both section id and base address are accepted
 e10dee7c0041cb7c  lb_section_base_exact  law lb_section_base_exact : for + base : Nat for + off : Nat { lb_section_base ( Nat.add ( base , off ) , off ) == base : Nat }
@@ -1575,10 +1581,16 @@ fcb6af9172c87357  rr_dirty_mode_always_dirty  law rr_dirty_mode_always_dirty : f
 # promise rr_dirty_mode_always_dirty: RrModeDirty always selects Dirty scope (not StateOnly and not Full), regardless of unclean
 f4ab99670b9bfde2  rr_end_ok_clears_unclean_and_keeps_held  law rr_end_ok_clears_unclean_and_keeps_held : for + m : RrMode for + hw : Nat for + held : Nat for + u : Bool for + prompt : Nat for + gen : Nat for + slack : Nat for + max_ctx : Nat { Bool.and ( Bool.not ( rr_state_unclean ( rr_end_ok ( RrState { m , hw , held , u } , prompt , gen , slack , max_ctx ) ) ) , Nat.is_le ( held , rr_state_hw ( rr_end_ok ( RrState { m , hw , held , u } , prompt , gen , slack , max_ctx ) ) ) ) == True { } : Bool }
 # promise rr_end_ok_clears_unclean_and_keeps_held: rr_end_ok clears unclean and preserves kept dirty rows from before the request
+02cef989cf6e19a5  rr_end_ok_hw_covers_request  law rr_end_ok_hw_covers_request : for + m : RrMode for hw : Nat for + held : Nat for + u : Bool for + p : Nat for + g : Nat for + sl : Nat for + mc : Nat { Nat.is_le ( rr_high_water ( p , g , sl , mc ) , rr_state_hw ( rr_end_ok ( RrState { m , hw , held , u } , p , g , sl , mc ) ) ) == True { } : Bool }
+# promise rr_end_ok_hw_covers_request: after a successful request, kv_hw still covers every row that request wrote
+67af1d656e3d45e1  rr_end_ok_hw_within_ctx  law rr_end_ok_hw_within_ctx : for + m : RrMode for hw : Nat for + held : Nat for + u : Bool for + p : Nat for + g : Nat for + sl : Nat for + mc : Nat { Nat.is_le ( rr_state_hw ( rr_end_ok ( RrState { m , hw , held , u } , p , g , sl , mc ) ) , Nat.max ( held , mc ) ) == True { } : Bool }
+# promise rr_end_ok_hw_within_ctx: after a successful request, kv_hw stays within the larger of the rows held before it and max_ctx
 9036a753b443755f  rr_end_ok_mode_preserved  law rr_end_ok_mode_preserved : for + m : RrMode for hw : Nat for held : Nat for u : Bool for p : Nat for g : Nat for sl : Nat for mc : Nat { rr_state_mode ( rr_end_ok ( RrState { m , hw , held , u } , p , g , sl , mc ) ) == m : RrMode }
 # promise rr_end_ok_mode_preserved: rr_end_ok preserves the configured reset mode read back by rr_state_mode
 2e0a9223de61454e  rr_full_always_full  law rr_full_always_full : for + u : Bool { rr_scope ( RrModeFull { } , u ) == RrScopeFull { } : RrScope }
 # promise rr_full_always_full: full reset mode always produces full scope
+25a70edb452bd924  rr_full_mode_zeroes_both_rings  law rr_full_mode_zeroes_both_rings : for + u : Bool { rr_zero_both_rings ( rr_scope ( RrModeFull { } , u ) ) == True { } : Bool }
+# promise rr_full_mode_zeroes_both_rings: Full reset mode always clears both DeltaNet rings, not only ring 0
 4565c525242aac45  rr_gdn_full_covers_all_slots  law rr_gdn_full_covers_all_slots : for + one_bytes : Nat for + slots_m1 : Nat { Nat.is_le ( Nat.mul ( one_bytes , 1n + slots_m1 ) , rr_gdn_zero_bytes ( RrScopeFull { } , one_bytes , 1n + slots_m1 ) ) == True { } : Bool }
 # promise rr_gdn_full_covers_all_slots: Full scope covers at least every allocated slot of the DeltaNet ring
 8d193b24d1f5bc52  rr_gdn_zero_covers_slot0  law rr_gdn_zero_covers_slot0 : for + sc : RrScope for + one_bytes : Nat for + alloc_slots : Nat { Nat.is_le ( one_bytes , rr_gdn_zero_bytes ( sc , one_bytes , alloc_slots ) ) == True { } : Bool }
@@ -1587,6 +1599,8 @@ f4ab99670b9bfde2  rr_end_ok_clears_unclean_and_keeps_held  law rr_end_ok_clears_
 # promise rr_gdn_zero_within_alloc: DeltaNet reset bytes never exceed the tensor's own allocated ring bytes (`one_bytes * alloc_slots`)
 7e51a3cbd3659aa2  rr_head_dirty_covers_input  law rr_head_dirty_covers_input : for + dirty : Nat for + extra : Nat for + rb : Nat { Nat.is_le ( dirty , rr_head_dirty_rows ( Nat.add ( dirty , extra ) , dirty , rb ) ) == True { } : Bool }
 # promise rr_head_dirty_covers_input: HeadMajor dirty rows always cover all dirty rows whenever dirty <= max(1, rows)
+0027ff13965be4aa  rr_head_dirty_rows_block_aligned  law rr_head_dirty_rows_block_aligned : for + rows : Nat for + dirty : Nat for + bm1 : Nat { Bool.or ( Nat.is_eq ( Nat.mod ( rr_head_dirty_rows ( rows , dirty , 1n + bm1 ) , 1n + bm1 ) , 0n ) , Nat.is_eq ( rr_head_dirty_rows ( rows , dirty , 1n + bm1 ) , Nat.max ( 1n , rows ) ) ) == True { } : Bool }
+# promise rr_head_dirty_rows_block_aligned: HeadMajor dirty rows always end on a row-block boundary unless they reach max(1, rows)
 16d6c68b72025311  rr_head_dirty_within_rows  law rr_head_dirty_within_rows : for + rows : Nat for + dirty : Nat for + rb : Nat { Nat.is_le ( rr_head_dirty_rows ( rows , dirty , rb ) , Nat.max ( 1n , rows ) ) == True { } : Bool }
 # promise rr_head_dirty_within_rows: HeadMajor dirty rows stay within [0, max(1, rows)]
 4cb38753ade9a3b5  rr_head_full_span_strict  law rr_head_full_span_strict : for + rows : Nat { Bool.and ( rr_head_full_span ( rows , Nat.max ( 1n , rows ) ) , Bool.not ( rr_head_full_span ( rows , 0n ) ) ) == True { } : Bool }
