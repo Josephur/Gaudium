@@ -23,13 +23,14 @@
 //! folded through the verified rule (`verified/inkling2_mtpfile.bend`, `mtpf_step`): a file
 //! matches when it is a block drafter of one of the two layouts and its hidden size and
 //! vocabulary are the model's; among matching files the best precision rank wins, the first in
-//! that order on a tie.
+//! that order on a tie. Why a file does not serve the model is the same rule's (`mtpf_fit`),
+//! both in the search's refusal and when the chosen file's contract is read.
 
 use super::*;
 use crate::gguf::dequant::{rows_bf16_par, rows_f32};
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::verified::{
-    ik_bf16_bytes, mtpf_matches, mtpf_rank, mtpf_rows_fit, mtpf_step, MmpPick, MtpfPrecision,
+    ik_bf16_bytes, mtpf_fit, mtpf_rank, mtpf_rows_fit, mtpf_step, MmpPick, MtpfFit, MtpfPrecision,
 };
 use std::path::{Path, PathBuf};
 
@@ -154,23 +155,34 @@ fn facts(g: &Gguf) -> (bool, u64, u64, u64) {
     )
 }
 
-/// Why a candidate does not serve the model `t` (`None`: it does).
+/// Why a candidate does not serve the model `t` (`None`: it does), from the facts the search
+/// folds through `mtpf_step`.
 fn why_not(g: &Gguf, t: Target) -> Option<String> {
     let (drafter, hid, vocab, _) = facts(g);
-    if mtpf_matches(drafter, hid, t.hid, vocab, t.vocab) {
-        None
-    } else if !drafter {
-        Some(format!(
+    refusal(
+        g,
+        mtpf_fit(drafter, hid, t.hid, vocab, t.vocab),
+        hid,
+        vocab,
+        t,
+    )
+}
+
+/// The words for the verified reason `fit` a file of hidden size `hid` and vocabulary `vocab`
+/// does not serve the model `t` for (`None`: it serves it). Both numbers are in every size
+/// refusal.
+fn refusal(g: &Gguf, fit: MtpfFit, hid: u64, vocab: u64, t: Target) -> Option<String> {
+    match fit {
+        MtpfFit::MtpfServes => None,
+        MtpfFit::MtpfNotDrafter => Some(format!(
             "not a block drafter of this family (architecture '{}')",
             g.arch()
-        ))
-    } else if hid != t.hid {
-        Some(format!("hidden size {hid}, the model's is {}", t.hid))
-    } else {
-        Some(format!(
+        )),
+        MtpfFit::MtpfHidden => Some(format!("hidden size {hid}, the model's is {}", t.hid)),
+        MtpfFit::MtpfVocab => Some(format!(
             "vocabulary of {vocab} tokens, the model's has {}",
             t.vocab
-        ))
+        )),
     }
 }
 
@@ -223,26 +235,33 @@ fn shape_of(g: &Gguf, name: &str) -> Result<Vec<u64>, String> {
 /// against the model `t` (both numbers in every refusal).
 pub fn drafter_config(g: &Gguf, path: &Path, t: Target) -> Result<MtpConfig, String> {
     let bad = |what: String| format!("Inkling 2 drafter file {}: {what}", path.display());
-    let lay = layout(g).ok_or_else(|| {
-        bad(format!(
-            "not a block drafter of this family (architecture '{}')",
-            g.arch()
-        ))
-    })?;
     let need = |k: &str| -> Result<u64, String> {
         g.arch_kv(k)
             .and_then(|v| v.as_u64())
             .ok_or_else(|| bad(format!("metadata {ARCH}.{k} is missing or not a number")))
     };
-    let hid = need("embedding_length")?;
-    let vocab = vocab_of(g).ok_or_else(|| bad("no vocabulary size and no token list".into()))?;
-    if !mtpf_matches(true, hid, t.hid, vocab, t.vocab) {
-        return Err(bad(if hid != t.hid {
-            format!("hidden size {hid}, the model's is {}", t.hid)
-        } else {
-            format!("vocabulary of {vocab} tokens, the model's has {}", t.vocab)
-        }));
+    let lay = layout(g);
+    // the sizes are read as the contract of a file of the family's layout, where a missing one is
+    // an error of its own; a file of another layout is refused for that whatever it states
+    // (`mtpf_fit_not_drafter_exactly`), so its sizes are not read
+    let (hid, vocab) = match lay {
+        Some(_) => (
+            need("embedding_length")?,
+            vocab_of(g).ok_or_else(|| bad("no vocabulary size and no token list".into()))?,
+        ),
+        None => (0, 0),
+    };
+    let fit = mtpf_fit(lay.is_some(), hid, t.hid, vocab, t.vocab);
+    if let Some(why) = refusal(g, fit, hid, vocab, t) {
+        return Err(bad(why));
     }
+    // a file the verified rule serves is one of the family's layout (`mtpf_fit_serves_exactly`)
+    let lay = lay.ok_or_else(|| {
+        bad(format!(
+            "not a block drafter of this family (architecture '{}')",
+            g.arch()
+        ))
+    })?;
     let layers = need("block_count")?;
     let present = (0..=layers)
         .take_while(|l| g.tensor(&format!("blk.{l}.attn_q.weight")).is_some())

@@ -404,6 +404,22 @@ fn a_file_that_disagrees_is_refused_with_both_numbers() {
                     ..Toy::default()
                 }),
             ),
+            (
+                "other.gguf",
+                toy_bytes(&Toy {
+                    arch: "qwen3",
+                    hid: 256,
+                    ..Toy::default()
+                }),
+            ),
+            (
+                "both.gguf",
+                toy_bytes(&Toy {
+                    hid: 256,
+                    vocab: 9,
+                    ..Toy::default()
+                }),
+            ),
         ],
     );
     let cfg = |name: &str| {
@@ -412,6 +428,14 @@ fn a_file_that_disagrees_is_refused_with_both_numbers() {
     };
     assert!(cfg("hid.gguf").contains("hidden size 256, the model's is 128"));
     assert!(cfg("voc.gguf").contains("vocabulary of 9 tokens, the model's has 6"));
+    // a file of another layout is refused for that, whatever sizes it states
+    let e = cfg("other.gguf");
+    assert!(
+        e.contains("not a block drafter of this family (architecture 'qwen3')"),
+        "{e}"
+    );
+    // both sizes differ: today's order names the hidden size (`mtpf_fit_of`)
+    assert!(cfg("both.gguf").contains("hidden size 256, the model's is 128"));
     assert!(cfg("layers.gguf").contains("block_count is 3, the file holds 2 layers"));
     let e = cfg("mask.gguf");
     assert!(

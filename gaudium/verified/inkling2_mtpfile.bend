@@ -14,6 +14,9 @@
 #   - The choice is always the file just seen or the earlier choice (one of the candidates)
 #   - A stored table with fewer rows than the drafter reads, or more than the device tensor
 #     holds, is never taken
+#   - The reason a file is refused for (`mtpf_fit`) agrees with the rule: a file is reported as
+#     serving the model exactly when it matches the rule, as not a block drafter exactly when it
+#     isn't one, and for a size only when that size is not the model's
 
 import Base
 import nat_lemmas.bend as L
@@ -30,6 +33,14 @@ type MtpfPrecision is Data:
   MtpfF32{}
   MtpfQ8{}
   MtpfOther{}
+
+# Whether a candidate drafter file serves the model, and if not, which of the rule's three facts
+# it fails: the reason both the search and the contract check report.
+type MtpfFit is Data:
+  MtpfServes{}      # a block drafter of the family with the model's hidden size and vocabulary
+  MtpfNotDrafter{}  # not a block drafter of the family's layout
+  MtpfHidden{}      # its hidden size is not the model's
+  MtpfVocab{}       # its vocabulary is not the model's
 
 # ============================================================================
 # 2. The rule
@@ -59,6 +70,61 @@ def mtpf_matches(drafter: Bool, +hid: Nat, +model_hid: Nat, +vocab: Nat, +model_
 def mtpf_step(drafter: Bool, +hid: Nat, +model_hid: Nat, +vocab: Nat, +model_vocab: Nat, best: MP.MmpPick, +i: Nat, +rank: Nat) -> MP.MmpPick:
   MP.mmp_step(mtpf_matches(drafter, hid, model_hid, vocab, model_vocab), best, i, rank)
 
+# The fit of a candidate from the rule's three facts: a block drafter of the family (`drafter`),
+# the model's hidden size (`same_hid`) and the model's vocabulary (`same_vocab`). The layout is
+# read first (another file's sizes are not a drafter's), then the hidden size, then the vocabulary.
+def mtpf_fit_of(drafter: Bool, same_hid: Bool, same_vocab: Bool) -> MtpfFit:
+  match drafter:
+    case False{}:
+      MtpfNotDrafter{}
+    case True{}:
+      match same_hid:
+        case False{}:
+          MtpfHidden{}
+        case True{}:
+          match same_vocab:
+            case False{}:
+              MtpfVocab{}
+            case True{}:
+              MtpfServes{}
+
+# Why a candidate drafter file does not serve the model, or that it does, from the facts
+# `mtpf_matches` reads.
+def mtpf_fit(drafter: Bool, +hid: Nat, +model_hid: Nat, +vocab: Nat, +model_vocab: Nat) -> MtpfFit:
+  mtpf_fit_of(drafter, Nat.is_eq(hid, model_hid), Nat.is_eq(vocab, model_vocab))
+
+# The fit is a file that serves the model (the observers the fit laws are stated with).
+def mtpf_fit_serves(f: MtpfFit) -> Bool:
+  match f:
+    case MtpfServes{}:
+      True{}
+    case _:
+      False{}
+
+# The fit is a file refused as not a block drafter of the family.
+def mtpf_fit_not_drafter(f: MtpfFit) -> Bool:
+  match f:
+    case MtpfNotDrafter{}:
+      True{}
+    case _:
+      False{}
+
+# The fit is a file refused for its hidden size.
+def mtpf_fit_hidden(f: MtpfFit) -> Bool:
+  match f:
+    case MtpfHidden{}:
+      True{}
+    case _:
+      False{}
+
+# The fit is a file refused for its vocabulary.
+def mtpf_fit_vocab(f: MtpfFit) -> Bool:
+  match f:
+    case MtpfVocab{}:
+      True{}
+    case _:
+      False{}
+
 # Whether a table a drafter file stores with `rows` rows serves a device tensor of `cap` rows
 # of which the drafter reads the first `need`: the rows past the file's are never read.
 def mtpf_rows_fit(+rows: Nat, +need: Nat, +cap: Nat) -> Bool:
@@ -72,6 +138,48 @@ def mtpf_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
   match b:
     case True{}: {==}
     case False{}: {==}
+
+# The fit serves exactly when all three facts hold.
+def mtpf_fit_of_serves(a: Bool, b: Bool, c: Bool) -> {mtpf_fit_serves(mtpf_fit_of(a, b, c)) == Bool.and(a, Bool.and(b, c)) : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match c:
+            case False{}: {==}
+            case True{}: {==}
+
+# The fit refuses as not a drafter exactly when the file isn't one.
+def mtpf_fit_of_not_drafter(a: Bool, b: Bool, c: Bool) -> {mtpf_fit_not_drafter(mtpf_fit_of(a, b, c)) == Bool.not(a) : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match c:
+            case False{}: {==}
+            case True{}: {==}
+
+# With the model's hidden size, the fit never refuses for the hidden size.
+def mtpf_fit_of_same_hid(a: Bool, c: Bool) -> {mtpf_fit_hidden(mtpf_fit_of(a, True{}, c)) == False{} : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match c:
+        case False{}: {==}
+        case True{}: {==}
+
+# With the model's vocabulary, the fit never refuses for the vocabulary.
+def mtpf_fit_of_same_vocab(a: Bool, b: Bool) -> {mtpf_fit_vocab(mtpf_fit_of(a, b, True{})) == False{} : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match b:
+        case False{}: {==}
+        case True{}: {==}
 
 # 1 + r + e <= r never holds.
 def mtpf_le_over(+r: Nat, +e: Nat) -> {Nat.is_le(Nat.add(1n+r, e), r) == False{} : Bool}:
@@ -215,6 +323,62 @@ law mtpf_choice_is_candidate:
 
 def mtpf_choice_is_candidate(drafter, hid, model_hid, vocab, model_vocab, best, i, rank):
   MP.mmp_choice_is_candidate(mtpf_matches(drafter, hid, model_hid, vocab, model_vocab), best, i, rank)
+
+# promise: a candidate file is reported as serving the model exactly when it matches the selection rule (`mtpf_matches`), so every file the rule refuses has a reason and a file it can choose has none
+# harm: the file the search chose would be refused when its contract is read, or a file it passed over would be listed with no reason
+# catches: the vocabulary left out of the reason (a drafter file of another vocabulary reported as serving)
+law mtpf_fit_serves_exactly:
+  for drafter: Bool
+  for +hid: Nat
+  for +model_hid: Nat
+  for +vocab: Nat
+  for +model_vocab: Nat
+  {mtpf_fit_serves(mtpf_fit(drafter, hid, model_hid, vocab, model_vocab)) == mtpf_matches(drafter, hid, model_hid, vocab, model_vocab) : Bool}
+
+def mtpf_fit_serves_exactly(drafter, hid, model_hid, vocab, model_vocab):
+  mtpf_fit_of_serves(drafter, Nat.is_eq(hid, model_hid), Nat.is_eq(vocab, model_vocab))
+
+# promise: a file is refused as not a block drafter of the family exactly when it isn't one, whatever sizes it states
+# harm: a projector or a main model would be reported by a size it isn't held to, or a drafter of the wrong size as another kind of file
+# catches: the sizes checked before the layout (a file of another layout reported as a hidden-size mismatch)
+law mtpf_fit_not_drafter_exactly:
+  for drafter: Bool
+  for +hid: Nat
+  for +model_hid: Nat
+  for +vocab: Nat
+  for +model_vocab: Nat
+  {mtpf_fit_not_drafter(mtpf_fit(drafter, hid, model_hid, vocab, model_vocab)) == Bool.not(drafter) : Bool}
+
+def mtpf_fit_not_drafter_exactly(drafter, hid, model_hid, vocab, model_vocab):
+  mtpf_fit_of_not_drafter(drafter, Nat.is_eq(hid, model_hid), Nat.is_eq(vocab, model_vocab))
+
+# promise: a file whose hidden size is the model's is never refused for its hidden size
+# harm: a drafter of the right width would be reported as the wrong width, sending the fix to the wrong place
+# catches: a vocabulary mismatch reported as a hidden-size mismatch
+law mtpf_fit_hidden_real:
+  for drafter: Bool
+  for +hid: Nat
+  for +vocab: Nat
+  for +model_vocab: Nat
+  {mtpf_fit_hidden(mtpf_fit(drafter, hid, hid, vocab, model_vocab)) == False{} : Bool}
+
+def mtpf_fit_hidden_real(drafter, hid, vocab, model_vocab):
+  %Equal.sym(Bool, Nat.is_eq(hid, hid), True{}, MP.mmp_eq_refl(hid)) : {mtpf_fit_hidden(mtpf_fit_of(drafter, _, Nat.is_eq(vocab, model_vocab))) == False{} : Bool}
+  mtpf_fit_of_same_hid(drafter, Nat.is_eq(vocab, model_vocab))
+
+# promise: a file whose vocabulary is the model's is never refused for its vocabulary
+# harm: a drafter with the model's vocabulary would be reported as having another, sending the fix to the wrong place
+# catches: a hidden-size mismatch reported as a vocabulary mismatch
+law mtpf_fit_vocab_real:
+  for drafter: Bool
+  for +hid: Nat
+  for +model_hid: Nat
+  for +vocab: Nat
+  {mtpf_fit_vocab(mtpf_fit(drafter, hid, model_hid, vocab, vocab)) == False{} : Bool}
+
+def mtpf_fit_vocab_real(drafter, hid, model_hid, vocab):
+  %Equal.sym(Bool, Nat.is_eq(vocab, vocab), True{}, MP.mmp_eq_refl(vocab)) : {mtpf_fit_vocab(mtpf_fit_of(drafter, Nat.is_eq(hid, model_hid), _)) == False{} : Bool}
+  mtpf_fit_of_same_vocab(drafter, Nat.is_eq(hid, model_hid))
 
 # promise: a stored table with fewer rows than the drafter reads is never taken
 # harm: the recurrent head would read token rows past the end of the stored table
