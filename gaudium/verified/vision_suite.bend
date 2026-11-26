@@ -15,6 +15,7 @@
 # exited cleanly and passed.
 
 import Base
+import lemmas.bend as G
 
 # How one run of a suite row ended against the engine's own K=0 stream (classified by the shell
 # from the run's report: the token streams and, at a fork, its margin trace).
@@ -306,3 +307,42 @@ law vs_suite_needs_every_pass:
 def vs_suite_needs_every_pass(s, r):
   %Equal.sym(Bool, Bool.and(Nat.is_gt(r, 0n), False{}), False{}, vs_and_false_r(Nat.is_gt(r, 0n))) : {Bool.and(Nat.is_eq(r, s), _) == False{} : Bool}
   vs_and_false_r(Nat.is_eq(r, s))
+
+# LAW VS.18: identical tokens always pass identity, whether opt-in or default.
+# promise: VsSame always passes vs_identity_ok regardless of opt_in
+# catches: vs_identity_ok returns opt_in for VsSame{} instead of True{}
+law vs_same_passes:
+  for +opt_in: Bool
+  {vs_identity_ok(VsSame{}, opt_in) == True{} : Bool}
+
+def vs_same_passes(opt_in):
+  {==}
+
+# LAW VS.19: a properly traced BF16 tie on a properly marked opt-in method passes identity.
+# promise: vs_identity_ok passes a replayed, first-traced, all-tie fork when marked and opt-in
+# catches: vs_fork_outcome returns VsFork{} or vs_method_opt_in returns False{} when all inputs are True{}
+law vs_traced_tie_opt_in_passes:
+  {vs_identity_ok(vs_fork_outcome(True{}, True{}, True{}), vs_method_opt_in(True{}, True{})) == True{} : Bool}
+
+def vs_traced_tie_opt_in_passes():
+  {==}
+
+# LAW VS.20: a row whose identity, semantics, after-check, and exit all pass yields a passing row verdict.
+# promise: vs_row_verdict returns True{} when identity, semantic, after, and exit checks are all True{}
+# catches: vs_row_verdict or vs_row_ok always returns False{} even when all checks pass
+law vs_valid_row_passes:
+  {vs_row_verdict(vs_row_ok(True{}, True{}, True{}), True{}) == True{} : Bool}
+
+def vs_valid_row_passes():
+  {==}
+
+# LAW VS.21: any non-empty suite where every selected row ran and passed yields a passing suite verdict.
+# promise: vs_suite_ok passes whenever ran == selected >= 1 and all_passed is True{}
+# catches: vs_suite_ok rejects valid runs when selected == ran >= 1
+law vs_valid_suite_passes:
+  for +n_m1: Nat
+  {vs_suite_ok(1n+n_m1, 1n+n_m1, True{}) == True{} : Bool}
+
+def vs_valid_suite_passes(n_m1):
+  %Equal.sym(Bool, Nat.is_eq(1n+n_m1, 1n+n_m1), True{}, G.g_nat_eq_refl(1n+n_m1)) : {Bool.and(_, Bool.and(Nat.is_gt(1n+n_m1, 0n), True{})) == True{} : Bool}
+  {==}

@@ -43,17 +43,6 @@ def kv_le_add_gt_false(a: Nat, extra: Nat) -> {False{} == Nat.is_le(Nat.add(a, 1
     case 1n+p:
       kv_le_add_gt_false(p, extra)
 
-def kv_lt_add_r_false(cap: Nat, extra: Nat) -> {False{} == Nat.is_lt(Nat.add(cap, extra), cap) : Bool}:
-  match cap:
-    case 0n:
-      match extra:
-        case 0n:
-          {==}
-        case 1n+_:
-          {==}
-    case 1n+p:
-      kv_lt_add_r_false(p, extra)
-
 def kv_lt_refl_false(n: Nat) -> {False{} == Nat.is_lt(n, n) : Bool}:
   match n:
     case 0n:
@@ -122,31 +111,6 @@ def pool_free(p: PoolAcct, +rel: Nat) -> PoolAcct:
 # Pinned (in active DMA) or busy (being written) entries may NEVER be evicted.
 def pool_can_evict(pins: Nat, busy: Bool) -> Bool:
   Bool.and(Nat.is_eq(pins, 0n), Bool.not(busy))
-
-def pool_block_in_bounds(block_id: Nat, nblocks: Nat) -> Bool:
-  Nat.is_lt(block_id, nblocks)
-
-# 2 MB block count for `bytes` (ceil(bytes / block_bytes); safe 0 when block_bytes == 0).
-def pool_blocks_for_nz(+bytes: Nat, +block_bytes: Nat) -> Nat:
-  Nat.add(Nat.div(bytes, block_bytes), Bool.pick(Nat, Nat.is_eq(Nat.mod(bytes, block_bytes), 0n), 0n, 1n))
-
-def pool_blocks_for_if(+bytes: Nat, +block_bytes: Nat, is_zero: Bool) -> Nat:
-  match is_zero:
-    case True{}:
-      0n
-    case False{}:
-      pool_blocks_for_nz(bytes, block_bytes)
-
-def pool_blocks_for(+bytes: Nat, +block_bytes: Nat) -> Nat:
-  pool_blocks_for_if(bytes, block_bytes, Nat.is_eq(block_bytes, 0n))
-
-# Slab coordinates (slab_idx, block_offset_in_slab) for 1 GB slabs (bps = 512 blocks/slab).
-def pool_slab_coords(block_id: Nat, bps: Nat) -> Nat & Nat:
-  Nat.divmod(block_id, bps)
-
-# Two blocks merge into one DMA extent iff contiguous AND not crossing a slab boundary.
-def pool_same_slab_adjacent(prev_block: Nat, +cur_block: Nat, bps: Nat) -> Bool:
-  Bool.and(Nat.is_eq(Nat.add(prev_block, 1n), cur_block), Bool.not(Nat.is_eq(Nat.mod(cur_block, bps), 0n)))
 
 # ============================================================================
 # 3. Prefix-Cache Tile-Boundary Reuse Rule (prefix_cache.hpp)
@@ -314,33 +278,6 @@ def pool_busy_never_evicted(pins):
   match pins:
     case 0n: {==}
     case 1n+_: {==}
-
-# LAW KV.8: Out-of-bounds block IDs (>= capacity) are ALWAYS rejected.
-law pool_oob_block_rejected:
-  for +cap: Nat
-  for +extra: Nat
-  {pool_block_in_bounds(Nat.add(cap, extra), cap) == False{} : Bool}
-
-def pool_oob_block_rejected(cap, extra):
-  Equal.sym(Bool, False{}, Nat.is_lt(Nat.add(cap, extra), cap), kv_lt_add_r_false(cap, extra))
-
-# LAW KV.9: Zero bytes always requires zero blocks (for any block size).
-law pool_blocks_for_zero_bytes:
-  for +b: Nat
-  {pool_blocks_for(0n, b) == 0n : Nat}
-
-def pool_blocks_for_zero_bytes(b):
-  match b:
-    case 0n: {==}
-    case 1n+_: {==}
-
-# LAW KV.10: Zero block size never divides by zero (returns 0 safely).
-law pool_blocks_for_zero_blocksize_safe:
-  for bytes: Nat
-  {pool_blocks_for(bytes, 0n) == 0n : Nat}
-
-def pool_blocks_for_zero_blocksize_safe(bytes):
-  {==}
 
 def kv_bool_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
   match b:

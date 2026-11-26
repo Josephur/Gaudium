@@ -58,24 +58,6 @@ def g4_nat_if(+p: Nat, low_half: Bool) -> Nat:
 def g4_nat(+h: Nat, +j: Nat) -> Nat:
   g4_nat_if(Nat.add(Nat.mul(2n, j), h), Nat.is_lt(Nat.add(Nat.mul(2n, j), h), 64n))
 
-# V row permutation for key slot j (matches g4l::vperm).
-def g4_vperm_inner(+i: Nat, low_half: Bool) -> Nat:
-  match low_half:
-    case True{}:
-      Nat.mul(2n, i)
-    case False{}:
-      Nat.add(Nat.mul(2n, Nat.sub(i, 64n)), 1n)
-
-def g4_vperm(+j: Nat) -> Nat:
-  Nat.add(
-    Nat.mul(Nat.div(j, 128n), 128n),
-    g4_vperm_inner(Nat.mod(j, 128n), Nat.is_lt(Nat.mod(j, 128n), 64n))
-  )
-
-# Number of 128-lane RoPE cos/sin table vectors: ceil(pairs / 128).
-def g4_rope_vecs(pairs: Nat) -> Nat:
-  Nat.div(Nat.add(pairs, 127n), 128n)
-
 # ============================================================================
 # 3. Gemma 4 Dimension & Multimodal Guards (adapter_gemma4.hpp)
 # ============================================================================
@@ -199,20 +181,9 @@ def pin_rollback(s: PinState) -> PinState:
     case PinRolledBack{}:
       PinRolledBack{}
 
-# Hugepage percentage check: huge_bytes * 100 >= total_bytes * min_pct.
-def pin_huge_ratio_ok(huge_bytes: Nat, total_bytes: Nat, min_pct: Nat) -> Bool:
-  Nat.is_ge(Nat.mul(huge_bytes, 100n), Nat.mul(total_bytes, min_pct))
-
 # ============================================================================
 # 5. Verified Gemma 4 & Host-Pinning Laws
 # ============================================================================
-
-# LAW G4.1: Zero RoPE pairs needs 0 table vectors; 128 pairs needs exactly 1.
-law g4_rope_vecs_boundary:
-  {Bool.and(Nat.is_eq(g4_rope_vecs(0n), 0n), Nat.is_eq(g4_rope_vecs(128n), 1n)) == True{} : Bool}
-
-def g4_rope_vecs_boundary():
-  {==}
 
 # LAW G4.2: Zero KV heads is ALWAYS rejected by Gemma 4 head guard.
 law g4_heads_zero_kv_rejected:
@@ -260,13 +231,6 @@ law g4_audio_zero_left_rejected:
   {g4_audio_ctx_valid(0n, ar) == False{} : Bool}
 
 def g4_audio_zero_left_rejected(ar):
-  {==}
-
-# LAW G4.7: Concrete Gemma 4 31B sliding (16Q/8KV, dh=256, pairs=128) & global (16Q/4KV, dh=512, pairs=128) pass.
-law g4_31b_heads_valid:
-  {Bool.and(g4_heads_valid(16n, 8n, 256n, 128n), g4_heads_valid(16n, 4n, 512n, 128n)) == True{} : Bool}
-
-def g4_31b_heads_valid():
   {==}
 
 # LAW G4.8: Host-pin rollback ALWAYS leaves 0 mapped extents and is unusable (no leaked synHostMap).

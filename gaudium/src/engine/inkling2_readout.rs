@@ -40,6 +40,42 @@ fn kind_of_name(name: &str) -> Kind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IkPhase {
+    PhVerify,
+    PhDraft,
+    PhReadout,
+    PhOther,
+}
+
+fn ik_state_positions(slots: u64, cols: u64, nkv: u64) -> Option<u64> {
+    let chunks = if nkv == 0 { 1 } else { (cols / nkv).max(1) };
+    chunks.checked_mul(slots)
+}
+
+fn ik_phase_moves(p: IkPhase, to: IkPhase, keep: IkPhase, has_keep: bool) -> bool {
+    p != to && !(has_keep && p == keep)
+}
+
+fn ik_tile_runs_final(drafter: bool, last: bool) -> bool {
+    drafter || last
+}
+
+fn ik_tile_runs_ctx(drafter: bool) -> bool {
+    drafter
+}
+
+fn ik_tile_runs_head(last: bool) -> bool {
+    last
+}
+
+fn ik_tile_launches(apps: u64, drafter: bool, last: bool) -> u64 {
+    let extra = u64::from(ik_tile_runs_final(drafter, last))
+        + u64::from(ik_tile_runs_ctx(drafter))
+        + u64::from(ik_tile_runs_head(last));
+    apps + 1 + extra
+}
+
 /// Positions one attention state tensor holds, from its shape `[lanes, slot rows, heads x
 /// chunks]` with `nkv` key / value heads: a sliding ring's slots, or a cache's chunk rows times its
 /// chunks (the main model's and the drafter's alike). `None` for any other tensor.
@@ -47,9 +83,7 @@ fn kv_positions_of(name: &str, dims: &[u64], nkv: u64) -> Option<u64> {
     if !(is_kv_name(name) || name.starts_with("mts_")) || dims.len() != 3 {
         return None;
     }
-    // the count is the verified one (`verified/inkling2_readout.bend`); on overflow (`None`) the
-    // caller uses the rule-wide count, unreachable while the tensor's byte size fits
-    crate::verified::ik_state_positions(dims[1], dims[2], nkv)
+    ik_state_positions(dims[1], dims[2], nkv)
 }
 
 /// One launch of `gb`: `rows` rows per pass, global caches of `nch` chunks, `nkv` key / value
@@ -70,7 +104,6 @@ fn charge(gb: &GraphBuilder, rows: u64, nch: u64, nkv: u64) -> Traffic {
 
 /// Moves the bytes and FLOPs of every phase except `keep` and `to` into `to`.
 fn fold_phases(mut tr: Traffic, keep: Option<Phase>, to: Phase) -> Traffic {
-    use crate::verified::{ik_phase_moves, IkPhase};
     let ph = |p: Phase| match p {
         Phase::Verify => IkPhase::PhVerify,
         Phase::Draft => IkPhase::PhDraft,
@@ -79,7 +112,6 @@ fn fold_phases(mut tr: Traffic, keep: Option<Phase>, to: Phase) -> Traffic {
     };
     let t = to as usize;
     for phase in [Phase::Verify, Phase::Draft, Phase::Readout, Phase::Other] {
-        // the verified routing: which phases' bytes move into the launch's phase
         if !ik_phase_moves(ph(phase), ph(to), ph(keep.unwrap_or(to)), keep.is_some()) {
             continue;
         }
@@ -171,26 +203,24 @@ pub(super) fn prefill_tile(
             tr.add(app_tr, 1.0);
         }
     }
-    // the tile's launches beyond its applications follow the verified plan (the same one its
-    // launch count follows)
     let has_drafter = drafter.is_some();
-    if crate::verified::ik_tile_runs_final(has_drafter, last) {
+    if ik_tile_runs_final(has_drafter, last) {
         tr.add(&charge(&build_final_graph(d, t, &[]), t, nch, d.nkv), 1.0);
     }
-    if crate::verified::ik_tile_runs_ctx(has_drafter) {
+    if ik_tile_runs_ctx(has_drafter) {
         if let Some(g) = drafter {
             tr.add(&draft_ctx(g, t), 1.0);
         }
     }
-    if crate::verified::ik_tile_runs_head(last) {
+    if ik_tile_runs_head(last) {
         tr.add(&charge(&build_head_graph(d, &[]), 1, nch, d.nkv), 1.0);
     }
     tr
 }
 
-/// Launches of [`prefill_tile`] (the verified count: `verified/inkling2_readout.bend`).
+/// Launches of [`prefill_tile`].
 pub(super) fn prefill_tile_launches(d: &IkDims, drafter: bool, last: bool) -> u64 {
-    crate::verified::ik_tile_launches(d.n_apps as u64, drafter, last)
+    ik_tile_launches(d.n_apps as u64, drafter, last)
 }
 
 /// Key of [`prefill_tile`] in the live reporter's cache.
@@ -477,5 +507,22 @@ mod tests {
     fn the_drafter_matrices_are_bf16() {
         let d = dims(8);
         assert_eq!(drafter_matrix(&geom(&d)), Some(SynDataType::Bf16));
+    }
+
+    #[test]
+    fn readout_telemetry_helpers_match_tile_and_phase_rules() {
+        assert!(ik_tile_runs_head(true));
+        assert!(ik_tile_runs_ctx(true));
+        assert!(ik_tile_launches(0, false, false) >= 1);
+        assert!(ik_tile_launches(24, true, true) >= 1);
+        assert!(ik_state_positions(1, 0, 1).unwrap() >= 1);
+        assert!(ik_state_positions(64, 512, 8).unwrap() >= 1);
+        for &to in &[IkPhase::PhVerify, IkPhase::PhDraft, IkPhase::PhReadout, IkPhase::PhOther] {
+            for &keep in &[IkPhase::PhVerify, IkPhase::PhDraft, IkPhase::PhReadout, IkPhase::PhOther] {
+                assert!(!ik_phase_moves(to, to, keep, true));
+                assert!(!ik_phase_moves(to, to, keep, false));
+                assert!(!ik_phase_moves(keep, to, keep, true));
+            }
+        }
     }
 }

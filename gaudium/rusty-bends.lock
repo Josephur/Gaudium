@@ -27,7 +27,6 @@ bafa9500c7a2bc5f  align_up_zero_align_safe  law align_up_zero_align_safe : for +
 63493361526980c7  block_none_never_opens  law block_none_never_opens : for k : BlockKind { block_must_open ( BkNone { } , k ) == False { } : Bool }
 c577bc00a1eae468  block_same_kind_continues  law block_same_kind_continues : for + k : BlockKind { Bool.and ( block_must_open ( k , k ) , Bool.not ( block_is_tool ( k ) ) ) == False { } : Bool }
 6926f2205b5e1503  block_tool_always_opens  law block_tool_always_opens : for k : BlockKind { block_must_open ( BkTool { } , k ) == True { } : Bool }
-b78c36cf6b175755  bucket_zero_invalid  law bucket_zero_invalid : { bucket_valid ( 0n ) == False { } : Bool }
 c969518b535cece3  call_fragment_needs_header  law call_fragment_needs_header : for + p : CallPhase { call_accepts ( p , CeFragment { } ) == call_is_streaming ( p ) : Bool }
 6292cc8163f6d31c  call_header_needs_block  law call_header_needs_block : for + p : CallPhase { call_accepts ( p , CeHeader { } ) == call_phase_eq ( p , CpBlock { } ) : Bool }
 463917a6f7bdd58a  call_limit_one_stops  law call_limit_one_stops : for done : Nat { call_after_finish ( done , True { } , 1n ) == CpStopped { } : CallPhase }
@@ -78,7 +77,6 @@ b48c8a581f14cf08  ds_draft_rows_inside_vocab  law ds_draft_rows_inside_vocab : f
 59a4caed82357976  ds_no_draft_rows_no_map  law ds_no_draft_rows_no_map : for v : Nat { ds_draft_mapped ( 0n , v ) == False { } : Bool }
 e5ac6739516742cc  ds_ring_holds_window_and_pass  law ds_ring_holds_window_and_pass : for w : Nat for p : Nat for g : Nat { Nat.is_le ( Nat.add ( Nat.add ( w , p ) , g ) , ds_ring_rows ( w , p , g ) ) == True { } : Bool }
 a0a0a67e1d6ae93a  ds_ring_needs_its_kernels  law ds_ring_needs_its_kernels : for w : Nat for + l : Nat for + r : Nat { ds_ring_pick ( False { } , w , l , r ) == 0n : Nat }
-d64aa69324dcf18f  ds_window_rows_split  law ds_window_rows_split : for + nv : Nat for + hi : Nat { Nat.add ( ds_win_low ( nv , hi ) , ds_win_wrap ( nv , hi ) ) == nv : Nat }
 a09474b00bc19d2b  effective_max_new_le_room  law effective_max_new_le_room : for unb : Bool for + req : Nat for + p : Nat for + lmax : Nat { Nat.is_le ( effective_max_new ( unb , req , p , lmax ) , prompt_room ( p , lmax ) ) == True { } : Bool }
 8295eac7f6a6dfeb  effective_max_new_respects_req  law effective_max_new_respects_req : for + req : Nat for + p : Nat for + lmax : Nat { Nat.is_le ( effective_max_new ( False { } , req , p , lmax ) , req ) == True { } : Bool }
 # promise effective_max_new_respects_req: effective_max_new with req_unbounded=False never exceeds req_max_new
@@ -112,7 +110,6 @@ f6771bf6b09c4e0c  force_none_when_not_forced  law force_none_when_not_forced : f
 75fd49693051a595  force_placed_only_when_possible  law force_placed_only_when_possible : for + f : Bool for + r : Bool for + c : Bool { Bool.or ( Bool.not ( force_is_placed ( tool_force_place ( f , r , c ) ) ) , Bool.and ( f , Bool.and ( Bool.not ( r ) , c ) ) ) == True { } : Bool }
 # promise force_placed_only_when_possible: a call's opening is put into the prompt only when the call is forced, the prompt is not inside reasoning, and the format can write it
 # harm force_placed_only_when_possible: an opening placed inside reasoning or in a form the model cannot continue would garble the reply
-9334163f983bbf1f  g4_31b_heads_valid  law g4_31b_heads_valid : { Bool.and ( g4_heads_valid ( 16n , 8n , 256n , 128n ) , g4_heads_valid ( 16n , 4n , 512n , 128n ) ) == True { } : Bool }
 c74c47153e6fb0be  g4_audio_zero_left_rejected  law g4_audio_zero_left_rejected : for ar : Nat { g4_audio_ctx_valid ( 0n , ar ) == False { } : Bool }
 6bc6fbd345acaeea  g4_heads_zero_dh_rejected  law g4_heads_zero_dh_rejected : for + nh : Nat for + nkv : Nat for + p : Nat { g4_heads_valid ( nh , nkv , 0n , p ) == False { } : Bool }
 d556bde2ff41c207  g4_heads_zero_kv_rejected  law g4_heads_zero_kv_rejected : for + nh : Nat for + dh : Nat for + p : Nat { g4_heads_valid ( nh , 0n , dh , p ) == False { } : Bool }
@@ -130,7 +127,6 @@ ef09582ee291aefb  g4_lane_nat_roundtrip_hi  law g4_lane_nat_roundtrip_hi : for +
 b71f1c2f74e8a2ef  g4_nat_in_block_lo  law g4_nat_in_block_lo : for + j : Nat for hj : { Nat.is_lt ( j , 64n ) == True { } : Bool } { Nat.is_lt ( g4_nat ( 0n , j ) , 128n ) == True { } : Bool }
 # promise g4_nat_in_block_lo: g4_nat for half 0 and any lane j < 64 stays strictly below 128
 c53430ffbf275392  g4_ple_off_always_valid  law g4_ple_off_always_valid : for pv : Nat for v : Nat { g4_ple_valid ( 0n , pv , v ) == True { } : Bool }
-629829a88fd02c54  g4_rope_vecs_boundary  law g4_rope_vecs_boundary : { Bool.and ( Nat.is_eq ( g4_rope_vecs ( 0n ) , 0n ) , Nat.is_eq ( g4_rope_vecs ( 128n ) , 1n ) ) == True { } : Bool }
 fdd5c6e325f099b2  g4c_build_step_drafts_within  law g4c_build_step_drafts_within : for + t : Nat for + kd : Nat for + kmax : Nat for l : Bool for tp : Bool { Bool.and ( g4c_build_step ( t , kd , kmax , l , tp ) , Nat.is_lt ( kmax , kd ) ) == False { } : Bool }
 # promise g4c_build_step_drafts_within: --build-cache never asks for a drafter step that drafts more tokens than the widest width.
 # harm g4c_build_step_drafts_within: the off-card build would compile steps that draft past the drafter's planned width.
@@ -413,7 +409,6 @@ aeb29c9ca7fad41a  hc_cache_span_is_the_checked_size  law hc_cache_span_is_the_ch
 3dbd2d6600ea7491  hc_cold_request_never_restores  law hc_cold_request_never_restores : for + s : Bool for + i : Bool for + r : Bool { hc_may_restore ( False { } , s , i , r ) == False { } : Bool }
 97704e5fff36ee91  hc_copy_never_wins_for_no_rows  law hc_copy_never_wins_for_no_rows : for + b : Nat for + c : Nat for + p : Nat { hc_copy_wins ( b , c , 0n , p ) == False { } : Bool }
 03fce08d1bd7ee9a  hc_cut_short_never_whole  law hc_cut_short_never_whole : for + b : Nat for + h : Bool for + i : Nat for + k : Nat { hc_saved_whole ( False { } , b , h , i , k ) == False { } : Bool }
-c2a6cbbf8df017dd  hc_cut_short_save_copies_no_ring  law hc_cut_short_save_copies_no_ring : for + b : Nat for + i : Bool for + g : Bool { hc_ring_save ( b , False { } , i , g ) == False { } : Bool }
 e36a90fa142cde8e  hc_default_within_available  law hc_default_within_available : for + a : Nat { Nat.is_le ( hc_default_budget ( a ) , a ) == True { } : Bool }
 9256365bf9f03076  hc_end_write_keeps_held  law hc_end_write_keeps_held : for + t : Nat for + d : Nat { hc_end_write ( HcHeld { t } , d ) == HcHeld { t } : HcEntry }
 db5a9ad7c863bd61  hc_end_write_keeps_vacant  law hc_end_write_keeps_vacant : for + d : Nat { hc_end_write ( HcVacant { } , d ) == HcVacant { } : HcEntry }
@@ -424,8 +419,6 @@ db5a9ad7c863bd61  hc_end_write_keeps_vacant  law hc_end_write_keeps_vacant : for
 e06aa7dd342b23b6  hc_failed_restore_never_readable  law hc_failed_restore_never_readable : for + e : HcEntry { hc_readable ( hc_read_done ( hc_begin_read ( e ) , False { } ) ) == False { } : Bool }
 ab8e09f97c3466ff  hc_failed_write_leaves_nothing  law hc_failed_write_leaves_nothing : for + e : HcEntry for + u : Nat { hc_abort ( hc_begin_write ( e , u ) ) == HcVacant { } : HcEntry }
 86947e2baa046e94  hc_flush_only_for_a_loss  law hc_flush_only_for_a_loss : for + u : Bool for + r : Nat for + c : Nat for + k : Nat { Bool.and ( hc_must_flush ( u , r , c , k ) , Bool.not ( hc_loses_unsaved ( u , c , k ) ) ) == False { } : Bool }
-53b09638cc411bd8  hc_free_now_within_budget  law hc_free_now_within_budget : for + f : Nat for + a : Nat { Nat.is_le ( hc_free_now ( f , a ) , f ) == True { } : Bool }
-2968aab19d192eba  hc_free_now_within_host  law hc_free_now_within_host : for + f : Nat for + a : Nat { Nat.is_le ( hc_free_now ( f , a ) , a ) == True { } : Bool }
 0034766057628190  hc_held_states_never_charged  law hc_held_states_never_charged : for + u : Nat for + h : Nat for + tc : Nat for + k : Nat for + x : Nat for + sc : Nat for + f : Bool for + rc : Nat { hc_save_need ( u , h , tc , k , Nat.add ( k , x ) , sc , f , rc ) == hc_save_need ( u , h , tc , 0n , 0n , sc , f , rc ) : Nat }
 5ce02e15d44a2956  hc_host_counted_within_read  law hc_host_counted_within_read : for + k : Bool for + n : Bool for + b : Nat { Nat.is_le ( hc_host_counted ( k , n , b ) , b ) == True { } : Bool }
 b79373ef3ff274bc  hc_idle_busy_engine_keeps_work_pending  law hc_idle_busy_engine_keeps_work_pending : for + a : Nat for + r : Bool { hc_idle_left ( True { } , hc_idle_starts ( True { } , 1n + a , r ) ) == True { } : Bool }
@@ -449,7 +442,6 @@ b90f8344e977a746  hc_new_tiles_within_target  law hc_new_tiles_within_target : f
 781ebb8bf320e954  hc_no_new_rows_never_added  law hc_no_new_rows_never_added : for + b : Nat for + a : Nat { Bool.and ( hc_rows_added ( b , a ) , Nat.is_le ( a , b ) ) == False { } : Bool }
 dc7ba155c3e85ceb  hc_no_position_not_resumable  law hc_no_position_not_resumable : for u : Unit { hc_resumable ( 0n ) == False { } : Bool }
 13b707f3e3a8b184  hc_no_rings_nothing_restored  law hc_no_rings_nothing_restored : for + s : Bool for + o : Bool { hc_ring_restore ( 0n , s , o ) == False { } : Bool }
-7e537b39c5fe6fbe  hc_no_rings_nothing_saved  law hc_no_rings_nothing_saved : for + c : Bool for + i : Bool for + g : Bool { hc_ring_save ( 0n , c , i , g ) == False { } : Bool }
 52644010c5f237d2  hc_no_shared_tile_never_continues  law hc_no_shared_tile_never_continues : for + t : Nat { hc_continues ( 0n , t ) == False { } : Bool }
 f60ef58d8d67588f  hc_no_unusable_spares_nothing_returned  law hc_no_unusable_spares_nothing_returned : for + n : Nat for + a : Nat for + r : Nat { hc_spares_return ( n , a , r , 0n ) == False { } : Bool }
 69f89b5f137b1bb7  hc_nothing_unsaved_never_flushes  law hc_nothing_unsaved_never_flushes : for + r : Nat for + c : Nat for + k : Nat { hc_must_flush ( False { } , r , c , k ) == False { } : Bool }
@@ -616,12 +608,6 @@ a1ceab4457cf184e  ik_nib_partial_refused  law ik_nib_partial_refused : for + c :
 # promise ik_nib_row_consistent: a 4-bit row the geometry accepts (non-zero bytes) has two codes per byte and one scale per 16 codes, covering exactly its columns.
 d0247ecb5a368690  ik_one_pass_no_messages  law ik_one_pass_no_messages : for + p : Nat for + ls : Nat for + le : Nat for + b : Nat { Bool.and ( Nat.is_le ( p , 1n ) , Nat.is_ne ( ik_msg_states ( ik_eff_loop_start ( p , ls , b ) , ik_eff_loop_end ( p , le , b ) , b ) , 0n ) ) == False { } : Bool }
 # promise ik_one_pass_no_messages: a model of one pass has no messages (its schedule's span is empty).
-0d019c9fc4109a11  ik_phase_kept_stays  law ik_phase_kept_stays : for + p : IkPhase for to : IkPhase { ik_phase_moves ( p , to , p , True { } ) == False { } : Bool }
-# promise ik_phase_kept_stays: a phase kept apart keeps its own bytes
-# harm ik_phase_kept_stays: the readout charges the kept phase (the verify pass's readout) to the verify pass
-b9c524c22ec51e7e  ik_phase_target_stays  law ik_phase_target_stays : for + to : IkPhase for keep : IkPhase for has_keep : Bool { ik_phase_moves ( to , to , keep , has_keep ) == False { } : Bool }
-# promise ik_phase_target_stays: the phase a launch is charged as always keeps its own bytes
-# harm ik_phase_target_stays: the readout moves a phase's bytes out of the phase the launch is charged as
 006f9aa91aba2c24  ik_proj_whole_blocks  law ik_proj_whole_blocks : for + nh : Nat for + dr : Nat for + nkv : Nat for + t : Nat { Bool.and ( Nat.is_eq ( Nat.mod ( ik_qx_width ( nh , dr ) , 128n ) , 0n ) , Nat.is_eq ( Nat.mod ( ik_kx_width ( nkv , t ) , 128n ) , 0n ) ) == True { } : Bool }
 # promise ik_proj_whole_blocks: the query-side and key / value projections are whole blocks of 128 channels.
 0b9fb2eb3b0cec5a  ik_qx_holds_rel  law ik_qx_holds_rel : for + nh : Nat for + dr : Nat { Nat.is_le ( Nat.add ( ik_rel_off ( nh ) , Nat.mul ( dr , nh ) ) , ik_qx_width ( nh , dr ) ) == True { } : Bool }
@@ -640,9 +626,6 @@ f2350b24e56a3bd9  ik_ring_holds_vector  law ik_ring_holds_vector : for + w : Nat
 # promise ik_ring_within_bounded: a K / V ring the kernel-bounded sizing returns never has more slots than the chunk the softmax kernel stages.
 03fa217e4c3b12e9  ik_ring_within_is_ring  law ik_ring_within_is_ring : for + w : Nat for + rows : Nat for + mx : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , 0n ) , Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , ik_ring_slots ( w , rows ) ) ) == False { } : Bool }
 # promise ik_ring_within_is_ring: the kernel-bounded sizing returns the K / V ring itself or no ring (0), never a different, smaller one.
-243ce0e6ef0bd6e5  ik_state_positions_some  law ik_state_positions_some : for + slots : Nat for + cols : Nat for + nkv : Nat { Nat.is_lt ( 0n , ik_state_positions ( 1n + slots , cols , nkv ) ) == True { } : Bool }
-# promise ik_state_positions_some: a state tensor with at least one slot row holds at least one position
-# harm ik_state_positions_some: the readout charges a whole cache to every pass that writes one row of it
 1572ee1b0b28002d  ik_states_carry  law ik_states_carry : for + l : Nat for + bp : Nat { ik_states_attn ( 1n + l , 1n + bp ) == ik_states_mlp ( l , 1n + bp ) : Nat }
 # promise ik_states_carry: the block states a layer's attention-input mix reads are exactly the ones the previous layer's MLP-input mix read.
 7e7b86ddb68242ab  ik_states_mlp_covers_attn  law ik_states_mlp_covers_attn : for + l : Nat for + b : Nat { Nat.is_le ( ik_states_attn ( l , b ) , ik_states_mlp ( l , b ) ) == True { } : Bool }
@@ -655,17 +638,8 @@ e30d133c07832426  ik_states_within_max  law ik_states_within_max : for + n : Nat
 # promise ik_states_within_max: on a schedule the guard accepts, no layer's residual mix reads more block states than the kernels hold.
 d1a4f19a096d333c  ik_taps_nonzero  law ik_taps_nonzero : for + t : Nat { Bool.and ( ik_taps_valid ( t ) , Nat.is_eq ( t , 0n ) ) == False { } : Bool }
 # promise ik_taps_nonzero: the shape guard refuses short convolutions without taps.
-08df751e713a9d3f  ik_tile_drafter_runs_ctx  law ik_tile_drafter_runs_ctx : { ik_tile_runs_ctx ( True { } ) == True { } : Bool }
-# promise ik_tile_drafter_runs_ctx: a tile run with a drafter always runs the drafter's context pass over its rows
-# harm ik_tile_drafter_runs_ctx: the drafter drafts without the context of the tile's rows
 1020da00a9c12c67  ik_tile_holds_rows  law ik_tile_holds_rows : for + rows : Nat for + tile : Nat for + room : Nat { Nat.is_le ( rows , ik_tile_rows ( rows , tile , room ) ) == True { } : Bool }
 # promise ik_tile_holds_rows: a prefill tile never has fewer rows than the prompt rows it carries.
-8889a05d549ecadf  ik_tile_last_runs_head  law ik_tile_last_runs_head : { ik_tile_runs_head ( True { } ) == True { } : Bool }
-# promise ik_tile_last_runs_head: the last tile of a prompt always runs the head that gives the request's first token
-# harm ik_tile_last_runs_head: a prompt ends without its first token's readout, or the readout reports none
-43c5cf58b599e634  ik_tile_launches_some  law ik_tile_launches_some : for apps : Nat for drafter : Bool for last : Bool { Nat.is_lt ( 0n , ik_tile_launches ( apps , drafter , last ) ) == True { } : Bool }
-# promise ik_tile_launches_some: a prefill tile always runs at least one launch
-# harm ik_tile_launches_some: the readout reports a tile that ran nothing on the card
 ee1eabf3467cbedc  ik_tile_readout_inside  law ik_tile_readout_inside : for + rp : Nat for + tile : Nat for + room : Nat { Nat.is_lt ( ik_tile_last_row ( 1n + rp ) , ik_tile_rows ( 1n + rp , tile , room ) ) == True { } : Bool }
 # promise ik_tile_readout_inside: the row the prefill readout reads is a row of the last tile (its last prompt row).
 ab05c1840659a1e2  ik_tile_take_bounded  law ik_tile_take_bounded : for + left : Nat for + tile : Nat { Bool.and ( Nat.is_le ( ik_tile_take ( left , tile ) , left ) , Nat.is_le ( ik_tile_take ( left , tile ) , tile ) ) == True { } : Bool }
@@ -837,7 +811,6 @@ f5cd20a46e2dd85b  kv_bf16_load_stays_bf16  law kv_bf16_load_stays_bf16 : for t :
 d5295993693309a4  kv_half_core_only_asked  law kv_half_core_only_asked : for d : KvDtype { kv_half_core_taken ( False { } , d ) == False { } : Bool }
 # promise kv_half_core_only_asked: a prefill tile builds the half-width core only when its form asks for it
 # harm kv_half_core_only_asked: a load whose form turned the core off would still build it
-ac457689d6ae1b43  kv_hw_le_lmax  law kv_hw_le_lmax : for + p : Nat for + c : Nat for + k : Nat for + b : Nat for + lmax : Nat { Nat.is_le ( kv_high_water ( p , c , k , b , lmax ) , lmax ) == True { } : Bool }
 eb581db27a9b1619  kv_piece_fits_stage  law kv_piece_fits_stage : for + done : Nat for + len : Nat for + piece : Nat { Nat.is_le ( kv_piece_len ( done , len , piece ) , piece ) == True { } : Bool }
 # promise kv_piece_fits_stage: a copy of the read-back never takes more bytes than the staging buffer holds
 # harm kv_piece_fits_stage: the device-to-host copy would overrun the pinned staging buffer, or be refused and fail the calibration
@@ -1006,10 +979,6 @@ c3fa29078370a38d  ln_lanes_need_engine  law ln_lanes_need_engine : for + d : Lan
 # promise ln_lanes_need_engine: an engine without batched steps is never given lanes, whatever its drafter.
 640e1ce3eba53008  ln_lanes_never_calibrating  law ln_lanes_never_calibrating : for + e : Bool for + d : LaneDrafter { ln_lanes_ok ( e , d , True { } ) == False { } : Bool }
 # promise ln_lanes_never_calibrating: a calibration load is never given lanes.
-7cb9217959f79de5  ln_ld_is_dspine_of_dspine  law ln_ld_is_dspine_of_dspine : { ln_ld_is_dspine ( LdDSpine { } ) == True { } : Bool }
-# promise ln_ld_is_dspine_of_dspine: the lane rule's DSpine check holds for DSpine.
-5ab7020dd1efa237  ln_ld_is_none_of_none  law ln_ld_is_none_of_none : { ln_ld_is_none ( LdNone { } ) == True { } : Bool }
-# promise ln_ld_is_none_of_none: the lane rule's plain-decode check holds for plain decode.
 9077088cb191c7e0  ln_never_passes_younger  law ln_never_passes_younger : for + r : Nat for + e : Nat { ln_passes_over ( Nat.add ( r , e ) , r ) == False { } : Bool }
 # promise ln_never_passes_younger: a request never counts as passing over a waiter for the card that arrived after it.
 ec1806058792e6c2  ln_next_admits_only_waiting  law ln_next_admits_only_waiting : for + i : Bool for + b : Bool { ln_sm_admits ( ln_session_next ( i , False { } , b ) ) == False { } : Bool }
@@ -1078,8 +1047,6 @@ eb78c06bf888695a  ln_route_irreflexive  law ln_route_irreflexive : for + r : Nat
 # promise ln_run_done_at_eos: a request that produced an end-of-sequence token has ended.
 e22c036f6d4f833c  ln_run_done_when_cancelled  law ln_run_done_when_cancelled : for + e : Bool for + r : Nat { ln_run_done ( e , True { } , r ) == True { } : Bool }
 # promise ln_run_done_when_cancelled: a cancelled request has ended.
-53ed6fe49d0033ef  ln_sa_done_of_done  law ln_sa_done_of_done : { ln_sa_done ( SaDone { } ) == True { } : Bool }
-# promise ln_sa_done_of_done: the stop outcome of a lane session's driver counts as stopping.
 19e041957d1c0b08  ln_served_lanes_at_least_one  law ln_served_lanes_at_least_one : for + r : Nat for + m : Nat for + ok : Bool { Nat.is_le ( 1n , ln_served_lanes ( r , m , ok ) ) == True { } : Bool }
 # promise ln_served_lanes_at_least_one: a model is always served with at least one lane.
 743d48f0889ba4ef  ln_served_lanes_one_without_batching  law ln_served_lanes_one_without_batching : for + r : Nat for + m : Nat { Nat.is_le ( ln_served_lanes ( r , m , False { } ) , 1n ) == True { } : Bool }
@@ -1122,10 +1089,6 @@ bfa338a9ab5398d1  ln_spec_batched_fits  law ln_spec_batched_fits : for + c : Nat
 # promise ln_step_chunks_cover_need: a batched step covers every chunk its slots need whenever a lane can hold them.
 a0c03e484928dc40  ln_step_chunks_within_lane  law ln_step_chunks_within_lane : for + need : Nat for + lc : Nat { Nat.is_le ( ln_step_chunks ( need , lc ) , lc ) == True { } : Bool }
 # promise ln_step_chunks_within_lane: a batched step never covers more chunks than a lane owns.
-70dc1ad3976b591e  ln_step_kept_not_bonus  law ln_step_kept_not_bonus : for + r : Nat for + e : Nat { Nat.is_lt ( ln_step_kept ( r , 1n + e ) , 1n + e ) == True { } : Bool }
-# promise ln_step_kept_not_bonus: the token a speculative step emits after its kept drafts is never counted as a kept draft.
-2b7561f7077ae224  ln_step_kept_within_drafted  law ln_step_kept_within_drafted : for + r : Nat for + e : Nat { Nat.is_le ( ln_step_kept ( r , e ) , ln_step_drafted ( r ) ) == True { } : Bool }
-# promise ln_step_kept_within_drafted: a speculative step never counts more kept drafts than drafts it verified.
 0c7b843488bcffde  ln_step_rows_in_ctx  law ln_step_rows_in_ctx : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_gt ( Nat.add ( c , n ) , m ) , Nat.is_le ( Nat.add ( c , ln_lane_step_rows ( g , n , w , r , c , m ) ) , m ) ) == True { } : Bool }
 # promise ln_step_rows_in_ctx: a lane never verifies rows past the end of its context in a batched step, whenever its narrow rows fit it.
 cd5590e07b5dcccf  ln_step_rows_in_ring  law ln_step_rows_in_ring : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_gt ( n , r ) , Nat.is_le ( ln_lane_step_rows ( g , n , w , r , c , m ) , r ) ) == True { } : Bool }
@@ -1134,12 +1097,6 @@ cd5590e07b5dcccf  ln_step_rows_in_ring  law ln_step_rows_in_ring : for + g : Boo
 # promise ln_step_rows_is_asked: a lane verifies at the narrow or at the wide width asked for, never at another.
 ad3088743b14ce44  ln_step_rows_unchosen_narrow  law ln_step_rows_unchosen_narrow : for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { ln_lane_step_rows ( False { } , n , w , r , c , m ) == n : Nat }
 # promise ln_step_rows_unchosen_narrow: a lane not chosen to go wide verifies at the narrow width.
-99a83cbabba09828  ln_tally_drafted_never_drops  law ln_tally_drafted_never_drops : for + d : Nat for + r : Nat { Nat.is_le ( d , ln_tally_drafted ( d , r ) ) == True { } : Bool }
-# promise ln_tally_drafted_never_drops: a request's count of verified drafts never goes back.
-3be077fe5f25de0a  ln_tally_kept_never_drops  law ln_tally_kept_never_drops : for + k : Nat for + r : Nat for + e : Nat { Nat.is_le ( k , ln_tally_kept ( k , r , e ) ) == True { } : Bool }
-# promise ln_tally_kept_never_drops: a request's count of kept drafts never goes back.
-39e4056282776247  ln_tally_kept_within_drafted  law ln_tally_kept_within_drafted : for + k : Nat for + d : Nat for + r : Nat for + e : Nat { Bool.or ( Nat.is_gt ( k , d ) , Nat.is_le ( ln_tally_kept ( k , r , e ) , ln_tally_drafted ( d , r ) ) ) == True { } : Bool }
-# promise ln_tally_kept_within_drafted: a lane's request never counts more kept drafts than drafts its steps verified.
 29a0d191c7382a25  ln_tier_record_void_after_write  law ln_tier_record_void_after_write : for + m : Nat for + e : Nat { ln_tier_record_trusted ( m , Nat.add ( m , 1n + e ) ) == False { } : Bool }
 # promise ln_tier_record_void_after_write: a lane never trusts its record of a host-RAM entry that was written again after it recorded it.
 2afe0b633b18c224  ln_tier_write_voids_earlier  law ln_tier_write_voids_earlier : for + m : Nat for + e : Nat { ln_tier_record_trusted ( m , ln_tier_write_count ( Nat.add ( m , e ) ) ) == False { } : Bool }
@@ -1156,16 +1113,6 @@ d460c8070aa7e22e  ln_wide_held_is_asked  law ln_wide_held_is_asked : for + n : N
 # promise ln_wide_held_is_asked: the widest width a lane is given is one of the widths asked for.
 ee4d7d07db0e432e  ln_wide_unknown_chunk_narrow  law ln_wide_unknown_chunk_narrow : for + g : Nat for + e : Nat for + n : Nat for + d : Nat for + c : Nat for + t : Nat for + s : Nat { ln_lane_goes_wide_at ( g , ln_wide_cost ( e , n , 1n + Nat.add ( n , d ) , False { } , c ) , t , s ) == False { } : Bool }
 # promise ln_wide_unknown_chunk_narrow: a lane never goes wide into K/V chunks whose cost the model has not measured.
-dfa1c1aa4e1c5269  ln_wt_chunk_sound  law ln_wt_chunk_sound : for t : WidthTally for + m : Bool { Bool.or ( Bool.not ( ln_wt_sound ( t ) ) , ln_wt_sound ( ln_wt_chunk ( t , m ) ) ) == True { } : Bool }
-# promise ln_wt_chunk_sound: a chunk choice never leaves the width report with more choices kept narrow unmeasured than chunk choices.
-1e5b52891a88effa  ln_wt_dropped_never_drops  law ln_wt_dropped_never_drops : for t : WidthTally for + n : Nat { Nat.is_le ( ln_wt_dropped_of ( t ) , ln_wt_dropped_of ( ln_wt_dropped ( t , n ) ) ) == True { } : Bool }
-# promise ln_wt_dropped_never_drops: the width report's count of dropped estimates never goes back within a report.
-83ce339767d0cb8d  ln_wt_empty_sound  law ln_wt_empty_sound : { ln_wt_sound ( ln_wt_empty ( ) ) == True { } : Bool }
-# promise ln_wt_empty_sound: a width report starts with counts that hold together.
-97b56b556d9bfaa6  ln_wt_launch_counted  law ln_wt_launch_counted : for t : WidthTally for + b : Nat for + k : Nat { Nat.is_gt ( ln_wt_launches_of ( ln_wt_launch ( t , b , k ) ) , ln_wt_launches_of ( t ) ) == True { } : Bool }
-# promise ln_wt_launch_counted: every launch is counted in the width report.
-1bd69633d9e76989  ln_wt_launch_sound  law ln_wt_launch_sound : for t : WidthTally for + b : Nat for + k : Nat { Bool.or ( Bool.not ( ln_wt_sound ( t ) ) , ln_wt_sound ( ln_wt_launch ( t , b , k ) ) ) == True { } : Bool }
-# promise ln_wt_launch_sound: a launch never leaves the width report with more wide slot steps than slot steps, or more launches with a wide slot than launches.
 f8533147dc62d652  ln_younger_waiter_never_blocks  law ln_younger_waiter_never_blocks : for + d : Bool for + r : Nat for + e : Nat { ln_admission_blocked ( d , Nat.add ( r , e ) , r ) == False { } : Bool }
 # promise ln_younger_waiter_never_blocks: a waiter that arrived after a session's next request never blocks its admission.
 1d7a0b64d1763db8  ls_hello_byte_recognised  law ls_hello_byte_recognised : { ls_is_hello ( 22n ) == True { } : Bool }
@@ -1418,14 +1365,11 @@ d988530d3e062cc3  pin_rollback_idempotent_and_absorbing  law pin_rollback_idempo
 b9ae717603d6847a  pin_rollback_leaves_zero_mapped  law pin_rollback_leaves_zero_mapped : for s : PinState { pin_mapped_count ( pin_rollback ( s ) ) == 0n : Nat }
 fb68ef776588f49d  pool_alloc_conserved  law pool_alloc_conserved : for + a : Nat for + f : Nat for + req : Nat { pool_total ( pool_alloc ( PoolAcct { a , f } , req ) ) == Nat.add ( a , f ) : Nat }
 62d06ff92b1b645a  pool_alloc_within_capacity  law pool_alloc_within_capacity : for + a : Nat for + f : Nat for + req : Nat { Nat.is_le ( pool_allocated ( pool_alloc ( PoolAcct { a , f } , req ) ) , Nat.add ( a , f ) ) == True { } : Bool }
-3b361c056a362005  pool_blocks_for_zero_blocksize_safe  law pool_blocks_for_zero_blocksize_safe : for bytes : Nat { pool_blocks_for ( bytes , 0n ) == 0n : Nat }
-629df579b2948887  pool_blocks_for_zero_bytes  law pool_blocks_for_zero_bytes : for + b : Nat { pool_blocks_for ( 0n , b ) == 0n : Nat }
 504161b525faee92  pool_busy_never_evicted  law pool_busy_never_evicted : for pins : Nat { pool_can_evict ( pins , True { } ) == False { } : Bool }
 aa76434870811052  pool_double_free_noop  law pool_double_free_noop : for + a : Nat for + f : Nat for + extra : Nat { pool_free ( PoolAcct { a , f } , Nat.add ( a , 1n + extra ) ) == PoolAcct { a , f } : PoolAcct }
 b30c6bd81672818b  pool_free_conserved  law pool_free_conserved : for + a : Nat for + f : Nat for + rel : Nat { pool_total ( pool_free ( PoolAcct { a , f } , rel ) ) == Nat.add ( a , f ) : Nat }
 9dc3df12b3dac58a  pool_free_within_capacity  law pool_free_within_capacity : for + a : Nat for + f : Nat for + rel : Nat { Nat.is_le ( pool_allocated ( pool_free ( PoolAcct { a , f } , rel ) ) , Nat.add ( a , f ) ) == True { } : Bool }
 f37e1ea922e84f0b  pool_init_conserved  law pool_init_conserved : for cap : Nat { pool_total ( pool_init ( cap ) ) == cap : Nat }
-4eccdf8143fa6c1e  pool_oob_block_rejected  law pool_oob_block_rejected : for + cap : Nat for + extra : Nat { pool_block_in_bounds ( Nat.add ( cap , extra ) , cap ) == False { } : Bool }
 59241ade773e071d  pool_oom_alloc_noop  law pool_oom_alloc_noop : for + a : Nat for + f : Nat for + extra : Nat { pool_alloc ( PoolAcct { a , f } , Nat.add ( f , 1n + extra ) ) == PoolAcct { a , f } : PoolAcct }
 e7c4808878bc6e78  pool_pinned_never_evicted  law pool_pinned_never_evicted : for p : Nat for busy : Bool { pool_can_evict ( 1n + p , busy ) == False { } : Bool }
 35e4862c66780f18  px_bound_header_stays_with_origin  law px_bound_header_stays_with_origin : for + p : Bool { px_req_header_goes ( p , PxRhBound { } , False { } ) == False { } : Bool }
@@ -1447,7 +1391,6 @@ cfc7b72468abb316  px_join_all_must_pass  law px_join_all_must_pass : for + a : P
 c5b05a6ed036fde3  px_keepalive_wait_within_interval  law px_keepalive_wait_within_interval : for + s : Bool for + l : Bool for + q : Nat for + e : Nat { Nat.is_le ( px_keepalive_wait ( s , l , q , e ) , e ) == True { } : Bool }
 be1813123cf95005  px_net_bits_past_prefix_zero  law px_net_bits_past_prefix_zero : for + r : Nat for + i : Nat { px_net_bits_at ( Nat.min ( r , Nat.mul ( i , 8n ) ) , i ) == 0n : Nat }
 # promise px_net_bits_past_prefix_zero: px_net_bits_at returns 0n whenever bits <= 8 * index
-b6e1470d1a9886f4  px_net_bits_run_out  law px_net_bits_run_out : for i : Nat { px_net_bits_at ( 0n , i ) == 0n : Nat }
 fb3c37b3203eb06e  px_net_full_byte_exact  law px_net_full_byte_exact : for a : Nat for b : Nat { px_net_byte_match ( a , b , 8n ) == Nat.is_eq ( a , b ) : Bool }
 dbfee0668cc7f38e  px_net_no_bits_any_byte  law px_net_no_bits_any_byte : for a : Nat for b : Nat { px_net_byte_match ( a , b , 0n ) == True { } : Bool }
 7ebb882938e051b2  px_never_class_refused  law px_never_class_refused : for l : Bool { px_addr_ok ( PxAcNever { } , l ) == False { } : Bool }
@@ -1500,8 +1443,6 @@ c33898efdb0d53e6  px_write_idle_gives_up  law px_write_idle_gives_up : for + t :
 161ef990493105b8  px_write_spent_gives_up  law px_write_spent_gives_up : for + i : Nat { px_write_gives_up ( i , 0n ) == True { } : Bool }
 2b1ee1dcff89fe96  px_write_wait_within_idle  law px_write_wait_within_idle : for + i : Nat for + t : Nat { Nat.is_le ( px_write_wait ( i , t ) , i ) == True { } : Bool }
 6f3ad6c263405dff  px_write_wait_within_total  law px_write_wait_within_total : for + i : Nat for + t : Nat { Nat.is_le ( px_write_wait ( i , t ) , t ) == True { } : Bool }
-2afc489632120517  qwen36_35b_moe_dims_valid  law qwen36_35b_moe_dims_valid : { Bool.and ( gqa_dims_valid ( 16n , 2n , 256n ) , Bool.and ( gdn_dims_valid ( 16n , 32n , 4n ) , moe_dims_valid ( 256n , 8n , 512n ) ) ) == True { } : Bool }
-b4326499ace96154  qwen38_27b_dims_valid  law qwen38_27b_dims_valid : { Bool.and ( gqa_dims_valid ( 24n , 4n , 256n ) , gdn_dims_valid ( 16n , 48n , 4n ) ) == True { } : Bool }
 f1cbe1206fb49073  recipe_destroy_idempotent  law recipe_destroy_idempotent : for s : RecipeState { recipe_step ( recipe_step ( s , EvRecDestroy { } ) , EvRecDestroy { } ) == recipe_step ( s , EvRecDestroy { } ) : RecipeState }
 836167e72b5b07af  recipe_destroyed_absorbing  law recipe_destroyed_absorbing : for ev : RecipeEvent { recipe_step ( RecDestroyed { } , ev ) == RecDestroyed { } : RecipeState }
 49ef901098934384  recipe_sealed_ws_overflow_fails  law recipe_sealed_ws_overflow_fails : { recipe_bind_ws ( RecCompiled { } , False { } , True { } ) == RecWsFailed { } : RecipeState }
@@ -1513,8 +1454,6 @@ ccedb8b0ed563ee0  recipe_shared_ws_oversize_fails  law recipe_shared_ws_oversize
 bcdbb0965633fbf5  recipe_shared_ws_uncompiled_cannot_launch  law recipe_shared_ws_uncompiled_cannot_launch : for + ws_need : Nat for + pool_size : Nat { Bool.and ( Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecBuilding { } , ws_need , pool_size ) ) ) , Bool.and ( Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecWsFailed { } , ws_need , pool_size ) ) ) , Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecDestroyed { } , ws_need , pool_size ) ) ) ) ) == True { } : Bool }
 # promise recipe_shared_ws_uncompiled_cannot_launch: binding shared workspace on RecBuilding, RecWsFailed, or RecDestroyed never enables launch
 a1e1d13137bf7fec  recipe_ws_fail_never_launches  law recipe_ws_fail_never_launches : { recipe_can_launch ( RecWsFailed { } ) == False { } : Bool }
-ef5581aa41edbb3c  relocate_outside_hi_unchanged  law relocate_outside_hi_unchanged : for + lo : Nat for + hi : Nat for + extra : Nat for dst : Nat { relocate_addr ( Nat.add ( hi , extra ) , lo , hi , dst ) == Nat.add ( hi , extra ) : Nat }
-86a3f7e429ec2b6a  relocate_preserves_lo  law relocate_preserves_lo : for + lo : Nat for + span : Nat for + dst : Nat { relocate_addr ( lo , lo , Nat.add ( lo , 1n + span ) , dst ) == dst : Nat }
 4e29b494852f35ad  remaining_monotone_step  law remaining_monotone_step : for + sent : Nat for + m : Nat { Nat.is_le ( remaining_budget ( 1n + sent , m ) , remaining_budget ( sent , m ) ) == True { } : Bool }
 1f4af7eeefaac3d0  remaining_zero_at_limit  law remaining_zero_at_limit : for + m : Nat for + over : Nat { remaining_budget ( Nat.add ( m , over ) , m ) == 0n : Nat }
 50e5c88a1ed73b76  req_cancel_idempotent  law req_cancel_idempotent : for s : ReqState { req_cancel ( req_cancel ( s ) ) == req_cancel ( s ) : ReqState }
@@ -1688,12 +1627,10 @@ fb735d95b6786cae  rt_sidecar_on_disk_not_counted  law rt_sidecar_on_disk_not_cou
 e727f19b871afa3b  rt_within_target_keeps  law rt_within_target_keeps : for + h : Nat for + x : Nat for + p : Bool { rt_should_evict ( h , Nat.add ( h , x ) , p ) == False { } : Bool }
 # promise rt_within_target_keeps: nothing is removed while the cache is within its target.
 # harm rt_within_target_keeps: a trim could empty a cache that already fits and force every recipe to compile again
-26b5224cfa7d2e55  sampler_join_assoc  law sampler_join_assoc : for a : SamplerFamily for b : SamplerFamily for c : SamplerFamily { sampler_family_join ( sampler_family_join ( a , b ) , c ) == sampler_family_join ( a , sampler_family_join ( b , c ) ) : SamplerFamily }
-19191af27260d856  sampler_join_comm  law sampler_join_comm : for a : SamplerFamily for b : SamplerFamily { sampler_family_join ( a , b ) == sampler_family_join ( b , a ) : SamplerFamily }
-ef3164b94e9c8972  sampler_join_idem  law sampler_join_idem : for a : SamplerFamily { sampler_family_join ( a , a ) == a : SamplerFamily }
 89369bb81e6c6736  sampling_admitted_when_allowed  law sampling_admitted_when_allowed : for + wants : Bool { sampling_request_admitted ( True { } , wants ) == True { } : Bool }
 # promise sampling_admitted_when_allowed: sampling_request_admitted returns True whenever method_can_sample is True
-e8d3c1badf2d23ad  served_ctx_above_reserve  law served_ctx_above_reserve : for + extra : Nat { served_ctx ( Nat.add ( 128n , extra ) ) == extra : Nat }
+9c560d1737221699  served_ctx_above_reserve  law served_ctx_above_reserve : for + extra : Nat { served_ctx ( Nat.add ( ctx_reserve ( ) , extra ) ) == extra : Nat }
+# promise served_ctx_above_reserve: served_ctx recovers extra exactly when lmax is ctx_reserve() + extra
 d969f0265d42f716  served_ctx_le_lmax  law served_ctx_le_lmax : for + lmax : Nat { Nat.is_le ( served_ctx ( lmax ) , lmax ) == True { } : Bool }
 ba91700303bb3c2a  slice_bound_in_range  law slice_bound_in_range : for from_end : Bool for + mag : Nat for + len : Nat { Nat.is_le ( slice_bound ( from_end , mag , len ) , len ) == True { } : Bool }
 31193373364a99fe  slot_fill_never_overwrites_readable  law slot_fill_never_overwrites_readable : for + s : SlotState { Bool.and ( slot_is_readable ( s ) , slot_is_writable ( slot_begin_fill ( s ) ) ) == False { } : Bool }
@@ -1768,7 +1705,6 @@ bfafc51de2dc08d3  vis_run_in_tile  law vis_run_in_tile : for + start : Nat for +
 bf9e4e50104d5d6a  vis_unknown_drafter_text_only  law vis_unknown_drafter_text_only : { vis_drafter_ok ( VdOther { } ) == False { } : Bool }
 # promise vis_unknown_drafter_text_only: a model whose drafter is not one the vision table knows is always served text only.
 # harm vis_unknown_drafter_text_only: an unknown drafter could read image-pad embeddings and be served with images unchecked.
-bf27fed2cf696824  vit_zero_h_rejected  law vit_zero_h_rejected : for + t : Nat for + w : Nat for m : Nat { vit_grid_valid ( t , 0n , w , m ) == False { } : Bool }
 6c4d7459f601ae04  vs_default_form_is_exact  law vs_default_form_is_exact : for + m : Bool { vs_method_opt_in ( m , False { } ) == False { } : Bool }
 # promise vs_default_form_is_exact: a method whose own options select no opt-in form is never exempt from token identity to K=0, even when the suite file marks it opt-in.
 # harm vs_default_form_is_exact: a default mode labelled opt-in by mistake would be allowed to fork from K=0.

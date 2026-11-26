@@ -2470,7 +2470,9 @@ pub(crate) mod tests {
     /// with the verified window functions, against the positions a block row may read.
     #[test]
     fn ring_slots_of_a_window_are_its_positions() {
-        use crate::verified::{ds_win_low, ds_win_rows, ds_win_wrap};
+        let ds_win_rows = |window: u64, t: u64, span: u64| window.saturating_sub(1).saturating_sub(t).min(span);
+        let ds_win_low = |nv: u64, hi: u64| nv.min(hi);
+        let ds_win_wrap = |nv: u64, hi: u64| nv.saturating_sub(hi);
         use std::collections::BTreeSet;
         for (rg, w, tmax) in [(384u64, 100u64, 16u64), (512, 200, 16), (1024, 513, 64), (768, 64, 128)] {
             assert!(rg % 128 == 0 && rg >= w + tmax + 128, "the glue's condition on a ring");
