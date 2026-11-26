@@ -566,6 +566,11 @@ pub(super) struct LaneRt {
     next_event: usize,
 }
 
+fn step_draft_counts(rows: u64, emitted: u64) -> (u64, u64) {
+    let drafted = rows.saturating_sub(1);
+    (drafted, emitted.saturating_sub(1).min(drafted))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct WidthTally {
     slots: u64,
@@ -1976,8 +1981,7 @@ fn apply_spec(
         }
         run.advance(n_emit as u64, rows);
         let n_out = n_emit as u64;
-        let drafted = rows.saturating_sub(1);
-        let kept = n_out.saturating_sub(1).min(drafted);
+        let (drafted, kept) = step_draft_counts(rows, n_out);
         run.drafted += drafted;
         run.accepted += kept;
         if drafted > 0 {
@@ -2512,8 +2516,7 @@ mod tests {
             (1, 1, 0, 0),
             (8, 12, 7, 7),
         ] {
-            let drafted = rows.saturating_sub(1);
-            let kept = emitted.saturating_sub(1).min(drafted);
+            let (drafted, kept) = step_draft_counts(rows, emitted);
             assert_eq!(drafted, want_drafted);
             assert_eq!(kept, want_kept);
             assert!(kept <= drafted);

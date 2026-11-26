@@ -2467,7 +2467,7 @@ pub(crate) mod tests {
     }
 
     /// The slot arithmetic of the ring kernels (`gaudium_ds_ctxr`, `gaudium_ds_softr`), written
-    /// with the verified window functions, against the positions a block row may read.
+    /// with the window slot arithmetic, against the positions a block row may read.
     #[test]
     fn ring_slots_of_a_window_are_its_positions() {
         let ds_win_rows = |window: u64, t: u64, span: u64| window.saturating_sub(1).saturating_sub(t).min(span);

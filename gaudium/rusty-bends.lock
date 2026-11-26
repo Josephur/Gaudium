@@ -1738,6 +1738,8 @@ d5eefbeedaf264ff  vs_row_needs_semantics  law vs_row_needs_semantics : for i : B
 # promise vs_row_needs_semantics: a row passes only when every semantic answer check passed.
 096899c23da06eba  vs_row_verdict_needs_checks  law vs_row_verdict_needs_checks : for + e : Bool { vs_row_verdict ( False { } , e ) == False { } : Bool }
 # promise vs_row_verdict_needs_checks: a row whose identity, answer or after-request checks failed never passes, even when its process exited cleanly.
+6fc15a053664a8ec  vs_same_passes  law vs_same_passes : for + opt_in : Bool { vs_identity_ok ( VsSame { } , opt_in ) == True { } : Bool }
+# promise vs_same_passes: an identical token stream always passes the identity check, whether the method is opt-in or default.
 9d8aef4754ed3b48  vs_suite_needs_a_row  law vs_suite_needs_a_row : for + s : Nat for + a : Bool { vs_suite_ok ( s , 0n , a ) == False { } : Bool }
 # promise vs_suite_needs_a_row: a suite run that ran no row at all never passes.
 # harm vs_suite_needs_a_row: an empty selection (a mistyped --only) would report success.
@@ -1746,12 +1748,18 @@ d89d8e29a265d77b  vs_suite_needs_every_pass  law vs_suite_needs_every_pass : for
 920fb466ce1f7386  vs_suite_needs_every_row  law vs_suite_needs_every_row : for + r : Nat for + k : Nat for + a : Bool { vs_suite_ok ( Nat.add ( r , 1n + k ) , r , a ) == False { } : Bool }
 # promise vs_suite_needs_every_row: a suite run that stopped before every selected row ran never passes, even when every row that ran passed.
 # harm vs_suite_needs_every_row: an interrupted run would report success for rows it never checked.
+65c62c2dc852dcfd  vs_traced_tie_opt_in_passes  law vs_traced_tie_opt_in_passes : { vs_identity_ok ( vs_fork_outcome ( True { } , True { } , True { } ) , vs_method_opt_in ( True { } , True { } ) ) == True { } : Bool }
+# promise vs_traced_tie_opt_in_passes: a fork whose replay traced every divergence as a tie passes the identity check for a marked opt-in method.
 7ea2c79c12cdc6fd  vs_unmarked_method_is_exact  law vs_unmarked_method_is_exact : for + f : Bool { vs_method_opt_in ( False { } , f ) == False { } : Bool }
 # promise vs_unmarked_method_is_exact: a method the suite file does not mark as opt-in is never exempt from token identity to K=0, whatever its options select.
 # harm vs_unmarked_method_is_exact: a speculative method could fork from K=0 without anyone having marked it as an opt-in mode.
 bda193789ce4a897  vs_untraced_fork_fails  law vs_untraced_fork_fails : for b : Bool { vs_identity_ok ( VsFork { } , b ) == False { } : Bool }
 # promise vs_untraced_fork_fails: a run that forked from K=0 anywhere but at a traced tie never passes the suite.
 # harm vs_untraced_fork_fails: an opt-in mode could fork at real differences and still be reported as passing.
+50f333b50c7f1eab  vs_valid_row_passes  law vs_valid_row_passes : { vs_row_verdict ( vs_row_ok ( True { } , True { } , True { } ) , True { } ) == True { } : Bool }
+# promise vs_valid_row_passes: a row whose identity, semantic, after-image, and process-exit checks all passed receives a passing verdict.
+39607fb278eec494  vs_valid_suite_passes  law vs_valid_suite_passes : for + n_m1 : Nat { vs_suite_ok ( 1n + n_m1 , 1n + n_m1 , True { } ) == True { } : Bool }
+# promise vs_valid_suite_passes: a non-empty suite in which every selected row ran and passed receives a passing verdict.
 ba31aa6c874875b7  wave_lag_follows_lead  law wave_lag_follows_lead : for m : Nat for h : Nat for + p : Nat { Nat.is_lt ( wave_step ( m , False { } , h , p ) , wave_step ( m , True { } , h , p ) ) == True { } : Bool }
 976317570747274f  wave_next_pair_follows  law wave_next_pair_follows : for m : Nat for h : Nat for + q : Nat { Nat.is_lt ( wave_step ( m , True { } , h , 1n + 1n + q ) , wave_step ( 1n + m , False { } , h , 1n + 1n + q ) ) == True { } : Bool }
 cad96b9f02ba842e  wave_off_runs_no_tile  law wave_off_runs_no_tile : for n : Nat { wave_tiles ( n , False { } ) == 0n : Nat }
