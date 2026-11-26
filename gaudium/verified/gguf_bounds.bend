@@ -160,14 +160,14 @@ def gg_tensor_total_ok(+declared: Nat, +total: Nat) -> Bool:
 
 # A model of `count` shards (0: not split) whose shards hold `total` tensors may be used, given
 # what its first shard declares: `has_declared` says the `split.tensors.count` key is there, with
-# value `declared`. A split model's declared count must match; a first shard without the key is
-# taken as it is, and a model that is not split declares nothing that is checked.
+# value `declared`. A split model's first shard must declare a count, and it must match; a model
+# that is not split declares nothing that is checked.
 def gg_split_total_ok(+count: Nat, +has_declared: Bool, +declared: Nat, +total: Nat) -> Bool:
   match has_declared:
     case True{}:
       Bool.or(Nat.is_eq(count, 0n), gg_tensor_total_ok(declared, total))
     case False{}:
-      True{}
+      Nat.is_eq(count, 0n)
 
 # `present` shards make up a split model of `count` shards.
 def gg_split_complete(+present: Nat, +count: Nat) -> Bool:
@@ -413,7 +413,7 @@ law gg_shard_in_set_index:
 def gg_shard_in_set_index(no, own, k, c):
   gg_and_mid(gg_shard_ok(no, k, c), Nat.is_eq(own, c), Nat.is_le(c, k), gg_shard_fit(Nat.is_eq(no, k), k, c, Nat.is_lt(k, c), {==}))
 
-# promise: a split model is accepted only when its shards hold the tensor count its first shard declares.
+# promise: the tensor-count comparison passes only when the shards hold exactly the count the first shard declares.
 # harm: a missing or duplicated shard's tensors would go unnoticed
 law gg_tensor_total_matches:
   for +d: Nat
@@ -459,6 +459,18 @@ law gg_split_total_unsplit_taken:
   {gg_split_total_ok(0n, False{}, d, t) == True{} : Bool}
 
 def gg_split_total_unsplit_taken(d, t):
+  {==}
+
+# promise: a split model whose first shard declares no tensor count is refused.
+# harm: a split model whose shards lack some of its tensors would be accepted, since nothing says how many the shards should hold
+# catches: a first shard without the key taken as it is (the count left unchecked when the key is missing)
+law gg_split_total_needs_key:
+  for +p: Nat
+  for +d: Nat
+  for +t: Nat
+  {gg_split_total_ok(1n+p, False{}, d, t) == False{} : Bool}
+
+def gg_split_total_needs_key(p, d, t):
   {==}
 
 # promise: a model with no shards at all is never taken as a complete split model.

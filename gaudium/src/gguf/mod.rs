@@ -896,16 +896,22 @@ impl Gguf {
                 .ok_or_else(|| err(&where_, "split tensor count overflow"))?;
         }
         // whether the shards' total may be used, given what the first shard declares, is the
-        // verified rule's (`gg_split_total_ok`), a first shard without the key included
-        let declared = files[0].kv("split.tensors.count").and_then(|v| v.as_u64());
+        // verified rule's (`gg_split_total_ok`): a split model's first shard must declare it
+        let raw = files[0].kv("split.tensors.count");
+        let declared = raw.and_then(|v| v.as_u64());
         if !v::gg_split_total_ok(count, declared.is_some(), declared.unwrap_or(0), total) {
-            return Err(err(
-                &where_,
-                format!(
-                    "split.tensors.count is {}, the shards hold {total}",
-                    declared.unwrap_or(0)
+            // the message only: the rule above has already refused, and a key that is not a
+            // tensor count (a negative or non-integer value) counts as no declared count
+            let msg = match (declared, raw) {
+                (Some(want), _) => format!("split.tensors.count is {want}, the shards hold {total}"),
+                (None, Some(_)) => format!(
+                    "the first shard's split.tensors.count is not a tensor count, the shards hold {total}"
                 ),
-            ));
+                (None, None) => {
+                    format!("the first shard has no split.tensors.count, the shards hold {total}")
+                }
+            };
+            return Err(err(&where_, msg));
         }
         Ok(Self {
             source: path.to_path_buf(),
