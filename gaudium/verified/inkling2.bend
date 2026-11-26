@@ -1430,6 +1430,12 @@ def ik_f8_row_consistent(c):
 def ik_row_at(+e: Nat, +rows: Nat, +r: Nat, +rb: Nat) -> Nat:
   Nat.mul(Nat.add(r, Nat.mul(e, rows)), rb)
 
+# Whether row `r` is one of an expert's `rows` rows, the only rows the safetensors expert reader
+# decodes: past an expert's last row, `ik_row_at` points into the next expert's bytes
+# (`ik_row_admit_in_expert`, `ik_row_admit_every_row`).
+def ik_row_admit(+rows: Nat, +r: Nat) -> Bool:
+  Nat.is_lt(r, rows)
+
 # Bytes a stacked expert tensor of shape [ne, rows, rb] names (a byte per element). The packer
 # refuses a tensor whose header gives it fewer. Refused on overflow: the shape comes from a
 # checkpoint's header.
@@ -1521,6 +1527,57 @@ law ik_bf16_bytes_holds:
 
 def ik_bf16_bytes_holds(r, c):
   L.nat_add_le_mono(Nat.mul(r, c), Nat.mul(r, c), Nat.mul(r, c), Nat.add(Nat.mul(r, c), 0n), L.nat_le_refl(Nat.mul(r, c)), L.nat_add_le_r(Nat.mul(r, c), 0n))
+
+# LAW IK.27f
+# promise: a BF16 tensor's byte size is never more than two bytes a value.
+# harm: a vision buffer would take more HBM than its values need, and a drafter table would be built larger than its device tensor, so a well-formed drafter is refused.
+# catches: four bytes a value (an FP32 size in place of BF16)
+law ik_bf16_bytes_within:
+  for +r: Nat
+  for +c: Nat
+  {Nat.is_le(ik_bf16_bytes(r, c), Nat.add(Nat.mul(r, c), Nat.mul(r, c))) == True{} : Bool}
+
+def ik_bf16_bytes_within(r, c):
+  L.nat_add_le_mono(Nat.mul(r, c), Nat.mul(r, c), Nat.add(Nat.mul(r, c), 0n), Nat.mul(r, c), L.nat_le_refl(Nat.mul(r, c)), L.nat_le_subst_r(Nat.add(Nat.mul(r, c), 0n), Nat.add(Nat.mul(r, c), 0n), Nat.mul(r, c), L.nat_add_zero_r(Nat.mul(r, c)), L.nat_le_refl(Nat.add(Nat.mul(r, c), 0n))))
+
+# An admitted row is below the row count: when r < rows holds, rows <= r does not; a refused row needs nothing.
+def ik_row_admit_go(+rows: Nat, +r: Nat, +b: Bool, +e: {Nat.is_lt(r, rows) == b : Bool}) -> {Bool.and(b, Nat.is_le(rows, r)) == False{} : Bool}:
+  match b:
+    case True{}:
+      L.nat_lt_le_false(r, rows, e)
+    case False{}:
+      {==}
+
+def ik_lt_add_succ(+r: Nat, +j: Nat) -> {Nat.is_lt(r, Nat.add(1n+r, j)) == True{} : Bool}:
+  match r:
+    case 0n:
+      {==}
+    case 1n+rp:
+      ik_lt_add_succ(rp, j)
+
+# LAW IK.27g
+# promise: a row is admitted only when it is below its expert's row count.
+# harm: a row past an expert's last row would be decoded from the next expert's bytes.
+# catches: the row at the row count admitted (`r <= rows` in place of `r < rows`)
+law ik_row_admit_in_expert:
+  for +rows: Nat
+  for +r: Nat
+  {Bool.and(ik_row_admit(rows, r), Nat.is_le(rows, r)) == False{} : Bool}
+
+def ik_row_admit_in_expert(rows, r):
+  ik_row_admit_go(rows, r, ik_row_admit(rows, r), {==})
+
+# LAW IK.27h
+# promise: every row of an expert is admitted.
+# harm: the packer would refuse a well-formed checkpoint at one of an expert's rows.
+# catches: the last row refused (`r + 1 < rows` in place of `r < rows`)
+law ik_row_admit_every_row:
+  for +r: Nat
+  for +j: Nat
+  {ik_row_admit(Nat.add(1n+r, j), r) == True{} : Bool}
+
+def ik_row_admit_every_row(r, j):
+  ik_lt_add_succ(r, j)
 
 # ============================================================================
 # 6. Shape guard

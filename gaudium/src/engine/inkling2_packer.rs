@@ -22,8 +22,8 @@ use crate::core::gemma4::{lane_in_block, natural_channel};
 use crate::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use crate::safetensors::{SafetensorsStore, TensorMeta};
 use crate::verified::{
-    ik_bias_src, ik_f8_row_ok, ik_f8_row_scales, ik_nib_row_bytes, ik_nib_row_scales, ik_row_at,
-    ik_stacked_bytes,
+    ik_bias_src, ik_f8_row_ok, ik_f8_row_scales, ik_nib_row_bytes, ik_nib_row_scales, ik_row_admit,
+    ik_row_at, ik_stacked_bytes,
 };
 
 /// Values of the sixteen 4-bit codes (sign, two exponent bits, one mantissa bit). Code 8 is a
@@ -147,8 +147,9 @@ impl ExpertRows for StExperts<'_> {
             None => (self.cols, ik_f8_row_scales(self.cols as u64) as usize),
         };
         // a row at or past the expert's row count would read the next expert's rows
+        // (`verified::ik_row_admit_in_expert`)
         let (true, Some(w), Some(s)) = (
-            r < self.rows,
+            ik_row_admit(self.rows as u64, r as u64),
             stacked_row(self.w, e, self.rows, r, rb),
             stacked_row(self.scale, e, self.rows, r, rs),
         ) else {

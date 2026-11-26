@@ -573,6 +573,9 @@ aca5cff341d0c466  ik_app_layer_in_model  law ik_app_layer_in_model : for + n : N
 3128bc81a1eba240  ik_bf16_bytes_holds  law ik_bf16_bytes_holds : for + r : Nat for + c : Nat { Nat.is_le ( Nat.add ( Nat.mul ( r , c ) , Nat.mul ( r , c ) ) , ik_bf16_bytes ( r , c ) ) == True { } : Bool }
 # promise ik_bf16_bytes_holds: a BF16 tensor's byte size holds two bytes for every value of its rows.
 # harm ik_bf16_bytes_holds: a buffer or a table would be planned short of the values a kernel writes or an upload copies.
+0d9f33413f059e9f  ik_bf16_bytes_within  law ik_bf16_bytes_within : for + r : Nat for + c : Nat { Nat.is_le ( ik_bf16_bytes ( r , c ) , Nat.add ( Nat.mul ( r , c ) , Nat.mul ( r , c ) ) ) == True { } : Bool }
+# promise ik_bf16_bytes_within: a BF16 tensor's byte size is never more than two bytes a value.
+# harm ik_bf16_bytes_within: a vision buffer would take more HBM than its values need, and a drafter table would be built larger than its device tensor, so a well-formed drafter is refused.
 1e56d626c8a72153  ik_bias_block_in_table  law ik_bias_block_in_table : for + e : Nat for + dd : Nat { Nat.is_le ( Nat.add ( Nat.sub ( ik_bias_off ( e ) , dd ) , 64n ) , ik_bias_width ( e ) ) == True { } : Bool }
 # promise ik_bias_block_in_table: the 64 bias channels a softmax block loads for any first-key distance up to the table's offset stay inside one head's table.
 b1535cefc222c670  ik_bias_distance_channel  law ik_bias_distance_channel : for + e : Nat for + d : Nat { Bool.and ( Nat.is_lt ( d , e ) , Nat.is_ne ( ik_bias_src ( e , Nat.sub ( ik_bias_off ( e ) , d ) ) , d ) ) == False { } : Bool }
@@ -650,6 +653,12 @@ f2350b24e56a3bd9  ik_ring_holds_vector  law ik_ring_holds_vector : for + w : Nat
 # promise ik_ring_within_bounded: a K / V ring the kernel-bounded sizing returns never has more slots than the chunk the softmax kernel stages.
 03fa217e4c3b12e9  ik_ring_within_is_ring  law ik_ring_within_is_ring : for + w : Nat for + rows : Nat for + mx : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , 0n ) , Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , ik_ring_slots ( w , rows ) ) ) == False { } : Bool }
 # promise ik_ring_within_is_ring: the kernel-bounded sizing returns the K / V ring itself or no ring (0), never a different, smaller one.
+b35c02fc177c818a  ik_row_admit_every_row  law ik_row_admit_every_row : for + r : Nat for + j : Nat { ik_row_admit ( Nat.add ( 1n + r , j ) , r ) == True { } : Bool }
+# promise ik_row_admit_every_row: every row of an expert is admitted.
+# harm ik_row_admit_every_row: the packer would refuse a well-formed checkpoint at one of an expert's rows.
+4e17fe3e6643f083  ik_row_admit_in_expert  law ik_row_admit_in_expert : for + rows : Nat for + r : Nat { Bool.and ( ik_row_admit ( rows , r ) , Nat.is_le ( rows , r ) ) == False { } : Bool }
+# promise ik_row_admit_in_expert: a row is admitted only when it is below its expert's row count.
+# harm ik_row_admit_in_expert: a row past an expert's last row would be decoded from the next expert's bytes.
 27ac9a89bb612537  ik_row_at_in_tensor  law ik_row_at_in_tensor : for + e : Nat for + k : Nat for + r : Nat for + j : Nat for + rb : Nat { Nat.is_le ( Nat.add ( rb , ik_row_at ( e , Nat.add ( 1n + r , j ) , r , rb ) ) , ik_stacked_bytes ( Nat.add ( 1n + e , k ) , Nat.add ( 1n + r , j ) , rb ) ) == True { } : Bool }
 # promise ik_row_at_in_tensor: a row of an expert below the tensor's expert count, at a row below its row count, ends inside the bytes the tensor's shape names.
 # harm ik_row_at_in_tensor: the packer would read a row past the end of the mapped tensor, or the bytes of the tensor behind it.
