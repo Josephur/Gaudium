@@ -1154,6 +1154,9 @@ bee16f5f77cefa27  mb_call_entered_fresh  law mb_call_entered_fresh : for + s : M
 7d5f0d69a8d191f2  mb_call_fresh_only_on_open  law mb_call_fresh_only_on_open : for + s : MbState for + e : MbEvent { Bool.and ( mb_fresh_is_call ( mb_fresh ( s , e ) ) , Bool.not ( Bool.and ( mb_is_open_call ( e ) , mb_is_call ( mb_next ( s , e ) ) ) ) ) == False { } : Bool }
 # promise mb_call_fresh_only_on_open: a new call (its text started empty, a call opened in the reply's lifecycle) begins only at the call marker, and the reader is then inside the call.
 # harm mb_call_fresh_only_on_open: plain text or another block would open a tool call in the client's stream
+4691fc97146adc15  mb_call_marker_starts_fresh  law mb_call_marker_starts_fresh : for + s : MbState for + e : MbEvent { Bool.and ( Bool.and ( mb_is_open_call ( e ) , mb_is_call ( mb_next ( s , e ) ) ) , Bool.not ( mb_fresh_is_call ( mb_fresh ( s , e ) ) ) ) == False { } : Bool }
+# promise mb_call_marker_starts_fresh: a call marker that leaves the reader inside a call always starts empty call text and a new call, also when it is read inside a call that was still open.
+# harm mb_call_marker_starts_fresh: a call cut by the next call marker would hand its text, or its place in the call lifecycle, to the call after it
 5ded362825b66de2  mb_call_opens_by_marker  law mb_call_opens_by_marker : for + s : MbState for + e : MbEvent { Bool.or ( mb_is_call ( s ) , Bool.or ( Bool.not ( mb_is_call ( mb_next ( s , e ) ) ) , mb_is_open_call ( e ) ) ) == True { } : Bool }
 # promise mb_call_opens_by_marker: a tool-call block is entered only through its own content-type marker, never by text
 # harm mb_call_opens_by_marker: plain text would be parsed as a tool call
@@ -1168,9 +1171,15 @@ e8e241e14fcc4fd9  mb_finish_ends  law mb_finish_ends : for s : MbState { mb_next
 # promise mb_finish_ends: the end of generation always ends the reply
 e915827970aebdf8  mb_finish_idempotent  law mb_finish_idempotent : for + s : MbState for split : Bool { mb_is_none ( mb_act ( mb_next ( s , MeFinish { } ) , MeFinish { } , split ) ) == True { } : Bool }
 # promise mb_finish_idempotent: finishing twice is the same as finishing once: the second finish routes nothing
+cccce617984e731f  mb_header_starts_fresh_name  law mb_header_starts_fresh_name : for + s : MbState for + e : MbEvent { Bool.and ( Bool.and ( mb_is_header_ev ( e ) , mb_is_header ( mb_next ( s , e ) ) ) , Bool.not ( mb_fresh_is_name ( mb_fresh ( s , e ) ) ) ) == False { } : Bool }
+# promise mb_header_starts_fresh_name: a header that leaves the reader in a header always starts an empty name, also when it is read inside a header.
+# harm mb_header_starts_fresh_name: a block would carry the name of the header before it
 871cce5d11643d0b  mb_name_entered_fresh  law mb_name_entered_fresh : for + s : MbState for + e : MbEvent { Bool.and ( Bool.and ( Bool.not ( mb_is_header ( s ) ) , mb_is_header ( mb_next ( s , e ) ) ) , Bool.not ( mb_fresh_is_name ( mb_fresh ( s , e ) ) ) ) == False { } : Bool }
 # promise mb_name_entered_fresh: a block header the reader enters always starts with an empty name.
 # harm mb_name_entered_fresh: a call would be named with the name of an earlier block
+6ea41f362fb30ee5  mb_name_fresh_only_by_header  law mb_name_fresh_only_by_header : for + s : MbState for + e : MbEvent { Bool.and ( mb_fresh_is_name ( mb_fresh ( s , e ) ) , Bool.not ( mb_is_header_ev ( e ) ) ) == False { } : Bool }
+# promise mb_name_fresh_only_by_header: only a header event starts a block's name empty; words, markers and ends never do.
+# harm mb_name_fresh_only_by_header: the name of a block would be lost while the reader is still reading it
 bd7d332b386fd286  mb_name_fresh_only_on_header  law mb_name_fresh_only_on_header : for + s : MbState for + e : MbEvent { Bool.and ( mb_fresh_is_name ( mb_fresh ( s , e ) ) , Bool.not ( mb_is_header ( mb_next ( s , e ) ) ) ) == False { } : Bool }
 # promise mb_name_fresh_only_on_header: a block's name is started empty only when the reader enters a header.
 # harm mb_name_fresh_only_on_header: the name of the open block would be lost in the middle of the block

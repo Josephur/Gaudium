@@ -212,6 +212,14 @@ def mb_is_header(s: MbState) -> Bool:
     case _:
       False{}
 
+# The event is a block header (the observer the name laws below are stated with).
+def mb_is_header_ev(e: MbEvent) -> Bool:
+  match e:
+    case MeHeader{}:
+      True{}
+    case _:
+      False{}
+
 def mb_is_done(s: MbState) -> Bool:
   match s:
     case MsDone{}:
@@ -932,6 +940,219 @@ law mb_name_fresh_only_on_header:
   {Bool.and(mb_fresh_is_name(mb_fresh(s, e)), Bool.not(mb_is_header(mb_next(s, e)))) == False{} : Bool}
 
 def mb_name_fresh_only_on_header(s, e):
+  match s:
+    case MsOutside{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsHeader{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsThink{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsText{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsCall{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsDone{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+
+# promise: a call marker that leaves the reader inside a call always starts empty call text and a new call, also when it is read inside a call that was still open.
+# harm: a call cut by the next call marker would hand its text, or its place in the call lifecycle, to the call after it
+# catches: a call started fresh only when entered from outside a call (a call marker inside an open call keeps the old call's text)
+law mb_call_marker_starts_fresh:
+  for +s: MbState
+  for +e: MbEvent
+  {Bool.and(Bool.and(mb_is_open_call(e), mb_is_call(mb_next(s, e))), Bool.not(mb_fresh_is_call(mb_fresh(s, e)))) == False{} : Bool}
+
+def mb_call_marker_starts_fresh(s, e):
+  match s:
+    case MsOutside{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsHeader{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsThink{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsText{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsCall{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsDone{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+
+# promise: a header that leaves the reader in a header always starts an empty name, also when it is read inside a header.
+# harm: a block would carry the name of the header before it
+# catches: a name started fresh only when entered from outside a header (a header inside a header keeps the name it was reading)
+law mb_header_starts_fresh_name:
+  for +s: MbState
+  for +e: MbEvent
+  {Bool.and(Bool.and(mb_is_header_ev(e), mb_is_header(mb_next(s, e))), Bool.not(mb_fresh_is_name(mb_fresh(s, e)))) == False{} : Bool}
+
+def mb_header_starts_fresh_name(s, e):
+  match s:
+    case MsOutside{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsHeader{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsThink{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsText{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsCall{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+    case MsDone{}:
+      match e:
+        case MeHeader{}: {==}
+        case MeOpenThink{}: {==}
+        case MeOpenText{}: {==}
+        case MeOpenCall{}: {==}
+        case MeEnd{}: {==}
+        case MeWords{}: {==}
+        case MeStop{}: {==}
+        case MeFinish{}: {==}
+
+# promise: only a header event starts a block's name empty; words, markers and ends never do.
+# harm: the name of a block would be lost while the reader is still reading it
+# catches: the name emptied by words read inside a header
+law mb_name_fresh_only_by_header:
+  for +s: MbState
+  for +e: MbEvent
+  {Bool.and(mb_fresh_is_name(mb_fresh(s, e)), Bool.not(mb_is_header_ev(e))) == False{} : Bool}
+
+def mb_name_fresh_only_by_header(s, e):
   match s:
     case MsOutside{}:
       match e:
