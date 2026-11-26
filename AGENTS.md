@@ -76,6 +76,7 @@ Never rely on memory or GPU analogies for Gaudi 2 MME geometry, TPC VLIW/SIMD in
   - The author changes the code to that body in a scratch copy and shows `cargo check` failing with `E_LAW_FALSE` and a concrete input. A failed proof with "no counterexample" does not count, because the law may still hold for that body.
   - RustyBends ignores the line and does not store it in the lock. Adding one, also to a sealed law, never changes `rusty-bends.lock`.
   - `gaudium/tests/law_comments.rs` fails `cargo test` when a law lands without one.
+- **The skill.** `.claude/skills/verified-first/SKILL.md` walks through this section and section 5 in the order a change applies them: list the decisions, write laws in pairs, state bounds, read the build's verdict, review and seal, write the hand-off. Load it (or read it as a file) before changing a decision of the kinds above.
 - **Report it.** Every hand-off lists:
   - the laws added, each with its `# catches:` body and the Rust call sites of the function it constrains;
   - what was left in the shell, and why;
