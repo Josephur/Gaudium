@@ -125,7 +125,7 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
   - `auto` (default): always enforces `bend <file> --check-only`, plus Lean `bend <file> --verdict` whenever compatible Lean is installed.
   - `require`: fails the build if Lean `--verdict` is unavailable (use in CI and whenever Lean matches Bend's expected kernel version).
   - `off`: `--check-only` only (only when compiling on a host without Lean).
-  - **The build cache.** RustyBends skips every check when `OUT_DIR/rusty-bends.cache` matches the build. The cache records the content of the `.bend` files, a hash of the `rusty-bends-build/` sources, whether the verdict ran (`ran`, `skipped` or `off`), the Bend binary and version, and the check and verdict flags. So `BEND_VERDICT=require cargo check` after an `off` or skipped build runs `--verdict` again, a pass under `require` means the verdict ran on these sources, and the first build after updating `rusty-bends-build/` runs every check and writes a new `verified.rs`. `RUSTY_BENDS_NO_CACHE=1` forces a full run.
+  - **The build cache.** RustyBends skips every check when `OUT_DIR/rusty-bends.cache` matches the build. The cache records the content of the `.bend` files, a hash of the `rusty-bends-build/` sources, whether the verdict ran (`ran`, `skipped` or `off`), the Bend binary and version, and the check and verdict flags. So `BEND_VERDICT=require cargo check` after an `off` or skipped build runs `--verdict` again, a pass under `require` means the verdict ran on these sources, and the first build after updating `rusty-bends-build/` runs every check and writes a new `verified.rs`. `RUSTY_BENDS_NO_CACHE=1` forces a full build and mutation run.
 - **Anti-Cheat Law Lock (`gaudium/rusty-bends.lock`):**
   - Once a `law` is locked in `gaudium/rusty-bends.lock`, **NEVER weaken, edit, comment out, or delete it** to make `cargo check` pass.
   - If `E_BEND_CHECK_FAILED` or `E_LAW_LOCK_TAMPERED` fires, fix the implementation or proof — NOT the law.
@@ -140,7 +140,7 @@ Read `BEND_GUIDE.md` before writing `.bend` code. Key rules enforced by Bend 2.0
   - **The author checks first.** Before asking for review, the author takes each new law through section 3a:
     - it belongs in Bend (the "must be verified" list);
     - it states a bound, not a pinned value;
-    - it names the function the Rust shell calls (`RUSTY_BENDS_LIST_COVERAGE=1 cargo check` lists the laws that name only functions no Rust source mentions, and the functions no law reaches; a mention in a test counts, so a clean listing does not prove the call site);
+    - it names the function the Rust shell calls (`RUSTY_BENDS_LIST_COVERAGE=1 cargo check` lists the laws that name only functions with no Rust mention (`rust=uncalled`) or only test mentions (`rust=tests-only`), and the functions no law reaches; callers should still confirm the Rust wrapper is live in production);
     - it bounds both sides where there are two;
     - its `# catches:` body fails with `E_LAW_FALSE`.
     The author also answers "what wrong body still passes?". Try at least: a sum replaced by a max, a dropped term or condition, an off-by-one, a constant result, and an unaligned value where alignment matters. The law's survivors in `RUSTY_BENDS_MUTATE=report cargo check` are further candidates. A survivor that breaks the promise calls for a stronger law before the review.
