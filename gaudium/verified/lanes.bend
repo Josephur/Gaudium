@@ -2662,7 +2662,7 @@ law ln_step_kept_within_drafted:
 def ln_step_kept_within_drafted(r, e):
   L.nat_min_le_r(Nat.sub(e, 1n), Nat.sub(r, 1n))
 
-# promise: the token a speculative step emits after its kept drafts is never counted as a kept draft.
+# promise: a speculative step that emitted tokens counts fewer kept drafts than tokens it emitted, so its own last token is never a kept draft.
 # catches: ln_step_kept returns Nat.min(emitted, Nat.sub(rows, 1n)), counting the step's own token
 law ln_step_kept_not_bonus:
   for +r: Nat
@@ -2676,7 +2676,7 @@ def ln_step_kept_not_bonus(r, e):
     case 1n+ep:
       L.nat_le_lt_trans(Nat.min(1n+ep, Nat.sub(r, 1n)), 1n+ep, 1n+1n+ep, L.nat_min_le_l(1n+ep, Nat.sub(r, 1n)), L.nat_lt_succ_self(1n+ep))
 
-# promise: a speculative step never counts the row of its last token as a draft.
+# promise: a speculative step of at least one row counts fewer drafts than rows it verified, so the row of its last token is never a draft.
 # catches: ln_step_drafted returns rows, counting the row of the last token as a draft
 law ln_step_drafted_within_rows:
   for +r: Nat

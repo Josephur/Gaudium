@@ -1140,6 +1140,14 @@ bfa338a9ab5398d1  ln_spec_batched_fits  law ln_spec_batched_fits : for + c : Nat
 # promise ln_step_chunks_cover_need: a batched step covers every chunk its slots need whenever a lane can hold them.
 a0c03e484928dc40  ln_step_chunks_within_lane  law ln_step_chunks_within_lane : for + need : Nat for + lc : Nat { Nat.is_le ( ln_step_chunks ( need , lc ) , lc ) == True { } : Bool }
 # promise ln_step_chunks_within_lane: a batched step never covers more chunks than a lane owns.
+01fc401a834b6d42  ln_step_drafted_within_rows  law ln_step_drafted_within_rows : for + r : Nat { Nat.is_lt ( ln_step_drafted ( 1n + r ) , 1n + r ) == True { } : Bool }
+# promise ln_step_drafted_within_rows: a speculative step of at least one row counts fewer drafts than rows it verified, so the row of its last token is never a draft.
+07b2062658b26b20  ln_step_kept_counts_every_draft  law ln_step_kept_counts_every_draft : for + r : Nat for + e : Nat { Bool.or ( Nat.is_gt ( 1n + e , r ) , Nat.is_ge ( ln_step_kept ( r , 1n + e ) , e ) ) == True { } : Bool }
+# promise ln_step_kept_counts_every_draft: a speculative step that emitted no more tokens than it verified rows counts every token before its own as a kept draft.
+70dc1ad3976b591e  ln_step_kept_not_bonus  law ln_step_kept_not_bonus : for + r : Nat for + e : Nat { Nat.is_lt ( ln_step_kept ( r , 1n + e ) , 1n + e ) == True { } : Bool }
+# promise ln_step_kept_not_bonus: a speculative step that emitted tokens counts fewer kept drafts than tokens it emitted, so its own last token is never a kept draft.
+2b7561f7077ae224  ln_step_kept_within_drafted  law ln_step_kept_within_drafted : for + r : Nat for + e : Nat { Nat.is_le ( ln_step_kept ( r , e ) , ln_step_drafted ( r ) ) == True { } : Bool }
+# promise ln_step_kept_within_drafted: a speculative step never counts more kept drafts than drafts it verified.
 0c7b843488bcffde  ln_step_rows_in_ctx  law ln_step_rows_in_ctx : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_gt ( Nat.add ( c , n ) , m ) , Nat.is_le ( Nat.add ( c , ln_lane_step_rows ( g , n , w , r , c , m ) ) , m ) ) == True { } : Bool }
 # promise ln_step_rows_in_ctx: a lane never verifies rows past the end of its context in a batched step, whenever its narrow rows fit it.
 cd5590e07b5dcccf  ln_step_rows_in_ring  law ln_step_rows_in_ring : for + g : Bool for + n : Nat for + w : Nat for + r : Nat for + c : Nat for + m : Nat { Bool.or ( Nat.is_gt ( n , r ) , Nat.is_le ( ln_lane_step_rows ( g , n , w , r , c , m ) , r ) ) == True { } : Bool }
