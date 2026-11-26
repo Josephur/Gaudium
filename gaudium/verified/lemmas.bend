@@ -99,6 +99,11 @@ def g_bool_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
     case True{}: {==}
     case False{}: {==}
 
+def g_bool_or_true_r(b: Bool) -> {Bool.or(b, True{}) == True{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
 def g_nat_align_up_nz_sum(+x: Nat, +ap: Nat, +rem: Nat, erem: {rem == Nat.mod(x, 1n+ap) : Nat}, h_lt: {Nat.is_lt(rem, 1n+ap) == True{} : Bool}) -> {Nat.add(x, Nat.sub(1n+ap, rem)) == Nat.mul(1n+Nat.div(x, 1n+ap), 1n+ap) : Nat}:
   +q = Nat.div(x, 1n+ap)
   %L.nat_div_mod_r(x, ap) : {Nat.add(_, Nat.sub(1n+ap, rem)) == Nat.mul(1n+q, 1n+ap) : Nat}
