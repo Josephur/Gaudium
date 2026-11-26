@@ -2413,7 +2413,13 @@ impl Inkling2Engine {
                 let t_d = Instant::now();
                 let d = self.mtp_draft(generated[gi], cursor)?;
                 self.mtp_mut().stats.draft_ms += t_d.elapsed().as_secs_f64() * 1000.0;
-                toks.extend_from_slice(&d[..k.min(d.len())]);
+                // the drafts a block yields for this verify are the verified count
+                // (`mtp_draft_count`); the block returns one draft for each of its mask rows
+                let n = self.mtp_ref().g.drafts(k as u64) as usize;
+                let drafts = d.get(..n).ok_or_else(|| {
+                    format!("Inkling 2: the drafter block gave {} drafts, {n} expected", d.len())
+                })?;
+                toks.extend_from_slice(drafts);
             } else {
                 // drafts of the host oracle: the known continuation, with the marked ones made wrong
                 for j in 0..k {

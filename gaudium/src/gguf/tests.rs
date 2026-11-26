@@ -508,6 +508,68 @@ fn split_models_and_directories() {
 }
 
 #[test]
+fn a_split_model_must_declare_its_tensor_count_on_its_first_shard() {
+    // `gg_split_total_ok`: a first shard without `split.tensors.count` is refused (nothing would
+    // say tensors are missing), and a declared count must match the shards' total
+    let dir = temp_dir("split-undeclared");
+    let mk = |no: u16, name: &str, declared: Option<i32>| {
+        let mut b = Builder::new();
+        if no == 0 {
+            b.kv_str("general.architecture", "toy");
+        }
+        b.kv_raw("split.no", 2, &no.to_le_bytes())
+            .kv_raw("split.count", 2, &2u16.to_le_bytes());
+        if let Some(n) = declared {
+            b.kv_raw("split.tensors.count", 5, &n.to_le_bytes());
+        }
+        b.tensor(name, &[4], GgmlType::F32, f32_bytes(&[no as f32; 4]));
+        b.build()
+    };
+    fs::write(dir.join("m-00001-of-00002.gguf"), mk(0, "a", None)).unwrap();
+    fs::write(dir.join("m-00002-of-00002.gguf"), mk(1, "b", None)).unwrap();
+    let e = Gguf::open(dir.join("m-00001-of-00002.gguf"))
+        .unwrap_err()
+        .msg;
+    assert!(
+        e.contains("the first shard has no split.tensors.count, the shards hold 2"),
+        "{e}"
+    );
+    // only the first shard's key is read: a count in a later shard does not stand in for it
+    fs::write(dir.join("m-00002-of-00002.gguf"), mk(1, "b", Some(2))).unwrap();
+    assert!(Gguf::open(dir.join("m-00001-of-00002.gguf")).is_err());
+    // nor does a wrong count there matter once the first shard declares the right one
+    fs::write(dir.join("m-00001-of-00002.gguf"), mk(0, "a", Some(2))).unwrap();
+    fs::write(dir.join("m-00002-of-00002.gguf"), mk(1, "b", Some(7))).unwrap();
+    assert_eq!(
+        Gguf::open(dir.join("m-00001-of-00002.gguf"))
+            .unwrap()
+            .tensor_count(),
+        2
+    );
+    // a declared count on the first shard is held to the shards' total
+    fs::write(dir.join("m-00001-of-00002.gguf"), mk(0, "a", Some(1))).unwrap();
+    let e = Gguf::open(dir.join("m-00001-of-00002.gguf"))
+        .unwrap_err()
+        .msg;
+    assert!(
+        e.contains("split.tensors.count is 1, the shards hold 2"),
+        "{e}"
+    );
+    // and a key there that is not a tensor count is no declared count
+    fs::write(dir.join("m-00001-of-00002.gguf"), mk(0, "a", Some(-1))).unwrap();
+    let e = Gguf::open(dir.join("m-00001-of-00002.gguf"))
+        .unwrap_err()
+        .msg;
+    assert!(
+        e.contains(
+            "the first shard's split.tensors.count is not a tensor count, the shards hold 2"
+        ),
+        "{e}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn adapter_registers_views_by_checkpoint_name() {
     let dir = temp_dir("adapter");
     let p = dir.join("m.gguf");
