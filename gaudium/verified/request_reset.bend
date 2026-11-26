@@ -967,3 +967,28 @@ law rr_end_ok_hw_covers_request:
 
 def rr_end_ok_hw_covers_request(m, hw, held, u, p, g, sl, mc):
   L.nat_max_ge_r(held, rr_high_water(p, g, sl, mc))
+
+# LAW RR.27: Completing a request (`rr_end_ok`) never raises kv_hw above max(held, max_ctx).
+# RR.26 bounds kv_hw from below. `begin_request` takes kv_hw as the next reset's dirty rows,
+# so this keeps that count within the cache; a Rust test pins the exact value.
+# promise: after a successful request, kv_hw stays within the larger of the rows held before it and max_ctx
+# catches: rr_end_ok_fields sets kv_hw to Nat.add(held, rr_high_water(...)), which RR.17 and RR.26 accept
+law rr_end_ok_hw_within_ctx:
+  for +m: RrMode
+  for hw: Nat
+  for +held: Nat
+  for +u: Bool
+  for +p: Nat
+  for +g: Nat
+  for +sl: Nat
+  for +mc: Nat
+  {Nat.is_le(rr_state_hw(rr_end_ok(RrState{m, hw, held, u}, p, g, sl, mc)), Nat.max(held, mc)) == True{} : Bool}
+
+def rr_end_ok_hw_within_ctx(m, hw, held, u, p, g, sl, mc):
+  G.g_nat_max_le(
+    held,
+    rr_high_water(p, g, sl, mc),
+    Nat.max(held, mc),
+    L.nat_max_ge_l(held, mc),
+    L.nat_le_trans(rr_high_water(p, g, sl, mc), mc, Nat.max(held, mc), rr_hw_le_max_ctx(p, g, sl, mc), L.nat_max_ge_r(held, mc))
+  )

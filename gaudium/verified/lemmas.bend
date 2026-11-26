@@ -104,6 +104,28 @@ def g_bool_or_true_r(b: Bool) -> {Bool.or(b, True{}) == True{} : Bool}:
     case True{}: {==}
     case False{}: {==}
 
+# `Nat.max(a, b)` is at most any `c` that both `a` and `b` are at most (least upper bound).
+def g_nat_max_le(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  ha: {Nat.is_le(a, c) == True{} : Bool},
+  hb: {Nat.is_le(b, c) == True{} : Bool}
+) -> {Nat.is_le(Nat.max(a, b), c) == True{} : Bool}:
+  match a:
+    case 0n:
+      hb
+    case 1n+ap:
+      match b:
+        case 0n:
+          ha
+        case 1n+bp:
+          match c:
+            case 0n:
+              L.bool_absurd({Nat.is_le(Nat.max(1n+ap, 1n+bp), 0n) == True{} : Bool}, ha)
+            case 1n+cp:
+              g_nat_max_le(ap, bp, cp, ha, hb)
+
 def g_nat_align_up_nz_sum(+x: Nat, +ap: Nat, +rem: Nat, erem: {rem == Nat.mod(x, 1n+ap) : Nat}, h_lt: {Nat.is_lt(rem, 1n+ap) == True{} : Bool}) -> {Nat.add(x, Nat.sub(1n+ap, rem)) == Nat.mul(1n+Nat.div(x, 1n+ap), 1n+ap) : Nat}:
   +q = Nat.div(x, 1n+ap)
   %L.nat_div_mod_r(x, ap) : {Nat.add(_, Nat.sub(1n+ap, rem)) == Nat.mul(1n+q, 1n+ap) : Nat}
