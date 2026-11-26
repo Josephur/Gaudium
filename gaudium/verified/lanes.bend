@@ -2633,3 +2633,97 @@ law ln_lane_buf_aligned:
 
 def ln_lane_buf_aligned(b):
   TB.align_up_is_multiple(Nat.max(b, ln_arena_unit()), 255n)
+
+# ============================================================================
+# 15. The drafts of a speculative lane step
+# ============================================================================
+#
+# A speculative step verifies `rows` rows: the row of its last token and `rows - 1` drafts. It
+# emits `emitted` tokens: the drafts it kept, then one token of its own. The lane's width policy
+# learns its acceptance from these two counts (`WidthPolicy::observe`), and `lane_rows_of` reads
+# that estimate to choose between the narrow and the wide launch, so they are verified here. The
+# request's running totals of them are report-only and stay in the shell.
+
+# The drafts a step of `rows` verify rows verified.
+def ln_step_drafted(rows: Nat) -> Nat:
+  Nat.sub(rows, 1n)
+
+# The drafts a step of `rows` verify rows kept, when it emitted `emitted` tokens.
+def ln_step_kept(rows: Nat, emitted: Nat) -> Nat:
+  Nat.min(Nat.sub(emitted, 1n), Nat.sub(rows, 1n))
+
+# promise: a speculative step never counts more kept drafts than drafts it verified.
+# catches: ln_step_kept returns Nat.sub(emitted, 1n), trusting the accept kernel's count past the drafts
+law ln_step_kept_within_drafted:
+  for +r: Nat
+  for +e: Nat
+  {Nat.is_le(ln_step_kept(r, e), ln_step_drafted(r)) == True{} : Bool}
+
+def ln_step_kept_within_drafted(r, e):
+  L.nat_min_le_r(Nat.sub(e, 1n), Nat.sub(r, 1n))
+
+# promise: the token a speculative step emits after its kept drafts is never counted as a kept draft.
+# catches: ln_step_kept returns Nat.min(emitted, Nat.sub(rows, 1n)), counting the step's own token
+law ln_step_kept_not_bonus:
+  for +r: Nat
+  for +e: Nat
+  {Nat.is_lt(ln_step_kept(r, 1n+e), 1n+e) == True{} : Bool}
+
+def ln_step_kept_not_bonus(r, e):
+  match e:
+    case 0n:
+      {==}
+    case 1n+ep:
+      L.nat_le_lt_trans(Nat.min(1n+ep, Nat.sub(r, 1n)), 1n+ep, 1n+1n+ep, L.nat_min_le_l(1n+ep, Nat.sub(r, 1n)), L.nat_lt_succ_self(1n+ep))
+
+# promise: a speculative step never counts the row of its last token as a draft.
+# catches: ln_step_drafted returns rows, counting the row of the last token as a draft
+law ln_step_drafted_within_rows:
+  for +r: Nat
+  {Nat.is_lt(ln_step_drafted(1n+r), 1n+r) == True{} : Bool}
+
+def ln_step_drafted_within_rows(r):
+  match r:
+    case 0n:
+      {==}
+    case 1n+rp:
+      L.nat_lt_succ_self(1n+rp)
+
+# A step that emitted 1 + e tokens out of 1 + rp rows either emitted more than it verified, or kept
+# at least e drafts.
+def ln_step_kept_aux(+e: Nat, +rp: Nat) -> {Bool.or(Nat.is_gt(e, rp), Nat.is_ge(Nat.min(e, rp), e)) == True{} : Bool}:
+  match e rp:
+    case 0n 0n:
+      {==}
+    case 0n 1n+q:
+      {==}
+    case 1n+ep 0n:
+      {==}
+    case 1n+ep 1n+q:
+      ln_step_kept_aux(ep, q)
+
+# `ln_step_kept_aux` as `ln_step_kept` leaves it: `Nat.sub(x, 0n)` only reduces on a constructor.
+def ln_step_kept_sub_aux(+e: Nat, +rp: Nat) -> {Bool.or(Nat.is_gt(e, rp), Nat.is_ge(Nat.min(Nat.sub(e, 0n), Nat.sub(rp, 0n)), e)) == True{} : Bool}:
+  match e rp:
+    case 0n 0n:
+      {==}
+    case 0n 1n+q:
+      {==}
+    case 1n+ep 0n:
+      {==}
+    case 1n+ep 1n+q:
+      ln_step_kept_aux(ep, q)
+
+# promise: a speculative step that emitted no more tokens than it verified rows counts every token before its own as a kept draft.
+# catches: ln_step_kept returns 0n, so the width policy sees no draft ever kept
+law ln_step_kept_counts_every_draft:
+  for +r: Nat
+  for +e: Nat
+  {Bool.or(Nat.is_gt(1n+e, r), Nat.is_ge(ln_step_kept(r, 1n+e), e)) == True{} : Bool}
+
+def ln_step_kept_counts_every_draft(r, e):
+  match r:
+    case 0n:
+      {==}
+    case 1n+rp:
+      ln_step_kept_sub_aux(e, rp)
