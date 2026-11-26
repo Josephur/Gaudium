@@ -1356,6 +1356,18 @@ b5f19ec53334e77f  mtp_ring_slots_found  law mtp_ring_slots_found : for + w : Nat
 86e2fe57525a5ec7  mtpf_choice_is_candidate  law mtpf_choice_is_candidate : for drafter : Bool for + hid : Nat for + model_hid : Nat for + vocab : Nat for + model_vocab : Nat for best : MmpPick for + i : Nat for + rank : Nat { mmp_index_from ( mtpf_step ( drafter , hid , model_hid , vocab , model_vocab , best , i , rank ) , best , i ) == True { } : Bool }
 # promise mtpf_choice_is_candidate: the chosen drafter file is always the file just seen or the earlier choice, so it is always one of the candidates
 # harm mtpf_choice_is_candidate: an index past the candidate list would name no file or another one
+025f3eff11d9a9f9  mtpf_fit_hidden_real  law mtpf_fit_hidden_real : for drafter : Bool for + hid : Nat for + vocab : Nat for + model_vocab : Nat { mtpf_fit_hidden ( mtpf_fit ( drafter , hid , hid , vocab , model_vocab ) ) == False { } : Bool }
+# promise mtpf_fit_hidden_real: a file whose hidden size is the model's is never refused for its hidden size
+# harm mtpf_fit_hidden_real: a drafter of the right width would be reported as the wrong width, sending the fix to the wrong place
+505c0099c71c665c  mtpf_fit_not_drafter_exactly  law mtpf_fit_not_drafter_exactly : for drafter : Bool for + hid : Nat for + model_hid : Nat for + vocab : Nat for + model_vocab : Nat { mtpf_fit_not_drafter ( mtpf_fit ( drafter , hid , model_hid , vocab , model_vocab ) ) == Bool.not ( drafter ) : Bool }
+# promise mtpf_fit_not_drafter_exactly: a file is refused as not a block drafter of the family exactly when it isn't one, whatever sizes it states
+# harm mtpf_fit_not_drafter_exactly: a projector or a main model would be reported by a size it isn't held to, or a drafter of the wrong size as another kind of file
+aee354c11537cd64  mtpf_fit_serves_exactly  law mtpf_fit_serves_exactly : for drafter : Bool for + hid : Nat for + model_hid : Nat for + vocab : Nat for + model_vocab : Nat { mtpf_fit_serves ( mtpf_fit ( drafter , hid , model_hid , vocab , model_vocab ) ) == mtpf_matches ( drafter , hid , model_hid , vocab , model_vocab ) : Bool }
+# promise mtpf_fit_serves_exactly: a candidate file is reported as serving the model exactly when it matches the selection rule (`mtpf_matches`), so every file the rule refuses has a reason and a file it can choose has none
+# harm mtpf_fit_serves_exactly: the file the search chose would be refused when its contract is read, or a file it passed over would be listed with no reason
+2f644032f3adc04f  mtpf_fit_vocab_real  law mtpf_fit_vocab_real : for drafter : Bool for + hid : Nat for + model_hid : Nat for + vocab : Nat { mtpf_fit_vocab ( mtpf_fit ( drafter , hid , model_hid , vocab , vocab ) ) == False { } : Bool }
+# promise mtpf_fit_vocab_real: a file whose vocabulary is the model's is never refused for its vocabulary
+# harm mtpf_fit_vocab_real: a drafter with the model's vocabulary would be reported as having another, sending the fix to the wrong place
 3448a9fc595d8992  mtpf_less_vocab_keeps  law mtpf_less_vocab_keeps : for drafter : Bool for + hid : Nat for + model_hid : Nat for + vocab : Nat for + e : Nat for best : MmpPick for + i : Nat for + rank : Nat { mtpf_step ( drafter , hid , model_hid , vocab , Nat.add ( 1n + vocab , e ) , best , i , rank ) == best : MmpPick }
 # promise mtpf_less_vocab_keeps: a drafter file with a smaller vocabulary than the model's leaves the choice exactly as it was, so it is never chosen
 # harm mtpf_less_vocab_keeps: the drafter of another tokenizer would propose ids that mean other text
