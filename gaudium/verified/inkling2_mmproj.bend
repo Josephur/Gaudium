@@ -10,6 +10,11 @@
 #   - The choice's rank never gets worse, and is never worse than any matching file's
 #   - A file of another projector type, or whose projection width differs from the model's
 #     hidden size, never matches
+#   - The reason a file is refused for (`mmp_fit`) agrees with the rule: a file is reported as
+#     serving the model exactly when it matches the rule, and as of another type exactly when it is
+#   - What the model gets from the search (`mmp_outcome`): the chosen file when there is one,
+#     text only when no candidate lies beside it, and a refusal when candidates do but the search
+#     chose none
 
 import Base
 import nat_lemmas.bend as L
@@ -30,6 +35,19 @@ type MmpPrecision is Data:
   MmpF32{}
   MmpF16{}
   MmpOther{}
+
+# Whether a candidate projector file serves the model, and if not, which of the rule's two facts
+# it fails: the reason both the search and the tower check report.
+type MmpFit is Data:
+  MmpServes{}     # of the family's projector type, with the model's hidden size as its width
+  MmpOtherType{}  # of another projector type
+  MmpWidth{}      # its projection width is not the model's hidden size
+
+# What the model gets from the search over its candidate files.
+type MmpOutcome is Data:
+  MmpUse{index: Nat}  # the candidate at `index` is the model's projector
+  MmpTextOnly{}       # no candidate lies beside the model: it runs on text alone
+  MmpNoMatch{}        # candidates lie beside it, but none serves it: refused with their reasons
 
 # ============================================================================
 # 2. The rule
@@ -70,6 +88,33 @@ def mmp_step(ok: Bool, best: MmpPick, +i: Nat, +rank: Nat) -> MmpPick:
           MmpAt{i, rank}
         case MmpAt{bi, br}:
           mmp_better(i, rank, bi, br)
+
+# The fit of a candidate from the rule's two facts: of the family's projector type (`family`),
+# and with the model's hidden size as its width (`same_width`). The type is read first (another
+# type's width is not a projection of this family's).
+def mmp_fit_of(family: Bool, same_width: Bool) -> MmpFit:
+  match family:
+    case False{}:
+      MmpOtherType{}
+    case True{}:
+      match same_width:
+        case False{}:
+          MmpWidth{}
+        case True{}:
+          MmpServes{}
+
+# Why a candidate projector file does not serve the model, or that it does, from the facts
+# `mmp_matches` reads.
+def mmp_fit(family: Bool, +proj: Nat, +hidden: Nat) -> MmpFit:
+  mmp_fit_of(family, Nat.is_eq(proj, hidden))
+
+# What the model gets from the search: the choice `best` after all `files` candidates were folded.
+def mmp_outcome(+files: Nat, best: MmpPick) -> MmpOutcome:
+  match best:
+    case MmpAt{bi, br}:
+      MmpUse{bi}
+    case MmpNone{}:
+      Bool.pick(MmpOutcome, Nat.is_eq(files, 0n), MmpTextOnly{}, MmpNoMatch{})
 
 # ============================================================================
 # 3. Observations of a choice (used by the laws and the shell)
@@ -120,9 +165,43 @@ def mmp_index_from(new: MmpPick, old: MmpPick, +i: Nat) -> Bool:
     case MmpAt{ni, nr}:
       mmp_at_from(ni, old, i)
 
+# The fit is a file that serves the model (the observers the fit laws are stated with).
+def mmp_fit_serves(f: MmpFit) -> Bool:
+  match f:
+    case MmpServes{}:
+      True{}
+    case _:
+      False{}
+
+# The fit is a file refused as of another projector type.
+def mmp_fit_other_type(f: MmpFit) -> Bool:
+  match f:
+    case MmpOtherType{}:
+      True{}
+    case _:
+      False{}
+
 # ============================================================================
 # 4. Helper lemmas (erased before Rust codegen)
 # ============================================================================
+
+# The fit serves exactly when both facts hold.
+def mmp_fit_of_serves(a: Bool, b: Bool) -> {mmp_fit_serves(mmp_fit_of(a, b)) == Bool.and(a, b) : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match b:
+        case False{}: {==}
+        case True{}: {==}
+
+# The fit refuses as of another type exactly when the file is of another type.
+def mmp_fit_of_other_type(a: Bool, b: Bool) -> {mmp_fit_other_type(mmp_fit_of(a, b)) == Bool.not(a) : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match b:
+        case False{}: {==}
+        case True{}: {==}
 
 def mmp_eq_refl(n: Nat) -> {Nat.is_eq(n, n) == True{} : Bool}:
   match n:
@@ -323,3 +402,58 @@ def mmp_narrower_never_matches(family, hidden, e):
       {==}
     case True{}:
       IV.ikv_under_ne(hidden, e)
+
+# promise: a candidate projector file is reported as serving the model exactly when it matches the selection rule (`mmp_matches`), so every file the rule refuses has a reason and a file it can choose has none
+# harm: the file the search chose would be refused when its tower is read, or a file it passed over would be listed with no reason
+# catches: the width left out of the reason (a projector of the family but another width reported as serving)
+law mmp_fit_serves_exactly:
+  for family: Bool
+  for +proj: Nat
+  for +hidden: Nat
+  {mmp_fit_serves(mmp_fit(family, proj, hidden)) == mmp_matches(family, proj, hidden) : Bool}
+
+def mmp_fit_serves_exactly(family, proj, hidden):
+  mmp_fit_of_serves(family, Nat.is_eq(proj, hidden))
+
+# promise: a projector file is refused as of another projector type exactly when it is of another type, whatever width it states
+# harm: a tower of another architecture would be reported by a width it isn't held to, or a family projector of the wrong width as another type
+# catches: the width checked before the type (a projector of another type reported as a width mismatch)
+law mmp_fit_other_type_exactly:
+  for family: Bool
+  for +proj: Nat
+  for +hidden: Nat
+  {mmp_fit_other_type(mmp_fit(family, proj, hidden)) == Bool.not(family) : Bool}
+
+def mmp_fit_other_type_exactly(family, proj, hidden):
+  mmp_fit_of_other_type(family, Nat.is_eq(proj, hidden))
+
+# promise: the file the search chose is always the model's projector
+# harm: a model with a matching projector beside it would run without images, or read its tower from another file
+# catches: the choice dropped (a chosen file read as text only)
+law mmp_outcome_uses_choice:
+  for +files: Nat
+  for +i: Nat
+  for +rank: Nat
+  {mmp_outcome(files, MmpAt{i, rank}) == MmpUse{i} : MmpOutcome}
+
+def mmp_outcome_uses_choice(files, i, rank):
+  {==}
+
+# promise: the search over no candidate projector files gives the model text only, never a refusal
+# harm: every GGUF model of the family shipped without a projector would refuse to load
+# catches: a model without a projector refused (no candidate taken as no match)
+law mmp_outcome_no_files_text_only:
+  {mmp_outcome(0n, MmpNone{}) == MmpTextOnly{} : MmpOutcome}
+
+def mmp_outcome_no_files_text_only():
+  {==}
+
+# promise: a search that chose nothing from one or more candidate projector files refuses the model, never runs it on text alone and never gives it a file
+# harm: a model whose projector file doesn't fit would silently lose its images, or read a tower that doesn't serve it
+# catches: no match taken as text only (the candidates' refusals dropped)
+law mmp_outcome_no_match_refused:
+  for +files: Nat
+  {mmp_outcome(1n+files, MmpNone{}) == MmpNoMatch{} : MmpOutcome}
+
+def mmp_outcome_no_match_refused(files):
+  {==}
