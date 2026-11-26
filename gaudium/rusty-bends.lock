@@ -1341,6 +1341,9 @@ d5b501b0c2c5ee3b  mtp_frnn_row_in_pass  law mtp_frnn_row_in_pass : for + r : Nat
 884d4cac92212815  mtp_ring_ok_holds  law mtp_ring_ok_holds : for + r : Nat for + w : Nat for + a : Nat { Bool.and ( mtp_ring_ok ( r , w , a ) , Nat.is_lt ( r , Nat.add ( w , a ) ) ) == False { } : Bool }
 # promise mtp_ring_ok_holds: a ring the check accepts always holds the window beside every row a context pass writes ahead of the anchor.
 # harm mtp_ring_ok_holds: a row written ahead would overwrite a context position the block still reads.
+84dc6b24b7e29adf  mtp_ring_slots_bounded  law mtp_ring_slots_bounded : for + w : Nat for + a : Nat for + h : Nat { Bool.and ( Nat.is_lt ( 128n , mtp_ring_slots ( w , a ) ) , Bool.and ( mtp_ring_ok ( h , w , a ) , Nat.is_le ( Nat.mul ( h , 2n ) , mtp_ring_slots ( w , a ) ) ) ) == False { } : Bool }
+# promise mtp_ring_slots_bounded: a ring the sizing returns with more than 128 slots always has fewer than twice the slots of any ring the check accepts for the same window and rows written ahead.
+# harm mtp_ring_slots_bounded: the drafter's persistent K / V rings could take twice the HBM the window and the rows written ahead need, or more, and a load whose rings would fit could be refused.
 b5f19ec53334e77f  mtp_ring_slots_found  law mtp_ring_slots_found : for + w : Nat for + a : Nat { Bool.and ( Nat.is_le ( Nat.add ( w , a ) , Nat.mul ( 128n , 512n ) ) , Nat.is_eq ( mtp_ring_slots ( w , a ) , 0n ) ) == False { } : Bool }
 # promise mtp_ring_slots_found: a window and a pass that together need at most 65536 slots (128 x 512, 64 times the 1024-row windows of today's drafters) always get a ring, so the two laws above never hold only because the sizing gave none.
 # harm mtp_ring_slots_found: the drafter would refuse a checkpoint whose window and passes fit a ring the engine can build.

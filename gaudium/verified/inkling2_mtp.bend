@@ -223,6 +223,73 @@ law mtp_ring_slots_found:
 def mtp_ring_slots_found(w, a):
   mtp_cap_ring(Nat.is_le(Nat.add(w, a), Nat.mul(128n, 512n)), w, a, {==})
 
+# A need above a size stays above it when both are doubled.
+def mtp_le_double(+a: Nat, +b: Nat, h: {Nat.is_le(a, b) == False{} : Bool}) -> {Nat.is_le(Nat.mul(a, 2n), Nat.mul(b, 2n)) == False{} : Bool}:
+  match a b:
+    case 0n 0n:
+      h
+    case 0n 1n+bp:
+      h
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      mtp_le_double(ap, bp, h)
+
+# The doubling search answers at most 128, or less than twice `need`, when the size it starts from does and it stops as soon
+# as a size holds `need` (erased before Rust codegen, as are the three below).
+def mtp_pow2_hi(fuel: Nat, done: Bool, +p: Nat, +need: Nat, hp: {Bool.and(Nat.is_lt(128n, p), Nat.is_le(Nat.mul(need, 2n), p)) == False{} : Bool}, hd: {Bool.and(Bool.not(done), Nat.is_le(need, p)) == False{} : Bool}) -> {Bool.and(Nat.is_lt(128n, K.ik_pow2_from(fuel, done, p, need)), Nat.is_le(Nat.mul(need, 2n), K.ik_pow2_from(fuel, done, p, need))) == False{} : Bool}:
+  match fuel:
+    case 0n:
+      match done:
+        case True{}:
+          hp
+        case False{}:
+          {==}
+    case 1n+f:
+      match done:
+        case True{}:
+          hp
+        case False{}:
+          +g = {f : Nat}
+          mtp_pow2_hi(g, Nat.is_ge(Nat.mul(p, 2n), need), Nat.mul(p, 2n), need, K.ikp_and_fr(Nat.is_lt(128n, Nat.mul(p, 2n)), Nat.is_le(Nat.mul(need, 2n), Nat.mul(p, 2n)), mtp_le_double(need, p, hd)), mtp_ge_le_excl(Nat.mul(p, 2n), need))
+
+# A ring below twice `n` is below twice any `h` that holds `n`.
+def mtp_bound_go(c: Bool, +n: Nat, +h: Nat, +r: Nat, e: {Nat.is_le(Nat.mul(h, 2n), r) == c : Bool}, hh: {Nat.is_le(n, h) == True{} : Bool}, hb: {Nat.is_le(Nat.mul(n, 2n), r) == False{} : Bool}) -> {c == False{} : Bool}:
+  match c:
+    case False{}:
+      {==}
+    case True{}:
+      L.bool_absurd({True{} == False{} : Bool}, mtp_clash(Nat.is_le(Nat.mul(n, 2n), r), hb, L.nat_le_trans(Nat.mul(n, 2n), Nat.mul(h, 2n), r, L.nat_mul_le_mono_r(n, h, 2n, hh), e)))
+
+# A ring below twice `n` is below twice `h` whenever `h` holds `n`, read against the check's answer.
+def mtp_bound_ok(b: Bool, +n: Nat, +h: Nat, +r: Nat, e: {Nat.is_le(n, h) == b : Bool}, hb: {Nat.is_le(Nat.mul(n, 2n), r) == False{} : Bool}) -> {Bool.and(b, Nat.is_le(Nat.mul(h, 2n), r)) == False{} : Bool}:
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      mtp_bound_go(Nat.is_le(Nat.mul(h, 2n), r), n, h, r, {==}, e, hb)
+
+# A bound below twice `n`, read against every `h` that holds `n`.
+def mtp_bound_all(x: Bool, +n: Nat, +h: Nat, +r: Nat, hb: {Bool.and(x, Nat.is_le(Nat.mul(n, 2n), r)) == False{} : Bool}) -> {Bool.and(x, Bool.and(Nat.is_le(n, h), Nat.is_le(Nat.mul(h, 2n), r))) == False{} : Bool}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      mtp_bound_ok(Nat.is_le(n, h), n, h, r, {==}, hb)
+
+# promise: a ring the sizing returns with more than 128 slots always has fewer than twice the slots of any ring the check accepts for the same window and rows written ahead.
+# harm: the drafter's persistent K / V rings could take twice the HBM the window and the rows written ahead need, or more, and a load whose rings would fit could be refused.
+# catches: the ring doubled after rounding (twice the power of two that holds the window and the pass)
+law mtp_ring_slots_bounded:
+  for +w: Nat
+  for +a: Nat
+  for +h: Nat
+  {Bool.and(Nat.is_lt(128n, mtp_ring_slots(w, a)), Bool.and(mtp_ring_ok(h, w, a), Nat.is_le(Nat.mul(h, 2n), mtp_ring_slots(w, a)))) == False{} : Bool}
+
+def mtp_ring_slots_bounded(w, a, h):
+  +n = {Nat.add(w, a) : Nat}
+  mtp_bound_all(Nat.is_lt(128n, mtp_ring_slots(w, a)), n, h, mtp_ring_slots(w, a), mtp_pow2_hi(40n, Nat.is_ge(128n, n), 128n, n, {==}, mtp_ge_le_excl(128n, n)))
+
 # ============================================================================
 # 3. Drafts of a block
 # ============================================================================
