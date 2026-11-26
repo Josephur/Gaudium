@@ -31,6 +31,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import lemmas.bend as G
 import tensor_bounds.bend as T
 
 # ============================================================================
@@ -1283,12 +1284,6 @@ def kv_batches_apart(c1, g1, c2, g2, n, h, h1, h2):
     {==},
     {==})
 
-def kc_eq_add_succ_false(+row: Nat, +d: Nat) -> {Nat.is_eq(Nat.add(row, 1n+d), row) == False{} : Bool}:
-  match row:
-    case 0n: {==}
-    case 1n+rp:
-      kc_eq_add_succ_false(rp, d)
-
 # promise: FP8 attention shape validation rejects any head_dim strictly larger than row
 # catches: kv8_shape_ok checks head_dim >= row instead of equality
 law kv8_shape_rejects_larger_head_dim:
@@ -1299,14 +1294,8 @@ law kv8_shape_rejects_larger_head_dim:
   {kv8_shape_ok(Nat.add(row, 1n+d), nkv, row, slots) == False{} : Bool}
 
 def kv8_shape_rejects_larger_head_dim(row, d, nkv, slots):
-  %Equal.sym(Bool, Nat.is_eq(Nat.add(row, 1n+d), row), False{}, kc_eq_add_succ_false(row, d)) : {Bool.and(_, Bool.and(Nat.is_gt(nkv, 0n), Nat.is_le(nkv, slots))) == False{} : Bool}
+  %Equal.sym(Bool, Nat.is_eq(Nat.add(row, 1n+d), row), False{}, G.g_nat_eq_add_succ_false(row, d)) : {Bool.and(_, Bool.and(Nat.is_gt(nkv, 0n), Nat.is_le(nkv, slots))) == False{} : Bool}
   {==}
-
-def kc_eq_succ_add_false(+hd: Nat, +d: Nat) -> {Nat.is_eq(hd, Nat.add(hd, 1n+d)) == False{} : Bool}:
-  match hd:
-    case 0n: {==}
-    case 1n+hp:
-      kc_eq_succ_add_false(hp, d)
 
 # promise: FP8 attention shape validation rejects any head_dim strictly smaller than row
 # catches: kv8_shape_ok checks head_dim <= row instead of equality
@@ -1318,7 +1307,7 @@ law kv8_shape_rejects_smaller_head_dim:
   {kv8_shape_ok(hd, nkv, Nat.add(hd, 1n+d), slots) == False{} : Bool}
 
 def kv8_shape_rejects_smaller_head_dim(hd, d, nkv, slots):
-  %Equal.sym(Bool, Nat.is_eq(hd, Nat.add(hd, 1n+d)), False{}, kc_eq_succ_add_false(hd, d)) : {Bool.and(_, Bool.and(Nat.is_gt(nkv, 0n), Nat.is_le(nkv, slots))) == False{} : Bool}
+  %Equal.sym(Bool, Nat.is_eq(hd, Nat.add(hd, 1n+d)), False{}, G.g_nat_eq_succ_add_false(hd, d)) : {Bool.and(_, Bool.and(Nat.is_gt(nkv, 0n), Nat.is_le(nkv, slots))) == False{} : Bool}
   {==}
 
 # promise: BF16 K/V caches are always accepted by every engine regardless of FP8 attention support

@@ -8,6 +8,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper Nat / Bool lemmas (erased before Rust codegen)
@@ -401,14 +402,9 @@ law rr_chunk_dirty_covers_first_chunk:
   for +cr: Nat
   {Nat.is_le(Nat.div(cb, Nat.max(1n, chunks)), rr_chunk_dirty_bytes(cb, chunks, 1n+r_m1, cr)) == True{} : Bool}
 
-def rr_nat_eq_refl(+n: Nat) -> {Nat.is_eq(n, n) == True{} : Bool}:
-  match n:
-    case 0n: {==}
-    case 1n+np: rr_nat_eq_refl(np)
-
 def rr_zero_ne_succ_bool(+r_m1: Nat, h: {0n == 1n+r_m1 : Nat}) -> {False{} == True{} : Bool}:
   %Equal.sym(Nat, 0n, 1n+r_m1, h) : {Nat.is_eq(_, 1n+r_m1) == True{} : Bool}
-  rr_nat_eq_refl(1n+r_m1)
+  G.g_nat_eq_refl(1n+r_m1)
 
 def rr_zero_eq_succ_from_div(+r_m1: Nat, +bm1: Nat, hq: {Nat.div(1n+r_m1, 1n+bm1) == 0n : Nat}, hm: {Nat.mod(1n+r_m1, 1n+bm1) == 0n : Nat}) -> {0n == 1n+r_m1 : Nat}:
   %hm : {Nat.add(_, Nat.mul(0n, 1n+bm1)) == 1n+r_m1 : Nat}
@@ -613,6 +609,23 @@ def rr_head_span_within_per_head(cb, heads, rows, n):
     case 1n+rm1:
       rr_head_span_within_per_head_aux(Nat.div(cb, Nat.max(1n, heads)), rm1, n)
 
+# LAW RR.12b: HeadMajor span bytes cover at least min(n, rows) * row_bytes for a valid layout.
+# promise: a HeadMajor span byte length covers at least min(n, rows) * row_bytes for a cache of heads * rows * row_bytes bytes
+# catches: rr_head_span_bytes returns 0n
+law rr_head_span_covers_rows:
+  for +rb: Nat
+  for +hm1: Nat
+  for +rm1: Nat
+  for +n: Nat
+  {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), rr_head_span_bytes(Nat.mul(Nat.mul(rb, 1n+rm1), 1n+hm1), 1n+hm1, 1n+rm1, n)) == True{} : Bool}
+
+def rr_head_span_covers_rows(rb, hm1, rm1, n):
+  %G.g_nat_max_one_succ(hm1) : {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), Nat.mul(Nat.min(n, Nat.max(1n, 1n+rm1)), Nat.div(Nat.div(Nat.mul(Nat.mul(rb, 1n+rm1), 1n+hm1), _), Nat.max(1n, 1n+rm1)))) == True{} : Bool}
+  %G.g_nat_max_one_succ(rm1) : {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), Nat.mul(Nat.min(n, _), Nat.div(Nat.div(Nat.mul(Nat.mul(rb, 1n+rm1), 1n+hm1), 1n+hm1), _))) == True{} : Bool}
+  %Equal.sym(Nat, Nat.div(Nat.mul(Nat.mul(rb, 1n+rm1), 1n+hm1), 1n+hm1), Nat.mul(rb, 1n+rm1), L.nat_div_mul(Nat.mul(rb, 1n+rm1), hm1)) : {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), Nat.mul(Nat.min(n, 1n+rm1), Nat.div(_, 1n+rm1))) == True{} : Bool}
+  %Equal.sym(Nat, Nat.div(Nat.mul(rb, 1n+rm1), 1n+rm1), rb, L.nat_div_mul(rb, rm1)) : {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), Nat.mul(Nat.min(n, 1n+rm1), _)) == True{} : Bool}
+  L.nat_le_refl(Nat.mul(Nat.min(n, 1n+rm1), rb))
+
 # LAW RR.13: Request high-water mark NEVER exceeds `max_ctx`.
 # promise: request high-water row mark never exceeds max_ctx
 # catches: max_ctx cap omitted from rr_high_water
@@ -648,60 +661,46 @@ def rr_hw_from_prompt_le(+max_ctx: Nat, +prompt: Nat, +new_tokens: Nat, +slack: 
 def rr_hw_le_max_ctx(prompt, new_tokens, slack, max_ctx):
   rr_hw_from_prompt_le(max_ctx, prompt, new_tokens, slack, Nat.is_le(prompt, max_ctx), {==})
 
-# LAW RR.14: When `prompt + new_tokens + slack <= max_ctx`, high-water covers at least `prompt + new_tokens`.
-# promise: high-water covers prompt + new_tokens when context has headroom
-# catches: new_tokens or prompt omitted from rr_high_water
-law rr_hw_covers_prompt_plus_tokens:
+# LAW RR.14: High-water covers prompt + new_tokens + slack, saturated at max_ctx.
+# promise: request high-water covers prompt + new_tokens + slack up to max_ctx
+# catches: slack omitted from rr_high_water
+law rr_hw_covers_written_with_slack:
   for +prompt: Nat
   for +new_tokens: Nat
   for +slack: Nat
-  for +extra: Nat
-  {Nat.is_le(Nat.add(prompt, new_tokens), rr_high_water(prompt, new_tokens, slack, Nat.add(Nat.add(prompt, new_tokens), Nat.add(slack, extra)))) == True{} : Bool}
+  for +max_ctx: Nat
+  {Nat.is_le(Nat.min(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx), rr_high_water(prompt, new_tokens, slack, max_ctx)) == True{} : Bool}
 
-def rr_hw_step_pick_ge(+target: Nat, +cap: Nat, +base: Nat, +add: Nat, +fits: Bool, hcap: {Nat.is_le(target, cap) == True{} : Bool}, hsum: {Nat.is_le(target, Nat.add(base, add)) == True{} : Bool}) -> {Nat.is_le(target, rr_hw_step_pick(cap, base, add, fits)) == True{} : Bool}:
-  match fits:
+def rr_hw_cov_slack_sat(+tot: Nat, +max_ctx: Nat, +slack: Nat, +s_fits: Bool) -> {Nat.is_le(Nat.min(tot, max_ctx), rr_hw_step_pick(max_ctx, max_ctx, slack, s_fits)) == True{} : Bool}:
+  match s_fits:
     case True{}:
-      hsum
+      L.nat_le_trans(Nat.min(tot, max_ctx), max_ctx, Nat.add(max_ctx, slack), L.nat_min_le_r(tot, max_ctx), L.nat_add_le_r(max_ctx, slack))
     case False{}:
-      hcap
+      L.nat_min_le_r(tot, max_ctx)
 
-def rr_hw_from_prompt_ge(+target: Nat, +max_ctx: Nat, +prompt: Nat, +new_tokens: Nat, +slack: Nat, +p_fits: Bool, hcap: {Nat.is_le(target, max_ctx) == True{} : Bool}, hp: {Nat.is_le(target, rr_hw_add_capped(max_ctx, prompt, new_tokens)) == True{} : Bool}) -> {Nat.is_le(target, rr_hw_from_prompt(max_ctx, prompt, new_tokens, slack, p_fits)) == True{} : Bool}:
+def rr_hw_cov_slack_fit(+prompt: Nat, +new_tokens: Nat, +slack: Nat, +max_ctx: Nat, +s_fits: Bool) -> {Nat.is_le(Nat.min(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx), rr_hw_step_pick(max_ctx, Nat.add(prompt, new_tokens), slack, s_fits)) == True{} : Bool}:
+  match s_fits:
+    case True{}:
+      L.nat_min_le_l(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx)
+    case False{}:
+      L.nat_min_le_r(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx)
+
+def rr_hw_cov_nt(+prompt: Nat, +new_tokens: Nat, +slack: Nat, +max_ctx: Nat, +nt_fits: Bool) -> {Nat.is_le(Nat.min(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx), rr_hw_add_capped(max_ctx, rr_hw_step_pick(max_ctx, prompt, new_tokens, nt_fits), slack)) == True{} : Bool}:
+  match nt_fits:
+    case True{}:
+      rr_hw_cov_slack_fit(prompt, new_tokens, slack, max_ctx, Nat.is_le(slack, Nat.sub(max_ctx, Nat.add(prompt, new_tokens))))
+    case False{}:
+      rr_hw_cov_slack_sat(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx, slack, Nat.is_le(slack, Nat.sub(max_ctx, max_ctx)))
+
+def rr_hw_cov_prompt(+prompt: Nat, +new_tokens: Nat, +slack: Nat, +max_ctx: Nat, +p_fits: Bool) -> {Nat.is_le(Nat.min(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx), rr_hw_from_prompt(max_ctx, prompt, new_tokens, slack, p_fits)) == True{} : Bool}:
   match p_fits:
-    case False{}:
-      hcap
     case True{}:
-      rr_hw_step_pick_ge(
-        target,
-        max_ctx,
-        rr_hw_add_capped(max_ctx, prompt, new_tokens),
-        slack,
-        Nat.is_le(slack, Nat.sub(max_ctx, rr_hw_add_capped(max_ctx, prompt, new_tokens))),
-        hcap,
-        L.nat_le_trans(target, rr_hw_add_capped(max_ctx, prompt, new_tokens), Nat.add(rr_hw_add_capped(max_ctx, prompt, new_tokens), slack), hp, L.nat_add_le_r(rr_hw_add_capped(max_ctx, prompt, new_tokens), slack))
-      )
+      rr_hw_cov_nt(prompt, new_tokens, slack, max_ctx, Nat.is_le(new_tokens, Nat.sub(max_ctx, prompt)))
+    case False{}:
+      L.nat_min_le_r(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx)
 
-def rr_hw_covers_prompt_plus_tokens_aux(+target: Nat, +prompt: Nat, +new_tokens: Nat, +slack: Nat, +max_ctx: Nat, +hcap: {Nat.is_le(target, max_ctx) == True{} : Bool}, hsum: {Nat.is_le(target, Nat.add(prompt, new_tokens)) == True{} : Bool}) -> {Nat.is_le(target, rr_high_water(prompt, new_tokens, slack, max_ctx)) == True{} : Bool}:
-  rr_hw_from_prompt_ge(
-    target,
-    max_ctx,
-    prompt,
-    new_tokens,
-    slack,
-    Nat.is_le(prompt, max_ctx),
-    hcap,
-    rr_hw_step_pick_ge(target, max_ctx, prompt, new_tokens, Nat.is_le(new_tokens, Nat.sub(max_ctx, prompt)), hcap, hsum)
-  )
-
-def rr_hw_covers_prompt_plus_tokens(prompt, new_tokens, slack, extra):
-  rr_hw_covers_prompt_plus_tokens_aux(
-    Nat.add(prompt, new_tokens),
-    prompt,
-    new_tokens,
-    slack,
-    Nat.add(Nat.add(prompt, new_tokens), Nat.add(slack, extra)),
-    L.nat_add_le_r(Nat.add(prompt, new_tokens), Nat.add(slack, extra)),
-    L.nat_le_refl(Nat.add(prompt, new_tokens))
-  )
+def rr_hw_covers_written_with_slack(prompt, new_tokens, slack, max_ctx):
+  rr_hw_cov_prompt(prompt, new_tokens, slack, max_ctx, Nat.is_le(prompt, max_ctx))
 
 # LAW RR.15: Beginning a request always sets `unclean = True`, and a failed Auto request forces Dirty on the next reset.
 # promise: starting a request marks ResetState unclean so a failure without end_ok forces Dirty on the next Auto request
@@ -773,21 +772,22 @@ def rr_head_full_span_strict(rows):
       %rr_eq_refl(rp) : {Bool.and(_, True{}) == True{} : Bool}
       {==}
 
-def rr_mode_refl(m: RrMode) -> {m == m : RrMode}:
-  {==}
-
-# LAW RR.19: Beginning or completing a request never alters the configured reset mode in RrState.
-# promise: rr_begin and rr_end_ok preserve the reset mode in RrState
-# catches: rr_begin resets mode to RrModeAuto instead of keeping st.mode
+# LAW RR.19: Beginning a request preserves the configured reset mode (directly checked against `m`, catching constant `rr_state_mode` returns).
+# promise: rr_begin preserves the reset mode read back by rr_state_mode
+# catches: rr_state_mode ignores field m and returns RrModeAuto{}
 law rr_state_mode_preserved:
-  for st: RrState
-  for +p: Nat
-  for +g: Nat
-  for +s: Nat
-  for +mc: Nat
-  {rr_state_mode(rr_end_ok(rr_begin(st, p, g, s, mc), p, g, s, mc)) == rr_state_mode(st) : RrMode}
+  for +m: RrMode
+  for hw: Nat
+  for held: Nat
+  for u: Bool
+  for p: Nat
+  for mn: Nat
+  for sl: Nat
+  for mc: Nat
+  {rr_state_mode(rr_begin(RrState{m, hw, held, u}, p, mn, sl, mc)) == m : RrMode}
 
-def rr_state_mode_preserved(st, p, g, s, mc):
-  match st:
-    case RrState{m, hw, held, u}:
-      rr_mode_refl(m)
+def rr_state_mode_preserved(m, hw, held, u, p, mn, sl, mc):
+  match m:
+    case RrModeAuto{}: {==}
+    case RrModeDirty{}: {==}
+    case RrModeFull{}: {==}

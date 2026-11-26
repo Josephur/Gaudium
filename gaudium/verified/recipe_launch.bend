@@ -31,15 +31,6 @@ def lb_bool_eq(+a: Bool, +b: Bool) -> Bool:
 def lb_pair_ok(+sec_a: Nat, +base_a: Nat, +sec_b: Nat, +base_b: Nat) -> Bool:
   lb_bool_eq(Nat.is_eq(sec_a, sec_b), Nat.is_eq(base_a, base_b))
 
-def lb_le_add_r(+a: Nat, b: Nat) -> {Nat.is_le(a, Nat.add(a, b)) == True{} : Bool}:
-  match a:
-    case 0n:
-      match b:
-        case 0n: {==}
-        case 1n+_: {==}
-    case 1n+ap:
-      lb_le_add_r(ap, b)
-
 def lb_le_add_gt_false(+a: Nat, extra: Nat) -> {False{} == Nat.is_le(Nat.add(a, 1n+extra), a) : Bool}:
   match a:
     case 0n:
@@ -60,10 +51,6 @@ def lb_eq_add_gt_false(+a: Nat, extra: Nat) -> {False{} == Nat.is_eq(a, Nat.add(
       {==}
     case 1n+ap:
       lb_eq_add_gt_false(ap, extra)
-
-def lb_le_succ_add(+off: Nat, +base: Nat) -> {True{} == Nat.is_le(off, Nat.add(1n+base, off)) : Bool}:
-  %L.nat_add_comm(off, 1n+base) : {True{} == Nat.is_le(off, _) : Bool}
-  Equal.sym(Bool, Nat.is_le(off, Nat.add(off, 1n+base)), True{}, L.nat_add_le_r(off, 1n+base))
 
 # LAW LB.1: A zero HBM address is never accepted for any tensor binding.
 # promise: a zero HBM address is always rejected

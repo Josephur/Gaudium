@@ -11,6 +11,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper Nat / Bool lemmas (erased before Rust codegen)
@@ -680,12 +681,6 @@ law vis_plan_keeps_earlier:
 def vis_plan_keeps_earlier(p, n):
   L.nat_max_ge_l(p, n)
 
-def vb_le_add_succ_false(+m: Nat, +d: Nat) -> {Nat.is_le(Nat.add(m, 1n+d), m) == False{} : Bool}:
-  match m:
-    case 0n: {==}
-    case 1n+mp:
-      vb_le_add_succ_false(mp, d)
-
 # LAW VB.31: Embedding-row admission rejects any request that pushes used + add past capacity.
 # promise: vis_rows_fit returns False whenever add exceeds cap - used
 # catches: vis_rows_fit ignores add and only checks used <= cap
@@ -697,61 +692,7 @@ law vis_rows_fit_rejects_over:
 
 def vis_rows_fit_rejects_over(u, a, d):
   %L.nat_add_assoc(u, a, 1n+d) : {Nat.is_le(_, Nat.add(u, a)) == False{} : Bool}
-  vb_le_add_succ_false(Nat.add(u, a), d)
-
-def vb_not_le_imp_lt(+a: Nat, +b: Nat, h: {Nat.is_le(a, b) == False{} : Bool}) -> {Nat.is_lt(b, a) == True{} : Bool}:
-  match a b:
-    case 0n 0n:
-      L.bool_absurd_tf({Nat.is_lt(0n, 0n) == True{} : Bool}, h)
-    case 0n 1n+bp:
-      L.bool_absurd_tf({Nat.is_lt(1n+bp, 0n) == True{} : Bool}, h)
-    case 1n+ap 0n:
-      {==}
-    case 1n+ap 1n+bp:
-      vb_not_le_imp_lt(ap, bp, h)
-
-def vb_lt_succ_le_add1(+b: Nat, +a: Nat, h: {Nat.is_lt(b, a) == True{} : Bool}) -> {Nat.is_le(Nat.add(b, 1n), a) == True{} : Bool}:
-  match b a:
-    case 0n 0n:
-      L.bool_absurd({Nat.is_le(1n, 0n) == True{} : Bool}, h)
-    case 0n 1n+ap:
-      L.nat_le_zero(ap)
-    case 1n+bp 0n:
-      L.bool_absurd({Nat.is_le(Nat.add(1n+bp, 1n), 0n) == True{} : Bool}, h)
-    case 1n+bp 1n+ap:
-      vb_lt_succ_le_add1(bp, ap, h)
-
-def vb_ceil_le_r(
-  +f: Nat,
-  +tp: Nat,
-  +q: Nat,
-  eqq: {q == Nat.div(Nat.add(f, tp), 1n+tp) : Nat},
-  hadd1: {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+tp), 1n), tp), Nat.add(f, tp)) == True{} : Bool}
-) -> {Nat.is_le(Nat.add(Nat.mul(q, 1n+tp), 1n+tp), Nat.add(Nat.mul(q, 1n+tp), Nat.mod(Nat.add(f, tp), 1n+tp))) == True{} : Bool}:
-  %L.nat_add_assoc(Nat.mul(q, 1n+tp), 1n, tp) : {Nat.is_le(_, Nat.add(Nat.mul(q, 1n+tp), Nat.mod(Nat.add(f, tp), 1n+tp))) == True{} : Bool}
-  %Equal.sym(Nat, q, Nat.div(Nat.add(f, tp), 1n+tp), eqq) : {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+tp), 1n), tp), Nat.add(Nat.mul(_, 1n+tp), Nat.mod(Nat.add(f, tp), 1n+tp))) == True{} : Bool}
-  %Equal.sym(Nat, Nat.add(Nat.mul(Nat.div(Nat.add(f, tp), 1n+tp), 1n+tp), Nat.mod(Nat.add(f, tp), 1n+tp)), Nat.add(f, tp), L.nat_div_mod_r(Nat.add(f, tp), tp)) : {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+tp), 1n), tp), _) == True{} : Bool}
-  hadd1
-
-def vb_ceil_le_aux(
-  +f: Nat,
-  +tp: Nat,
-  +q: Nat,
-  b: Bool,
-  eb: {b == Nat.is_le(f, Nat.mul(q, 1n+tp)) : Bool},
-  eqq: {q == Nat.div(Nat.add(f, tp), 1n+tp) : Nat}
-) -> {Nat.is_le(f, Nat.mul(q, 1n+tp)) == True{} : Bool}:
-  match b:
-    case True{}:
-      Equal.sym(Bool, True{}, Nat.is_le(f, Nat.mul(q, 1n+tp)), eb)
-    case False{}:
-      +x = Nat.mul(q, 1n+tp)
-      +hlt = vb_not_le_imp_lt(f, x, Equal.sym(Bool, False{}, Nat.is_le(f, x), eb))
-      +hsle = vb_lt_succ_le_add1(x, f, hlt)
-      +hadd1 = L.nat_add_le_mono(Nat.add(x, 1n), f, tp, tp, hsle, L.nat_le_refl(tp))
-      +hle_bad = vb_ceil_le_r(f, tp, q, eqq, hadd1)
-      +hlt_bad = L.nat_add_lt_l(x, Nat.mod(Nat.add(f, tp), 1n+tp), 1n+tp, L.nat_mod_lt(Nat.add(f, tp), tp))
-      Empty.absurd({Nat.is_le(f, x) == True{} : Bool}, L.nat_lt_not_le(Nat.add(x, Nat.mod(Nat.add(f, tp), 1n+tp)), Nat.add(x, 1n+tp), hlt_bad, hle_bad))
+  G.g_nat_le_add_succ_false(Nat.add(u, a), d)
 
 # LAW VB.32: Temporal patch count multiplied by temporal stride always covers every frame.
 # promise: vid_groups(f, 1+tp) * (1+tp) is always at least f
@@ -763,8 +704,7 @@ law vid_groups_covers_frames:
 
 def vid_groups_covers_frames(f, tp):
   %Equal.sym(Nat, Nat.sub(tp, 0n), tp, L.nat_sub_zero_r(tp)) : {Nat.is_le(f, Nat.mul(Nat.div(Nat.add(f, _), 1n+tp), 1n+tp)) == True{} : Bool}
-  +q = Nat.div(Nat.add(f, tp), 1n+tp)
-  vb_ceil_le_aux(f, tp, q, Nat.is_le(f, Nat.mul(q, 1n+tp)), {==}, {==})
+  G.g_nat_ceil_div_covers(f, tp)
 
 # LAW VB.33: Mirroring an in-range axis index twice recovers the original index identically.
 # promise: orient_mirror applied twice recovers any in-range index i < n

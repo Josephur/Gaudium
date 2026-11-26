@@ -1,0 +1,114 @@
+# Shared project proof helpers beyond `nat_lemmas.bend` (AGENTS.md §4 item 6).
+# Every definition here returns an equality type (`q=0`) and is erased before Rust codegen.
+
+import Base
+import nat_lemmas.bend as L
+
+def g_nat_not_le_imp_lt(+a: Nat, +b: Nat, h: {Nat.is_le(a, b) == False{} : Bool}) -> {Nat.is_lt(b, a) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      L.bool_absurd_tf({Nat.is_lt(0n, 0n) == True{} : Bool}, h)
+    case 0n 1n+bp:
+      L.bool_absurd_tf({Nat.is_lt(1n+bp, 0n) == True{} : Bool}, h)
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      g_nat_not_le_imp_lt(ap, bp, h)
+
+def g_nat_lt_imp_succ_le(+b: Nat, +a: Nat, h: {Nat.is_lt(b, a) == True{} : Bool}) -> {Nat.is_le(Nat.add(b, 1n), a) == True{} : Bool}:
+  match b a:
+    case 0n 0n:
+      L.bool_absurd({Nat.is_le(1n, 0n) == True{} : Bool}, h)
+    case 0n 1n+ap:
+      L.nat_le_zero(ap)
+    case 1n+bp 0n:
+      L.bool_absurd({Nat.is_le(Nat.add(1n+bp, 1n), 0n) == True{} : Bool}, h)
+    case 1n+bp 1n+ap:
+      g_nat_lt_imp_succ_le(bp, ap, h)
+
+def g_nat_ceil_le_r(
+  +n: Nat,
+  +dp: Nat,
+  +q: Nat,
+  eqq: {q == Nat.div(Nat.add(n, dp), 1n+dp) : Nat},
+  hadd1: {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+dp), 1n), dp), Nat.add(n, dp)) == True{} : Bool}
+) -> {Nat.is_le(Nat.add(Nat.mul(q, 1n+dp), 1n+dp), Nat.add(Nat.mul(q, 1n+dp), Nat.mod(Nat.add(n, dp), 1n+dp))) == True{} : Bool}:
+  %L.nat_add_assoc(Nat.mul(q, 1n+dp), 1n, dp) : {Nat.is_le(_, Nat.add(Nat.mul(q, 1n+dp), Nat.mod(Nat.add(n, dp), 1n+dp))) == True{} : Bool}
+  %Equal.sym(Nat, q, Nat.div(Nat.add(n, dp), 1n+dp), eqq) : {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+dp), 1n), dp), Nat.add(Nat.mul(_, 1n+dp), Nat.mod(Nat.add(n, dp), 1n+dp))) == True{} : Bool}
+  %Equal.sym(Nat, Nat.add(Nat.mul(Nat.div(Nat.add(n, dp), 1n+dp), 1n+dp), Nat.mod(Nat.add(n, dp), 1n+dp)), Nat.add(n, dp), L.nat_div_mod_r(Nat.add(n, dp), dp)) : {Nat.is_le(Nat.add(Nat.add(Nat.mul(q, 1n+dp), 1n), dp), _) == True{} : Bool}
+  hadd1
+
+def g_nat_ceil_le_aux(
+  +n: Nat,
+  +dp: Nat,
+  +q: Nat,
+  b: Bool,
+  eb: {b == Nat.is_le(n, Nat.mul(q, 1n+dp)) : Bool},
+  eqq: {q == Nat.div(Nat.add(n, dp), 1n+dp) : Nat}
+) -> {Nat.is_le(n, Nat.mul(q, 1n+dp)) == True{} : Bool}:
+  match b:
+    case True{}:
+      Equal.sym(Bool, True{}, Nat.is_le(n, Nat.mul(q, 1n+dp)), eb)
+    case False{}:
+      +x = Nat.mul(q, 1n+dp)
+      +hlt = g_nat_not_le_imp_lt(n, x, Equal.sym(Bool, False{}, Nat.is_le(n, x), eb))
+      +hsle = g_nat_lt_imp_succ_le(x, n, hlt)
+      +hadd1 = L.nat_add_le_mono(Nat.add(x, 1n), n, dp, dp, hsle, L.nat_le_refl(dp))
+      +hle_bad = g_nat_ceil_le_r(n, dp, q, eqq, hadd1)
+      +hlt_bad = L.nat_add_lt_l(x, Nat.mod(Nat.add(n, dp), 1n+dp), 1n+dp, L.nat_mod_lt(Nat.add(n, dp), dp))
+      Empty.absurd({Nat.is_le(n, x) == True{} : Bool}, L.nat_lt_not_le(Nat.add(x, Nat.mod(Nat.add(n, dp), 1n+dp)), Nat.add(x, 1n+dp), hlt_bad, hle_bad))
+
+def g_nat_ceil_div_covers(+n: Nat, +dp: Nat) -> {Nat.is_le(n, Nat.mul(Nat.div(Nat.add(n, dp), 1n+dp), 1n+dp)) == True{} : Bool}:
+  +q = Nat.div(Nat.add(n, dp), 1n+dp)
+  g_nat_ceil_le_aux(n, dp, q, Nat.is_le(n, Nat.mul(q, 1n+dp)), {==}, {==})
+
+def g_nat_le_add_succ_false(+m: Nat, +d: Nat) -> {Nat.is_le(Nat.add(m, 1n+d), m) == False{} : Bool}:
+  match m:
+    case 0n: {==}
+    case 1n+mp:
+      g_nat_le_add_succ_false(mp, d)
+
+def g_nat_sub_le_self(+a: Nat, +b: Nat) -> {Nat.is_le(Nat.sub(a, b), a) == True{} : Bool}:
+  match a b:
+    case 0n _: {==}
+    case 1n+ap 0n:
+      L.nat_le_refl(1n+ap)
+    case 1n+ap 1n+bp:
+      L.nat_le_succ_r(Nat.sub(ap, bp), ap, g_nat_sub_le_self(ap, bp))
+
+def g_nat_eq_refl(n: Nat) -> {Nat.is_eq(n, n) == True{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+np:
+      g_nat_eq_refl(np)
+
+def g_nat_eq_add_succ_false(+n: Nat, +d: Nat) -> {Nat.is_eq(Nat.add(n, 1n+d), n) == False{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+np:
+      g_nat_eq_add_succ_false(np, d)
+
+def g_nat_eq_succ_add_false(+n: Nat, +d: Nat) -> {Nat.is_eq(n, Nat.add(n, 1n+d)) == False{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+np:
+      g_nat_eq_succ_add_false(np, d)
+
+def g_bool_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
+  match b:
+    case True{}: {==}
+    case False{}: {==}
+
+def g_nat_align_up_nz_sum(+x: Nat, +ap: Nat, +rem: Nat, erem: {rem == Nat.mod(x, 1n+ap) : Nat}, h_lt: {Nat.is_lt(rem, 1n+ap) == True{} : Bool}) -> {Nat.add(x, Nat.sub(1n+ap, rem)) == Nat.mul(1n+Nat.div(x, 1n+ap), 1n+ap) : Nat}:
+  +q = Nat.div(x, 1n+ap)
+  %L.nat_div_mod_r(x, ap) : {Nat.add(_, Nat.sub(1n+ap, rem)) == Nat.mul(1n+q, 1n+ap) : Nat}
+  %erem : {Nat.add(Nat.add(Nat.mul(q, 1n+ap), _), Nat.sub(1n+ap, rem)) == Nat.mul(1n+q, 1n+ap) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.mul(q, 1n+ap), rem), Nat.sub(1n+ap, rem)), Nat.add(Nat.mul(q, 1n+ap), Nat.add(rem, Nat.sub(1n+ap, rem))), L.nat_add_assoc(Nat.mul(q, 1n+ap), rem, Nat.sub(1n+ap, rem))) : {_ == Nat.mul(1n+q, 1n+ap) : Nat}
+  %L.nat_add_comm(Nat.sub(1n+ap, rem), rem) : {Nat.add(Nat.mul(q, 1n+ap), _) == Nat.mul(1n+q, 1n+ap) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.sub(1n+ap, rem), rem), 1n+ap, L.nat_sub_add_cancel(1n+ap, rem, L.nat_lt_imp_le(rem, 1n+ap, h_lt))) : {Nat.add(Nat.mul(q, 1n+ap), _) == Nat.mul(1n+q, 1n+ap) : Nat}
+  L.nat_add_comm(Nat.mul(q, 1n+ap), 1n+ap)
+
+def g_nat_max_one_succ(+x: Nat) -> {Nat.max(1n, 1n+x) == 1n+x : Nat}:
+  match x:
+    case 0n: {==}
+    case 1n+_: {==}
