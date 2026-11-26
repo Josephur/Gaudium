@@ -288,6 +288,12 @@ Serve options:
   --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets
                         besides the system's (an MCP server with a private certificate)
   --verbose             Print server, HBM, and recipe diagnostics
+  --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the
+                        last 64 chat requests (job, reply id, endpoint, model,
+                        streamed or not, still running or not, and the newest request
+                        event: phase, timings, token counts; never prompt or reply
+                        text). Off by default: the path answers 404. Needs the API key
+                        when one is set
 
 Live status environment variables:
   GAUDI_LIVE_DIR        Directory for live dashboard JSON records (GAUDI_LIVE=0 disables).

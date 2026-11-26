@@ -4,8 +4,11 @@
 //! - Gaudium Web UI static assets (`GET /`, `/sw.js`, `/css/*`, `/js/*`, `/img/*`, `/vendor/*`)
 //! - OpenAI-compatible chat & model endpoints (`/v1/models`, `/v1/chat/completions`, `/props`,
 //!   `/health`, `/tokenize`, `/detokenize`, `/slots`, `/models/load`, `/models/unload`)
+//! - The model list as server-sent events for a model picker (`/models/sse`)
 //! - Gaudium UI telemetry & card-lifecycle endpoints (`/gaudium/ui`, `/gaudium/engine`,
 //!   `/gaudium/live`, `/gaudium/events`, `/gaudium/count_tokens`, `/v1/chat/completions/control`)
+//! - The streamed replies still running (`/v1/streams/lookup`) and, with `--debug-endpoints`,
+//!   the recent requests (`/gaudium/requests`); see `requests.rs`
 //! - A2UI interfaces as a per-request option (`--a2ui`, the request field `gaudium_a2ui`,
 //!   `/gaudium/a2ui`, instructions hot-reloaded from `--a2ui-prompt <file>`; see `a2ui.rs`)
 //! - The MCP proxy for the Web UI's MCP servers (`--mcp-proxy`, `/cors-proxy`, `/gaudium/proxy`;
@@ -56,6 +59,7 @@ mod lanes;
 mod outparse;
 mod proxy;
 mod readout;
+mod requests;
 mod stream_out;
 
 use chat::{ChatPrompt, ChatTemplate};
@@ -124,6 +128,9 @@ pub struct ServerConfig {
     /// changes on disk (a file that fails its checks is not served; see `a2ui.rs`).
     pub a2ui_prompt: Option<PathBuf>,
     pub verbose: bool,
+    /// Serve the debug endpoints (`--debug-endpoints`): `GET /gaudium/requests`, the recent
+    /// requests and what each last did (`requests.rs`). Off: those paths answer 404.
+    pub debug_endpoints: bool,
     /// Per-model options keyed by served model id.
     pub per_model: Vec<(String, ModelRunOptions)>,
     /// Draft widths for models with a drafter (one value = fixed, several = adaptive).
@@ -404,6 +411,8 @@ struct AppState {
     host_cache: Option<Arc<crate::cache_ram::SharedCache>>,
     /// The lane queues of models served with `--parallel` lanes.
     lanes: lanes::LaneHub,
+    /// The recent chat requests (`/gaudium/requests`, `/v1/streams/lookup`); reported only.
+    recent: requests::RecentRequests,
 }
 
 impl AppState {
@@ -805,8 +814,10 @@ impl AppState {
         out
     }
 
-    /// Publishes a `request` event and keeps it for `/gaudium/live`.
-    fn publish_request(&self, json: String) {
+    /// Publishes a `request` event of request `job` and keeps it for `/gaudium/live` and as that
+    /// request's newest event in the recent-requests table (`/gaudium/requests`).
+    fn publish_request(&self, job: u64, json: String) {
+        self.recent.record(job, &json);
         self.slot.lock().unwrap().last_request_json = Some(json.clone());
         self.hub.publish(json);
     }
@@ -1787,6 +1798,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
         tls,
         host_cache,
         lanes: lanes::LaneHub::new(n_models),
+        recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
     });
 
     // The recipe-cache trim starts once the first load has taken (and marked) its recipes, so it
@@ -2251,6 +2263,7 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
             req.path.as_str(),
             "/props"
                 | "/models"
+                | "/models/sse"
                 | "/models/load"
                 | "/models/unload"
                 | "/chat/completions"
@@ -2288,21 +2301,14 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
             write_json(&mut stream, 200, &json);
         }
         ("GET", "/v1/models") | ("GET", "/models") => {
-            let mut arr = String::from("{\"object\":\"list\",\"data\":[");
-            for i in 0..state.models.len() {
-                if i > 0 {
-                    arr.push(',');
-                }
-                arr.push_str(&state.model_entry_json(i));
-            }
-            arr.push_str("]}");
-            write_json(&mut stream, 200, &arr);
+            write_json(&mut stream, 200, &models_list_json(&state));
         }
         ("GET", p) if p.starts_with("/v1/models/") => {
             let id = &p["/v1/models/".len()..];
             let idx = state.find_model(Some(id));
             write_json(&mut stream, 200, &state.model_entry_json(idx));
         }
+        ("GET", "/models/sse") => handle_models_sse(&state, &mut stream),
         ("POST", "/models/load") => handle_model_load(&state, &req, &mut stream, true),
         ("POST", "/models/unload") => handle_model_load(&state, &req, &mut stream, false),
         ("GET", "/gaudium/ui") => {
@@ -2330,7 +2336,19 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
         ("GET", "/slots") => {
             write_json(&mut stream, 200, &state.slots_json());
         }
-        ("POST", "/v1/streams/lookup") => write_json(&mut stream, 200, "[]"),
+        ("GET", "/gaudium/requests") => {
+            if state.cfg.debug_endpoints {
+                write_json(&mut stream, 200, &state.recent.list_json());
+            } else {
+                write_error(
+                    &mut stream,
+                    404,
+                    "not_found_error",
+                    "debug endpoints are off: start the server with --debug-endpoints",
+                );
+            }
+        }
+        ("POST", "/v1/streams/lookup") => handle_streams_lookup(&state, &req, &mut stream),
         ("POST", "/tokenize") => handle_tokenize(&state, &req, &mut stream),
         ("POST", "/detokenize") => handle_detokenize(&state, &req, &mut stream),
         ("POST", "/gaudium/count_tokens") => handle_count_tokens(&state, &req, &mut stream),
@@ -2388,6 +2406,124 @@ fn handle_events_sse(state: &AppState, stream: &mut Conn) {
         }
     }
     write_sse_end(stream);
+}
+
+/// The served models as `GET /v1/models` lists them.
+fn models_list_json(state: &AppState) -> String {
+    let entries: Vec<String> = (0..state.models.len())
+        .map(|i| state.model_entry_json(i))
+        .collect();
+    format!("{{\"object\":\"list\",\"data\":[{}]}}", entries.join(","))
+}
+
+/// `GET /models/sse`: the model list of `GET /v1/models` as server-sent events, for a model
+/// picker. The first event is the list as it stands; a new one follows whenever a model's state
+/// changes (loading, loaded, unloaded, failed; a switch of the resident model). A comment line
+/// goes out whenever 10 s pass without a write, so the connection stays open and a client that
+/// went away is noticed, however busy the server is. The stream ends when the server stops or the
+/// client goes away.
+fn handle_models_sse(state: &AppState, stream: &mut Conn) {
+    models_sse(state, stream, SSE_HEARTBEAT);
+}
+
+/// How long an event stream goes without a write before a comment line keeps it open.
+const SSE_HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// `handle_models_sse` with the heartbeat interval as a parameter, so a test can run it short.
+fn models_sse(state: &AppState, stream: &mut Conn, heartbeat: Duration) {
+    if write_sse_headers(stream).is_err() {
+        return;
+    }
+    // Every state change publishes `hello` and `engine` events on the hub
+    // (`publish_engine_event`): any event is a cue to read the list again, and a list equal to
+    // the one last sent is not sent twice.
+    let mut seq = state.hub.last_seq();
+    let mut sent = models_list_json(state);
+    if write_sse_chunk(stream, format!("data: {sent}\n\n").as_bytes()).is_err() {
+        return;
+    }
+    // Most hub events change no model's state (a reply's live telemetry comes every 400 ms), and
+    // they wake this loop without a write. So the heartbeat counts from the last write, not from
+    // the last wake, or a stream that a long reply keeps waking would never get one.
+    let mut last_write = Instant::now();
+    loop {
+        let wait = heartbeat.saturating_sub(last_write.elapsed());
+        let (evs, closed) = state.hub.since(seq, wait);
+        if let Some(&(last, _)) = evs.last() {
+            seq = last;
+            let now = models_list_json(state);
+            if now != sent {
+                if write_sse_chunk(stream, format!("data: {now}\n\n").as_bytes()).is_err() {
+                    return;
+                }
+                sent = now;
+                last_write = Instant::now();
+            }
+        }
+        // a change published just before the server stopped is still sent (above)
+        if closed {
+            break;
+        }
+        if last_write.elapsed() >= heartbeat {
+            if write_sse_chunk(stream, b":\n\n").is_err() {
+                return;
+            }
+            last_write = Instant::now();
+        }
+    }
+    write_sse_end(stream);
+}
+
+/// `POST /v1/streams/lookup`: the streamed chat replies still being written, newest first, in the
+/// shape of the `/gaudium/requests` items (`requests.rs`). A body `{"ids": [...]}` keeps only the
+/// replies with those ids; an empty body, or one without `ids`, lists them all.
+///
+/// This tells a client that reloaded (a Web UI page) which of its replies are still running. It
+/// can not take over the stream: the reply goes only to the connection that asked for it. A
+/// running reply is stopped with `POST /v1/chat/completions/control` and its id.
+fn handle_streams_lookup(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
+    let body = String::from_utf8_lossy(&req.body);
+    let ids: Option<Vec<String>> = if body.trim().is_empty() {
+        None
+    } else {
+        let Ok(val) = json::parse_json(&body) else {
+            write_error(stream, 400, "invalid_request_error", "invalid JSON body");
+            return;
+        };
+        match val.get("ids") {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::Array(arr)) => {
+                let mut ids = Vec::with_capacity(arr.len());
+                for v in arr {
+                    let Some(id) = v.as_str() else {
+                        write_error(
+                            stream,
+                            400,
+                            "invalid_request_error",
+                            "ids must be an array of reply id strings",
+                        );
+                        return;
+                    };
+                    ids.push(id.to_string());
+                }
+                Some(ids)
+            }
+            Some(_) => {
+                write_error(
+                    stream,
+                    400,
+                    "invalid_request_error",
+                    "ids must be an array of reply id strings",
+                );
+                return;
+            }
+        }
+    };
+    write_json(
+        stream,
+        200,
+        &state.recent.running_streams_json(ids.as_deref()),
+    );
 }
 
 fn handle_engine_action(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
@@ -3268,7 +3404,20 @@ fn run_chat(
             jq(&method),
         )
     };
-    state.publish_request(format!("{{{}}}", req_base("queued", 0.0)));
+    // The recent-requests table holds the request as running until this handle is dropped,
+    // which is when this function returns, whatever the way out.
+    let _tracked = state.recent.begin(requests::RequestMeta {
+        job: req_num,
+        id: req_id.clone(),
+        endpoint: match api {
+            Api::Chat => "chat",
+            Api::Messages { .. } => "messages",
+        },
+        model: m.id.clone(),
+        stream: stream_mode,
+        created,
+    });
+    state.publish_request(req_num, format!("{{{}}}", req_base("queued", 0.0)));
     // Counts this request in the card queue until it holds the card; any early return leaves it.
     let mut ticket = WaitTicket::enter(state, idx);
     // A model served with lanes: the request joins the model's lane session, which takes the
@@ -3289,11 +3438,14 @@ fn run_chat(
         .then(|| state.ensure_loaded(idx, false))
         .unwrap_or(Ok(()))
     {
-        state.publish_request(format!(
-            "{{{},\"message\":{}}}",
-            req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
-            jq(&e)
-        ));
+        state.publish_request(
+            req_num,
+            format!(
+                "{{{},\"message\":{}}}",
+                req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
+                jq(&e)
+            ),
+        );
         api.error(stream, 503, "unavailable_error", &e);
         return;
     }
@@ -3378,11 +3530,14 @@ fn run_chat(
             state.cancels.lock().unwrap().remove(&req_id);
             step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
             debug_assert!(rguard.is_terminal());
-            state.publish_request(format!(
-                "{{{},\"message\":{}}}",
-                req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
-                jq(&e)
-            ));
+            state.publish_request(
+                req_num,
+                format!(
+                    "{{{},\"message\":{}}}",
+                    req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
+                    jq(&e)
+                ),
+            );
             if stream_mode {
                 let _ = write_sse_chunk(stream, api.stream_error(503, &e).as_bytes());
                 write_sse_end(stream);
@@ -3425,11 +3580,14 @@ fn run_chat(
                 step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
                 debug_assert!(rguard.is_terminal());
                 let msg = "model unloaded concurrently; retry request";
-                state.publish_request(format!(
-                    "{{{},\"message\":{}}}",
-                    req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
-                    jq(msg)
-                ));
+                state.publish_request(
+                    req_num,
+                    format!(
+                        "{{{},\"message\":{}}}",
+                        req_base("error", t_arrival.elapsed().as_secs_f64() * 1e3),
+                        jq(msg)
+                    ),
+                );
                 if stream_mode {
                     let _ = write_sse_chunk(stream, api.stream_error(503, msg).as_bytes());
                     write_sse_end(stream);
@@ -3443,7 +3601,7 @@ fn run_chat(
     // From here the engine has the request: everything before was the wait for the card (the
     // model load, or another request).
     let queued_ms = t_arrival.elapsed().as_secs_f64() * 1e3;
-    state.publish_request(format!("{{{}}}", req_base("prefill", queued_ms)));
+    state.publish_request(req_num, format!("{{{}}}", req_base("prefill", queued_ms)));
 
     let mut decoder = StreamDecoder::new(&m.tokenizer);
     // Generated text -> reasoning, content and tool calls (and the request's stop strings).
@@ -3555,11 +3713,14 @@ fn run_chat(
             if !started_decode {
                 started_decode = true;
                 step_request_guard(&mut rguard, ReqEvent::EvReqPrefillDone, &req_id);
-                state.publish_request(format!(
-                    "{{{},\"timings\":{}}}",
-                    req_base("decode", queued_ms),
-                    timings.json()
-                ));
+                state.publish_request(
+                    req_num,
+                    format!(
+                        "{{{},\"timings\":{}}}",
+                        req_base("decode", queued_ms),
+                        timings.json()
+                    ),
+                );
             }
             let now = Instant::now();
             if seen >= 3 && now.duration_since(last_live_pub).as_millis() >= 400 {
@@ -3821,10 +3982,13 @@ fn run_chat(
                 ",\"sampling\":{{\"greedy\":{is_greedy},\"temperature\":{temperature:.3},\"top_k\":{top_k},\
                  \"top_p\":{top_p:.3},\"min_p\":{min_p:.3},\"seed\":{seed_json}}}}}"
             ));
-            state.publish_request(format!(
-                "{{{},\"timings\":{timings_json},\"details\":{details}}}",
-                req_base(phase, queued_ms)
-            ));
+            state.publish_request(
+                req_num,
+                format!(
+                    "{{{},\"timings\":{timings_json},\"details\":{details}}}",
+                    req_base(phase, queued_ms)
+                ),
+            );
 
             if let Api::Messages { show_thinking } = api {
                 let mut b = builder.unwrap_or_else(|| anthropic::Builder::new(show_thinking));
@@ -3901,11 +4065,14 @@ fn run_chat(
         Err(e) => {
             step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
             debug_assert!(rguard.is_terminal());
-            state.publish_request(format!(
-                "{{{},\"message\":{}}}",
-                req_base("error", queued_ms),
-                jq(&e)
-            ));
+            state.publish_request(
+                req_num,
+                format!(
+                    "{{{},\"message\":{}}}",
+                    req_base("error", queued_ms),
+                    jq(&e)
+                ),
+            );
             if stream_mode {
                 out.write(&api.stream_error(500, &e));
                 write_sse_end(stream);

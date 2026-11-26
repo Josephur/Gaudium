@@ -315,6 +315,12 @@ fn print_usage() {
          \x20 --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets\n\
          \x20                       besides the system's (an MCP server with a private certificate)\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
+         \x20 --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the\n\
+         \x20                       last 64 chat requests (job, reply id, endpoint, model,\n\
+         \x20                       streamed or not, still running or not, and the newest request\n\
+         \x20                       event: phase, timings, token counts; never prompt or reply\n\
+         \x20                       text). Off by default: the path answers 404. Needs the API key\n\
+         \x20                       when one is set\n\
          \n\
          Live status environment variables:\n\
          \x20 GAUDI_LIVE_DIR        Directory for live dashboard JSON records (GAUDI_LIVE=0 disables).\n\
@@ -2498,6 +2504,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let mut verbose = false;
+    let mut debug_endpoints = false;
     let mut mcp_proxy = ProxyOptions::default();
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
@@ -2803,6 +2810,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 mcp_proxy.ca_file = Some(PathBuf::from(next_val(&mut i, "--mcp-proxy-ca")?))
             }
             "--verbose" => verbose = true,
+            "--debug-endpoints" => debug_endpoints = true,
             other => return Err(format!("unknown --serve flag '{other}'")),
         }
         i += 1;
@@ -2876,6 +2884,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         a2ui,
         a2ui_prompt,
         verbose,
+        debug_endpoints,
         per_model,
         draft_k,
         vision,

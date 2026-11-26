@@ -306,6 +306,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             a2ui: true,
             a2ui_prompt: None,
             verbose: false,
+            debug_endpoints: false,
             per_model: Vec::new(),
             draft_k: Vec::new(),
             vision: true,
@@ -355,6 +356,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
         tls: None,
         host_cache,
         lanes: lanes::LaneHub::new(1),
+        recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
     });
     let _ = model; // (one resident model per harness)
     Harness {
@@ -429,6 +431,7 @@ fn model_harness(id: &str, template: &str, config: Option<&str>, spec: Option<&s
         tls: None,
         host_cache: None,
         lanes: lanes::LaneHub::new(1),
+        recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
     });
     Harness {
         state,
@@ -547,6 +550,7 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
         tls: None,
         host_cache: None,
         lanes: lanes::LaneHub::new(1),
+        recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
     });
     Harness {
         state,
@@ -1411,6 +1415,7 @@ fn served_engine_configuration_follows_the_server_options() {
         a2ui: false,
         a2ui_prompt: None,
         verbose: false,
+        debug_endpoints: false,
         per_model: vec![("a".into(), opts), ("moe".into(), own)],
         draft_k: Vec::new(),
         vision: true,
@@ -1954,6 +1959,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         a2ui: false,
         a2ui_prompt: None,
         verbose: false,
+        debug_endpoints: false,
         per_model: vec![
             (
                 "ds".into(),
@@ -2622,6 +2628,7 @@ fn lane_harness(n: usize) -> Harness {
         tls: None,
         host_cache: None,
         lanes: lanes::LaneHub::new(1),
+        recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
     });
     Harness { state, ..h }
 }
@@ -2875,4 +2882,336 @@ fn hsts_max_age_is_zero_and_explicit_nonzero_refused_on_port_80_with_tls() {
     // without TLS nothing is sent; the value is passed through unchanged
     assert_eq!(hsts_max_age_for(false, 80, Some(3600)), Ok(3600));
     assert_eq!(hsts_max_age_for(false, 80, None), Ok(DEFAULT_HSTS_MAX_AGE));
+}
+
+// ------------------------------------------------------------------------------------------------
+// Recent requests (`/gaudium/requests`), running streams (`/v1/streams/lookup`) and the model
+// list as events (`/models/sse`)
+// ------------------------------------------------------------------------------------------------
+
+/// The harness with its server configuration changed by `tweak`.
+fn configured_harness(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
+    let Harness {
+        state,
+        replies,
+        prompts,
+        images,
+        tier,
+    } = harness();
+    let mut st = Arc::try_unwrap(state)
+        .ok()
+        .expect("the harness owns its state");
+    tweak(&mut st.cfg);
+    Harness {
+        state: Arc::new(st),
+        replies,
+        prompts,
+        images,
+        tier,
+    }
+}
+
+/// The harness serving a second model, `other` (multi-model mode: the model list gives each
+/// model's state). The second model has no chat template; these tests send it no chat.
+fn two_model_harness() -> Harness {
+    let Harness {
+        state,
+        replies,
+        prompts,
+        images,
+        tier,
+    } = harness();
+    let mut st = Arc::try_unwrap(state)
+        .ok()
+        .expect("the harness owns its state");
+    let m = &st.models[0];
+    let other = RegisteredModel {
+        id: "other".into(),
+        dir: m.dir.clone(),
+        spec: m.spec.clone(),
+        format: m.format.clone(),
+        chat: None,
+        tokenizer: Arc::clone(&m.tokenizer),
+        extra_eos_ids: Vec::new(),
+        max_ctx: m.max_ctx,
+        gemma_closes_thought: false,
+        gen_defaults: m.gen_defaults,
+        vision: None,
+        n_ctx_train: None,
+        lanes: 1,
+    };
+    st.models.push(other);
+    st.slot.get_mut().unwrap().waiting = vec![0; 2];
+    st.lanes = lanes::LaneHub::new(2);
+    Harness {
+        state: Arc::new(st),
+        replies,
+        prompts,
+        images,
+        tier,
+    }
+}
+
+/// The JSON of each `data:` event in `raw` (the bytes of an event stream so far, chunk framing
+/// included: the server writes each event in one chunk).
+fn sse_events(raw: &[u8]) -> Vec<JsonValue> {
+    let text = String::from_utf8_lossy(raw);
+    text.split("data: ")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("\n\n").map(|(json, _)| json))
+        .map(|j| json::parse_json(j).unwrap_or_else(|e| panic!("{e}: {j}")))
+        .collect()
+}
+
+/// Reads from `c` until `raw` holds `n` whole events (or the read times out).
+fn read_sse_until(c: &mut TcpStream, raw: &mut Vec<u8>, n: usize) -> Vec<JsonValue> {
+    let mut buf = [0u8; 4096];
+    loop {
+        let evs = sse_events(raw);
+        if evs.len() >= n {
+            return evs;
+        }
+        match c.read(&mut buf) {
+            Ok(0) => panic!("the stream ended after {} events", evs.len()),
+            Ok(k) => raw.extend_from_slice(&buf[..k]),
+            Err(e) => panic!("no event {} within the timeout: {e}", evs.len() + 1),
+        }
+    }
+}
+
+#[test]
+fn recent_requests_are_served_only_with_the_debug_endpoints() {
+    let h = harness();
+    let (status, body) = h.get("/gaudium/requests");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains("--debug-endpoints"), "{body}");
+
+    let h = configured_harness(|cfg| cfg.debug_endpoints = true);
+    h.script("Sunny in Oslo.");
+    let (status, _) = h.chat("");
+    assert_eq!(status, 200);
+    h.script("Rain tomorrow.");
+    let (status, text) = h.post(
+        "/v1/chat/completions",
+        r#"{"stream":true,"messages":[{"role":"user","content":"And tomorrow?"}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    h.script("Clear skies.");
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"Weekend?"}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+
+    let (status, body) = h.get("/gaudium/requests");
+    assert_eq!(status, 200, "{body}");
+    let v = json::parse_json(&body).unwrap();
+    assert_eq!(
+        at(&v, &["capacity"]).as_u64(),
+        Some(requests::RECENT_REQUESTS as u64)
+    );
+    let data = at(&v, &["data"]).as_array().unwrap();
+    assert_eq!(data.len(), 3, "{body}");
+    // newest first, each with what it is
+    let row = |i: usize| {
+        (
+            s(&data[i], &["id"]),
+            s(&data[i], &["endpoint"]),
+            s(&data[i], &["model"]),
+            at(&data[i], &["stream"]).clone(),
+        )
+    };
+    assert_eq!(
+        row(0),
+        ("msg_gaudium_3", "messages", "tags", JsonValue::Bool(false))
+    );
+    assert_eq!(
+        row(1),
+        ("chatcmpl-gaudium-2", "chat", "tags", JsonValue::Bool(true))
+    );
+    assert_eq!(
+        row(2),
+        ("chatcmpl-gaudium-1", "chat", "tags", JsonValue::Bool(false))
+    );
+    for (i, item) in data.iter().enumerate() {
+        // every reply was written, so none is running; the newest event is the request's last
+        assert_eq!(at(item, &["running"]), &JsonValue::Bool(false), "{i}");
+        assert_eq!(at(item, &["job"]).as_u64(), Some(3 - i as u64));
+        assert_eq!(s(item, &["event", "type"]), "request");
+        assert_eq!(at(item, &["event", "job"]).as_u64(), Some(3 - i as u64));
+        assert_eq!(s(item, &["event", "phase"]), "stop", "{i}");
+        assert!(at(item, &["created"]).as_u64().unwrap() > 0);
+    }
+    // counts and timings only: no prompt or reply text
+    for text in ["Oslo", "tomorrow", "Weekend", "Sunny", "Rain", "Clear"] {
+        assert!(!body.contains(text), "{text} in {body}");
+    }
+}
+
+#[test]
+fn a_request_refused_before_it_is_accepted_is_not_listed() {
+    let h = configured_harness(|cfg| cfg.debug_endpoints = true);
+    let (status, _) = h.post("/v1/chat/completions", "{\"messages\":7}");
+    assert_eq!(status, 400);
+    let (_, body) = h.get("/gaudium/requests");
+    let v = json::parse_json(&body).unwrap();
+    assert!(at(&v, &["data"]).as_array().unwrap().is_empty(), "{body}");
+}
+
+#[test]
+fn streams_lookup_lists_the_streamed_replies_still_running() {
+    let h = harness();
+    // a finished streamed reply is not running
+    h.script("Sunny.");
+    let (status, _) = h.post(
+        "/v1/chat/completions",
+        r#"{"stream":true,"messages":[{"role":"user","content":"Weather?"}]}"#,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(h.post("/v1/streams/lookup", ""), (200, "[]".to_string()));
+
+    // requests the table holds as running, as a request's handler leaves them while it writes
+    let meta = |job: u64, stream: bool| requests::RequestMeta {
+        job,
+        id: format!("chatcmpl-gaudium-{job}"),
+        endpoint: "chat",
+        model: "tags".into(),
+        stream,
+        created: 1,
+    };
+    let streaming = h.state.recent.begin(meta(10, true));
+    let _plain = h.state.recent.begin(meta(11, false));
+    let _newer = h.state.recent.begin(meta(12, true));
+
+    let ids = |body: &str| -> Vec<String> {
+        let v = json::parse_json(body).unwrap_or_else(|e| panic!("{e}: {body}"));
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|i| s(i, &["id"]).to_string())
+            .collect()
+    };
+    let (status, body) = h.post("/v1/streams/lookup", "");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ids(&body), ["chatcmpl-gaudium-12", "chatcmpl-gaudium-10"]);
+    let (_, body) = h.post("/v1/streams/lookup", "{}");
+    assert_eq!(ids(&body).len(), 2, "{body}");
+    let (_, body) = h.post(
+        "/v1/streams/lookup",
+        r#"{"ids":["chatcmpl-gaudium-10","chatcmpl-gaudium-11","chatcmpl-gaudium-1"]}"#,
+    );
+    assert_eq!(ids(&body), ["chatcmpl-gaudium-10"]);
+
+    // the handle of a request is dropped when its handler returns
+    drop(streaming);
+    let (_, body) = h.post("/v1/streams/lookup", "");
+    assert_eq!(ids(&body), ["chatcmpl-gaudium-12"]);
+
+    for bad in ["{", r#"{"ids":"chatcmpl-gaudium-12"}"#, r#"{"ids":[12]}"#] {
+        let (status, body) = h.post("/v1/streams/lookup", bad);
+        assert_eq!(status, 400, "{bad}: {body}");
+        assert!(body.contains("invalid_request_error"), "{body}");
+    }
+}
+
+#[test]
+fn models_sse_sends_the_list_and_again_when_a_model_changes_state() {
+    let h = two_model_harness();
+    let addr = serve(&h.state, 1);
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(c, "GET /models/sse HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+
+    let mut raw = Vec::new();
+    let evs = read_sse_until(&mut c, &mut raw, 1);
+    let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-type: text/event-stream"), "{head}");
+    // the first event is the list of GET /v1/models as it stands
+    let (_, listed) = h.get("/v1/models");
+    assert_eq!(evs[0], json::parse_json(&listed).unwrap());
+    let state_of = |ev: &JsonValue, i: &str| {
+        (
+            s(ev, &["data", i, "id"]).to_string(),
+            s(ev, &["data", i, "status", "value"]).to_string(),
+        )
+    };
+    assert_eq!(state_of(&evs[0], "0"), ("tags".into(), "loaded".into()));
+    assert_eq!(state_of(&evs[0], "1"), ("other".into(), "unloaded".into()));
+
+    // an event that changes no model's state sends nothing; the next change is sent: the card
+    // starts loading the other model
+    h.state.publish_engine_event();
+    h.state.slot.lock().unwrap().lifecycle = Lifecycle::Loading(1);
+    h.state.publish_engine_event();
+    let evs = read_sse_until(&mut c, &mut raw, 2);
+    assert_eq!(state_of(&evs[1], "0"), ("tags".into(), "unloaded".into()));
+    assert_eq!(state_of(&evs[1], "1"), ("other".into(), "loading".into()));
+
+    // the stream ends with the server
+    h.state.hub.close();
+    let _ = c.read_to_end(&mut raw);
+    let (_, _, body) = split_response(&raw);
+    assert_eq!(sse_events(body.as_bytes()).len(), 2, "{body}");
+}
+
+#[test]
+fn models_sse_keeps_its_heartbeat_while_other_events_arrive() {
+    // While a reply is written, the hub carries its live telemetry (every 400 ms), which changes
+    // no model's state. The stream must still get a comment line once a heartbeat passes without
+    // a write, or a front end may cut it and a client that left is not noticed.
+    let h = two_model_harness();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (server_side, _) = listener.accept().unwrap();
+    let sse = {
+        let state = Arc::clone(&h.state);
+        thread::spawn(move || {
+            let mut conn = Conn::from(server_side);
+            models_sse(&state, &mut conn, Duration::from_millis(200));
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let noise = {
+        let (state, stop) = (Arc::clone(&h.state), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                state.hub.publish(r#"{"type":"live"}"#.into());
+                thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+
+    // the first event is the list; a comment line follows within the heartbeat, not after the
+    // telemetry stops (a chunk of 3 bytes, ":\n\n")
+    let mut raw = Vec::new();
+    let evs = read_sse_until(&mut client, &mut raw, 1);
+    assert_eq!(evs.len(), 1);
+    let mut buf = [0u8; 4096];
+    let started = Instant::now();
+    while !String::from_utf8_lossy(&raw).contains("\r\n3\r\n:\n\n\r\n") {
+        match client.read(&mut buf) {
+            Ok(0) => panic!("the stream ended without a comment line"),
+            Ok(k) => raw.extend_from_slice(&buf[..k]),
+            Err(e) => panic!("no comment line within the timeout: {e}"),
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    // nothing else was sent: the telemetry changed no model's state
+    assert_eq!(sse_events(&raw).len(), 1);
+
+    stop.store(true, Ordering::Relaxed);
+    noise.join().unwrap();
+    h.state.hub.close();
+    sse.join().unwrap();
+}
+
+#[test]
+fn models_sse_is_behind_the_api_key() {
+    let h = configured_harness(|cfg| cfg.api_key = Some("server-key".into()));
+    let (status, _, body) =
+        plain_exchange(&h.state, "GET /models/sse HTTP/1.1\r\nHost: localhost", "");
+    assert_eq!(status, 401);
+    assert!(body.contains("authentication_error"), "{body}");
 }
