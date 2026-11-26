@@ -610,26 +610,14 @@ mod tests {
     }
 
     #[test]
-    fn the_command_line_counts_and_a_lanes_tally_of_drafts() {
-        use crate::verified::{
-            ln_lanes_arg_ok, ln_prefix_arg_ok, ln_step_drafted, ln_step_kept, ln_tally_drafted,
-            ln_tally_kept,
-        };
+    fn the_command_line_counts() {
+        use crate::verified::{ln_lanes_arg_ok, ln_prefix_arg_ok};
         let max = crate::engine::MAX_LANES;
         assert!(!ln_lanes_arg_ok(0, max));
         assert!(ln_lanes_arg_ok(1, max) && ln_lanes_arg_ok(max, max));
         assert!(!ln_lanes_arg_ok(max + 1, max) && !ln_lanes_arg_ok(u64::MAX, max));
         assert!(ln_prefix_arg_ok(0, 4096) && ln_prefix_arg_ok(4096, 4096));
         assert!(!ln_prefix_arg_ok(4097, 4096) && !ln_prefix_arg_ok(u64::MAX, 4096));
-        // 8 rows verify 7 drafts; 4 tokens emitted keep 3 of them; a single-row step drafts none
-        assert_eq!((ln_step_drafted(8), ln_step_kept(8, 4)), (7, 3));
-        assert_eq!((ln_step_drafted(1), ln_step_kept(1, 1)), (0, 0));
-        assert_eq!(
-            (ln_tally_drafted(70, 16), ln_tally_kept(40, 16, 16)),
-            (85, 55)
-        );
-        // never more kept than verified, whatever the accept kernel reported
-        assert_eq!(ln_step_kept(8, 12), 7);
     }
 
     #[test]

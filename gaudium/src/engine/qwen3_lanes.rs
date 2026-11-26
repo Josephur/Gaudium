@@ -566,12 +566,46 @@ pub(super) struct LaneRt {
     next_event: usize,
 }
 
+fn step_draft_counts(rows: u64, emitted: u64) -> (u64, u64) {
+    let drafted = rows.saturating_sub(1);
+    (drafted, emitted.saturating_sub(1).min(drafted))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WidthTally {
+    slots: u64,
+    wide_slots: u64,
+    launches: u64,
+    wide_launches: u64,
+    dropped: u64,
+    chunked: u64,
+    unmeasured: u64,
+}
+
+impl WidthTally {
+    fn record_launch(&mut self, b: u64, wide: u64) {
+        self.slots += b;
+        self.wide_slots += wide.min(b);
+        self.launches += 1;
+        self.wide_launches += wide.min(1);
+    }
+
+    fn record_dropped(&mut self, n: u64) {
+        self.dropped += n;
+    }
+
+    fn record_chunk(&mut self, unmeasured: bool) {
+        self.chunked += 1;
+        self.unmeasured += u64::from(unmeasured);
+    }
+}
+
 /// What the lanes' width choices know of a batched speculative step's time (measured,
 /// exponentially averaged), each readout kind (greedy, sampled: their own recipes) apart: per
 /// slot count and chunk count, the launch with every slot at its narrow width; per slot count,
 /// the extra time of one slot at its wide width, with the launch that last measured it (an
 /// estimate not measured again for a while is dropped: the verified `ln_cost_kept`).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct WidthCosts {
     /// (slot count, chunk count, sampled) -> the narrow step's time.
     narrow_ms: HashMap<(u64, u64, bool), f64>,
@@ -579,22 +613,8 @@ struct WidthCosts {
     extra_ms: HashMap<(u64, bool), (f64, u64)>,
     /// Launches observed (the clock of `extra_ms`, the verified `ln_cost_clock_next`).
     launches: u64,
-    /// The counts of the session report (report only; its steps are the verified `ln_wt_*`):
-    /// slot steps and wide ones, launches and ones with a wide slot, estimates dropped
-    /// unmeasured, lane choices whose cost the K/V chunks of their wide rows raised and the ones
-    /// of them kept narrow because those chunks were not measured.
-    tally: std::cell::Cell<crate::verified::WidthTally>,
-}
-
-impl Default for WidthCosts {
-    fn default() -> Self {
-        Self {
-            narrow_ms: HashMap::new(),
-            extra_ms: HashMap::new(),
-            launches: 0,
-            tally: std::cell::Cell::new(crate::verified::ln_wt_empty()),
-        }
-    }
+    /// Report-only counts for `--verbose` session logging.
+    tally: std::cell::Cell<WidthTally>,
 }
 
 impl WidthCosts {
@@ -624,8 +644,8 @@ impl WidthCosts {
         // arithmetic, where estimates then stand as before this rule)
         self.launches = ln_cost_clock_next(self.launches).unwrap_or(self.launches);
         let now = self.launches;
-        self.tally
-            .set(crate::verified::ln_wt_launch(self.tally.get(), b, wide));
+        let mut tally = self.tally.get();
+        tally.record_launch(b, wide);
         let narrow = self.narrow(b, nch, sampled);
         if ln_cost_measures_narrow(wide) {
             let mut m = narrow;
@@ -640,16 +660,16 @@ impl WidthCosts {
         let before = self.extra_ms.len();
         self.extra_ms
             .retain(|_, &mut (_, at)| ln_cost_kept(now, at, Self::KEEP_LAUNCHES));
-        let n = (before - self.extra_ms.len()) as u64;
-        self.tally
-            .set(crate::verified::ln_wt_dropped(self.tally.get(), n));
+        tally.record_dropped((before - self.extra_ms.len()) as u64);
+        self.tally.set(tally);
     }
 
     /// A lane choice whose cost the K/V chunks of its wide rows raised (`unmeasured`: those
     /// chunks were not measured, so the lane stayed narrow), for the report.
     fn note_chunk_choice(&self, unmeasured: bool) {
-        self.tally
-            .set(crate::verified::ln_wt_chunk(self.tally.get(), unmeasured));
+        let mut tally = self.tally.get();
+        tally.record_chunk(unmeasured);
+        self.tally.set(tally);
     }
 
     /// The measured slot count whose extra time stands in for `b` slots of the readout kind
@@ -671,7 +691,7 @@ impl WidthCosts {
 
     /// What the model holds, for the session report (and fresh counts for the next one).
     fn report(&mut self) -> Option<String> {
-        let crate::verified::WidthTally::WidthTally(
+        let WidthTally {
             slots,
             wide_slots,
             launches,
@@ -679,7 +699,7 @@ impl WidthCosts {
             dropped,
             chunked,
             unmeasured,
-        ) = self.tally.replace(crate::verified::ln_wt_empty());
+        } = self.tally.take();
         if wide_slots == 0 && self.extra_ms.is_empty() && dropped == 0 && chunked == 0 {
             return None;
         }
@@ -1960,19 +1980,13 @@ fn apply_spec(
             ));
         }
         run.advance(n_emit as u64, rows);
-        // the request's tally of drafts (the verified `ln_tally_*`), and what the width policy
-        // learns of this step's drafts
         let n_out = n_emit as u64;
-        run.drafted = crate::verified::ln_tally_drafted(run.drafted, rows);
-        run.accepted = crate::verified::ln_tally_kept(run.accepted, rows, n_out);
-        let drafted = crate::verified::ln_step_drafted(rows);
+        let (drafted, kept) = step_draft_counts(rows, n_out);
+        run.drafted += drafted;
+        run.accepted += kept;
         if drafted > 0 {
             if let Some(p) = run.policy.as_mut() {
-                p.observe(
-                    drafted,
-                    crate::verified::ln_step_kept(rows, n_out) as usize,
-                    0.0,
-                );
+                p.observe(drafted, kept as usize, 0.0);
             }
         }
         run.observe_cancel();
@@ -2479,5 +2493,33 @@ mod tests {
             assert_eq!(n.inputs[4].name, format!("s{j}_samp_i"));
         }
         assert!(!views.iter().any(|n| n.guid == "argmax_fwd_bf16"));
+    }
+
+    #[test]
+    fn width_and_draft_tallies_keep_telemetry_invariants() {
+        let mut wt = WidthTally::default();
+        assert_eq!(wt.launches, 0);
+        wt.record_launch(4, 2);
+        wt.record_launch(4, 0);
+        wt.record_launch(2, 5);
+        wt.record_dropped(3);
+        wt.record_chunk(true);
+        wt.record_chunk(false);
+        assert!(wt.wide_slots <= wt.slots);
+        assert!(wt.wide_launches <= wt.launches);
+        assert!(wt.unmeasured <= wt.chunked);
+        assert_eq!(wt.launches, 3);
+        assert_eq!(wt.dropped, 3);
+        // Step / request draft tally helpers: emitted tokens minus 1 bonus token, clamped to drafted
+        for &(rows, emitted, want_drafted, want_kept) in &[
+            (8u64, 4u64, 7u64, 3u64),
+            (1, 1, 0, 0),
+            (8, 12, 7, 7),
+        ] {
+            let (drafted, kept) = step_draft_counts(rows, emitted);
+            assert_eq!(drafted, want_drafted);
+            assert_eq!(kept, want_kept);
+            assert!(kept <= drafted);
+        }
     }
 }

@@ -4,8 +4,7 @@
 //! delegate directly to the build-time verified Bend 2 core (`verified/kv_pool.bend`).
 
 use crate::verified::{
-    pfx_reuse_valid, pool_alloc, pool_block_in_bounds, pool_blocks_for, pool_can_alloc,
-    pool_can_evict, pool_free, pool_init, pool_same_slab_adjacent, pool_slab_coords, pool_total,
+    pfx_reuse_valid, pool_alloc, pool_can_alloc, pool_can_evict, pool_free, pool_init, pool_total,
     PoolAcct,
 };
 
@@ -22,16 +21,6 @@ pub const BLOCKS_PER_SLAB: u64 = SLAB_BYTES / BLOCK_BYTES;
 pub enum PoolError {
     OutOfBlocks { requested: u64, free: u64 },
     DoubleFree { requested: u64, allocated: u64 },
-    BlockOutOfBounds { block_id: u64, capacity: u64 },
-}
-
-/// Contiguous byte run within a single host-RAM slab (never crosses a 1 GiB slab boundary).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlabRun {
-    pub slab_idx: u64,
-    pub first_block_in_slab: u64,
-    pub byte_offset_in_slab: u64,
-    pub byte_len: u64,
 }
 
 /// Checked block-pool accounting guard (`allocated + free == capacity` proven in Bend 2).
@@ -86,77 +75,11 @@ impl BlockPoolTracker {
         self.acct = pool_free(self.acct, rel_blocks);
         Ok(())
     }
-
-    pub fn check_block_id(&self, block_id: u64) -> Result<(), PoolError> {
-        if pool_block_in_bounds(block_id, self.capacity()) {
-            Ok(())
-        } else {
-            Err(PoolError::BlockOutOfBounds {
-                block_id,
-                capacity: self.capacity(),
-            })
-        }
-    }
 }
 
 /// True iff a host-RAM cache entry is eligible for LRU eviction (`pins == 0 && !busy`).
 pub fn can_evict_entry(pins: u64, busy: bool) -> bool {
     pool_can_evict(pins, busy)
-}
-
-/// Ceiling block count for `bytes` given `block_bytes` (div-by-zero safe).
-pub fn blocks_needed(bytes: u64, block_bytes: u64) -> u64 {
-    pool_blocks_for(bytes, block_bytes)
-}
-
-/// Maps a global `block_id` into `(slab_index, block_in_slab)`.
-pub fn slab_coords(block_id: u64, blocks_per_slab: u64) -> (u64, u64) {
-    pool_slab_coords(block_id, blocks_per_slab)
-}
-
-/// True iff `prev_block` and `cur_block` can coalesce into one contiguous DMA run inside one slab.
-pub fn same_slab_adjacent(prev_block: u64, cur_block: u64, blocks_per_slab: u64) -> bool {
-    pool_same_slab_adjacent(prev_block, cur_block, blocks_per_slab)
-}
-
-/// Coalesces block IDs into slab-bounded host byte runs (mirrors `cram::Pool::extents`).
-pub fn coalesce_slab_runs(
-    blocks: &[u64],
-    total_bytes: u64,
-    block_bytes: u64,
-    blocks_per_slab: u64,
-) -> Vec<SlabRun> {
-    if blocks.is_empty() || total_bytes == 0 || block_bytes == 0 {
-        return Vec::new();
-    }
-    let mut runs = Vec::new();
-    let mut remaining = total_bytes;
-    let mut idx = 0usize;
-    while idx < blocks.len() && remaining > 0 {
-        let start_blk = blocks[idx];
-        let (slab_idx, first_in_slab) = slab_coords(start_blk, blocks_per_slab);
-        let mut take = remaining.min(block_bytes);
-        remaining -= take;
-        let mut prev_blk = start_blk;
-        idx += 1;
-        while idx < blocks.len()
-            && remaining > 0
-            && same_slab_adjacent(prev_blk, blocks[idx], blocks_per_slab)
-        {
-            let chunk = remaining.min(block_bytes);
-            take += chunk;
-            remaining -= chunk;
-            prev_blk = blocks[idx];
-            idx += 1;
-        }
-        runs.push(SlabRun {
-            slab_idx,
-            first_block_in_slab: first_in_slab,
-            byte_offset_in_slab: first_in_slab.saturating_mul(block_bytes),
-            byte_len: take,
-        });
-    }
-    runs
 }
 
 /// Parameters for checking whether a prefix-cache snapshot at `snap_pos` is valid for reuse.
@@ -200,15 +123,8 @@ mod tests {
         assert_eq!(pool.allocated(), 0);
         assert_eq!(pool.free(), 32);
 
-        // Entry A: 5 MB rows -> 3 blocks, 2 x 3 MB snapshots -> 2 blocks each = 7 blocks
-        let b_rows = blocks_needed(2048 * 2560, BLOCK_BYTES);
-        let b_snap = blocks_needed(3 * MB, BLOCK_BYTES);
-        assert_eq!(b_rows, 3);
-        assert_eq!(b_snap, 2);
-        assert_eq!(blocks_needed(0, BLOCK_BYTES), 0);
-        assert_eq!(blocks_needed(5 * MB, 0), 0);
-
-        pool.alloc(b_rows + 2 * b_snap).unwrap();
+        // Entry A: 7 blocks
+        pool.alloc(7).unwrap();
         assert_eq!(pool.allocated(), 7);
         assert_eq!(pool.free(), 25);
         assert_eq!(pool.allocated() + pool.free(), 32);
@@ -239,17 +155,6 @@ mod tests {
         pool.free_blocks(7).unwrap();
         assert_eq!(pool.allocated(), 0);
         assert_eq!(pool.free(), 32);
-
-        // Block ID bounds
-        assert!(pool.check_block_id(0).is_ok());
-        assert!(pool.check_block_id(31).is_ok());
-        assert_eq!(
-            pool.check_block_id(32),
-            Err(PoolError::BlockOutOfBounds {
-                block_id: 32,
-                capacity: 32
-            })
-        );
     }
 
     #[test]
@@ -258,46 +163,6 @@ mod tests {
         assert!(!can_evict_entry(1, false));
         assert!(!can_evict_entry(0, true));
         assert!(!can_evict_entry(3, true));
-    }
-
-    #[test]
-    fn slab_runs_split_on_holes_and_1gb_boundaries() {
-        // Mirrors cache_ram_test.cpp tests 5 & 7
-        let runs = coalesce_slab_runs(
-            &[3, 4, 5, 9, 10],
-            4 * BLOCK_BYTES + 100,
-            BLOCK_BYTES,
-            BLOCKS_PER_SLAB,
-        );
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].slab_idx, 0);
-        assert_eq!(runs[0].first_block_in_slab, 3);
-        assert_eq!(runs[0].byte_len, 3 * BLOCK_BYTES);
-        assert_eq!(runs[1].slab_idx, 0);
-        assert_eq!(runs[1].first_block_in_slab, 9);
-        assert_eq!(runs[1].byte_len, BLOCK_BYTES + 100);
-
-        // Cross-slab boundary at 511 -> 512 (1 GiB boundary with 512 blocks/slab)
-        assert!(!same_slab_adjacent(511, 512, BLOCKS_PER_SLAB));
-        assert!(same_slab_adjacent(510, 511, BLOCKS_PER_SLAB));
-        assert!(same_slab_adjacent(512, 513, BLOCKS_PER_SLAB));
-        assert_eq!(slab_coords(511, BLOCKS_PER_SLAB), (0, 511));
-        assert_eq!(slab_coords(512, BLOCKS_PER_SLAB), (1, 0));
-
-        let cross = coalesce_slab_runs(
-            &[510, 511, 512, 513],
-            4 * BLOCK_BYTES,
-            BLOCK_BYTES,
-            BLOCKS_PER_SLAB,
-        );
-        assert_eq!(cross.len(), 2);
-        assert_eq!(cross[0].slab_idx, 0);
-        assert_eq!(cross[0].first_block_in_slab, 510);
-        assert_eq!(cross[0].byte_len, 2 * BLOCK_BYTES);
-        assert_eq!(cross[1].slab_idx, 1);
-        assert_eq!(cross[1].first_block_in_slab, 0);
-        assert_eq!(cross[1].byte_offset_in_slab, 0);
-        assert_eq!(cross[1].byte_len, 2 * BLOCK_BYTES);
     }
 
     #[test]

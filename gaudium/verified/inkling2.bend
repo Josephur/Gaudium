@@ -2033,3 +2033,34 @@ law ik_buf_reuse_safe:
 
 def ik_buf_reuse_safe(lu, a, bs, bo, s):
   ikp_buf(lu, a, bs, bo, s, Nat.is_lt(lu, a), {==})
+
+# ============================================================================
+# 9. Whether a request's decode runs the drafter
+# ============================================================================
+
+# The decode of a request runs the loaded drafter unless the request asks for the plain loop (the
+# K = 0 reference); the decode dispatch and the live record's label both ask this.
+def ik_decode_runs_drafter(has_drafter: Bool, plain_asked: Bool) -> Bool:
+  Bool.and(has_drafter, Bool.not(plain_asked))
+
+# promise: a request that asks for the plain decode loop never runs the drafter
+# harm: the K = 0 reference of a comparison is itself speculative
+law ik_decode_plain_no_drafter:
+  for has_drafter: Bool
+  {ik_decode_runs_drafter(has_drafter, True{}) == False{} : Bool}
+
+def ik_decode_plain_no_drafter(has_drafter):
+  match has_drafter:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# promise: an engine without a drafter never runs one
+# harm: a request is labelled or run as speculative with no drafter loaded
+law ik_decode_no_drafter:
+  for plain_asked: Bool
+  {ik_decode_runs_drafter(False{}, plain_asked) == False{} : Bool}
+
+def ik_decode_no_drafter(plain_asked):
+  {==}

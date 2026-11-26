@@ -107,9 +107,9 @@ def tb_lt_succ_add(+p: Nat, e: Nat) -> {Nat.is_lt(p, 1n+Nat.add(p, e)) == True{}
 def ctx_reserve() -> Nat:
   128n
 
-# Advertised served context: Lmax - 128, saturating safely at 0 (no underflow).
+# Advertised served context: Lmax - ctx_reserve(), saturating safely at 0 (no underflow).
 def served_ctx(lmax: Nat) -> Nat:
-  Nat.sub(lmax, 128n)
+  Nat.sub(lmax, ctx_reserve())
 
 # Prompt is admitted iff 1 <= prompt_len < served_ctx(lmax) (leaves >= 1 token room).
 def prompt_admitted(+prompt_len: Nat, lmax: Nat) -> Bool:
@@ -135,80 +135,13 @@ def effective_max_new(req_unbounded: Bool, req_max_new: Nat, prompt_len: Nat, lm
 def remaining_budget(sent: Nat, max_new: Nat) -> Nat:
   Nat.sub(max_new, sent)
 
-# Speculative step safety headroom: verify + draft rows stay within Lmax (3*Kmax + 8 margin).
-def step_headroom_fits(cursor: Nat, kmax: Nat, lmax: Nat) -> Bool:
-  Nat.is_le(Nat.add(cursor, Nat.add(Nat.mul(3n, kmax), 8n)), lmax)
-
-# KV high-water mark for post-request prefix clean: clamped to <= lmax, div-by-zero safe.
-def kv_hw_round_if(+e: Nat, +kv_blk: Nat, is_zero: Bool) -> Nat:
-  match is_zero:
-    case True{}:
-      e
-    case False{}:
-      Nat.add(Nat.mul(Nat.div(Nat.add(e, Nat.sub(kv_blk, 1n)), kv_blk), kv_blk), kv_blk)
-
-def kv_high_water(prompt_len: Nat, cursor: Nat, kmax: Nat, +kv_blk: Nat, +lmax: Nat) -> Nat:
-  Nat.min(
-    lmax,
-    kv_hw_round_if(
-      Nat.add(Nat.max(prompt_len, cursor), Nat.add(Nat.mul(3n, kmax), 8n)),
-      kv_blk,
-      Nat.is_eq(kv_blk, 0n)
-    )
-  )
-
 # ============================================================================
-# 3. Sampler Family Lattice & Method Compatibility (backend.hpp, gaudium_engine.cpp)
+# 3. Sampler Admission & Top-K Clamping
 # ============================================================================
-
-type SamplerFamily is Data:
-  SampGreedy{}
-  SampNoSearch{}
-  SampSearch{}
-
-type SpecMethod is Data:
-  MethodMtpChain{}
-  MethodMtpAdaptive{}
-  MethodDSpineChain{}
-  MethodDSpineAdaptive{}
-  MethodDFlash2{}
-  MethodCertified{}
-  MethodPromptLookup{}
-  MethodMtpTree{}
-  MethodDSpineFixedTree{}
-
-def method_allows_sampling(m: SpecMethod) -> Bool:
-  match m:
-    case MethodMtpChain{}:
-      True{}
-    case MethodMtpAdaptive{}:
-      True{}
-    case MethodDSpineChain{}:
-      True{}
-    case MethodDSpineAdaptive{}:
-      True{}
-    case _:
-      False{}
 
 # Policy gate: greedy requests are always allowed; sampled requests require method capability.
 def sampling_request_admitted(method_can_sample: Bool, wants_sampling: Bool) -> Bool:
   Bool.or(Bool.not(wants_sampling), method_can_sample)
-
-# Mixed-batch sampler lattice join: Search > NoSearch > Greedy (GAUDIUM_BATCH_MIX).
-def sampler_family_join(a: SamplerFamily, b: SamplerFamily) -> SamplerFamily:
-  match a:
-    case SampSearch{}:
-      SampSearch{}
-    case SampNoSearch{}:
-      match b:
-        case SampSearch{}:
-          SampSearch{}
-        case SampNoSearch{}:
-          SampNoSearch{}
-        case SampGreedy{}:
-          SampNoSearch{}
-    case SampGreedy{}:
-      b
 
 def clamp_top_k(top_k: Nat, vocab: Nat) -> Nat:
   Nat.min(top_k, vocab)
@@ -223,15 +156,17 @@ law served_ctx_le_lmax:
   {Nat.is_le(served_ctx(lmax), lmax) == True{} : Bool}
 
 def served_ctx_le_lmax(lmax):
-  tb_sub_le_self(lmax, 128n)
+  tb_sub_le_self(lmax, ctx_reserve())
 
-# LAW TB.2: For lmax = 128 + extra, served_ctx recovers extra exactly.
+# LAW TB.2: For lmax = ctx_reserve() + extra, served_ctx recovers extra exactly.
+# promise: served_ctx recovers extra exactly when lmax is ctx_reserve() + extra
+# catches: served_ctx ignores ctx_reserve() and returns lmax unchanged
 law served_ctx_above_reserve:
   for +extra: Nat
-  {served_ctx(Nat.add(128n, extra)) == extra : Nat}
+  {served_ctx(Nat.add(ctx_reserve(), extra)) == extra : Nat}
 
 def served_ctx_above_reserve(extra):
-  tb_sub_add_cancel(128n, extra)
+  tb_sub_add_cancel(ctx_reserve(), extra)
 
 # LAW TB.3: Empty prompt (len 0) is ALWAYS rejected.
 law empty_prompt_rejected:
@@ -283,80 +218,6 @@ law remaining_monotone_step:
 
 def remaining_monotone_step(sent, m):
   tb_sub_succ_le(m, sent)
-
-# LAW TB.8: KV high-water mark is ALWAYS clamped to <= lmax.
-law kv_hw_le_lmax:
-  for +p: Nat
-  for +c: Nat
-  for +k: Nat
-  for +b: Nat
-  for +lmax: Nat
-  {Nat.is_le(kv_high_water(p, c, k, b, lmax), lmax) == True{} : Bool}
-
-def kv_hw_le_lmax(p, c, k, b, lmax):
-  tb_min_le_l(
-    lmax,
-    kv_hw_round_if(
-      Nat.add(Nat.max(p, c), Nat.add(Nat.mul(3n, k), 8n)),
-      b,
-      Nat.is_eq(b, 0n)
-    )
-  )
-
-# LAW TB.9: Sampler mixed-batch family join is commutative, idempotent, and associative.
-law sampler_join_comm:
-  for a: SamplerFamily
-  for b: SamplerFamily
-  {sampler_family_join(a, b) == sampler_family_join(b, a) : SamplerFamily}
-
-def sampler_join_comm(a, b):
-  match a b:
-    case SampGreedy{} SampGreedy{}: {==}
-    case SampGreedy{} SampNoSearch{}: {==}
-    case SampGreedy{} SampSearch{}: {==}
-    case SampNoSearch{} SampGreedy{}: {==}
-    case SampNoSearch{} SampNoSearch{}: {==}
-    case SampNoSearch{} SampSearch{}: {==}
-    case SampSearch{} SampGreedy{}: {==}
-    case SampSearch{} SampNoSearch{}: {==}
-    case SampSearch{} SampSearch{}: {==}
-
-law sampler_join_idem:
-  for a: SamplerFamily
-  {sampler_family_join(a, a) == a : SamplerFamily}
-
-def sampler_join_idem(a):
-  match a:
-    case SampGreedy{}: {==}
-    case SampNoSearch{}: {==}
-    case SampSearch{}: {==}
-
-law sampler_join_assoc:
-  for a: SamplerFamily
-  for b: SamplerFamily
-  for c: SamplerFamily
-  {sampler_family_join(sampler_family_join(a, b), c) == sampler_family_join(a, sampler_family_join(b, c)) : SamplerFamily}
-
-def sampler_join_assoc(a, b, c):
-  match a:
-    case SampSearch{}:
-      {==}
-    case SampGreedy{}:
-      {==}
-    case SampNoSearch{}:
-      match b:
-        case SampSearch{}:
-          {==}
-        case SampNoSearch{}:
-          match c:
-            case SampGreedy{}: {==}
-            case SampNoSearch{}: {==}
-            case SampSearch{}: {==}
-        case SampGreedy{}:
-          match c:
-            case SampGreedy{}: {==}
-            case SampNoSearch{}: {==}
-            case SampSearch{}: {==}
 
 # LAW TB.10: Any method without sampling capability refuses sampled requests; greedy is always admitted.
 law unsupported_method_refuses_sampling:

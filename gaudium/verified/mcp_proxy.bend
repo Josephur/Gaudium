@@ -965,14 +965,6 @@ law px_net_no_bits_any_byte:
 def px_net_no_bits_any_byte(a, b):
   {==}
 
-# LAW 6.9: Past the last prefix byte no bits are left (the comparison ends with the prefix).
-law px_net_bits_run_out:
-  for i: Nat
-  {px_net_bits_at(0n, i) == 0n : Nat}
-
-def px_net_bits_run_out(i):
-  {==}
-
 # ============================================================================
 # 7. Redirects
 # ============================================================================

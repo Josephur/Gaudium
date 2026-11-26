@@ -4,14 +4,12 @@
 //! All predicates and bounds math delegate directly to `verified/tensor_bounds.bend`.
 
 use crate::verified::{
-    addr_in_block, align128, align_up, bucket_chunks, bucket_valid, gdn_dims_valid, gqa_dims_valid,
-    hidden_dims_valid, kv8_vpos, kv8_vpos128, lane128, lane256, moe_dims_valid, qsa_blocks,
-    relocate_addr, tree_node_valid, tree_shape_bounds_valid, vit_grid_valid, vit_merged_tokens,
+    align128, align_up, gdn_dims_valid, gqa_dims_valid, hidden_dims_valid, kv8_vpos, kv8_vpos128,
+    lane128, lane256, moe_dims_valid, tree_node_valid, tree_shape_bounds_valid,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShapeError {
-    InvalidBucket(u64),
     InvalidGqa {
         n_heads: u64,
         n_kv_heads: u64,
@@ -30,12 +28,6 @@ pub enum ShapeError {
         n_experts: u64,
         top_k: u64,
         expert_ff: u64,
-    },
-    InvalidVitGrid {
-        t: u64,
-        h: u64,
-        w: u64,
-        max_patches: u64,
     },
     InvalidTreeShape {
         n_nodes: u64,
@@ -57,15 +49,6 @@ pub fn align_up_safe(x: u64, align: u64) -> u64 {
 /// 128-element / 128-byte upward alignment.
 pub fn align_128(x: u64) -> u64 {
     align128(x)
-}
-
-/// Validates a 4096-token attention chunk bucket (`lb > 0 && lb % 4096 == 0`).
-pub fn validate_bucket(lb: u64) -> Result<(u64, u64), ShapeError> {
-    if bucket_valid(lb) {
-        Ok((bucket_chunks(lb), qsa_blocks(lb)))
-    } else {
-        Err(ShapeError::InvalidBucket(lb))
-    }
 }
 
 /// Deinterleaved 128-lane channel permutation (`model_qwen35.hpp`).
@@ -136,20 +119,6 @@ pub fn validate_moe(n_experts: u64, top_k: u64, expert_ff: u64) -> Result<(), Sh
     }
 }
 
-/// Validates a ViT patch grid `(t, h, w)` and returns the 2x2-merged vision token count.
-pub fn validate_vit_grid(t: u64, h: u64, w: u64, max_patches: u64) -> Result<u64, ShapeError> {
-    if vit_grid_valid(t, h, w, max_patches) {
-        Ok(vit_merged_tokens(t, h, w))
-    } else {
-        Err(ShapeError::InvalidVitGrid {
-            t,
-            h,
-            w,
-            max_patches,
-        })
-    }
-}
-
 /// Draft-tree node metadata matching `dtree::Node`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreeNodeSpec {
@@ -210,41 +179,18 @@ pub fn validate_draft_tree(
     Ok(())
 }
 
-/// Checked lane state-block address relocator (mirrors `common.hpp` `Reloc`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LaneReloc {
-    pub lane0_lo: u64,
-    pub lane0_hi: u64,
-    pub dst_lo: u64,
-}
-
-impl LaneReloc {
-    pub fn contains(&self, addr: u64) -> bool {
-        addr_in_block(addr, self.lane0_lo, self.lane0_hi)
-    }
-
-    pub fn relocate(&self, addr: u64) -> u64 {
-        relocate_addr(addr, self.lane0_lo, self.lane0_hi, self.dst_lo)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn alignment_and_bucket_bounds() {
+    fn alignment_bounds() {
         assert_eq!(align_up_safe(0, 128), 0);
         assert_eq!(align_up_safe(1, 128), 128);
         assert_eq!(align_up_safe(128, 128), 128);
         assert_eq!(align_up_safe(129, 128), 256);
         assert_eq!(align_up_safe(777, 0), 777); // div-by-zero safe
         assert_eq!(align_128(5120), 5120);
-
-        assert_eq!(validate_bucket(4096), Ok((1, 1024)));
-        assert_eq!(validate_bucket(262_144), Ok((64, 65_536)));
-        assert!(validate_bucket(0).is_err());
-        assert!(validate_bucket(4095).is_err());
     }
 
     #[test]
@@ -313,12 +259,6 @@ mod tests {
         assert!(validate_hidden(5120, 248_321).is_err());
         assert!(validate_moe(0, 8, 512).is_err());
         assert!(validate_moe(256, 16, 512).is_err()); // ek > 12
-
-        // ViT 2x2 merger
-        assert_eq!(validate_vit_grid(1, 28, 28, 4096), Ok(196));
-        assert!(validate_vit_grid(1, 0, 28, 4096).is_err());
-        assert!(validate_vit_grid(1, 27, 28, 4096).is_err()); // odd height
-        assert!(validate_vit_grid(1, 100, 100, 4096).is_err()); // exceeds max_patches
     }
 
     #[test]
@@ -410,25 +350,5 @@ mod tests {
             });
         }
         assert!(validate_draft_tree(&oversized, 32, 32, 32, 4).is_err());
-    }
-
-    #[test]
-    fn lane_relocation_moves_only_in_block_addresses() {
-        let reloc = LaneReloc {
-            lane0_lo: 0x1000_0000,
-            lane0_hi: 0x2000_0000,
-            dst_lo: 0x3000_0000,
-        };
-        assert!(reloc.contains(0x1000_0000));
-        assert!(reloc.contains(0x1FFF_FFFF));
-        assert!(!reloc.contains(0x2000_0000));
-        assert!(!reloc.contains(0x0800_0000));
-
-        assert_eq!(reloc.relocate(0x1000_0000), 0x3000_0000);
-        assert_eq!(reloc.relocate(0x1234_5678), 0x3234_5678);
-        // Shared weights outside [lane0_lo, lane0_hi) remain untouched
-        assert_eq!(reloc.relocate(0x0800_1000), 0x0800_1000);
-        assert_eq!(reloc.relocate(0x2000_0000), 0x2000_0000);
-        assert_eq!(reloc.relocate(0x9000_0000), 0x9000_0000);
     }
 }

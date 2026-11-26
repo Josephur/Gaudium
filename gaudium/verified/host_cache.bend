@@ -221,12 +221,6 @@ def hc_default_budget(+available: Nat) -> Nat:
 def hc_beside_pinned(available: Nat, pinned: Nat) -> Nat:
   Nat.sub(available, pinned)
 
-# Bytes a save may take without evicting: what the budget has free, and never more than the
-# host can give at that moment (the budget was checked when the server started; other
-# processes have taken and given memory since).
-def hc_free_now(+budget_free: Nat, +host_available: Nat) -> Nat:
-  Nat.min(budget_free, host_available)
-
 # Can a budget be honoured? It and the pinned transfer buffers must fit in what is available.
 # Written as pinned <= available and budget <= available - pinned, which is budget + pinned <=
 # available (`hc_fits_split`) without the sum, so no budget an operator names can overflow it.
@@ -1261,25 +1255,6 @@ law hc_ring_cover_never_grows:
 def hc_ring_cover_never_grows(i, k):
   hc_min_le_l(i, k)
 
-# LAW HC.53: a save never counts on more free bytes than its budget has left ...
-law hc_free_now_within_budget:
-  for +f: Nat
-  for +a: Nat
-  {Nat.is_le(hc_free_now(f, a), f) == True{} : Bool}
-
-def hc_free_now_within_budget(f, a):
-  hc_min_le_l(f, a)
-
-# LAW HC.54: ... nor on more than the host has available now: the cache gives its own entries
-# back before it takes memory the host does not have.
-law hc_free_now_within_host:
-  for +f: Nat
-  for +a: Nat
-  {Nat.is_le(hc_free_now(f, a), a) == True{} : Bool}
-
-def hc_free_now_within_host(f, a):
-  hc_min_le_r(f, a)
-
 # LAW HC.55: an entry with no kept position is never one to resume from.
 law hc_no_position_not_resumable:
   for u: Unit
@@ -1505,12 +1480,6 @@ def hc_state_kept(done: Nat, all: Nat, state_tiles: Nat, entry_tiles: Nat) -> Bo
 # the one the save just reached (`last_tiles`): the next turn resumes there.
 def hc_state_may_leave(state_tiles: Nat, last_tiles: Nat) -> Bool:
   Bool.not(Nat.is_eq(state_tiles, last_tiles))
-
-# Does a save copy the drafter's rings? Only on an engine that has rings, only when everything
-# before them was copied whole (a save that was cut short gives the card up at once), and only
-# when the entry's image is stale (`hc_ring_stale`).
-def hc_ring_save(ring_bytes: Nat, complete: Bool, has_image: Bool, grew: Bool) -> Bool:
-  Bool.and(Nat.is_gt(ring_bytes, 0n), Bool.and(complete, hc_ring_stale(has_image, grew)))
 
 # May the server's idle work take the engine? Only a ready engine that no request is using.
 def hc_idle_may_take(active: Nat, ready: Bool) -> Bool:
@@ -1984,26 +1953,6 @@ law hc_last_position_never_leaves:
 def hc_last_position_never_leaves(k):
   %Equal.sym(Bool, Nat.is_eq(k, k), True{}, hc_eq_refl(k)) : {Bool.not(_) == False{} : Bool}
   {==}
-
-# LAW HC.87: an engine without rings never copies a ring image out.
-law hc_no_rings_nothing_saved:
-  for +c: Bool
-  for +i: Bool
-  for +g: Bool
-  {hc_ring_save(0n, c, i, g) == False{} : Bool}
-
-def hc_no_rings_nothing_saved(c, i, g):
-  {==}
-
-# LAW HC.88: a save that was cut short never goes on to copy the rings: it gives the card up.
-law hc_cut_short_save_copies_no_ring:
-  for +b: Nat
-  for +i: Bool
-  for +g: Bool
-  {hc_ring_save(b, False{}, i, g) == False{} : Bool}
-
-def hc_cut_short_save_copies_no_ring(b, i, g):
-  hc_and_false_r(Nat.is_gt(b, 0n))
 
 # LAW HC.89: idle work never takes the engine while a request is using it ...
 law hc_idle_never_takes_a_busy_engine:

@@ -5,8 +5,7 @@
 
 use crate::verified::{
     g4_audio_ctx_valid, g4_heads_valid, g4_kv_share_valid, g4_lane, g4_nat, g4_ple_valid,
-    g4_rope_vecs, g4_vision_heads_valid, g4_vperm, pin_add_extent, pin_huge_ratio_ok,
-    pin_is_usable, pin_mapped_count, pin_rollback, PinState,
+    g4_vision_heads_valid, pin_add_extent, pin_is_usable, pin_mapped_count, pin_rollback, PinState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,14 +48,9 @@ pub fn natural_channel(h: u64, j: u64) -> u64 {
     g4_nat(h, j)
 }
 
-/// V row index for key slot `j` (`g4l::vperm`).
-pub fn v_row_perm(j: u64) -> u64 {
-    g4_vperm(j)
-}
-
 /// Number of 128-lane RoPE cos/sin table vectors: `ceil(pairs / 128)`.
 pub fn rope_table_vecs(pairs: u64) -> u64 {
-    g4_rope_vecs(pairs)
+    pairs.div_ceil(128)
 }
 
 /// Converts a natural-order per-channel f32 table `{DH}` (`DH % 128 == 0`) into the Gemma 4 TPC view.
@@ -248,10 +242,6 @@ impl HostPinGuard {
         self.state = pin_rollback(self.state);
         self.state
     }
-
-    pub fn huge_ratio_meets_min(huge_bytes: u64, total_bytes: u64, min_pct: u64) -> bool {
-        pin_huge_ratio_ok(huge_bytes, total_bytes, min_pct)
-    }
 }
 
 #[cfg(test)]
@@ -270,13 +260,6 @@ mod tests {
                 // TPC bf16 load deinterleaves lane positions: even positions -> h=0, odd -> h=1
                 assert_eq!(lane_in_block(c), 2 * j + h);
             }
-        }
-        // vperm is a bijection on 0..256
-        let mut seen_v = [false; 256];
-        for j in 0..256u64 {
-            let p = v_row_perm(j) as usize;
-            assert!(p < 256 && !seen_v[p]);
-            seen_v[p] = true;
         }
     }
 
@@ -343,7 +326,5 @@ mod tests {
         ok.record_extent(true).unwrap();
         assert!(ok.is_usable());
         assert_eq!(ok.mapped_extents(), 2);
-        assert!(HostPinGuard::huge_ratio_meets_min(60, 100, 50));
-        assert!(!HostPinGuard::huge_ratio_meets_min(49, 100, 50));
     }
 }

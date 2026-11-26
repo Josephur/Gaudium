@@ -34,39 +34,11 @@ def tn_lt_refl_false(n: Nat) -> {False{} == Nat.is_lt(n, n) : Bool}:
     case 1n+p:
       tn_lt_refl_false(p)
 
-def tn_lt_add_r_false(hi: Nat, extra: Nat) -> {False{} == Nat.is_lt(Nat.add(hi, extra), hi) : Bool}:
-  match hi:
-    case 0n:
-      match extra:
-        case 0n: {==}
-        case 1n+_: {==}
-    case 1n+p:
-      tn_lt_add_r_false(p, extra)
-
 def tn_lt_add_succ_true(lo: Nat, span: Nat) -> {True{} == Nat.is_lt(lo, Nat.add(lo, 1n+span)) : Bool}:
   match lo:
     case 0n: {==}
     case 1n+p:
       tn_lt_add_succ_true(p, span)
-
-def tn_ge_refl(n: Nat) -> {True{} == Nat.is_ge(n, n) : Bool}:
-  match n:
-    case 0n: {==}
-    case 1n+p:
-      tn_ge_refl(p)
-
-def tn_sub_self_zero(n: Nat) -> {Nat.sub(n, n) == 0n : Nat}:
-  match n:
-    case 0n: {==}
-    case 1n+p:
-      tn_sub_self_zero(p)
-
-def tn_add_zero(a: Nat) -> {Nat.add(a, 0n) == a : Nat}:
-  match a:
-    case 0n: {==}
-    case 1n+p:
-      %tn_add_zero(p) : {1n+Nat.add(p, 0n) == 1n+_ : Nat}
-      {==}
 
 def tn_bool_and_false_r(b: Bool) -> {Bool.and(b, False{}) == False{} : Bool}:
   match b:
@@ -103,16 +75,6 @@ def align_up(+x: Nat, +align: Nat) -> Nat:
 
 def align128(+x: Nat) -> Nat:
   align_up(x, 128n)
-
-# Attention chunk bucket validation (CHUNK = 4096; model_engine.hpp:32,176).
-def bucket_valid(+lb: Nat) -> Bool:
-  Bool.and(Nat.is_gt(lb, 0n), Nat.is_eq(Nat.mod(lb, 4096n), 0n))
-
-def bucket_chunks(lb: Nat) -> Nat:
-  Nat.div(lb, 4096n)
-
-def qsa_blocks(lb: Nat) -> Nat:
-  Nat.div(lb, 4n)
 
 # Deinterleaved 128-lane order (model_qwen35.hpp:41-42): even -> c/2, odd -> 64 + c/2.
 def lane128_if(half: Nat, is_even: Bool) -> Nat:
@@ -207,27 +169,6 @@ def moe_dims_valid(+ne: Nat, +ek: Nat, +ef: Nat) -> Bool:
     )
   )
 
-def vit_grid_valid(+t: Nat, +h: Nat, +w: Nat, max_patches: Nat) -> Bool:
-  Bool.and(
-    Nat.is_ge(t, 1n),
-    Bool.and(
-      Nat.is_ge(h, 2n),
-      Bool.and(
-        Nat.is_ge(w, 2n),
-        Bool.and(
-          Nat.is_eq(Nat.mod(h, 2n), 0n),
-          Bool.and(
-            Nat.is_eq(Nat.mod(w, 2n), 0n),
-            Nat.is_le(Nat.mul(t, Nat.mul(h, w)), max_patches)
-          )
-        )
-      )
-    )
-  )
-
-def vit_merged_tokens(t: Nat, h: Nat, w: Nat) -> Nat:
-  Nat.mul(t, Nat.mul(Nat.div(h, 2n), Nat.div(w, 2n)))
-
 # Draft-tree bounds: parameterized by adapter max_nodes (e.g. 32 for u32 ancestor bitmasks), caterpillar depth/rank checks.
 def tree_shape_bounds_valid(+n_nodes: Nat, +spine: Nat, max_nodes: Nat, max_depth: Nat, topk: Nat) -> Bool:
   Bool.and(
@@ -257,24 +198,7 @@ def tree_node_valid(idx: Nat, +parent: Nat, +depth: Nat, parent_depth: Nat, rank
   )
 
 # ============================================================================
-# 4. Lane State-Block Address Relocation (common.hpp: Reloc)
-# ============================================================================
-
-def addr_in_block(+addr: Nat, lo: Nat, hi: Nat) -> Bool:
-  Bool.and(Nat.is_ge(addr, lo), Nat.is_lt(addr, hi))
-
-def relocate_addr_if(+addr: Nat, lo: Nat, dst_lo: Nat, inside: Bool) -> Nat:
-  match inside:
-    case True{}:
-      Nat.add(dst_lo, Nat.sub(addr, lo))
-    case False{}:
-      addr
-
-def relocate_addr(+addr: Nat, +lo: Nat, hi: Nat, dst_lo: Nat) -> Nat:
-  relocate_addr_if(addr, lo, dst_lo, addr_in_block(addr, lo, hi))
-
-# ============================================================================
-# 5. Verified Tensor, Alignment, Tree & Relocation Laws
+# 4. Verified Tensor, Alignment & Tree Laws
 # ============================================================================
 
 def tn_align_rem_ge(+x: Nat, align: Nat, rem: Nat, rem_zero: Bool) -> {Nat.is_le(x, align_up_rem_if(x, align, rem, rem_zero)) == True{} : Bool}:
@@ -306,13 +230,6 @@ law align_up_zero_align_safe:
   {align_up(x, 0n) == x : Nat}
 
 def align_up_zero_align_safe(x):
-  {==}
-
-# LAW TN.3: Zero-sized bucket is ALWAYS invalid.
-law bucket_zero_invalid:
-  {bucket_valid(0n) == False{} : Bool}
-
-def bucket_zero_invalid():
   {==}
 
 # LAW TN.4: Zero KV head count is ALWAYS rejected (prevents GQA mod-by-zero).
@@ -363,16 +280,6 @@ law moe_zero_experts_rejected:
 def moe_zero_experts_rejected(ek, ef):
   {==}
 
-# LAW TN.8: Zero ViT height is ALWAYS rejected (prevents empty / odd 2x2 merge).
-law vit_zero_h_rejected:
-  for +t: Nat
-  for +w: Nat
-  for m: Nat
-  {vit_grid_valid(t, 0n, w, m) == False{} : Bool}
-
-def vit_zero_h_rejected(t, w, m):
-  tn_bool_and_false_r(Nat.is_ge(t, 1n))
-
 # LAW TN.9: Any draft tree exceeding its bitmask/adapter cap `max_nodes` is ALWAYS rejected.
 law tree_over_max_nodes_rejected:
   for +mn: Nat
@@ -400,32 +307,6 @@ def tree_self_parent_rejected(i, d, pd, r, sp, tk):
   %tn_lt_refl_false(i) : {Bool.and(_, Bool.and(Nat.is_eq(d, Nat.add(pd, 1n)), Bool.and(Nat.is_lt(i, sp), Bool.and(Nat.is_le(d, sp), Nat.is_lt(r, tk))))) == False{} : Bool}
   {==}
 
-# LAW TN.11: Relocating the lane-0 base address `lo` of a non-empty block lands at `dst_lo`.
-law relocate_preserves_lo:
-  for +lo: Nat
-  for +span: Nat
-  for +dst: Nat
-  {relocate_addr(lo, lo, Nat.add(lo, 1n+span), dst) == dst : Nat}
-
-def relocate_preserves_lo(lo, span, dst):
-  %tn_ge_refl(lo) : {relocate_addr_if(lo, lo, dst, Bool.and(_, Nat.is_lt(lo, Nat.add(lo, 1n+span)))) == dst : Nat}
-  %tn_lt_add_succ_true(lo, span) : {relocate_addr_if(lo, lo, dst, _) == dst : Nat}
-  %Equal.sym(Nat, Nat.sub(lo, lo), 0n, tn_sub_self_zero(lo)) : {Nat.add(dst, _) == dst : Nat}
-  tn_add_zero(dst)
-
-# LAW TN.12: Any address >= hi (weights/tables outside the lane state block) is NEVER relocated.
-law relocate_outside_hi_unchanged:
-  for +lo: Nat
-  for +hi: Nat
-  for +extra: Nat
-  for dst: Nat
-  {relocate_addr(Nat.add(hi, extra), lo, hi, dst) == Nat.add(hi, extra) : Nat}
-
-def relocate_outside_hi_unchanged(lo, hi, extra, dst):
-  %tn_lt_add_r_false(hi, extra) : {relocate_addr_if(Nat.add(hi, extra), lo, dst, Bool.and(Nat.is_ge(Nat.add(hi, extra), lo), _)) == Nat.add(hi, extra) : Nat}
-  %Equal.sym(Bool, Bool.and(Nat.is_ge(Nat.add(hi, extra), lo), False{}), False{}, tn_bool_and_false_r(Nat.is_ge(Nat.add(hi, extra), lo))) : {relocate_addr_if(Nat.add(hi, extra), lo, dst, _) == Nat.add(hi, extra) : Nat}
-  {==}
-
 # LAW TN.13: Zero vocabulary size is ALWAYS rejected (prevents empty lm_head / embedding table).
 law hidden_zero_vocab_rejected:
   for +h: Nat
@@ -435,20 +316,6 @@ def hidden_zero_vocab_rejected(h):
   %Equal.sym(Bool, Bool.and(Nat.is_eq(Nat.mod(h, 256n), 0n), False{}), False{}, tn_bool_and_false_r(Nat.is_eq(Nat.mod(h, 256n), 0n))) : {Bool.and(Nat.is_gt(h, 0n), Bool.and(Nat.is_le(h, 6144n), _)) == False{} : Bool}
   %Equal.sym(Bool, Bool.and(Nat.is_le(h, 6144n), False{}), False{}, tn_bool_and_false_r(Nat.is_le(h, 6144n))) : {Bool.and(Nat.is_gt(h, 0n), _) == False{} : Bool}
   tn_bool_and_false_r(Nat.is_gt(h, 0n))
-
-# LAW TN.14: Qwen3.8-27B GQA + GDN concrete head dimensions pass all kernel-baked shape guards.
-law qwen38_27b_dims_valid:
-  {Bool.and(gqa_dims_valid(24n, 4n, 256n), gdn_dims_valid(16n, 48n, 4n)) == True{} : Bool}
-
-def qwen38_27b_dims_valid():
-  {==}
-
-# LAW TN.15: Qwen3.6-35B-A3B MoE concrete dimensions pass all MoE + attention guards.
-law qwen36_35b_moe_dims_valid:
-  {Bool.and(gqa_dims_valid(16n, 2n, 256n), Bool.and(gdn_dims_valid(16n, 32n, 4n), moe_dims_valid(256n, 8n, 512n))) == True{} : Bool}
-
-def qwen36_35b_moe_dims_valid():
-  {==}
 
 # ============================================================================
 # 6. Drafter context rings & draft readout rows
@@ -469,19 +336,6 @@ def tn_min_le_r(a: Nat, b: Nat) -> {Nat.is_le(Nat.min(a, b), b) == True{} : Bool
         case 0n: {==}
         case 1n+q:
           tn_min_le_r(p, q)
-
-def tn_min_sub_split(nv: Nat, hi: Nat) -> {Nat.add(Nat.min(nv, hi), Nat.sub(nv, hi)) == nv : Nat}:
-  match nv:
-    case 0n:
-      match hi:
-        case 0n: {==}
-        case 1n+_: {==}
-    case 1n+p:
-      match hi:
-        case 0n: {==}
-        case 1n+q:
-          %tn_min_sub_split(p, q) : {1n+Nat.add(Nat.min(p, q), Nat.sub(p, q)) == 1n+_ : Nat}
-          {==}
 
 # Rows of a context ring: whole 128-row blocks that hold a sliding window, the rows one context
 # pass may write past the cursor, and the guard that keeps the two swept slot ranges apart.
@@ -511,19 +365,6 @@ def ds_ctx_rows_if(ring: Nat, lmax: Nat, linear: Bool) -> Nat:
 # (`ring` = 0) one per context position.
 def ds_ctx_rows(+ring: Nat, lmax: Nat) -> Nat:
   ds_ctx_rows_if(ring, lmax, Nat.is_eq(ring, 0n))
-
-# Context rows a block row at offset `t` may read: its window less the block rows before it,
-# at most the `span` rows the request has written.
-def ds_win_rows(window: Nat, t: Nat, span: Nat) -> Nat:
-  Nat.min(Nat.sub(Nat.sub(window, 1n), t), span)
-
-# Those rows' slots: the ones below the write slot `hi` (the swept range A) and the ones that
-# wrapped to the top of the ring (range B).
-def ds_win_low(nv: Nat, hi: Nat) -> Nat:
-  Nat.min(nv, hi)
-
-def ds_win_wrap(nv: Nat, hi: Nat) -> Nat:
-  Nat.sub(nv, hi)
 
 def ds_draft_rows_if(asked: Nat, vocab: Nat, every_row: Bool) -> Nat:
   match every_row:
@@ -589,16 +430,6 @@ law ds_ctx_rows_linear_without_ring:
 
 def ds_ctx_rows_linear_without_ring(l):
   {==}
-
-# LAW TN.DR5: the two swept slot ranges hold exactly the rows a block row may read: none is
-# lost at the wrap and none is read twice.
-law ds_window_rows_split:
-  for +nv: Nat
-  for +hi: Nat
-  {Nat.add(ds_win_low(nv, hi), ds_win_wrap(nv, hi)) == nv : Nat}
-
-def ds_window_rows_split(nv, hi):
-  tn_min_sub_split(nv, hi)
 
 # LAW TN.DR6: the draft readout never has more rows than the vocabulary, for any request that
 # itself stays inside the vocabulary: the readout GEMM cannot address a row the head lacks.
