@@ -7,6 +7,8 @@ c7331b2bb18ed54f  a2ui_place_keeps_messages  law a2ui_place_keeps_messages : for
 603b7e4fdf4976bd  a2ui_prompt_empty_rejected  law a2ui_prompt_empty_rejected : for c : Nat { a2ui_prompt_size_ok ( 0n , c ) == False { } : Bool }
 befad067c4fa9616  a2ui_prompt_invalid_never_loads  law a2ui_prompt_invalid_never_loads : for + c : Bool { a2ui_prompt_loads ( a2ui_prompt_pick ( c , False { } ) ) == False { } : Bool }
 42faf90ea6fc8122  a2ui_prompt_load_xor_warn  law a2ui_prompt_load_xor_warn : for + p : A2PromptPick { Bool.and ( a2ui_prompt_loads ( p ) , a2ui_prompt_warns ( p ) ) == False { } : Bool }
+d25b42a7ec13291c  a2ui_prompt_over_cap_rejected  law a2ui_prompt_over_cap_rejected : for + cap : Nat for + d : Nat { a2ui_prompt_size_ok ( Nat.add ( cap , 1n + d ) , cap ) == False { } : Bool }
+# promise a2ui_prompt_over_cap_rejected: a2ui_prompt_size_ok rejects any prompt size strictly exceeding cap
 b0c3840f3f9bfec4  a2ui_prompt_reject_warns  law a2ui_prompt_reject_warns : { a2ui_prompt_warns ( a2ui_prompt_pick ( True { } , False { } ) ) == True { } : Bool }
 17320f20121fc1f5  a2ui_prompt_unchanged_quiet  law a2ui_prompt_unchanged_quiet : for + v : Bool { Bool.or ( a2ui_prompt_loads ( a2ui_prompt_pick ( False { } , v ) ) , a2ui_prompt_warns ( a2ui_prompt_pick ( False { } , v ) ) ) == False { } : Bool }
 c6d3f96fdd50f5f8  a2ui_refusal_never_injects  law a2ui_refusal_never_injects : for + d : A2uiDecision { Bool.and ( a2ui_refuses ( d ) , a2ui_injects ( d ) ) == False { } : Bool }
@@ -15,7 +17,11 @@ c6d3f96fdd50f5f8  a2ui_refusal_never_injects  law a2ui_refusal_never_injects : f
 30cfe882fbb72bc5  a2ui_scan_within_limit  law a2ui_scan_within_limit : for + l : Nat for + m : Nat { Nat.is_le ( a2ui_ids_scanned ( l , m ) , m ) == True { } : Bool }
 90386463ade431b5  a2ui_scan_within_list  law a2ui_scan_within_list : for + l : Nat for + m : Nat { Nat.is_le ( a2ui_ids_scanned ( l , m ) , l ) == True { } : Bool }
 4c5cfed7ad8d0f50  a2ui_unrequested_is_off  law a2ui_unrequested_is_off : for e : Bool for c : Bool { a2ui_decide ( False { } , e , c ) == A2Off { } : A2uiDecision }
+75e3fb07794da87a  align_up_is_multiple  law align_up_is_multiple : for + x : Nat for + ap : Nat { Nat.mod ( align_up ( x , 1n + ap ) , 1n + ap ) == 0n : Nat }
+# promise align_up_is_multiple: align_up with a positive alignment always yields a multiple of that alignment
 2bf79af1179eb9b8  align_up_never_shrinks  law align_up_never_shrinks : for + x : Nat for + a : Nat { Nat.is_le ( x , align_up ( x , a ) ) == True { } : Bool }
+c6111b53d5eba234  align_up_tight  law align_up_tight : for + x : Nat for + ap : Nat { Nat.is_lt ( align_up ( x , 1n + ap ) , Nat.add ( x , 1n + ap ) ) == True { } : Bool }
+# promise align_up_tight: align_up(x, 1+ap) is always strictly less than x + (1+ap)
 bafa9500c7a2bc5f  align_up_zero_align_safe  law align_up_zero_align_safe : for + x : Nat { align_up ( x , 0n ) == x : Nat }
 2ffa0d49fcaf0748  block_close_idempotent  law block_close_idempotent : for k : BlockKind { block_close_events ( block_close ( k ) ) == 0n : Nat }
 63493361526980c7  block_none_never_opens  law block_none_never_opens : for k : BlockKind { block_must_open ( BkNone { } , k ) == False { } : Bool }
@@ -57,6 +63,8 @@ bf64e42c2d2741d7  cg_server_kept_without_overwrite  law cg_server_kept_without_o
 9e64dfef12e11303  cg_server_needs_signer  law cg_server_needs_signer : for + a : Bool for + b : Bool for + c : Bool for + d : Bool for + f : Bool { Bool.and ( cg_writes_server ( cg_plan ( a , b , c , d , f ) ) , Bool.not ( Bool.or ( cg_writes_ca ( cg_plan ( a , b , c , d , f ) ) , Bool.and ( a , b ) ) ) ) == False { } : Bool }
 # promise cg_server_needs_signer: a server certificate is only written when its authority is made in the same run or both of the authority's files exist
 # harm cg_server_needs_signer: a server certificate signed by an authority that is not kept, so no device can be told to trust it
+96f409b922e6e3d4  clamp_top_k_within_input  law clamp_top_k_within_input : for + k : Nat for + v : Nat { Nat.is_le ( clamp_top_k ( k , v ) , k ) == True { } : Bool }
+# promise clamp_top_k_within_input: clamp_top_k never exceeds the input top_k
 f63d6f88affafb04  ctx_for_prompt_admits  law ctx_for_prompt_admits : for + p : Nat for + extra : Nat { prompt_admitted ( 1n + p , Nat.add ( ctx_for_prompt ( 1n + p ) , extra ) ) == True { } : Bool }
 # promise ctx_for_prompt_admits: a capacity of at least ctx_for_prompt(p) admits a non-empty prompt of p tokens, also after it is rounded up to whole cache chunks
 # harm ctx_for_prompt_admits: a calibration load would refuse its own longest prompt after the engine had loaded
@@ -72,6 +80,8 @@ e5ac6739516742cc  ds_ring_holds_window_and_pass  law ds_ring_holds_window_and_pa
 a0a0a67e1d6ae93a  ds_ring_needs_its_kernels  law ds_ring_needs_its_kernels : for w : Nat for + l : Nat for + r : Nat { ds_ring_pick ( False { } , w , l , r ) == 0n : Nat }
 d64aa69324dcf18f  ds_window_rows_split  law ds_window_rows_split : for + nv : Nat for + hi : Nat { Nat.add ( ds_win_low ( nv , hi ) , ds_win_wrap ( nv , hi ) ) == nv : Nat }
 a09474b00bc19d2b  effective_max_new_le_room  law effective_max_new_le_room : for unb : Bool for + req : Nat for + p : Nat for + lmax : Nat { Nat.is_le ( effective_max_new ( unb , req , p , lmax ) , prompt_room ( p , lmax ) ) == True { } : Bool }
+8295eac7f6a6dfeb  effective_max_new_respects_req  law effective_max_new_respects_req : for + req : Nat for + p : Nat for + lmax : Nat { Nat.is_le ( effective_max_new ( False { } , req , p , lmax ) , req ) == True { } : Bool }
+# promise effective_max_new_respects_req: effective_max_new with req_unbounded=False never exceeds req_max_new
 c5c794aed8b5d9a9  effort_level_ask_thinks  law effort_level_ask_thinks : for + s : EffortSet for + r : Nat { effort_plan_is_off ( effort_plan ( s , EaLevel { r } ) ) == False { } : Bool }
 e793ca3caadd0e8e  effort_no_levels_no_level  law effort_no_levels_no_level : for + s : EffortSet for + q : EffortAsk { Bool.or ( effort_any ( s ) , Bool.not ( effort_plan_is_level ( effort_plan ( s , q ) ) ) ) == True { } : Bool }
 3954a413478e8ac1  effort_number_needs_template  law effort_number_needs_template : for zero : Bool { effort_number_passes ( effort_number_plan ( False { } , zero ) ) == False { } : Bool }
@@ -107,6 +117,18 @@ c74c47153e6fb0be  g4_audio_zero_left_rejected  law g4_audio_zero_left_rejected :
 6bc6fbd345acaeea  g4_heads_zero_dh_rejected  law g4_heads_zero_dh_rejected : for + nh : Nat for + nkv : Nat for + p : Nat { g4_heads_valid ( nh , nkv , 0n , p ) == False { } : Bool }
 d556bde2ff41c207  g4_heads_zero_kv_rejected  law g4_heads_zero_kv_rejected : for + nh : Nat for + dh : Nat for + p : Nat { g4_heads_valid ( nh , 0n , dh , p ) == False { } : Bool }
 b92e3f940df9aed8  g4_kv_share_all_rejected  law g4_kv_share_all_rejected : for + nl : Nat for + extra : Nat { g4_kv_share_valid ( nl , Nat.add ( nl , extra ) ) == False { } : Bool }
+1303992cf18e5ff1  g4_lane_in_block  law g4_lane_in_block : for + c : Nat { Nat.is_lt ( g4_lane ( c ) , 128n ) == True { } : Bool }
+# promise g4_lane_in_block: g4_lane always returns a position strictly below 128
+ef09582ee291aefb  g4_lane_nat_roundtrip_hi  law g4_lane_nat_roundtrip_hi : for + j : Nat for hj : { Nat.is_lt ( j , 64n ) == True { } : Bool } { g4_lane ( g4_nat ( 1n , j ) ) == Nat.add ( Nat.mul ( 2n , j ) , 1n ) : Nat }
+# promise g4_lane_nat_roundtrip_hi: g4_lane(g4_nat(1, j)) equals 2*j + 1 for every lane j < 64
+20ec9944af21f01c  g4_lane_nat_roundtrip_lo  law g4_lane_nat_roundtrip_lo : for + j : Nat for hj : { Nat.is_lt ( j , 64n ) == True { } : Bool } { g4_lane ( g4_nat ( 0n , j ) ) == Nat.mul ( 2n , j ) : Nat }
+# promise g4_lane_nat_roundtrip_lo: g4_lane(g4_nat(0, j)) equals 2*j for every lane j < 64
+1f07e5f5dc71863f  g4_lane_periodic_128  law g4_lane_periodic_128 : for + c : Nat { g4_lane ( c ) == g4_lane ( Nat.mod ( c , 128n ) ) : Nat }
+# promise g4_lane_periodic_128: g4_lane is periodic modulo the 128-channel kernel block width
+1e6e7abf12407100  g4_nat_in_block_hi  law g4_nat_in_block_hi : for + j : Nat for hj : { Nat.is_lt ( j , 64n ) == True { } : Bool } { Nat.is_lt ( g4_nat ( 1n , j ) , 128n ) == True { } : Bool }
+# promise g4_nat_in_block_hi: g4_nat for half 1 and any lane j < 64 stays strictly below 128
+b71f1c2f74e8a2ef  g4_nat_in_block_lo  law g4_nat_in_block_lo : for + j : Nat for hj : { Nat.is_lt ( j , 64n ) == True { } : Bool } { Nat.is_lt ( g4_nat ( 0n , j ) , 128n ) == True { } : Bool }
+# promise g4_nat_in_block_lo: g4_nat for half 0 and any lane j < 64 stays strictly below 128
 c53430ffbf275392  g4_ple_off_always_valid  law g4_ple_off_always_valid : for pv : Nat for v : Nat { g4_ple_valid ( 0n , pv , v ) == True { } : Bool }
 629829a88fd02c54  g4_rope_vecs_boundary  law g4_rope_vecs_boundary : { Bool.and ( Nat.is_eq ( g4_rope_vecs ( 0n ) , 0n ) , Nat.is_eq ( g4_rope_vecs ( 128n ) , 1n ) ) == True { } : Bool }
 fdd5c6e325f099b2  g4c_build_step_drafts_within  law g4c_build_step_drafts_within : for + t : Nat for + kd : Nat for + kmax : Nat for l : Bool for tp : Bool { Bool.and ( g4c_build_step ( t , kd , kmax , l , tp ) , Nat.is_lt ( kmax , kd ) ) == False { } : Bool }
@@ -304,6 +326,8 @@ dcfddfa5a53ff82e  g4v_whole_token_patches_within  law g4v_whole_token_patches_wi
 6dcec9a285ad3c40  g4v_zero_patch_refused  law g4v_zero_patch_refused : for + q : Nat for + n : Nat { g4v_grid_ok ( 0n , q , n ) == False { } : Bool }
 # promise g4v_zero_patch_refused: an image path without a patch size is refused.
 13a2fa8783059771  gdn_zero_k_rejected  law gdn_zero_k_rejected : for + vh : Nat for ck : Nat { gdn_dims_valid ( 0n , vh , ck ) == False { } : Bool }
+019bf212458dba00  gdn_zero_v_heads_rejected  law gdn_zero_v_heads_rejected : for + k : Nat for ck : Nat { gdn_dims_valid ( k , 0n , ck ) == False { } : Bool }
+# promise gdn_zero_v_heads_rejected: zero DeltaNet value head count is always rejected
 5e31df0d7e1ee34b  gen_end_call_limit_not_cancel  law gen_end_call_limit_not_cancel : for eos : Bool for cancelled : Bool { gen_end ( False { } , True { } , eos , cancelled ) == GeCallLimit { } : GenEnd }
 701a333557e52866  gen_end_no_flag_is_length  law gen_end_no_flag_is_length : { gen_end ( False { } , False { } , False { } , False { } ) == GeLength { } : GenEnd }
 e067e43cfe4436bc  gen_end_stop_string_wins  law gen_end_stop_string_wins : for limit : Bool for eos : Bool for cancelled : Bool { gen_end ( True { } , limit , eos , cancelled ) == GeStopString { } : GenEnd }
@@ -322,13 +346,19 @@ a34a0d3c5cf51834  gg_nbytes_within  law gg_nbytes_within : for + r : Nat for + n
 # harm gg_nbytes_within: a tensor could claim more bytes than the file holds.
 71d35a49153340b8  gg_nbytes_zero_block_refused  law gg_nbytes_zero_block_refused : for + r : Nat for + n : Nat for + bb : Nat for + lim : Nat { gg_nbytes_ok ( r , n , 0n , bb , lim ) == False { } : Bool }
 # promise gg_nbytes_zero_block_refused: a type whose block holds no weights is always refused, so no size is ever divided by zero.
+c46efbb15c89ad04  gg_pad_aligns  law gg_pad_aligns : for + x : Nat for + ap : Nat { Nat.mod ( Nat.add ( x , gg_pad ( x , 1n + ap ) ) , 1n + ap ) == 0n : Nat }
+# promise gg_pad_aligns: adding gg_pad(x, 1+ap) to x always lands on an exact multiple of 1+ap
 b2637b06d1a88d8e  gg_pad_below_alignment  law gg_pad_below_alignment : for + x : Nat for + ap : Nat { Nat.is_lt ( gg_pad ( x , 1n + ap ) , 1n + ap ) == True { } : Bool }
 # promise gg_pad_below_alignment: the padding to the next multiple of a nonzero alignment is always smaller than the alignment.
 a0eaded73c915892  gg_part_lo_within  law gg_part_lo_within : for + i : Nat for + rows : Nat for + c : Nat { Nat.is_le ( gg_part_lo ( i , rows , c ) , rows ) == True { } : Bool }
 # promise gg_part_lo_within: the first row of a decode part never lies past the last row.
+1a14cb05da9ad9b3  gg_place_requires_aligned  law gg_place_requires_aligned : for + q : Nat for + ap : Nat for len : Nat for avail : Nat { gg_place_ok ( Nat.add ( Nat.mul ( q , 1n + 1n + ap ) , 1n ) , len , 1n + 1n + ap , avail ) == False { } : Bool }
+# promise gg_place_requires_aligned: placing a tensor at a misaligned offset is always rejected by gg_place_ok
 1a8db2eb57538a4b  gg_place_within  law gg_place_within : for + o : Nat for + l : Nat for + a : Nat for + v : Nat { Bool.and ( gg_place_ok ( o , l , a , v ) , Nat.is_lt ( v , Nat.add ( o , l ) ) ) == False { } : Bool }
 # promise gg_place_within: a tensor the reader places in the data section never ends past the end of that section.
 # harm gg_place_within: tensor bytes could be read from outside the file mapping.
+ca6943b4230b3e1b  gg_rows_requires_ordered  law gg_rows_requires_ordered : for + r1 : Nat for + d : Nat for rb : Nat for nb : Nat { gg_rows_ok ( Nat.add ( r1 , 1n + d ) , r1 , rb , nb ) == False { } : Bool }
+# promise gg_rows_requires_ordered: a reversed row range (r0 > r1) is always rejected by gg_rows_ok
 17d4eb452322f7ac  gg_rows_within  law gg_rows_within : for + r0 : Nat for + r1 : Nat for + rb : Nat for + nb : Nat { Bool.and ( gg_rows_ok ( r0 , r1 , rb , nb ) , Nat.is_lt ( nb , Nat.mul ( r1 , rb ) ) ) == False { } : Bool }
 # promise gg_rows_within: a run of rows the reader accepts never ends past the end of the tensor's bytes.
 # harm gg_rows_within: a row decode could read the next tensor or past the mapping.
@@ -354,9 +384,13 @@ a84855f9f8cf8e53  gg_split_empty_refused  law gg_split_empty_refused : for + c :
 517d5b7e787fa37f  hbm_fit_partition_exact  law hbm_fit_partition_exact : for + p : Nat for + u : Nat { hbm_fit_reconstruct_lhs ( hbm_check_fit ( p , u ) , p , u ) == hbm_fit_reconstruct_rhs ( hbm_check_fit ( p , u ) , p , u ) : Nat }
 f81a59d79982e9f9  hbm_ledger_add_conserved  law hbm_ledger_add_conserved : for + w : Nat for + kv : Nat for + ck : Nat for + sc : Nat for + ot : Nat for cat : HbmCat for + b : Nat { hbm_ledger_total ( hbm_ledger_add ( HbmLedger { w , kv , ck , sc , ot } , cat , b ) ) == Nat.add ( hbm_ledger_total ( HbmLedger { w , kv , ck , sc , ot } ) , b ) : Nat }
 7dbbb48200f8d4a4  hbm_prefix_slots_bounded_by_req  law hbm_prefix_slots_bounded_by_req : for + req : Nat for + sb : Nat for + bp : Nat for + u : Nat { Nat.is_le ( hbm_grant_prefix_slots ( req , sb , bp , u ) , req ) == True { } : Bool }
+0a12e7078ca81f0a  hbm_prefix_slots_fit_usable  law hbm_prefix_slots_fit_usable : for + req : Nat for + sb : Nat for + bp : Nat for + rem : Nat { Nat.is_le ( Nat.add ( bp , Nat.mul ( hbm_grant_prefix_slots ( req , sb , bp , Nat.add ( bp , rem ) ) , sb ) ) , Nat.add ( bp , rem ) ) == True { } : Bool }
+# promise hbm_prefix_slots_fit_usable: granted prefix-reuse slots keep base_planned + granted * slot_bytes within usable HBM
 09c88ccc963f74d8  hbm_prefix_slots_zero_bytes_safe  law hbm_prefix_slots_zero_bytes_safe : for + req : Nat for + bp : Nat for + u : Nat { hbm_grant_prefix_slots ( req , 0n , bp , u ) == 0n : Nat }
 9b6a2afddc86aed9  hbm_prefix_slots_zero_when_context_over  law hbm_prefix_slots_zero_when_context_over : for + req : Nat for + sb : Nat for + u : Nat for + extra : Nat { hbm_grant_prefix_slots ( req , sb , Nat.add ( u , 1n + extra ) , u ) == 0n : Nat }
 7d4cf812aaad6ae8  hbm_usable_le_total  law hbm_usable_le_total : for + t : Nat for + b : Nat for + s : Nat { Nat.is_le ( hbm_usable ( t , b , s ) , t ) == True { } : Bool }
+ab727d5896981163  hbm_usable_within_remaining  law hbm_usable_within_remaining : for + b : Nat for + s : Nat for + rem : Nat { Nat.is_le ( hbm_usable ( Nat.add ( Nat.add ( b , s ) , rem ) , b , s ) , rem ) == True { } : Bool }
+# promise hbm_usable_within_remaining: hbm_usable never exceeds total - (base + spare) when total >= base + spare
 b7e5987616afd237  hbm_usable_zero_when_exceeded  law hbm_usable_zero_when_exceeded : for + t : Nat for + extra : Nat for + spare : Nat { hbm_usable ( t , Nat.add ( t , extra ) , spare ) == 0n : Nat }
 1f7d68d5d68a3bd2  hc_available_within_group  law hc_available_within_group : for + h : Nat for + lim : Nat for + used : Nat { Nat.is_le ( hc_available ( h , True { } , lim , used ) , Nat.sub ( lim , used ) ) == True { } : Bool }
 f3190493ac6bb2c8  hc_available_within_host  law hc_available_within_host : for + h : Nat for + l : Bool for + lim : Nat for + used : Nat { Nat.is_le ( hc_available ( h , l , lim , used ) , h ) == True { } : Bool }
@@ -407,6 +441,8 @@ affefad2c90e8e97  hc_idle_save_yields  law hc_idle_save_yields : for + w : Nat {
 7e71c427b8760d8a  hc_layout_cache_size_matches  law hc_layout_cache_size_matches : for + c : Nat for + ch : Nat for + cr : Nat for + h : Nat for + rb : Nat for + t : Nat for + b : Nat for + cb : Nat { Bool.and ( hc_layout_ok ( hc_layout ( c , ch , cr , h , rb , t , b , cb ) ) , Bool.not ( Nat.is_eq ( cb , Nat.mul ( Nat.mul ( Nat.mul ( ch , h ) , cr ) , rb ) ) ) ) == False { } : Bool }
 5fc0803d77791c96  hc_layout_no_caches_never_ok  law hc_layout_no_caches_never_ok : for + ch : Nat for + cr : Nat for + h : Nat for + rb : Nat for + t : Nat for + b : Nat for + cb : Nat { hc_layout_ok ( hc_layout ( 0n , ch , cr , h , rb , t , b , cb ) ) == False { } : Bool }
 4458dcae46a791d1  hc_layout_tile_divides_a_chunk  law hc_layout_tile_divides_a_chunk : for + c : Nat for + ch : Nat for + cr : Nat for + h : Nat for + rb : Nat for + t : Nat for + b : Nat for + cb : Nat { Bool.and ( hc_layout_ok ( hc_layout ( c , ch , cr , h , rb , t , b , cb ) ) , Bool.not ( Nat.is_eq ( Nat.mod ( cr , t ) , 0n ) ) ) == False { } : Bool }
+b1ae40f4dff2eb07  hc_layout_valid_accepted  law hc_layout_valid_accepted : for + ca : Nat for + ch : Nat for + k : Nat for + hd : Nat for + rb : Nat for + bp : Nat { hc_layout ( 1n + ca , 1n + ch , Nat.mul ( 1n + k , Nat.mul ( 2n , 1n + bp ) ) , 1n + hd , 1n + rb , Nat.mul ( 2n , 1n + bp ) , 1n + bp , Nat.mul ( Nat.mul ( Nat.mul ( 1n + ch , 1n + hd ) , Nat.mul ( 1n + k , Nat.mul ( 2n , 1n + bp ) ) ) , 1n + rb ) ) == HcLayoutOk { } : HcLayout }
+# promise hc_layout_valid_accepted: hc_layout accepts any non-empty aligned layout whose cache_bytes equals chunks * heads * chunk_rows * row_bytes
 c0308e04fceb98e0  hc_new_entry_is_busy  law hc_new_entry_is_busy : for + u : Nat { hc_busy ( hc_begin_write ( HcVacant { } , u ) ) == True { } : Bool }
 b90f8344e977a746  hc_new_tiles_within_target  law hc_new_tiles_within_target : for + h : Nat for + u : Nat { Nat.is_le ( Nat.add ( h , hc_new_tiles ( u , h ) ) , Nat.max ( h , u ) ) == True { } : Bool }
 38422eb793c1ec4c  hc_no_image_never_whole  law hc_no_image_never_whole : for + c : Bool for + b : Nat for + i : Nat for + k : Nat { hc_saved_whole ( c , 1n + b , False { } , i , k ) == False { } : Bool }
@@ -497,6 +533,10 @@ b4967a936fc817b8  hc_whole_entry_shared_continues  law hc_whole_entry_shared_con
 f637e57e5aabaea2  hc_writing_is_busy  law hc_writing_is_busy : for + t : Nat for + u : Nat { hc_busy ( hc_begin_write ( HcHeld { t } , u ) ) == True { } : Bool }
 9947f6c9a06daf46  hc_writing_not_readable  law hc_writing_not_readable : for + e : HcEntry for + u : Nat { hc_readable ( hc_begin_write ( e , u ) ) == False { } : Bool }
 886d6689866e18ba  hc_written_entry_never_read  law hc_written_entry_never_read : for + e : HcEntry for + u : Nat for + t : Nat { hc_may_read ( hc_begin_write ( e , u ) , t ) == False { } : Bool }
+d51ed847829a3520  hc_written_hi_covers_end  law hc_written_hi_covers_end : for + w : Nat for + tp : Nat { Nat.is_le ( w , Nat.mul ( hc_written_hi ( w , 1n + tp ) , 1n + tp ) ) == True { } : Bool }
+# promise hc_written_hi_covers_end: hc_written_hi(w, 1+tp) * (1+tp) is always at least w
+a0c49c3a2df011b4  hc_written_lo_within_resume  law hc_written_lo_within_resume : for + r : Nat for + tp : Nat { Nat.is_le ( Nat.mul ( hc_written_lo ( r , 1n + tp ) , 1n + tp ) , r ) == True { } : Bool }
+# promise hc_written_lo_within_resume: hc_written_lo(r, 1+tp) * (1+tp) never exceeds r
 08cdd002a2423f2d  hidden_zero_rejected  law hidden_zero_rejected : for + v : Nat { hidden_dims_valid ( 0n , v ) == False { } : Bool }
 7ab60bcdca0eaca5  hidden_zero_vocab_rejected  law hidden_zero_vocab_rejected : for + h : Nat { hidden_dims_valid ( h , 0n ) == False { } : Bool }
 e4d9dc6e571b9e77  hm_fresh_and_reused_cover_the_need  law hm_fresh_and_reused_cover_the_need : for + n : Nat for + r : Nat { Nat.is_le ( n , Nat.add ( hm_fresh ( n , r ) , r ) ) == True { } : Bool }
@@ -507,6 +547,8 @@ a47dbeb2f055e0dd  hm_never_covers_beyond_the_leave  law hm_never_covers_beyond_t
 9111006def5018cb  hm_taken_and_left_within_the_leave  law hm_taken_and_left_within_the_leave : for + b : Nat for + r : Nat { Nat.is_le ( Nat.add ( b , hm_left ( Nat.add ( b , r ) , b ) ) , Nat.add ( b , r ) ) == True { } : Bool }
 d21532af3aa140c6  hold_conserved  law hold_conserved : for + b : Nat for + t : Nat { Nat.add ( hold_max ( b , t ) , hold_release ( b , hold_max ( b , t ) ) ) == b : Nat }
 06a1321d4cd0be64  hold_empty_tag_holds_nothing  law hold_empty_tag_holds_nothing : for b : Nat { hold_max ( b , 0n ) == 0n : Nat }
+c6f5145e48e1bb00  hold_max_keeps_partial_tag  law hold_max_keeps_partial_tag : for + b : Nat for + t : Nat { Nat.is_le ( Nat.min ( b , t ) , hold_max ( b , 1n + t ) ) == True { } : Bool }
+# promise hold_max_keeps_partial_tag: hold_max keeps at least min(b, t) bytes when the tag has length 1+t
 ecd414a23b12f2c1  hold_max_le_buf  law hold_max_le_buf : for + b : Nat for t : Nat { Nat.is_le ( hold_max ( b , t ) , b ) == True { } : Bool }
 ae08a33bfac2b3cc  hold_max_lt_tag  law hold_max_lt_tag : for b : Nat for + t : Nat { Nat.is_lt ( hold_max ( b , 1n + t ) , 1n + t ) == True { } : Bool }
 aca5cff341d0c466  ik_app_layer_in_model  law ik_app_layer_in_model : for + n : Nat for + ls : Nat for + le : Nat for + p : Nat for + b : Nat for + mx : Nat for + a : Nat { Bool.and ( ik_schedule_valid ( n , ls , le , p , b , mx ) , Bool.and ( Nat.is_lt ( a , ik_apps ( n , ls , le , p ) ) , Nat.is_le ( n , ik_app_layer ( a , ls , le , p ) ) ) ) == False { } : Bool }
@@ -762,6 +804,10 @@ a1c2f97bf00a530d  kv8_load_needs_family  law kv8_load_needs_family : for + kc : 
 # harm kv8_plain_decode_ok: an FP8 K/V load could offer a drafter with nothing to check its tokens against
 5f4bc6ba5ca18326  kv8_shape_needs_groups  law kv8_shape_needs_groups : for + w : Nat for + r : Nat for + s : Nat { kv8_shape_ok ( w , 0n , r , s ) == False { } : Bool }
 # promise kv8_shape_needs_groups: a model without kv heads is never accepted by the FP8 kernels
+c3f715709537f1ea  kv8_shape_rejects_larger_head_dim  law kv8_shape_rejects_larger_head_dim : for + row : Nat for + d : Nat for nkv : Nat for slots : Nat { kv8_shape_ok ( Nat.add ( row , 1n + d ) , nkv , row , slots ) == False { } : Bool }
+# promise kv8_shape_rejects_larger_head_dim: FP8 attention shape validation rejects any head_dim strictly larger than row
+8100fa2d82183a0f  kv8_shape_rejects_smaller_head_dim  law kv8_shape_rejects_smaller_head_dim : for + hd : Nat for + d : Nat for nkv : Nat for slots : Nat { kv8_shape_ok ( hd , nkv , Nat.add ( hd , 1n + d ) , slots ) == False { } : Bool }
+# promise kv8_shape_rejects_smaller_head_dim: FP8 attention shape validation rejects any head_dim strictly smaller than row
 80e696ec1290a904  kv8_shape_within_slots  law kv8_shape_within_slots : for + w : Nat for + n : Nat for + r : Nat for + s : Nat { Bool.and ( kv8_shape_ok ( w , n , r , s ) , Nat.is_lt ( s , n ) ) == False { } : Bool }
 # promise kv8_shape_within_slots: a head shape the FP8 kernels accept never has more kv groups than the scale table has slots
 # harm kv8_shape_within_slots: a group past the table would read another kind's multiplier
@@ -771,6 +817,8 @@ cbf3b034df5d5d27  kv8_table_covers_heads  law kv8_table_covers_heads : for + a :
 6e6434e12ee11df2  kv_batches_apart  law kv_batches_apart : for + c1 : Nat for + g1 : Nat for + c2 : Nat for + g2 : Nat for + n : Nat for + h : Nat for h1 : { Nat.is_lt ( g1 , n ) == True { } : Bool } for h2 : { Nat.is_lt ( g2 , n ) == True { } : Bool } { Bool.or ( Bool.and ( Nat.is_eq ( c1 , c2 ) , Nat.is_eq ( g1 , g2 ) ) , Bool.or ( Nat.is_le ( Nat.add ( kv_batch_off ( c1 , g1 , n , h ) , h ) , kv_batch_off ( c2 , g2 , n , h ) ) , Nat.is_le ( Nat.add ( kv_batch_off ( c2 , g2 , n , h ) , h ) , kv_batch_off ( c1 , g1 , n , h ) ) ) ) == True { } : Bool }
 # promise kv_batches_apart: the batches of two different (chunk, kv head) pairs of a cache never overlap, whatever order the layout puts them in
 # harm kv_batches_apart: the read-back would fold one head's or one chunk's bytes into another's maxima, measure the wrong batch without a sign, and a V multiplier could clip
+c04127c7a116bcf9  kv_bf16_always_taken  law kv_bf16_always_taken : for + fp8_att : Bool { kv_setting_taken ( fp8_att , KvBf16 { } ) == True { } : Bool }
+# promise kv_bf16_always_taken: BF16 K/V caches are always accepted by every engine regardless of FP8 attention support
 f5cd20a46e2dd85b  kv_bf16_load_stays_bf16  law kv_bf16_load_stays_bf16 : for t : Bool { kv_layer_dtype ( t , KvBf16 { } ) == KvBf16 { } : KvDtype }
 # promise kv_bf16_load_stays_bf16: a load configured for BF16 K/V never gets an FP8 cache
 # harm kv_bf16_load_stays_bf16: a cache would be FP8 without a scale table made for it
@@ -814,6 +862,8 @@ b482ee9e4bc6c7e1  kv_tile_rows_nonzero  law kv_tile_rows_nonzero : for + t : Nat
 3db2160775c84806  kv_tile_rows_not_wider  law kv_tile_rows_not_wider : for + t : Nat for d : KvDtype for + m : Nat { Nat.is_le ( kv_tile_rows ( t , d , m ) , t ) == True { } : Bool }
 # promise kv_tile_rows_not_wider: the cache dtype only ever narrows a prefill tile, never makes it wider than the tile asked for
 # harm kv_tile_rows_not_wider: a tile wider than every width asked for (an explicit width or a candidate, at most the engine's widest) would overrun buffers sized for those widths
+243b3ada89973f1d  kv_vperm_rows_positive  law kv_vperm_rows_positive : for + d : KvDtype { Nat.is_gt ( kv_vperm_rows ( d ) , 0n ) == True { } : Bool }
+# promise kv_vperm_rows_positive: kv_vperm_rows always returns a positive block size for every KV cache dtype
 221a51e4695468d8  kv_wv_row_in_head_128  law kv_wv_row_in_head_128 : for + c : Nat for + d : KvDtype for ok : { Nat.is_lt ( c , 128n ) == True { } : Bool } { Nat.is_lt ( kv_wv_row ( c , 128n , d ) , 128n ) == True { } : Bool }
 # promise kv_wv_row_in_head_128: every channel of a 128-channel head lands on a row of that head in its V projection
 # harm kv_wv_row_in_head_128: a V channel would be packed outside its head, over another head's rows or past the weight
@@ -829,6 +879,22 @@ e8dd4d122e82d747  kv_wv_rows_distinct_256  law kv_wv_rows_distinct_256 : for + a
 3ddfe8a0a0c54651  lane_busy_blocks_exclusive  law lane_busy_blocks_exclusive : for b : Nat for max_lanes : Nat { lane_can_admit ( 1n + b , max_lanes , False { } , True { } ) == False { } : Bool }
 3f71bff599d5e309  lane_exclusive_blocks_all  law lane_exclusive_blocks_all : for busy : Nat for max_lanes : Nat for want_excl : Bool { lane_can_admit ( busy , max_lanes , True { } , want_excl ) == False { } : Bool }
 4775d7007e9e1d84  lane_full_blocks_shared  law lane_full_blocks_shared : for + cap : Nat for excl : Bool { lane_can_admit ( cap , cap , excl , False { } ) == False { } : Bool }
+dbb5aa603345792f  lb_diff_section_same_base_rejected  law lb_diff_section_same_base_rejected : for + sec_a : Nat for + extra : Nat for + base : Nat { lb_pair_ok ( sec_a , base , Nat.add ( sec_a , 1n + extra ) , base ) == False { } : Bool }
+# promise lb_diff_section_same_base_rejected: distinct sections sharing the same base address are always rejected
+d65a7ccd2bd078e7  lb_nonzero_ws_needs_addr  law lb_nonzero_ws_needs_addr : for + ws_m1 : Nat { lb_ws_ok ( 1n + ws_m1 , 0n ) == False { } : Bool }
+# promise lb_nonzero_ws_needs_addr: non-zero workspace size requires a non-zero workspace address
+67a2919c7bf3c287  lb_same_section_diff_base_rejected  law lb_same_section_diff_base_rejected : for + sec : Nat for + base_a : Nat for + extra : Nat { lb_pair_ok ( sec , base_a , sec , Nat.add ( base_a , 1n + extra ) ) == False { } : Bool }
+# promise lb_same_section_diff_base_rejected: two tensors in the same persistent section with different computed base addresses are rejected
+64b7c6a3a66e077f  lb_same_section_same_base_ok  law lb_same_section_same_base_ok : for + sec : Nat for + base : Nat { lb_pair_ok ( sec , base , sec , base ) == True { } : Bool }
+# promise lb_same_section_same_base_ok: two tensors sharing both section id and base address are accepted
+e10dee7c0041cb7c  lb_section_base_exact  law lb_section_base_exact : for + base : Nat for + off : Nat { lb_section_base ( Nat.add ( base , off ) , off ) == base : Nat }
+# promise lb_section_base_exact: lb_section_base recovers the exact section base whenever addr >= offset
+c75fc9469c7e0235  lb_underflow_addr_invalid  law lb_underflow_addr_invalid : for + addr : Nat for + extra : Nat { lb_addr_valid ( addr , Nat.add ( addr , 1n + extra ) ) == False { } : Bool }
+# promise lb_underflow_addr_invalid: any binding with addr < offset_in_section is always rejected
+84b6f371c7da2f8a  lb_valid_addr_accepted  law lb_valid_addr_accepted : for + a_m1 : Nat for + off : Nat { lb_addr_valid ( 1n + a_m1 , Nat.min ( off , 1n + a_m1 ) ) == True { } : Bool }
+# promise lb_valid_addr_accepted: any positive address >= offset_in_section (including offset == 0 and offset == addr) satisfies lb_addr_valid
+235598d4f46b4184  lb_zero_addr_invalid  law lb_zero_addr_invalid : for + off : Nat { lb_addr_valid ( 0n , off ) == False { } : Bool }
+# promise lb_zero_addr_invalid: a zero HBM address is always rejected
 72939e08483e2782  live_write_forced_not_deferred  law live_write_forced_not_deferred : for has_writer : Bool { lw_is_defer ( live_write_route ( has_writer , True { } ) ) == False { } : Bool }
 2e68cb9c0d45b0de  live_write_no_writer_no_defer  law live_write_no_writer_no_defer : for force : Bool { lw_is_defer ( live_write_route ( False { } , force ) ) == False { } : Bool }
 37c4cba4beb87a11  live_write_off_the_caller  law live_write_off_the_caller : for force : Bool { lw_is_inline ( live_write_route ( True { } , force ) ) == False { } : Bool }
@@ -906,6 +972,8 @@ bb557c04a151fa5f  ln_host_tier_never_with_lanes  law ln_host_tier_never_with_lan
 # promise ln_host_tier_never_with_lanes: an engine with more than one lane never gets a host-RAM tier that is not built for several lanes.
 e17bb2f8a04442b6  ln_kv_arena_counts_both  law ln_kv_arena_counts_both : for + a : Nat for + p : Nat { Nat.is_le ( Nat.add ( a , p ) , ln_kv_arena_total ( a , p ) ) == True { } : Bool }
 # promise ln_kv_arena_counts_both: the device arena holds both the lanes' caches and state and their kept positions.
+e154d5c0fc52eadd  ln_lane_buf_aligned  law ln_lane_buf_aligned : for + b : Nat { Nat.mod ( ln_lane_buf_bytes ( b ) , ln_arena_unit ( ) ) == 0n : Nat }
+# promise ln_lane_buf_aligned: activation arena buffer sizing always rounds up to a multiple of ln_arena_unit()
 88450676aa88ca86  ln_lane_buf_holds_it  law ln_lane_buf_holds_it : for + b : Nat { Nat.is_le ( b , ln_lane_buf_bytes ( b ) ) == True { } : Bool }
 # promise ln_lane_buf_holds_it: the activation arena gives every buffer of the batched steps at least the bytes it needs.
 c5d8763a33ddcfd0  ln_lane_bufs_add_rounded  law ln_lane_bufs_add_rounded : for + a : Nat for + b : Nat { Nat.is_le ( Nat.add ( a , ln_lane_buf_bytes ( b ) ) , ln_lane_bufs_add ( a , b ) ) == True { } : Bool }
@@ -1232,9 +1300,15 @@ de65bf930a4e1923  mt_file_needs_key  law mt_file_needs_key : for + g : Bool for 
 # promise mt_special_is_added: a special token is always an added token, matched whole and never built by merges.
 0d2efdb4f46dc7eb  mt_vocab_nonempty  law mt_vocab_nonempty : for + t : Nat for + lim : Nat { mt_vocab_ok ( 0n , t , lim ) == False { } : Bool }
 # promise mt_vocab_nonempty: an empty vocabulary is never accepted.
+741fbd6c734d15b1  mt_vocab_rejects_extra_types  law mt_vocab_rejects_extra_types : for + n : Nat for + d : Nat for lim : Nat { mt_vocab_ok ( n , Nat.add ( n , 1n + d ) , lim ) == False { } : Bool }
+# promise mt_vocab_rejects_extra_types: vocabulary validation rejects files with more token types than tokens
+74fac05ba7738c35  mt_vocab_rejects_missing_types  law mt_vocab_rejects_missing_types : for + t : Nat for + d : Nat for lim : Nat { mt_vocab_ok ( Nat.add ( t , 1n + d ) , t , lim ) == False { } : Bool }
+# promise mt_vocab_rejects_missing_types: vocabulary validation rejects files with fewer token types than tokens
 1749afe402ddc20e  mt_vocab_within  law mt_vocab_within : for + n : Nat for + t : Nat for + lim : Nat { Bool.and ( mt_vocab_ok ( n , t , lim ) , Nat.is_lt ( lim , n ) ) == False { } : Bool }
 # promise mt_vocab_within: a vocabulary the reader accepts never has more tokens than the limit it was checked against.
 # harm mt_vocab_within: a hostile token count could overflow the 32-bit token ids or exhaust host memory.
+0b150c9bb42c6939  mtp_ctx_chunks_covers_prompt  law mtp_ctx_chunks_covers_prompt : for + p : Nat for + cm1 : Nat { Nat.is_le ( p , Nat.mul ( mtp_ctx_chunks ( p , 1n + cm1 ) , 1n + cm1 ) ) == True { } : Bool }
+# promise mtp_ctx_chunks_covers_prompt: chunk count multiplied by chunk size always covers every position before anchor p
 b4a6b681bc295164  mtp_ctx_chunks_some  law mtp_ctx_chunks_some : for + p : Nat for + c : Nat { Nat.is_le ( 1n , mtp_ctx_chunks ( p , c ) ) == True { } : Bool }
 # promise mtp_ctx_chunks_some: a block always reads at least one chunk of the global layer's cache.
 29355ae428fb6250  mtp_ctx_seen_before_anchor  law mtp_ctx_seen_before_anchor : for + p : Nat for + w : Nat for + b : Bool { Nat.is_le ( mtp_ctx_seen ( p , w , b ) , p ) == True { } : Bool }
@@ -1279,6 +1353,8 @@ a6e42a07de382d3e  mtpf_long_never_fits  law mtpf_long_never_fits : for + need : 
 # promise mtpf_wider_keeps: a drafter file wider than the model's hidden size leaves the choice exactly as it was, so it is never chosen
 # harm mtpf_wider_keeps: the drafter of another model would read the model's states with the wrong width
 7d7f156c04961994  orient_mirror_in_range  law orient_mirror_in_range : for + i : Nat for + p : Nat { Nat.is_le ( orient_mirror ( i , 1n + p ) , p ) == True { } : Bool }
+3177c87c82d1102e  orient_mirror_involution  law orient_mirror_involution : for + i : Nat for + d : Nat { orient_mirror ( orient_mirror ( i , Nat.add ( 1n + i , d ) ) , Nat.add ( 1n + i , d ) ) == i : Nat }
+# promise orient_mirror_involution: orient_mirror applied twice recovers any in-range index i < n
 1b6bb5e0fe9aa632  oversized_prompt_rejected  law oversized_prompt_rejected : for + lmax : Nat for + extra : Nat { prompt_admitted ( Nat.add ( served_ctx ( lmax ) , extra ) , lmax ) == False { } : Bool }
 b90e1722fbf1d3b6  pc_abort_leaves_nothing  law pc_abort_leaves_nothing : for + s : PcSlot for + t : Nat { pc_abort ( pc_begin_write ( s , t ) ) == PcEmpty { } : PcSlot }
 fe5efcbe8ae4fb26  pc_cap_within_images  law pc_cap_within_images : for + l : Nat for + i : Nat { Nat.is_le ( pc_cap ( l , i ) , i ) == True { } : Bool }
@@ -1295,6 +1371,10 @@ abf47b25bae0ca28  pc_commit_holds_what_was_written  law pc_commit_holds_what_was
 df47dd1eff7d111d  pc_free_slot_first  law pc_free_slot_first : for + t : Nat for + r : Bool for + m : Bool for + ca : Nat for + r2 : Bool for + m2 : Bool for + cb : Nat { pc_victim_better ( pc_victim_class ( PcHeld { t } , r , m ) , ca , pc_victim_class ( PcEmpty { } , r2 , m2 ) , cb ) == False { } : Bool }
 814eddf55918b0c8  pc_grant_none_when_over  law pc_grant_none_when_over : for + g : Nat for + sb : Nat for + bp : Nat for + u : Nat { Bool.or ( pc_plan_fits ( g , sb , bp , u ) , Nat.is_eq ( pc_grant_checked ( g , sb , bp , u ) , 0n ) ) == True { } : Bool }
 831b6b69c65f6b9f  pc_grant_within_request  law pc_grant_within_request : for + g : Nat for + sb : Nat for + bp : Nat for + u : Nat { Nat.is_le ( pc_grant_checked ( g , sb , bp , u ) , g ) == True { } : Bool }
+7ef813ae6905a85f  pc_image_different_grid_refused  law pc_image_different_grid_refused : for s : Bool for p : Bool { pc_image_same ( s , False { } , p ) == False { } : Bool }
+# promise pc_image_different_grid_refused: pc_image_same returns False when same_grid is False
+2ff205434e8c04bd  pc_image_different_start_refused  law pc_image_different_start_refused : for g : Bool for p : Bool { pc_image_same ( False { } , g , p ) == False { } : Bool }
+# promise pc_image_different_start_refused: pc_image_same returns False when same_start is False
 61c9ac21a7de386d  pc_image_limit_before_held  law pc_image_limit_before_held : for + a : Nat for + b : Nat for + later : Nat { Nat.is_le ( pc_image_limit ( False { } , a , b , later ) , a ) == True { } : Bool }
 8fa6d1d1c94ec71d  pc_image_limit_before_new  law pc_image_limit_before_new : for + a : Nat for + b : Nat for + later : Nat { Nat.is_le ( pc_image_limit ( False { } , a , b , later ) , b ) == True { } : Bool }
 96228fa2b07ae1c0  pc_image_limit_within_later  law pc_image_limit_within_later : for + s : Bool for + a : Nat for + b : Nat for + later : Nat { Nat.is_le ( pc_image_limit ( s , a , b , later ) , later ) == True { } : Bool }
@@ -1330,6 +1410,8 @@ d34f2537e2e6aec8  pc_zeroed_rows_never_reused  law pc_zeroed_rows_never_reused :
 3033d0beb3c8c14f  pfx_reuse_on_tile_boundary  law pfx_reuse_on_tile_boundary : for + pos : Nat for + lcp : Nat for + p : Nat for + tile : Nat for + nm : Bool for + mu : Nat for + nd : Bool for + du : Nat { Bool.and ( pfx_reuse_valid ( pos , lcp , p , tile , nm , mu , nd , du ) , Bool.not ( Nat.is_eq ( Nat.mod ( pos , tile ) , 0n ) ) ) == False { } : Bool }
 884774c05e8909bc  pfx_reuse_within_common_prefix  law pfx_reuse_within_common_prefix : for + pos : Nat for + lcp : Nat for + p : Nat for + tile : Nat for + nm : Bool for + mu : Nat for + nd : Bool for + du : Nat { Bool.and ( pfx_reuse_valid ( pos , lcp , p , tile , nm , mu , nd , du ) , Nat.is_le ( lcp , pos ) ) == False { } : Bool }
 a84e0e0a1b8f1736  pfx_reuse_within_drafter_rows  law pfx_reuse_within_drafter_rows : for + pos : Nat for + lcp : Nat for + p : Nat for + tile : Nat for + nm : Bool for + mu : Nat for + du : Nat { Bool.and ( pfx_reuse_valid ( pos , lcp , p , tile , nm , mu , True { } , du ) , Bool.not ( Nat.is_le ( pos , du ) ) ) == False { } : Bool }
+a683ec3979261071  pfx_reuse_within_mtp_rows  law pfx_reuse_within_mtp_rows : for + pos : Nat for + lcp : Nat for + p : Nat for + tile : Nat for + mu : Nat for + nd : Bool for + du : Nat { Bool.and ( pfx_reuse_valid ( pos , lcp , p , tile , True { } , mu , nd , du ) , Nat.is_lt ( mu , pos ) ) == False { } : Bool }
+# promise pfx_reuse_within_mtp_rows: with an MTP head that tracks kept rows, a resume point never lies beyond the rows the MTP head holds
 88c72e192da91a43  pfx_reuse_zero_lcp_false  law pfx_reuse_zero_lcp_false : for + pos : Nat for p : Nat for + tile : Nat for nm : Bool for mu : Nat for nd : Bool for du : Nat { pfx_reuse_valid ( pos , 0n , p , tile , nm , mu , nd , du ) == False { } : Bool }
 562f7a385f56ce0b  pin_partial_never_usable  law pin_partial_never_usable : for m : Nat { pin_is_usable ( PinPartial { m } ) == False { } : Bool }
 d988530d3e062cc3  pin_rollback_idempotent_and_absorbing  law pin_rollback_idempotent_and_absorbing : for s : PinState for last : Bool { Bool.and ( Nat.is_eq ( pin_mapped_count ( pin_rollback ( pin_rollback ( s ) ) ) , 0n ) , Bool.not ( pin_is_usable ( pin_add_extent ( pin_rollback ( s ) , last ) ) ) ) == True { } : Bool }
@@ -1347,6 +1429,8 @@ f37e1ea922e84f0b  pool_init_conserved  law pool_init_conserved : for cap : Nat {
 59241ade773e071d  pool_oom_alloc_noop  law pool_oom_alloc_noop : for + a : Nat for + f : Nat for + extra : Nat { pool_alloc ( PoolAcct { a , f } , Nat.add ( f , 1n + extra ) ) == PoolAcct { a , f } : PoolAcct }
 e7c4808878bc6e78  pool_pinned_never_evicted  law pool_pinned_never_evicted : for p : Nat for busy : Bool { pool_can_evict ( 1n + p , busy ) == False { } : Bool }
 35e4862c66780f18  px_bound_header_stays_with_origin  law px_bound_header_stays_with_origin : for + p : Bool { px_req_header_goes ( p , PxRhBound { } , False { } ) == False { } : Bool }
+aaaae8ab4ff087df  px_cap_over_max_refused  law px_cap_over_max_refused : for + most : Nat for + extra : Nat { px_cap_ok ( Nat.add ( most , 1n + extra ) , most ) == False { } : Bool }
+# promise px_cap_over_max_refused: px_cap_ok rejects every value strictly greater than most
 9ea3408d820ceba8  px_cap_zero_refused  law px_cap_zero_refused : for m : Nat { px_cap_ok ( 0n , m ) == False { } : Bool }
 a3addbdf3b41fa93  px_check_within_addr_ok  law px_check_within_addr_ok : for + m : PxMatch for + r : Bool for + c : PxAddrClass for + l : Bool { Bool.or ( px_addr_ok ( c , l ) , Bool.not ( px_addr_passes ( px_addr_check ( m , r , c , l ) ) ) ) == True { } : Bool }
 02b927ba52f907fb  px_framing_never_forwarded  law px_framing_never_forwarded : for + p : Bool for o : Bool { px_req_header_goes ( p , PxRhFraming { } , o ) == False { } : Bool }
@@ -1361,11 +1445,15 @@ cfc7b72468abb316  px_join_all_must_pass  law px_join_all_must_pass : for + a : P
 477e277c8c489d28  px_keepalive_never_mid_line  law px_keepalive_never_mid_line : for + s : Bool for q : Nat for e : Nat { px_keepalive_due ( s , False { } , q , e ) == False { } : Bool }
 69e3e98a9de7c23b  px_keepalive_only_event_stream  law px_keepalive_only_event_stream : for l : Bool for q : Nat for e : Nat { px_keepalive_due ( False { } , l , q , e ) == False { } : Bool }
 c5b05a6ed036fde3  px_keepalive_wait_within_interval  law px_keepalive_wait_within_interval : for + s : Bool for + l : Bool for + q : Nat for + e : Nat { Nat.is_le ( px_keepalive_wait ( s , l , q , e ) , e ) == True { } : Bool }
+be1813123cf95005  px_net_bits_past_prefix_zero  law px_net_bits_past_prefix_zero : for + r : Nat for + i : Nat { px_net_bits_at ( Nat.min ( r , Nat.mul ( i , 8n ) ) , i ) == 0n : Nat }
+# promise px_net_bits_past_prefix_zero: px_net_bits_at returns 0n whenever bits <= 8 * index
 b6e1470d1a9886f4  px_net_bits_run_out  law px_net_bits_run_out : for i : Nat { px_net_bits_at ( 0n , i ) == 0n : Nat }
 fb3c37b3203eb06e  px_net_full_byte_exact  law px_net_full_byte_exact : for a : Nat for b : Nat { px_net_byte_match ( a , b , 8n ) == Nat.is_eq ( a , b ) : Bool }
 dbfee0668cc7f38e  px_net_no_bits_any_byte  law px_net_no_bits_any_byte : for a : Nat for b : Nat { px_net_byte_match ( a , b , 0n ) == True { } : Bool }
 7ebb882938e051b2  px_never_class_refused  law px_never_class_refused : for l : Bool { px_addr_ok ( PxAcNever { } , l ) == False { } : Bool }
 8caf646802ae91de  px_nonpublic_needs_listing  law px_nonpublic_needs_listing : for + c : PxAddrClass { Bool.or ( px_ac_public ( c ) , Bool.not ( px_addr_ok ( c , False { } ) ) ) == True { } : Bool }
+d2fa2bc571d5c82d  px_port_over_max_refused  law px_port_over_max_refused : for + extra : Nat { px_port_ok ( Nat.add ( 65535n , 1n + extra ) ) == False { } : Bool }
+# promise px_port_over_max_refused: px_port_ok rejects every port strictly above 65535
 556f62f8ba775642  px_port_zero_refused  law px_port_zero_refused : { px_port_ok ( 0n ) == False { } : Bool }
 6d75ad29d6e33492  px_range_name_resolves_inside  law px_range_name_resolves_inside : for c : PxAddrClass for l : Bool { px_addr_passes ( px_addr_check ( PxMRange { } , False { } , c , l ) ) == False { } : Bool }
 d56786f1518f3c51  px_read_wait_within_limits  law px_read_wait_within_limits : for + i : Nat for + t : Nat for + k : Nat { Nat.is_le ( px_read_wait ( i , t , k ) , Nat.min ( i , t ) ) == True { } : Bool }
@@ -1418,6 +1506,12 @@ f1cbe1206fb49073  recipe_destroy_idempotent  law recipe_destroy_idempotent : for
 836167e72b5b07af  recipe_destroyed_absorbing  law recipe_destroyed_absorbing : for ev : RecipeEvent { recipe_step ( RecDestroyed { } , ev ) == RecDestroyed { } : RecipeState }
 49ef901098934384  recipe_sealed_ws_overflow_fails  law recipe_sealed_ws_overflow_fails : { recipe_bind_ws ( RecCompiled { } , False { } , True { } ) == RecWsFailed { } : RecipeState }
 5f951be29cb5f043  recipe_shared_fit_binds  law recipe_shared_fit_binds : for sealed : Bool { recipe_bind_ws ( RecCompiled { } , True { } , sealed ) == RecWsBound { } : RecipeState }
+d97ff523ef255912  recipe_shared_ws_fit_binds  law recipe_shared_ws_fit_binds : for + need : Nat for + slack : Nat { recipe_bind_shared_ws ( RecCompiled { } , need , Nat.add ( need , slack ) ) == RecWsBound { } : RecipeState }
+# promise recipe_shared_ws_fit_binds: a compiled recipe whose workspace requirement fits in the shared pool becomes launch-ready
+ccedb8b0ed563ee0  recipe_shared_ws_oversize_fails  law recipe_shared_ws_oversize_fails : for + pool : Nat for + extra : Nat { recipe_bind_shared_ws ( RecCompiled { } , Nat.add ( pool , 1n + extra ) , pool ) == RecWsFailed { } : RecipeState }
+# promise recipe_shared_ws_oversize_fails: binding a compiled recipe whose workspace exceeds the shared pool transitions to RecWsFailed
+bcdbb0965633fbf5  recipe_shared_ws_uncompiled_cannot_launch  law recipe_shared_ws_uncompiled_cannot_launch : for + ws_need : Nat for + pool_size : Nat { Bool.and ( Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecBuilding { } , ws_need , pool_size ) ) ) , Bool.and ( Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecWsFailed { } , ws_need , pool_size ) ) ) , Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecDestroyed { } , ws_need , pool_size ) ) ) ) ) == True { } : Bool }
+# promise recipe_shared_ws_uncompiled_cannot_launch: binding shared workspace on RecBuilding, RecWsFailed, or RecDestroyed never enables launch
 a1e1d13137bf7fec  recipe_ws_fail_never_launches  law recipe_ws_fail_never_launches : { recipe_can_launch ( RecWsFailed { } ) == False { } : Bool }
 ef5581aa41edbb3c  relocate_outside_hi_unchanged  law relocate_outside_hi_unchanged : for + lo : Nat for + hi : Nat for + extra : Nat for dst : Nat { relocate_addr ( Nat.add ( hi , extra ) , lo , hi , dst ) == Nat.add ( hi , extra ) : Nat }
 86a3f7e429ec2b6a  relocate_preserves_lo  law relocate_preserves_lo : for + lo : Nat for + span : Nat for + dst : Nat { relocate_addr ( lo , lo , Nat.add ( lo , 1n + span ) , dst ) == dst : Nat }
@@ -1429,6 +1523,54 @@ ef5581aa41edbb3c  relocate_outside_hi_unchanged  law relocate_outside_hi_unchang
 c2cbe6cec354675c  router_no_switch_while_loading  law router_no_switch_while_loading : for act : Nat { router_can_switch ( act , BeLoading { } ) == False { } : Bool }
 b4a7e0b48da9b054  router_no_switch_while_ready  law router_no_switch_while_ready : for act : Nat { router_can_switch ( act , BeReady { } ) == False { } : Bool }
 2e1a09ee017289ea  router_no_switch_while_stopping  law router_no_switch_while_stopping : for act : Nat { router_can_switch ( act , BeStopping { } ) == False { } : Bool }
+e5908827114b9dd8  rr_auto_clean_is_state_only  law rr_auto_clean_is_state_only : { Bool.and ( rr_is_state_only ( RrModeAuto { } , False { } ) , Bool.not ( rr_zero_both_rings ( rr_scope ( RrModeAuto { } , False { } ) ) ) ) == True { } : Bool }
+# promise rr_auto_clean_is_state_only: clean Auto mode selects StateOnly and never zeroes ring 1
+708a8f308159f3c0  rr_auto_unclean_is_dirty  law rr_auto_unclean_is_dirty : { rr_scope ( RrModeAuto { } , True { } ) == RrScopeDirty { } : RrScope }
+# promise rr_auto_unclean_is_dirty: an unclean Auto state always zeroes dirty KV rows on the next reset
+c0b9bcaf5a6a5421  rr_begin_hw_covers_request  law rr_begin_hw_covers_request : for + m : RrMode for + hw : Nat for held : Nat for + u : Bool for + p : Nat for + mn : Nat for + sl : Nat for + mc : Nat { Nat.is_le ( rr_high_water ( p , mn , sl , mc ) , rr_state_hw ( rr_begin ( RrState { m , hw , held , u } , p , mn , sl , mc ) ) ) == True { } : Bool }
+# promise rr_begin_hw_covers_request: rr_begin sets kv_hw to at least rr_high_water for the incoming request
+bae5ab4260affc7a  rr_begin_sets_unclean_and_dirties_auto  law rr_begin_sets_unclean_and_dirties_auto : for + hw : Nat for + held : Nat for + u : Bool for + prompt : Nat for + max_new : Nat for + slack : Nat for + max_ctx : Nat { Bool.and ( rr_state_unclean ( rr_begin ( RrState { RrModeAuto { } , hw , held , u } , prompt , max_new , slack , max_ctx ) ) , Bool.not ( rr_is_state_only ( RrModeAuto { } , rr_state_unclean ( rr_begin ( RrState { RrModeAuto { } , hw , held , u } , prompt , max_new , slack , max_ctx ) ) ) ) ) == True { } : Bool }
+# promise rr_begin_sets_unclean_and_dirties_auto: starting a request marks ResetState unclean so a failure without end_ok forces Dirty on the next Auto request
+4c163830a2ed41a9  rr_begin_state_only_keeps_hw  law rr_begin_state_only_keeps_hw : for + hw : Nat for held : Nat for + p : Nat for + mn : Nat for + sl : Nat for + mc : Nat { Bool.and ( Nat.is_eq ( rr_state_held ( rr_begin ( RrState { RrModeAuto { } , hw , held , False { } } , p , mn , sl , mc ) ) , hw ) , Nat.is_le ( hw , rr_state_hw ( rr_begin ( RrState { RrModeAuto { } , hw , held , False { } } , p , mn , sl , mc ) ) ) ) == True { } : Bool }
+# promise rr_begin_state_only_keeps_hw: in StateOnly scope, rr_begin preserves prior kv_hw in both held_hw and kv_hw
+a02299bf3e4cdfcb  rr_begin_zeroing_resets_held  law rr_begin_zeroing_resets_held : for + m : RrMode for hw : Nat for held : Nat for + u : Bool for prompt : Nat for new_t : Nat for slack : Nat for max_ctx : Nat { Bool.or ( rr_is_state_only ( m , u ) , Nat.is_eq ( rr_state_held ( rr_begin ( RrState { m , hw , held , u } , prompt , new_t , slack , max_ctx ) ) , 0n ) ) == True { } : Bool }
+# promise rr_begin_zeroing_resets_held: when begin runs with any zeroing scope (Dirty or Full, including unclean Auto), held_hw is reset to 0n
+629bec66d8855476  rr_chunk_dirty_covers_chunks  law rr_chunk_dirty_covers_chunks : for + cb : Nat for + chunks : Nat for + r_m1 : Nat for + cr : Nat { Nat.is_le ( Nat.mul ( Nat.div ( cb , Nat.max ( 1n , chunks ) ) , Nat.min ( Nat.div ( Nat.add ( 1n + r_m1 , Nat.sub ( Nat.max ( 1n , cr ) , 1n ) ) , Nat.max ( 1n , cr ) ) , Nat.max ( 1n , chunks ) ) ) , rr_chunk_dirty_bytes ( cb , chunks , 1n + r_m1 , cr ) ) == True { } : Bool }
+# promise rr_chunk_dirty_covers_chunks: rr_chunk_dirty_bytes covers at least (cb / max(1, chunks)) * min(ceil(dirty_rows / max(1, cr)), max(1, chunks)) bytes
+18361bbc169a886e  rr_chunk_dirty_within_cache  law rr_chunk_dirty_within_cache : for + cb : Nat for + chunks : Nat for + rows : Nat for + cr : Nat { Nat.is_le ( rr_chunk_dirty_bytes ( cb , chunks , rows , cr ) , cb ) == True { } : Bool }
+# promise rr_chunk_dirty_within_cache: ChunkMajor dirty zero fill never exceeds cache_bytes
+fcb6af9172c87357  rr_dirty_mode_always_dirty  law rr_dirty_mode_always_dirty : for + u : Bool { Bool.and ( Bool.not ( rr_is_state_only ( RrModeDirty { } , u ) ) , Bool.not ( rr_zero_both_rings ( rr_scope ( RrModeDirty { } , u ) ) ) ) == True { } : Bool }
+# promise rr_dirty_mode_always_dirty: RrModeDirty always selects Dirty scope (not StateOnly and not Full), regardless of unclean
+f4ab99670b9bfde2  rr_end_ok_clears_unclean_and_keeps_held  law rr_end_ok_clears_unclean_and_keeps_held : for + m : RrMode for + hw : Nat for + held : Nat for + u : Bool for + prompt : Nat for + gen : Nat for + slack : Nat for + max_ctx : Nat { Bool.and ( Bool.not ( rr_state_unclean ( rr_end_ok ( RrState { m , hw , held , u } , prompt , gen , slack , max_ctx ) ) ) , Nat.is_le ( held , rr_state_hw ( rr_end_ok ( RrState { m , hw , held , u } , prompt , gen , slack , max_ctx ) ) ) ) == True { } : Bool }
+# promise rr_end_ok_clears_unclean_and_keeps_held: rr_end_ok clears unclean and preserves kept dirty rows from before the request
+9036a753b443755f  rr_end_ok_mode_preserved  law rr_end_ok_mode_preserved : for + m : RrMode for hw : Nat for held : Nat for u : Bool for p : Nat for g : Nat for sl : Nat for mc : Nat { rr_state_mode ( rr_end_ok ( RrState { m , hw , held , u } , p , g , sl , mc ) ) == m : RrMode }
+# promise rr_end_ok_mode_preserved: rr_end_ok preserves the configured reset mode read back by rr_state_mode
+2e0a9223de61454e  rr_full_always_full  law rr_full_always_full : for + u : Bool { rr_scope ( RrModeFull { } , u ) == RrScopeFull { } : RrScope }
+# promise rr_full_always_full: full reset mode always produces full scope
+4565c525242aac45  rr_gdn_full_covers_all_slots  law rr_gdn_full_covers_all_slots : for + one_bytes : Nat for + slots_m1 : Nat { Nat.is_le ( Nat.mul ( one_bytes , 1n + slots_m1 ) , rr_gdn_zero_bytes ( RrScopeFull { } , one_bytes , 1n + slots_m1 ) ) == True { } : Bool }
+# promise rr_gdn_full_covers_all_slots: Full scope covers at least every allocated slot of the DeltaNet ring
+8d193b24d1f5bc52  rr_gdn_zero_covers_slot0  law rr_gdn_zero_covers_slot0 : for + sc : RrScope for + one_bytes : Nat for + alloc_slots : Nat { Nat.is_le ( one_bytes , rr_gdn_zero_bytes ( sc , one_bytes , alloc_slots ) ) == True { } : Bool }
+# promise rr_gdn_zero_covers_slot0: every reset scope covers at least slot 0 of ring 0 (`one_bytes`)
+1fce457955d369e8  rr_gdn_zero_within_alloc  law rr_gdn_zero_within_alloc : for + sc : RrScope for + one_bytes : Nat for + slots_m1 : Nat { Nat.is_le ( rr_gdn_zero_bytes ( sc , one_bytes , 1n + slots_m1 ) , Nat.mul ( one_bytes , 1n + slots_m1 ) ) == True { } : Bool }
+# promise rr_gdn_zero_within_alloc: DeltaNet reset bytes never exceed the tensor's own allocated ring bytes (`one_bytes * alloc_slots`)
+7e51a3cbd3659aa2  rr_head_dirty_covers_input  law rr_head_dirty_covers_input : for + dirty : Nat for + extra : Nat for + rb : Nat { Nat.is_le ( dirty , rr_head_dirty_rows ( Nat.add ( dirty , extra ) , dirty , rb ) ) == True { } : Bool }
+# promise rr_head_dirty_covers_input: HeadMajor dirty rows always cover all dirty rows whenever dirty <= max(1, rows)
+16d6c68b72025311  rr_head_dirty_within_rows  law rr_head_dirty_within_rows : for + rows : Nat for + dirty : Nat for + rb : Nat { Nat.is_le ( rr_head_dirty_rows ( rows , dirty , rb ) , Nat.max ( 1n , rows ) ) == True { } : Bool }
+# promise rr_head_dirty_within_rows: HeadMajor dirty rows stay within [0, max(1, rows)]
+4cb38753ade9a3b5  rr_head_full_span_strict  law rr_head_full_span_strict : for + rows : Nat { Bool.and ( rr_head_full_span ( rows , Nat.max ( 1n , rows ) ) , Bool.not ( rr_head_full_span ( rows , 0n ) ) ) == True { } : Bool }
+# promise rr_head_full_span_strict: rr_head_full_span holds at the full head-row capacity and fails at zero
+6015a6835eaa5747  rr_head_span_covers_rows  law rr_head_span_covers_rows : for + rb : Nat for + hm1 : Nat for + rm1 : Nat for + n : Nat { Nat.is_le ( Nat.mul ( Nat.min ( n , 1n + rm1 ) , rb ) , rr_head_span_bytes ( Nat.mul ( Nat.mul ( rb , 1n + rm1 ) , 1n + hm1 ) , 1n + hm1 , 1n + rm1 , n ) ) == True { } : Bool }
+# promise rr_head_span_covers_rows: a HeadMajor span byte length covers at least min(n, rows) * row_bytes for a cache of heads * rows * row_bytes bytes
+4fb188848ed0109b  rr_head_span_within_per_head  law rr_head_span_within_per_head : for + cb : Nat for + heads : Nat for + rows : Nat for + n : Nat { Nat.is_le ( rr_head_span_bytes ( cb , heads , rows , n ) , Nat.div ( cb , Nat.max ( 1n , heads ) ) ) == True { } : Bool }
+# promise rr_head_span_within_per_head: a HeadMajor span byte length never exceeds per_head bytes
+3a0b781e9ec72ec5  rr_hw_covers_written_with_slack  law rr_hw_covers_written_with_slack : for + prompt : Nat for + new_tokens : Nat for + slack : Nat for + max_ctx : Nat { Nat.is_le ( Nat.min ( Nat.add ( Nat.add ( prompt , new_tokens ) , slack ) , max_ctx ) , rr_high_water ( prompt , new_tokens , slack , max_ctx ) ) == True { } : Bool }
+# promise rr_hw_covers_written_with_slack: request high-water covers prompt + new_tokens + slack up to max_ctx
+f9641cbf76dadef6  rr_hw_le_max_ctx  law rr_hw_le_max_ctx : for + prompt : Nat for new_tokens : Nat for slack : Nat for + max_ctx : Nat { Nat.is_le ( rr_high_water ( prompt , new_tokens , slack , max_ctx ) , max_ctx ) == True { } : Bool }
+# promise rr_hw_le_max_ctx: request high-water row mark never exceeds max_ctx
+388d7dd9d883f49b  rr_state_mode_preserved  law rr_state_mode_preserved : for + m : RrMode for hw : Nat for held : Nat for u : Bool for p : Nat for mn : Nat for sl : Nat for mc : Nat { rr_state_mode ( rr_begin ( RrState { m , hw , held , u } , p , mn , sl , mc ) ) == m : RrMode }
+# promise rr_state_mode_preserved: rr_begin preserves the reset mode read back by rr_state_mode
+91e8dd285b1b7bfe  rr_zero_dirty_clears_nothing  law rr_zero_dirty_clears_nothing : for + cb : Nat for + chunks : Nat for + rows : Nat for + cr : Nat for + rb : Nat { Bool.and ( Nat.is_eq ( rr_chunk_dirty_bytes ( cb , chunks , 0n , cr ) , 0n ) , Nat.is_eq ( rr_head_dirty_rows ( rows , 0n , rb ) , 0n ) ) == True { } : Bool }
+# promise rr_zero_dirty_clears_nothing: zero dirty rows requires zero KV bytes to clear
 4d991163fc1faf9c  rt_after_never_grows  law rt_after_never_grows : for + h : Nat for + b : Nat { Nat.is_le ( rt_after ( h , b ) , h ) == True { } : Bool }
 # promise rt_after_never_grows: the count of held bytes never grows during a trim.
 a42b6a942341612b  rt_ahead_within_window_protected  law rt_ahead_within_window_protected : for + n : Nat for + e : Nat for + k : Nat for + f : Bool { rt_protected ( Nat.add ( n , e ) , n , 1n + Nat.add ( e , k ) , f ) == True { } : Bool }
@@ -1549,6 +1691,8 @@ e727f19b871afa3b  rt_within_target_keeps  law rt_within_target_keeps : for + h :
 26b5224cfa7d2e55  sampler_join_assoc  law sampler_join_assoc : for a : SamplerFamily for b : SamplerFamily for c : SamplerFamily { sampler_family_join ( sampler_family_join ( a , b ) , c ) == sampler_family_join ( a , sampler_family_join ( b , c ) ) : SamplerFamily }
 19191af27260d856  sampler_join_comm  law sampler_join_comm : for a : SamplerFamily for b : SamplerFamily { sampler_family_join ( a , b ) == sampler_family_join ( b , a ) : SamplerFamily }
 ef3164b94e9c8972  sampler_join_idem  law sampler_join_idem : for a : SamplerFamily { sampler_family_join ( a , a ) == a : SamplerFamily }
+89369bb81e6c6736  sampling_admitted_when_allowed  law sampling_admitted_when_allowed : for + wants : Bool { sampling_request_admitted ( True { } , wants ) == True { } : Bool }
+# promise sampling_admitted_when_allowed: sampling_request_admitted returns True whenever method_can_sample is True
 e8d3c1badf2d23ad  served_ctx_above_reserve  law served_ctx_above_reserve : for + extra : Nat { served_ctx ( Nat.add ( 128n , extra ) ) == extra : Nat }
 d969f0265d42f716  served_ctx_le_lmax  law served_ctx_le_lmax : for + lmax : Nat { Nat.is_le ( served_ctx ( lmax ) , lmax ) == True { } : Bool }
 ba91700303bb3c2a  slice_bound_in_range  law slice_bound_in_range : for from_end : Bool for + mag : Nat for + len : Nat { Nat.is_le ( slice_bound ( from_end , mag , len ) , len ) == True { } : Bool }
@@ -1562,6 +1706,10 @@ d2f1459314d3bf87  stop_length_is_max_tokens  law stop_length_is_max_tokens : for
 e06afa1753839470  stop_sequence_needs_stop_string  law stop_sequence_needs_stop_string : for + e : GenEnd for c : Bool { Bool.or ( Bool.not ( sr_is_stop_sequence ( stop_reason ( e , c ) ) ) , ge_is_stop_string ( e ) ) == True { } : Bool }
 02fd1bd807dd2f14  stop_tool_use_needs_calls  law stop_tool_use_needs_calls : for e : GenEnd { sr_is_tool_use ( stop_reason ( e , False { } ) ) == False { } : Bool }
 4fe24103e68cc08f  tool_auto_never_forces  law tool_auto_never_forces : for g : Bool { tool_choice_forces ( TcAuto { } , g ) == False { } : Bool }
+9a9a069d38d51c47  tool_choice_named_needs_tools  law tool_choice_named_needs_tools : { tool_choice_valid ( TcNamed { } , False { } ) == False { } : Bool }
+# promise tool_choice_named_needs_tools: forcing a named tool when no tools are provided is always refused
+fe581080664098ff  tool_choice_required_needs_tools  law tool_choice_required_needs_tools : { tool_choice_valid ( TcRequired { } , False { } ) == False { } : Bool }
+# promise tool_choice_required_needs_tools: requiring a tool call when no tools are provided is always refused
 047cf9276d8a7db1  tool_continue_never_forces  law tool_continue_never_forces : for f : Bool { tool_force_applies ( f , True { } ) == False { } : Bool }
 4d4579e41bbad6da  tool_force_implies_offer  law tool_force_implies_offer : for + c : ToolChoice for + g : Bool { Bool.or ( Bool.not ( tool_choice_forces ( c , g ) ) , tool_choice_offers ( c , g ) ) == True { } : Bool }
 1459e2f94551093c  tool_forced_call_disables_thinking  law tool_forced_call_disables_thinking : for w : Bool { tool_thinking_allowed ( w , True { } ) == False { } : Bool }
@@ -1584,6 +1732,8 @@ e1c0a1c7de02c50e  turn_due_keeps_turn  law turn_due_keeps_turn : for + d : Bool 
 09ae686fe3d30743  unsupported_method_refuses_sampling  law unsupported_method_refuses_sampling : { sampling_request_admitted ( False { } , True { } ) == False { } : Bool }
 95d8e8e470b18e0a  vid_frame_index_in_range  law vid_frame_index_in_range : for + raw : Nat for + p : Nat { Nat.is_le ( vid_frame_index ( raw , 1n + p ) , p ) == True { } : Bool }
 673301e5bd807518  vid_group_frame_in_range  law vid_group_frame_in_range : for + g : Nat for + s : Nat for + t : Nat for + p : Nat { Nat.is_le ( vid_group_frame ( g , s , t , 1n + p ) , p ) == True { } : Bool }
+0544484169adaef4  vid_groups_covers_frames  law vid_groups_covers_frames : for + f : Nat for + tp : Nat { Nat.is_le ( f , Nat.mul ( vid_groups ( f , 1n + tp ) , 1n + tp ) ) == True { } : Bool }
+# promise vid_groups_covers_frames: vid_groups(f, 1+tp) * (1+tp) is always at least f
 dc30cbbbb0fa4675  vid_groups_zero_temporal  law vid_groups_zero_temporal : for f : Nat { vid_groups ( f , 0n ) == 0n : Nat }
 654cd74e38d74436  vid_keep_le_max  law vid_keep_le_max : for + r : Nat for + mn : Nat for + mx : Nat for + total : Nat { Nat.is_le ( vid_keep_count ( r , mn , mx , total ) , mx ) == True { } : Bool }
 e3b0d5391fa13f91  vid_keep_le_total  law vid_keep_le_total : for + r : Nat for + mn : Nat for + mx : Nat for + total : Nat { Nat.is_le ( vid_keep_count ( r , mn , mx , total ) , total ) == True { } : Bool }
@@ -1603,6 +1753,8 @@ fb6c210645fe5d7b  vis_plan_keeps_earlier  law vis_plan_keeps_earlier : for + p :
 6008833297a9cba3  vis_request_counts_all  law vis_request_counts_all : for + c : Nat for + i : Nat { Nat.is_le ( Nat.add ( c , i ) , vis_request_tokens ( c , i ) ) == True { } : Bool }
 # promise vis_request_counts_all: a request's image-token count covers the tokens counted before plus the added image's, so it covers all of the request's images.
 # harm vis_request_counts_all: the embedding buffer could be planned for fewer rows than a multi-image request holds.
+8df08ba359911380  vis_rows_fit_rejects_over  law vis_rows_fit_rejects_over : for + u : Nat for + a : Nat for + d : Nat { vis_rows_fit ( u , Nat.add ( a , 1n + d ) , Nat.add ( u , a ) ) == False { } : Bool }
+# promise vis_rows_fit_rejects_over: vis_rows_fit returns False whenever add exceeds cap - used
 0d8da77fa48e204f  vis_rows_full_refuses  law vis_rows_full_refuses : for + cap : Nat for + extra : Nat { vis_rows_fit ( cap , 1n + extra , cap ) == False { } : Bool }
 9c1d124ed35699fb  vis_rows_left_le_cap  law vis_rows_left_le_cap : for + used : Nat for + cap : Nat { Nat.is_le ( vis_rows_left ( used , cap ) , cap ) == True { } : Bool }
 ed5641dd62da3f42  vis_rows_take_le_cap  law vis_rows_take_le_cap : for + used : Nat for + add : Nat for + cap : Nat { Nat.is_le ( vis_rows_take ( used , add , cap ) , cap ) == True { } : Bool }
@@ -1667,7 +1819,13 @@ bda193789ce4a897  vs_untraced_fork_fails  law vs_untraced_fork_fails : for b : B
 ba31aa6c874875b7  wave_lag_follows_lead  law wave_lag_follows_lead : for m : Nat for h : Nat for + p : Nat { Nat.is_lt ( wave_step ( m , False { } , h , p ) , wave_step ( m , True { } , h , p ) ) == True { } : Bool }
 976317570747274f  wave_next_pair_follows  law wave_next_pair_follows : for m : Nat for h : Nat for + q : Nat { Nat.is_lt ( wave_step ( m , True { } , h , 1n + 1n + q ) , wave_step ( 1n + m , False { } , h , 1n + 1n + q ) ) == True { } : Bool }
 cad96b9f02ba842e  wave_off_runs_no_tile  law wave_off_runs_no_tile : for n : Nat { wave_tiles ( n , False { } ) == 0n : Nat }
+9064d5c9bb0b96ec  wave_set_in_pair  law wave_set_in_pair : for + lag : Bool { Nat.is_lt ( wave_set ( lag ) , 2n ) == True { } : Bool }
+# promise wave_set_in_pair: wave_set always returns a valid 2-buffer pair index (< 2)
 42d2bcd977672452  wave_sets_differ  law wave_sets_differ : for u : Unit { Nat.is_eq ( wave_set ( False { } ) , wave_set ( True { } ) ) == False { } : Bool }
+33044ebe33dcc285  wave_step_half_order  law wave_step_half_order : for + m : Nat for + lag : Bool for + h : Nat for + extra : Nat for + p : Nat { Nat.is_lt ( wave_step ( m , lag , h , p ) , wave_step ( m , lag , Nat.add ( h , 1n + extra ) , p ) ) == True { } : Bool }
+# promise wave_step_half_order: wave_step strictly increases with half-step index for any pair, lag flag, and period
+01e8324c0e9745f5  wave_tiles_even  law wave_tiles_even : for + n : Nat for + e : Bool { Nat.is_eq ( Nat.mod ( wave_tiles ( n , e ) , 2n ) , 0n ) == True { } : Bool }
+# promise wave_tiles_even: wave_tiles always produces an even count divisible by 2
 50c73e65fceb99d3  wave_tiles_never_exceed_full  law wave_tiles_never_exceed_full : for n : Nat for e : Bool { Nat.is_le ( wave_tiles ( n , e ) , n ) == True { } : Bool }
 00c5f41c3f3918cd  xf_cmd_joins_in_the_ring  law xf_cmd_joins_in_the_ring : for + pd : Nat for + pl : Nat for + da : Nat for + pr : Nat for + f : Nat { Bool.and ( xf_cmd_joins ( pd , pl , da , pr , f ) , Bool.not ( Nat.is_eq ( Nat.add ( pr , pl ) , f ) ) ) == False { } : Bool }
 713d94a7e19ce8ac  xf_cmd_joins_on_the_device  law xf_cmd_joins_on_the_device : for + pd : Nat for + pl : Nat for + da : Nat for + pr : Nat for + f : Nat { Bool.and ( xf_cmd_joins ( pd , pl , da , pr , f ) , Bool.not ( Nat.is_eq ( Nat.add ( pd , pl ) , da ) ) ) == False { } : Bool }
