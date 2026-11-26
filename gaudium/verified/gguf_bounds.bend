@@ -158,6 +158,17 @@ def gg_shard_in_set(+no: Nat, +own: Nat, +k: Nat, +count: Nat) -> Bool:
 def gg_tensor_total_ok(+declared: Nat, +total: Nat) -> Bool:
   Nat.is_eq(declared, total)
 
+# A model of `count` shards (0: not split) whose shards hold `total` tensors may be used, given
+# what its first shard declares: `has_declared` says the `split.tensors.count` key is there, with
+# value `declared`. A split model's declared count must match; a first shard without the key is
+# taken as it is, and a model that is not split declares nothing that is checked.
+def gg_split_total_ok(+count: Nat, +has_declared: Bool, +declared: Nat, +total: Nat) -> Bool:
+  match has_declared:
+    case True{}:
+      Bool.or(Nat.is_eq(count, 0n), gg_tensor_total_ok(declared, total))
+    case False{}:
+      True{}
+
 # `present` shards make up a split model of `count` shards.
 def gg_split_complete(+present: Nat, +count: Nat) -> Bool:
   Bool.and(Nat.is_gt(count, 0n), Nat.is_eq(present, count))
@@ -411,6 +422,44 @@ law gg_tensor_total_matches:
 
 def gg_tensor_total_matches(d, t):
   gg_and_not_self(Nat.is_eq(d, t))
+
+# promise: a split model whose first shard declares a tensor count is accepted only when its shards hold exactly that count.
+# harm: a missing or duplicated shard's tensors would go unnoticed
+# catches: the declared count ignored (a split model accepted whatever its shards hold)
+law gg_split_total_declared:
+  for +c: Nat
+  for +d: Nat
+  for +t: Nat
+  {Bool.and(Bool.and(Nat.is_ne(c, 0n), gg_split_total_ok(c, True{}, d, t)), Nat.is_ne(d, t)) == False{} : Bool}
+
+def gg_split_total_declared(c, d, t):
+  match c:
+    case 0n: {==}
+    case 1n+p: gg_and_not_self(Nat.is_eq(d, t))
+
+# promise: a model whose shards hold the tensor count its first shard declares is never refused by the tensor-count check.
+# harm: a whole, well-formed split model would be refused
+# catches: every split model that declares a count refused (the declared count compared with nothing)
+law gg_split_total_held:
+  for +c: Nat
+  for +t: Nat
+  {gg_split_total_ok(c, True{}, t, t) == True{} : Bool}
+
+def gg_split_total_held(c, t):
+  match c:
+    case 0n: {==}
+    case 1n+p: G.g_nat_eq_refl(t)
+
+# promise: a model that is not split and whose file declares no tensor count is never refused by the tensor-count check.
+# harm: every ordinary single-file model would be refused
+# catches: a file without the key refused (the missing key taken as a mismatch)
+law gg_split_total_unsplit_taken:
+  for +d: Nat
+  for +t: Nat
+  {gg_split_total_ok(0n, False{}, d, t) == True{} : Bool}
+
+def gg_split_total_unsplit_taken(d, t):
+  {==}
 
 # promise: a model with no shards at all is never taken as a complete split model.
 law gg_split_empty_refused:

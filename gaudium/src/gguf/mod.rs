@@ -895,15 +895,17 @@ impl Gguf {
             total = v::gg_count_add(total, f.tensors.len() as u64)
                 .ok_or_else(|| err(&where_, "split tensor count overflow"))?;
         }
-        if count > 0 {
-            if let Some(want) = files[0].kv("split.tensors.count").and_then(|v| v.as_u64()) {
-                if !v::gg_tensor_total_ok(want, total) {
-                    return Err(err(
-                        &where_,
-                        format!("split.tensors.count is {want}, the shards hold {total}"),
-                    ));
-                }
-            }
+        // whether the shards' total may be used, given what the first shard declares, is the
+        // verified rule's (`gg_split_total_ok`), a first shard without the key included
+        let declared = files[0].kv("split.tensors.count").and_then(|v| v.as_u64());
+        if !v::gg_split_total_ok(count, declared.is_some(), declared.unwrap_or(0), total) {
+            return Err(err(
+                &where_,
+                format!(
+                    "split.tensors.count is {}, the shards hold {total}",
+                    declared.unwrap_or(0)
+                ),
+            ));
         }
         Ok(Self {
             source: path.to_path_buf(),

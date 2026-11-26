@@ -370,6 +370,15 @@ aa7c431c38b0b723  gg_span_within  law gg_span_within : for + o : Nat for + l : N
 # harm gg_span_within: an accepted span could read outside the file mapping.
 a84855f9f8cf8e53  gg_split_empty_refused  law gg_split_empty_refused : for + c : Nat { gg_split_complete ( 0n , c ) == False { } : Bool }
 # promise gg_split_empty_refused: a model with no shards at all is never taken as a complete split model.
+609319ebae783265  gg_split_total_declared  law gg_split_total_declared : for + c : Nat for + d : Nat for + t : Nat { Bool.and ( Bool.and ( Nat.is_ne ( c , 0n ) , gg_split_total_ok ( c , True { } , d , t ) ) , Nat.is_ne ( d , t ) ) == False { } : Bool }
+# promise gg_split_total_declared: a split model whose first shard declares a tensor count is accepted only when its shards hold exactly that count.
+# harm gg_split_total_declared: a missing or duplicated shard's tensors would go unnoticed
+8e873866db4cd627  gg_split_total_held  law gg_split_total_held : for + c : Nat for + t : Nat { gg_split_total_ok ( c , True { } , t , t ) == True { } : Bool }
+# promise gg_split_total_held: a model whose shards hold the tensor count its first shard declares is never refused by the tensor-count check.
+# harm gg_split_total_held: a whole, well-formed split model would be refused
+cfb1257998fa57a2  gg_split_total_unsplit_taken  law gg_split_total_unsplit_taken : for + d : Nat for + t : Nat { gg_split_total_ok ( 0n , False { } , d , t ) == True { } : Bool }
+# promise gg_split_total_unsplit_taken: a model that is not split and whose file declares no tensor count is never refused by the tensor-count check.
+# harm gg_split_total_unsplit_taken: every ordinary single-file model would be refused
 5c969ee207403248  gg_tensor_total_matches  law gg_tensor_total_matches : for + d : Nat for + t : Nat { Bool.and ( gg_tensor_total_ok ( d , t ) , Nat.is_ne ( d , t ) ) == False { } : Bool }
 # promise gg_tensor_total_matches: a split model is accepted only when its shards hold the tensor count its first shard declares.
 # harm gg_tensor_total_matches: a missing or duplicated shard's tensors would go unnoticed
