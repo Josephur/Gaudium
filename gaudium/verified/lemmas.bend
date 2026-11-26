@@ -112,3 +112,24 @@ def g_nat_max_one_succ(+x: Nat) -> {Nat.max(1n, 1n+x) == 1n+x : Nat}:
   match x:
     case 0n: {==}
     case 1n+_: {==}
+
+# A proof of `m < 0` proves anything.
+def g_nat_lt_zero_absurd(-A: Type, +m: Nat, +h: {Nat.is_lt(m, 0n) == True{} : Bool}) -> A:
+  match m:
+    case 0n:
+      L.bool_absurd(A, h)
+    case 1n+mp:
+      L.bool_absurd(A, h)
+
+# `Nat.is_eq(a, b)` is True only when `a == b`.
+def g_nat_eq_of_is_eq(+a: Nat, +b: Nat, +h: {Nat.is_eq(a, b) == True{} : Bool}) -> {a == b : Nat}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      L.bool_absurd({0n == 1n+bp : Nat}, h)
+    case 1n+ap 0n:
+      L.bool_absurd({1n+ap == 0n : Nat}, h)
+    case 1n+ap 1n+bp:
+      %g_nat_eq_of_is_eq(ap, bp, h) : {1n+ap == 1n+_ : Nat}
+      {==}

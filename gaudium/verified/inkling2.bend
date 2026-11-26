@@ -11,6 +11,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import lemmas.bend as G
 
 # ============================================================================
 # 0. Proof helpers (Bool and Nat facts; erased before Rust codegen)
@@ -163,13 +164,6 @@ def ikp_ne_of_is_eq(-a: Nat, -b: Nat, h: {Nat.is_eq(a, b) == True{} : Bool}) -> 
   %Equal.sym(Bool, Nat.is_eq(a, b), True{}, h) : {Bool.not(_) == False{} : Bool}
   {==}
 
-def ikp_lt_zero(-A: Type, +m: Nat, h: {Nat.is_lt(m, 0n) == True{} : Bool}) -> A:
-  match m:
-    case 0n:
-      L.bool_absurd(A, h)
-    case 1n+mp:
-      L.bool_absurd(A, h)
-
 def ikp_le_double(+p: Nat) -> {Nat.is_le(p, Nat.mul(p, 2n)) == True{} : Bool}:
   match p:
     case 0n:
@@ -237,7 +231,7 @@ def ikp_lt_sub_add(+ls: Nat, +le: Nat, +m: Nat, h: {Nat.is_lt(m, Nat.sub(le, ls)
       %L.nat_sub_zero_r(le) : {Nat.is_lt(m, _) == True{} : Bool}
       h
     case 1n+lp 0n:
-      ikp_lt_zero({Nat.is_lt(Nat.add(1n+lp, m), 0n) == True{} : Bool}, m, h)
+      G.g_nat_lt_zero_absurd({Nat.is_lt(Nat.add(1n+lp, m), 0n) == True{} : Bool}, m, h)
     case 1n+lp 1n+ep:
       ikp_lt_sub_add(lp, ep, m, h)
 
@@ -270,7 +264,7 @@ def ikp_span_end(+ls: Nat, +le: Nat, h: {Nat.is_le(ls, le) == True{} : Bool}) ->
 def ikp_lt_le_pred(+l: Nat, +n: Nat, h: {Nat.is_lt(l, n) == True{} : Bool}) -> {Nat.is_le(l, Nat.sub(n, 1n)) == True{} : Bool}:
   match n:
     case 0n:
-      ikp_lt_zero({Nat.is_le(l, Nat.sub(0n, 1n)) == True{} : Bool}, l, h)
+      G.g_nat_lt_zero_absurd({Nat.is_le(l, Nat.sub(0n, 1n)) == True{} : Bool}, l, h)
     case 1n+np:
       %Equal.sym(Nat, Nat.sub(np, 0n), np, L.nat_sub_zero_r(np)) : {Nat.is_le(l, _) == True{} : Bool}
       Equal.trans(Bool, Nat.is_le(l, np), Nat.is_lt(l, 1n+np), True{}, Equal.sym(Bool, Nat.is_lt(l, 1n+np), Nat.is_le(l, np), L.nat_lt_succ_eq_le(l, np)), h)

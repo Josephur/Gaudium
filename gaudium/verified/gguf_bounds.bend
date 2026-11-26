@@ -448,25 +448,6 @@ def gg_vhead_lead_fixed(i, p, hk, r, d):
 # A value offset j < hk * (r * d) splits as j = k * (r * d) + q with q = rr * d + dd; its stored
 # offset rr * (hk * d) + (k * d + dd) is below hk * (r * d) and gives back rr, k and dd, hence j.
 
-def gg_lt_zero_absurd(-A: Type, +j: Nat, +h: {Nat.is_lt(j, 0n) == True{} : Bool}) -> A:
-  match j:
-    case 0n:
-      L.bool_absurd(A, h)
-    case 1n+jp:
-      L.bool_absurd(A, h)
-
-def gg_eq_of_is_eq(+a: Nat, +b: Nat, +h: {Nat.is_eq(a, b) == True{} : Bool}) -> {a == b : Nat}:
-  match a b:
-    case 0n 0n:
-      {==}
-    case 0n 1n+bp:
-      L.bool_absurd({0n == 1n+bp : Nat}, h)
-    case 1n+ap 0n:
-      L.bool_absurd({1n+ap == 0n : Nat}, h)
-    case 1n+ap 1n+bp:
-      %gg_eq_of_is_eq(ap, bp, h) : {1n+ap == 1n+_ : Nat}
-      {==}
-
 def gg_is_ne_self(+n: Nat) -> {Nat.is_ne(n, n) == False{} : Bool}:
   match n:
     case 0n:
@@ -549,30 +530,30 @@ def gg_vt_inj(+j1: Nat, +j2: Nat, +hp: Nat, +rp: Nat, +dp: Nat, +h1: {Nat.is_lt(
 def gg_vt_lt_any(+j: Nat, +hk: Nat, +r: Nat, +d: Nat, +h: {Nat.is_lt(j, Nat.mul(hk, Nat.mul(r, d))) == True{} : Bool}) -> {Nat.is_lt(gg_vhead_sum(j, hk, r, d), Nat.mul(hk, Nat.mul(r, d))) == True{} : Bool}:
   match hk:
     case 0n:
-      gg_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 0n, r, d), Nat.mul(0n, Nat.mul(r, d))) == True{} : Bool}, j, h)
+      G.g_nat_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 0n, r, d), Nat.mul(0n, Nat.mul(r, d))) == True{} : Bool}, j, h)
     case 1n+hp:
       match r:
         case 0n:
-          gg_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 1n+hp, 0n, d), Nat.mul(1n+hp, Nat.mul(0n, d))) == True{} : Bool}, j, L.nat_lt_subst_r(j, Nat.mul(1n+hp, 0n), 0n, L.nat_mul_zero_r(1n+hp), h))
+          G.g_nat_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 1n+hp, 0n, d), Nat.mul(1n+hp, Nat.mul(0n, d))) == True{} : Bool}, j, L.nat_lt_subst_r(j, Nat.mul(1n+hp, 0n), 0n, L.nat_mul_zero_r(1n+hp), h))
         case 1n+rp:
           match d:
             case 0n:
-              gg_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 1n+hp, 1n+rp, 0n), Nat.mul(1n+hp, Nat.mul(1n+rp, 0n))) == True{} : Bool}, j, L.nat_lt_subst_r(j, Nat.mul(1n+hp, Nat.mul(1n+rp, 0n)), 0n, gg_mul_mul_zero(1n+hp, 1n+rp), h))
+              G.g_nat_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 1n+hp, 1n+rp, 0n), Nat.mul(1n+hp, Nat.mul(1n+rp, 0n))) == True{} : Bool}, j, L.nat_lt_subst_r(j, Nat.mul(1n+hp, Nat.mul(1n+rp, 0n)), 0n, gg_mul_mul_zero(1n+hp, 1n+rp), h))
             case 1n+dp:
               gg_vt_lt(j, hp, rp, dp, h)
 
 def gg_vt_inj_any(+j1: Nat, +j2: Nat, +hk: Nat, +r: Nat, +d: Nat, +h1: {Nat.is_lt(j1, Nat.mul(hk, Nat.mul(r, d))) == True{} : Bool}, +h2: {Nat.is_lt(j2, Nat.mul(hk, Nat.mul(r, d))) == True{} : Bool}, +e: {gg_vhead_sum(j1, hk, r, d) == gg_vhead_sum(j2, hk, r, d) : Nat}) -> {j1 == j2 : Nat}:
   match hk:
     case 0n:
-      gg_lt_zero_absurd({j1 == j2 : Nat}, j1, h1)
+      G.g_nat_lt_zero_absurd({j1 == j2 : Nat}, j1, h1)
     case 1n+hp:
       match r:
         case 0n:
-          gg_lt_zero_absurd({j1 == j2 : Nat}, j1, L.nat_lt_subst_r(j1, Nat.mul(1n+hp, 0n), 0n, L.nat_mul_zero_r(1n+hp), h1))
+          G.g_nat_lt_zero_absurd({j1 == j2 : Nat}, j1, L.nat_lt_subst_r(j1, Nat.mul(1n+hp, 0n), 0n, L.nat_mul_zero_r(1n+hp), h1))
         case 1n+rp:
           match d:
             case 0n:
-              gg_lt_zero_absurd({j1 == j2 : Nat}, j1, L.nat_lt_subst_r(j1, Nat.mul(1n+hp, Nat.mul(1n+rp, 0n)), 0n, gg_mul_mul_zero(1n+hp, 1n+rp), h1))
+              G.g_nat_lt_zero_absurd({j1 == j2 : Nat}, j1, L.nat_lt_subst_r(j1, Nat.mul(1n+hp, Nat.mul(1n+rp, 0n)), 0n, gg_mul_mul_zero(1n+hp, 1n+rp), h1))
             case 1n+dp:
               gg_vt_inj(j1, j2, hp, rp, dp, h1, h2, e)
 
@@ -627,7 +608,7 @@ def gg_vf_go(+n: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +f: Bool, +ef: {gg
     case False{}:
       {==}
     case True{}:
-      +en = gg_eq_of_is_eq(n, gg_vhead_len(base, hk, r, d), ef)
+      +en = G.g_nat_eq_of_is_eq(n, gg_vhead_len(base, hk, r, d), ef)
       %Equal.sym(Nat, n, gg_vhead_len(base, hk, r, d), en) : {Nat.is_ne(_, gg_vhead_len(base, hk, r, d)) == False{} : Bool}
       gg_is_ne_self(gg_vhead_len(base, hk, r, d))
 
@@ -651,7 +632,7 @@ def gg_vi_go(+i: Nat, +j: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +li: Bool
             case False{}:
               {==}
             case True{}:
-              +eij = gg_vsrc_inj(i, j, base, hk, r, d, eli, elj, gg_eq_of_is_eq(gg_vhead_src(i, base, hk, r, d), gg_vhead_src(j, base, hk, r, d), es))
+              +eij = gg_vsrc_inj(i, j, base, hk, r, d, eli, elj, G.g_nat_eq_of_is_eq(gg_vhead_src(i, base, hk, r, d), gg_vhead_src(j, base, hk, r, d), es))
               %eij : {Nat.is_ne(i, _) == False{} : Bool}
               gg_is_ne_self(i)
 
