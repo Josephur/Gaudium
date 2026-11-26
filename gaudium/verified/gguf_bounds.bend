@@ -9,7 +9,9 @@
 #   - the general.alignment value and the padding to the data section;
 #   - a tensor's place in the data section (aligned, inside);
 #   - a run of rows of a tensor, and the row partition of a bulk decode;
-#   - small limits (array nesting, tensor rank) and the shard order of a split model.
+#   - small limits (array nesting, tensor rank) and the shard order of a split model;
+#   - the value-head reorder of a gated DeltaNet layer, which maps a tensor's entries one-to-one
+#     onto themselves when their number is the leading entries plus the value heads.
 # The type table (block weights and block bytes per ggml type) and the value-type sizes are
 # format facts of an outside specification; they live in Rust with tests.
 
@@ -168,8 +170,12 @@ def gg_split_complete(+present: Nat, +count: Nat) -> Bool:
 # checkpoint groups them, (k, r): `hk` key heads, `r` value heads per key head, `d` values per
 # head, after `base` leading entries that keep their place. Checkpoint index `i` reads stored
 # index base + rr * (hk * d) + k * d + dd, with i - base = k * (r * d) + rr * d + dd.
+# The value-head part: stored offset rr * (hk * d) + (k * d + dd) of checkpoint offset j.
+def gg_vhead_sum(+j: Nat, +hk: Nat, +r: Nat, +d: Nat) -> Nat:
+  Nat.add(Nat.mul(Nat.div(Nat.mod(j, Nat.mul(r, d)), d), Nat.mul(hk, d)), Nat.add(Nat.mul(Nat.div(j, Nat.mul(r, d)), d), Nat.mod(Nat.mod(j, Nat.mul(r, d)), d)))
+
 def gg_vhead_tail(+j: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat) -> Nat:
-  Nat.add(base, Nat.add(Nat.add(Nat.mul(Nat.div(Nat.mod(j, Nat.mul(r, d)), d), Nat.mul(hk, d)), Nat.mul(Nat.div(j, Nat.mul(r, d)), d)), Nat.mod(Nat.mod(j, Nat.mul(r, d)), d)))
+  Nat.add(base, gg_vhead_sum(j, hk, r, d))
 
 def gg_vhead_pick(+i: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, lead: Bool) -> Nat:
   match lead:
@@ -181,6 +187,17 @@ def gg_vhead_pick(+i: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, lead: Bool) -
 # rusty-bends: total
 def gg_vhead_src(+i: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat) -> Nat:
   gg_vhead_pick(i, base, hk, r, d, Nat.is_lt(i, base))
+
+# The `base` leading entries and the value heads: the number of entries over which the reorder
+# stays in range and sends no two entries to one place (`gg_vhead_src_in_range`,
+# `gg_vhead_src_one_to_one`).
+def gg_vhead_len(+base: Nat, +hk: Nat, +r: Nat, +d: Nat) -> Nat:
+  Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))
+
+# Whether a tensor of `n` entries has that number (`gg_vhead_fits_only_len`).
+# rusty-bends: total
+def gg_vhead_fits(+n: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat) -> Bool:
+  Nat.is_eq(n, gg_vhead_len(base, hk, r, d))
 
 # ============================================================================
 # 6. Laws
@@ -426,6 +443,260 @@ law gg_vhead_lead_fixed:
 def gg_vhead_lead_fixed(i, p, hk, r, d):
   %gg_lt_add_succ(i, p) : {gg_vhead_pick(i, Nat.add(i, 1n+p), hk, r, d, _) == i : Nat}
   {==}
+
+# --- The value-head reorder maps a tensor that fits onto itself, one-to-one (helpers) ---------
+# A value offset j < hk * (r * d) splits as j = k * (r * d) + q with q = rr * d + dd; its stored
+# offset rr * (hk * d) + (k * d + dd) is below hk * (r * d) and gives back rr, k and dd, hence j.
+
+def gg_lt_zero_absurd(-A: Type, +j: Nat, +h: {Nat.is_lt(j, 0n) == True{} : Bool}) -> A:
+  match j:
+    case 0n:
+      L.bool_absurd(A, h)
+    case 1n+jp:
+      L.bool_absurd(A, h)
+
+def gg_eq_of_is_eq(+a: Nat, +b: Nat, +h: {Nat.is_eq(a, b) == True{} : Bool}) -> {a == b : Nat}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      L.bool_absurd({0n == 1n+bp : Nat}, h)
+    case 1n+ap 0n:
+      L.bool_absurd({1n+ap == 0n : Nat}, h)
+    case 1n+ap 1n+bp:
+      %gg_eq_of_is_eq(ap, bp, h) : {1n+ap == 1n+_ : Nat}
+      {==}
+
+def gg_is_ne_self(+n: Nat) -> {Nat.is_ne(n, n) == False{} : Bool}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+p:
+      gg_is_ne_self(p)
+
+def gg_le_false_go(+a: Nat, +b: Nat, +h: {Nat.is_lt(a, b) == True{} : Bool}, +v: Bool, +e: {Nat.is_le(b, a) == v : Bool}) -> {v == False{} : Bool}:
+  match v:
+    case True{}:
+      Empty.absurd({True{} == False{} : Bool}, L.nat_lt_not_le(a, b, h, e))
+    case False{}:
+      {==}
+
+def gg_le_false_of_lt(+a: Nat, +b: Nat, +h: {Nat.is_lt(a, b) == True{} : Bool}) -> {Nat.is_le(b, a) == False{} : Bool}:
+  gg_le_false_go(a, b, h, Nat.is_le(b, a), {==})
+
+# (a * b) * c == b * (a * c)
+def gg_mul_swap_l(+a: Nat, +b: Nat, +c: Nat) -> {Nat.mul(Nat.mul(a, b), c) == Nat.mul(b, Nat.mul(a, c)) : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  %L.nat_mul_comm(b2, a2) : {Nat.mul(_, c2) == Nat.mul(b2, Nat.mul(a2, c2)) : Nat}
+  L.nat_mul_assoc(b2, a2, c2)
+
+# a * (b * c) == b * (a * c)
+def gg_mul_swap(+a: Nat, +b: Nat, +c: Nat) -> {Nat.mul(a, Nat.mul(b, c)) == Nat.mul(b, Nat.mul(a, c)) : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  %L.nat_mul_assoc(a2, b2, c2) : {_ == Nat.mul(b2, Nat.mul(a2, c2)) : Nat}
+  gg_mul_swap_l(a2, b2, c2)
+
+# a * (b * 0) == 0
+def gg_mul_mul_zero(+a: Nat, +b: Nat) -> {Nat.mul(a, Nat.mul(b, 0n)) == 0n : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  %Equal.sym(Nat, Nat.mul(b2, 0n), 0n, L.nat_mul_zero_r(b2)) : {Nat.mul(a2, _) == 0n : Nat}
+  L.nat_mul_zero_r(a2)
+
+# With hk, r and d all positive: the stored offset of j < hk * (r * d) is below hk * (r * d).
+def gg_vt_lt(+j: Nat, +hp: Nat, +rp: Nat, +dp: Nat, +h: {Nat.is_lt(j, Nat.mul(1n+hp, Nat.mul(1n+rp, 1n+dp))) == True{} : Bool}) -> {Nat.is_lt(gg_vhead_sum(j, 1n+hp, 1n+rp, 1n+dp), Nat.mul(1n+hp, Nat.mul(1n+rp, 1n+dp))) == True{} : Bool}:
+  +j2 = {j : Nat}
+  +hp2 = {hp : Nat}
+  +rp2 = {rp : Nat}
+  +dp2 = {dp : Nat}
+  +kl = L.nat_div_lt_of_lt_mul(j2, 1n+hp2, Nat.add(dp2, Nat.mul(rp2, 1n+dp2)), h)
+  +ql = L.nat_mod_lt(j2, Nat.add(dp2, Nat.mul(rp2, 1n+dp2)))
+  +rrl = L.nat_div_lt_of_lt_mul(Nat.mod(j2, Nat.mul(1n+rp2, 1n+dp2)), 1n+rp2, dp2, ql)
+  +ddl = L.nat_mod_lt(Nat.mod(j2, Nat.mul(1n+rp2, 1n+dp2)), dp2)
+  +tl = L.nat_split_lt(Nat.div(j2, Nat.mul(1n+rp2, 1n+dp2)), Nat.mod(Nat.mod(j2, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), 1n+hp2, dp2, kl, ddl)
+  +ol = L.nat_split_lt(Nat.div(Nat.mod(j2, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.add(Nat.mul(Nat.div(j2, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.mod(Nat.mod(j2, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2)), 1n+rp2, Nat.add(dp2, Nat.mul(hp2, 1n+dp2)), rrl, tl)
+  L.nat_lt_subst_r(gg_vhead_sum(j2, 1n+hp2, 1n+rp2, 1n+dp2), Nat.mul(1n+rp2, Nat.mul(1n+hp2, 1n+dp2)), Nat.mul(1n+hp2, Nat.mul(1n+rp2, 1n+dp2)), gg_mul_swap(1n+rp2, 1n+hp2, 1n+dp2), ol)
+
+# With hk, r and d all positive: two offsets below hk * (r * d) with one stored offset are one.
+def gg_vt_inj(+j1: Nat, +j2: Nat, +hp: Nat, +rp: Nat, +dp: Nat, +h1: {Nat.is_lt(j1, Nat.mul(1n+hp, Nat.mul(1n+rp, 1n+dp))) == True{} : Bool}, +h2: {Nat.is_lt(j2, Nat.mul(1n+hp, Nat.mul(1n+rp, 1n+dp))) == True{} : Bool}, +e: {gg_vhead_sum(j1, 1n+hp, 1n+rp, 1n+dp) == gg_vhead_sum(j2, 1n+hp, 1n+rp, 1n+dp) : Nat}) -> {j1 == j2 : Nat}:
+  +a = {j1 : Nat}
+  +b = {j2 : Nat}
+  +hp2 = {hp : Nat}
+  +rp2 = {rp : Nat}
+  +dp2 = {dp : Nat}
+  +kl1 = L.nat_div_lt_of_lt_mul(a, 1n+hp2, Nat.add(dp2, Nat.mul(rp2, 1n+dp2)), h1)
+  +kl2 = L.nat_div_lt_of_lt_mul(b, 1n+hp2, Nat.add(dp2, Nat.mul(rp2, 1n+dp2)), h2)
+  +ql1 = L.nat_mod_lt(a, Nat.add(dp2, Nat.mul(rp2, 1n+dp2)))
+  +ql2 = L.nat_mod_lt(b, Nat.add(dp2, Nat.mul(rp2, 1n+dp2)))
+  +rrl1 = L.nat_div_lt_of_lt_mul(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+rp2, dp2, ql1)
+  +rrl2 = L.nat_div_lt_of_lt_mul(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+rp2, dp2, ql2)
+  +ddl1 = L.nat_mod_lt(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), dp2)
+  +ddl2 = L.nat_mod_lt(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), dp2)
+  +tl1 = L.nat_split_lt(Nat.div(a, Nat.mul(1n+rp2, 1n+dp2)), Nat.mod(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), 1n+hp2, dp2, kl1, ddl1)
+  +tl2 = L.nat_split_lt(Nat.div(b, Nat.mul(1n+rp2, 1n+dp2)), Nat.mod(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), 1n+hp2, dp2, kl2, ddl2)
+  +e_t = L.nat_split_unique_r(Nat.div(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.add(Nat.mul(Nat.div(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.mod(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2)), Nat.div(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.add(Nat.mul(Nat.div(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.mod(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2)), Nat.add(dp2, Nat.mul(hp2, 1n+dp2)), tl1, tl2, e)
+  +e_rr = L.nat_split_unique_q(Nat.div(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.add(Nat.mul(Nat.div(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.mod(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2)), Nat.div(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.add(Nat.mul(Nat.div(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.mod(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2)), Nat.add(dp2, Nat.mul(hp2, 1n+dp2)), tl1, tl2, e)
+  +e_k = L.nat_split_unique_q(Nat.div(a, Nat.mul(1n+rp2, 1n+dp2)), Nat.mod(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.div(b, Nat.mul(1n+rp2, 1n+dp2)), Nat.mod(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), dp2, ddl1, ddl2, e_t)
+  +e_dd = L.nat_split_unique_r(Nat.div(a, Nat.mul(1n+rp2, 1n+dp2)), Nat.mod(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), Nat.div(b, Nat.mul(1n+rp2, 1n+dp2)), Nat.mod(Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), 1n+dp2), dp2, ddl1, ddl2, e_t)
+  +e_q = L.nat_eq_of_div_mod(Nat.mod(a, Nat.mul(1n+rp2, 1n+dp2)), Nat.mod(b, Nat.mul(1n+rp2, 1n+dp2)), dp2, e_rr, e_dd)
+  L.nat_eq_of_div_mod(a, b, Nat.add(dp2, Nat.mul(rp2, 1n+dp2)), e_k, e_q)
+
+# Any hk, r, d: an offset below hk * (r * d) exists only when all three are positive.
+def gg_vt_lt_any(+j: Nat, +hk: Nat, +r: Nat, +d: Nat, +h: {Nat.is_lt(j, Nat.mul(hk, Nat.mul(r, d))) == True{} : Bool}) -> {Nat.is_lt(gg_vhead_sum(j, hk, r, d), Nat.mul(hk, Nat.mul(r, d))) == True{} : Bool}:
+  match hk:
+    case 0n:
+      gg_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 0n, r, d), Nat.mul(0n, Nat.mul(r, d))) == True{} : Bool}, j, h)
+    case 1n+hp:
+      match r:
+        case 0n:
+          gg_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 1n+hp, 0n, d), Nat.mul(1n+hp, Nat.mul(0n, d))) == True{} : Bool}, j, L.nat_lt_subst_r(j, Nat.mul(1n+hp, 0n), 0n, L.nat_mul_zero_r(1n+hp), h))
+        case 1n+rp:
+          match d:
+            case 0n:
+              gg_lt_zero_absurd({Nat.is_lt(gg_vhead_sum(j, 1n+hp, 1n+rp, 0n), Nat.mul(1n+hp, Nat.mul(1n+rp, 0n))) == True{} : Bool}, j, L.nat_lt_subst_r(j, Nat.mul(1n+hp, Nat.mul(1n+rp, 0n)), 0n, gg_mul_mul_zero(1n+hp, 1n+rp), h))
+            case 1n+dp:
+              gg_vt_lt(j, hp, rp, dp, h)
+
+def gg_vt_inj_any(+j1: Nat, +j2: Nat, +hk: Nat, +r: Nat, +d: Nat, +h1: {Nat.is_lt(j1, Nat.mul(hk, Nat.mul(r, d))) == True{} : Bool}, +h2: {Nat.is_lt(j2, Nat.mul(hk, Nat.mul(r, d))) == True{} : Bool}, +e: {gg_vhead_sum(j1, hk, r, d) == gg_vhead_sum(j2, hk, r, d) : Nat}) -> {j1 == j2 : Nat}:
+  match hk:
+    case 0n:
+      gg_lt_zero_absurd({j1 == j2 : Nat}, j1, h1)
+    case 1n+hp:
+      match r:
+        case 0n:
+          gg_lt_zero_absurd({j1 == j2 : Nat}, j1, L.nat_lt_subst_r(j1, Nat.mul(1n+hp, 0n), 0n, L.nat_mul_zero_r(1n+hp), h1))
+        case 1n+rp:
+          match d:
+            case 0n:
+              gg_lt_zero_absurd({j1 == j2 : Nat}, j1, L.nat_lt_subst_r(j1, Nat.mul(1n+hp, Nat.mul(1n+rp, 0n)), 0n, gg_mul_mul_zero(1n+hp, 1n+rp), h1))
+            case 1n+dp:
+              gg_vt_inj(j1, j2, hp, rp, dp, h1, h2, e)
+
+# An entry at or past the leading ones of a tensor of base + x entries means x is positive.
+def gg_vhead_pos(+i: Nat, +base: Nat, +x: Nat, +hlt: {Nat.is_lt(i, Nat.add(base, x)) == True{} : Bool}, +hge: {Nat.is_lt(i, base) == False{} : Bool}) -> {Nat.is_lt(0n, x) == True{} : Bool}:
+  match x:
+    case 0n:
+      +a = L.nat_lt_subst_r(i, Nat.add(base, 0n), base, L.nat_add_zero_r(base), hlt)
+      L.bool_absurd_tf({Nat.is_lt(0n, 0n) == True{} : Bool}, Equal.trans(Bool, True{}, Nat.is_lt(i, base), False{}, Equal.sym(Bool, Nat.is_lt(i, base), True{}, a), hge))
+    case 1n+xp:
+      {==}
+
+def gg_vsrc_lt_go(+i: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +h: {Nat.is_lt(i, Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))) == True{} : Bool}, +b: Bool, +eb: {Nat.is_lt(i, base) == b : Bool}) -> {Nat.is_lt(gg_vhead_pick(i, base, hk, r, d, b), Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))) == True{} : Bool}:
+  match b:
+    case True{}:
+      h
+    case False{}:
+      +hn = gg_vhead_pos(i, base, Nat.mul(hk, Nat.mul(r, d)), h, eb)
+      +hj = L.nat_sub_lt(i, base, Nat.mul(hk, Nat.mul(r, d)), hn, h)
+      L.nat_add_lt_l(base, gg_vhead_sum(Nat.sub(i, base), hk, r, d), Nat.mul(hk, Nat.mul(r, d)), gg_vt_lt_any(Nat.sub(i, base), hk, r, d, hj))
+
+def gg_vsrc_lt(+i: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +h: {Nat.is_lt(i, Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))) == True{} : Bool}) -> {Nat.is_lt(gg_vhead_src(i, base, hk, r, d), Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))) == True{} : Bool}:
+  gg_vsrc_lt_go(i, base, hk, r, d, h, Nat.is_lt(i, base), {==})
+
+def gg_vsrc_inj_go(+i: Nat, +j: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +hi: {Nat.is_lt(i, Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))) == True{} : Bool}, +hj: {Nat.is_lt(j, Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))) == True{} : Bool}, +bi: Bool, +ebi: {Nat.is_lt(i, base) == bi : Bool}, +bj: Bool, +ebj: {Nat.is_lt(j, base) == bj : Bool}, +e: {gg_vhead_pick(i, base, hk, r, d, bi) == gg_vhead_pick(j, base, hk, r, d, bj) : Nat}) -> {i == j : Nat}:
+  match bi:
+    case True{}:
+      match bj:
+        case True{}:
+          e
+        case False{}:
+          Empty.absurd({i == j : Nat}, L.nat_add_not_lt_l(base, gg_vhead_sum(Nat.sub(j, base), hk, r, d), L.nat_lt_subst_l(i, Nat.add(base, gg_vhead_sum(Nat.sub(j, base), hk, r, d)), base, e, ebi)))
+    case False{}:
+      match bj:
+        case True{}:
+          Empty.absurd({i == j : Nat}, L.nat_add_not_lt_l(base, gg_vhead_sum(Nat.sub(i, base), hk, r, d), L.nat_lt_subst_l(j, Nat.add(base, gg_vhead_sum(Nat.sub(i, base), hk, r, d)), base, Equal.sym(Nat, Nat.add(base, gg_vhead_sum(Nat.sub(i, base), hk, r, d)), j, e), ebj)))
+        case False{}:
+          +es = L.nat_add_cancel_l(base, gg_vhead_sum(Nat.sub(i, base), hk, r, d), gg_vhead_sum(Nat.sub(j, base), hk, r, d), e)
+          +hji = L.nat_sub_lt(i, base, Nat.mul(hk, Nat.mul(r, d)), gg_vhead_pos(i, base, Nat.mul(hk, Nat.mul(r, d)), hi, ebi), hi)
+          +hjj = L.nat_sub_lt(j, base, Nat.mul(hk, Nat.mul(r, d)), gg_vhead_pos(j, base, Nat.mul(hk, Nat.mul(r, d)), hj, ebj), hj)
+          +ejj = gg_vt_inj_any(Nat.sub(i, base), Nat.sub(j, base), hk, r, d, hji, hjj, es)
+          %L.nat_sub_add_cancel(i, base, L.nat_not_lt_imp_le(i, base, ebi)) : {_ == j : Nat}
+          %L.nat_sub_add_cancel(j, base, L.nat_not_lt_imp_le(j, base, ebj)) : {Nat.add(Nat.sub(i, base), base) == _ : Nat}
+          %ejj : {Nat.add(Nat.sub(i, base), base) == Nat.add(_, base) : Nat}
+          {==}
+
+def gg_vsrc_inj(+i: Nat, +j: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +hi: {Nat.is_lt(i, Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))) == True{} : Bool}, +hj: {Nat.is_lt(j, Nat.add(base, Nat.mul(hk, Nat.mul(r, d)))) == True{} : Bool}, +e: {gg_vhead_src(i, base, hk, r, d) == gg_vhead_src(j, base, hk, r, d) : Nat}) -> {i == j : Nat}:
+  gg_vsrc_inj_go(i, j, base, hk, r, d, hi, hj, Nat.is_lt(i, base), {==}, Nat.is_lt(j, base), {==}, e)
+
+def gg_vf_go(+n: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +f: Bool, +ef: {gg_vhead_fits(n, base, hk, r, d) == f : Bool}) -> {Bool.and(f, Nat.is_ne(n, gg_vhead_len(base, hk, r, d))) == False{} : Bool}:
+  match f:
+    case False{}:
+      {==}
+    case True{}:
+      +en = gg_eq_of_is_eq(n, gg_vhead_len(base, hk, r, d), ef)
+      %Equal.sym(Nat, n, gg_vhead_len(base, hk, r, d), en) : {Nat.is_ne(_, gg_vhead_len(base, hk, r, d)) == False{} : Bool}
+      gg_is_ne_self(gg_vhead_len(base, hk, r, d))
+
+def gg_vr_go(+i: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +li: Bool, +eli: {Nat.is_lt(i, gg_vhead_len(base, hk, r, d)) == li : Bool}) -> {Bool.and(li, Nat.is_le(gg_vhead_len(base, hk, r, d), gg_vhead_src(i, base, hk, r, d))) == False{} : Bool}:
+  match li:
+    case False{}:
+      {==}
+    case True{}:
+      gg_le_false_of_lt(gg_vhead_src(i, base, hk, r, d), gg_vhead_len(base, hk, r, d), gg_vsrc_lt(i, base, hk, r, d, eli))
+
+def gg_vi_go(+i: Nat, +j: Nat, +base: Nat, +hk: Nat, +r: Nat, +d: Nat, +li: Bool, +eli: {Nat.is_lt(i, gg_vhead_len(base, hk, r, d)) == li : Bool}, +lj: Bool, +elj: {Nat.is_lt(j, gg_vhead_len(base, hk, r, d)) == lj : Bool}, +s: Bool, +es: {Nat.is_eq(gg_vhead_src(i, base, hk, r, d), gg_vhead_src(j, base, hk, r, d)) == s : Bool}) -> {Bool.and(Bool.and(li, lj), Bool.and(s, Nat.is_ne(i, j))) == False{} : Bool}:
+  match li:
+    case False{}:
+      {==}
+    case True{}:
+      match lj:
+        case False{}:
+          {==}
+        case True{}:
+          match s:
+            case False{}:
+              {==}
+            case True{}:
+              +eij = gg_vsrc_inj(i, j, base, hk, r, d, eli, elj, gg_eq_of_is_eq(gg_vhead_src(i, base, hk, r, d), gg_vhead_src(j, base, hk, r, d), es))
+              %eij : {Nat.is_ne(i, _) == False{} : Bool}
+              gg_is_ne_self(i)
+
+# promise: the value-head length check admits a tensor only when its number of entries is exactly its leading entries plus its value heads (`gg_vhead_len`).
+# harm: a tensor of another length would be reordered by a map not shown to stay inside it or to keep its entries apart
+# catches: a shorter tensor admitted (`Nat.is_le` in place of `Nat.is_eq`), which the reorder can read past the end of
+law gg_vhead_fits_only_len:
+  for +n: Nat
+  for +base: Nat
+  for +hk: Nat
+  for +r: Nat
+  for +d: Nat
+  {Bool.and(gg_vhead_fits(n, base, hk, r, d), Nat.is_ne(n, gg_vhead_len(base, hk, r, d))) == False{} : Bool}
+
+def gg_vhead_fits_only_len(n, base, hk, r, d):
+  gg_vf_go(n, base, hk, r, d, gg_vhead_fits(n, base, hk, r, d), {==})
+
+# promise: over a tensor of exactly its leading entries and its value heads (`gg_vhead_len`), every entry is read from a place inside the tensor.
+# harm: a reordered row or column would be read from outside its tensor
+# catches: the value heads laid out with the wrong stride (rr * (r * d) in place of rr * (hk * d)), which reads past the end when a key head has more value heads than there are key heads
+law gg_vhead_src_in_range:
+  for +i: Nat
+  for +base: Nat
+  for +hk: Nat
+  for +r: Nat
+  for +d: Nat
+  {Bool.and(Nat.is_lt(i, gg_vhead_len(base, hk, r, d)), Nat.is_le(gg_vhead_len(base, hk, r, d), gg_vhead_src(i, base, hk, r, d))) == False{} : Bool}
+
+def gg_vhead_src_in_range(i, base, hk, r, d):
+  gg_vr_go(i, base, hk, r, d, Nat.is_lt(i, gg_vhead_len(base, hk, r, d)), {==})
+
+# promise: over a tensor of exactly its leading entries and its value heads (`gg_vhead_len`), no two entries are read from the same place.
+# harm: two rows or columns of the checkpoint would carry the same stored values and one would be lost
+# catches: the key head left out of the stored place (every key head's values read from the first key head's place)
+law gg_vhead_src_one_to_one:
+  for +i: Nat
+  for +j: Nat
+  for +base: Nat
+  for +hk: Nat
+  for +r: Nat
+  for +d: Nat
+  {Bool.and(Bool.and(Nat.is_lt(i, gg_vhead_len(base, hk, r, d)), Nat.is_lt(j, gg_vhead_len(base, hk, r, d))), Bool.and(Nat.is_eq(gg_vhead_src(i, base, hk, r, d), gg_vhead_src(j, base, hk, r, d)), Nat.is_ne(i, j))) == False{} : Bool}
+
+def gg_vhead_src_one_to_one(i, j, base, hk, r, d):
+  gg_vi_go(i, j, base, hk, r, d, Nat.is_lt(i, gg_vhead_len(base, hk, r, d)), {==}, Nat.is_lt(j, gg_vhead_len(base, hk, r, d)), {==}, Nat.is_eq(gg_vhead_src(i, base, hk, r, d), gg_vhead_src(j, base, hk, r, d)), {==})
 
 def gg_pad_aligns_aux(+x: Nat, +ap: Nat, +rem: Nat, erem1: {rem == Nat.mod(x, 1n+ap) : Nat}, erem2: {rem == Nat.mod(x, 1n+ap) : Nat}) -> {Nat.mod(Nat.add(x, Nat.mod(Nat.sub(1n+ap, rem), 1n+ap)), 1n+ap) == 0n : Nat}:
   match rem:

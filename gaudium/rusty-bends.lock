@@ -373,8 +373,17 @@ a84855f9f8cf8e53  gg_split_empty_refused  law gg_split_empty_refused : for + c :
 5c969ee207403248  gg_tensor_total_matches  law gg_tensor_total_matches : for + d : Nat for + t : Nat { Bool.and ( gg_tensor_total_ok ( d , t ) , Nat.is_ne ( d , t ) ) == False { } : Bool }
 # promise gg_tensor_total_matches: a split model is accepted only when its shards hold the tensor count its first shard declares.
 # harm gg_tensor_total_matches: a missing or duplicated shard's tensors would go unnoticed
+038151e7dac141d3  gg_vhead_fits_only_len  law gg_vhead_fits_only_len : for + n : Nat for + base : Nat for + hk : Nat for + r : Nat for + d : Nat { Bool.and ( gg_vhead_fits ( n , base , hk , r , d ) , Nat.is_ne ( n , gg_vhead_len ( base , hk , r , d ) ) ) == False { } : Bool }
+# promise gg_vhead_fits_only_len: the value-head length check admits a tensor only when its number of entries is exactly its leading entries plus its value heads (`gg_vhead_len`).
+# harm gg_vhead_fits_only_len: a tensor of another length would be reordered by a map not shown to stay inside it or to keep its entries apart
 2598539dc1c69f9c  gg_vhead_lead_fixed  law gg_vhead_lead_fixed : for + i : Nat for + p : Nat for + hk : Nat for + r : Nat for + d : Nat { gg_vhead_src ( i , Nat.add ( i , 1n + p ) , hk , r , d ) == i : Nat }
 # promise gg_vhead_lead_fixed: the leading entries before the value heads keep their place in any head reordering.
+cc5c2e36ddd3b3f6  gg_vhead_src_in_range  law gg_vhead_src_in_range : for + i : Nat for + base : Nat for + hk : Nat for + r : Nat for + d : Nat { Bool.and ( Nat.is_lt ( i , gg_vhead_len ( base , hk , r , d ) ) , Nat.is_le ( gg_vhead_len ( base , hk , r , d ) , gg_vhead_src ( i , base , hk , r , d ) ) ) == False { } : Bool }
+# promise gg_vhead_src_in_range: over a tensor of exactly its leading entries and its value heads (`gg_vhead_len`), every entry is read from a place inside the tensor.
+# harm gg_vhead_src_in_range: a reordered row or column would be read from outside its tensor
+fc9ae56db70bf935  gg_vhead_src_one_to_one  law gg_vhead_src_one_to_one : for + i : Nat for + j : Nat for + base : Nat for + hk : Nat for + r : Nat for + d : Nat { Bool.and ( Bool.and ( Nat.is_lt ( i , gg_vhead_len ( base , hk , r , d ) ) , Nat.is_lt ( j , gg_vhead_len ( base , hk , r , d ) ) ) , Bool.and ( Nat.is_eq ( gg_vhead_src ( i , base , hk , r , d ) , gg_vhead_src ( j , base , hk , r , d ) ) , Nat.is_ne ( i , j ) ) ) == False { } : Bool }
+# promise gg_vhead_src_one_to_one: over a tensor of exactly its leading entries and its value heads (`gg_vhead_len`), no two entries are read from the same place.
+# harm gg_vhead_src_one_to_one: two rows or columns of the checkpoint would carry the same stored values and one would be lost
 53fe9947235719b6  gqa_zero_kv_rejected  law gqa_zero_kv_rejected : for + nh : Nat for + dh : Nat { gqa_dims_valid ( nh , 0n , dh ) == False { } : Bool }
 22d66bf5996db2a1  greedy_request_always_admitted  law greedy_request_always_admitted : for cap : Bool { sampling_request_admitted ( cap , False { } ) == True { } : Bool }
 517d5b7e787fa37f  hbm_fit_partition_exact  law hbm_fit_partition_exact : for + p : Nat for + u : Nat { hbm_fit_reconstruct_lhs ( hbm_check_fit ( p , u ) , p , u ) == hbm_fit_reconstruct_rhs ( hbm_check_fit ( p , u ) , p , u ) : Nat }

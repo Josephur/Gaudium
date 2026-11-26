@@ -101,26 +101,21 @@ pub fn dims(g: &Gguf) -> Result<Qwen35Dims, GgufError> {
 }
 
 /// Checkpoint index -> stored index over `n` entries: `base` leading entries in place, then the
-/// value heads (`d` values each) from tiled to grouped order. Refused unless it permutes `0..n`.
+/// value heads (`d` values each) from tiled to grouped order. Refused unless `n` is exactly the
+/// leading entries and the value heads (`gg_vhead_fits`, `gg_vhead_fits_only_len`): over those
+/// entries the map stays in `0..n` (`gg_vhead_src_in_range`) and sends no two to one place
+/// (`gg_vhead_src_one_to_one`), so it permutes them.
 fn vhead_map(n: u64, base: u64, d: &Qwen35Dims, head: u64, name: &str) -> Result<Vec<u64>, String> {
     let r = d.v_heads / d.k_heads;
-    let mut seen = vec![false; n as usize];
-    let mut out = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let s = v::gg_vhead_src(i, base, d.k_heads, r, head).filter(|&s| s < n);
-        match s {
-            Some(s) if !seen[s as usize] => {
-                seen[s as usize] = true;
-                out.push(s);
-            }
-            _ => {
-                return Err(format!(
-                    "{name}: ssm.* metadata does not match its {n} entries"
-                ))
-            }
-        }
+    let refused = || format!("{name}: ssm.* metadata does not match its {n} entries");
+    // `None`: `base + k_heads * r * head` overflows, so no tensor has that many entries.
+    if v::gg_vhead_fits(n, base, d.k_heads, r, head) != Some(true) {
+        return Err(refused());
     }
-    Ok(out)
+    // Every product and sum in the stored index is at most `n`, so `None` is not reached.
+    (0..n)
+        .map(|i| v::gg_vhead_src(i, base, d.k_heads, r, head).ok_or_else(refused))
+        .collect()
 }
 
 fn minus_one() -> super::adapter::ValueFn {
@@ -316,4 +311,51 @@ pub fn register_qwen35(
 ) -> Result<Registered, GgufError> {
     let d = dims(g)?;
     register(store, g, |g, t| map_tensor(g, &d, t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2 key heads, 4 value heads (r = 2) of value dim 1.
+    fn two_by_two() -> Qwen35Dims {
+        Qwen35Dims {
+            n_layers: 1,
+            mtp_layers: 0,
+            hidden: 4,
+            k_heads: 2,
+            v_heads: 4,
+            k_dim: 1,
+            v_dim: 1,
+            qk: 4,
+        }
+    }
+
+    /// A tensor of exactly the leading entries and the value heads gets the grouped order back;
+    /// one entry more or fewer is refused, even where the map would still permute the entries.
+    #[test]
+    fn the_value_head_map_takes_only_its_own_length() {
+        let d = two_by_two();
+        assert_eq!(vhead_map(4, 0, &d, 1, "dt").unwrap(), vec![0, 2, 1, 3]);
+        assert_eq!(
+            vhead_map(8, 4, &d, 1, "qkv").unwrap(),
+            vec![0, 1, 2, 3, 4, 6, 5, 7]
+        );
+        // value dim 2: each head moves as a block of 2, in order inside it
+        assert_eq!(
+            vhead_map(8, 0, &d, 2, "z").unwrap(),
+            vec![0, 1, 4, 5, 2, 3, 6, 7]
+        );
+        // 3 entries map to [0, 2, 1], a permutation, but a tensor of 3 value heads is not one
+        // of 2 x 2
+        for (n, base) in [(3, 0), (5, 0), (7, 4), (9, 4)] {
+            let e = vhead_map(n, base, &d, 1, "t").unwrap_err();
+            assert_eq!(e, format!("t: ssm.* metadata does not match its {n} entries"));
+        }
+        // a value dim of 0 fits only the leading entries
+        assert_eq!(vhead_map(4, 4, &d, 0, "t").unwrap(), vec![0, 1, 2, 3]);
+        assert!(vhead_map(5, 4, &d, 0, "t").is_err());
+        // a length the u64 sum cannot reach
+        assert!(vhead_map(4, u64::MAX, &d, 1, "t").is_err());
+    }
 }
