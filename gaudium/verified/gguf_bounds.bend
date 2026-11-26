@@ -15,6 +15,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper lemmas (erased before Rust codegen)
@@ -79,7 +80,8 @@ def gg_dim_ok(+acc: Nat, +d: Nat, +limit: Nat) -> Bool:
 def gg_dim_step(acc: Nat, d: Nat) -> Nat:
   Nat.mul(acc, d)
 
-# A sum of counts (tensors over the shards of a split model).
+# A sum of counts (tensors over the shards of a split model); `None` past 64 bits.
+# rusty-bends: total
 def gg_count_add(acc: Nat, n: Nat) -> Nat:
   Nat.add(acc, n)
 
@@ -423,4 +425,56 @@ law gg_vhead_lead_fixed:
 
 def gg_vhead_lead_fixed(i, p, hk, r, d):
   %gg_lt_add_succ(i, p) : {gg_vhead_pick(i, Nat.add(i, 1n+p), hk, r, d, _) == i : Nat}
+  {==}
+
+def gg_pad_aligns_aux(+x: Nat, +ap: Nat, +rem: Nat, erem1: {rem == Nat.mod(x, 1n+ap) : Nat}, erem2: {rem == Nat.mod(x, 1n+ap) : Nat}) -> {Nat.mod(Nat.add(x, Nat.mod(Nat.sub(1n+ap, rem), 1n+ap)), 1n+ap) == 0n : Nat}:
+  match rem:
+    case 0n:
+      %Equal.sym(Nat, Nat.sub(1n+ap, 0n), 1n+ap, L.nat_sub_zero_r(1n+ap)) : {Nat.mod(Nat.add(x, Nat.mod(_, 1n+ap)), 1n+ap) == 0n : Nat}
+      %L.nat_add_zero_r(1n+ap) : {Nat.mod(Nat.add(x, Nat.mod(_, 1n+ap)), 1n+ap) == 0n : Nat}
+      %Equal.sym(Nat, Nat.mod(Nat.mul(1n, 1n+ap), 1n+ap), 0n, L.nat_mod_mul(1n, ap)) : {Nat.mod(Nat.add(x, _), 1n+ap) == 0n : Nat}
+      %Equal.sym(Nat, Nat.add(x, 0n), x, L.nat_add_zero_r(x)) : {Nat.mod(_, 1n+ap) == 0n : Nat}
+      Equal.sym(Nat, 0n, Nat.mod(x, 1n+ap), erem1)
+    case 1n+rp:
+      +h_lt = L.nat_lt_subst_l(Nat.mod(x, 1n+ap), 1n+rp, 1n+ap, Equal.sym(Nat, 1n+rp, Nat.mod(x, 1n+ap), erem1), L.nat_mod_lt(x, ap))
+      +h_sub_lt = L.nat_le_lt_trans(Nat.sub(ap, rp), ap, 1n+ap, G.g_nat_sub_le_self(ap, rp), L.nat_lt_succ_self(ap))
+      %Equal.sym(Nat, Nat.mod(Nat.sub(ap, rp), 1n+ap), Nat.sub(ap, rp), L.nat_mod_small(Nat.sub(ap, rp), ap, h_sub_lt)) : {Nat.mod(Nat.add(x, _), 1n+ap) == 0n : Nat}
+      +sum_eq = G.g_nat_align_up_nz_sum(x, ap, 1n+rp, erem2, h_lt)
+      %Equal.sym(Nat, Nat.add(x, Nat.sub(1n+ap, 1n+rp)), Nat.mul(1n+Nat.div(x, 1n+ap), 1n+ap), sum_eq) : {Nat.mod(_, 1n+ap) == 0n : Nat}
+      L.nat_mod_mul(1n+Nat.div(x, 1n+ap), ap)
+
+# promise: adding gg_pad(x, 1+ap) to x always lands on an exact multiple of 1+ap
+# catches: gg_pad returns 1+ap unconditionally instead of alignment padding
+law gg_pad_aligns:
+  for +x: Nat
+  for +ap: Nat
+  {Nat.mod(Nat.add(x, gg_pad(x, 1n+ap)), 1n+ap) == 0n : Nat}
+
+def gg_pad_aligns(x, ap):
+  gg_pad_aligns_aux(x, ap, Nat.mod(x, 1n+ap), {==}, {==})
+
+# promise: placing a tensor at a misaligned offset is always rejected by gg_place_ok
+# catches: gg_place_ok drops the offset alignment check Nat.mod(off, a) == 0n
+law gg_place_requires_aligned:
+  for +q: Nat
+  for +ap: Nat
+  for len: Nat
+  for avail: Nat
+  {gg_place_ok(Nat.add(Nat.mul(q, 1n+1n+ap), 1n), len, 1n+1n+ap, avail) == False{} : Bool}
+
+def gg_place_requires_aligned(q, ap, len, avail):
+  %Equal.sym(Nat, Nat.mod(Nat.add(Nat.mul(q, 1n+1n+ap), 1n), 1n+1n+ap), 1n, L.nat_mod_split(q, 1n, 1n+ap, {==})) : {Bool.and(Nat.is_eq(_, 0n), gg_span_ok(Nat.add(Nat.mul(q, 1n+1n+ap), 1n), len, avail)) == False{} : Bool}
+  {==}
+
+# promise: a reversed row range (r0 > r1) is always rejected by gg_rows_ok
+# catches: gg_rows_ok drops the Nat.is_le(r0, r1) ordering check
+law gg_rows_requires_ordered:
+  for +r1: Nat
+  for +d: Nat
+  for rb: Nat
+  for nb: Nat
+  {gg_rows_ok(Nat.add(r1, 1n+d), r1, rb, nb) == False{} : Bool}
+
+def gg_rows_requires_ordered(r1, d, rb, nb):
+  %Equal.sym(Bool, Nat.is_le(Nat.add(r1, 1n+d), r1), False{}, G.g_nat_le_add_succ_false(r1, d)) : {Bool.and(_, gg_count_fits(r1, rb, nb)) == False{} : Bool}
   {==}

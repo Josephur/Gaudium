@@ -9,6 +9,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import lemmas.bend as G
 import inkling2.bend as K
 
 # ============================================================================
@@ -141,3 +142,16 @@ def mtp_frnn_row_in_pass(r, n):
   %Equal.sym(Nat, Nat.sub(n, 0n), n, L.nat_sub_zero_r(n)) : {Nat.is_lt(Nat.min(r, _), 1n+n) == True{} : Bool}
   %Equal.sym(Bool, Nat.is_lt(Nat.min(r, n), 1n+n), Nat.is_le(Nat.min(r, n), n), L.nat_lt_succ_eq_le(Nat.min(r, n), n)) : {_ == True{} : Bool}
   L.nat_min_le_r(r, n)
+
+# promise: chunk count multiplied by chunk size always covers every position before anchor p
+# catches: mtp_ctx_chunks omits the Nat.sub(chunk, 1n) ceiling term
+law mtp_ctx_chunks_covers_prompt:
+  for +p: Nat
+  for +cm1: Nat
+  {Nat.is_le(p, Nat.mul(mtp_ctx_chunks(p, 1n+cm1), 1n+cm1)) == True{} : Bool}
+
+def mtp_ctx_chunks_covers_prompt(p, cm1):
+  %Equal.sym(Nat, Nat.sub(cm1, 0n), cm1, L.nat_sub_zero_r(cm1)) : {Nat.is_le(p, Nat.mul(Nat.max(1n, Nat.div(Nat.add(p, _), 1n+cm1)), 1n+cm1)) == True{} : Bool}
+  +q = Nat.div(Nat.add(p, cm1), 1n+cm1)
+  L.nat_le_trans(p, Nat.mul(q, 1n+cm1), Nat.mul(Nat.max(1n, q), 1n+cm1), G.g_nat_ceil_div_covers(p, cm1), L.nat_mul_le_mono_r(q, Nat.max(1n, q), 1n+cm1, L.nat_max_ge_r(1n, q)))
+

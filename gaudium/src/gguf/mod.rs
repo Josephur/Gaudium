@@ -458,7 +458,9 @@ impl<'a> Cursor<'a> {
                         )
                     })?;
                     let n2 = self.u64(&what)?;
-                    self.skip_array(et2, n2, v::gg_count_add(depth, 1), key)?;
+                    let next_depth = v::gg_count_add(depth, 1)
+                        .ok_or_else(|| err(self.file, format!("array {key}: nesting depth overflow")))?;
+                    self.skip_array(et2, n2, next_depth, key)?;
                 }
             }
             _ => {
@@ -890,7 +892,8 @@ impl Gguf {
                     ));
                 }
             }
-            total = v::gg_count_add(total, f.tensors.len() as u64);
+            total = v::gg_count_add(total, f.tensors.len() as u64)
+                .ok_or_else(|| err(&where_, "split tensor count overflow"))?;
         }
         if count > 0 {
             if let Some(want) = files[0].kv("split.tensors.count").and_then(|v| v.as_u64()) {

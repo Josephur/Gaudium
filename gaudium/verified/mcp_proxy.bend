@@ -13,6 +13,7 @@
 #   - Size and time caps, and the keep-alive line of an idle event stream
 
 import Base
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper lemmas (erased before Rust codegen)
@@ -1221,7 +1222,8 @@ def px_resp_framing_dropped():
 # 9. Size and Time Caps
 # ============================================================================
 
-# A megabyte count as bytes (saturating).
+# A megabyte count as bytes (`None` past 64 bits).
+# rusty-bends: total
 def px_cap_bytes(mb: Nat) -> Nat:
   Nat.mul(Nat.mul(mb, 1024n), 1024n)
 
@@ -1461,3 +1463,44 @@ def px_write_idle_gives_up(t):
   match t:
     case 0n: {==}
     case 1n+p: {==}
+
+# LAW 4.13: Any port above 65535 is refused (valid TCP ports fit in 16 bits).
+# promise: px_port_ok rejects every port strictly above 65535
+# catches: px_port_ok drops the Nat.is_le(port, 65535n) upper bound check
+law px_port_over_max_refused:
+  for +extra: Nat
+  {px_port_ok(Nat.add(65535n, 1n+extra)) == False{} : Bool}
+
+def px_port_over_max_refused(extra):
+  %Equal.sym(Bool, Nat.is_le(Nat.add(65535n, 1n+extra), 65535n), False{}, G.g_nat_le_add_succ_false(65535n, extra)) : {Bool.and(Nat.is_gt(Nat.add(65535n, 1n+extra), 0n), _) == False{} : Bool}
+  G.g_bool_and_false_r(Nat.is_gt(Nat.add(65535n, 1n+extra), 0n))
+
+# LAW 9.10: Any operator cap above `most` is refused by px_cap_ok.
+# promise: px_cap_ok rejects every value strictly greater than most
+# catches: px_cap_ok drops Nat.is_le(value, most) and accepts arbitrarily large caps
+law px_cap_over_max_refused:
+  for +most: Nat
+  for +extra: Nat
+  {px_cap_ok(Nat.add(most, 1n+extra), most) == False{} : Bool}
+
+def px_cap_over_max_refused(most, extra):
+  %Equal.sym(Bool, Nat.is_le(Nat.add(most, 1n+extra), most), False{}, G.g_nat_le_add_succ_false(most, extra)) : {Bool.and(Nat.is_gt(Nat.add(most, 1n+extra), 0n), _) == False{} : Bool}
+  G.g_bool_and_false_r(Nat.is_gt(Nat.add(most, 1n+extra), 0n))
+
+def px_sub_min_r_zero(+r: Nat, +k: Nat) -> {Nat.sub(Nat.min(r, k), k) == 0n : Nat}:
+  match r k:
+    case 0n _: {==}
+    case 1n+_ 0n: {==}
+    case 1n+rp 1n+kp:
+      px_sub_min_r_zero(rp, kp)
+
+# LAW 6.12: For every prefix length at or before byte boundary 8 * i, no bits remain at byte i.
+# promise: px_net_bits_at returns 0n whenever bits <= 8 * index
+# catches: px_net_bits_at returns bits without subtracting index * 8n
+law px_net_bits_past_prefix_zero:
+  for +r: Nat
+  for +i: Nat
+  {px_net_bits_at(Nat.min(r, Nat.mul(i, 8n)), i) == 0n : Nat}
+
+def px_net_bits_past_prefix_zero(r, i):
+  px_sub_min_r_zero(r, Nat.mul(i, 8n))

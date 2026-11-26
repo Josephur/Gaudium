@@ -8,6 +8,7 @@
 #   - How many of a request's catalog identifiers are examined
 
 import Base
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper Nat lemmas (erased before Rust codegen)
@@ -355,3 +356,15 @@ law a2ui_prompt_empty_rejected:
 
 def a2ui_prompt_empty_rejected(c):
   {==}
+
+# LAW 5.6: A prompt file strictly larger than cap is always rejected by a2ui_prompt_size_ok.
+# promise: a2ui_prompt_size_ok rejects any prompt size strictly exceeding cap
+# catches: a2ui_prompt_size_ok drops Nat.is_le(len, cap) and accepts any non-empty prompt
+law a2ui_prompt_over_cap_rejected:
+  for +cap: Nat
+  for +d: Nat
+  {a2ui_prompt_size_ok(Nat.add(cap, 1n+d), cap) == False{} : Bool}
+
+def a2ui_prompt_over_cap_rejected(cap, d):
+  %Equal.sym(Bool, Nat.is_le(Nat.add(cap, 1n+d), cap), False{}, G.g_nat_le_add_succ_false(cap, d)) : {Bool.and(Nat.is_gt(Nat.add(cap, 1n+d), 0n), _) == False{} : Bool}
+  G.g_bool_and_false_r(Nat.is_gt(Nat.add(cap, 1n+d), 0n))

@@ -162,9 +162,9 @@ pub fn resp_header_passes(kind: RespHeader) -> bool {
     px_resp_header_passes(kind)
 }
 
-/// A megabyte count as bytes.
+/// A megabyte count as bytes (saturating at `u64::MAX` past 64 bits).
 pub fn cap_bytes(mb: u64) -> u64 {
-    px_cap_bytes(mb)
+    px_cap_bytes(mb).unwrap_or(u64::MAX)
 }
 
 /// A cap value the operator may set (`1..=most`).
@@ -482,5 +482,11 @@ mod tests {
         ] {
             assert!(!resp_header_passes(k), "{k:?}");
         }
+    }
+
+    #[test]
+    fn cap_bytes_saturates_without_overflow_panic() {
+        assert_eq!(cap_bytes(4), 4 * 1024 * 1024);
+        assert_eq!(cap_bytes(u64::MAX), u64::MAX);
     }
 }

@@ -20,6 +20,8 @@
 # (`hc_can_evict`) and the byte ledger are in `kv_pool.bend`, beside the rules they build on.
 
 import Base
+import nat_lemmas.bend as L
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper Nat / Bool lemmas (erased before Rust codegen)
@@ -480,7 +482,7 @@ def hc_room_pick(can: Bool, fits: Bool) -> HcRoom:
           HcEvict{}
 
 def hc_room(+need: Nat, +free: Nat, evictable: Nat) -> HcRoom:
-  hc_room_pick(Nat.is_le(need, Nat.add(free, evictable)), Nat.is_le(need, free))
+  hc_room_pick(Nat.is_le(Nat.sub(need, free), evictable), Nat.is_le(need, free))
 
 # ============================================================================
 # 8. Device rows that still equal an entry's rows
@@ -916,6 +918,13 @@ law hc_evict_before_irreflexive:
 def hc_evict_before_irreflexive(a):
   hc_lt_refl(a)
 
+def hc_room_sub_add_zero(+n: Nat, x: Nat) -> {0n == Nat.sub(n, Nat.add(n, x)) : Nat}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+p:
+      hc_room_sub_add_zero(p, x)
+
 # LAW HC.28: a save that fits in the free bytes evicts nothing.
 law hc_room_fits_evicts_nothing:
   for +n: Nat
@@ -924,7 +933,8 @@ law hc_room_fits_evicts_nothing:
   {hc_room(n, Nat.add(n, extra), ev) == HcFits{} : HcRoom}
 
 def hc_room_fits_evicts_nothing(n, extra, ev):
-  %hc_le_add_add(n, extra, ev) : {hc_room_pick(_, Nat.is_le(n, Nat.add(n, extra))) == HcFits{} : HcRoom}
+  %hc_room_sub_add_zero(n, extra) : {hc_room_pick(Nat.is_le(_, ev), Nat.is_le(n, Nat.add(n, extra))) == HcFits{} : HcRoom}
+  %Equal.sym(Bool, Nat.is_le(0n, ev), True{}, hc_zero_le(ev)) : {hc_room_pick(_, Nat.is_le(n, Nat.add(n, extra))) == HcFits{} : HcRoom}
   %hc_le_add_r(n, extra) : {hc_room_pick(True{}, _) == HcFits{} : HcRoom}
   {==}
 
@@ -937,7 +947,9 @@ law hc_room_refuses_what_cannot_fit:
   {hc_room(Nat.add(Nat.add(f, ev), 1n+x), f, ev) == HcRefuse{} : HcRoom}
 
 def hc_room_refuses_what_cannot_fit(f, ev, x):
-  %hc_le_add_gt_false(Nat.add(f, ev), x) : {hc_room_pick(_, Nat.is_le(Nat.add(Nat.add(f, ev), 1n+x), f)) == HcRefuse{} : HcRoom}
+  %Equal.sym(Nat, Nat.add(Nat.add(f, ev), 1n+x), Nat.add(f, Nat.add(ev, 1n+x)), L.nat_add_assoc(f, ev, 1n+x)) : {hc_room_pick(Nat.is_le(Nat.sub(_, f), ev), Nat.is_le(Nat.add(Nat.add(f, ev), 1n+x), f)) == HcRefuse{} : HcRoom}
+  %Equal.sym(Nat, Nat.sub(Nat.add(f, Nat.add(ev, 1n+x)), f), Nat.add(ev, 1n+x), L.nat_add_sub_cancel_l(f, Nat.add(ev, 1n+x))) : {hc_room_pick(Nat.is_le(_, ev), Nat.is_le(Nat.add(Nat.add(f, ev), 1n+x), f)) == HcRefuse{} : HcRoom}
+  %hc_le_add_gt_false(ev, x) : {hc_room_pick(_, Nat.is_le(Nat.add(Nat.add(f, ev), 1n+x), f)) == HcRefuse{} : HcRoom}
   {==}
 
 def hc_clean_apart_aux(k: Bool, +lo: Nat, +hi: Nat, +w0: Nat, +w1: Nat) -> {Bool.or(Nat.is_le(w1, hc_clean_lo_if(k, lo, w1)), Nat.is_le(hc_clean_hi_if(k, hi, w0), w0)) == True{} : Bool}:
@@ -3412,3 +3424,48 @@ def hc_host_counted_within_read(k, n, b):
 
 # (That the store counts no host memory at all under an unread limit and an unnamed budget is
 # the same decision, and is left to the Rust tests for the same reason.)
+
+# LAW HC.157: Rounding a resume offset down to a whole tile never lands past resume_rows.
+# promise: hc_written_lo(r, 1+tp) * (1+tp) never exceeds r
+# catches: hc_written_lo adds tp to r like hc_written_hi instead of flooring
+law hc_written_lo_within_resume:
+  for +r: Nat
+  for +tp: Nat
+  {Nat.is_le(Nat.mul(hc_written_lo(r, 1n+tp), 1n+tp), r) == True{} : Bool}
+
+def hc_written_lo_within_resume(r, tp):
+  L.nat_align_down_le(r, tp)
+
+# LAW HC.158: Rounding written_end up to whole tiles always covers every written row.
+# promise: hc_written_hi(w, 1+tp) * (1+tp) is always at least w
+# catches: hc_written_hi floors like hc_written_lo without adding Nat.sub(tile, 1n)
+law hc_written_hi_covers_end:
+  for +w: Nat
+  for +tp: Nat
+  {Nat.is_le(w, Nat.mul(hc_written_hi(w, 1n+tp), 1n+tp)) == True{} : Bool}
+
+def hc_written_hi_covers_end(w, tp):
+  %Equal.sym(Nat, Nat.sub(tp, 0n), tp, L.nat_sub_zero_r(tp)) : {Nat.is_le(w, Nat.mul(Nat.div(Nat.add(w, _), 1n+tp), 1n+tp)) == True{} : Bool}
+  G.g_nat_ceil_div_covers(w, tp)
+
+def hc_layout_valid_aux(+ca: Nat, +ch: Nat, +k: Nat, +hd: Nat, +rb: Nat, +bp: Nat, +tp: Nat, etp: {1n+tp == Nat.mul(2n, 1n+bp) : Nat}) -> {hc_layout(1n+ca, 1n+ch, Nat.mul(1n+k, Nat.mul(2n, 1n+bp)), 1n+hd, 1n+rb, Nat.mul(2n, 1n+bp), 1n+bp, Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb)) == HcLayoutOk{} : HcLayout}:
+  %etp : {hc_layout_pick(True{}, Bool.and(Nat.is_eq(Nat.mod(Nat.mul(1n+k, _), _), 0n), Nat.is_eq(Nat.mod(Nat.mul(2n, 1n+bp), 1n+bp), 0n)), Nat.is_eq(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb), Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb))) == HcLayoutOk{} : HcLayout}
+  %Equal.sym(Nat, Nat.mod(Nat.mul(1n+k, 1n+tp), 1n+tp), 0n, L.nat_mod_mul(1n+k, tp)) : {hc_layout_pick(True{}, Bool.and(Nat.is_eq(_, 0n), Nat.is_eq(Nat.mod(Nat.mul(2n, 1n+bp), 1n+bp), 0n)), Nat.is_eq(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb), Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb))) == HcLayoutOk{} : HcLayout}
+  %Equal.sym(Nat, Nat.mod(Nat.mul(2n, 1n+bp), 1n+bp), 0n, L.nat_mod_mul(2n, bp)) : {hc_layout_pick(True{}, Bool.and(True{}, Nat.is_eq(_, 0n)), Nat.is_eq(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb), Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb))) == HcLayoutOk{} : HcLayout}
+  %Equal.sym(Bool, Nat.is_eq(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb), Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb)), True{}, G.g_nat_eq_refl(Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb))) : {hc_layout_pick(True{}, True{}, _) == HcLayoutOk{} : HcLayout}
+  {==}
+
+# LAW HC.159: A positive cache layout where tile divides chunk_rows, block divides tile, and cache_bytes matches exact dimensions is always accepted.
+# promise: hc_layout accepts any non-empty aligned layout whose cache_bytes equals chunks * heads * chunk_rows * row_bytes
+# catches: hc_layout checks Nat.mod(block, tile) instead of Nat.mod(tile, block) or rejects valid aligned layouts
+law hc_layout_valid_accepted:
+  for +ca: Nat
+  for +ch: Nat
+  for +k: Nat
+  for +hd: Nat
+  for +rb: Nat
+  for +bp: Nat
+  {hc_layout(1n+ca, 1n+ch, Nat.mul(1n+k, Nat.mul(2n, 1n+bp)), 1n+hd, 1n+rb, Nat.mul(2n, 1n+bp), 1n+bp, Nat.mul(Nat.mul(Nat.mul(1n+ch, 1n+hd), Nat.mul(1n+k, Nat.mul(2n, 1n+bp))), 1n+rb)) == HcLayoutOk{} : HcLayout}
+
+def hc_layout_valid_accepted(ca, ch, k, hd, rb, bp):
+  hc_layout_valid_aux(ca, ch, k, hd, rb, bp, Nat.add(bp, Nat.add(1n+bp, 0n)), {==})

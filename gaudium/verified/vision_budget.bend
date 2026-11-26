@@ -11,6 +11,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper Nat / Bool lemmas (erased before Rust codegen)
@@ -679,3 +680,41 @@ law vis_plan_keeps_earlier:
 
 def vis_plan_keeps_earlier(p, n):
   L.nat_max_ge_l(p, n)
+
+# LAW VB.31: Embedding-row admission rejects any request that pushes used + add past capacity.
+# promise: vis_rows_fit returns False whenever add exceeds cap - used
+# catches: vis_rows_fit ignores add and only checks used <= cap
+law vis_rows_fit_rejects_over:
+  for +u: Nat
+  for +a: Nat
+  for +d: Nat
+  {vis_rows_fit(u, Nat.add(a, 1n+d), Nat.add(u, a)) == False{} : Bool}
+
+def vis_rows_fit_rejects_over(u, a, d):
+  %L.nat_add_assoc(u, a, 1n+d) : {Nat.is_le(_, Nat.add(u, a)) == False{} : Bool}
+  G.g_nat_le_add_succ_false(Nat.add(u, a), d)
+
+# LAW VB.32: Temporal patch count multiplied by temporal stride always covers every frame.
+# promise: vid_groups(f, 1+tp) * (1+tp) is always at least f
+# catches: vid_groups floors frames / temporal without adding Nat.sub(temporal, 1n)
+law vid_groups_covers_frames:
+  for +f: Nat
+  for +tp: Nat
+  {Nat.is_le(f, Nat.mul(vid_groups(f, 1n+tp), 1n+tp)) == True{} : Bool}
+
+def vid_groups_covers_frames(f, tp):
+  %Equal.sym(Nat, Nat.sub(tp, 0n), tp, L.nat_sub_zero_r(tp)) : {Nat.is_le(f, Nat.mul(Nat.div(Nat.add(f, _), 1n+tp), 1n+tp)) == True{} : Bool}
+  G.g_nat_ceil_div_covers(f, tp)
+
+# LAW VB.33: Mirroring an in-range axis index twice recovers the original index identically.
+# promise: orient_mirror applied twice recovers any in-range index i < n
+# catches: orient_mirror drops - i and returns Nat.sub(n, 1n)
+law orient_mirror_involution:
+  for +i: Nat
+  for +d: Nat
+  {orient_mirror(orient_mirror(i, Nat.add(1n+i, d)), Nat.add(1n+i, d)) == i : Nat}
+
+def orient_mirror_involution(i, d):
+  %Equal.sym(Nat, Nat.sub(Nat.add(i, d), 0n), Nat.add(i, d), L.nat_sub_zero_r(Nat.add(i, d))) : {Nat.sub(_, Nat.sub(_, i)) == i : Nat}
+  %Equal.sym(Nat, Nat.sub(Nat.add(i, d), i), d, L.nat_add_sub_cancel_l(i, d)) : {Nat.sub(Nat.add(i, d), _) == i : Nat}
+  L.nat_add_sub_cancel_r(i, d)

@@ -4,6 +4,7 @@
 #   - 5-category byte-exact HBM allocation ledger conservation
 
 import Base
+import nat_lemmas.bend as L
 
 # ============================================================================
 # 1. Helper Nat arithmetic lemmas (erased before Rust codegen)
@@ -404,3 +405,49 @@ law hbm_prefix_slots_zero_bytes_safe:
 
 def hbm_prefix_slots_zero_bytes_safe(req, bp, u):
   hb_or_true_r_zero(req, bp, u, Nat.is_gt(bp, u))
+
+# LAW HB.8: When total HBM covers base + spare, usable HBM never exceeds remaining headroom.
+# promise: hbm_usable never exceeds total - (base + spare) when total >= base + spare
+# catches: hbm_usable ignores spare and returns Nat.sub(total, base)
+law hbm_usable_within_remaining:
+  for +b: Nat
+  for +s: Nat
+  for +rem: Nat
+  {Nat.is_le(hbm_usable(Nat.add(Nat.add(b, s), rem), b, s), rem) == True{} : Bool}
+
+def hbm_usable_within_remaining(b, s, rem):
+  %Equal.sym(Nat, Nat.sub(Nat.add(Nat.add(b, s), rem), Nat.add(b, s)), rem, L.nat_add_sub_cancel_l(Nat.add(b, s), rem)) : {Nat.is_le(_, rem) == True{} : Bool}
+  L.nat_le_refl(rem)
+
+def hb_not_gt_add(+bp: Nat, +rem: Nat) -> {Nat.is_gt(bp, Nat.add(bp, rem)) == False{} : Bool}:
+  match bp rem:
+    case 0n 0n: {==}
+    case 0n 1n+_: {==}
+    case 1n+bpp _:
+      hb_not_gt_add(bpp, rem)
+
+def hb_grant_fit_aux(+req: Nat, +sb: Nat, +bp: Nat, +rem: Nat) -> {Nat.is_le(Nat.add(bp, Nat.mul(hbm_grant_prefix_if(req, sb, bp, Nat.add(bp, rem), Nat.is_eq(sb, 0n)), sb)), Nat.add(bp, rem)) == True{} : Bool}:
+  match sb:
+    case 0n:
+      %Equal.sym(Nat, Nat.add(bp, 0n), bp, L.nat_add_zero_r(bp)) : {Nat.is_le(_, Nat.add(bp, rem)) == True{} : Bool}
+      L.nat_add_le_r(bp, rem)
+    case 1n+sbp:
+      %Equal.sym(Nat, Nat.sub(Nat.add(bp, rem), bp), rem, L.nat_add_sub_cancel_l(bp, rem)) : {Nat.is_le(Nat.add(bp, Nat.mul(Nat.min(req, Nat.div(_, 1n+sbp)), 1n+sbp)), Nat.add(bp, rem)) == True{} : Bool}
+      +g_le = L.nat_min_le_r(req, Nat.div(rem, 1n+sbp))
+      +mul_le = L.nat_mul_le_mono_r(Nat.min(req, Nat.div(rem, 1n+sbp)), Nat.div(rem, 1n+sbp), 1n+sbp, g_le)
+      +bytes_le = L.nat_le_trans(Nat.mul(Nat.min(req, Nat.div(rem, 1n+sbp)), 1n+sbp), Nat.mul(Nat.div(rem, 1n+sbp), 1n+sbp), rem, mul_le, L.nat_align_down_le(rem, sbp))
+      L.nat_add_le_mono(bp, bp, Nat.mul(Nat.min(req, Nat.div(rem, 1n+sbp)), 1n+sbp), rem, L.nat_le_refl(bp), bytes_le)
+
+# LAW HB.9: Granted prefix-reuse slots never push base_planned + granted * slot_bytes past usable HBM.
+# promise: granted prefix-reuse slots keep base_planned + granted * slot_bytes within usable HBM
+# catches: hbm_grant_prefix_slots returns req_slots without clamping to remaining usable bytes
+law hbm_prefix_slots_fit_usable:
+  for +req: Nat
+  for +sb: Nat
+  for +bp: Nat
+  for +rem: Nat
+  {Nat.is_le(Nat.add(bp, Nat.mul(hbm_grant_prefix_slots(req, sb, bp, Nat.add(bp, rem)), sb)), Nat.add(bp, rem)) == True{} : Bool}
+
+def hbm_prefix_slots_fit_usable(req, sb, bp, rem):
+  %Equal.sym(Bool, Nat.is_gt(bp, Nat.add(bp, rem)), False{}, hb_not_gt_add(bp, rem)) : {Nat.is_le(Nat.add(bp, Nat.mul(hbm_grant_prefix_if(req, sb, bp, Nat.add(bp, rem), Bool.or(_, Nat.is_eq(sb, 0n))), sb)), Nat.add(bp, rem)) == True{} : Bool}
+  hb_grant_fit_aux(req, sb, bp, rem)

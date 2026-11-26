@@ -1981,4 +1981,12 @@ mod tests {
         assert_ne!(digest128(b""), digest128(b"\0"));
         assert_ne!(digest128(b"abcdefgh"), digest128(b"abcdefgi"));
     }
+
+    #[test]
+    fn hc_room_does_not_overflow_when_host_avail_is_u64_max() {
+        assert_eq!(
+            crate::verified::hc_room(1024, u64::MAX, 4096),
+            crate::verified::HcRoom::HcFits
+        );
+    }
 }

@@ -6,6 +6,8 @@
 #   - Speculative draft-tree bounds (<= 32 nodes, acyclic DAG) & lane state-block relocation
 
 import Base
+import nat_lemmas.bend as L
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Helper Nat arithmetic lemmas (erased before Rust codegen)
@@ -164,8 +166,11 @@ def gdn_dims_valid(+k_heads: Nat, +v_heads: Nat, conv_k: Nat) -> Bool:
   Bool.and(
     Nat.is_gt(k_heads, 0n),
     Bool.and(
-      Nat.is_le(v_heads, 64n),
-      Bool.and(Nat.is_eq(Nat.mod(v_heads, k_heads), 0n), Nat.is_eq(conv_k, 4n))
+      Nat.is_gt(v_heads, 0n),
+      Bool.and(
+        Nat.is_le(v_heads, 64n),
+        Bool.and(Nat.is_eq(Nat.mod(v_heads, k_heads), 0n), Nat.is_eq(conv_k, 4n))
+      )
     )
   )
 
@@ -327,6 +332,19 @@ law gdn_zero_k_rejected:
 
 def gdn_zero_k_rejected(vh, ck):
   {==}
+
+# LAW TN.19: Zero DeltaNet value head count is ALWAYS rejected.
+# promise: zero DeltaNet value head count is always rejected
+# catches: Nat.is_gt(v_heads, 0n) check omitted from gdn_dims_valid
+law gdn_zero_v_heads_rejected:
+  for +k: Nat
+  for ck: Nat
+  {gdn_dims_valid(k, 0n, ck) == False{} : Bool}
+
+def gdn_zero_v_heads_rejected(k, ck):
+  match k:
+    case 0n: {==}
+    case 1n+_: {==}
 
 # LAW TN.6: Zero hidden size is ALWAYS rejected.
 law hidden_zero_rejected:
@@ -609,3 +627,43 @@ law ds_no_draft_rows_no_map:
 
 def ds_no_draft_rows_no_map(v):
   {==}
+
+def tn_align_up_mod_aux(+x: Nat, +ap: Nat, +rem: Nat, erem1: {rem == Nat.mod(x, 1n+ap) : Nat}, erem2: {rem == Nat.mod(x, 1n+ap) : Nat}) -> {Nat.mod(align_up_rem_if(x, 1n+ap, rem, Nat.is_eq(rem, 0n)), 1n+ap) == 0n : Nat}:
+  match rem:
+    case 0n:
+      Equal.sym(Nat, 0n, Nat.mod(x, 1n+ap), erem1)
+    case 1n+rp:
+      +h_lt = L.nat_lt_subst_l(Nat.mod(x, 1n+ap), 1n+rp, 1n+ap, Equal.sym(Nat, 1n+rp, Nat.mod(x, 1n+ap), erem1), L.nat_mod_lt(x, ap))
+      +sum_eq = G.g_nat_align_up_nz_sum(x, ap, 1n+rp, erem2, h_lt)
+      %Equal.sym(Nat, Nat.add(x, Nat.sub(1n+ap, 1n+rp)), Nat.mul(1n+Nat.div(x, 1n+ap), 1n+ap), sum_eq) : {Nat.mod(_, 1n+ap) == 0n : Nat}
+      L.nat_mod_mul(1n+Nat.div(x, 1n+ap), ap)
+
+# LAW TN.20: Aligning x up to any positive alignment yields an exact multiple of that alignment.
+# promise: align_up with a positive alignment always yields a multiple of that alignment
+# catches: align_up returns x unchanged without rounding up
+law align_up_is_multiple:
+  for +x: Nat
+  for +ap: Nat
+  {Nat.mod(align_up(x, 1n+ap), 1n+ap) == 0n : Nat}
+
+def align_up_is_multiple(x, ap):
+  tn_align_up_mod_aux(x, ap, Nat.mod(x, 1n+ap), {==}, {==})
+
+def tn_align_up_tight_aux(+x: Nat, +ap: Nat, +rem: Nat) -> {Nat.is_lt(align_up_rem_if(x, 1n+ap, rem, Nat.is_eq(rem, 0n)), Nat.add(x, 1n+ap)) == True{} : Bool}:
+  match rem:
+    case 0n:
+      Equal.sym(Bool, True{}, Nat.is_lt(x, Nat.add(x, 1n+ap)), tn_lt_add_succ_true(x, ap))
+    case 1n+rp:
+      +h_sub = L.nat_le_lt_trans(Nat.sub(ap, rp), ap, 1n+ap, G.g_nat_sub_le_self(ap, rp), L.nat_lt_succ_self(ap))
+      L.nat_add_lt_l(x, Nat.sub(ap, rp), 1n+ap, h_sub)
+
+# LAW TN.21: Aligning x up to a positive alignment adds strictly less than the alignment.
+# promise: align_up(x, 1+ap) is always strictly less than x + (1+ap)
+# catches: align_up adds a full alignment when x is already aligned (or adds align twice)
+law align_up_tight:
+  for +x: Nat
+  for +ap: Nat
+  {Nat.is_lt(align_up(x, 1n+ap), Nat.add(x, 1n+ap)) == True{} : Bool}
+
+def align_up_tight(x, ap):
+  tn_align_up_tight_aux(x, ap, Nat.mod(x, 1n+ap))

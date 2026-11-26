@@ -1,4 +1,5 @@
 import Base
+import nat_lemmas.bend as L
 
 # Prefill wavefront: two prompt tiles in flight.
 #
@@ -149,3 +150,87 @@ law wave_sets_differ:
 
 def wave_sets_differ(u):
   {==}
+
+# LAW PW6: Every tile's buffer-set index lies strictly inside the 2-buffer pair (< 2).
+# promise: wave_set always returns a valid 2-buffer pair index (< 2)
+# catches: wave_set returns 2n for lagged tiles
+law wave_set_in_pair:
+  for +lag: Bool
+  {Nat.is_lt(wave_set(lag), 2n) == True{} : Bool}
+
+def wave_set_in_pair(lag):
+  match lag:
+    case True{}: {==}
+    case False{}: {==}
+
+def pw_lt_add_succ(+h: Nat, +extra: Nat) -> {Nat.is_lt(h, Nat.add(h, 1n+extra)) == True{} : Bool}:
+  match h:
+    case 0n: {==}
+    case 1n+hp:
+      pw_lt_add_succ(hp, extra)
+
+def pw_base_half_lt(+m: Nat, +h: Nat, +extra: Nat, +p: Nat) -> {Nat.is_lt(wave_base(m, h, p), wave_base(m, Nat.add(h, 1n+extra), p)) == True{} : Bool}:
+  match m:
+    case 0n:
+      pw_lt_add_succ(h, extra)
+    case 1n+mp:
+      L.nat_add_lt_le_mono(wave_base(mp, h, p), wave_base(mp, Nat.add(h, 1n+extra), p), p, p, pw_base_half_lt(mp, h, extra, p), L.nat_le_refl(p))
+
+# LAW PW7: Within any tile, later half-steps always receive strictly later launch indices.
+# promise: wave_step strictly increases with half-step index for any pair, lag flag, and period
+# catches: wave_step drops the half index and ignores half-step ordering
+law wave_step_half_order:
+  for +m: Nat
+  for +lag: Bool
+  for +h: Nat
+  for +extra: Nat
+  for +p: Nat
+  {Nat.is_lt(wave_step(m, lag, h, p), wave_step(m, lag, Nat.add(h, 1n+extra), p)) == True{} : Bool}
+
+def wave_step_half_order(m, lag, h, extra, p):
+  L.nat_add_lt_l(wave_lag(lag), wave_base(m, h, p), wave_base(m, Nat.add(h, 1n+extra), p), pw_base_half_lt(m, h, extra, p))
+
+def pw_divmod_snd_d(n: Nat, +m: Nat, d1: Nat, d2: Nat, +r: Nat) -> {Pair.snd(Nat, Nat, Nat.divmod.go(n, m, d1, r)) == Pair.snd(Nat, Nat, Nat.divmod.go(n, m, d2, r)) : Nat}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+np:
+      match m:
+        case 0n:
+          pw_divmod_snd_d(np, r, 1n+d1, 1n+d2, 0n)
+        case 1n+mp:
+          pw_divmod_snd_d(np, mp, d1, d2, 1n+r)
+
+def pw_even_mod_zero(+n: Nat) -> {Nat.mod(wave_even(n), 2n) == 0n : Nat}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+p:
+      match p:
+        case 0n:
+          {==}
+        case 1n+q:
+          Equal.trans(
+            Nat,
+            Pair.snd(Nat, Nat, Nat.divmod.go(wave_even(q), 1n, 1n, 0n)),
+            Nat.mod(wave_even(q), 2n),
+            0n,
+            pw_divmod_snd_d(wave_even(q), 1n, 1n, 0n, 0n),
+            pw_even_mod_zero(q)
+          )
+
+# LAW PW8: wave_tiles always returns an even number of tiles (only complete pairs run).
+# promise: wave_tiles always produces an even count divisible by 2
+# catches: wave_tiles returns full_tiles without rounding down to complete pairs
+law wave_tiles_even:
+  for +n: Nat
+  for +e: Bool
+  {Nat.is_eq(Nat.mod(wave_tiles(n, e), 2n), 0n) == True{} : Bool}
+
+def wave_tiles_even(n, e):
+  match e:
+    case False{}:
+      {==}
+    case True{}:
+      %Equal.sym(Nat, Nat.mod(wave_even(n), 2n), 0n, pw_even_mod_zero(n)) : {Nat.is_eq(_, 0n) == True{} : Bool}
+      {==}

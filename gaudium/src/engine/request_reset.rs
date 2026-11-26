@@ -27,6 +27,7 @@
 //! selects that (`dirty`) or a zero fill of every cache (`full`) for every request.
 
 use super::*;
+use crate::verified as v;
 
 /// Rows past `prompt + generated` a request may have written: the widest verify block of a step
 /// that was already enqueued when the request stopped, the step before it, and the drafter's
@@ -74,6 +75,22 @@ impl ResetMode {
             Self::Full => "full",
         }
     }
+
+    fn to_verified(self) -> v::RrMode {
+        match self {
+            Self::Auto => v::RrMode::RrModeAuto,
+            Self::Dirty => v::RrMode::RrModeDirty,
+            Self::Full => v::RrMode::RrModeFull,
+        }
+    }
+
+    fn from_verified(m: v::RrMode) -> Self {
+        match m {
+            v::RrMode::RrModeAuto => Self::Auto,
+            v::RrMode::RrModeDirty => Self::Dirty,
+            v::RrMode::RrModeFull => Self::Full,
+        }
+    }
 }
 
 /// How the rows of one K/V cache are laid out in its buffer.
@@ -99,19 +116,25 @@ pub(super) fn dirty_ranges(
     }
     match layout {
         CacheLayout::ChunkMajor { chunks } => {
-            let chunks = chunks.max(1);
-            let n = dirty_rows.div_ceil(KV_CHUNK).min(chunks);
-            vec![(0, (cache_bytes / chunks) * n)]
+            let bytes = v::rr_chunk_dirty_bytes(cache_bytes, chunks, dirty_rows, KV_CHUNK);
+            if bytes == 0 {
+                Vec::new()
+            } else {
+                vec![(0, bytes)]
+            }
         }
         CacheLayout::HeadMajor { heads, rows } => {
-            let (heads, rows) = (heads.max(1), rows.max(1));
-            let per_head = cache_bytes / heads;
-            let row_bytes = per_head / rows;
-            let n = dirty_rows.next_multiple_of(128).min(rows);
-            if n == rows {
+            let heads_c = heads.max(1);
+            let per_head = cache_bytes / heads_c;
+            let n = v::rr_head_dirty_rows(rows, dirty_rows, 128);
+            if n == 0 {
+                return Vec::new();
+            }
+            if v::rr_head_full_span(rows, n) {
                 return vec![(0, cache_bytes)];
             }
-            (0..heads).map(|h| (h * per_head, n * row_bytes)).collect()
+            let span = v::rr_head_span_bytes(cache_bytes, heads, rows, n);
+            (0..heads_c).map(|h| (h * per_head, span)).collect()
         }
     }
 }
@@ -119,10 +142,7 @@ pub(super) fn dirty_ranges(
 /// Upper bound of the rows a request with `prompt` rows and at most `new_tokens` generated ones
 /// can have written, capped at the context capacity.
 pub(super) fn request_high_water(prompt: u64, new_tokens: u64, max_ctx: u64) -> u64 {
-    prompt
-        .saturating_add(new_tokens)
-        .saturating_add(HW_SLACK_ROWS)
-        .min(max_ctx)
+    v::rr_high_water(prompt, new_tokens, HW_SLACK_ROWS, max_ctx)
 }
 
 /// Reset bookkeeping of one loaded engine.
@@ -164,7 +184,23 @@ impl ResetState {
     /// request, or the reset after a request that ended with an error)? A request after such a
     /// reset cannot take anything over from the one before it.
     pub(super) fn zeroes_rows(&self) -> bool {
-        scope_of(self.mode, self.unclean) != Scope::StateOnly
+        !v::rr_is_state_only(self.mode.to_verified(), self.unclean)
+    }
+
+    fn as_verified(&self) -> v::RrState {
+        v::RrState::RrState(
+            self.mode.to_verified(),
+            self.kv_hw,
+            self.held_hw,
+            self.unclean,
+        )
+    }
+
+    fn apply_verified(&mut self, next: v::RrState) {
+        self.mode = ResetMode::from_verified(v::rr_state_mode(next));
+        self.kv_hw = v::rr_state_hw(next);
+        self.held_hw = v::rr_state_held(next);
+        self.unclean = v::rr_state_unclean(next);
     }
 }
 
@@ -190,11 +226,49 @@ enum Scope {
     Full,
 }
 
+impl Scope {
+    fn to_verified(self) -> v::RrScope {
+        match self {
+            Self::StateOnly => v::RrScope::RrScopeState,
+            Self::Dirty => v::RrScope::RrScopeDirty,
+            Self::Full => v::RrScope::RrScopeFull,
+        }
+    }
+
+    fn from_verified(sc: v::RrScope) -> Self {
+        match sc {
+            v::RrScope::RrScopeState => Self::StateOnly,
+            v::RrScope::RrScopeDirty => Self::Dirty,
+            v::RrScope::RrScopeFull => Self::Full,
+        }
+    }
+}
+
 fn scope_of(mode: ResetMode, unclean: bool) -> Scope {
-    match (mode, unclean) {
-        (ResetMode::Full, _) => Scope::Full,
-        (ResetMode::Dirty, _) | (ResetMode::Auto, true) => Scope::Dirty,
-        (ResetMode::Auto, false) => Scope::StateOnly,
+    Scope::from_verified(v::rr_scope(mode.to_verified(), unclean))
+}
+
+fn push_gdn_zero_ranges(
+    ranges: &mut Vec<(u64, u64)>,
+    scope: Scope,
+    s_addrs: [u64; 2],
+    s_one_bytes: u64,
+    s_slots: u64,
+    cs_addrs: [u64; 2],
+    cs_one_bytes: u64,
+    cs_slots: u64,
+) {
+    let sc = scope.to_verified();
+    let sb = v::rr_gdn_zero_bytes(sc, s_one_bytes, s_slots);
+    let csb = v::rr_gdn_zero_bytes(sc, cs_one_bytes, cs_slots);
+    if v::rr_zero_both_rings(sc) {
+        for p in 0..2 {
+            ranges.push((s_addrs[p], sb));
+            ranges.push((cs_addrs[p], csb));
+        }
+    } else {
+        ranges.push((s_addrs[0], sb));
+        ranges.push((cs_addrs[0], csb));
     }
 }
 
@@ -207,19 +281,21 @@ pub(super) fn begin_request(
     let t0 = Instant::now();
     let scope = scope_of(eng.reset.mode, eng.reset.unclean);
     let dirty_rows = eng.reset.kv_hw;
-    let ring_slots = eng.specdec.as_ref().map_or(1, |sd| sd.gdn_slots());
+    let s_slots = eng.specdec.as_ref().map_or(1, |sd| sd.gdn_state_slots());
+    let cs_slots = eng.specdec.as_ref().map_or(1, |sd| sd.gdn_slots());
 
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     for st in eng.gdn_state.values() {
-        if scope == Scope::Full {
-            for p in 0..2 {
-                ranges.push((st.s[p], st.s_bytes * ring_slots));
-                ranges.push((st.cs[p], st.cs_bytes * ring_slots));
-            }
-        } else {
-            ranges.push((st.s[0], st.s_bytes));
-            ranges.push((st.cs[0], st.cs_bytes));
-        }
+        push_gdn_zero_ranges(
+            &mut ranges,
+            scope,
+            st.s,
+            st.s_bytes,
+            s_slots,
+            st.cs,
+            st.cs_bytes,
+            cs_slots,
+        );
     }
     if scope != Scope::StateOnly {
         let rows = if scope == Scope::Full {
@@ -257,16 +333,15 @@ pub(super) fn begin_request(
         .map_err(|e| format!("request reset: sync: {e}"));
     res.and(synced)?;
 
-    let kept = if scope == Scope::StateOnly {
-        dirty_rows
-    } else {
-        0
-    };
     let st = &mut eng.reset;
-    st.held_hw = kept;
-    // Until the request reports what it wrote: everything its budget allows.
-    st.kv_hw = kept.max(request_high_water(prompt_len, max_new, eng.max_ctx));
-    st.unclean = true;
+    let next = v::rr_begin(
+        st.as_verified(),
+        prompt_len,
+        max_new,
+        HW_SLACK_ROWS,
+        eng.max_ctx,
+    );
+    st.apply_verified(next);
     st.last_ms = t0.elapsed().as_secs_f64() * 1000.0;
     st.last_bytes = bytes;
     if st.verbose {
@@ -302,9 +377,14 @@ pub(super) fn end_request(
     let max_ctx = eng.max_ctx;
     let st = &mut eng.reset;
     if let Ok(report) = res {
-        let wrote = request_high_water(prompt_len, report.generated_tokens.len() as u64, max_ctx);
-        st.kv_hw = st.held_hw.max(wrote);
-        st.unclean = false;
+        let next = v::rr_end_ok(
+            st.as_verified(),
+            prompt_len,
+            report.generated_tokens.len() as u64,
+            HW_SLACK_ROWS,
+            max_ctx,
+        );
+        st.apply_verified(next);
     }
 }
 
@@ -370,5 +450,74 @@ mod tests {
         );
         assert_eq!(request_high_water(130_000, 4096, 131072), 131072);
         assert_eq!(request_high_water(u64::MAX, 5, 4096), 4096);
+    }
+
+    #[test]
+    fn full_reset_uses_distinct_gdn_state_and_conv_slot_counts() {
+        let mut ranges = Vec::new();
+        // Recurrent state (`s`) keeps 1 slot under replay while conv state (`cs`) has 32 slots.
+        push_gdn_zero_ranges(
+            &mut ranges,
+            Scope::Full,
+            [0x1000, 0x2000],
+            4096,
+            1,
+            [0x3000, 0x4000],
+            512,
+            32,
+        );
+        assert_eq!(
+            ranges,
+            vec![
+                (0x1000, 4096),
+                (0x3000, 512 * 32),
+                (0x2000, 4096),
+                (0x4000, 512 * 32),
+            ]
+        );
+
+        let mut state_only = Vec::new();
+        push_gdn_zero_ranges(
+            &mut state_only,
+            Scope::StateOnly,
+            [0x1000, 0x2000],
+            4096,
+            1,
+            [0x3000, 0x4000],
+            512,
+            32,
+        );
+        assert_eq!(state_only, vec![(0x1000, 4096), (0x3000, 512)]);
+    }
+
+    #[test]
+    fn head_and_chunk_dirty_ranges_handle_u64_max_without_overflow() {
+        let head = CacheLayout::HeadMajor {
+            heads: 8,
+            rows: 8192,
+        };
+        let bytes = 8 * 8192 * 256u64;
+        assert_eq!(dirty_ranges(head, bytes, u64::MAX), vec![(0, bytes)]);
+
+        let chunk = CacheLayout::ChunkMajor { chunks: 8 };
+        let cbytes = 8 * 1024 * 1024u64;
+        assert_eq!(dirty_ranges(chunk, cbytes, u64::MAX), vec![(0, cbytes)]);
+    }
+
+    #[test]
+    fn reset_state_escalates_to_dirty_after_failed_request() {
+        let mut st = ResetState::new(ResetMode::Auto, false);
+        assert!(!st.zeroes_rows());
+
+        let next = v::rr_begin(st.as_verified(), 100, 200, HW_SLACK_ROWS, 4096);
+        st.apply_verified(next);
+        assert!(st.unclean);
+        assert!(st.zeroes_rows());
+
+        let done = v::rr_end_ok(st.as_verified(), 100, 20, HW_SLACK_ROWS, 4096);
+        st.apply_verified(done);
+        assert!(!st.unclean);
+        assert!(!st.zeroes_rows());
+        assert_eq!(st.kv_hw, 120 + HW_SLACK_ROWS);
     }
 }

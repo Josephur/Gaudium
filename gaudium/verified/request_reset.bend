@@ -1,0 +1,885 @@
+# Per-request device state reset (`engine/request_reset.rs`):
+#   - Resets DeltaNet start state (`slot 0` of `ring 0` normally; full allocated rings on `Full`)
+#     using separate `alloc_slots` for recurrent state (`s`) and conv state (`cs`) so a 1-slot
+#     recurrent replay ring is never zeroed past its allocation.
+#   - Computes overflow-free dirty byte / row spans for ChunkMajor and HeadMajor caches.
+#   - Tracks per-request written high-water rows and transitions `ResetState` across request begin
+#     and successful completion (so a failed request automatically zeroes written rows next turn).
+
+import Base
+import nat_lemmas.bend as L
+import lemmas.bend as G
+
+# ============================================================================
+# 1. Helper Nat / Bool lemmas (erased before Rust codegen)
+# ============================================================================
+
+def rr_le_add_sub_self(+floor: Nat, +r: Nat, h_le: {Nat.is_le(floor, r) == True{} : Bool}) -> {Nat.add(floor, Nat.sub(r, floor)) == r : Nat}:
+  match floor r:
+    case 0n 0n:
+      {==}
+    case 0n 1n+rp:
+      {==}
+    case 1n+fp 0n:
+      L.bool_absurd({Nat.add(1n+fp, Nat.sub(0n, 1n+fp)) == 0n : Nat}, h_le)
+    case 1n+fp 1n+rp:
+      %rr_le_add_sub_self(fp, rp, h_le) : {1n+Nat.add(fp, Nat.sub(rp, fp)) == 1n+_ : Nat}
+      {==}
+
+def rr_ge_one_max1(x: Nat) -> {Nat.is_le(1n, Nat.max(1n, x)) == True{} : Bool}:
+  L.nat_max_ge_l(1n, x)
+
+def rr_min_ge_one(+a: Nat, +b: Nat, ha: {Nat.is_le(1n, a) == True{} : Bool}, hb: {Nat.is_le(1n, b) == True{} : Bool}) -> {Nat.is_le(1n, Nat.min(a, b)) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      L.bool_absurd({Nat.is_le(1n, Nat.min(0n, b)) == True{} : Bool}, ha)
+    case 1n+ap 0n:
+      L.bool_absurd({Nat.is_le(1n, Nat.min(1n+ap, 0n)) == True{} : Bool}, hb)
+    case 1n+ap 1n+bp:
+      L.nat_le_zero(Nat.min(ap, bp))
+
+# ============================================================================
+# 2. Reset mode, scope, and DeltaNet ring zero sizes
+# ============================================================================
+
+type RrMode is Data:
+  RrModeAuto{}
+  RrModeDirty{}
+  RrModeFull{}
+
+type RrScope is Data:
+  RrScopeState{}
+  RrScopeDirty{}
+  RrScopeFull{}
+
+def rr_scope(+mode: RrMode, +unclean: Bool) -> RrScope:
+  match mode:
+    case RrModeFull{}:
+      RrScopeFull{}
+    case RrModeDirty{}:
+      RrScopeDirty{}
+    case RrModeAuto{}:
+      match unclean:
+        case True{}:
+          RrScopeDirty{}
+        case False{}:
+          RrScopeState{}
+
+def rr_scope_is_state(+scope: RrScope) -> Bool:
+  match scope:
+    case RrScopeState{}:
+      True{}
+    case _:
+      False{}
+
+def rr_is_state_only(+mode: RrMode, +unclean: Bool) -> Bool:
+  rr_scope_is_state(rr_scope(mode, unclean))
+
+def rr_kept_hw(+scope: RrScope, dirty_rows: Nat) -> Nat:
+  match scope:
+    case RrScopeState{}:
+      dirty_rows
+    case _:
+      0n
+
+def rr_zero_both_rings(+scope: RrScope) -> Bool:
+  match scope:
+    case RrScopeFull{}:
+      True{}
+    case _:
+      False{}
+
+# Bytes of one DeltaNet tensor ring (`s[p]` or `cs[p]`) to zero for a request.
+# `alloc_slots` is that tensor's own ring slot count (`gdn_state_slots()` for `s`,
+# `gdn_slots()` for `cs`). In State/Dirty modes only slot 0 (`one_bytes`) is zeroed.
+def rr_gdn_zero_bytes(+scope: RrScope, one_bytes: Nat, alloc_slots: Nat) -> Nat:
+  match scope:
+    case RrScopeFull{}:
+      Nat.mul(one_bytes, Nat.max(1n, alloc_slots))
+    case RrScopeDirty{}:
+      one_bytes
+    case RrScopeState{}:
+      one_bytes
+
+# ============================================================================
+# 3. Overflow-free dirty range sizing for ChunkMajor & HeadMajor KV caches
+# ============================================================================
+
+def rr_div_ceil_pick(q: Nat, +rem_gt_zero: Bool) -> Nat:
+  match rem_gt_zero:
+    case True{}:
+      Nat.add(q, 1n)
+    case False{}:
+      q
+
+def rr_div_ceil(+rows: Nat, +block: Nat) -> Nat:
+  match rows:
+    case 0n:
+      0n
+    case 1n+rp:
+      match block:
+        case 0n:
+          1n+rp
+        case 1n+bm1:
+          rr_div_ceil_pick(Nat.div(1n+rp, 1n+bm1), Nat.is_gt(Nat.mod(1n+rp, 1n+bm1), 0n))
+
+def rr_chunk_dirty_nonzero(+cache_bytes: Nat, +c: Nat, +dirty_rows: Nat, +chunk_rows: Nat) -> Nat:
+  match cache_bytes:
+    case 0n:
+      0n
+    case 1n+cp:
+      Nat.mul(Nat.div(1n+cp, c), Nat.min(rr_div_ceil(dirty_rows, chunk_rows), c))
+
+# Prefix bytes to zero in a ChunkMajor KV cache (`0n` when `dirty_rows == 0n` or `cache_bytes == 0n`).
+def rr_chunk_dirty_bytes(+cache_bytes: Nat, +chunks: Nat, +dirty_rows: Nat, +chunk_rows: Nat) -> Nat:
+  match dirty_rows:
+    case 0n:
+      0n
+    case 1n+rp:
+      rr_chunk_dirty_nonzero(cache_bytes, Nat.max(1n, chunks), 1n+rp, chunk_rows)
+
+def rr_head_dirty_pick(r: Nat, cand: Nat, +fits: Bool) -> Nat:
+  match fits:
+    case True{}:
+      cand
+    case False{}:
+      r
+
+def rr_head_dirty_align_nz(+r: Nat, dirty: Nat, +block: Nat, +rem_zero: Bool, +floor: Nat) -> Nat:
+  match rem_zero:
+    case True{}:
+      dirty
+    case False{}:
+      rr_head_dirty_pick(r, Nat.add(floor, block), Nat.is_le(block, Nat.sub(r, floor)))
+
+def rr_head_dirty_block(+r: Nat, +dirty: Nat, +block: Nat) -> Nat:
+  match block:
+    case 0n:
+      dirty
+    case 1n+bm1:
+      rr_head_dirty_align_nz(
+        r,
+        dirty,
+        1n+bm1,
+        Nat.is_eq(Nat.mod(dirty, 1n+bm1), 0n),
+        Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1)
+      )
+
+def rr_head_dirty_lt(+r: Nat, +dirty: Nat, +block: Nat, +within: Bool) -> Nat:
+  match within:
+    case True{}:
+      rr_head_dirty_block(r, dirty, block)
+    case False{}:
+      r
+
+# Rows per head to zero in a HeadMajor cache, rounded up to `row_block` and clamped at `max(1, rows)`.
+def rr_head_dirty_rows(+rows: Nat, +dirty_rows: Nat, +row_block: Nat) -> Nat:
+  match dirty_rows:
+    case 0n:
+      0n
+    case 1n+rp:
+      rr_head_dirty_lt(Nat.max(1n, rows), 1n+rp, row_block, Nat.is_lt(1n+rp, Nat.max(1n, rows)))
+
+def rr_head_full_span(+rows: Nat, +n: Nat) -> Bool:
+  Nat.is_eq(n, Nat.max(1n, rows))
+
+def rr_head_span_bytes(+cache_bytes: Nat, +heads: Nat, +rows: Nat, +n: Nat) -> Nat:
+  Nat.mul(
+    Nat.min(n, Nat.max(1n, rows)),
+    Nat.div(Nat.div(cache_bytes, Nat.max(1n, heads)), Nat.max(1n, rows))
+  )
+
+# ============================================================================
+# 4. Overflow-free high-water mark & ResetState lifecycle
+# ============================================================================
+
+def rr_hw_step_pick(+cap: Nat, +base: Nat, +add: Nat, +fits: Bool) -> Nat:
+  match fits:
+    case True{}:
+      Nat.add(base, add)
+    case False{}:
+      cap
+
+def rr_hw_add_capped(+cap: Nat, +base: Nat, +add: Nat) -> Nat:
+  rr_hw_step_pick(cap, base, add, Nat.is_le(add, Nat.sub(cap, base)))
+
+def rr_hw_from_prompt(+max_ctx: Nat, +prompt: Nat, +new_tokens: Nat, +slack: Nat, +p_fits: Bool) -> Nat:
+  match p_fits:
+    case True{}:
+      rr_hw_add_capped(max_ctx, rr_hw_add_capped(max_ctx, prompt, new_tokens), slack)
+    case False{}:
+      max_ctx
+
+# Row high-water mark (`min(prompt + new_tokens + slack, max_ctx)` without overflow).
+def rr_high_water(+prompt: Nat, +new_tokens: Nat, +slack: Nat, +max_ctx: Nat) -> Nat:
+  rr_hw_from_prompt(max_ctx, prompt, new_tokens, slack, Nat.is_le(prompt, max_ctx))
+
+type RrState is Data:
+  RrState{mode: RrMode, kv_hw: Nat, held_hw: Nat, unclean: Bool}
+
+def rr_state_hw(st: RrState) -> Nat:
+  match st:
+    case RrState{_, hw, _, _}:
+      hw
+
+def rr_state_held(st: RrState) -> Nat:
+  match st:
+    case RrState{_, _, held, _}:
+      held
+
+def rr_state_unclean(st: RrState) -> Bool:
+  match st:
+    case RrState{_, _, _, u}:
+      u
+
+def rr_state_mode(st: RrState) -> RrMode:
+  match st:
+    case RrState{m, _, _, _}:
+      m
+
+def rr_begin_kept(+m: RrMode, +kept: Nat, prompt: Nat, max_new: Nat, slack: Nat, max_ctx: Nat) -> RrState:
+  RrState{m, Nat.max(kept, rr_high_water(prompt, max_new, slack, max_ctx)), kept, True{}}
+
+def rr_begin_fields(+m: RrMode, hw: Nat, u: Bool, prompt: Nat, max_new: Nat, slack: Nat, max_ctx: Nat) -> RrState:
+  rr_begin_kept(m, rr_kept_hw(rr_scope(m, u), hw), prompt, max_new, slack, max_ctx)
+
+def rr_begin(st: RrState, prompt: Nat, max_new: Nat, slack: Nat, max_ctx: Nat) -> RrState:
+  match st:
+    case RrState{m, hw, _, u}:
+      rr_begin_fields(m, hw, u, prompt, max_new, slack, max_ctx)
+
+def rr_end_ok_fields(m: RrMode, +held: Nat, prompt: Nat, generated: Nat, slack: Nat, max_ctx: Nat) -> RrState:
+  RrState{m, Nat.max(held, rr_high_water(prompt, generated, slack, max_ctx)), held, False{}}
+
+def rr_end_ok(st: RrState, prompt: Nat, generated: Nat, slack: Nat, max_ctx: Nat) -> RrState:
+  match st:
+    case RrState{m, _, held, _}:
+      rr_end_ok_fields(m, held, prompt, generated, slack, max_ctx)
+
+# ============================================================================
+# 5. Proofs & Laws
+# ============================================================================
+
+# LAW RR.1: Full reset mode always selects Full scope regardless of unclean history.
+# promise: full reset mode always produces full scope
+# catches: unclean checked before Full mode so Full falls back to Dirty
+law rr_full_always_full:
+  for +u: Bool
+  {rr_scope(RrModeFull{}, u) == RrScopeFull{} : RrScope}
+
+def rr_full_always_full(u):
+  {==}
+
+# LAW RR.2: An Auto request after a failed request escalates to Dirty scope.
+# promise: an unclean Auto state always zeroes dirty KV rows on the next reset
+# catches: Auto mode ignores unclean and stays in StateOnly
+law rr_auto_unclean_is_dirty:
+  {rr_scope(RrModeAuto{}, True{}) == RrScopeDirty{} : RrScope}
+
+def rr_auto_unclean_is_dirty():
+  {==}
+
+# LAW RR.3: Clean Auto mode uses StateOnly and never zeroes both rings.
+# promise: clean Auto mode selects StateOnly and never zeroes ring 1
+# catches: rr_zero_both_rings returns True for StateOnly
+law rr_auto_clean_is_state_only:
+  {Bool.and(rr_is_state_only(RrModeAuto{}, False{}), Bool.not(rr_zero_both_rings(rr_scope(RrModeAuto{}, False{})))) == True{} : Bool}
+
+def rr_auto_clean_is_state_only():
+  {==}
+
+# LAW RR.4: Zeroing bytes for a DeltaNet ring NEVER exceeds `one_bytes * alloc_slots` when alloc_slots >= 1.
+# promise: DeltaNet reset bytes never exceed the tensor's own allocated ring bytes (`one_bytes * alloc_slots`)
+# catches: Full reset returns one_bytes * (alloc_slots + 1) or ignores alloc_slots in favor of a larger constant
+law rr_gdn_zero_within_alloc:
+  for +sc: RrScope
+  for +one_bytes: Nat
+  for +slots_m1: Nat
+  {Nat.is_le(rr_gdn_zero_bytes(sc, one_bytes, 1n+slots_m1), Nat.mul(one_bytes, 1n+slots_m1)) == True{} : Bool}
+
+def rr_gdn_zero_within_alloc(sc, one_bytes, slots_m1):
+  match sc:
+    case RrScopeFull{}:
+      L.nat_le_refl(Nat.mul(one_bytes, 1n+slots_m1))
+    case RrScopeDirty{}:
+      %L.nat_mul_one_r(one_bytes) : {Nat.is_le(_, Nat.mul(one_bytes, 1n+slots_m1)) == True{} : Bool}
+      L.nat_mul_le_mono_l(one_bytes, 1n, 1n+slots_m1, L.nat_le_zero(slots_m1))
+    case RrScopeState{}:
+      %L.nat_mul_one_r(one_bytes) : {Nat.is_le(_, Nat.mul(one_bytes, 1n+slots_m1)) == True{} : Bool}
+      L.nat_mul_le_mono_l(one_bytes, 1n, 1n+slots_m1, L.nat_le_zero(slots_m1))
+
+# LAW RR.5: Every reset scope zeroes at least slot 0 (`one_bytes`).
+# promise: every reset scope covers at least slot 0 of ring 0 (`one_bytes`)
+# catches: StateOnly/Dirty returns 0n instead of one_bytes
+law rr_gdn_zero_covers_slot0:
+  for +sc: RrScope
+  for +one_bytes: Nat
+  for +alloc_slots: Nat
+  {Nat.is_le(one_bytes, rr_gdn_zero_bytes(sc, one_bytes, alloc_slots)) == True{} : Bool}
+
+def rr_gdn_zero_covers_slot0_full(+one_bytes: Nat, +max_slots: Nat, h: {Nat.is_le(1n, max_slots) == True{} : Bool}) -> {Nat.is_le(one_bytes, Nat.mul(one_bytes, max_slots)) == True{} : Bool}:
+  %L.nat_mul_one_r(one_bytes) : {Nat.is_le(_, Nat.mul(one_bytes, max_slots)) == True{} : Bool}
+  L.nat_mul_le_mono_l(one_bytes, 1n, max_slots, h)
+
+def rr_gdn_zero_covers_slot0(sc, one_bytes, alloc_slots):
+  match sc:
+    case RrScopeFull{}:
+      rr_gdn_zero_covers_slot0_full(one_bytes, Nat.max(1n, alloc_slots), rr_ge_one_max1(alloc_slots))
+    case RrScopeDirty{}:
+      L.nat_le_refl(one_bytes)
+    case RrScopeState{}:
+      L.nat_le_refl(one_bytes)
+
+# LAW RR.6: Full reset covers ALL allocated slots of a DeltaNet ring (`one_bytes * alloc_slots`).
+# promise: Full scope covers at least every allocated slot of the DeltaNet ring
+# catches: Full arm replaced by StateOnly (`one_bytes`)
+law rr_gdn_full_covers_all_slots:
+  for +one_bytes: Nat
+  for +slots_m1: Nat
+  {Nat.is_le(Nat.mul(one_bytes, 1n+slots_m1), rr_gdn_zero_bytes(RrScopeFull{}, one_bytes, 1n+slots_m1)) == True{} : Bool}
+
+def rr_gdn_full_covers_all_slots(one_bytes, slots_m1):
+  L.nat_le_refl(Nat.mul(one_bytes, 1n+slots_m1))
+
+# LAW RR.7: ChunkMajor dirty bytes NEVER exceed `cache_bytes`.
+# promise: ChunkMajor dirty zero fill never exceeds cache_bytes
+# catches: Nat.min(c) dropped from chunk count in rr_chunk_dirty_nonzero
+law rr_chunk_dirty_within_cache:
+  for +cb: Nat
+  for +chunks: Nat
+  for +rows: Nat
+  for +cr: Nat
+  {Nat.is_le(rr_chunk_dirty_bytes(cb, chunks, rows, cr), cb) == True{} : Bool}
+
+def rr_chunk_dirty_within_cache_nz(+cb: Nat, +c_m1: Nat, +rows: Nat, +cr: Nat) -> {Nat.is_le(Nat.mul(Nat.div(cb, 1n+c_m1), Nat.min(rr_div_ceil(rows, cr), 1n+c_m1)), cb) == True{} : Bool}:
+  L.nat_le_trans(
+    Nat.mul(Nat.div(cb, 1n+c_m1), Nat.min(rr_div_ceil(rows, cr), 1n+c_m1)),
+    Nat.mul(Nat.div(cb, 1n+c_m1), 1n+c_m1),
+    cb,
+    L.nat_mul_le_mono_l(Nat.div(cb, 1n+c_m1), Nat.min(rr_div_ceil(rows, cr), 1n+c_m1), 1n+c_m1, L.nat_min_le_r(rr_div_ceil(rows, cr), 1n+c_m1)),
+    L.nat_align_down_le(cb, c_m1)
+  )
+
+def rr_chunk_dirty_within_rows_nz(+cb: Nat, +chunks: Nat, +rows: Nat, +cr: Nat) -> {Nat.is_le(rr_chunk_dirty_nonzero(cb, Nat.max(1n, chunks), rows, cr), cb) == True{} : Bool}:
+  match cb:
+    case 0n:
+      {==}
+    case 1n+cp:
+      match chunks:
+        case 0n:
+          rr_chunk_dirty_within_cache_nz(1n+cp, 0n, rows, cr)
+        case 1n+cm1:
+          rr_chunk_dirty_within_cache_nz(1n+cp, cm1, rows, cr)
+
+def rr_chunk_dirty_within_cache(cb, chunks, rows, cr):
+  match rows:
+    case 0n:
+      L.nat_le_zero(cb)
+    case 1n+rp:
+      rr_chunk_dirty_within_rows_nz(cb, chunks, 1n+rp, cr)
+
+# LAW RR.8: Zero dirty rows produces zero bytes for ChunkMajor and zero rows for HeadMajor.
+# promise: zero dirty rows requires zero KV bytes to clear
+# catches: rr_chunk_dirty_bytes or rr_head_dirty_rows returns non-zero when dirty_rows is 0
+law rr_zero_dirty_clears_nothing:
+  for +cb: Nat
+  for +chunks: Nat
+  for +rows: Nat
+  for +cr: Nat
+  for +rb: Nat
+  {Bool.and(Nat.is_eq(rr_chunk_dirty_bytes(cb, chunks, 0n, cr), 0n), Nat.is_eq(rr_head_dirty_rows(rows, 0n, rb), 0n)) == True{} : Bool}
+
+def rr_zero_dirty_clears_nothing(cb, chunks, rows, cr, rb):
+  {==}
+
+# LAW RR.9: Non-zero dirty rows in a ChunkMajor cache covers every dirty chunk up to max(1, chunks).
+# promise: rr_chunk_dirty_bytes covers at least (cb / max(1, chunks)) * min(ceil(dirty_rows / max(1, cr)), max(1, chunks)) bytes
+# catches: rr_chunk_dirty_nonzero caps chunks at 1n or drops Nat.max(1n, chunks)
+law rr_chunk_dirty_covers_chunks:
+  for +cb: Nat
+  for +chunks: Nat
+  for +r_m1: Nat
+  for +cr: Nat
+  {Nat.is_le(Nat.mul(Nat.div(cb, Nat.max(1n, chunks)), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(Nat.max(1n, cr), 1n)), Nat.max(1n, cr)), Nat.max(1n, chunks))), rr_chunk_dirty_bytes(cb, chunks, 1n+r_m1, cr)) == True{} : Bool}
+
+def rr_succ_mul_eq(+q: Nat, +x: Nat) -> {Nat.add(Nat.mul(q, x), x) == Nat.mul(Nat.add(q, 1n), x) : Nat}:
+  %Equal.sym(Nat, Nat.add(q, 1n), 1n+q, L.nat_add_comm(q, 1n)) : {Nat.add(Nat.mul(q, x), x) == Nat.mul(_, x) : Nat}
+  %L.nat_add_comm(x, Nat.mul(q, x)) : {_ == Nat.mul(1n+q, x) : Nat}
+  {==}
+
+def rr_split_nz_add(+r_m1: Nat, +cr_m1: Nat, +q: Nat, +mp: Nat, eq: {q == Nat.div(1n+r_m1, 1n+cr_m1) : Nat}, em: {1n+mp == Nat.mod(1n+r_m1, 1n+cr_m1) : Nat}) -> {Nat.add(1n+r_m1, cr_m1) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}:
+  %L.nat_div_mod_r(1n+r_m1, cr_m1) : {Nat.add(_, cr_m1) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %eq : {Nat.add(Nat.add(Nat.mul(_, 1n+cr_m1), Nat.mod(1n+r_m1, 1n+cr_m1)), cr_m1) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %em : {Nat.add(Nat.add(Nat.mul(q, 1n+cr_m1), _), cr_m1) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.mul(q, 1n+cr_m1), 1n+mp), cr_m1), Nat.add(Nat.mul(q, 1n+cr_m1), Nat.add(1n+mp, cr_m1)), L.nat_add_assoc(Nat.mul(q, 1n+cr_m1), 1n+mp, cr_m1)) : {_ == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %Equal.sym(Nat, Nat.add(mp, cr_m1), Nat.add(cr_m1, mp), L.nat_add_comm(mp, cr_m1)) : {Nat.add(Nat.mul(q, 1n+cr_m1), 1n+_) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %L.nat_add_assoc(Nat.mul(q, 1n+cr_m1), 1n+cr_m1, mp) : {_ == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.mul(q, 1n+cr_m1), 1n+cr_m1), Nat.mul(Nat.add(q, 1n), 1n+cr_m1), rr_succ_mul_eq(q, 1n+cr_m1)) : {Nat.add(_, mp) == Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp) : Nat}
+  {==}
+
+def rr_split_z_add(+r_m1: Nat, +cr_m1: Nat, +q: Nat, eq: {q == Nat.div(1n+r_m1, 1n+cr_m1) : Nat}, em: {0n == Nat.mod(1n+r_m1, 1n+cr_m1) : Nat}) -> {Nat.add(1n+r_m1, cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}:
+  %L.nat_div_mod_r(1n+r_m1, cr_m1) : {Nat.add(_, cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}
+  %eq : {Nat.add(Nat.add(Nat.mul(_, 1n+cr_m1), Nat.mod(1n+r_m1, 1n+cr_m1)), cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}
+  %em : {Nat.add(Nat.add(Nat.mul(q, 1n+cr_m1), _), cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.mul(q, 1n+cr_m1), 0n), Nat.mul(q, 1n+cr_m1), L.nat_add_zero_r(Nat.mul(q, 1n+cr_m1))) : {Nat.add(_, cr_m1) == Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1) : Nat}
+  {==}
+
+def rr_div_ceil_exact_aux(+r_m1: Nat, +cr_m1: Nat, +q: Nat, +m: Nat, eq: {q == Nat.div(1n+r_m1, 1n+cr_m1) : Nat}, em1: {m == Nat.mod(1n+r_m1, 1n+cr_m1) : Nat}, em2: {m == Nat.mod(1n+r_m1, 1n+cr_m1) : Nat}) -> {rr_div_ceil_pick(q, Nat.is_gt(m, 0n)) == Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1) : Nat}:
+  match m:
+    case 0n:
+      %Equal.sym(Nat, Nat.add(1n+r_m1, cr_m1), Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1), rr_split_z_add(r_m1, cr_m1, q, eq, em1)) : {q == Nat.div(_, 1n+cr_m1) : Nat}
+      Equal.sym(Nat, Nat.div(Nat.add(Nat.mul(q, 1n+cr_m1), cr_m1), 1n+cr_m1), q, L.nat_div_split(q, cr_m1, cr_m1, L.nat_lt_succ_self(cr_m1)))
+    case 1n+mp:
+      +hlt_succ = L.nat_lt_subst_l(Nat.mod(1n+r_m1, 1n+cr_m1), 1n+mp, 1n+cr_m1, Equal.sym(Nat, 1n+mp, Nat.mod(1n+r_m1, 1n+cr_m1), em1), L.nat_mod_lt(1n+r_m1, cr_m1))
+      +hlt_mp = L.nat_lt_trans(mp, 1n+mp, 1n+cr_m1, L.nat_lt_succ_self(mp), hlt_succ)
+      %Equal.sym(Nat, Nat.add(1n+r_m1, cr_m1), Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp), rr_split_nz_add(r_m1, cr_m1, q, mp, eq, em2)) : {Nat.add(q, 1n) == Nat.div(_, 1n+cr_m1) : Nat}
+      Equal.sym(Nat, Nat.div(Nat.add(Nat.mul(Nat.add(q, 1n), 1n+cr_m1), mp), 1n+cr_m1), Nat.add(q, 1n), L.nat_div_split(Nat.add(q, 1n), mp, cr_m1, hlt_mp))
+
+def rr_div_ceil_eq_ceil_div(+r_m1: Nat, +cr_m1: Nat) -> {rr_div_ceil(1n+r_m1, 1n+cr_m1) == Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1) : Nat}:
+  rr_div_ceil_exact_aux(r_m1, cr_m1, Nat.div(1n+r_m1, 1n+cr_m1), Nat.mod(1n+r_m1, 1n+cr_m1), {==}, {==}, {==})
+
+def rr_sub_zero_r(+x: Nat) -> {Nat.sub(x, 0n) == x : Nat}:
+  match x:
+    case 0n: {==}
+    case 1n+_: {==}
+
+def rr_chunk_dirty_covers_cr(+cp: Nat, +c_nz: Nat, +r_m1: Nat, +cr: Nat) -> {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(Nat.max(1n, cr), 1n)), Nat.max(1n, cr)), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, cr), c_nz))) == True{} : Bool}:
+  match cr:
+    case 0n:
+      %Equal.sym(Nat, Nat.add(r_m1, 0n), r_m1, L.nat_add_zero_r(r_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(1n+_, 1n), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, 0n), c_nz))) == True{} : Bool}
+      %L.nat_mul_one_r(1n+r_m1) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(_, 1n), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, 0n), c_nz))) == True{} : Bool}
+      %L.nat_div_mul(1n+r_m1, 0n) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.mul(1n+r_m1, 1n), 1n), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(_, c_nz))) == True{} : Bool}
+      L.nat_le_refl(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.mul(1n+r_m1, 1n), 1n), c_nz)))
+    case 1n+cr_m1:
+      %Equal.sym(Nat, Nat.max(1n, 1n+cr_m1), 1n+cr_m1, G.g_nat_max_one_succ(cr_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(_, 1n)), _), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, 1n+cr_m1), c_nz))) == True{} : Bool}
+      %Equal.sym(Nat, Nat.sub(cr_m1, 0n), cr_m1, rr_sub_zero_r(cr_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, _), 1n+cr_m1), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, 1n+cr_m1), c_nz))) == True{} : Bool}
+      %Equal.sym(Nat, rr_div_ceil(1n+r_m1, 1n+cr_m1), Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), rr_div_ceil_eq_ceil_div(r_m1, cr_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(_, c_nz))) == True{} : Bool}
+      L.nat_le_refl(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), c_nz)))
+
+def rr_chunk_dirty_covers_chunks(cb, chunks, r_m1, cr):
+  match cb:
+    case 0n:
+      match chunks:
+        case 0n:
+          {==}
+        case 1n+c_m1:
+          %Equal.sym(Nat, Nat.max(1n, 1n+c_m1), 1n+c_m1, G.g_nat_max_one_succ(c_m1)) : {Nat.is_le(Nat.mul(Nat.div(0n, _), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(Nat.max(1n, cr), 1n)), Nat.max(1n, cr)), _)), 0n) == True{} : Bool}
+          {==}
+    case 1n+cp:
+      match chunks:
+        case 0n:
+          rr_chunk_dirty_covers_cr(cp, 1n, r_m1, cr)
+        case 1n+c_m1:
+          %Equal.sym(Nat, Nat.max(1n, 1n+c_m1), 1n+c_m1, G.g_nat_max_one_succ(c_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, _), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(Nat.max(1n, cr), 1n)), Nat.max(1n, cr)), _)), Nat.mul(Nat.div(1n+cp, _), Nat.min(rr_div_ceil(1n+r_m1, cr), _))) == True{} : Bool}
+          rr_chunk_dirty_covers_cr(cp, 1n+c_m1, r_m1, cr)
+
+# LAW RR.10: HeadMajor dirty rows NEVER exceed `max(1, rows)`.
+# promise: HeadMajor dirty rows stay within [0, max(1, rows)]
+# catches: rr_head_dirty_pick ignores rows clamp when floor + block > rows
+law rr_head_dirty_within_rows:
+  for +rows: Nat
+  for +dirty: Nat
+  for +rb: Nat
+  {Nat.is_le(rr_head_dirty_rows(rows, dirty, rb), Nat.max(1n, rows)) == True{} : Bool}
+
+def rr_head_dirty_pick_le(+r: Nat, +floor: Nat, +block: Nat, +fits: Bool, hfl: {Nat.is_le(floor, r) == True{} : Bool}, hfits: {Nat.is_le(block, Nat.sub(r, floor)) == fits : Bool}) -> {Nat.is_le(rr_head_dirty_pick(r, Nat.add(floor, block), fits), r) == True{} : Bool}:
+  match fits:
+    case True{}:
+      %rr_le_add_sub_self(floor, r, hfl) : {Nat.is_le(Nat.add(floor, block), _) == True{} : Bool}
+      L.nat_add_le_mono(floor, floor, block, Nat.sub(r, floor), L.nat_le_refl(floor), hfits)
+    case False{}:
+      L.nat_le_refl(r)
+
+def rr_head_dirty_align_le(+r: Nat, +dirty: Nat, +bm1: Nat, +rz: Bool, hle: {Nat.is_le(dirty, r) == True{} : Bool}) -> {Nat.is_le(rr_head_dirty_align_nz(r, dirty, 1n+bm1, rz, Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1)), r) == True{} : Bool}:
+  match rz:
+    case True{}:
+      hle
+    case False{}:
+      rr_head_dirty_pick_le(
+        r,
+        Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1),
+        1n+bm1,
+        Nat.is_le(1n+bm1, Nat.sub(r, Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1))),
+        L.nat_le_trans(Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1), dirty, r, L.nat_align_down_le(dirty, bm1), hle),
+        {==}
+      )
+
+def rr_head_dirty_lt_true_le(+r: Nat, +dirty: Nat, +rb: Nat, hle: {Nat.is_le(dirty, r) == True{} : Bool}) -> {Nat.is_le(rr_head_dirty_block(r, dirty, rb), r) == True{} : Bool}:
+  match rb:
+    case 0n:
+      hle
+    case 1n+bm1:
+      rr_head_dirty_align_le(r, dirty, bm1, Nat.is_eq(Nat.mod(dirty, 1n+bm1), 0n), hle)
+
+def rr_head_dirty_lt_proof(+r: Nat, +dirty: Nat, +rb: Nat, +w: Bool, hw: {Nat.is_lt(dirty, r) == w : Bool}) -> {Nat.is_le(rr_head_dirty_lt(r, dirty, rb, w), r) == True{} : Bool}:
+  match w:
+    case False{}:
+      L.nat_le_refl(r)
+    case True{}:
+      rr_head_dirty_lt_true_le(r, dirty, rb, L.nat_lt_imp_le(dirty, r, hw))
+
+def rr_head_dirty_within_rows(rows, dirty, rb):
+  match dirty:
+    case 0n:
+      L.nat_le_zero(Nat.max(1n, rows))
+    case 1n+rp:
+      rr_head_dirty_lt_proof(Nat.max(1n, rows), 1n+rp, rb, Nat.is_lt(1n+rp, Nat.max(1n, rows)), {==})
+
+# LAW RR.11: When dirty <= rows + extra (and so <= max(1, rows)), HeadMajor dirty rows cover all dirty rows.
+# promise: HeadMajor dirty rows always cover all dirty rows whenever dirty <= max(1, rows)
+# catches: rr_head_dirty_block truncates down to floor instead of aligning up
+law rr_head_dirty_covers_input:
+  for +dirty: Nat
+  for +extra: Nat
+  for +rb: Nat
+  {Nat.is_le(dirty, rr_head_dirty_rows(Nat.add(dirty, extra), dirty, rb)) == True{} : Bool}
+
+def rr_head_dirty_pick_ge(+dirty: Nat, +r: Nat, +floor: Nat, +block: Nat, +fits: Bool, hr: {Nat.is_le(dirty, r) == True{} : Bool}, hcov: {Nat.is_le(dirty, Nat.add(floor, block)) == True{} : Bool}) -> {Nat.is_le(dirty, rr_head_dirty_pick(r, Nat.add(floor, block), fits)) == True{} : Bool}:
+  match fits:
+    case True{}:
+      hcov
+    case False{}:
+      hr
+
+def rr_head_dirty_cov_from_eq(+dirty: Nat, +floor: Nat, +m: Nat, +bm1: Nat, eq_d: {Nat.add(floor, m) == dirty : Nat}, hm_le: {Nat.is_le(m, 1n+bm1) == True{} : Bool}) -> {Nat.is_le(dirty, Nat.add(floor, 1n+bm1)) == True{} : Bool}:
+  %eq_d : {Nat.is_le(_, Nat.add(floor, 1n+bm1)) == True{} : Bool}
+  L.nat_add_le_mono(floor, floor, m, 1n+bm1, L.nat_le_refl(floor), hm_le)
+
+def rr_head_dirty_align_ge(+dirty: Nat, +r: Nat, +bm1: Nat, +rz: Bool, hr: {Nat.is_le(dirty, r) == True{} : Bool}) -> {Nat.is_le(dirty, rr_head_dirty_align_nz(r, dirty, 1n+bm1, rz, Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1))) == True{} : Bool}:
+  match rz:
+    case True{}:
+      L.nat_le_refl(dirty)
+    case False{}:
+      rr_head_dirty_pick_ge(
+        dirty,
+        r,
+        Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1),
+        1n+bm1,
+        Nat.is_le(1n+bm1, Nat.sub(r, Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1))),
+        hr,
+        rr_head_dirty_cov_from_eq(
+          dirty,
+          Nat.mul(Nat.div(dirty, 1n+bm1), 1n+bm1),
+          Nat.mod(dirty, 1n+bm1),
+          bm1,
+          L.nat_div_mod_r(dirty, bm1),
+          L.nat_lt_imp_le(Nat.mod(dirty, 1n+bm1), 1n+bm1, L.nat_mod_lt(dirty, bm1))
+        )
+      )
+
+def rr_head_dirty_covers_true_lt(+r: Nat, +dirty: Nat, +rb: Nat, hr: {Nat.is_le(dirty, r) == True{} : Bool}) -> {Nat.is_le(dirty, rr_head_dirty_block(r, dirty, rb)) == True{} : Bool}:
+  match rb:
+    case 0n:
+      L.nat_le_refl(dirty)
+    case 1n+bm1:
+      rr_head_dirty_align_ge(dirty, r, bm1, Nat.is_eq(Nat.mod(dirty, 1n+bm1), 0n), hr)
+
+def rr_head_dirty_covers_lt(+r: Nat, +dirty: Nat, +rb: Nat, +w: Bool, hr: {Nat.is_le(dirty, r) == True{} : Bool}) -> {Nat.is_le(dirty, rr_head_dirty_lt(r, dirty, rb, w)) == True{} : Bool}:
+  match w:
+    case False{}:
+      hr
+    case True{}:
+      rr_head_dirty_covers_true_lt(r, dirty, rb, hr)
+
+def rr_head_dirty_covers_input(dirty, extra, rb):
+  match dirty:
+    case 0n:
+      {==}
+    case 1n+rp:
+      rr_head_dirty_covers_lt(
+        Nat.max(1n, Nat.add(1n+rp, extra)),
+        1n+rp,
+        rb,
+        Nat.is_lt(1n+rp, Nat.max(1n, Nat.add(1n+rp, extra))),
+        L.nat_le_trans(
+          1n+rp,
+          Nat.add(1n+rp, extra),
+          Nat.max(1n, Nat.add(1n+rp, extra)),
+          L.nat_add_le_r(1n+rp, extra),
+          L.nat_max_ge_r(1n, Nat.add(1n+rp, extra))
+        )
+      )
+
+# LAW RR.12: HeadMajor span bytes for any n rows NEVER exceed one head's byte stride.
+# promise: a HeadMajor span byte length never exceeds per_head bytes
+# catches: Nat.min(n, rows) omitted in rr_head_span_bytes
+law rr_head_span_within_per_head:
+  for +cb: Nat
+  for +heads: Nat
+  for +rows: Nat
+  for +n: Nat
+  {Nat.is_le(rr_head_span_bytes(cb, heads, rows, n), Nat.div(cb, Nat.max(1n, heads))) == True{} : Bool}
+
+def rr_align_down_le_l(+ph: Nat, +rm1: Nat) -> {Nat.is_le(Nat.mul(1n+rm1, Nat.div(ph, 1n+rm1)), ph) == True{} : Bool}:
+  %L.nat_mul_comm(Nat.div(ph, 1n+rm1), 1n+rm1) : {Nat.is_le(_, ph) == True{} : Bool}
+  L.nat_align_down_le(ph, rm1)
+
+def rr_head_span_within_per_head_aux(+ph: Nat, +rm1: Nat, +n: Nat) -> {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), Nat.div(ph, 1n+rm1)), ph) == True{} : Bool}:
+  L.nat_le_trans(
+    Nat.mul(Nat.min(n, 1n+rm1), Nat.div(ph, 1n+rm1)),
+    Nat.mul(1n+rm1, Nat.div(ph, 1n+rm1)),
+    ph,
+    L.nat_mul_le_mono_r(Nat.min(n, 1n+rm1), 1n+rm1, Nat.div(ph, 1n+rm1), L.nat_min_le_r(n, 1n+rm1)),
+    rr_align_down_le_l(ph, rm1)
+  )
+
+def rr_head_span_within_per_head(cb, heads, rows, n):
+  match rows:
+    case 0n:
+      rr_head_span_within_per_head_aux(Nat.div(cb, Nat.max(1n, heads)), 0n, n)
+    case 1n+rm1:
+      rr_head_span_within_per_head_aux(Nat.div(cb, Nat.max(1n, heads)), rm1, n)
+
+# LAW RR.12b: HeadMajor span bytes cover at least min(n, rows) * row_bytes for a valid layout.
+# promise: a HeadMajor span byte length covers at least min(n, rows) * row_bytes for a cache of heads * rows * row_bytes bytes
+# catches: rr_head_span_bytes returns 0n
+law rr_head_span_covers_rows:
+  for +rb: Nat
+  for +hm1: Nat
+  for +rm1: Nat
+  for +n: Nat
+  {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), rr_head_span_bytes(Nat.mul(Nat.mul(rb, 1n+rm1), 1n+hm1), 1n+hm1, 1n+rm1, n)) == True{} : Bool}
+
+def rr_head_span_covers_rows(rb, hm1, rm1, n):
+  %G.g_nat_max_one_succ(hm1) : {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), Nat.mul(Nat.min(n, Nat.max(1n, 1n+rm1)), Nat.div(Nat.div(Nat.mul(Nat.mul(rb, 1n+rm1), 1n+hm1), _), Nat.max(1n, 1n+rm1)))) == True{} : Bool}
+  %G.g_nat_max_one_succ(rm1) : {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), Nat.mul(Nat.min(n, _), Nat.div(Nat.div(Nat.mul(Nat.mul(rb, 1n+rm1), 1n+hm1), 1n+hm1), _))) == True{} : Bool}
+  %Equal.sym(Nat, Nat.div(Nat.mul(Nat.mul(rb, 1n+rm1), 1n+hm1), 1n+hm1), Nat.mul(rb, 1n+rm1), L.nat_div_mul(Nat.mul(rb, 1n+rm1), hm1)) : {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), Nat.mul(Nat.min(n, 1n+rm1), Nat.div(_, 1n+rm1))) == True{} : Bool}
+  %Equal.sym(Nat, Nat.div(Nat.mul(rb, 1n+rm1), 1n+rm1), rb, L.nat_div_mul(rb, rm1)) : {Nat.is_le(Nat.mul(Nat.min(n, 1n+rm1), rb), Nat.mul(Nat.min(n, 1n+rm1), _)) == True{} : Bool}
+  L.nat_le_refl(Nat.mul(Nat.min(n, 1n+rm1), rb))
+
+# LAW RR.13: Request high-water mark NEVER exceeds `max_ctx`.
+# promise: request high-water row mark never exceeds max_ctx
+# catches: max_ctx cap omitted from rr_high_water
+law rr_hw_le_max_ctx:
+  for +prompt: Nat
+  for new_tokens: Nat
+  for slack: Nat
+  for +max_ctx: Nat
+  {Nat.is_le(rr_high_water(prompt, new_tokens, slack, max_ctx), max_ctx) == True{} : Bool}
+
+def rr_hw_step_pick_le(+cap: Nat, +base: Nat, +add: Nat, +fits: Bool, hb: {Nat.is_le(base, cap) == True{} : Bool}, hfits: {Nat.is_le(add, Nat.sub(cap, base)) == fits : Bool}) -> {Nat.is_le(rr_hw_step_pick(cap, base, add, fits), cap) == True{} : Bool}:
+  match fits:
+    case True{}:
+      %rr_le_add_sub_self(base, cap, hb) : {Nat.is_le(Nat.add(base, add), _) == True{} : Bool}
+      L.nat_add_le_mono(base, base, add, Nat.sub(cap, base), L.nat_le_refl(base), hfits)
+    case False{}:
+      L.nat_le_refl(cap)
+
+def rr_hw_from_prompt_le(+max_ctx: Nat, +prompt: Nat, +new_tokens: Nat, +slack: Nat, +p_fits: Bool, hp: {Nat.is_le(prompt, max_ctx) == p_fits : Bool}) -> {Nat.is_le(rr_hw_from_prompt(max_ctx, prompt, new_tokens, slack, p_fits), max_ctx) == True{} : Bool}:
+  match p_fits:
+    case False{}:
+      L.nat_le_refl(max_ctx)
+    case True{}:
+      rr_hw_step_pick_le(
+        max_ctx,
+        rr_hw_add_capped(max_ctx, prompt, new_tokens),
+        slack,
+        Nat.is_le(slack, Nat.sub(max_ctx, rr_hw_add_capped(max_ctx, prompt, new_tokens))),
+        rr_hw_step_pick_le(max_ctx, prompt, new_tokens, Nat.is_le(new_tokens, Nat.sub(max_ctx, prompt)), hp, {==}),
+        {==}
+      )
+
+def rr_hw_le_max_ctx(prompt, new_tokens, slack, max_ctx):
+  rr_hw_from_prompt_le(max_ctx, prompt, new_tokens, slack, Nat.is_le(prompt, max_ctx), {==})
+
+# LAW RR.14: High-water covers prompt + new_tokens + slack, saturated at max_ctx.
+# promise: request high-water covers prompt + new_tokens + slack up to max_ctx
+# catches: slack omitted from rr_high_water
+law rr_hw_covers_written_with_slack:
+  for +prompt: Nat
+  for +new_tokens: Nat
+  for +slack: Nat
+  for +max_ctx: Nat
+  {Nat.is_le(Nat.min(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx), rr_high_water(prompt, new_tokens, slack, max_ctx)) == True{} : Bool}
+
+def rr_hw_cov_slack_sat(+tot: Nat, +max_ctx: Nat, +slack: Nat, +s_fits: Bool) -> {Nat.is_le(Nat.min(tot, max_ctx), rr_hw_step_pick(max_ctx, max_ctx, slack, s_fits)) == True{} : Bool}:
+  match s_fits:
+    case True{}:
+      L.nat_le_trans(Nat.min(tot, max_ctx), max_ctx, Nat.add(max_ctx, slack), L.nat_min_le_r(tot, max_ctx), L.nat_add_le_r(max_ctx, slack))
+    case False{}:
+      L.nat_min_le_r(tot, max_ctx)
+
+def rr_hw_cov_slack_fit(+prompt: Nat, +new_tokens: Nat, +slack: Nat, +max_ctx: Nat, +s_fits: Bool) -> {Nat.is_le(Nat.min(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx), rr_hw_step_pick(max_ctx, Nat.add(prompt, new_tokens), slack, s_fits)) == True{} : Bool}:
+  match s_fits:
+    case True{}:
+      L.nat_min_le_l(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx)
+    case False{}:
+      L.nat_min_le_r(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx)
+
+def rr_hw_cov_nt(+prompt: Nat, +new_tokens: Nat, +slack: Nat, +max_ctx: Nat, +nt_fits: Bool) -> {Nat.is_le(Nat.min(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx), rr_hw_add_capped(max_ctx, rr_hw_step_pick(max_ctx, prompt, new_tokens, nt_fits), slack)) == True{} : Bool}:
+  match nt_fits:
+    case True{}:
+      rr_hw_cov_slack_fit(prompt, new_tokens, slack, max_ctx, Nat.is_le(slack, Nat.sub(max_ctx, Nat.add(prompt, new_tokens))))
+    case False{}:
+      rr_hw_cov_slack_sat(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx, slack, Nat.is_le(slack, Nat.sub(max_ctx, max_ctx)))
+
+def rr_hw_cov_prompt(+prompt: Nat, +new_tokens: Nat, +slack: Nat, +max_ctx: Nat, +p_fits: Bool) -> {Nat.is_le(Nat.min(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx), rr_hw_from_prompt(max_ctx, prompt, new_tokens, slack, p_fits)) == True{} : Bool}:
+  match p_fits:
+    case True{}:
+      rr_hw_cov_nt(prompt, new_tokens, slack, max_ctx, Nat.is_le(new_tokens, Nat.sub(max_ctx, prompt)))
+    case False{}:
+      L.nat_min_le_r(Nat.add(Nat.add(prompt, new_tokens), slack), max_ctx)
+
+def rr_hw_covers_written_with_slack(prompt, new_tokens, slack, max_ctx):
+  rr_hw_cov_prompt(prompt, new_tokens, slack, max_ctx, Nat.is_le(prompt, max_ctx))
+
+# LAW RR.15: Beginning a request always sets `unclean = True`, and a failed Auto request forces Dirty on the next reset.
+# promise: starting a request marks ResetState unclean so a failure without end_ok forces Dirty on the next Auto request
+# catches: rr_begin fails to set unclean = True
+law rr_begin_sets_unclean_and_dirties_auto:
+  for +hw: Nat
+  for +held: Nat
+  for +u: Bool
+  for +prompt: Nat
+  for +max_new: Nat
+  for +slack: Nat
+  for +max_ctx: Nat
+  {Bool.and(rr_state_unclean(rr_begin(RrState{RrModeAuto{}, hw, held, u}, prompt, max_new, slack, max_ctx)), Bool.not(rr_is_state_only(RrModeAuto{}, rr_state_unclean(rr_begin(RrState{RrModeAuto{}, hw, held, u}, prompt, max_new, slack, max_ctx))))) == True{} : Bool}
+
+def rr_begin_sets_unclean_and_dirties_auto(hw, held, u, prompt, max_new, slack, max_ctx):
+  match u:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW RR.16: Zeroing scopes (Dirty or Full, including unclean Auto) always clear `held_hw` to 0 on begin.
+# promise: when begin runs with any zeroing scope (Dirty or Full, including unclean Auto), held_hw is reset to 0n
+# catches: rr_kept_hw returns dirty_rows for RrScopeFull{}
+law rr_begin_zeroing_resets_held:
+  for +m: RrMode
+  for hw: Nat
+  for held: Nat
+  for +u: Bool
+  for prompt: Nat
+  for new_t: Nat
+  for slack: Nat
+  for max_ctx: Nat
+  {Bool.or(rr_is_state_only(m, u), Nat.is_eq(rr_state_held(rr_begin(RrState{m, hw, held, u}, prompt, new_t, slack, max_ctx)), 0n)) == True{} : Bool}
+
+def rr_begin_zeroing_resets_held(m, hw, held, u, prompt, new_t, slack, max_ctx):
+  match m u:
+    case RrModeAuto{} True{}: {==}
+    case RrModeAuto{} False{}: {==}
+    case RrModeDirty{} True{}: {==}
+    case RrModeDirty{} False{}: {==}
+    case RrModeFull{} True{}: {==}
+    case RrModeFull{} False{}: {==}
+
+# LAW RR.17: Completing a request (`rr_end_ok`) clears `unclean` and preserves `held_hw <= kv_hw`.
+# promise: rr_end_ok clears unclean and preserves kept dirty rows from before the request
+# catches: rr_end_ok leaves unclean True or drops held_hw below max
+law rr_end_ok_clears_unclean_and_keeps_held:
+  for +m: RrMode
+  for +hw: Nat
+  for +held: Nat
+  for +u: Bool
+  for +prompt: Nat
+  for +gen: Nat
+  for +slack: Nat
+  for +max_ctx: Nat
+  {Bool.and(Bool.not(rr_state_unclean(rr_end_ok(RrState{m, hw, held, u}, prompt, gen, slack, max_ctx))), Nat.is_le(held, rr_state_hw(rr_end_ok(RrState{m, hw, held, u}, prompt, gen, slack, max_ctx)))) == True{} : Bool}
+
+def rr_end_ok_clears_unclean_and_keeps_held(m, hw, held, u, prompt, gen, slack, max_ctx):
+  L.nat_max_ge_l(held, rr_high_water(prompt, gen, slack, max_ctx))
+
+def rr_eq_refl(a: Nat) -> {True{} == Nat.is_eq(a, a) : Bool}:
+  match a:
+    case 0n: {==}
+    case 1n+ap:
+      rr_eq_refl(ap)
+
+# LAW RR.18: rr_head_full_span holds at max(1, rows) and fails at 0 (so partial spans never trigger full-cache zeroing).
+# promise: rr_head_full_span holds at the full head-row capacity and fails at zero
+# catches: rr_head_full_span checks n <= max(1, rows) instead of equality
+law rr_head_full_span_strict:
+  for +rows: Nat
+  {Bool.and(rr_head_full_span(rows, Nat.max(1n, rows)), Bool.not(rr_head_full_span(rows, 0n))) == True{} : Bool}
+
+def rr_head_full_span_strict(rows):
+  match rows:
+    case 0n: {==}
+    case 1n+rp:
+      %rr_eq_refl(rp) : {Bool.and(_, True{}) == True{} : Bool}
+      {==}
+
+# LAW RR.19: Beginning a request preserves the configured reset mode (directly checked against `m`, catching constant `rr_state_mode` returns).
+# promise: rr_begin preserves the reset mode read back by rr_state_mode
+# catches: rr_state_mode ignores field m and returns RrModeAuto{}
+law rr_state_mode_preserved:
+  for +m: RrMode
+  for hw: Nat
+  for held: Nat
+  for u: Bool
+  for p: Nat
+  for mn: Nat
+  for sl: Nat
+  for mc: Nat
+  {rr_state_mode(rr_begin(RrState{m, hw, held, u}, p, mn, sl, mc)) == m : RrMode}
+
+def rr_state_mode_preserved(m, hw, held, u, p, mn, sl, mc):
+  match m:
+    case RrModeAuto{}: {==}
+    case RrModeDirty{}: {==}
+    case RrModeFull{}: {==}
+
+# LAW RR.20: Beginning a request sets kv_hw to at least rr_high_water for the incoming request.
+# promise: rr_begin sets kv_hw to at least rr_high_water for the incoming request
+# catches: rr_begin_kept uses Nat.min instead of Nat.max
+law rr_begin_hw_covers_request:
+  for +m: RrMode
+  for +hw: Nat
+  for held: Nat
+  for +u: Bool
+  for +p: Nat
+  for +mn: Nat
+  for +sl: Nat
+  for +mc: Nat
+  {Nat.is_le(rr_high_water(p, mn, sl, mc), rr_state_hw(rr_begin(RrState{m, hw, held, u}, p, mn, sl, mc))) == True{} : Bool}
+
+def rr_begin_hw_covers_request(m, hw, held, u, p, mn, sl, mc):
+  L.nat_max_ge_r(rr_kept_hw(rr_scope(m, u), hw), rr_high_water(p, mn, sl, mc))
+
+# LAW RR.21: In StateOnly scope, rr_begin preserves prior kv_hw in both held_hw and kv_hw.
+# promise: in StateOnly scope, rr_begin preserves prior kv_hw in both held_hw and kv_hw
+# catches: rr_kept_hw returns 0n for RrScopeState{}
+law rr_begin_state_only_keeps_hw:
+  for +hw: Nat
+  for held: Nat
+  for +p: Nat
+  for +mn: Nat
+  for +sl: Nat
+  for +mc: Nat
+  {Bool.and(Nat.is_eq(rr_state_held(rr_begin(RrState{RrModeAuto{}, hw, held, False{}}, p, mn, sl, mc)), hw), Nat.is_le(hw, rr_state_hw(rr_begin(RrState{RrModeAuto{}, hw, held, False{}}, p, mn, sl, mc)))) == True{} : Bool}
+
+def rr_begin_state_only_keeps_hw(hw, held, p, mn, sl, mc):
+  %Equal.sym(Bool, Nat.is_eq(hw, hw), True{}, G.g_nat_eq_refl(hw)) : {Bool.and(_, Nat.is_le(hw, Nat.max(hw, rr_high_water(p, mn, sl, mc)))) == True{} : Bool}
+  L.nat_max_ge_l(hw, rr_high_water(p, mn, sl, mc))
+
+# LAW RR.22: RrModeDirty always selects Dirty scope regardless of unclean.
+# promise: RrModeDirty always selects Dirty scope (not StateOnly and not Full), regardless of unclean
+# catches: RrModeDirty{} maps to RrScopeState{} or RrScopeFull{}
+law rr_dirty_mode_always_dirty:
+  for +u: Bool
+  {Bool.and(Bool.not(rr_is_state_only(RrModeDirty{}, u)), Bool.not(rr_zero_both_rings(rr_scope(RrModeDirty{}, u)))) == True{} : Bool}
+
+def rr_dirty_mode_always_dirty(u):
+  {==}
+
+# LAW RR.23: Completing a request (rr_end_ok) preserves the configured reset mode.
+# promise: rr_end_ok preserves the configured reset mode read back by rr_state_mode
+# catches: rr_end_ok resets mode to RrModeAuto{}
+law rr_end_ok_mode_preserved:
+  for +m: RrMode
+  for hw: Nat
+  for held: Nat
+  for u: Bool
+  for p: Nat
+  for g: Nat
+  for sl: Nat
+  for mc: Nat
+  {rr_state_mode(rr_end_ok(RrState{m, hw, held, u}, p, g, sl, mc)) == m : RrMode}
+
+def rr_end_ok_mode_preserved(m, hw, held, u, p, g, sl, mc):
+  match m:
+    case RrModeAuto{}: {==}
+    case RrModeDirty{}: {==}
+    case RrModeFull{}: {==}

@@ -456,6 +456,10 @@ pub fn plan_build(ids: &[i32], slots: &[i32], k: usize, t: usize) -> (Vec<i32>, 
         plan[b + 1] = (j - i) as i32;
         plan[b + 2] = rs as i32;
         plan[b + 3] = exp;
+        assert!(
+            k > 0 && k <= 16,
+            "moe assign slot stride assumes k in 1..=16, got {k}"
+        );
         for &(_, assign) in &on_card[i..j] {
             plan[rbase + rs] = ((assign / k) * 16 + (assign % k)) as i32;
             rs += 1;

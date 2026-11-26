@@ -1042,3 +1042,30 @@ law pc_ring_after_never_before_the_rule:
 
 def pc_ring_after_never_before_the_rule(p, r, w, n):
   pc_le_refl(pc_ring_from(p, r, w, 1n+n))
+
+# LAW PC.46: Image runs starting at different prompt slots never count as the same image.
+# promise: pc_image_same returns False when same_start is False
+# catches: pc_image_same drops same_start and compares only grid and pixels
+law pc_image_different_start_refused:
+  for g: Bool
+  for p: Bool
+  {pc_image_same(False{}, g, p) == False{} : Bool}
+
+def pc_image_different_start_refused(g, p):
+  {==}
+
+def pc_img_and_false_mid(a: Bool, b: Bool) -> {Bool.and(a, Bool.and(False{}, b)) == False{} : Bool}:
+  match a:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW PC.47: Image runs with different token grids never count as the same image.
+# promise: pc_image_same returns False when same_grid is False
+# catches: pc_image_same drops same_grid and compares only start and pixels
+law pc_image_different_grid_refused:
+  for s: Bool
+  for p: Bool
+  {pc_image_same(s, False{}, p) == False{} : Bool}
+
+def pc_image_different_grid_refused(s, p):
+  pc_img_and_false_mid(s, p)

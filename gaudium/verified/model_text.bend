@@ -15,6 +15,7 @@
 
 import Base
 import nat_lemmas.bend as L
+import lemmas.bend as G
 
 # ============================================================================
 # 1. Types
@@ -311,4 +312,30 @@ law mt_cli_no_chat_no_template:
   {mt_cli_wants_template(False{}, b) == False{} : Bool}
 
 def mt_cli_no_chat_no_template(b):
+  {==}
+
+# promise: vocabulary validation rejects files with more token types than tokens
+# catches: mt_vocab_ok checks t >= n instead of t == n
+law mt_vocab_rejects_extra_types:
+  for +n: Nat
+  for +d: Nat
+  for lim: Nat
+  {mt_vocab_ok(n, Nat.add(n, 1n+d), lim) == False{} : Bool}
+
+def mt_vocab_rejects_extra_types(n, d, lim):
+  %Equal.sym(Bool, Nat.is_eq(Nat.add(n, 1n+d), n), False{}, G.g_nat_eq_add_succ_false(n, d)) : {Bool.and(Bool.and(Nat.is_gt(n, 0n), _), Nat.is_le(n, lim)) == False{} : Bool}
+  %Equal.sym(Bool, Bool.and(Nat.is_gt(n, 0n), False{}), False{}, G.g_bool_and_false_r(Nat.is_gt(n, 0n))) : {Bool.and(_, Nat.is_le(n, lim)) == False{} : Bool}
+  {==}
+
+# promise: vocabulary validation rejects files with fewer token types than tokens
+# catches: mt_vocab_ok checks t <= n instead of t == n
+law mt_vocab_rejects_missing_types:
+  for +t: Nat
+  for +d: Nat
+  for lim: Nat
+  {mt_vocab_ok(Nat.add(t, 1n+d), t, lim) == False{} : Bool}
+
+def mt_vocab_rejects_missing_types(t, d, lim):
+  %Equal.sym(Bool, Nat.is_eq(t, Nat.add(t, 1n+d)), False{}, G.g_nat_eq_succ_add_false(t, d)) : {Bool.and(Bool.and(Nat.is_gt(Nat.add(t, 1n+d), 0n), _), Nat.is_le(Nat.add(t, 1n+d), lim)) == False{} : Bool}
+  %Equal.sym(Bool, Bool.and(Nat.is_gt(Nat.add(t, 1n+d), 0n), False{}), False{}, G.g_bool_and_false_r(Nat.is_gt(Nat.add(t, 1n+d), 0n))) : {Bool.and(_, Nat.is_le(Nat.add(t, 1n+d), lim)) == False{} : Bool}
   {==}
