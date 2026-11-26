@@ -2418,10 +2418,19 @@ fn models_list_json(state: &AppState) -> String {
 
 /// `GET /models/sse`: the model list of `GET /v1/models` as server-sent events, for a model
 /// picker. The first event is the list as it stands; a new one follows whenever a model's state
-/// changes (loading, loaded, unloaded, failed; a switch of the resident model). Between changes a
-/// comment line every 10 s keeps the connection open. The stream ends when the server stops or
-/// the client goes away.
+/// changes (loading, loaded, unloaded, failed; a switch of the resident model). A comment line
+/// goes out whenever 10 s pass without a write, so the connection stays open and a client that
+/// went away is noticed, however busy the server is. The stream ends when the server stops or the
+/// client goes away.
 fn handle_models_sse(state: &AppState, stream: &mut Conn) {
+    models_sse(state, stream, SSE_HEARTBEAT);
+}
+
+/// How long an event stream goes without a write before a comment line keeps it open.
+const SSE_HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// `handle_models_sse` with the heartbeat interval as a parameter, so a test can run it short.
+fn models_sse(state: &AppState, stream: &mut Conn, heartbeat: Duration) {
     if write_sse_headers(stream).is_err() {
         return;
     }
@@ -2433,8 +2442,13 @@ fn handle_models_sse(state: &AppState, stream: &mut Conn) {
     if write_sse_chunk(stream, format!("data: {sent}\n\n").as_bytes()).is_err() {
         return;
     }
+    // Most hub events change no model's state (a reply's live telemetry comes every 400 ms), and
+    // they wake this loop without a write. So the heartbeat counts from the last write, not from
+    // the last wake, or a stream that a long reply keeps waking would never get one.
+    let mut last_write = Instant::now();
     loop {
-        let (evs, closed) = state.hub.since(seq, Duration::from_secs(10));
+        let wait = heartbeat.saturating_sub(last_write.elapsed());
+        let (evs, closed) = state.hub.since(seq, wait);
         if let Some(&(last, _)) = evs.last() {
             seq = last;
             let now = models_list_json(state);
@@ -2443,13 +2457,18 @@ fn handle_models_sse(state: &AppState, stream: &mut Conn) {
                     return;
                 }
                 sent = now;
+                last_write = Instant::now();
             }
-        } else if !closed && write_sse_chunk(stream, b":\n\n").is_err() {
-            return;
         }
         // a change published just before the server stopped is still sent (above)
         if closed {
             break;
+        }
+        if last_write.elapsed() >= heartbeat {
+            if write_sse_chunk(stream, b":\n\n").is_err() {
+                return;
+            }
+            last_write = Instant::now();
         }
     }
     write_sse_end(stream);

@@ -3156,6 +3156,58 @@ fn models_sse_sends_the_list_and_again_when_a_model_changes_state() {
 }
 
 #[test]
+fn models_sse_keeps_its_heartbeat_while_other_events_arrive() {
+    // While a reply is written, the hub carries its live telemetry (every 400 ms), which changes
+    // no model's state. The stream must still get a comment line once a heartbeat passes without
+    // a write, or a front end may cut it and a client that left is not noticed.
+    let h = two_model_harness();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (server_side, _) = listener.accept().unwrap();
+    let sse = {
+        let state = Arc::clone(&h.state);
+        thread::spawn(move || {
+            let mut conn = Conn::from(server_side);
+            models_sse(&state, &mut conn, Duration::from_millis(200));
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let noise = {
+        let (state, stop) = (Arc::clone(&h.state), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                state.hub.publish(r#"{"type":"live"}"#.into());
+                thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+
+    // the first event is the list; a comment line follows within the heartbeat, not after the
+    // telemetry stops (a chunk of 3 bytes, ":\n\n")
+    let mut raw = Vec::new();
+    let evs = read_sse_until(&mut client, &mut raw, 1);
+    assert_eq!(evs.len(), 1);
+    let mut buf = [0u8; 4096];
+    let started = Instant::now();
+    while !String::from_utf8_lossy(&raw).contains("\r\n3\r\n:\n\n\r\n") {
+        match client.read(&mut buf) {
+            Ok(0) => panic!("the stream ended without a comment line"),
+            Ok(k) => raw.extend_from_slice(&buf[..k]),
+            Err(e) => panic!("no comment line within the timeout: {e}"),
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    // nothing else was sent: the telemetry changed no model's state
+    assert_eq!(sse_events(&raw).len(), 1);
+
+    stop.store(true, Ordering::Relaxed);
+    noise.join().unwrap();
+    h.state.hub.close();
+    sse.join().unwrap();
+}
+
+#[test]
 fn models_sse_is_behind_the_api_key() {
     let h = configured_harness(|cfg| cfg.api_key = Some("server-key".into()));
     let (status, _, body) =
