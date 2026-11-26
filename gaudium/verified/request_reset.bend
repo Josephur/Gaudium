@@ -394,13 +394,13 @@ def rr_zero_dirty_clears_nothing(cb, chunks, rows, cr, rb):
 
 # LAW RR.9: Non-zero dirty rows in a ChunkMajor cache covers every dirty chunk up to max(1, chunks).
 # promise: rr_chunk_dirty_bytes covers at least (cb / max(1, chunks)) * min(ceil(dirty_rows / max(1, cr)), max(1, chunks)) bytes
-# catches: rr_chunk_dirty_nonzero caps chunks at 1n instead of Nat.min(rr_div_ceil(dirty_rows, chunk_rows), c)
+# catches: rr_chunk_dirty_nonzero caps chunks at 1n or drops Nat.max(1n, chunks)
 law rr_chunk_dirty_covers_chunks:
   for +cb: Nat
-  for +c_m1: Nat
+  for +chunks: Nat
   for +r_m1: Nat
-  for +cr_m1: Nat
-  {Nat.is_le(Nat.mul(Nat.div(cb, 1n+c_m1), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), 1n+c_m1)), rr_chunk_dirty_bytes(cb, 1n+c_m1, 1n+r_m1, 1n+cr_m1)) == True{} : Bool}
+  for +cr: Nat
+  {Nat.is_le(Nat.mul(Nat.div(cb, Nat.max(1n, chunks)), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(Nat.max(1n, cr), 1n)), Nat.max(1n, cr)), Nat.max(1n, chunks))), rr_chunk_dirty_bytes(cb, chunks, 1n+r_m1, cr)) == True{} : Bool}
 
 def rr_succ_mul_eq(+q: Nat, +x: Nat) -> {Nat.add(Nat.mul(q, x), x) == Nat.mul(Nat.add(q, 1n), x) : Nat}:
   %Equal.sym(Nat, Nat.add(q, 1n), 1n+q, L.nat_add_comm(q, 1n)) : {Nat.add(Nat.mul(q, x), x) == Nat.mul(_, x) : Nat}
@@ -438,14 +438,40 @@ def rr_div_ceil_exact_aux(+r_m1: Nat, +cr_m1: Nat, +q: Nat, +m: Nat, eq: {q == N
 def rr_div_ceil_eq_ceil_div(+r_m1: Nat, +cr_m1: Nat) -> {rr_div_ceil(1n+r_m1, 1n+cr_m1) == Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1) : Nat}:
   rr_div_ceil_exact_aux(r_m1, cr_m1, Nat.div(1n+r_m1, 1n+cr_m1), Nat.mod(1n+r_m1, 1n+cr_m1), {==}, {==}, {==})
 
-def rr_chunk_dirty_covers_chunks(cb, c_m1, r_m1, cr_m1):
+def rr_sub_zero_r(+x: Nat) -> {Nat.sub(x, 0n) == x : Nat}:
+  match x:
+    case 0n: {==}
+    case 1n+_: {==}
+
+def rr_chunk_dirty_covers_cr(+cp: Nat, +c_nz: Nat, +r_m1: Nat, +cr: Nat) -> {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(Nat.max(1n, cr), 1n)), Nat.max(1n, cr)), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, cr), c_nz))) == True{} : Bool}:
+  match cr:
+    case 0n:
+      %Equal.sym(Nat, Nat.add(r_m1, 0n), r_m1, L.nat_add_zero_r(r_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(1n+_, 1n), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, 0n), c_nz))) == True{} : Bool}
+      %L.nat_mul_one_r(1n+r_m1) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(_, 1n), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, 0n), c_nz))) == True{} : Bool}
+      %L.nat_div_mul(1n+r_m1, 0n) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.mul(1n+r_m1, 1n), 1n), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(_, c_nz))) == True{} : Bool}
+      L.nat_le_refl(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.mul(1n+r_m1, 1n), 1n), c_nz)))
+    case 1n+cr_m1:
+      %Equal.sym(Nat, Nat.max(1n, 1n+cr_m1), 1n+cr_m1, G.g_nat_max_one_succ(cr_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(_, 1n)), _), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, 1n+cr_m1), c_nz))) == True{} : Bool}
+      %Equal.sym(Nat, Nat.sub(cr_m1, 0n), cr_m1, rr_sub_zero_r(cr_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, _), 1n+cr_m1), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(rr_div_ceil(1n+r_m1, 1n+cr_m1), c_nz))) == True{} : Bool}
+      %Equal.sym(Nat, rr_div_ceil(1n+r_m1, 1n+cr_m1), Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), rr_div_ceil_eq_ceil_div(r_m1, cr_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), c_nz)), Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(_, c_nz))) == True{} : Bool}
+      L.nat_le_refl(Nat.mul(Nat.div(1n+cp, c_nz), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), c_nz)))
+
+def rr_chunk_dirty_covers_chunks(cb, chunks, r_m1, cr):
   match cb:
     case 0n:
-      {==}
+      match chunks:
+        case 0n:
+          {==}
+        case 1n+c_m1:
+          %Equal.sym(Nat, Nat.max(1n, 1n+c_m1), 1n+c_m1, G.g_nat_max_one_succ(c_m1)) : {Nat.is_le(Nat.mul(Nat.div(0n, _), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(Nat.max(1n, cr), 1n)), Nat.max(1n, cr)), _)), 0n) == True{} : Bool}
+          {==}
     case 1n+cp:
-      %Equal.sym(Nat, Nat.max(1n, 1n+c_m1), 1n+c_m1, G.g_nat_max_one_succ(c_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, 1n+c_m1), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), 1n+c_m1)), Nat.mul(Nat.div(1n+cp, _), Nat.min(rr_div_ceil(1n+r_m1, 1n+cr_m1), _))) == True{} : Bool}
-      %Equal.sym(Nat, rr_div_ceil(1n+r_m1, 1n+cr_m1), Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), rr_div_ceil_eq_ceil_div(r_m1, cr_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, 1n+c_m1), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), 1n+c_m1)), Nat.mul(Nat.div(1n+cp, 1n+c_m1), Nat.min(_, 1n+c_m1))) == True{} : Bool}
-      L.nat_le_refl(Nat.mul(Nat.div(1n+cp, 1n+c_m1), Nat.min(Nat.div(Nat.add(1n+r_m1, cr_m1), 1n+cr_m1), 1n+c_m1)))
+      match chunks:
+        case 0n:
+          rr_chunk_dirty_covers_cr(cp, 1n, r_m1, cr)
+        case 1n+c_m1:
+          %Equal.sym(Nat, Nat.max(1n, 1n+c_m1), 1n+c_m1, G.g_nat_max_one_succ(c_m1)) : {Nat.is_le(Nat.mul(Nat.div(1n+cp, _), Nat.min(Nat.div(Nat.add(1n+r_m1, Nat.sub(Nat.max(1n, cr), 1n)), Nat.max(1n, cr)), _)), Nat.mul(Nat.div(1n+cp, _), Nat.min(rr_div_ceil(1n+r_m1, cr), _))) == True{} : Bool}
+          rr_chunk_dirty_covers_cr(cp, 1n+c_m1, r_m1, cr)
 
 # LAW RR.10: HeadMajor dirty rows NEVER exceed `max(1, rows)`.
 # promise: HeadMajor dirty rows stay within [0, max(1, rows)]
