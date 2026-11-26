@@ -257,13 +257,15 @@ pub struct MtpGeom {
 
 impl MtpGeom {
     pub fn new(c: MtpConfig, d: &IkDims, max_ctx: u64, ctx_rows: u64) -> Result<Self, String> {
-        let ring = mtp_ring_slots(c.window, ctx_rows);
-        if !mtp_ring_ok(ring, c.window, ctx_rows) {
-            return Err(format!(
-                "Inkling 2 drafter: no context ring holds a window of {} beside passes of {ctx_rows} rows",
-                c.window
-            ));
-        }
+        // `None`: the window (read from the drafter's file) and the pass overflow u64 together
+        let ring = mtp_ring_slots(c.window, ctx_rows)
+            .filter(|&r| mtp_ring_ok(r, c.window, ctx_rows))
+            .ok_or_else(|| {
+                format!(
+                    "Inkling 2 drafter: no context ring holds a window of {} beside passes of {ctx_rows} rows",
+                    c.window
+                )
+            })?;
         // positions the block rows can reach: the context and one block past it
         let max_pos = max_ctx + c.block;
         Ok(Self {
@@ -1472,9 +1474,18 @@ mod tests {
     fn geometry_and_plan_of_the_mini() {
         let c = MtpConfig::from_config_json(MTP_JSON).unwrap();
         let d = mini_dims(256);
-        let g = MtpGeom::new(c, &d, 262144, 256).unwrap();
+        let g = MtpGeom::new(c.clone(), &d, 262144, 256).unwrap();
         // the ring holds the window beside the widest context pass
         assert!(g.ring >= 1024 + 256 && g.ring.is_power_of_two());
+        // a window no ring holds is refused, and one that overflows u64 beside the pass too
+        for window in [1 << 50, u64::MAX - 100, u64::MAX] {
+            let wide = MtpConfig {
+                window,
+                ..c.clone()
+            };
+            let e = MtpGeom::new(wide, &d, 262144, 256).unwrap_err();
+            assert!(e.contains("no context ring holds"), "{e}");
+        }
         assert_eq!(g.drafts(7), 7);
         assert_eq!(g.drafts(15), 7);
         assert_eq!(g.drafts(3), 3);

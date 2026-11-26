@@ -28,7 +28,9 @@
 use super::*;
 use crate::gguf::dequant::{rows_bf16_par, rows_f32};
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
-use crate::verified::{mtpf_matches, mtpf_rank, mtpf_rows_fit, mtpf_step, MmpPick, MtpfPrecision};
+use crate::verified::{
+    ik_bf16_bytes, mtpf_matches, mtpf_rank, mtpf_rows_fit, mtpf_step, MmpPick, MtpfPrecision,
+};
 use std::path::{Path, PathBuf};
 
 /// The architecture name of a drafter file.
@@ -501,8 +503,14 @@ impl GgufMtp {
                 "drafter tensor '{name}' has {rows} rows: the drafter reads {need}, the device tensor holds {cap}"
             ));
         }
+        // the device tensor's bytes; `None`: its shape (from the model's config) overflows u64
+        let bytes = ik_bf16_bytes(cap, cols)
+            .and_then(|b| usize::try_from(b).ok())
+            .ok_or_else(|| {
+                format!("drafter tensor '{name}': a table of {cap} rows of {cols} values overflows")
+            })?;
         let mut out = self.all_bf16(t)?.into_owned();
-        out.resize((cap * cols * 2) as usize, 0);
+        out.resize(bytes, 0);
         Ok(out)
     }
 }

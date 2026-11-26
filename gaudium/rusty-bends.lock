@@ -570,6 +570,9 @@ aca5cff341d0c466  ik_app_layer_in_model  law ik_app_layer_in_model : for + n : N
 # promise ik_app_msgs_looped: an application that receives messages of a previous pass runs a layer of the looped span.
 444bd665a913298d  ik_app_pass_below_passes  law ik_app_pass_below_passes : for + a : Nat for + ls : Nat for + le : Nat for + pp : Nat { Nat.is_lt ( ik_app_pass ( a , ls , le , 1n + pp ) , 1n + pp ) == True { } : Bool }
 # promise ik_app_pass_below_passes: every layer application belongs to one of the passes the model runs (its pass is below the pass count).
+3128bc81a1eba240  ik_bf16_bytes_holds  law ik_bf16_bytes_holds : for + r : Nat for + c : Nat { Nat.is_le ( Nat.add ( Nat.mul ( r , c ) , Nat.mul ( r , c ) ) , ik_bf16_bytes ( r , c ) ) == True { } : Bool }
+# promise ik_bf16_bytes_holds: a BF16 tensor's byte size holds two bytes for every value of its rows.
+# harm ik_bf16_bytes_holds: a buffer or a table would be planned short of the values a kernel writes or an upload copies.
 1e56d626c8a72153  ik_bias_block_in_table  law ik_bias_block_in_table : for + e : Nat for + dd : Nat { Nat.is_le ( Nat.add ( Nat.sub ( ik_bias_off ( e ) , dd ) , 64n ) , ik_bias_width ( e ) ) == True { } : Bool }
 # promise ik_bias_block_in_table: the 64 bias channels a softmax block loads for any first-key distance up to the table's offset stay inside one head's table.
 b1535cefc222c670  ik_bias_distance_channel  law ik_bias_distance_channel : for + e : Nat for + d : Nat { Bool.and ( Nat.is_lt ( d , e ) , Nat.is_ne ( ik_bias_src ( e , Nat.sub ( ik_bias_off ( e ) , d ) ) , d ) ) == False { } : Bool }
@@ -647,6 +650,18 @@ f2350b24e56a3bd9  ik_ring_holds_vector  law ik_ring_holds_vector : for + w : Nat
 # promise ik_ring_within_bounded: a K / V ring the kernel-bounded sizing returns never has more slots than the chunk the softmax kernel stages.
 03fa217e4c3b12e9  ik_ring_within_is_ring  law ik_ring_within_is_ring : for + w : Nat for + rows : Nat for + mx : Nat { Bool.and ( Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , 0n ) , Nat.is_ne ( ik_ring_slots_within ( w , rows , mx ) , ik_ring_slots ( w , rows ) ) ) == False { } : Bool }
 # promise ik_ring_within_is_ring: the kernel-bounded sizing returns the K / V ring itself or no ring (0), never a different, smaller one.
+27ac9a89bb612537  ik_row_at_in_tensor  law ik_row_at_in_tensor : for + e : Nat for + k : Nat for + r : Nat for + j : Nat for + rb : Nat { Nat.is_le ( Nat.add ( rb , ik_row_at ( e , Nat.add ( 1n + r , j ) , r , rb ) ) , ik_stacked_bytes ( Nat.add ( 1n + e , k ) , Nat.add ( 1n + r , j ) , rb ) ) == True { } : Bool }
+# promise ik_row_at_in_tensor: a row of an expert below the tensor's expert count, at a row below its row count, ends inside the bytes the tensor's shape names.
+# harm ik_row_at_in_tensor: the packer would read a row past the end of the mapped tensor, or the bytes of the tensor behind it.
+f2180f9ebd4d75ee  ik_row_at_next_expert  law ik_row_at_next_expert : for + e : Nat for + r : Nat for + rb : Nat { Nat.is_le ( Nat.add ( rb , ik_row_at ( e , 1n + r , r , rb ) ) , ik_row_at ( 1n + e , 1n + r , 0n , rb ) ) == True { } : Bool }
+# promise ik_row_at_next_expert: the last row of an expert never overlaps the first row of the next expert.
+# harm ik_row_at_next_expert: two experts would be decoded from the same bytes.
+0a01d1028178ac44  ik_row_at_next_row  law ik_row_at_next_row : for + e : Nat for + rows : Nat for + r : Nat for + rb : Nat { Nat.is_le ( Nat.add ( rb , ik_row_at ( e , rows , r , rb ) ) , ik_row_at ( e , rows , 1n + r , rb ) ) == True { } : Bool }
+# promise ik_row_at_next_row: a row never overlaps the next row of its expert.
+# harm ik_row_at_next_row: two rows of one expert would be decoded from the same bytes.
+7e886b49c0e88e7b  ik_stacked_bytes_within_shape  law ik_stacked_bytes_within_shape : for + ne : Nat for + rows : Nat for + rb : Nat { Nat.is_le ( ik_stacked_bytes ( ne , rows , rb ) , Nat.mul ( ne , Nat.mul ( rows , rb ) ) ) == True { } : Bool }
+# promise ik_stacked_bytes_within_shape: the bytes a stacked tensor's shape names are never more than its experts times its rows times a row's bytes, so a tensor that holds its shape is never refused as short.
+# harm ik_stacked_bytes_within_shape: the packer would refuse a well-formed checkpoint.
 1572ee1b0b28002d  ik_states_carry  law ik_states_carry : for + l : Nat for + bp : Nat { ik_states_attn ( 1n + l , 1n + bp ) == ik_states_mlp ( l , 1n + bp ) : Nat }
 # promise ik_states_carry: the block states a layer's attention-input mix reads are exactly the ones the previous layer's MLP-input mix read.
 7e7b86ddb68242ab  ik_states_mlp_covers_attn  law ik_states_mlp_covers_attn : for + l : Nat for + b : Nat { Nat.is_le ( ik_states_attn ( l , b ) , ik_states_mlp ( l , b ) ) == True { } : Bool }
@@ -1317,6 +1332,15 @@ d5b501b0c2c5ee3b  mtp_frnn_row_in_pass  law mtp_frnn_row_in_pass : for + r : Nat
 884d4cac92212815  mtp_ring_ok_holds  law mtp_ring_ok_holds : for + r : Nat for + w : Nat for + a : Nat { Bool.and ( mtp_ring_ok ( r , w , a ) , Nat.is_lt ( r , Nat.add ( w , a ) ) ) == False { } : Bool }
 # promise mtp_ring_ok_holds: a ring the check accepts always holds the window beside every row a context pass writes ahead of the anchor.
 # harm mtp_ring_ok_holds: a row written ahead would overwrite a context position the block still reads.
+b5f19ec53334e77f  mtp_ring_slots_found  law mtp_ring_slots_found : for + w : Nat for + a : Nat { Bool.and ( Nat.is_le ( Nat.add ( w , a ) , Nat.mul ( 128n , 512n ) ) , Nat.is_eq ( mtp_ring_slots ( w , a ) , 0n ) ) == False { } : Bool }
+# promise mtp_ring_slots_found: a window and a pass that together need at most 65536 slots (128 x 512, 64 times the 1024-row windows of today's drafters) always get a ring, so the two laws above never hold only because the sizing gave none.
+# harm mtp_ring_slots_found: the drafter would refuse a checkpoint whose window and passes fit a ring the engine can build.
+66b05d051940bb5c  mtp_ring_slots_pass  law mtp_ring_slots_pass : for + w : Nat for + a : Nat { Bool.and ( Nat.is_ne ( mtp_ring_slots ( w , a ) , 0n ) , Bool.not ( mtp_ring_ok ( mtp_ring_slots ( w , a ) , w , a ) ) ) == False { } : Bool }
+# promise mtp_ring_slots_pass: a ring the sizing returns (non-zero) always passes the ring check, so the engine never builds a ring in which a row written ahead shares a slot with a position the window reads.
+# harm mtp_ring_slots_pass: a row written ahead would overwrite a context position the block still reads.
+8946684f62e3ef8c  mtp_ring_slots_pow2  law mtp_ring_slots_pow2 : for + w : Nat for + a : Nat { Bool.and ( Nat.is_ne ( mtp_ring_slots ( w , a ) , 0n ) , Bool.not ( ik_is_pow2 ( mtp_ring_slots ( w , a ) ) ) ) == False { } : Bool }
+# promise mtp_ring_slots_pow2: a ring the sizing returns (non-zero) has a power-of-two number of slots, so a position's slot is the position modulo the ring.
+# harm mtp_ring_slots_pow2: the context kernel's slot mask would send two live positions to one slot.
 86e2fe57525a5ec7  mtpf_choice_is_candidate  law mtpf_choice_is_candidate : for drafter : Bool for + hid : Nat for + model_hid : Nat for + vocab : Nat for + model_vocab : Nat for best : MmpPick for + i : Nat for + rank : Nat { mmp_index_from ( mtpf_step ( drafter , hid , model_hid , vocab , model_vocab , best , i , rank ) , best , i ) == True { } : Bool }
 # promise mtpf_choice_is_candidate: the chosen drafter file is always the file just seen or the earlier choice, so it is always one of the candidates
 # harm mtpf_choice_is_candidate: an index past the candidate list would name no file or another one

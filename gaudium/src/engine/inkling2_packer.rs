@@ -22,7 +22,8 @@ use crate::core::gemma4::{lane_in_block, natural_channel};
 use crate::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use crate::safetensors::{SafetensorsStore, TensorMeta};
 use crate::verified::{
-    ik_bias_src, ik_f8_row_ok, ik_f8_row_scales, ik_nib_row_bytes, ik_nib_row_scales,
+    ik_bias_src, ik_f8_row_ok, ik_f8_row_scales, ik_nib_row_bytes, ik_nib_row_scales, ik_row_at,
+    ik_stacked_bytes,
 };
 
 /// Values of the sixteen 4-bit codes (sign, two exponent bits, one mantissa bit). Code 8 is a
@@ -121,6 +122,21 @@ struct StExperts<'a> {
     f8: [f32; 256],
 }
 
+/// Row `r` of expert `e` of a stacked tensor of `rows` rows of `rb` bytes per expert
+/// (`verified::ik_row_at`); `None` when the row is not inside `bytes`.
+fn stacked_row(bytes: &[u8], e: usize, rows: usize, r: usize, rb: usize) -> Option<&[u8]> {
+    let at = ik_row_at(e as u64, rows as u64, r as u64, rb as u64)?;
+    let at = usize::try_from(at).ok()?;
+    bytes.get(at..at.checked_add(rb)?)
+}
+
+/// Whether `len` bytes hold the bytes a stacked tensor's shape `[ne, rows, rb]` names
+/// (`verified::ik_stacked_bytes`), so every row `stacked_row` reads below `ne` and `rows` is inside
+/// them (`verified::ik_row_at_in_tensor`).
+fn holds_stacked_rows(len: usize, ne: u64, rows: u64, rb: u64) -> bool {
+    ik_stacked_bytes(ne, rows, rb).is_some_and(|n| n <= len as u64)
+}
+
 impl ExpertRows for StExperts<'_> {
     fn decode(&self, e: usize, r: usize, out: &mut [u8]) -> Result<(), String> {
         let (rb, rs) = match self.factor {
@@ -130,17 +146,25 @@ impl ExpertRows for StExperts<'_> {
             ),
             None => (self.cols, ik_f8_row_scales(self.cols as u64) as usize),
         };
-        let wi = (e * self.rows + r) * rb;
-        let si = (e * self.rows + r) * rs;
+        // a row at or past the expert's row count would read the next expert's rows
+        let (true, Some(w), Some(s)) = (
+            r < self.rows,
+            stacked_row(self.w, e, self.rows, r, rb),
+            stacked_row(self.scale, e, self.rows, r, rs),
+        ) else {
+            return Err(format!(
+                "expert {e} row {r} is not inside its stacked tensor ({} rows an expert)",
+                self.rows
+            ));
+        };
         match &self.factor {
-            Some(f) => decode_nib_row(
-                &self.w[wi..wi + rb],
-                &self.scale[si..si + rs],
-                f[e],
-                &self.f8,
-                out,
-            ),
-            None => decode_f8_row(&self.w[wi..wi + rb], &self.scale[si..si + rs], &self.f8, out),
+            Some(f) => {
+                let factor = *f
+                    .get(e)
+                    .ok_or_else(|| format!("expert {e} has no factor ({} experts)", f.len()))?;
+                decode_nib_row(w, s, factor, &self.f8, out)
+            }
+            None => decode_f8_row(w, s, &self.f8, out),
         }
         Ok(())
     }
@@ -285,6 +309,16 @@ impl IkSource for StSource<'_> {
             ));
         }
         let scale = self.raw(&format!("{base}_scale"), scale_dtype, &[ne, rows, row_scales])?;
+        // the header's offsets may give a tensor fewer bytes than its shape names: refuse it here
+        // rather than meet a row past its end while decoding
+        for (what, bytes, rb) in [("", w, row_bytes), ("_scale", scale, row_scales)] {
+            if !holds_stacked_rows(bytes.len(), ne, rows, rb) {
+                return Err(format!(
+                    "expert tensor '{full}{what}' holds {} bytes, fewer than its {ne} x {rows} rows of {rb}",
+                    bytes.len()
+                ));
+            }
+        }
         Ok(Box::new(StExperts {
             w,
             scale,
@@ -751,6 +785,49 @@ mod tests {
             .map(|&c| E2M1[c])
             .collect();
         assert_eq!(vals, want);
+    }
+
+    #[test]
+    fn stacked_rows_stay_inside_their_tensor() {
+        // 2 experts x 3 rows of 4 bytes: row r of expert e at (3 e + r) 4
+        let t: Vec<u8> = (0..24).collect();
+        assert_eq!(stacked_row(&t, 0, 3, 0, 4), Some(&t[0..4]));
+        assert_eq!(stacked_row(&t, 1, 3, 2, 4), Some(&t[20..24]));
+        // a row past the tensor's bytes, and offsets that overflow u64, are refused
+        assert_eq!(stacked_row(&t, 2, 3, 0, 4), None);
+        assert_eq!(stacked_row(&t[..23], 1, 3, 2, 4), None);
+        assert_eq!(stacked_row(&t, usize::MAX, 3, 0, 4), None);
+        assert!(holds_stacked_rows(24, 2, 3, 4));
+        assert!(!holds_stacked_rows(23, 2, 3, 4));
+        assert!(!holds_stacked_rows(24, u64::MAX, 3, 4));
+    }
+
+    #[test]
+    fn a_short_stacked_tensor_is_an_error_not_a_panic() {
+        // one expert of two 32-value rows in the 8-bit float form: 64 value bytes and 2 scale
+        // bytes, with the value tensor one byte short
+        let ex = StExperts {
+            w: &[0x38; 63],
+            scale: &[127; 2],
+            factor: None,
+            rows: 2,
+            cols: 32,
+            f8: e4m3_table(),
+        };
+        let mut out = [0u8; 64];
+        assert!(ex.decode(0, 0, &mut out).is_ok());
+        let e = ex.decode(0, 1, &mut out).unwrap_err();
+        assert!(e.contains("not inside"), "{e}");
+        // two whole experts: a row past the expert's row count is refused, not read from the
+        // next expert's bytes
+        let ex = StExperts {
+            w: &[0x38; 128],
+            scale: &[127; 4],
+            ..ex
+        };
+        assert!(ex.decode(1, 1, &mut out).is_ok());
+        assert!(ex.decode(0, 2, &mut out).is_err());
+        assert!(ex.decode(2, 0, &mut out).is_err());
     }
 
     #[test]

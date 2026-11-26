@@ -68,6 +68,9 @@ def mtp_ctx_chunks_some(p, c):
 
 # Slots of a windowed layer's context ring: a power of two (of at least 128) that holds the window beside the rows a context
 # pass writes ahead of an anchor (a prefill tile or a verify pass writes up to `ahead` positions at or beyond the next anchor).
+# 0 when no ring holds them; refused on overflow (the window is read from the drafter's file, so a hostile file may give one
+# near the top of u64, and the sum is never built past it).
+# rusty-bends: total
 def mtp_ring_slots(window: Nat, ahead: Nat) -> Nat:
   K.ik_pow2_rows(Nat.add(window, ahead))
 
@@ -96,6 +99,129 @@ law mtp_ring_ok_holds:
 
 def mtp_ring_ok_holds(r, w, a):
   mtp_le_lt_false(Nat.add(w, a), r)
+
+# A result no smaller than `n` passes a check that `n` fits in it (erased before Rust codegen).
+def mtp_and_not_le(c: Bool, +r: Nat, +n: Nat, h: {Bool.and(c, Nat.is_lt(r, n)) == False{} : Bool}) -> {Bool.and(c, Bool.not(Nat.is_le(n, r))) == False{} : Bool}:
+  match c:
+    case False{}:
+      {==}
+    case True{}:
+      K.ikp_not_t(Nat.is_le(n, r), L.nat_not_lt_imp_le(r, n, h))
+
+# promise: a ring the sizing returns (non-zero) always passes the ring check, so the engine never builds a ring in which a row written ahead shares a slot with a position the window reads.
+# harm: a row written ahead would overwrite a context position the block still reads.
+# catches: the ring sized for the window alone (the rows a pass writes ahead left out)
+law mtp_ring_slots_pass:
+  for +w: Nat
+  for +a: Nat
+  {Bool.and(Nat.is_ne(mtp_ring_slots(w, a), 0n), Bool.not(mtp_ring_ok(mtp_ring_slots(w, a), w, a))) == False{} : Bool}
+
+def mtp_ring_slots_pass(w, a):
+  mtp_and_not_le(Nat.is_ne(mtp_ring_slots(w, a), 0n), mtp_ring_slots(w, a), Nat.add(w, a), K.ikp_pow2_holds(40n, Nat.is_ge(128n, Nat.add(w, a)), 128n, Nat.add(w, a), K.ikp_ge_lt_excl(128n, Nat.add(w, a))))
+
+# promise: a ring the sizing returns (non-zero) has a power-of-two number of slots, so a position's slot is the position modulo the ring.
+# harm: the context kernel's slot mask would send two live positions to one slot.
+# catches: the ring sized to the need itself, not rounded up to a power of two
+law mtp_ring_slots_pow2:
+  for +w: Nat
+  for +a: Nat
+  {Bool.and(Nat.is_ne(mtp_ring_slots(w, a), 0n), Bool.not(K.ik_is_pow2(mtp_ring_slots(w, a)))) == False{} : Bool}
+
+def mtp_ring_slots_pow2(w, a):
+  K.ikp_pow2_rows_pow2(Nat.add(w, a))
+
+# Lemmas of the doubling search behind `K.ik_pow2_rows` (all erased before Rust codegen).
+
+# Two answers of one Bool cannot both hold.
+def mtp_clash(-x: Bool, hf: {x == False{} : Bool}, ht: {x == True{} : Bool}) -> {False{} == True{} : Bool}:
+  %hf : {_ == True{} : Bool}
+  ht
+
+def mtp_not_self(x: Bool) -> {Bool.and(Bool.not(x), x) == False{} : Bool}:
+  match x:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# A search that has not stopped at `p` has a need above `p`.
+def mtp_ge_le_excl(+p: Nat, +need: Nat) -> {Bool.and(Bool.not(Nat.is_ge(p, need)), Nat.is_le(need, p)) == False{} : Bool}:
+  %Equal.sym(Bool, Nat.is_ge(p, need), Nat.is_le(need, p), K.ikp_ge_le(p, need)) : {Bool.and(Bool.not(_), Nat.is_le(need, p)) == False{} : Bool}
+  mtp_not_self(Nat.is_le(need, p))
+
+# Doubling a non-zero size keeps it non-zero.
+def mtp_double_nz(+p: Nat, hp: {Nat.is_ne(p, 0n) == True{} : Bool}) -> {Nat.is_ne(Nat.mul(p, 2n), 0n) == True{} : Bool}:
+  match p:
+    case 0n:
+      L.bool_absurd({Nat.is_ne(Nat.mul(0n, 2n), 0n) == True{} : Bool}, hp)
+    case 1n+q:
+      {==}
+
+# A need of at most `cap` stays within `p` times 2^fuel when `cap` is that bound written another way.
+def mtp_cap_bridge(-need: Nat, -p: Nat, -x: Nat, -y: Nat, e: {x == y : Nat}, h: {Nat.is_le(need, Nat.mul(p, x)) == True{} : Bool}) -> {Nat.is_le(need, Nat.mul(p, y)) == True{} : Bool}:
+  %e : {Nat.is_le(need, Nat.mul(p, _)) == True{} : Bool}
+  h
+
+# The search from a non-zero `p` finds a ring for every need of at most p * 2^fuel.
+def mtp_pow2_found(fuel: Nat, done: Bool, +p: Nat, +need: Nat, hp: {Nat.is_ne(p, 0n) == True{} : Bool}, hd: {Bool.and(Bool.not(done), Nat.is_le(need, p)) == False{} : Bool}, h: {Nat.is_le(need, Nat.mul(p, Nat.pow(2n, fuel))) == True{} : Bool}) -> {Nat.is_eq(K.ik_pow2_from(fuel, done, p, need), 0n) == False{} : Bool}:
+  match fuel:
+    case 0n:
+      match done:
+        case True{}:
+          K.ikp_not_tf(Nat.is_eq(p, 0n), hp)
+        case False{}:
+          L.bool_absurd({Nat.is_eq(K.ik_pow2_from(0n, False{}, p, need), 0n) == False{} : Bool}, mtp_clash(Nat.is_le(need, p), hd, L.nat_le_subst_r(need, Nat.mul(p, 1n), p, L.nat_mul_one_r(p), h)))
+    case 1n+f:
+      match done:
+        case True{}:
+          K.ikp_not_tf(Nat.is_eq(p, 0n), hp)
+        case False{}:
+          +g = {f : Nat}
+          mtp_pow2_found(g, Nat.is_ge(Nat.mul(p, 2n), need), Nat.mul(p, 2n), need, mtp_double_nz(p, hp), mtp_ge_le_excl(Nat.mul(p, 2n), need), L.nat_le_subst_r(need, Nat.mul(p, Nat.mul(2n, Nat.pow(2n, g))), Nat.mul(Nat.mul(p, 2n), Nat.pow(2n, g)), Equal.sym(Nat, Nat.mul(Nat.mul(p, 2n), Nat.pow(2n, g)), Nat.mul(p, Nat.mul(2n, Nat.pow(2n, g))), L.nat_mul_assoc(p, 2n, Nat.pow(2n, g))), h))
+
+# A ring the search finds with some fuel it still finds with more.
+def mtp_pow2_more_le(f: Nat, f2: Nat, done: Bool, +p: Nat, +need: Nat, hf: {Nat.is_le(f, f2) == True{} : Bool}, h: {Nat.is_eq(K.ik_pow2_from(f, done, p, need), 0n) == False{} : Bool}) -> {Nat.is_eq(K.ik_pow2_from(f2, done, p, need), 0n) == False{} : Bool}:
+  match f:
+    case 0n:
+      match f2:
+        case 0n:
+          h
+        case 1n+g2:
+          match done:
+            case True{}:
+              h
+            case False{}:
+              L.bool_absurd_tf({Nat.is_eq(K.ik_pow2_from(1n+g2, False{}, p, need), 0n) == False{} : Bool}, h)
+    case 1n+g:
+      match f2:
+        case 0n:
+          L.bool_absurd({Nat.is_eq(K.ik_pow2_from(0n, done, p, need), 0n) == False{} : Bool}, hf)
+        case 1n+g2:
+          match done:
+            case True{}:
+              h
+            case False{}:
+              mtp_pow2_more_le(g, g2, Nat.is_ge(Nat.mul(p, 2n), need), Nat.mul(p, 2n), need, hf, h)
+
+# A window and a pass within the cap get a ring: the search from 128 holds 128 * 2^9 rows within 9 of its 40 doublings.
+def mtp_cap_ring(c: Bool, +w: Nat, +a: Nat, e: {Nat.is_le(Nat.add(w, a), Nat.mul(128n, 512n)) == c : Bool}) -> {Bool.and(c, Nat.is_eq(mtp_ring_slots(w, a), 0n)) == False{} : Bool}:
+  match c:
+    case False{}:
+      {==}
+    case True{}:
+      +n = {Nat.add(w, a) : Nat}
+      mtp_pow2_more_le(9n, 40n, Nat.is_ge(128n, n), 128n, n, {==}, mtp_pow2_found(9n, Nat.is_ge(128n, n), 128n, n, {==}, mtp_ge_le_excl(128n, n), mtp_cap_bridge(n, 128n, 512n, Nat.pow(2n, 9n), {==}, e)))
+
+# promise: a window and a pass that together need at most 65536 slots (128 x 512, 64 times the 1024-row windows of today's drafters) always get a ring, so the two laws above never hold only because the sizing gave none.
+# harm: the drafter would refuse a checkpoint whose window and passes fit a ring the engine can build.
+# catches: the search cut to too few doublings (no ring past 128 slots, the 40 doublings of `K.ik_pow2_rows` cut to 0)
+law mtp_ring_slots_found:
+  for +w: Nat
+  for +a: Nat
+  {Bool.and(Nat.is_le(Nat.add(w, a), Nat.mul(128n, 512n)), Nat.is_eq(mtp_ring_slots(w, a), 0n)) == False{} : Bool}
+
+def mtp_ring_slots_found(w, a):
+  mtp_cap_ring(Nat.is_le(Nat.add(w, a), Nat.mul(128n, 512n)), w, a, {==})
 
 # ============================================================================
 # 3. Drafts of a block
