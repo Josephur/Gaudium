@@ -815,18 +815,6 @@ def kc_half_lt(+c: Nat) -> {Nat.is_lt(Nat.div(Nat.mod(c, 128n), 2n), 64n) == Tru
 def kc_quarter_lt(+c: Nat) -> {Nat.is_lt(Nat.div(Nat.mod(c, 128n), 4n), 32n) == True{} : Bool}:
   L.nat_div_lt_of_lt_mul(Nat.mod(c, 128n), 32n, 3n, L.nat_mod_lt(c, 127n))
 
-def kc_eq_of_is_eq(+a: Nat, +b: Nat, h: {Nat.is_eq(a, b) == True{} : Bool}) -> {a == b : Nat}:
-  match a b:
-    case 0n 0n:
-      {==}
-    case 0n 1n+bp:
-      L.bool_absurd({0n == 1n+bp : Nat}, h)
-    case 1n+ap 0n:
-      L.bool_absurd({1n+ap == 0n : Nat}, h)
-    case 1n+ap 1n+bp:
-      %kc_eq_of_is_eq(ap, bp, h) : {1n+ap == 1n+_ : Nat}
-      {==}
-
 # A remainder mod 2 that is not zero is one.
 def kc_odd_is_one(+p: Nat, ne: {False{} == Nat.is_eq(p, 0n) : Bool}, lt: {Nat.is_lt(p, 2n) == True{} : Bool}) -> {p == 1n : Nat}:
   match p:
@@ -883,8 +871,8 @@ def kc_lane128_if_inj(
 ) -> {Nat.add(Nat.mul(hx, 2n), px) == Nat.add(Nat.mul(hy, 2n), py) : Nat}:
   match ex ey:
     case True{} True{}:
-      %Equal.sym(Nat, px, 0n, kc_eq_of_is_eq(px, 0n, Equal.sym(Bool, True{}, Nat.is_eq(px, 0n), eqx))) : {Nat.add(Nat.mul(hx, 2n), _) == Nat.add(Nat.mul(hy, 2n), py) : Nat}
-      %Equal.sym(Nat, py, 0n, kc_eq_of_is_eq(py, 0n, Equal.sym(Bool, True{}, Nat.is_eq(py, 0n), eqy))) : {Nat.add(Nat.mul(hx, 2n), 0n) == Nat.add(Nat.mul(hy, 2n), _) : Nat}
+      %Equal.sym(Nat, px, 0n, G.g_nat_eq_of_is_eq(px, 0n, Equal.sym(Bool, True{}, Nat.is_eq(px, 0n), eqx))) : {Nat.add(Nat.mul(hx, 2n), _) == Nat.add(Nat.mul(hy, 2n), py) : Nat}
+      %Equal.sym(Nat, py, 0n, G.g_nat_eq_of_is_eq(py, 0n, Equal.sym(Bool, True{}, Nat.is_eq(py, 0n), eqy))) : {Nat.add(Nat.mul(hx, 2n), 0n) == Nat.add(Nat.mul(hy, 2n), _) : Nat}
       %e : {Nat.add(Nat.mul(hx, 2n), 0n) == Nat.add(Nat.mul(_, 2n), 0n) : Nat}
       {==}
     case False{} False{}:
