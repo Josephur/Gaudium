@@ -67,10 +67,12 @@ pub fn dims(g: &Gguf) -> Result<Qwen35Dims, GgufError> {
         u("ssm.inner_size"),
     );
     let hidden = u("embedding_length");
-    // at least one trunk layer; value heads a whole multiple of key heads; inner = value heads x value dim
+    // at least one trunk layer; value heads a whole multiple of key heads; inner = value heads x value
+    // dim, a value dim of at least 1 (an inner size of 0, or none, would leave the value heads empty)
     if !v::gg_span_ok(mtp, 1, blocks)
         || hidden == 0
         || dk == 0
+        || inner == 0
         || !v::gg_blocks_ok(hv, hk)
         || !v::gg_blocks_ok(inner, hv)
     {

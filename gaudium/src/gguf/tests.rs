@@ -981,6 +981,25 @@ fn qwen35_map_gives_the_packer_names() {
     o.kv_str("general.architecture", "llama");
     fs::write(&p, o.build()).unwrap();
     assert!(qwen35::dims(&Gguf::open(&p).unwrap()).is_err());
+    // an inner size of 0, or none, leaves the value heads empty, so it is refused up front
+    for inner in [Some(0u32), None] {
+        let mut z = Builder::new();
+        z.kv_str("general.architecture", "qwen35")
+            .kv_u32("qwen35.block_count", 3)
+            .kv_u32("qwen35.nextn_predict_layers", 1)
+            .kv_u32("qwen35.embedding_length", h as u32)
+            .kv_u32("qwen35.ssm.group_count", hk as u32)
+            .kv_u32("qwen35.ssm.time_step_rank", hv as u32)
+            .kv_u32("qwen35.ssm.state_size", 1);
+        if let Some(i) = inner {
+            z.kv_u32("qwen35.ssm.inner_size", i);
+        }
+        fs::write(&p, z.build()).unwrap();
+        assert!(
+            qwen35::dims(&Gguf::open(&p).unwrap()).is_err(),
+            "inner size {inner:?}"
+        );
+    }
     fs::remove_dir_all(&dir).unwrap();
 }
 
