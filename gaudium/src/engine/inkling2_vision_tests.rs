@@ -312,6 +312,27 @@ fn bucket_ladder_of_today() {
 }
 
 #[test]
+fn a_tower_too_wide_to_size_is_refused_not_planned() {
+    // the tower's width comes from the checkpoint's config: one whose sequence buffer's bytes
+    // overflow u64 is an error, not a wrapped (or panicking) size
+    let spec_text = ModelSpec::from_config_json(CONFIG).unwrap();
+    let text = IkDims::from_spec(&spec_text, crate::engine::inkling2::IK_MAX_PREFILL_TILE).unwrap();
+    let d = IkvDims::from_config_json(CONFIG).unwrap();
+    let wide = IkvDims {
+        hid: u64::MAX / 4,
+        ..d
+    };
+    let tile = crate::engine::inkling2::IK_MAX_PREFILL_TILE;
+    let e = match IkvPlan::new(wide, &text, 4096, 16_384, tile) {
+        Ok(_) => panic!("a tower of {} columns was planned", u64::MAX / 4),
+        Err(e) => e,
+    };
+    assert!(e.contains("overflows"), "{e}");
+    // the same image limits plan with the checkpoint's own width
+    assert!(IkvPlan::new(d, &text, 4096, 16_384, tile).is_ok());
+}
+
+#[test]
 fn plan_of_the_largest_image() {
     let spec_text = ModelSpec::from_config_json(CONFIG).unwrap();
     let text = IkDims::from_spec(&spec_text, crate::engine::inkling2::IK_MAX_PREFILL_TILE).unwrap();

@@ -62,7 +62,7 @@ use crate::synapse::graph::{CompiledRecipe, GraphBuilder, PreparedLaunch, Tensor
 use crate::synapse::ops::{as_param_bytes, TransposeParams};
 use crate::synapse::recipe_cache::RecipeCache;
 use crate::verified::{
-    align_up, ikv_bucket, ikv_feat_cols, ikv_feat_next, ikv_feat_row, ikv_feat_start,
+    align_up, ik_bf16_bytes, ikv_bucket, ikv_feat_cols, ikv_feat_next, ikv_feat_row, ikv_feat_start,
     ikv_feat_write_safe, ikv_key_live, ikv_round, ikv_rows_match, ikv_seq_rows, ikv_side,
     ikv_token_cap, ikv_tokens_fit, HbmCat,
 };
@@ -974,6 +974,19 @@ impl IkvPlan {
         let feat_cols = ikv_feat_cols(max_tokens, cap).ok_or_else(|| {
             format!("--vision-max-tokens {max_tokens}: the feature buffer overflows")
         })?;
+        // the widths come from the checkpoint's configs, so a BF16 buffer's bytes may overflow
+        let xbuf_bytes = ik_bf16_bytes(max_rows, d.hid).ok_or_else(|| {
+            format!(
+                "--vision-max-patches {max_patches}: the tower's sequence of {max_rows} rows of {} overflows",
+                d.hid
+            )
+        })?;
+        let feat_bytes = ik_bf16_bytes(feat_cols, text.hid).ok_or_else(|| {
+            format!(
+                "--vision-max-tokens {max_tokens}: the feature buffer of {feat_cols} columns of {} overflows",
+                text.hid
+            )
+        })?;
         let mut plan = Self {
             d,
             cap,
@@ -982,8 +995,8 @@ impl IkvPlan {
             feat_cols,
             weights: BTreeMap::new(),
             acts: BTreeMap::new(),
-            xbuf_bytes: d.hid * max_rows * 2,
-            feat_bytes: text.hid * feat_cols * 2,
+            xbuf_bytes,
+            feat_bytes,
         };
         let graphs = [
             build_embed_graph(&d, max_rows),

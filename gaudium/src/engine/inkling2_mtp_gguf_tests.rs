@@ -39,6 +39,8 @@ struct Toy {
     window: u32,
     mask_rows: u64,
     bulk: GgmlType,
+    /// Rows of the token table `markov_w1` of a folded file; 0: no table.
+    w1_rows: u64,
 }
 
 impl Default for Toy {
@@ -52,6 +54,7 @@ impl Default for Toy {
             window: 16,
             mask_rows: BLOCK - 1,
             bulk: GgmlType::BF16,
+            w1_rows: 0,
         }
     }
 }
@@ -127,6 +130,14 @@ fn toy_bytes(t: &Toy) -> Vec<u8> {
             GgmlType::F32,
             zeros(t.hid * t.mask_rows, GgmlType::F32),
         );
+        if t.w1_rows > 0 {
+            b.tensor(
+                "markov_w1.weight",
+                &[RANK, t.w1_rows],
+                GgmlType::BF16,
+                zeros(RANK * t.w1_rows, GgmlType::BF16),
+            );
+        }
     } else {
         b.tensor(
             "dspark_fuse.weight",
@@ -218,6 +229,26 @@ fn bf16_drafter_files_are_preferred() {
         .map(mtpf_rank)
         .collect();
     assert!(r.windows(2).all(|w| w[0] < w[1]), "{r:?}");
+}
+
+#[test]
+fn a_token_table_is_padded_to_its_device_rows_and_an_unsizable_one_refused() {
+    let bytes = toy_bytes(&Toy {
+        folded: true,
+        w1_rows: 4,
+        ..Toy::default()
+    });
+    let (dir, _) = model_dir("mtpf_w1", &[("drafter-BF16.gguf", bytes)]);
+    let f = GgufMtp::open(&dir.join("drafter-BF16.gguf")).unwrap();
+    // the file's 4 rows, then zero rows up to the device tensor's 8
+    let t = f.table("markov_w1.weight", RANK, 4, 8).unwrap();
+    assert_eq!(t.len(), (8 * RANK * 2) as usize);
+    // a device tensor whose bytes overflow u64 (its rows come from the model's config) is an
+    // error, not a wrapped size
+    let e = f
+        .table("markov_w1.weight", RANK, 4, u64::MAX / 2)
+        .unwrap_err();
+    assert!(e.contains("overflows"), "{e}");
 }
 
 #[test]
