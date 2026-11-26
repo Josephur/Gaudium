@@ -566,11 +566,6 @@ pub(super) struct LaneRt {
     next_event: usize,
 }
 
-fn step_draft_counts(rows: u64, emitted: u64) -> (u64, u64) {
-    let drafted = rows.saturating_sub(1);
-    (drafted, emitted.saturating_sub(1).min(drafted))
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct WidthTally {
     slots: u64,
@@ -1981,7 +1976,10 @@ fn apply_spec(
         }
         run.advance(n_emit as u64, rows);
         let n_out = n_emit as u64;
-        let (drafted, kept) = step_draft_counts(rows, n_out);
+        // What the width policy learns of this step's drafts (the verified `ln_step_*`); the
+        // request's running totals of them are report-only.
+        let drafted = crate::verified::ln_step_drafted(rows);
+        let kept = crate::verified::ln_step_kept(rows, n_out);
         run.drafted += drafted;
         run.accepted += kept;
         if drafted > 0 {
@@ -2510,13 +2508,16 @@ mod tests {
         assert!(wt.unmeasured <= wt.chunked);
         assert_eq!(wt.launches, 3);
         assert_eq!(wt.dropped, 3);
-        // Step / request draft tally helpers: emitted tokens minus 1 bonus token, clamped to drafted
+        // A step's drafts: 8 rows verify 7; 4 tokens emitted keep 3 of them; a single-row step
+        // drafts none; never more kept than verified, whatever the accept kernel reported.
+        use crate::verified::{ln_step_drafted, ln_step_kept};
         for &(rows, emitted, want_drafted, want_kept) in &[
             (8u64, 4u64, 7u64, 3u64),
             (1, 1, 0, 0),
             (8, 12, 7, 7),
+            (0, 0, 0, 0),
         ] {
-            let (drafted, kept) = step_draft_counts(rows, emitted);
+            let (drafted, kept) = (ln_step_drafted(rows), ln_step_kept(rows, emitted));
             assert_eq!(drafted, want_drafted);
             assert_eq!(kept, want_kept);
             assert!(kept <= drafted);
