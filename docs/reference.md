@@ -291,7 +291,8 @@ Serve options:
                         reaches, and plain-http servers used from an https page). Off
                         by default. It needs the targets it may reach (the two options
                         below); requests need the API key when one is set; a page of
-                        another site cannot drive it. GET /gaudium/proxy shows its
+                        another site cannot drive it, and a request must name this
+                        server (see --server-name). GET /gaudium/proxy shows its
                         settings and last decisions
   --mcp-proxy-allow <list>  Targets the proxy may reach, comma separated (repeatable):
                         host, host:port, *.domain, an address, an address range
@@ -303,6 +304,14 @@ Serve options:
                         (localhost:8931, 127.0.0.1, 192.168.0.0/16). An entry here
                         also allows the target, so an MCP server on this machine
                         needs this option only
+  --server-name <list>  Names this server is opened by, comma separated (repeatable),
+                        for the MCP proxy: its requests must name the server (Host and
+                        any X-Forwarded-Host or Forwarded host) by an address,
+                        localhost, a name given here, or a DNS name of the HTTPS
+                        certificate; any other name is refused, so a page of another
+                        site cannot point its own name at this server (DNS rebinding).
+                        Give the name the Web UI is opened by, and a front end's
+                        public name
   --mcp-proxy-max-mb <N>  Largest response the proxy passes on, in MiB (default: 64)
   --mcp-proxy-timeout <secs>  Longest silence of a target, or wait on a page that
                         stopped reading, before the proxy gives up (default: 600).

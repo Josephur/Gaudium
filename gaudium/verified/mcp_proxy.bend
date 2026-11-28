@@ -161,7 +161,9 @@ def px_start_serve_xor_refuse(s):
 # A page of another site, open in the same browser, must not be able to drive the proxy. The
 # browser says where a request comes from (its fetch-site statement, which page script cannot
 # set); without that statement the request's own origin is compared with the host the request
-# itself names. No configured name takes part, so the rule is the same behind any front end.
+# itself names. Whether that host is one of the server's own names is decided apart from this
+# rule (`hn_request_ours` and `hn_site_ok` in `server_names.bend`), which takes this verdict as
+# an input.
 
 type PxSite is Data:
   PxSiteAbsent{}

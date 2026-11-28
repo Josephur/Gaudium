@@ -1654,8 +1654,17 @@ pub fn run_server(cfg: ServerConfig) -> Result<(), String> {
         return Err("at least one --model <dir> is required for --serve".into());
     }
     // Settings that can refuse the start are checked before anything is loaded.
-    let proxy = proxy::McpProxy::new(&cfg.mcp_proxy, cfg.api_key.is_some())?;
+    let mut proxy = proxy::McpProxy::new(&cfg.mcp_proxy, cfg.api_key.is_some())?;
     let tls = start_tls(&cfg)?;
+    // the names of the HTTPS certificate are names the server is opened by
+    if let (true, Some(_), Some(cert)) = (proxy.enabled(), &tls, cfg.tls_cert.as_deref()) {
+        match crate::tls_cert::cert_file_dns_names(cert) {
+            Ok(n) => proxy.add_server_names(&n),
+            Err(e) => eprintln!(
+                "[server] the names of the HTTPS certificate could not be read ({e}); the MCP proxy takes only localhost, addresses and --server-name"
+            ),
+        }
+    }
     // Shared stop-request handler; re-asserted by the device layer after every card open, because
     // the runtime replaces signal dispositions while initializing.
     crate::signals::install();
@@ -1890,6 +1899,19 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
 
     if let Some(line) = state.proxy.summary(cfg.api_key.is_some()) {
         eprintln!("[server] {line}");
+        let loopback = cfg.host.eq_ignore_ascii_case("localhost")
+            || cfg
+                .host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|a| a.is_loopback());
+        if !loopback && cfg.api_key.is_none() {
+            eprintln!(
+                "[server] WARNING: the MCP proxy is reachable from other machines ({}) without authentication: no --api-key is set",
+                cfg.host
+            );
+        }
     }
     eprintln!(
         "[server] listening on http://{0}/{1} (models: {2}, lazy={3}, idle_park={4}s, ui={5})",

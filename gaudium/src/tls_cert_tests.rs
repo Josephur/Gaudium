@@ -172,6 +172,11 @@ fn a_first_run_makes_the_authority_and_the_server_files() {
     // the server file is the chain: the server's certificate, then the authority's
     let chain = fs::read_to_string(t.0.join(SERVER_CERT)).unwrap();
     assert_eq!(chain.matches("BEGIN CERTIFICATE").count(), 2);
+    // its DNS names, as the server reads them for the names it is opened by
+    assert_eq!(
+        cert_file_dns_names(&t.0.join(SERVER_CERT)).unwrap(),
+        ["localhost", "gaudium.example.lan"]
+    );
     let key = fs::read_to_string(t.0.join(SERVER_KEY)).unwrap();
     assert!(key.contains("BEGIN PRIVATE KEY"));
     // the report holds no key material

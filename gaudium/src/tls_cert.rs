@@ -305,6 +305,12 @@ struct Crypto {
     x509_check_host:
         unsafe extern "C" fn(P, *const c_char, usize, c_uint, *mut *mut c_char) -> c_int,
     x509_check_ip_asc: unsafe extern "C" fn(P, *const c_char, c_uint) -> c_int,
+    x509_get_ext_d2i: unsafe extern "C" fn(CP, c_int, *mut c_int, *mut c_int) -> P,
+    sk_num: unsafe extern "C" fn(CP) -> c_int,
+    sk_value: unsafe extern "C" fn(CP, c_int) -> P,
+    general_names_free: unsafe extern "C" fn(P),
+    asn1_string_get0_data: unsafe extern "C" fn(CP) -> *const u8,
+    asn1_string_length: unsafe extern "C" fn(CP) -> c_int,
     asn1_time_diff: unsafe extern "C" fn(*mut c_int, *mut c_int, CP, CP) -> c_int,
     asn1_time_print: unsafe extern "C" fn(P, CP) -> c_int,
     bio_s_mem: unsafe extern "C" fn() -> CP,
@@ -338,6 +344,9 @@ const BIO_NOCLOSE: c_int = 0;
 const BIO_CTRL_INFO: c_int = 3;
 const BIO_CTRL_FLUSH: c_int = 11;
 const X509_PURPOSE_SSL_SERVER: c_int = 2;
+/// `NID_subject_alt_name` and the `GEN_DNS` kind of a `GENERAL_NAME`.
+const NID_SUBJECT_ALT_NAME: c_int = 85;
+const GEN_DNS: c_int = 2;
 /// `X509_VERSION_3`: the version field holds the version minus one.
 const X509_VERSION_3: c_long = 2;
 /// Room for an `X509V3_CTX` (eight pointer-sized fields in OpenSSL 3), with a wide margin.
@@ -400,6 +409,12 @@ impl Crypto {
                     x509_check_ca: lookup(handle, "X509_check_ca")?,
                     x509_check_host: lookup(handle, "X509_check_host")?,
                     x509_check_ip_asc: lookup(handle, "X509_check_ip_asc")?,
+                    x509_get_ext_d2i: lookup(handle, "X509_get_ext_d2i")?,
+                    sk_num: lookup(handle, "OPENSSL_sk_num")?,
+                    sk_value: lookup(handle, "OPENSSL_sk_value")?,
+                    general_names_free: lookup(handle, "GENERAL_NAMES_free")?,
+                    asn1_string_get0_data: lookup(handle, "ASN1_STRING_get0_data")?,
+                    asn1_string_length: lookup(handle, "ASN1_STRING_length")?,
                     asn1_time_diff: lookup(handle, "ASN1_TIME_diff")?,
                     asn1_time_print: lookup(handle, "ASN1_TIME_print")?,
                     bio_s_mem: lookup(handle, "BIO_s_mem")?,
@@ -707,6 +722,49 @@ impl Crypto {
     }
 
     /// The first certificate of a PEM file.
+    /// The DNS names of a certificate's subject-alternative-name extension, as written there.
+    fn dns_names(&'static self, cert: &Cert) -> Vec<String> {
+        /// `GENERAL_NAME` of the OpenSSL headers: the kind, then a union of pointers.
+        #[repr(C)]
+        struct GeneralName {
+            kind: c_int,
+            d: CP,
+        }
+        let mut out = Vec::new();
+        // SAFETY: the extension is decoded into a stack owned here and freed once; each entry
+        // and string belongs to it and is read before it is freed.
+        unsafe {
+            (self.err_clear_error)();
+            let sk = (self.x509_get_ext_d2i)(
+                cert.1,
+                NID_SUBJECT_ALT_NAME,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if sk.is_null() {
+                (self.err_clear_error)();
+                return out;
+            }
+            for i in 0..(self.sk_num)(sk).max(0) {
+                let g = (self.sk_value)(sk, i).cast::<GeneralName>();
+                if g.is_null() || (*g).kind != GEN_DNS || (*g).d.is_null() {
+                    continue;
+                }
+                let data = (self.asn1_string_get0_data)((*g).d);
+                let len = (self.asn1_string_length)((*g).d);
+                if data.is_null() || len <= 0 {
+                    continue;
+                }
+                let b = std::slice::from_raw_parts(data, len as usize);
+                if let Ok(t) = std::str::from_utf8(b) {
+                    out.push(t.to_string());
+                }
+            }
+            (self.general_names_free)(sk);
+        }
+        out
+    }
+
     fn read_cert(&'static self, path: &Path) -> Result<Cert, String> {
         let c = crate::tls::c_path(path)?;
         // SAFETY: the BIO is owned; the library reads the file.
@@ -1208,6 +1266,14 @@ pub fn cert_file_expiry(path: &Path) -> Result<(String, i64), String> {
     let c = crypto()?;
     let cert = c.read_cert(path)?;
     c.not_after(&cert)
+}
+
+/// The DNS names the first certificate of a PEM file is valid for (its subject alternative
+/// names, wildcards included as written). For the names the server is opened by.
+pub fn cert_file_dns_names(path: &Path) -> Result<Vec<String>, String> {
+    let c = crypto()?;
+    let cert = c.read_cert(path)?;
+    Ok(c.dns_names(&cert))
 }
 
 /// How to trust the authority on each kind of device, for `ca` (the path of `ca.crt`).

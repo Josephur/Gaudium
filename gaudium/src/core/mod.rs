@@ -13,6 +13,7 @@ pub mod lanes;
 pub mod lifecycle;
 pub mod listener;
 pub mod proxy;
+pub mod server_names;
 pub mod shapes;
 pub mod think_budget;
 pub mod tool_calls;

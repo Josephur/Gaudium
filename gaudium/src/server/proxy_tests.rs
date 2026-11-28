@@ -765,86 +765,252 @@ fn a_page_of_another_site_cannot_drive_the_proxy() {
     assert_eq!(t.seen().len(), 5);
 }
 
-/// Behind a front end that ends TLS: the request arrives as plain HTTP, the page's origin is the
-/// public https name, and `Host` is whatever the front end sends. No name is configured anywhere.
+/// One request to `/cors-proxy` with `Host: <host>` and the given header lines.
+fn with_host(p: &Arc<McpProxy>, url: &str, host: &str, headers: &[&str]) -> Reply {
+    let mut raw = format!(
+        "POST /cors-proxy?url={} HTTP/1.1\r\nHost: {host}\r\n",
+        query(url)
+    );
+    for h in headers {
+        raw.push_str(h);
+        raw.push_str("\r\n");
+    }
+    raw.push_str("Content-Length: 2\r\n\r\n{}");
+    let mut c = open(p, raw, true);
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    parse_reply(&out)
+}
+
+/// A page on any domain can point its own name at this server's address (DNS rebinding). The
+/// browser then sends an origin and a `Host` that agree, and calls the request same-origin; the
+/// `Host` still names the page's domain, which is not one of this server's names.
 #[test]
-fn the_site_rule_needs_no_configured_name_behind_a_front_end() {
+fn a_page_that_points_its_own_name_at_this_server_is_refused() {
     let t = target(None, |_, s| ok_json(s, "", "{\"ok\":true}"));
     let p = Arc::new(proxy(&[], &["127.0.0.1"]));
     let url = t.url("/mcp");
+    for headers in [
+        &["Origin: http://rebind.example.com:8090"][..],
+        &[
+            "Origin: http://rebind.example.com:8090",
+            "Sec-Fetch-Site: same-origin",
+        ],
+        &["Sec-Fetch-Site: none"],
+        &[],
+    ] {
+        let r = with_host(&p, &url, "rebind.example.com:8090", headers);
+        assert_eq!(r.status, 403, "{headers:?}");
+        let e = r.error();
+        assert!(
+            e.starts_with("mcp proxy: the request names the host rebind.example.com:8090, which is not one of this server's names"),
+            "{e}"
+        );
+        assert!(e.contains("--server-name"), "{e}");
+        assert!(r.header("access-control-allow-origin").is_none());
+    }
+    // a name that only starts or ends like one of the server's names is another name
+    for host in ["localhost.example.com", "evil-localhost", "localhostx:8090"] {
+        let origin = format!("Origin: http://{host}");
+        assert_eq!(with_host(&p, &url, host, &[&origin]).status, 403, "{host}");
+    }
+    // no Host, or one that is not a host
+    let mut c = open(
+        &p,
+        format!(
+            "GET /cors-proxy?url={} HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+            query(&url)
+        ),
+        true,
+    );
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    assert_eq!(parse_reply(&out).status, 403);
+    for host in [
+        "",
+        "a b",
+        "localhost:http",
+        "[::1",
+        "::1",
+        "[::1]x",
+        "localhost:0",
+    ] {
+        assert_eq!(with_host(&p, &url, host, &[]).status, 403, "{host:?}");
+    }
+    assert_eq!(
+        t.seen().len(),
+        0,
+        "a refused request never reaches the target"
+    );
+}
+
+/// The Web UI opened by loopback names and addresses keeps working, with and without a port and
+/// whatever the case of the name; an IPv6 literal is bracketed.
+#[test]
+fn this_servers_own_names_and_addresses_pass() {
+    let t = target(None, |_, s| ok_json(s, "", "{\"ok\":true}"));
+    let p = Arc::new(proxy(&[], &["127.0.0.1"]));
+    let url = t.url("/mcp");
+    let mut n = 0;
+    for host in [
+        "localhost",
+        "localhost:8090",
+        "LocalHost:8090",
+        "localhost.:8090",
+        "127.0.0.1",
+        "127.0.0.1:8090",
+        "[::1]",
+        "[::1]:8090",
+        "192.0.2.10:8090",
+        "[2001:db8::10]:8090",
+    ] {
+        let origin = format!("Origin: http://{host}");
+        assert_eq!(with_host(&p, &url, host, &[&origin]).status, 200, "{host}");
+        assert_eq!(
+            with_host(&p, &url, host, &["Sec-Fetch-Site: same-origin"]).status,
+            200,
+            "{host}"
+        );
+        n += 2;
+    }
+    assert_eq!(t.seen().len(), n);
+}
+
+/// A name given with --server-name, or one of the HTTPS certificate, passes like localhost.
+#[test]
+fn names_given_to_the_server_pass_and_others_do_not() {
+    let t = target(None, |_, s| ok_json(s, "", "{\"ok\":true}"));
+    let mut o = options(&[], &["127.0.0.1"]);
+    o.server_names = vec!["chat.example.com, Gaudium.Example.Org".into()];
+    let mut p = McpProxy::new(&o, true).unwrap();
+    p.add_server_names(&["cert.example.net".into(), "*.example.net".into()]);
+    let p = Arc::new(p);
+    let url = t.url("/mcp");
+    for host in [
+        "chat.example.com",
+        "CHAT.EXAMPLE.COM:8090",
+        "gaudium.example.org:443",
+        "cert.example.net",
+    ] {
+        let origin = format!("Origin: https://{}", host.trim_end_matches(":443"));
+        assert_eq!(with_host(&p, &url, host, &[&origin]).status, 200, "{host}");
+    }
+    for host in [
+        "other.example.com",
+        "chat.example.com.example.net",
+        "x.example.net",
+    ] {
+        let origin = format!("Origin: https://{host}");
+        assert_eq!(with_host(&p, &url, host, &[&origin]).status, 403, "{host}");
+    }
+    assert!(p.status_json().contains(
+        "\"server_names\":[\"localhost\",\"chat.example.com\",\"gaudium.example.org\",\"cert.example.net\"]"
+    ));
+    // a malformed or wildcard name does not start the server
+    for bad in ["*.example.com", "a b", "chat.example.com:8090"] {
+        let mut o = options(&[], &["127.0.0.1"]);
+        o.server_names = vec![bad.into()];
+        let e = McpProxy::new(&o, true).err().expect(bad);
+        assert!(e.starts_with("--server-name "), "{e}");
+    }
+}
+
+/// Behind a front end that ends TLS: the request arrives as plain HTTP, the page's origin is the
+/// public https name, and `Host` is whatever the front end sends. The public name is given with
+/// --server-name; every host the request names (Host, X-Forwarded-Host, Forwarded host=) must be
+/// one of the server's.
+#[test]
+fn behind_a_front_end_its_public_name_is_given_to_the_server() {
+    let t = target(None, |_, s| ok_json(s, "", "{\"ok\":true}"));
+    let mut o = options(&[], &["127.0.0.1"]);
+    o.server_names = vec!["chat.example.com".into()];
+    let p = Arc::new(McpProxy::new(&o, true).unwrap());
+    let bare = Arc::new(proxy(&[], &["127.0.0.1"]));
+    let url = t.url("/mcp");
     // `send` writes `Host: localhost:8090`: a front end that passes its upstream's name on
-    let hit = |headers: &[&str]| send(&p, "POST", &url, headers, "{}").status;
+    let hit = |p: &Arc<McpProxy>, headers: &[&str]| send(p, "POST", &url, headers, "{}").status;
+    let proto = "X-Forwarded-Proto: https";
 
     // a front end that keeps the public name in Host
-    let direct = |host: &str, headers: &[&str]| {
-        let mut raw = format!(
-            "POST /cors-proxy?url={} HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-Proto: https\r\n",
-            query(&url)
-        );
-        for h in headers {
-            raw.push_str(h);
-            raw.push_str("\r\n");
-        }
-        raw.push_str("Content-Length: 2\r\n\r\n{}");
-        let mut c = open(&p, raw, true);
-        let mut out = Vec::new();
-        let _ = c.read_to_end(&mut out);
-        parse_reply(&out).status
-    };
+    let origin = "Origin: https://chat.example.com";
     assert_eq!(
-        direct("chat.example.com", &["Origin: https://chat.example.com"]),
+        with_host(&p, &url, "chat.example.com", &[proto, origin]).status,
         200
     );
     assert_eq!(
-        direct(
-            "chat.example.com:443",
-            &["Origin: https://chat.example.com"]
+        with_host(&p, &url, "chat.example.com:443", &[proto, origin]).status,
+        200
+    );
+    assert_eq!(
+        with_host(
+            &p,
+            &url,
+            "chat.example.com",
+            &[proto, "Origin: https://other.example.com"]
+        )
+        .status,
+        403
+    );
+    // the same front end without the name given: refused, and the message says what to give
+    let r = with_host(&bare, &url, "chat.example.com", &[proto, origin]);
+    assert_eq!(r.status, 403);
+    assert!(r.error().contains("--server-name"));
+
+    // the front end rewrites Host and names the public host in a forwarding header
+    let fwd = "X-Forwarded-Host: chat.example.com";
+    assert_eq!(hit(&p, &[origin, fwd]), 200);
+    assert_eq!(
+        hit(
+            &p,
+            &[
+                origin,
+                "Forwarded: for=192.0.2.9;host=chat.example.com;proto=https"
+            ]
         ),
         200
     );
     assert_eq!(
-        direct("chat.example.com", &["Origin: https://other.example.com"]),
+        hit(
+            &p,
+            &[
+                origin,
+                "Forwarded: for=192.0.2.9;host=\"chat.example.com:443\""
+            ]
+        ),
+        200
+    );
+    let r = send(&bare, "POST", &url, &[origin, fwd], "{}");
+    assert_eq!(r.status, 403);
+    assert!(
+        r.error().contains("a front-end header names a host"),
+        "{}",
+        r.error()
+    );
+    // a rebinding page behind the front end: the front end names the page's domain
+    assert_eq!(
+        hit(
+            &p,
+            &[
+                "Origin: https://other.example.com",
+                "X-Forwarded-Host: other.example.com"
+            ]
+        ),
         403
     );
-    // the front end rewrites Host and names the public host in a forwarding header
     assert_eq!(
-        hit(&[
-            "Origin: https://chat.example.com",
-            "X-Forwarded-Host: chat.example.com"
-        ]),
-        200
-    );
-    assert_eq!(
-        hit(&[
-            "Origin: https://chat.example.com",
-            "Forwarded: for=192.0.2.9;host=chat.example.com;proto=https"
-        ]),
-        200
-    );
-    assert_eq!(
-        hit(&[
-            "Origin: https://chat.example.com",
-            "X-Forwarded-Host: other.example.com"
-        ]),
+        hit(
+            &p,
+            &[
+                origin,
+                "X-Forwarded-Host: chat.example.com, other.example.com"
+            ]
+        ),
         403
     );
     // the front end rewrites Host and says nothing: the browser's own statement decides
     // (every browser sends it to an https page's server)
-    assert_eq!(
-        hit(&[
-            "Origin: https://chat.example.com",
-            "Sec-Fetch-Site: same-origin"
-        ]),
-        200
-    );
-    assert_eq!(
-        hit(&[
-            "Origin: https://chat.example.com",
-            "Sec-Fetch-Site: cross-site",
-            "X-Forwarded-Host: chat.example.com"
-        ]),
-        403
-    );
+    assert_eq!(hit(&p, &[origin, "Sec-Fetch-Site: same-origin"]), 200);
+    assert_eq!(hit(&p, &[origin, "Sec-Fetch-Site: cross-site", fwd]), 403);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1877,4 +2043,33 @@ fn decisions_are_counted_and_listed_without_the_query_of_a_url() {
         text.contains("\"url\":\"http://example.com:8931/mcp\""),
         "{text}"
     );
+}
+
+#[test]
+fn hosts_are_read_without_their_port_brackets_or_root_dot() {
+    let n = |s: &str| NamedHost::Name(s.as_bytes().to_vec());
+    assert_eq!(named_host("Example.COM"), n("Example.COM"));
+    assert_eq!(named_host(" example.com:8090 "), n("example.com"));
+    assert_eq!(named_host("example.com.:443"), n("example.com"));
+    assert_eq!(named_host("\"example.com:443\""), n("example.com"));
+    assert_eq!(named_host("192.0.2.7"), NamedHost::Addr);
+    assert_eq!(named_host("192.0.2.7:8090"), NamedHost::Addr);
+    assert_eq!(named_host("[2001:db8::7]"), NamedHost::Addr);
+    assert_eq!(named_host("[2001:db8::7]:8090"), NamedHost::Addr);
+    for bad in [
+        "",
+        "example.com:",
+        "example.com:0",
+        "example.com:65536",
+        "example.com:x",
+        "2001:db8::7",
+        "[2001:db8::7",
+        "[2001:db8::7]8090",
+        "[example.com]",
+        "exa mple.com",
+        "example.com/x",
+        "user@example.com",
+    ] {
+        assert_eq!(named_host(bad), NamedHost::Bad, "{bad:?}");
+    }
 }

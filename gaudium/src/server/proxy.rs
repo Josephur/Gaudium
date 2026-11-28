@@ -12,6 +12,12 @@
 //! redirects, headers, and the size and time caps. This file is the shell around those
 //! decisions: text parsing, name lookup, sockets, TLS and the HTTP exchange with the target.
 //!
+//! A request must also name this server (`verified/server_names.bend`, through
+//! `core::server_names`): its `Host`, and every host a front end names for it, is an address or
+//! one of the server's own names (`localhost`, `--server-name`, the names of the HTTPS
+//! certificate). A page of another site that points its own name at this server's address (DNS
+//! rebinding) sends an origin and a `Host` that agree, but its `Host` is its own name.
+//!
 //! The wire contract with the page (`ui/js/lib/mcp.js`):
 //! - `url` is the absolute `http://` or `https://` URL of the target;
 //! - only request headers named `x-gaudium-proxy-header-<name>` go to the target, as `<name>`;
@@ -21,7 +27,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -33,6 +39,7 @@ use crate::core::proxy::{
     self as rule, AddrClass, AddrVerdict, Gate, ListMatch, Method, ReqHeader, RespHeader, Scheme,
     Site, Start, UrlVerdict,
 };
+use crate::core::server_names::{self as names, NamedHost, OwnNames};
 use crate::tls::{TlsClient, TlsStream};
 
 /// Request headers with this prefix are forwarded to the target without it.
@@ -77,6 +84,8 @@ pub struct ProxyOptions {
     pub idle_timeout_s: u64,
     /// `--mcp-proxy-ca`: certificate authorities trusted for HTTPS targets besides the system's.
     pub ca_file: Option<PathBuf>,
+    /// `--server-name`: names this server is opened by, besides `localhost` and addresses.
+    pub server_names: Vec<String>,
 }
 
 impl Default for ProxyOptions {
@@ -88,6 +97,7 @@ impl Default for ProxyOptions {
             max_response_mb: DEFAULT_MAX_RESPONSE_MB,
             idle_timeout_s: DEFAULT_IDLE_TIMEOUT_S,
             ca_file: None,
+            server_names: Vec::new(),
         }
     }
 }
@@ -658,8 +668,8 @@ fn request_site(req: &HttpRequest) -> (Site, bool, bool) {
 }
 
 /// The origin names the host this request was sent to: the request's own `Host`, or the host a
-/// front end says it received the request for (`X-Forwarded-Host`, `Forwarded: host=`). Only the
-/// request is looked at; the server has no name of its own to compare with.
+/// front end says it received the request for (`X-Forwarded-Host`, `Forwarded: host=`). Those
+/// hosts are themselves checked against the server's own names (`request_hosts`).
 fn origin_is_request_host(origin: &str, req: &HttpRequest) -> bool {
     let Some((scheme, authority)) = origin.split_once("://") else {
         return false;
@@ -697,6 +707,84 @@ fn origin_is_request_host(origin: &str, req: &HttpRequest) -> bool {
         }
     }
     named.iter().any(|n| *n == want)
+}
+
+/// One host as a header names it: `name`, `name:port`, an IPv4 address with or without a port,
+/// or a bracketed IPv6 address with or without one. A `Forwarded` value may be quoted. The name's
+/// bytes are kept as sent, without its port and root dot; the verified core compares them.
+fn named_host(raw: &str) -> NamedHost {
+    let v = raw.trim();
+    let v = v
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(v);
+    let port_ok = |p: &str| parse_port(p).is_some();
+    if let Some(rest) = v.strip_prefix('[') {
+        let Some((inside, after)) = rest.split_once(']') else {
+            return NamedHost::Bad;
+        };
+        let port_fits = after.is_empty() || after.strip_prefix(':').is_some_and(port_ok);
+        return if inside.parse::<Ipv6Addr>().is_ok() && port_fits {
+            NamedHost::Addr
+        } else {
+            NamedHost::Bad
+        };
+    }
+    let host = match v.rsplit_once(':') {
+        Some((h, p)) if port_ok(p) => h,
+        Some(_) => return NamedHost::Bad,
+        None => v,
+    };
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return NamedHost::Addr;
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if host_name_ok(name) {
+        NamedHost::Name(name.as_bytes().to_vec())
+    } else {
+        NamedHost::Bad
+    }
+}
+
+/// The hosts a request names: its `Host` header, and those a front end says it received the
+/// request for (`X-Forwarded-Host`, `Forwarded: host=`). A missing `Host` is unreadable.
+fn request_hosts(req: &HttpRequest) -> (NamedHost, Vec<NamedHost>) {
+    let host = req
+        .headers
+        .get("host")
+        .map_or(NamedHost::Bad, |h| named_host(h));
+    let mut forwarded = Vec::new();
+    if let Some(h) = req.headers.get("x-forwarded-host") {
+        forwarded.extend(h.split(',').map(named_host));
+    }
+    if let Some(f) = req.headers.get("forwarded") {
+        for part in f.split([',', ';']) {
+            if let Some((k, v)) = part.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("host") {
+                    forwarded.push(named_host(v));
+                }
+            }
+        }
+    }
+    (host, forwarded)
+}
+
+/// `--server-name` values (comma-separated lists, repeatable): the DNS names, lower case. An
+/// address is accepted and needs no entry (every address passes).
+fn parse_server_names(raw: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for list in raw {
+        let parsed =
+            crate::tls_cert::parse_names(list).map_err(|e| format!("--server-name {e}"))?;
+        for n in parsed {
+            if let crate::tls_cert::CertName::Dns(d) = n {
+                if !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ================================================================================================
@@ -982,6 +1070,10 @@ pub(super) struct McpProxy {
     /// The TLS client for HTTPS targets, or what is missing on this machine.
     tls: Result<TlsClient, String>,
     resolver: Resolver,
+    /// The server's own names a request's hosts are compared with (`localhost` first), as shown
+    /// and as the verified core compares them.
+    server_names: Vec<String>,
+    own_names: OwnNames,
     proxied: AtomicU64,
     refused: AtomicU64,
     failed: AtomicU64,
@@ -1002,6 +1094,12 @@ impl McpProxy {
     pub fn new(opts: &ProxyOptions, keyed: bool) -> Result<McpProxy, String> {
         let allow = parse_entries("--mcp-proxy-allow", &opts.allow)?;
         let allow_private = parse_entries("--mcp-proxy-allow-private", &opts.allow_private)?;
+        let mut server_names = vec!["localhost".to_string()];
+        for n in parse_server_names(&opts.server_names)? {
+            if !server_names.contains(&n) {
+                server_names.push(n);
+            }
+        }
         if allow_private.iter().any(Entry::is_open) {
             return Err(
                 "--mcp-proxy-allow-private with '*' or a /0 range: name the private targets (hosts, addresses or ranges); every private address at once is not accepted"
@@ -1063,12 +1161,27 @@ impl McpProxy {
             },
             tls,
             resolver: Box::new(system_resolver),
+            own_names: OwnNames::new(&server_names),
+            server_names,
             proxied: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             stalled: AtomicU64::new(0),
             recent: Mutex::new(VecDeque::new()),
         })
+    }
+
+    /// Adds names the server is also opened by (the DNS names of its HTTPS certificate). A
+    /// wildcard or malformed name is skipped: it is listed with `--server-name` if wanted.
+    pub fn add_server_names(&mut self, extra: &[String]) {
+        for raw in extra {
+            if let Ok(crate::tls_cert::CertName::Dns(d)) = crate::tls_cert::parse_name(raw) {
+                if !self.server_names.contains(&d) {
+                    self.server_names.push(d);
+                }
+            }
+        }
+        self.own_names = OwnNames::new(&self.server_names);
     }
 
     /// The proxy is offered (`/props` reports this).
@@ -1080,7 +1193,7 @@ impl McpProxy {
     pub fn summary(&self, keyed: bool) -> Option<String> {
         self.enabled().then(|| {
             format!(
-                "MCP proxy on: {} target entr{}, {} of them private; https targets: {}{}",
+                "MCP proxy on: {} target entr{}, {} of them private; https targets: {}; requests must name this server by an address or by {} (--server-name adds names){}",
                 self.allow.len() + self.allow_private.len(),
                 if self.allow.len() + self.allow_private.len() == 1 {
                     "y"
@@ -1092,6 +1205,7 @@ impl McpProxy {
                     Ok(_) => "yes".to_string(),
                     Err(e) => format!("no ({e})"),
                 },
+                self.server_names.join(", "),
                 if keyed {
                     ""
                 } else {
@@ -1132,13 +1246,18 @@ impl McpProxy {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"enabled\":{},\"allow\":[{}],\"allow_private\":[{}],\"https_targets\":{},\
+            "{{\"enabled\":{},\"allow\":[{}],\"allow_private\":[{}],\"server_names\":[{}],\"https_targets\":{},\
              \"limits\":{{\"max_request_bytes\":{},\"max_response_bytes\":{},\"connect_timeout_ms\":{},\
              \"idle_timeout_ms\":{},\"total_timeout_ms\":{},\"keepalive_ms\":{},\"max_redirects\":{}}},\
              \"counts\":{{\"proxied\":{},\"refused\":{},\"failed\":{},\"stalled\":{}}},\"recent\":[{}]}}",
             self.enabled(),
             list(&self.allow),
             list(&self.allow_private),
+            self.server_names
+                .iter()
+                .map(|n| jq(n))
+                .collect::<Vec<_>>()
+                .join(","),
             self.tls.is_ok(),
             self.limits.max_request,
             self.limits.max_response,
@@ -1377,7 +1496,9 @@ impl McpProxy {
             _ => None,
         };
         let (site, has_origin, origin_is_host) = request_site(req);
-        let site_ok = rule::site_ok(site, has_origin, origin_is_host);
+        let (host, forwarded) = request_hosts(req);
+        let hosts_ours = names::request_ours(&host, &forwarded, &self.own_names);
+        let site_ok = names::site_ok(hosts_ours, rule::site_ok(site, has_origin, origin_is_host));
         let url = req.query.get("url").map(String::as_str).unwrap_or("");
         let refuse = |stream: &mut Conn, status: u16, kind: &str, why: String| {
             self.note(
@@ -1414,6 +1535,35 @@ impl McpProxy {
                     "mcp proxy: this server was started without --mcp-proxy",
                 );
                 return;
+            }
+            (Gate::PxGateForeign, _) if !hosts_ours => {
+                let shown = |h: Option<&String>| {
+                    shown_url(h.map_or("none", String::as_str))
+                        .chars()
+                        .take(120)
+                        .collect::<String>()
+                };
+                let named = if names::request_ours(&host, &[], &self.own_names) {
+                    format!(
+                        "a front-end header names a host that is not one of this server's names (X-Forwarded-Host: {}, Forwarded: {})",
+                        shown(req.headers.get("x-forwarded-host")),
+                        shown(req.headers.get("forwarded"))
+                    )
+                } else {
+                    format!(
+                        "the request names the host {}, which is not one of this server's names",
+                        shown(req.headers.get("host"))
+                    )
+                };
+                return refuse(
+                    stream,
+                    403,
+                    "permission_error",
+                    format!(
+                        "{named}: it may come from a page of another site that points its own name at this server. Its names are {}, its addresses, and the names given with --server-name",
+                        self.server_names.join(", ")
+                    ),
+                );
             }
             (Gate::PxGateForeign, _) => {
                 let origin = req

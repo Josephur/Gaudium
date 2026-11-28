@@ -14,7 +14,8 @@ For these, the Gaudium server offers a proxy: the page sends the request to its 
 HTTPS listener that lets the Web UI be opened over `https://`.
 
 Sources: `gaudium/src/server/proxy.rs`, `gaudium/src/server/conn.rs`, `gaudium/src/tls.rs`;
-the decisions are in `gaudium/verified/mcp_proxy.bend` and `gaudium/verified/tls_listener.bend`.
+the decisions are in `gaudium/verified/mcp_proxy.bend`, `gaudium/verified/server_names.bend` and
+`gaudium/verified/tls_listener.bend`.
 
 ## Turning it on
 
@@ -87,6 +88,7 @@ resolves to a public address when it is checked and to `127.0.0.1` when it is co
 | Targets are named | no list: the server does not start with `--mcp-proxy`. A list that allows any target (`*`, a `/0` range) needs `--api-key` |
 | API key | when the server has one, the route needs it like every API route |
 | Not for other sites' pages | a request another site's page sent is refused (see below) |
+| Names this server | the request's `Host`, and every host a front end names for it, is an address, `localhost`, a `--server-name` or a DNS name of the HTTPS certificate (see below) |
 | URL form | `http` and `https` only; no user name or password in the URL; a valid host and port; no control characters |
 | Addresses checked after lookup | every address of the target is classed: public, loopback, private (RFC 1918, shared address space, unique-local, documentation and benchmarking ranges), link-local (with the metadata endpoints), or never (unspecified, multicast, reserved). Non-public needs `--mcp-proxy-allow-private`; "never" is refused even when listed. An IPv6 address that carries an IPv4 one (IPv4-mapped, the `64:ff9b::/96` translation prefix, 6to4) is classed by that IPv4 address |
 | One refused address refuses the name | a name with a public and a private address is refused as a whole |
@@ -97,14 +99,35 @@ resolves to a public address when it is checked and to `127.0.0.1` when it is co
 | HTTPS targets | verified against the system's trust store (plus `--mcp-proxy-ca <file>`), with the host name checked; without the TLS library they are refused, never fetched in the clear |
 
 **Another site's page.** A page of any site, open in the same browser as the Gaudium Web UI,
-can make the browser send requests to the Gaudium server. The proxy refuses them without
-knowing its own public name: it looks only at the request. A browser states where a request
+can make the browser send requests to the Gaudium server. A browser states where a request
 comes from in `Sec-Fetch-Site` (page script cannot set it): `same-origin` and `none` (typed by
 the person) pass, every other value is refused. Browsers send this header to HTTPS pages'
 servers and to `localhost`. Without it, the request's `Origin`, when there is one, must name the
 host the request was sent to: its own `Host`, or the host a front end names in
 `X-Forwarded-Host` / `Forwarded: host=`. A client that is not a browser sends neither header
-and is not affected.
+and passes this rule.
+
+**A page that points its own name at the server (DNS rebinding).** A page on any domain can
+make its own name resolve to the Gaudium server's address. Its requests then carry an `Origin`
+and a `Host` that agree, and the browser calls them `same-origin`, so the rule above lets them
+pass. Their `Host` still names the page's domain, so every proxy request must also name this
+server: its `Host`, and every host in `X-Forwarded-Host` and `Forwarded: host=`, must be
+
+- an IPv4 address or a bracketed IPv6 address (a browser sends one only to the machine that
+  holds it, so it cannot be rebound);
+- `localhost`;
+- a name given with `--server-name` (comma separated, repeatable);
+- a DNS name of the HTTPS certificate, when the server serves HTTPS (wildcard names are not
+  taken: give each name with `--server-name`).
+
+Names are compared without regard to case, without the port and without a final dot. Any other
+host gets 403 `permission_error`, and the message names the host and `--server-name`. Opening
+the Web UI by a machine name (`http://gaudium.lan:8080/`) or through a front end that keeps its
+public name therefore needs that name: `--server-name gaudium.lan` or
+`--server-name chat.example.com`. The start-up line lists the names taken, and
+`GET /gaudium/proxy` shows them as `server_names`. This holds for clients that are not
+browsers too. When the server listens beyond loopback without `--api-key`, the start-up output
+warns that the proxy is reachable without authentication.
 
 **Not covered.** An allowed MCP server that is itself hostile (its tools run in the user's
 browser, with the page's permission prompts); whoever holds the API key; and, on a server
