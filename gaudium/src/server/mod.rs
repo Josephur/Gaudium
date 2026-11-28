@@ -3782,7 +3782,7 @@ fn handle_responses(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn)
         store: &state.responses,
         id: &id,
     };
-    run_chat(state, &t.chat, stream, api, t.ignored);
+    run_chat(state, &t.chat, stream, api, t.ignored, None);
 }
 
 /// A response's in-flight entry; dropping it ends the entry (`ResponseStore::end`), so its
@@ -4512,11 +4512,11 @@ fn run_prompt(
         // a heartbeat that finds the client gone cancels the reply and the round it runs then
         (Some(r), Some(s)) if r.sink.is_none() => {
             r.sink = Some(s.clone());
-            r.keep_alive = s.keep_alive(api.keep_alive_line(), heartbeat, Arc::clone(&r.cancel));
+            r.keep_alive = s.keep_alive(api.keep_alive_line(), heartbeat, r.cancel.clone());
         }
         (Some(_), _) => {}
         (None, Some(s)) => {
-            _keep_alive = s.keep_alive(api.keep_alive_line(), heartbeat, Arc::clone(&cancel_flag));
+            _keep_alive = s.keep_alive(api.keep_alive_line(), heartbeat, cancel_flag.clone());
         }
         (None, None) => {}
     }

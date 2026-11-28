@@ -198,6 +198,15 @@ pub(super) fn open_server_tools<'a>(
                  tools in the client"
                 .to_string()
                 .into(),
+            SvAdmit::SvForeign if !caller.hosts_ours => Refused {
+                status: 403,
+                kind: "permission_error",
+                message: "mcp_servers: the request names a host that is not one of this \
+                          server's names (see --server-name): it may come from a page of another \
+                          site that points its own name at this server, and such a page may not \
+                          make this server reach MCP servers (run the MCP tools in the client)"
+                    .into(),
+            },
             SvAdmit::SvForeign => Refused {
                 status: 403,
                 kind: "permission_error",

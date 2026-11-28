@@ -192,6 +192,8 @@ fn harness_with_proxy(allow_private: &str) -> Harness {
     let opts = ProxyOptions {
         enabled: true,
         allow_private: vec![allow_private.to_string()],
+        // the harness's requests name the host `test`
+        server_names: vec!["test".to_string()],
         ..ProxyOptions::default()
     };
     Arc::get_mut(&mut h.state)
@@ -595,6 +597,36 @@ fn a_page_of_another_site_cannot_drive_the_mcp_servers() {
     assert_eq!(status, 200, "{text}");
 }
 
+/// A page of another site that points its own name at this server (DNS rebinding) is its own
+/// origin to the browser, so its requests say `same-origin`; they name a host that is not one of
+/// this server's names, and no MCP server is contacted for them.
+#[test]
+fn a_request_to_a_name_that_is_not_this_servers_cannot_drive_the_mcp_servers() {
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    let ask = format!(
+        r#"{{"model":"any","max_tokens":64,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+        servers(&mcp.url())
+    );
+    let rebound = [
+        "X-Forwarded-Host: rebound.example",
+        "Origin: http://rebound.example",
+        "Sec-Fetch-Site: same-origin",
+    ];
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let (status, text) = h.exchange_with("POST", path, &rebound, &ask);
+        assert_eq!(status, 403, "{path}: {text}");
+        assert!(text.contains("permission_error"), "{path}: {text}");
+        assert!(text.contains("not one of this server's names"), "{path}: {text}");
+        assert!(!text.contains(TOKEN), "{path}: {text}");
+    }
+    assert!(
+        mcp.seen().is_empty(),
+        "a request to another name reached the MCP server: {:?}",
+        mcp.seen()
+    );
+}
+
 #[test]
 fn the_servers_own_page_runs_the_mcp_servers() {
     let mcp = McpServer::start();
@@ -935,4 +967,47 @@ fn the_stream_keeps_alive_while_a_tool_runs() {
     );
     assert_eq!(kinds.last().map(String::as_str), Some("message_stop"));
     assert_eq!(kinds.iter().filter(|k| *k == "message_start").count(), 1);
+}
+
+/// A reply of several rounds keeps one keep-alive for the whole reply. When a heartbeat finds the
+/// client gone while a round runs (a long prefill writes nothing), the cancel reaches the engine
+/// flag of the round attached then, not only the reply's own flag (Codex on #134).
+#[test]
+fn a_heartbeat_that_finds_the_client_gone_cancels_the_round_that_runs() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tx = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (rx, _) = l.accept().unwrap();
+    let entry = CancelEntry::rounds();
+    let sink = SseSink::new(tx.into());
+    // the first round began the stream and its keep-alive, which cancels through the entry
+    let first = Arc::new(AtomicBool::new(false));
+    entry.attach(&first);
+    let _keep_alive = sink.keep_alive(
+        ": keep-alive\n\n".into(),
+        Duration::from_millis(10),
+        entry.clone(),
+    );
+    // a later round runs now under its own engine flag; the client leaves during its prefill
+    let round = Arc::new(AtomicBool::new(false));
+    entry.attach(&round);
+    drop(rx);
+    let t = Instant::now();
+    while !round.load(Ordering::Relaxed) && t.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        round.load(Ordering::Relaxed),
+        "the running round's engine flag is cancelled"
+    );
+    assert!(entry.cancelled(), "the reply is cancelled too");
+    assert!(
+        !first.load(Ordering::Relaxed),
+        "a round that no longer runs is not touched"
+    );
+    // a round attached after the client left starts cancelled
+    let after = Arc::new(AtomicBool::new(false));
+    entry.attach(&after);
+    assert!(after.load(Ordering::Relaxed));
 }

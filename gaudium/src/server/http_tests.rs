@@ -4744,7 +4744,7 @@ fn responses_cancel_answers_with_the_response_its_generation_ends() {
         let cancel = sc.spawn(move || hr.post(&path, ""));
         // the generation goes on once the cancel has reached it
         let t0 = std::time::Instant::now();
-        while !h.state.cancels.lock().unwrap()[&id].load(Ordering::Relaxed) {
+        while !h.state.cancels.lock().unwrap()[&id].cancelled() {
             assert!(t0.elapsed() < Duration::from_secs(20));
             thread::sleep(Duration::from_millis(1));
         }

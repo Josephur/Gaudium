@@ -478,7 +478,7 @@ impl StreamOut {
             cancel.store(true, Ordering::Relaxed);
         }
         if let Some(s) = self.stream.as_ref().filter(|_| keep_alive) {
-            s.retarget_cancel(Arc::clone(&cancel));
+            s.retarget_cancel(cancel.clone());
         }
         self.cancel = cancel;
     }
@@ -840,7 +840,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let every = Duration::from_millis(60);
         let guard = sink
-            .keep_alive(": ka\n\n".into(), every, Arc::clone(&cancel))
+            .keep_alive(": ka\n\n".into(), every, cancel.clone())
             .expect("the keep-alive thread starts");
         // writes closer together than the heartbeat: no keep-alive between them
         for i in 0..10 {
@@ -875,11 +875,11 @@ mod tests {
         let _guard = sink.keep_alive(
             ": ka\n\n".into(),
             Duration::from_millis(10),
-            Arc::clone(&first),
+            first.clone(),
         );
         // a resumed generation's fresh flag, before the client leaves
         let fresh = Arc::new(AtomicBool::new(false));
-        sink.retarget_cancel(Arc::clone(&fresh));
+        sink.retarget_cancel(fresh.clone());
         drop(rx);
         let t = Instant::now();
         while !fresh.load(Ordering::Relaxed) && t.elapsed() < Duration::from_secs(5) {
@@ -891,7 +891,7 @@ mod tests {
         );
         // and a flag given after the client left starts cancelled
         let later = Arc::new(AtomicBool::new(false));
-        sink.retarget_cancel(Arc::clone(&later));
+        sink.retarget_cancel(later.clone());
         assert!(later.load(Ordering::Relaxed));
     }
 
@@ -904,7 +904,7 @@ mod tests {
         let _guard = sink.keep_alive(
             ": ka\n\n".into(),
             Duration::from_millis(10),
-            Arc::clone(&cancel),
+            cancel.clone(),
         );
         let t = Instant::now();
         while !cancel.load(Ordering::Relaxed) && t.elapsed() < Duration::from_secs(5) {
