@@ -183,8 +183,11 @@ pub(super) struct StreamOut {
     cancel: Arc<AtomicBool>,
     /// Parsed output not written yet.
     pending: Delta,
-    /// Block-structured framing (the Messages API) instead of chat-completion chunks.
+    /// Block-structured framing (the Messages API) instead of chat-completion chunks. It is fed
+    /// every delta as it arrives, streamed or not, so its blocks keep the order of the output.
     pub anth: Option<Builder>,
+    /// Block events built but not written yet (they go out when their launch is complete).
+    held: String,
     /// Tokens handed over by the token callback.
     seen: u64,
     /// Tokens covered by the launches reported so far.
@@ -232,6 +235,7 @@ impl StreamOut {
             cancel,
             pending: Delta::default(),
             anth: None,
+            held: String::new(),
             seen: 0,
             covered: 0,
             last: None,
@@ -296,7 +300,21 @@ impl StreamOut {
 
     /// Parsed output that belongs to no generated token (a forced call's opening).
     pub fn add(&mut self, d: Delta) {
-        self.pending.append(d);
+        self.take_in(d);
+    }
+
+    /// One delta in: the block builder takes it at once (merged deltas would lose the order of
+    /// text and calls within a launch, #139); chat-completion chunks merge it into `pending`.
+    fn take_in(&mut self, d: Delta) {
+        match self.anth.as_mut() {
+            Some(b) => {
+                let events = b.feed(&d);
+                if self.stream.is_some() {
+                    self.held.push_str(&events);
+                }
+            }
+            None => self.pending.append(d),
+        }
     }
 
     /// One generated token: what the output parser made of it (it may be empty, e.g. a special
@@ -306,7 +324,7 @@ impl StreamOut {
         self.seen += 1;
         self.first_token_at.get_or_insert(now);
         self.last_token_at = Some(now);
-        self.pending.append(d);
+        self.take_in(d);
         if !self.feed || self.seen <= self.covered {
             self.flush();
         }
@@ -354,19 +372,25 @@ impl StreamOut {
         std::mem::take(&mut self.pending)
     }
 
+    /// Takes the block events not written yet (the caller writes them before the final ones).
+    pub fn take_held(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+
     fn flush(&mut self) {
         // whole calls are for the final message; the stream carries their fragments
         self.pending.tool_calls.clear();
         let has_text = !self.pending.is_empty();
-        if self.stream.is_none() {
-            return;
-        }
-        if let Some(b) = self.anth.as_mut() {
-            let events = b.feed(&std::mem::take(&mut self.pending));
+        // content blocks were built as the output came (`take_in`): a launch's events go out
+        if self.anth.is_some() {
+            let events = std::mem::take(&mut self.held);
             if !events.is_empty() {
                 self.chunks += 1;
                 self.write(&events);
             }
+            return;
+        }
+        if self.stream.is_none() {
             return;
         }
         if !has_text && !self.timings_per_token {
@@ -809,5 +833,101 @@ mod tests {
         );
         // and the writer's next write fails at once
         assert!(sink.write(b"data: x\n\n").is_err());
+    }
+
+    /// Block events of one launch keep the order of its tokens: a call that ends and the text
+    /// after it in the same launch stay two blocks, the call with all of its arguments (#139).
+    #[test]
+    fn a_launch_that_ends_a_call_and_starts_text_keeps_both_in_order() {
+        use super::super::outparse::ToolDelta;
+        let call = |index: usize, header: bool, arguments: &str| Delta {
+            tool_deltas: vec![ToolDelta {
+                index,
+                header,
+                id: format!("call_{index}"),
+                name: if header { "f".into() } else { String::new() },
+                arguments: arguments.into(),
+            }],
+            ..Delta::default()
+        };
+        let tokens = [
+            text("", "A."),
+            call(0, true, "{\"x\":"),
+            call(0, false, "1}"),
+            text("", "B."),
+            call(1, true, "{\"x\":2}"),
+        ];
+        // streamed: the first token, then one speculative launch of the other four
+        let (tx, rx) = pair();
+        let mut w = writer(tx, true, false);
+        w.anth = Some(Builder::new(true));
+        w.on_event(&ev(LaunchKind::First, 1, 0, 0, 0, 0.0));
+        for d in tokens.clone() {
+            w.push_token(d);
+        }
+        w.on_event(&ev(LaunchKind::Step, 5, 1, 4, 4, 30.0));
+        assert_eq!(w.chunks, 2);
+        let mut b = w.anth.take().unwrap();
+        let tail = w.take_held() + &b.close();
+        w.write(&tail);
+        drop(w);
+        let events = payloads(rx);
+        let starts: Vec<String> = events
+            .iter()
+            .filter_map(|e| e.get("content_block"))
+            .map(|c| {
+                c.get("type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(starts, ["text", "tool_use", "text", "tool_use"]);
+        let args: String = events
+            .iter()
+            .filter(|e| e.get("index").and_then(JsonValue::as_u64) == Some(1))
+            .filter_map(|e| e.get("delta").and_then(|d| d.get("partial_json")))
+            .map(|j| j.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(args, "{\"x\":1}");
+        // not streamed: the same blocks, whole
+        let mut w = StreamOut::new(
+            None,
+            "msg-1",
+            "m",
+            7,
+            false,
+            false,
+            50,
+            true,
+            Arc::new(AtomicBool::new(false)),
+            ChunkForm::Chat,
+        );
+        w.anth = Some(Builder::new(true));
+        for d in tokens {
+            w.push_token(d);
+        }
+        w.on_event(&ev(LaunchKind::Step, 5, 1, 4, 4, 30.0));
+        assert!(w.take_held().is_empty() && w.take_pending().is_empty());
+        let mut b = w.anth.take().unwrap();
+        b.close();
+        let msg = json::parse_json(&b.message("msg-1", "m", "tool_use", "", "{}", "")).unwrap();
+        let blocks: Vec<String> = msg
+            .get("content")
+            .and_then(JsonValue::as_array)
+            .unwrap()
+            .iter()
+            .map(
+                |c| match c.get("type").and_then(JsonValue::as_str).unwrap() {
+                    "text" => c
+                        .get("text")
+                        .and_then(JsonValue::as_str)
+                        .unwrap()
+                        .to_string(),
+                    _ => c.get("input").unwrap().dump(),
+                },
+            )
+            .collect();
+        assert_eq!(blocks, ["A.", "{\"x\":1}", "B.", "{\"x\":2}"]);
     }
 }
