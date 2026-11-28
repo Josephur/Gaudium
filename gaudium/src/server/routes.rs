@@ -135,33 +135,77 @@ mod tests {
     }
 
     /// The router's `match` in `handle_request`: each arm's method (`None` for `_`) and path
-    /// pattern, read from the source.
+    /// pattern, read from the source. Every line at the arms' indentation that is not a comment
+    /// or a closing bracket starts an arm, and an arm whose pattern this reader does not
+    /// understand fails the test (a bound method such as `(m, "/x") if m == "GET"` included), so
+    /// no route can be added in a form the table check would skip.
     fn router_arms() -> Vec<(Option<String>, RoutePathPat)> {
         let src = include_str!("mod.rs");
         let start = src
             .find("fn handle_request(")
             .expect("handle_request is in server/mod.rs");
         let body = &src[start..];
+        let gate = body
+            .find("routes::admits(")
+            .expect("handle_request calls the route gate");
         let m = body
             .find("match (req.method.as_str(), req.path.as_str()) {")
             .expect("handle_request dispatches on (method, path)");
+        assert!(gate < m, "the route gate runs before the router");
+        // nothing between the gate's 401 block and the router: no route can answer before it
+        let after_gate = &body[gate..m];
+        let close = after_gate
+            .find("\n        return;\n    }\n")
+            .expect("the gate's refusal returns");
+        let between = &after_gate[close + "\n        return;\n    }\n".len()..];
+        assert!(
+            between.trim().is_empty(),
+            "code between the route gate and the router: {between:?}"
+        );
         let body = &body[m..];
         // the match ends at the first line that closes it at the function's indentation
         let end = body.find("\n    }\n").expect("the router's match closes");
         let body = &body[..end];
-        let mut arms = Vec::new();
-        for line in body.lines() {
-            let line = line.trim();
-            // an arm starts with a tuple pattern; `|` joins alternatives, also across lines
-            let line = line.strip_prefix("| ").unwrap_or(line);
-            if !line.starts_with("(\"") && !line.starts_with("(_,") {
+        let mut heads = Vec::new();
+        let mut open: Option<String> = None;
+        for line in body.lines().skip(1) {
+            let at_arm = line.starts_with("        ") && !line[8..].starts_with(' ');
+            let t = line.trim();
+            if let Some(h) = open.as_mut() {
+                // an arm head that spans lines (`|` alternatives) until its `=>`
+                h.push(' ');
+                h.push_str(t);
+                if t.contains("=>") {
+                    heads.push(open.take().unwrap());
+                }
                 continue;
             }
-            let Some(head) = line.split("=>").next() else {
+            if !at_arm
+                || t.is_empty()
+                || t.starts_with("//")
+                || t.starts_with('}')
+                || t.starts_with(')')
+            {
                 continue;
-            };
+            }
+            if t.contains("=>") {
+                heads.push(t.to_string());
+            } else {
+                open = Some(t.to_string());
+            }
+        }
+        assert!(open.is_none(), "a router arm head never reached `=>`");
+        let mut arms = Vec::new();
+        let n = heads.len();
+        for (i, head) in heads.iter().enumerate() {
+            let head = head.split("=>").next().unwrap().trim();
+            if head == "_" {
+                // the 404 for everything else: only as the last arm
+                assert_eq!(i + 1, n, "a catch-all router arm before the last one");
+                continue;
+            }
             for alt in head.split(" | ") {
-                let alt = alt.trim();
+                let alt = alt.trim().strip_prefix("| ").unwrap_or(alt.trim());
                 let (pat, guard) = match alt.split_once(" if ") {
                     Some((p, g)) => (p.trim(), Some(g.trim())),
                     None => (alt, None),
@@ -175,13 +219,17 @@ mod tests {
                     .unwrap_or_else(|| panic!("router arm pattern not understood: {alt}"));
                 let method = match method.trim() {
                     "_" => None,
-                    m => Some(m.trim_matches('"').to_string()),
+                    m if m.len() >= 2 && m.starts_with('"') && m.ends_with('"') => {
+                        Some(m.trim_matches('"').to_string())
+                    }
+                    m => panic!("router arm method not understood (bind none; match a literal or `_`): {m} in {alt}"),
                 };
                 let path = path.trim();
                 let pat = if path.starts_with('"') {
                     assert!(guard.is_none(), "a guard on a literal path: {alt}");
                     RoutePathPat::Exact(path.trim_matches('"').to_string())
                 } else if path == "_" {
+                    assert!(guard.is_none(), "a guard on a fallback arm: {alt}");
                     RoutePathPat::Fallback
                 } else {
                     // a bound path with a `starts_with` guard
