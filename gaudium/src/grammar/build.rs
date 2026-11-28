@@ -13,7 +13,7 @@
 //! budget of [`MAX_GRAMMAR_BYTES`] (the verified `gram_budget_ok`), and a schema past it, or one
 //! whose alternatives could not all be followed (`gram_alive_ok`), is refused before any token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::{Grammar, Node, NodeId, ObjDef, Pat, PropDef, TrieNode, FINISH, MAX_ALIVE, NO_LEAF};
@@ -28,6 +28,11 @@ pub const MAX_SCHEMA_LEVELS: u64 = 128;
 /// Bytes of grammar a request may compile to: nodes, trie nodes, literal bytes and the key
 /// tables of objects.
 pub const MAX_GRAMMAR_BYTES: u64 = 32 << 20;
+/// Bytes of a schema path, and of a name from the schema, kept for an error message (a client's
+/// keys may be megabytes long, and a path grows with each level).
+pub const PATH_MAX: usize = 200;
+/// Bytes of an error message a schema's refusal carries.
+pub const MESSAGE_MAX: usize = 1000;
 /// The parameter-block form's tags: a value ends at the first of them.
 pub const PARAM_CLOSE: &str = "</parameter>";
 pub const FUNCTION_CLOSE: &str = "</function>";
@@ -205,9 +210,10 @@ struct Builder {
     nodes: Vec<Node>,
     tries: Vec<TrieNode>,
     objs: Vec<ObjDef>,
-    /// Bytes charged to the compile budget (below `u64::MAX`). A refused charge leaves `used`
-    /// past `cap`, where every further charge is refused (`gram_budget_over_refused`): the
-    /// builder then adds nothing more, returns node 0, and `finish` refuses the grammar.
+    /// Bytes charged to the compile budget (below `u64::MAX`), changed only through the verified
+    /// `gram_budget_charge`. A refused charge leaves `used` past `cap`, where every further
+    /// charge is refused (`gram_budget_refused_latches`): the builder then adds nothing more,
+    /// returns node 0, and `finish` refuses the grammar.
     used: u64,
     cap: u64,
     /// Schemas the compiler is inside now.
@@ -223,7 +229,51 @@ struct Builder {
 }
 
 fn kw_err(path: &str, kw: &str, why: &str) -> String {
-    format!("response schema: '{kw}' at {path} {why}")
+    message(&format!("response schema: '{}' at {} {why}", short(kw), short(path))).into_owned()
+}
+
+/// `s` cut to `max` bytes (on a character boundary), `...` marking the cut.
+fn cut(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max {
+        return s.into();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end]).into()
+}
+
+/// A name or a path from a schema, cut to [`PATH_MAX`] bytes for a message.
+pub fn short(s: &str) -> std::borrow::Cow<'_, str> {
+    cut(s, PATH_MAX)
+}
+
+/// An error message cut to [`MESSAGE_MAX`] bytes (what a refusal's 400 carries).
+pub fn message(s: &str) -> std::borrow::Cow<'_, str> {
+    cut(s, MESSAGE_MAX)
+}
+
+/// `path` with `parts` appended, for error messages: it stops growing at [`PATH_MAX`] bytes, so
+/// a deep schema with long keys does not build a long path at every level.
+fn sub_path(path: &str, parts: &[&str]) -> String {
+    if path.len() >= PATH_MAX {
+        return path.to_string();
+    }
+    let mut p = String::with_capacity(2 * PATH_MAX + 8);
+    p.push_str(path);
+    for part in parts {
+        if p.len() > PATH_MAX {
+            break;
+        }
+        // at most PATH_MAX + 1 bytes of the part: enough for `short` to mark the cut
+        let mut end = part.len().min(PATH_MAX + 1);
+        while !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        p.push_str(&part[..end]);
+    }
+    short(&p).into_owned()
 }
 
 fn budget_err() -> String {
@@ -253,12 +303,9 @@ impl Builder {
 
     /// Charges `bytes` to the compile budget; `false` (and over from then on) past it.
     fn charge(&mut self, bytes: u64) -> bool {
-        if verified::gram_budget_ok(self.used, bytes, self.cap) {
-            self.used += bytes;
-            return true;
-        }
-        self.used = self.cap + 1;
-        false
+        let ok = verified::gram_budget_ok(self.used, bytes, self.cap);
+        self.used = verified::gram_budget_charge(self.used, bytes, self.cap);
+        ok
     }
 
     /// A charge was refused.
@@ -569,7 +616,7 @@ impl Builder {
             }
             let mut alts = Vec::with_capacity(list.len());
             for (i, s) in list.iter().enumerate() {
-                alts.push(self.value(s, &format!("{path}/anyOf/{i}"), depth)?);
+                alts.push(self.value(s, &sub_path(path, &["/anyOf/", &i.to_string()]), depth)?);
             }
             return Ok(self.push(Node::Alt(alts)));
         }
@@ -578,7 +625,7 @@ impl Builder {
                 return Err(kw_err(path, k, "can not stand beside 'allOf'"));
             }
             return match all_of.as_array() {
-                Some([one]) => self.value(one, &format!("{path}/allOf/0"), depth),
+                Some([one]) => self.value(one, &sub_path(path, &["/allOf/0"]), depth),
                 _ => Err(kw_err(path, "allOf", "is supported with exactly one schema")),
             };
         }
@@ -689,20 +736,7 @@ impl Builder {
             Some(JsonValue::Object(p)) => p,
             Some(_) => return Err(kw_err(path, "properties", "must be an object")),
         };
-        let required: Vec<&str> = match schema.get("required") {
-            None => Vec::new(),
-            Some(JsonValue::Array(r)) if r.iter().all(|x| x.as_str().is_some()) => {
-                r.iter().filter_map(JsonValue::as_str).collect()
-            }
-            Some(_) => return Err(kw_err(path, "required", "must be an array of property names")),
-        };
-        if let Some(missing) = required.iter().find(|r| !props.iter().any(|(k, _)| k == *r)) {
-            return Err(kw_err(
-                path,
-                "required",
-                &format!("names '{missing}', which is not in 'properties'"),
-            ));
-        }
+        let required = self.required_set(schema, props, path)?;
         match schema.get("additionalProperties") {
             None | Some(JsonValue::Bool(_)) => {}
             Some(extra @ JsonValue::Object(_)) => {
@@ -713,7 +747,7 @@ impl Builder {
                         "with a schema is supported only for an object without 'properties'",
                     ));
                 }
-                let value = self.value(extra, &format!("{path}/additionalProperties"), depth)?;
+                let value = self.value(extra, &sub_path(path, &["/additionalProperties"]), depth)?;
                 return Ok(self.map(value));
             }
             Some(_) => {
@@ -728,10 +762,10 @@ impl Builder {
         }
         let mut defs = Vec::with_capacity(props.len());
         for (k, s) in props {
-            let value = self.value(s, &format!("{path}/properties/{k}"), depth)?;
+            let value = self.value(s, &sub_path(path, &["/properties/", k]), depth)?;
             defs.push(PropDef {
                 value,
-                required: required.contains(&k.as_str()),
+                required: required.contains(k.as_str()),
             });
         }
         let n = defs.len();
@@ -821,7 +855,7 @@ impl Builder {
         }
         let items = match schema.get("items") {
             None => self.any(),
-            Some(s) => self.value(s, &format!("{path}/items"), depth)?,
+            Some(s) => self.value(s, &sub_path(path, &["/items"]), depth)?,
         };
         Ok(self.push(Node::Array { items, min, max }))
     }
@@ -849,9 +883,91 @@ impl Builder {
         // a placeholder first, so a recursive reference finds itself
         let slot = self.push(Node::Alt(Vec::new()));
         self.refs.insert(r.to_string(), slot);
-        let n = self.value(target, r, depth)?;
+        let n = self.value(target, &short(r), depth)?;
         self.nodes[slot as usize] = Node::Alt(vec![n]);
         Ok(slot)
+    }
+
+    /// The names an object schema at `path` lists in `required`, each checked to be one of
+    /// `props`. Both lists come from the client, so the work (one hash set of each) is charged
+    /// to the compile budget before it is done, and is linear in their sizes.
+    fn required_set<'s>(
+        &mut self,
+        schema: &'s JsonValue,
+        props: &'s [(String, JsonValue)],
+        path: &str,
+    ) -> Result<HashSet<&'s str>, String> {
+        let required: &[JsonValue] = match schema.get("required") {
+            None => &[],
+            Some(JsonValue::Array(r)) if r.iter().all(|x| x.as_str().is_some()) => r,
+            Some(_) => return Err(kw_err(path, "required", "must be an array of property names")),
+        };
+        let entry = (std::mem::size_of::<&str>() + 8) as u64;
+        let names = props
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .chain(required.iter().filter_map(JsonValue::as_str));
+        let cost = names.fold(0u64, |a, k| a.saturating_add(entry + k.len() as u64));
+        if !self.charge(cost) {
+            return Err(budget_err());
+        }
+        let known: HashSet<&str> = props.iter().map(|(k, _)| k.as_str()).collect();
+        let mut set = HashSet::with_capacity(required.len().min(known.len()));
+        for r in required.iter().filter_map(JsonValue::as_str) {
+            if !known.contains(r) {
+                return Err(kw_err(
+                    path,
+                    "required",
+                    &format!("names '{}', which is not in 'properties'", short(r)),
+                ));
+            }
+            set.insert(r);
+        }
+        Ok(set)
+    }
+
+    /// A strict tool's parameter list: `(name, schema, required)` in the schema's order. The
+    /// root is checked here as `value_in` checks a schema: a keyword it does not apply is
+    /// refused, never ignored.
+    fn tool_props(&mut self, schema: &JsonValue, path: &str) -> Result<Vec<(String, JsonValue, bool)>, String> {
+        let Some(obj) = schema.as_object() else {
+            return Err(format!("{path}: must be a JSON schema object"));
+        };
+        match schema.get("type") {
+            None => {}
+            Some(JsonValue::Str(t)) if t == "object" => {}
+            Some(_) => return Err(format!("{path}: a strict tool's parameters must be an object schema")),
+        }
+        if schema.get("additionalProperties").is_some_and(|a| a.as_object().is_some()) {
+            return Err(kw_err(path, "additionalProperties", "with a schema is not supported for a strict tool"));
+        }
+        for k in ["anyOf", "allOf", "$ref", "enum", "const"] {
+            if schema.get(k).is_some() {
+                return Err(kw_err(path, k, "is not supported at the top of a strict tool's parameters"));
+            }
+        }
+        for (k, v) in obj {
+            let applied = ANNOTATIONS.contains(&k.as_str())
+                || matches!(k.as_str(), "type" | "properties" | "required")
+                || (k == "additionalProperties" && matches!(v, JsonValue::Bool(_)));
+            if !applied {
+                return Err(kw_err(
+                    path,
+                    k,
+                    "is not supported at the top of a strict tool's parameters (supported: type, properties, required, additionalProperties)",
+                ));
+            }
+        }
+        let props = match schema.get("properties") {
+            None => &[][..],
+            Some(JsonValue::Object(p)) => p.as_slice(),
+            Some(_) => return Err(kw_err(path, "properties", "must be an object")),
+        };
+        let required = self.required_set(schema, props, path)?;
+        Ok(props
+            .iter()
+            .map(|(k, s)| (k.clone(), s.clone(), required.contains(k.as_str())))
+            .collect())
     }
 
     /// What follows the tool tag's opening: one call to one of `tools` in the model's form,
@@ -876,7 +992,7 @@ impl Builder {
                 self.forbid.clear();
                 return Err(format!(
                     "tool '{}': its name can not be written in this model's call form",
-                    t.name
+                    short(&t.name)
                 ));
             }
             let cont = match tags.form {
@@ -917,8 +1033,8 @@ impl Builder {
             let close = self.lit(&format!("\n{}", tags.close));
             return Ok(self.seq(vec![raw, close]));
         };
-        let path = format!("tool '{}' parameters", t.name);
-        let props = tool_props(schema, &path)?;
+        let path = format!("tool '{}' parameters", short(&t.name));
+        let props = self.tool_props(schema, &path)?;
         // the optional parameters before the next required one (or the end) are all open at
         // once after a parameter, each one stack of the automaton, with the end beside them
         let mut run = 0u64;
@@ -936,14 +1052,15 @@ impl Builder {
         for (k, s, required) in props {
             if k.contains('>') || k.contains('\n') || !self.clean(k.as_bytes()) {
                 return Err(format!(
-                    "{path}: the property name '{k}' can not be written in this model's call form"
+                    "{path}: the property name '{}' can not be written in this model's call form",
+                    short(&k)
                 ));
             }
             let open = self.lit(&format!("<parameter={k}>\n"));
             let value = if param_is_string(&s) {
-                self.raw_param(&s, tags, &format!("{path}/properties/{k}"))?
+                self.raw_param(&s, tags, &sub_path(&path, &["/properties/", &k]))?
             } else {
-                let v = self.value(&s, &format!("{path}/properties/{k}"), 1)?;
+                let v = self.value(&s, &sub_path(&path, &["/properties/", &k]), 1)?;
                 let close = self.lit("\n</parameter>\n");
                 self.seq(vec![v, close])
             };
@@ -996,8 +1113,8 @@ impl Builder {
     fn json_call(&mut self, t: &ToolDef, tags: &CallTags) -> Result<NodeId, String> {
         let args = match &t.strict {
             Some(schema) => {
-                let path = format!("tool '{}' parameters", t.name);
-                tool_props(schema, &path)?;
+                let path = format!("tool '{}' parameters", short(&t.name));
+                self.tool_props(schema, &path)?;
                 self.set_root(schema);
                 self.value(schema, &path, 0)?
             }
@@ -1021,43 +1138,6 @@ impl Builder {
         parts.extend([w, close_brace, w2, close]);
         Ok(self.seq(parts))
     }
-}
-
-/// A strict tool's parameter list: `(name, schema, required)` in the schema's order.
-fn tool_props(schema: &JsonValue, path: &str) -> Result<Vec<(String, JsonValue, bool)>, String> {
-    if schema.as_object().is_none() {
-        return Err(format!("{path}: must be a JSON schema object"));
-    }
-    match schema.get("type") {
-        None => {}
-        Some(JsonValue::Str(t)) if t == "object" => {}
-        Some(_) => return Err(format!("{path}: a strict tool's parameters must be an object schema")),
-    }
-    if schema.get("additionalProperties").is_some_and(|a| a.as_object().is_some()) {
-        return Err(kw_err(path, "additionalProperties", "with a schema is not supported for a strict tool"));
-    }
-    for k in ["anyOf", "allOf", "$ref", "enum", "const"] {
-        if schema.get(k).is_some() {
-            return Err(kw_err(path, k, "is not supported at the top of a strict tool's parameters"));
-        }
-    }
-    let props = match schema.get("properties") {
-        None => &[][..],
-        Some(JsonValue::Object(p)) => p.as_slice(),
-        Some(_) => return Err(kw_err(path, "properties", "must be an object")),
-    };
-    let required: Vec<&str> = schema
-        .get("required")
-        .and_then(JsonValue::as_array)
-        .map(|r| r.iter().filter_map(JsonValue::as_str).collect())
-        .unwrap_or_default();
-    if let Some(missing) = required.iter().find(|r| !props.iter().any(|(k, _)| k == *r)) {
-        return Err(kw_err(path, "required", &format!("names '{missing}', which is not in 'properties'")));
-    }
-    Ok(props
-        .iter()
-        .map(|(k, s)| (k.clone(), s.clone(), required.contains(&k.as_str())))
-        .collect())
 }
 
 /// The parameter is a string to `outparse` (its raw text is the value): `type` "string", or a

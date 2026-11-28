@@ -749,3 +749,150 @@ fn constrained_strings_never_hold_the_parsers_tags() {
     let g = build::reply(None, &[weather_tool()], &tags).unwrap();
     assert!(refuses(&g, "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"</tool_call>\", \"days\": 2}}\n</tool_call>"));
 }
+
+/// `required` is checked through a set built once, its work charged to the compile budget first
+/// (it was checked name against property, quadratic before any charge: 100,000 duplicate keys
+/// took 45 s in a release build).
+#[test]
+fn required_is_checked_in_linear_time_and_charged_first() {
+    // N - 1 duplicate keys, then the one every required entry names
+    let dup = |n: usize| {
+        let mut props: Vec<&str> = vec![r#""a":{}"#; n - 1];
+        props.push(r#""z":{}"#);
+        let req = vec![r#""z""#; n];
+        schema(&format!(
+            r#"{{"type":"object","properties":{{{}}},"required":[{}]}}"#,
+            props.join(","),
+            req.join(",")
+        ))
+    };
+    let t0 = std::time::Instant::now();
+    assert!(build::schema_doc(&dup(30_000)).is_ok());
+    assert!(t0.elapsed().as_secs_f64() < 10.0, "{:?}", t0.elapsed());
+    // a long list is refused by the budget before it is checked
+    let s = schema(&format!(
+        r#"{{"type":"object","properties":{{"z":{{}}}},"required":[{}]}}"#,
+        vec![r#""z""#; 50_000].join(",")
+    ));
+    assert!(build::schema_doc_within(&s, 1 << 20).unwrap_err().contains("MiB of grammar"));
+    assert!(build::schema_doc_within(&s, 4 << 20).is_ok());
+    // a strict tool's list goes through the same check
+    let tags = CallTags {
+        open: "<tool_call>".into(),
+        close: "</tool_call>".into(),
+        form: CallForm::Params,
+        think: None,
+    };
+    // (every parameter required: optional ones in a row have their own limit)
+    let props: Vec<String> = (0..30_000).map(|i| format!(r#""p{i}":{{}}"#)).collect();
+    let req: Vec<String> = (0..30_000).map(|i| format!(r#""p{i}""#)).collect();
+    let tool = ToolDef {
+        name: "t".into(),
+        strict: Some(schema(&format!(
+            r#"{{"type":"object","properties":{{{}}},"required":[{}]}}"#,
+            props.join(","),
+            req.join(",")
+        ))),
+    };
+    let t0 = std::time::Instant::now();
+    assert!(build::reply(None, &[tool], &tags).is_ok());
+    assert!(t0.elapsed().as_secs_f64() < 10.0, "{:?}", t0.elapsed());
+    let bad = ToolDef {
+        name: "t".into(),
+        strict: Some(schema(r#"{"type":"object","properties":{"a":{}},"required":["b"]}"#)),
+    };
+    assert!(build::reply(None, &[bad], &tags).unwrap_err().contains("names 'b'"));
+}
+
+/// A frame operation copies its stack, so it is charged by the frames it copies: the work caps
+/// then bound time at every depth (each operation was charged 1, and a mask's cap took 11 s at
+/// 142 frames against 0.45 s at 3).
+#[test]
+fn deep_stacks_are_charged_by_the_frames_they_copy() {
+    assert_eq!(step_cost(0), 1);
+    assert_eq!(step_cost(FRAMES_PER_UNIT as usize - 1), 1);
+    assert_eq!(step_cost(FRAMES_PER_UNIT as usize), 2);
+    assert_eq!(step_cost(MAX_STACK as usize), 1 + MAX_STACK / FRAMES_PER_UNIT);
+    let consts: Vec<String> = (0..20).map(|i| format!(r#"{{"const":"xxxxxxxx{i}"}}"#)).collect();
+    let s = schema(&format!(
+        r##"{{"$defs":{{"n":{{"anyOf":[{{"type":"array","items":{{"$ref":"#/$defs/n"}}}},{}]}}}},"$ref":"#/$defs/n"}}"##,
+        consts.join(",")
+    ));
+    let g = build::schema_doc(&s).unwrap();
+    let work_at = |depth: usize| {
+        let mut c = g.start().unwrap();
+        for _ in 0..depth {
+            c = g.step(&c, b'[').unwrap();
+        }
+        c = g.step(&c, b'"').unwrap();
+        let mut w = Work::new(MAX_WORK);
+        assert!(g.step_in(&c, b'x', &mut w).is_some());
+        w.used()
+    };
+    let (shallow, deep) = (work_at(1), work_at(140));
+    assert!(deep >= shallow * (1 + 140 / FRAMES_PER_UNIT) / 2, "{shallow} {deep}");
+}
+
+/// The ledger goes only through the verified `gram_budget_charge`: an accepted charge adds what
+/// was charged, and after a refused one every later charge is refused, an empty one included.
+#[test]
+fn a_refused_charge_cuts_the_call_short_for_good() {
+    let mut w = Work::new(10);
+    assert!(w.spend(0) && w.used() == 1);
+    assert!(w.spend(8 * FRAMES_PER_UNIT as usize) && w.used() == 10);
+    assert!(!w.exhausted());
+    assert!(!w.spend(0));
+    assert!(w.exhausted());
+    assert!(!w.spend(0) && w.exhausted());
+}
+
+/// A strict tool in the parameter-block form checks its root's keywords as any schema is
+/// checked: one it does not apply is refused, never ignored.
+#[test]
+fn a_strict_tools_root_keywords_are_never_ignored() {
+    for form in [CallForm::Params, CallForm::Json] {
+        let tags = CallTags {
+            open: "<tool_call>".into(),
+            close: "</tool_call>".into(),
+            form,
+            think: None,
+        };
+        for kw in [r#""maxProperties":0"#, r#""minProperties":2"#, r#""patternProperties":{}"#, r#""additionalProperties":{"type":"string"}"#] {
+            let tool = ToolDef {
+                name: "t".into(),
+                strict: Some(schema(&format!(
+                    r#"{{"type":"object","properties":{{"x":{{"type":"string"}}}},"required":["x"],{kw}}}"#
+                ))),
+            };
+            let e = build::reply(None, &[tool], &tags).unwrap_err();
+            assert!(e.contains("not supported"), "{form:?} {kw}: {e}");
+        }
+        let ok = ToolDef {
+            name: "t".into(),
+            strict: Some(schema(
+                r#"{"type":"object","title":"T","description":"d","properties":{"x":{"type":"string"}},"required":["x"],"additionalProperties":false}"#,
+            )),
+        };
+        assert!(build::reply(None, &[ok], &tags).is_ok(), "{form:?}");
+    }
+}
+
+/// A path kept for an error stops growing, and a refusal's message is short: 31 levels of
+/// 1 MiB keys built a 32 MB path (and a 32 MB 400) before.
+#[test]
+fn long_keys_nested_deep_keep_a_short_message() {
+    let key = "k".repeat(64 << 10);
+    let mut s = r#"{"type":"string","minLength":1}"#.to_string();
+    for _ in 0..31 {
+        s = format!(r#"{{"type":"object","properties":{{"{key}":{s}}}}}"#);
+    }
+    let e = build::schema_doc_within(&schema(&s), 1 << 40).unwrap_err();
+    assert!(e.contains("'minLength'"), "{}", &e[..200]);
+    assert!(e.len() <= build::MESSAGE_MAX + 3, "{}", e.len());
+    // a long unknown keyword or property name is cut as well
+    let long = "q".repeat(5000);
+    let e = build::schema_doc(&schema(&format!(r#"{{"{long}":1}}"#))).unwrap_err();
+    assert!(e.len() <= build::MESSAGE_MAX + 3, "{}", e.len());
+    let e = build::schema_doc(&schema(&format!(r#"{{"type":"object","properties":{{}},"required":["{long}"]}}"#))).unwrap_err();
+    assert!(e.len() <= build::MESSAGE_MAX + 3 && e.contains("names 'qqq"), "{e}");
+}

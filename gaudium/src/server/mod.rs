@@ -4087,7 +4087,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let structured_req = match structured::request(val, &prompt) {
         Ok(r) => r,
         Err(e) => {
-            api.error(stream, 400, "invalid_request_error", &e);
+            api.error(stream, 400, "invalid_request_error", &crate::grammar::build::message(&e));
             return;
         }
     };
@@ -4127,10 +4127,10 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 }
             }
             let table = structured::table(&m.id, &m.tokenizer, emit_vocab, &end_ids, &m.format);
-            match structured::plan(r, &prompt, &m.format, table) {
+            match structured::plan(r, &prompt, &m.format, table, !split_reasoning) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    api.error(stream, 400, "invalid_request_error", &e);
+                    api.error(stream, 400, "invalid_request_error", &crate::grammar::build::message(&e));
                     return;
                 }
             }

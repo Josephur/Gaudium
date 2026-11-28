@@ -4785,3 +4785,20 @@ fn a_panic_in_the_chat_path_releases_the_in_flight_response() {
     assert!(r.is_err());
     assert_eq!(store.live_held(), (0, 0));
 }
+
+#[test]
+fn reasoning_left_in_the_content_with_a_format_is_refused() {
+    // this template starts the reply inside the reasoning, which reasoning_format 'none' would
+    // leave in the content ahead of the JSON
+    let h = harness();
+    let before = h.prompts.lock().unwrap().len();
+    let (status, r) = h.chat(r#","reasoning_format":"none","response_format":{"type":"json_object"}"#);
+    assert_eq!(status, 400, "{}", r.dump());
+    assert!(s(&r, &["error", "message"]).contains("reasoning_format 'none'"), "{}", r.dump());
+    assert_eq!(h.prompts.lock().unwrap().len(), before);
+    // split off, the same request runs
+    h.script("Hm.\n</think>\n\n{}");
+    let (status, r) = h.chat(r#","response_format":{"type":"json_object"}"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(s(&r, &["choices", "0", "message", "content"]), "{}");
+}

@@ -139,8 +139,8 @@ pub struct Constraint {
     cache: HashMap<Key, Arc<Mask>>,
     /// Bytes the cache's entries hold (`gram_cache_held`).
     cache_bytes: u64,
-    /// The request's work so far, against `request_work_cap` (`gram_budget_ok`; past the cap
-    /// once a charge was refused).
+    /// The request's work so far, against `request_work_cap` (`gram_budget_ok`, updated only
+    /// through `gram_budget_charge`; past the cap once a charge was refused).
     spent: u64,
     pub stats: Stats,
 }
@@ -167,11 +167,11 @@ impl Constraint {
     /// Charges a call's work to the request; `Err` once the request's cap is passed.
     fn charge(&mut self, w: &Work) -> Result<(), String> {
         let cap = self.plan.request_work_cap.min(u64::MAX - 1);
-        if verified::gram_budget_ok(self.spent, w.used(), cap) {
-            self.spent += w.used();
+        let ok = verified::gram_budget_ok(self.spent, w.used(), cap);
+        self.spent = verified::gram_budget_charge(self.spent, w.used(), cap);
+        if ok {
             return Ok(());
         }
-        self.spent = cap + 1;
         Err(format!(
             "{}: the reply's format took more than {} automaton steps in all",
             self.plan.label, self.plan.request_work_cap

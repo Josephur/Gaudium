@@ -118,12 +118,24 @@ pub fn request(val: &JsonValue, prompt: &ChatPrompt) -> Result<Option<Request>, 
 
 /// The grammar of `req` for a model whose replies have the form `format`, started where the
 /// rendered prompt leaves the reply (in the reasoning, or after a forced call's opening).
+///
+/// `reasoning_in_content`: the reply parser does not split the reasoning off
+/// (`reasoning_format: "none"`), so any reasoning would stay in the content, ahead of the
+/// answer the format holds. The reply is then not offered a reasoning block, and a prompt that
+/// starts the reply inside one is refused.
 pub fn plan(
     req: &Request,
     prompt: &ChatPrompt,
     format: &OutputFormat,
     vocab: Arc<TokenTable>,
+    reasoning_in_content: bool,
 ) -> Result<Arc<Plan>, String> {
+    if reasoning_in_content && prompt.reasoning_open {
+        return Err(format!(
+            "{}: reasoning_format 'none' keeps the model's reasoning in the content, where it would not follow the reply's format; send reasoning_format 'auto', or turn reasoning off",
+            req.label
+        ));
+    }
     let form = match format.style {
         CallStyle::Params => Some(CallForm::Params),
         CallStyle::Json => Some(CallForm::Json),
@@ -143,7 +155,7 @@ pub fn plan(
         open: format.tool_open.clone(),
         close: format.tool_close.clone(),
         form,
-        think: offers_reasoning(prompt, format)
+        think: (!reasoning_in_content && offers_reasoning(prompt, format))
             .then(|| (format.think_open.clone(), format.think_close.clone())),
     };
     let grammar = build::reply(req.answer.as_ref(), &req.tools, &tags)?;
@@ -283,7 +295,7 @@ mod tests {
         let r = request(&parse_json("{}").unwrap(), &p).unwrap().unwrap();
         let bytes: Vec<Vec<u8>> = (0u8..128).map(|b| vec![b]).collect();
         let kinds = vec![Kind::Text; 128];
-        let plan = plan(&r, &p, &f, Arc::new(TokenTable::new(bytes, kinds))).unwrap();
+        let plan = plan(&r, &p, &f, Arc::new(TokenTable::new(bytes, kinds)), false).unwrap();
         let mut c = Constraint::begin(plan);
         for b in "<parameter=n>\n7\n</parameter>\n</function>\n</tool_call>".bytes() {
             assert!(c.mask().unwrap().has(b as u32), "{}", b as char);
@@ -303,7 +315,7 @@ mod tests {
     fn c_plan(r: &Request, p: &ChatPrompt, f: &OutputFormat) -> Arc<Plan> {
         use crate::grammar::vocab::Kind;
         let bytes: Vec<Vec<u8>> = (0u8..128).map(|b| vec![b]).collect();
-        plan(r, p, f, Arc::new(TokenTable::new(bytes, vec![Kind::Text; 128]))).unwrap()
+        plan(r, p, f, Arc::new(TokenTable::new(bytes, vec![Kind::Text; 128])), false).unwrap()
     }
 
     #[test]
@@ -321,6 +333,31 @@ mod tests {
         assert!(!offers_reasoning(&p, &f));
     }
 
+    /// `reasoning_format: "none"` leaves the reasoning in the content, where it would stand
+    /// before the answer: the reply is then not offered a reasoning block, and a prompt that
+    /// starts the reply inside one is refused.
+    #[test]
+    fn reasoning_kept_in_the_content_is_never_offered_or_started_in() {
+        use crate::grammar::vocab::Kind;
+        let f = OutputFormat::default();
+        let body = parse_json(r#"{"response_format":{"type":"json_object"}}"#).unwrap();
+        let mut p = prompt(None);
+        p.text = "<|im_start|>assistant\n".into();
+        let r = request(&body, &p).unwrap().unwrap();
+        let t = || Arc::new(TokenTable::new((0u8..128).map(|b| vec![b]).collect(), vec![Kind::Text; 128]));
+        let opens = |plan: &Plan| {
+            let g = &plan.grammar;
+            g.start().and_then(|c| g.step_bytes(&c, f.think_open.as_bytes())).is_some()
+        };
+        assert!(opens(&plan(&r, &p, &f, t(), false).unwrap()));
+        assert!(!opens(&plan(&r, &p, &f, t(), true).unwrap()));
+        p.text.push_str("<think>\n");
+        p.reasoning_open = true;
+        assert!(plan(&r, &p, &f, t(), false).is_ok());
+        let e = plan(&r, &p, &f, t(), true).unwrap_err();
+        assert!(e.contains("reasoning_format 'none'"), "{e}");
+    }
+
     #[test]
     fn a_call_form_that_cannot_be_held_is_refused() {
         let tools = r#"[{"type":"function","function":{"name":"a","strict":true,"parameters":{"type":"object"}}}]"#;
@@ -331,7 +368,7 @@ mod tests {
             ..OutputFormat::default()
         };
         let t = Arc::new(TokenTable::new(vec![b"a".to_vec()], vec![crate::grammar::vocab::Kind::Text]));
-        assert!(plan(&r, &p, &f, t).unwrap_err().contains("can not be held"));
+        assert!(plan(&r, &p, &f, t, false).unwrap_err().contains("can not be held"));
     }
 
     /// For replies the grammar accepts (random walks over adversarial pieces: tags inside

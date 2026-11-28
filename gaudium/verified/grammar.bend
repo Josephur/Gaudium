@@ -110,6 +110,19 @@ def gram_alive_ok(alive: Nat, cap: Nat) -> Bool:
 def gram_budget_ok(+used: Nat, add: Nat, +cap: Nat) -> Bool:
   Bool.and(Nat.is_le(used, cap), Nat.is_le(add, Nat.sub(cap, used)))
 
+# The ledger after a charge: what was charged added when gram_budget_ok accepts it, else one
+# past the cap, where gram_budget_ok refuses every later charge (the call stays cut short).
+def gram_budget_step(ok: Bool, used: Nat, add: Nat, cap: Nat) -> Nat:
+  match ok:
+    case True{}:
+      Nat.add(used, add)
+    case False{}:
+      1n+cap
+
+# used: the ledger; add: the charge; cap: the budget. The shell stores the result as its ledger.
+def gram_budget_charge(+used: Nat, +add: Nat, +cap: Nat) -> Nat:
+  gram_budget_step(gram_budget_ok(used, add, cap), used, add, cap)
+
 # What the mask cache does with a new entry: keep it beside what it holds, or empty itself
 # (the entry is then not kept).
 type GramCacheAct is Data:
@@ -159,6 +172,18 @@ def gram_budget_shift(+h: Nat, +a: Nat, +r: Nat) -> {gram_budget_ok(h, a, Nat.ad
         case 1n+_: {==}
     case 1n+p:
       gram_budget_shift(p, a, r)
+
+# 1 + c <= c never holds
+def gram_le_succ_false(+c: Nat) -> {Nat.is_le(1n+c, c) == False{} : Bool}:
+  match c:
+    case 0n: {==}
+    case 1n+p:
+      gram_le_succ_false(p)
+
+# a ledger one past its cap accepts no charge
+def gram_budget_succ_refused(+c: Nat, b: Nat) -> {gram_budget_ok(1n+c, b, c) == False{} : Bool}:
+  %Equal.sym(Bool, Nat.is_le(1n+c, c), False{}, gram_le_succ_false(c)) : {Bool.and(_, Nat.is_le(b, Nat.sub(c, 1n+c))) == False{} : Bool}
+  {==}
 
 # h + a <= h + r is a <= r
 def gram_le_add_shift(+h: Nat, +a: Nat, +r: Nat) -> {Nat.is_le(a, r) == Nat.is_le(Nat.add(h, a), Nat.add(h, r)) : Bool}:
@@ -482,3 +507,43 @@ law gram_control_free_in_think:
 
 def gram_control_free_in_think():
   {==}
+
+# promise: a charge the budget accepts adds exactly what was charged to the ledger
+# harm: an undercounted ledger would let a client's schema spend past its cap
+# catches: the True{} arm of gram_budget_step returns used (an accepted charge not recorded)
+law gram_budget_charge_adds:
+  for +u: Nat
+  for +a: Nat
+  for +e: Nat
+  {gram_budget_charge(u, a, Nat.add(u, Nat.add(a, e))) == Nat.add(u, a) : Nat}
+
+def gram_budget_charge_adds(u, a, e):
+  %Equal.sym(Bool, gram_budget_ok(u, a, Nat.add(u, Nat.add(a, e))), True{}, gram_budget_within_cap_ok(u, a, e)) : {gram_budget_step(_, u, a, Nat.add(u, Nat.add(a, e))) == Nat.add(u, a) : Nat}
+  {==}
+
+# promise: a ledger already past its cap stays past it after any charge
+# catches: the False{} arm of gram_budget_step returns cap (the ledger reset to its cap, where an empty charge passes)
+law gram_budget_over_stays_over:
+  for +c: Nat
+  for +e: Nat
+  for a: Nat
+  for b: Nat
+  {gram_budget_ok(gram_budget_charge(1n+Nat.add(c, e), a, c), b, c) == False{} : Bool}
+
+def gram_budget_over_stays_over(c, e, a, b):
+  %Equal.sym(Bool, gram_budget_ok(1n+Nat.add(c, e), a, c), False{}, gram_budget_over_refused(c, e, a)) : {gram_budget_ok(gram_budget_step(_, 1n+Nat.add(c, e), a, c), b, c) == False{} : Bool}
+  gram_budget_succ_refused(c, b)
+
+# promise: after a charge that does not fit, every later charge to the ledger is refused, an empty one included
+# harm: a mask cut short by its work cap would pass as complete, and the reply could leave its format
+# catches: the False{} arm of gram_budget_step returns used (a refused charge leaves the ledger as it was)
+law gram_budget_refused_latches:
+  for +u: Nat
+  for +r: Nat
+  for +e: Nat
+  for b: Nat
+  {gram_budget_ok(gram_budget_charge(u, 1n+Nat.add(r, e), Nat.add(u, r)), b, Nat.add(u, r)) == False{} : Bool}
+
+def gram_budget_refused_latches(u, r, e, b):
+  %Equal.sym(Bool, gram_budget_ok(u, 1n+Nat.add(r, e), Nat.add(u, r)), False{}, gram_budget_past_cap_refused(u, r, e)) : {gram_budget_ok(gram_budget_step(_, u, 1n+Nat.add(r, e), Nat.add(u, r)), b, Nat.add(u, r)) == False{} : Bool}
+  gram_budget_succ_refused(Nat.add(u, r), b)

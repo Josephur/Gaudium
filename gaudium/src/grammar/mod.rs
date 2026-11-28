@@ -46,16 +46,26 @@ pub const FRAC_DIGITS: u32 = 18;
 /// Two exponent digits keep every admitted number finite as an `f64` (at most about 1e117), so a
 /// tool argument read back through the JSON parser never turns into an infinity (written `null`).
 pub const EXP_DIGITS: u32 = 2;
-/// Frame operations (entering, feeding, completing a frame) one call into the automaton may do:
-/// a byte step, the start, a completion check, one token's commit, or the whole of one mask.
-/// Past it the call stops with [`Work::exhausted`] set and the request ends with an error.
-/// Measured on a 248K-token vocabulary: a mask of an ordinary schema takes 1-10 thousand, one
-/// that follows 256 alternatives about 240 thousand (7 ms on the dev host); the cap is about
-/// 30 times that.
+/// Work (frame operations, each charged by the frames it copies: [`step_cost`]) one call into
+/// the automaton may do: a byte step, the start, a completion check, one token's commit, or the
+/// whole of one mask. Past it the call stops with [`Work::exhausted`] set and the request ends
+/// with an error. Measured on a 248K-token vocabulary: a mask of an ordinary schema takes 1-10
+/// thousand, one that follows 256 alternatives about 240 thousand (7 ms on the dev host); the
+/// cap is about 30 times that. One unit took 44-75 ns at 3 to 142 frames (release build, 199
+/// alternatives alive), so the cap is under a second of one host core.
 pub const MAX_WORK: u64 = 8_000_000;
-/// Frame operations every mask and commit of one request may take together (a few minutes of
-/// one host core at most).
+/// Work every mask and commit of one request may take together: at the measured 44-75 ns a
+/// unit, about 3 to 5 minutes of one host core at most.
 pub const MAX_REQUEST_WORK: u64 = 4_000_000_000;
+/// Frames one unit of work may copy: a frame operation copies the stack it works on, so an
+/// operation on a stack of `n` frames is charged `1 + n / FRAMES_PER_UNIT` units (see
+/// [`step_cost`]), and the caps above bound time at every depth.
+pub const FRAMES_PER_UNIT: u64 = 8;
+
+/// The work charged for one frame operation on a stack of `frames` frames.
+pub fn step_cost(frames: usize) -> u64 {
+    1 + frames as u64 / FRAMES_PER_UNIT
+}
 
 pub type NodeId = u32;
 
@@ -221,9 +231,10 @@ impl Frame {
     }
 }
 
-/// The work one call into the automaton has done, against its cap (verified `gram_budget_ok`).
-/// A refused charge leaves the ledger past its cap, where `gram_budget_ok` refuses every
-/// further charge (law `gram_budget_over_refused`): the call stays cut short.
+/// The work one call into the automaton has done, against its cap. Whether a charge fits is the
+/// verified `gram_budget_ok`, and the ledger after it is the verified `gram_budget_charge`: a
+/// refused charge leaves the ledger past its cap, where every further charge is refused (laws
+/// `gram_budget_refused_latches`, `gram_budget_over_stays_over`): the call stays cut short.
 #[derive(Debug, Clone)]
 pub struct Work {
     used: u64,
@@ -239,14 +250,13 @@ impl Work {
         }
     }
 
-    /// One frame operation; `false` (and exhausted from then on) once the cap is reached.
-    fn spend(&mut self) -> bool {
-        if verified::gram_budget_ok(self.used, 1, self.cap) {
-            self.used += 1;
-            return true;
-        }
-        self.used = self.cap + 1;
-        false
+    /// One frame operation on a stack of `frames` frames ([`step_cost`]); `false` (and
+    /// exhausted from then on) once the cap is reached.
+    fn spend(&mut self, frames: usize) -> bool {
+        let cost = step_cost(frames);
+        let ok = verified::gram_budget_ok(self.used, cost, self.cap);
+        self.used = verified::gram_budget_charge(self.used, cost, self.cap);
+        ok
     }
 
     /// The cap was reached: what the call returned is incomplete and must not be used.
@@ -401,7 +411,7 @@ impl Grammar {
         let Some(&f) = st.last() else {
             return true;
         };
-        if fuel == 0 || !w.spend() || !self.can_finish(f) {
+        if fuel == 0 || !w.spend(st.len()) || !self.can_finish(f) {
             return false;
         }
         st.pop();
@@ -416,7 +426,7 @@ impl Grammar {
     /// Pushes `id` (alternatives: one stack per branch) onto `st`.
     fn enter(&self, mut st: Stack, id: NodeId, out: &mut Vec<Stack>, fuel: u32, w: &mut Work) {
         // `fuel` bounds the recursion's depth, `w` its total work across every branch
-        if fuel == 0 || !w.spend() {
+        if fuel == 0 || !w.spend(st.len()) {
             return;
         }
         let node = &self.nodes[id as usize];
@@ -517,7 +527,7 @@ impl Grammar {
     }
 
     fn feed(&self, st: Stack, b: u8, out: &mut Vec<Stack>, fuel: u32, w: &mut Work) {
-        if fuel == 0 || !w.spend() {
+        if fuel == 0 || !w.spend(st.len()) {
             return;
         }
         let Some(&f) = st.last() else {
