@@ -106,6 +106,18 @@ def ml_sub_le_sub(+c: Nat, +a: Nat, +b: Nat, h: {Nat.is_le(a, b) == True{} : Boo
     case 1n+cp 1n+ap 1n+bp:
       ml_sub_le_sub(cp, ap, bp, h)
 
+# `a <= b` gives `a - c <= b - c`.
+def ml_sub_le_sub_r(+a: Nat, +b: Nat, +c: Nat, h: {Nat.is_le(a, b) == True{} : Bool}) -> {Nat.is_le(Nat.sub(a, c), Nat.sub(b, c)) == True{} : Bool}:
+  match a b c:
+    case 0n _ _:
+      L.nat_le_zero(Nat.sub(b, c))
+    case 1n+ap 0n _:
+      L.bool_absurd({Nat.is_le(Nat.sub(1n+ap, c), Nat.sub(0n, c)) == True{} : Bool}, h)
+    case 1n+ap 1n+bp 0n:
+      h
+    case 1n+ap 1n+bp 1n+cp:
+      ml_sub_le_sub_r(ap, bp, cp, h)
+
 # `i < m` gives `i - lo < m - lo`, for `lo <= i`.
 def ml_sub_lt_sub(+lo: Nat, +i: Nat, +m: Nat, hle: {Nat.is_le(lo, i) == True{} : Bool}, hlt: {Nat.is_lt(i, m) == True{} : Bool}) -> {Nat.is_lt(Nat.sub(i, lo), Nat.sub(m, lo)) == True{} : Bool}:
   match lo i m:
@@ -240,6 +252,52 @@ law ml_page_back_within_limit:
 
 def ml_page_back_within_limit(i, n, lo, hi, limit, ok):
   ml_and_r(ml_in_window(i, n, lo, hi), ml_in_reach(i, n, lo, hi, limit, True{}), ok)
+
+# promise: a page read forward has no holes: every position from the after_id cursor up to a position on the page is on the page
+# harm: a client paging on with the last id would never see an entry the page skipped
+# catches: a page with more to follow keeping only its first and last positions (`ml_in_reach` forward also requiring `i == lo` or `i - lo == limit - 1` when `ml_more` holds)
+law ml_page_forward_prefix:
+  for +lo: Nat
+  for +i: Nat
+  for +j: Nat
+  for +limit: Nat
+  for +n: Nat
+  for +hi: Nat
+  for +hlo: {Nat.is_le(lo, i) == True{} : Bool}
+  for +hij: {Nat.is_le(i, j) == True{} : Bool}
+  for +ok: {ml_on_page(j, n, lo, hi, limit, False{}) == True{} : Bool}
+  {ml_on_page(i, n, lo, hi, limit, False{}) == True{} : Bool}
+
+def ml_page_forward_prefix(lo, i, j, limit, n, hi, hlo, hij, ok):
+  +hw = ml_and_l(ml_in_window(j, n, lo, hi), ml_in_reach(j, n, lo, hi, limit, False{}), ok)
+  +hr = ml_and_r(ml_in_window(j, n, lo, hi), ml_in_reach(j, n, lo, hi, limit, False{}), ok)
+  +hjm = ml_and_r(Nat.is_le(lo, j), Nat.is_lt(j, Nat.min(hi, n)), hw)
+  +him = L.nat_le_lt_trans(i, j, Nat.min(hi, n), hij, hjm)
+  +hir = L.nat_le_lt_trans(Nat.sub(i, lo), Nat.sub(j, lo), limit, ml_sub_le_sub_r(i, j, lo, hij), hr)
+  ml_and_intro(ml_in_window(i, n, lo, hi), ml_in_reach(i, n, lo, hi, limit, False{}), ml_and_intro(Nat.is_le(lo, i), Nat.is_lt(i, Nat.min(hi, n)), hlo, him), hir)
+
+# promise: a page read from its end has no holes: every position from a position on the page up to the window's end is on the page
+# harm: a client paging back with the first id would never see an entry the page skipped
+# catches: a page with more to follow keeping only its first and last positions (`ml_in_reach` back also requiring `m - i == 1` or `m - i == limit` when `ml_more` holds, `m` the window's end)
+law ml_page_back_suffix:
+  for +lo: Nat
+  for +j: Nat
+  for +i: Nat
+  for +limit: Nat
+  for +n: Nat
+  for +hi: Nat
+  for +hji: {Nat.is_le(j, i) == True{} : Bool}
+  for +hend: {Nat.is_lt(i, Nat.min(hi, n)) == True{} : Bool}
+  for +ok: {ml_on_page(j, n, lo, hi, limit, True{}) == True{} : Bool}
+  {ml_on_page(i, n, lo, hi, limit, True{}) == True{} : Bool}
+
+def ml_page_back_suffix(lo, j, i, limit, n, hi, hji, hend, ok):
+  +hw = ml_and_l(ml_in_window(j, n, lo, hi), ml_in_reach(j, n, lo, hi, limit, True{}), ok)
+  +hr = ml_and_r(ml_in_window(j, n, lo, hi), ml_in_reach(j, n, lo, hi, limit, True{}), ok)
+  +hlj = ml_and_l(Nat.is_le(lo, j), Nat.is_lt(j, Nat.min(hi, n)), hw)
+  +hli = L.nat_le_trans(lo, j, i, hlj, hji)
+  +hir = L.nat_le_trans(Nat.sub(Nat.min(hi, n), i), Nat.sub(Nat.min(hi, n), j), limit, ml_sub_le_sub(Nat.min(hi, n), j, i, hji), hr)
+  ml_and_intro(ml_in_window(i, n, lo, hi), ml_in_reach(i, n, lo, hi, limit, True{}), ml_and_intro(Nat.is_le(lo, i), Nat.is_lt(i, Nat.min(hi, n)), hli, hend), hir)
 
 # promise: a forward page that says more entries follow is not empty, so a client paging on with its last id always moves
 # harm: a client would ask for the same empty page forever
