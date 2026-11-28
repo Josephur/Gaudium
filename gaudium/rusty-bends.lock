@@ -222,6 +222,9 @@ c4fc37515bfd2073  fs_start_refuses_overfull  law fs_start_refuses_overfull : for
 19872f3a3df46c83  fs_take_below_bound  law fs_take_below_bound : for + n : Nat for + z : Nat { fs_take_ok ( fs_count_take ( FsCount { n , Nat.add ( n , 1n + z ) } ) ) == True { } : Bool }
 # promise fs_take_below_bound: an upload is given its slot whenever the store holds fewer files than its bound.
 # harm fs_take_below_bound: the store could refuse every upload, or the last one its bound allows
+c86dd65765e3fc41  fs_take_count_counts  law fs_take_count_counts : for + c : FsCount { fs_take_counted ( c , fs_count_take ( c ) , fs_take_count ( c , fs_count_take ( c ) ) ) == True { } : Bool }
+# promise fs_take_count_counts: when a take gives an upload its slot, the count the store keeps after it holds more files than before, no more than the bound, and the same bound.
+# harm fs_take_count_counts: an upload could take a slot the count never records, and uploads of no bytes would then pass the bound without end
 df80ae00d54a2f1c  fs_take_raises_count  law fs_take_raises_count : for + c : FsCount { fs_take_raises ( fs_count_live ( c ) , fs_count_take ( c ) ) == True { } : Bool }
 # promise fs_take_raises_count: a take that gives an upload its slot counts it: the store holds more files after it.
 # harm fs_take_raises_count: uploads in progress and stored files would not count against the bound
