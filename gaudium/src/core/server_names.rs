@@ -5,8 +5,17 @@
 //! verdict counts, delegate to the verified core. What this module adds is the conversion of
 //! names to the byte lists the core compares; reading hosts out of request headers is done by
 //! the caller.
+//!
+//! The lists are built only for a request inside the bounds below (`hn_hosts_fit`): a request
+//! can name any number of hosts, and a list of thousands would exhaust the stack of the
+//! connection thread when the verified core walks or drops it.
 
-use crate::verified::{hn_request_ours, hn_site_ok, HnHost, List};
+use crate::verified::{hn_hosts_fit, hn_hosts_ours, hn_request_ours, hn_site_ok, HnHost, List};
+
+/// Most hosts the front-end headers of one request may name (one or two per front end).
+pub const MAX_FORWARDED_HOSTS: u64 = 16;
+/// Most bytes the names of one request may hold between them, its Host included.
+pub const MAX_NAME_BYTES: u64 = 4096;
 
 /// One host a request names, as read from a header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,14 +54,43 @@ fn host(h: &NamedHost) -> HnHost {
     }
 }
 
-/// The request names this server: its Host (`host`) and every host a front end names for it
-/// (`forwarded`) is an address or one of `names`.
+fn name_bytes(h: &NamedHost) -> u64 {
+    match h {
+        NamedHost::Name(n) => n.len() as u64,
+        NamedHost::Addr | NamedHost::Bad => 0,
+    }
+}
+
+/// The hosts the request names are few enough to be read (`MAX_FORWARDED_HOSTS`,
+/// `MAX_NAME_BYTES`).
+pub fn hosts_fit(host_header: &NamedHost, forwarded: &[NamedHost]) -> bool {
+    let bytes = forwarded.iter().fold(name_bytes(host_header), |sum, h| {
+        sum.saturating_add(name_bytes(h))
+    });
+    hn_hosts_fit(
+        forwarded.len() as u64,
+        bytes,
+        MAX_FORWARDED_HOSTS,
+        MAX_NAME_BYTES,
+    )
+}
+
+/// The request names this server: its hosts fit the bounds, and its Host (`host`) and every
+/// host a front end names for it (`forwarded`) is an address or one of `names`.
 pub fn request_ours(host_header: &NamedHost, forwarded: &[NamedHost], names: &OwnNames) -> bool {
-    let fwd = forwarded
-        .iter()
-        .rev()
-        .fold(List::Nil, |tail, h| List::Con(host(h), Box::new(tail)));
-    hn_request_ours(host(host_header), fwd, names.0.clone())
+    let fits = hosts_fit(host_header, forwarded);
+    // the core refuses a request that does not fit whatever it names; its hosts are not read
+    let (h, fwd) = match fits {
+        true => (
+            host(host_header),
+            forwarded
+                .iter()
+                .rev()
+                .fold(List::Nil, |tail, h| List::Con(host(h), Box::new(tail))),
+        ),
+        false => (HnHost::HnBad, List::Nil),
+    };
+    hn_hosts_ours(fits, hn_request_ours(h, fwd, names.0.clone()))
 }
 
 /// The proxy's site verdict, counted only for a request that names this server.
@@ -110,6 +148,37 @@ mod tests {
             &[name("localhost")],
             &own
         ));
+    }
+
+    #[test]
+    fn a_request_naming_too_many_hosts_is_refused_unread() {
+        let own = OwnNames::new(&["localhost"]);
+        let max = MAX_FORWARDED_HOSTS as usize;
+        let fwd = vec![NamedHost::Addr; max];
+        assert!(request_ours(&name("localhost"), &fwd, &own));
+        let fwd = vec![NamedHost::Addr; max + 1];
+        assert!(!hosts_fit(&name("localhost"), &fwd));
+        assert!(!request_ours(&name("localhost"), &fwd, &own));
+        // far past the bound: refused without a list being built (no stack overflow)
+        let fwd = vec![name("localhost"); 1_000_000];
+        assert!(!request_ours(&name("localhost"), &fwd, &own));
+        // the bytes of the names are bounded too, the Host's included
+        let long = "a".repeat(MAX_NAME_BYTES as usize);
+        let own = OwnNames::new(&[long.as_str()]);
+        assert!(request_ours(&name(&long), &[], &own));
+        assert!(!request_ours(&name(&long), &[name("a")], &own));
+        let longer = "a".repeat(MAX_NAME_BYTES as usize + 1);
+        assert!(!request_ours(
+            &name(&longer),
+            &[],
+            &OwnNames::new(&[longer.as_str()])
+        ));
+    }
+
+    #[test]
+    fn the_bounds_are_today_16_hosts_and_4096_bytes() {
+        assert_eq!(MAX_FORWARDED_HOSTS, 16);
+        assert_eq!(MAX_NAME_BYTES, 4096);
     }
 
     #[test]

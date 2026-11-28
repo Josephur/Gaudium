@@ -1007,6 +1007,91 @@ fn behind_a_front_end_its_public_name_is_given_to_the_server() {
         ),
         403
     );
+    // a chain of front ends, each adding its own line: every line counts, whichever comes first
+    for (a, b) in [
+        (
+            "X-Forwarded-Host: evil.example",
+            "X-Forwarded-Host: 127.0.0.1:8080",
+        ),
+        (
+            "X-Forwarded-Host: 127.0.0.1:8080",
+            "X-Forwarded-Host: evil.example",
+        ),
+        (
+            "Forwarded: host=evil.example",
+            "Forwarded: host=127.0.0.1:8080",
+        ),
+        (
+            "Forwarded: host=127.0.0.1:8080",
+            "Forwarded: host=evil.example",
+        ),
+        (
+            "X-Forwarded-Host: evil.example",
+            "X-Forwarded-Host: chat.example.com",
+        ),
+        (
+            "Forwarded: host=evil.example",
+            "Forwarded: for=192.0.2.9;host=localhost",
+        ),
+    ] {
+        let r = send(
+            &p,
+            "POST",
+            &url,
+            &[origin, "Sec-Fetch-Site: same-origin", a, b],
+            "{}",
+        );
+        assert_eq!(r.status, 403, "{a} / {b}");
+        assert!(
+            r.error().contains("a front-end header names a host"),
+            "{}",
+            r.error()
+        );
+    }
+    // lines that all name this server pass
+    assert_eq!(
+        hit(
+            &p,
+            &[
+                origin,
+                "X-Forwarded-Host: chat.example.com",
+                "X-Forwarded-Host: 127.0.0.1:8080"
+            ]
+        ),
+        200
+    );
+    assert_eq!(
+        hit(
+            &p,
+            &[
+                origin,
+                "Forwarded: host=chat.example.com",
+                "Forwarded: for=192.0.2.9;host=localhost"
+            ]
+        ),
+        200
+    );
+    // more hosts than the bound: refused before any is read
+    let many = format!(
+        "X-Forwarded-Host: {}",
+        vec!["127.0.0.1"; names::MAX_FORWARDED_HOSTS as usize + 1].join(",")
+    );
+    let same = "Sec-Fetch-Site: same-origin";
+    let r = send(&p, "POST", &url, &[origin, same, &many], "{}");
+    assert_eq!(r.status, 403);
+    assert!(r.error().contains("more than 16 hosts"), "{}", r.error());
+    // the same bound across lines, and one host fewer passes
+    let line = "X-Forwarded-Host: 127.0.0.1";
+    let lines = vec![line; names::MAX_FORWARDED_HOSTS as usize + 1];
+    let mut headers = vec![origin, same];
+    headers.extend(lines.iter().copied());
+    let r = send(&p, "POST", &url, &headers, "{}");
+    assert_eq!(r.status, 403);
+    assert!(r.error().contains("more than 16 hosts"), "{}", r.error());
+    let lines = vec![line; names::MAX_FORWARDED_HOSTS as usize];
+    let mut headers = vec![origin, same];
+    headers.extend(lines.iter().copied());
+    assert_eq!(hit(&p, &headers), 200);
     // the front end rewrites Host and says nothing: the browser's own statement decides
     // (every browser sends it to an https page's server)
     assert_eq!(hit(&p, &[origin, "Sec-Fetch-Site: same-origin"]), 200);

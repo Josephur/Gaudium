@@ -84,6 +84,20 @@ def hn_request_ours(host: HnHost, fwd: List<&2, HnHost>, +ns: List<&2, List<&2, 
 def hn_site_ok(hosts_ours: Bool, site_ok: Bool) -> Bool:
   Bool.and(hosts_ours, site_ok)
 
+# The hosts a request names are few enough to be read: the front-end headers name at most
+# max_hosts hosts, and the names the request carries (its Host included) hold at most max_bytes
+# bytes between them. The Rust shell builds the lists hn_request_ours reads only for a request
+# that fits, so a request naming thousands of hosts is refused before any is read.
+# hosts: the number of hosts the front-end headers name
+# bytes: the bytes of every name the request carries
+def hn_hosts_fit(hosts: Nat, bytes: Nat, max_hosts: Nat, max_bytes: Nat) -> Bool:
+  Bool.and(Nat.is_le(hosts, max_hosts), Nat.is_le(bytes, max_bytes))
+
+# fits: hn_hosts_fit of the request
+# ours: hn_request_ours of the request (of nothing it names, when it does not fit)
+def hn_hosts_ours(fits: Bool, ours: Bool) -> Bool:
+  Bool.and(fits, ours)
+
 # ============================================================================
 # 2. Proof Helpers (erased before Rust codegen)
 # ============================================================================
@@ -332,4 +346,76 @@ law hn_site_own_host_passes:
   {hn_site_ok(True{}, True{}) == True{} : Bool}
 
 def hn_site_own_host_passes():
+  {==}
+
+# ============================================================================
+# 6. Laws: How Many Hosts a Request May Name
+# ============================================================================
+
+# promise: a request whose front-end headers name more hosts than the bound never fits
+# catches: the count of hosts not compared (only the bytes bounded)
+law hn_too_many_hosts_refused:
+  for +m: Nat
+  for +d: Nat
+  for b: Nat
+  for mb: Nat
+  {hn_hosts_fit(Nat.add(m, 1n+d), b, m, mb) == False{} : Bool}
+
+def hn_too_many_hosts_refused(m, d, b, mb):
+  %Equal.sym(Bool, Nat.is_le(Nat.add(m, 1n+d), m), False{}, G.g_nat_le_add_succ_false(m, d)) : {Bool.and(_, Nat.is_le(b, mb)) == False{} : Bool}
+  {==}
+
+# promise: a request whose names hold more bytes than the bound never fits
+# catches: the bytes not compared (only the count of hosts bounded)
+law hn_too_many_bytes_refused:
+  for +h: Nat
+  for +mh: Nat
+  for +m: Nat
+  for +d: Nat
+  {hn_hosts_fit(h, Nat.add(m, 1n+d), mh, m) == False{} : Bool}
+
+def hn_too_many_bytes_refused(h, mh, m, d):
+  %Equal.sym(Bool, Nat.is_le(Nat.add(m, 1n+d), m), False{}, G.g_nat_le_add_succ_false(m, d)) : {Bool.and(Nat.is_le(h, mh), _) == False{} : Bool}
+  G.g_bool_and_false_r(Nat.is_le(h, mh))
+
+# promise: a request inside both bounds fits
+# catches: the bound on the hosts made strict (Nat.is_lt in place of Nat.is_le)
+law hn_within_bounds_fits:
+  for +h: Nat
+  for +mh: Nat
+  for +b: Nat
+  for +mb: Nat
+  for okh: {Nat.is_le(h, mh) == True{} : Bool}
+  for okb: {Nat.is_le(b, mb) == True{} : Bool}
+  {hn_hosts_fit(h, b, mh, mb) == True{} : Bool}
+
+def hn_within_bounds_fits(h, mh, b, mb, okh, okb):
+  %Equal.sym(Bool, Nat.is_le(h, mh), True{}, okh) : {Bool.and(_, Nat.is_le(b, mb)) == True{} : Bool}
+  %Equal.sym(Bool, Nat.is_le(b, mb), True{}, okb) : {Bool.and(True{}, _) == True{} : Bool}
+  {==}
+
+# promise: a request that does not fit the bounds never names this server
+# catches: the bound ignored (hn_hosts_ours returns ours)
+law hn_unfit_refused:
+  for o: Bool
+  {hn_hosts_ours(False{}, o) == False{} : Bool}
+
+def hn_unfit_refused(o):
+  {==}
+
+# promise: fitting the bounds never lets through a request that does not name this server
+# catches: the host check ignored (hn_hosts_ours returns fits)
+law hn_fit_never_widens:
+  for +f: Bool
+  {hn_hosts_ours(f, False{}) == False{} : Bool}
+
+def hn_fit_never_widens(f):
+  G.g_bool_and_false_r(f)
+
+# promise: a request that fits the bounds and names this server names this server
+# catches: every request refused (hn_hosts_ours always False{})
+law hn_fit_own_hosts_pass:
+  {hn_hosts_ours(True{}, True{}) == True{} : Bool}
+
+def hn_fit_own_hosts_pass():
   {==}

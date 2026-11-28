@@ -120,7 +120,11 @@ server: its `Host`, and every host in `X-Forwarded-Host` and `Forwarded: host=`,
 - a DNS name of the HTTPS certificate, when the server serves HTTPS (wildcard names are not
   taken: give each name with `--server-name`).
 
-Names are compared without regard to case, without the port and without a final dot. Any other
+Names are compared without regard to case, without the port and without a final dot. When a
+chain of front ends adds several `X-Forwarded-Host` or `Forwarded` lines, every line counts, in
+the order received, so an outer front end's host cannot be hidden behind an inner one's. A
+request whose front-end headers name more than 16 hosts, or whose names hold more than 4096
+bytes between them, is refused without being read. Any other
 host gets 403 `permission_error`, and the message names the host and `--server-name`. Opening
 the Web UI by a machine name (`http://gaudium.lan:8080/`) or through a front end that keeps its
 public name therefore needs that name: `--server-name gaudium.lan` or
@@ -299,10 +303,19 @@ browser does not let an HTTPS page call it directly.
 ### Behind a front end that ends TLS
 
 A reverse proxy, a tunnel or a forwarded router port may end TLS and pass plain HTTP on. Give
-neither TLS option then. Nothing in the server is configured with the public name: the Web UI
-uses relative paths only, without the TLS options the server builds no URL from a name (the
-redirect above is the one that does), no check pins `Host`, and the
-proxy's site rule compares the request with itself (above).
+neither TLS option then. The Web UI uses relative paths only, and without the TLS options the
+server builds no URL from a name (the redirect above is the one that does). The MCP proxy needs
+the public name: give it with `--server-name` (above), and have the front end pass it on, either
+by keeping it in `Host` or by naming it in `X-Forwarded-Host` or `Forwarded: host=`.
+
+**A plain-HTTP front end must pass the public host on, or refuse hosts it does not serve.** A
+front end that rewrites `Host` to an address or to `localhost` (`Host: 127.0.0.1:8080`) and adds
+no forwarded header gives the server only that host, and an address or `localhost` always passes. A page that points
+its own name at the front end's address (DNS rebinding) then reaches the proxy, and the server
+cannot tell: nothing it receives names the page's domain. Keep `Host`, add one of the two
+headers, or make the front end itself answer only for the names it serves (a list of those
+names, with a default that refuses the rest). A front end that serves HTTPS is protected by the
+browser: a rebound name does not match its certificate.
 
 A front end usually cuts a connection that carries nothing for a while (60 to 100 s are common
 limits). The server's own event stream sends a comment line every 10 s; the proxy sends one

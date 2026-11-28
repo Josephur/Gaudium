@@ -2004,7 +2004,7 @@ fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
     let path = percent_decode(raw_path);
     let query = parse_query(raw_query);
 
-    let mut headers = HashMap::new();
+    let mut headers: HashMap<String, String> = HashMap::new();
     loop {
         let mut line = String::new();
         let r = reader
@@ -2018,6 +2018,16 @@ fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
             // RFC 9112: a request with more than one Host is refused (which one would count?)
             if k == "host" && headers.contains_key("host") {
                 return Err("more than one Host header".into());
+            }
+            // RFC 9110 5.3 / RFC 7239: each front end of a chain may add its own line. Every
+            // line is kept, joined into one list in the order received, so the hosts an outer
+            // front end names are checked as well as the inner one's.
+            if k == "x-forwarded-host" || k == "forwarded" {
+                if let Some(prev) = headers.get_mut(&k) {
+                    prev.push_str(", ");
+                    prev.push_str(v.trim());
+                    continue;
+                }
             }
             headers.insert(k, v.trim().to_string());
         }

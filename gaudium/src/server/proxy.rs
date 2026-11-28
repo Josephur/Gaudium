@@ -1543,7 +1543,13 @@ impl McpProxy {
                         .take(120)
                         .collect::<String>()
                 };
-                let named = if names::request_ours(&host, &[], &self.own_names) {
+                let named = if !names::hosts_fit(&host, &forwarded) {
+                    format!(
+                        "the request names more than {} hosts in front-end headers, or more than {} bytes of names",
+                        names::MAX_FORWARDED_HOSTS,
+                        names::MAX_NAME_BYTES
+                    )
+                } else if names::request_ours(&host, &[], &self.own_names) {
                     format!(
                         "a front-end header names a host that is not one of this server's names (X-Forwarded-Host: {}, Forwarded: {})",
                         shown(req.headers.get("x-forwarded-host")),
