@@ -29,6 +29,9 @@ Ids are `file-<12 hex digits of the counter><12 random hex digits>`.
 - With `--api-key`, a file belongs to the key that stored it. `owner` in its `.json` is
   `key:` and the first 32 hex digits of the key's SHA-256 digest. Without a key, `owner` is
   empty, and every client sees every file stored without a key.
+- The owner is the server's key that let the request in, as a Bearer token or as `x-api-key`. A
+  request may carry both; when one of them is the key, the other is ignored, and it never picks
+  the owner. A request with neither is refused (401) before any file is looked at.
 - After the key changes (or one is added to a server that had none, or removed), the files
   stored under the old owner are not served: list, get, content and delete answer as if they did
   not exist. Their bytes still count against the quota. The start reports them:
