@@ -2257,6 +2257,11 @@ c2f67c24de81fae5  sv_cut_round_never_runs  law sv_cut_round_never_runs : for + s
 cda40479ac87dadc  sv_foreign_never_runs  law sv_foreign_never_runs : for + n : Nat for + p : Bool for + m : Nat { sv_admit_runs ( sv_admit ( n , p , False { } , m ) ) == False { } : Bool }
 # promise sv_foreign_never_runs: a request that names tool servers and comes from a page of another site never runs them
 # harm sv_foreign_never_runs: any web page open in a browser that can reach the server could make it call allow-listed
+49a485d9c2c0caef  sv_left_goes_on  law sv_left_goes_on : for + b : Bool for + l : Nat { sv_round_goes_on ( SvRunGoOn { } , b , 1n + l ) == True { } : Bool }
+# promise sv_left_goes_on: a round the round's decision continues generates again while output tokens are left of the limit
+14be5742b0290b9b  sv_left_within_limit  law sv_left_within_limit : for + m : Nat for + u : Nat { Nat.is_le ( sv_tokens_left ( m , u ) , Nat.sub ( m , u ) ) == True { } : Bool }
+# promise sv_left_within_limit: a round is never given more output tokens than are left of the request's limit after the rounds before
+# harm sv_left_within_limit: one reply could generate many times the max_tokens its client asked for
 ad7b60e79797d231  sv_list_ends_without_cursor  law sv_list_ends_without_cursor : for + p : Nat for + m : Nat { sv_list_more ( False { } , p , m ) == False { } : Bool }
 # promise sv_list_ends_without_cursor: a tool-list page without a cursor is the last one asked for
 798d61bec2261893  sv_list_follows_cursor  law sv_list_follows_cursor : for + n : Nat for + d : Nat { sv_list_more ( True { } , n , Nat.add ( n , 1n + d ) ) == True { } : Bool }
@@ -2290,10 +2295,21 @@ d9a093e3018be72a  sv_result_within_cap  law sv_result_within_cap : for + l : Nat
 # promise sv_result_within_len: the bytes kept of a tool result never exceed its length
 e1f117208c43e228  sv_room_goes_on  law sv_room_goes_on : for + s : Nat for + n : Nat for + d : Nat { sv_goes_on ( sv_next ( True { } , 1n + s , 0n , n , Nat.add ( n , 1n + d ) ) ) == True { } : Bool }
 # promise sv_room_goes_on: a round the model ended with server-side calls and no client call generates again while rounds are left
+4e7eb3740cce8ede  sv_round_within_rules  law sv_round_within_rules : for + n : SvNext for + b : Bool for + l : Nat { Bool.and ( sv_round_goes_on ( n , b , l ) , Bool.not ( sv_goes_on ( n ) ) ) == False { } : Bool }
+# promise sv_round_within_rules: the loop never generates a round that the round's own decision stops, whatever is left of the limit
 29f2777aa254ad27  sv_server_calls_always_run  law sv_server_calls_always_run : for + s : Nat for + c : Nat for + n : Nat for + m : Nat { sv_runs ( sv_next ( True { } , 1n + s , c , n , m ) ) == True { } : Bool }
 # promise sv_server_calls_always_run: in a round the model ended, its server-side calls are run whether or not the loop goes on
 53d1276b0b8ecaaf  sv_server_tool_runs  law sv_server_tool_runs : { sv_route_server ( sv_route ( True { } , False { } ) ) == True { } : Bool }
 # promise sv_server_tool_runs: a call of a server-side tool that is not a client tool is run server-side
+3d2dc320c2fba9ac  sv_spent_keeps_stop_reason  law sv_spent_keeps_stop_reason : for + n : SvNext for + b : Bool for + l : Nat { Bool.and ( sv_budget_spent ( n , b , l ) , Bool.not ( sv_goes_on ( n ) ) ) == False { } : Bool }
+# promise sv_spent_keeps_stop_reason: a round whose own decision stops (client calls waiting, no round left, nothing to run) never stops for the output limit instead
+c44fcc1a939a35da  sv_spent_never_goes_on  law sv_spent_never_goes_on : for + n : SvNext { sv_round_goes_on ( n , True { } , 0n ) == False { } : Bool }
+# promise sv_spent_never_goes_on: once the request's output-token limit is spent, the loop never generates another round
+# harm sv_spent_never_goes_on: a round given no limit (0 means none to the chat path) would generate to the end of the context
+5b888579a90058f1  sv_spent_only_when_spent  law sv_spent_only_when_spent : for + n : SvNext for + b : Bool for + l : Nat { Bool.and ( sv_budget_spent ( n , b , l ) , Bool.or ( Bool.not ( b ) , Nat.is_gt ( l , 0n ) ) ) == False { } : Bool }
+# promise sv_spent_only_when_spent: the reply stops for the output limit only when the request set one and none of it is left
+a3ba3d17fbb186b5  sv_spent_says_so  law sv_spent_says_so : { sv_budget_spent ( SvRunGoOn { } , True { } , 0n ) == True { } : Bool }
+# promise sv_spent_says_so: a reply whose round decision goes on but whose output limit is spent stops for the limit
 ca25adadd6fde54c  sv_take_all_that_fit  law sv_take_all_that_fit : for + d : Nat for + a : Nat for + r : Nat { sv_calls_take ( d , a , Nat.add ( d , Nat.add ( a , r ) ) ) == a : Nat }
 # promise sv_take_all_that_fit: when the round's calls fit in what is left of the limit, every one of them runs
 56a9cee52acc00e5  sv_take_within_asked  law sv_take_within_asked : for + d : Nat for + a : Nat for + m : Nat { Nat.is_le ( sv_calls_take ( d , a , m ) , a ) == True { } : Bool }
@@ -2306,6 +2322,8 @@ ca25adadd6fde54c  sv_take_all_that_fit  law sv_take_all_that_fit : for + d : Nat
 # harm sv_unasked_runs_as_before: every request without tool servers would be refused
 ad28bec100b98ac0  sv_unknown_never_server  law sv_unknown_never_server : for + c : Bool { sv_route_server ( sv_route ( False { } , c ) ) == False { } : Bool }
 # promise sv_unknown_never_server: a call whose name is not one of the request's server-side tools is never run server-side
+f8b122d170b0a30a  sv_unlimited_goes_on  law sv_unlimited_goes_on : for + l : Nat { sv_round_goes_on ( SvRunGoOn { } , False { } , l ) == True { } : Bool }
+# promise sv_unlimited_goes_on: a request without an output limit generates its rounds as the round decision says, without a token bound
 a378964733894e9d  sv_within_limit_runs  law sv_within_limit_runs : for + n : Nat for + d : Nat { sv_admit_runs ( sv_admit ( 1n + n , True { } , True { } , Nat.add ( 1n + n , d ) ) ) == True { } : Bool }
 # promise sv_within_limit_runs: with the MCP proxy on, a request that passes the site rule and names between one and `most` servers runs them
 46ab38ee952ff713  think_answer_kept  law think_answer_kept : for + n : Nat for + cap : Nat for + c : Nat for + room : Nat for + forced : Bool { think_act ( False { } , n , cap , c , room , forced ) == TaFeed { n } : ThinkAct }
