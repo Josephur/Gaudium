@@ -490,6 +490,12 @@ d24d9517559d3cc5  ge_length_not_model_end  law ge_length_not_model_end : { ge_mo
 95d1b0c1a056e85b  ge_repaired_cut_not_model_end  law ge_repaired_cut_not_model_end : for + ss : Bool for + st : Bool for + c : Bool { ge_model_ended ( gen_end_closed ( ss , st , True { } , False { } , c ) ) == False { } : Bool }
 # promise ge_repaired_cut_not_model_end: a generation cut by the length limit or a cancel inside a call the parser then closed is never one the model ended
 # harm ge_repaired_cut_not_model_end: the half-written call would be run as a whole one, on a remote tool server with arguments the model never finished
+917ffbab6213fcfe  ge_repaired_ends_as_engine  law ge_repaired_ends_as_engine : for + st : Bool for + eos : Bool for + c : Bool { gen_end_closed ( False { } , st , True { } , eos , c ) == gen_end ( False { } , False { } , eos , c ) : GenEnd }
+# promise ge_repaired_ends_as_engine: a generation whose last call the parser closed ends as the engine ended it (an end-of-sequence token, the length limit or a cancel), whether or not the parser's cleanup stopped it
+# harm ge_repaired_ends_as_engine: a cancelled round whose cleanup reached the call limit would report a length cut (or a stop string) instead of the cancel
+e77c6b6c9fea2607  ge_repaired_eos_model_end  law ge_repaired_eos_model_end : for + st : Bool for + c : Bool { ge_model_ended ( gen_end_closed ( False { } , st , True { } , True { } , c ) ) == True { } : Bool }
+# promise ge_repaired_eos_model_end: a generation the model ended with an end-of-sequence token inside a call the parser then closed is one the model ended, also when the parser's cleanup reached the call limit
+# harm ge_repaired_eos_model_end: the round would end the reply without the unfinished call's error result and without the continuation the model asked for
 0f6a720226cb7f9f  ge_stop_string_closed_wins  law ge_stop_string_closed_wins : for + st : Bool for + r : Bool for + eos : Bool for + c : Bool { gen_end_closed ( True { } , st , r , eos , c ) == GeStopString { } : GenEnd }
 # promise ge_stop_string_closed_wins: a generation one of the request's stop strings ended ends as the stop string, whatever the parser stopped or closed
 69ab07579e592380  ge_stop_string_not_model_end  law ge_stop_string_not_model_end : { ge_model_ended ( GeStopString { } ) == False { } : Bool }
