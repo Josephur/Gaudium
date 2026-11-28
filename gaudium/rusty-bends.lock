@@ -1268,6 +1268,32 @@ d9c2a2fe466391df  media_oversized_refused  law media_oversized_refused : for + m
 25c6c5b940cf3cbe  media_remote_follows_setting  law media_remote_follows_setting : for a : Bool { media_source_allowed ( MsRemote { } , a ) == a : Bool }
 ef45a806ccc81bf8  media_zero_height_refused  law media_zero_height_refused : for + w : Nat for m : Nat { media_canvas_ok ( w , 0n , m ) == False { } : Bool }
 61de762b8557772c  media_zero_width_refused  law media_zero_width_refused : for h : Nat for m : Nat { media_canvas_ok ( 0n , h , m ) == False { } : Bool }
+a9143821fed967ff  ml_last_page_reaches_end  law ml_last_page_reaches_end : for + n : Nat for + lo : Nat for + hi : Nat for + p : Nat for nm : { ml_more ( n , lo , hi , 1n + p ) == False { } : Bool } { Bool.or ( Nat.is_le ( Nat.min ( hi , n ) , lo ) , ml_on_page ( Nat.sub ( Nat.min ( hi , n ) , 1n ) , n , lo , hi , 1n + p , False { } ) ) == True { } : Bool }
+# promise ml_last_page_reaches_end: a forward page of at least one entry that does not say more entries follow ends at the last entry before the before_id cursor or the list's end
+# harm ml_last_page_reaches_end: a client would stop paging one entry short
+85056aed05220a10  ml_more_back_nonempty  law ml_more_back_nonempty : for + n : Nat for + lo : Nat for + hi : Nat for + limit : Nat for + ok : { ml_more ( n , lo , hi , limit ) == True { } : Bool } { ml_on_page ( Nat.sub ( Nat.min ( hi , n ) , 1n ) , n , lo , hi , limit , True { } ) == True { } : Bool }
+# promise ml_more_back_nonempty: a page read from its end that says more entries follow is not empty, so a client paging back with its first id always moves
+# harm ml_more_back_nonempty: a client would ask for the same empty page forever
+4dbfde0f6472932c  ml_more_forward_nonempty  law ml_more_forward_nonempty : for + n : Nat for + lo : Nat for + hi : Nat for + limit : Nat for + ok : { ml_more ( n , lo , hi , limit ) == True { } : Bool } { ml_on_page ( lo , n , lo , hi , limit , False { } ) == True { } : Bool }
+# promise ml_more_forward_nonempty: a forward page that says more entries follow is not empty, so a client paging on with its last id always moves
+# harm ml_more_forward_nonempty: a client would ask for the same empty page forever
+358c11ebfd4658ce  ml_more_only_past_limit  law ml_more_only_past_limit : for + n : Nat for + lo : Nat for + hi : Nat for + limit : Nat for ok : { ml_more ( n , lo , hi , limit ) == True { } : Bool } { Nat.is_lt ( Nat.add ( lo , limit ) , Nat.min ( hi , n ) ) == True { } : Bool }
+# promise ml_more_only_past_limit: has_more is said only when the window holds an entry past the page's `limit` entries
+# harm ml_more_only_past_limit: a client would page on to an empty page
+4573699dfe2d5a9a  ml_page_after_cursor  law ml_page_after_cursor : for + i : Nat for + n : Nat for + lo : Nat for + hi : Nat for + limit : Nat for + back : Bool for ok : { ml_on_page ( i , n , lo , hi , limit , back ) == True { } : Bool } { Nat.is_le ( lo , i ) == True { } : Bool }
+# promise ml_page_after_cursor: a page never holds the after_id entry or any entry before it
+a39dfe5616bdfc17  ml_page_back_within_limit  law ml_page_back_within_limit : for + i : Nat for + n : Nat for + lo : Nat for + hi : Nat for + limit : Nat for ok : { ml_on_page ( i , n , lo , hi , limit , True { } ) == True { } : Bool } { Nat.is_le ( Nat.sub ( Nat.min ( hi , n ) , i ) , limit ) == True { } : Bool }
+# promise ml_page_back_within_limit: a page read from its end lies within `limit` positions of the window's end, so it holds at most `limit` entries
+d10a60bf342e9814  ml_page_before_cursor  law ml_page_before_cursor : for + i : Nat for + n : Nat for + lo : Nat for + hi : Nat for + limit : Nat for + back : Bool for ok : { ml_on_page ( i , n , lo , hi , limit , back ) == True { } : Bool } { Nat.is_lt ( i , hi ) == True { } : Bool }
+# promise ml_page_before_cursor: a page never holds the before_id entry or any entry after it
+89103f355cf77f03  ml_page_complete_without_more  law ml_page_complete_without_more : for + i : Nat for + n : Nat for + lo : Nat for + hi : Nat for + p : Nat for + back : Bool for nm : { ml_more ( n , lo , hi , 1n + p ) == False { } : Bool } for + hw : { Bool.and ( Nat.is_le ( lo , i ) , Nat.is_lt ( i , Nat.min ( hi , n ) ) ) == True { } : Bool } { ml_on_page ( i , n , lo , hi , 1n + p , back ) == True { } : Bool }
+# promise ml_page_complete_without_more: a page of at least one entry that does not say more entries follow holds every entry between the cursors
+# harm ml_page_complete_without_more: a client would stop paging with entries it never saw
+5dd3ffc0be61bdf7  ml_page_forward_within_limit  law ml_page_forward_within_limit : for + i : Nat for + n : Nat for + lo : Nat for + hi : Nat for + limit : Nat for ok : { ml_on_page ( i , n , lo , hi , limit , False { } ) == True { } : Bool } { Nat.is_lt ( Nat.sub ( i , lo ) , limit ) == True { } : Bool }
+# promise ml_page_forward_within_limit: a page read forward lies within `limit` positions of the after_id cursor, so it holds at most `limit` entries
+6782363c84f9831b  ml_page_in_list  law ml_page_in_list : for + i : Nat for + n : Nat for + lo : Nat for + hi : Nat for + limit : Nat for + back : Bool for ok : { ml_on_page ( i , n , lo , hi , limit , back ) == True { } : Bool } { Nat.is_lt ( i , n ) == True { } : Bool }
+# promise ml_page_in_list: every position on a page is a position of the model list
+# harm ml_page_in_list: the shell would index past the end of the list
 0afeee2dd389f4cb  mmp_choice_is_candidate  law mmp_choice_is_candidate : for ok : Bool for best : MmpPick for + i : Nat for + rank : Nat { mmp_index_from ( mmp_step ( ok , best , i , rank ) , best , i ) == True { } : Bool }
 # promise mmp_choice_is_candidate: the chosen projector file is always the file just seen or the earlier choice, so it is always one of the candidates
 # harm mmp_choice_is_candidate: an index past the candidate list would name no file or another one
