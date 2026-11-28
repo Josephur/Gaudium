@@ -61,6 +61,7 @@ use crate::vision::VisionSpec;
 
 mod a2ui;
 mod anthropic;
+mod documents;
 mod chat;
 mod chat_fields;
 mod completion;
@@ -169,6 +170,9 @@ pub struct ServerConfig {
     pub prefix_slots: u64,
     /// The MCP proxy (`--mcp-proxy` and its options).
     pub mcp_proxy: ProxyOptions,
+    /// What one PDF in a request may cost (`--pdf-max-mb`, `--pdf-max-pages`,
+    /// `--pdf-max-inflate-mb`).
+    pub pdf: crate::pdf::Limits,
     /// PEM certificate chain of the HTTPS listener (`--tls-cert`).
     pub tls_cert: Option<PathBuf>,
     /// PEM private key of the HTTPS listener (`--tls-key`). Only its path is held here.
@@ -2939,10 +2943,14 @@ fn handle_detokenize(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
 
 fn handle_count_tokens(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
-    let Ok(val) = json::parse_json(&body_str) else {
+    let Ok(mut val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON");
         return;
     };
+    if let Err(e) = expand_documents(state, req, &mut val, false) {
+        write_error(stream, 400, "invalid_request_error", &e);
+        return;
+    }
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
     let m = &state.models[idx];
     let prompt = match prepare_prompt(state.cfg.a2ui, m, &val) {
@@ -3605,6 +3613,31 @@ fn tokenize_prompt(
     Ok((ids, Some(media)))
 }
 
+/// Turns a request's binary documents into their text (`documents.rs`): Messages `document`
+/// blocks (`messages`) or chat `file` parts. A document `url` is fetched only through the MCP
+/// proxy's rules, and only when the proxy is on. Returns the fields accepted but not applied.
+fn expand_documents(
+    state: &AppState,
+    req: &HttpRequest,
+    val: &mut JsonValue,
+    messages: bool,
+) -> Result<Vec<String>, String> {
+    // API routes have passed the key check before they get here
+    let fetch = |url: &str, max: u64| state.proxy.fetch_document(req, true, url, max);
+    let ctx = documents::Ctx {
+        limits: state.cfg.pdf,
+        fetch: state
+            .proxy
+            .enabled()
+            .then_some(&fetch as documents::Fetch),
+    };
+    if messages {
+        documents::expand_messages(val, &ctx)
+    } else {
+        documents::expand_chat(val, &ctx).map(|()| Vec::new())
+    }
+}
+
 fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(mut val) = json::parse_json(&body_str) else {
@@ -3620,7 +3653,13 @@ fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mu
             return;
         }
     };
+    // an uploaded file becomes inline file data first, so a PDF named by `file_id` is read as
+    // its text layer like an inline one
     if let Err(e) = files::resolve_chat(state, req, &mut val) {
+        write_error(stream, 400, "invalid_request_error", &e);
+        return;
+    }
+    if let Err(e) = expand_documents(state, req, &mut val, false) {
         write_error(stream, 400, "invalid_request_error", &e);
         return;
     }
@@ -3641,16 +3680,26 @@ fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) 
         api.error(stream, 400, "invalid_request_error", &e);
         return;
     }
+    let mut ignored = match expand_documents(state, req, &mut val, true) {
+        Ok(i) => i,
+        Err(e) => {
+            api.error(stream, 400, "invalid_request_error", &e);
+            return;
+        }
+    };
     match anthropic::translate(&val) {
-        Ok(t) => run_chat(
-            state,
-            &t.chat,
-            stream,
-            Api::Messages {
-                show_thinking: t.show_thinking,
-            },
-            t.ignored,
-        ),
+        Ok(t) => {
+            ignored.extend(t.ignored);
+            run_chat(
+                state,
+                &t.chat,
+                stream,
+                Api::Messages {
+                    show_thinking: t.show_thinking,
+                },
+                ignored,
+            )
+        }
         Err(e) => api.error(stream, 400, "invalid_request_error", &e),
     }
 }
@@ -3669,7 +3718,7 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut Conn)
         api.error(stream, 400, "invalid_request_error", &e);
         return;
     }
-    let rendered = anthropic::translate(&val).and_then(|t| {
+    let rendered = expand_documents(state, req, &mut val, true).and_then(|_| anthropic::translate(&val)).and_then(|t| {
         let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
         let p = prepare_prompt(state.cfg.a2ui, m, &t.chat)?;
         tokenize_prompt(m, &p, false).map(|(ids, _)| ids.len())
@@ -3856,10 +3905,14 @@ fn handle_stored_response(
 /// `POST /apply-template`: the prompt text a chat request renders to.
 fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
-    let Ok(val) = json::parse_json(&body_str) else {
+    let Ok(mut val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
         return;
     };
+    if let Err(e) = expand_documents(state, req, &mut val, false) {
+        write_error(stream, 400, "invalid_request_error", &e);
+        return;
+    }
     let m = &state.models[state.find_model(val.get("model").and_then(|v| v.as_str()))];
     match prepare_prompt(state.cfg.a2ui, m, &val) {
         Ok(p) => write_json(stream, 200, &format!("{{\"prompt\":{}}}", jq(&p.text))),

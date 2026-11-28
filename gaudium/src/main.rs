@@ -353,6 +353,16 @@ fn print_usage() {
          \x20                       that a front end does not cut it\n\
          \x20 --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets\n\
          \x20                       besides the system's (an MCP server with a private certificate)\n\
+         \x20 --pdf-max-mb <N>      Largest PDF read from a request, in MiB (default: 32). PDFs\n\
+         \x20                       arrive as Messages document blocks (base64, or a url fetched\n\
+         \x20                       through the MCP proxy's rules when --mcp-proxy is on) and as\n\
+         \x20                       chat file parts (file_data); the model reads their text layer,\n\
+         \x20                       page by page. A PDF without one (scanned pages), an encrypted\n\
+         \x20                       one, or one over a limit is refused with a 400 that says why\n\
+         \x20 --pdf-max-pages <N>   Most pages read from one PDF (default: 500)\n\
+         \x20 --pdf-max-inflate-mb <N>  Most bytes one PDF's compressed streams may expand to, in\n\
+         \x20                       MiB (default: 256; also the most text it may yield). Host\n\
+         \x20                       memory a request may hold for it, on the request's own thread\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \x20 --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the\n\
          \x20                       last 64 chat requests (job, reply id, endpoint, model,\n\
@@ -2564,6 +2574,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut files_max_mb: Option<f64> = None;
     let mut files_max_count: Option<u64> = None;
     let mut mcp_proxy = ProxyOptions::default();
+    let mut pdf = gaudium::pdf::Limits::default();
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut tls_http = gaudium::core::listener::PlainHttpMode::LsHttpRedirect;
@@ -2885,6 +2896,34 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             "--mcp-proxy-ca" => {
                 mcp_proxy.ca_file = Some(PathBuf::from(next_val(&mut i, "--mcp-proxy-ca")?))
             }
+            "--pdf-max-mb" => {
+                let s = next_val(&mut i, "--pdf-max-mb")?;
+                pdf.max_bytes = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=4096).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-mb '{s}' (MiB, 1 to 4096)"))?
+                    << 20;
+            }
+            "--pdf-max-pages" => {
+                let s = next_val(&mut i, "--pdf-max-pages")?;
+                pdf.max_pages = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=1_000_000).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-pages '{s}' (1 to 1000000)"))?;
+            }
+            "--pdf-max-inflate-mb" => {
+                let s = next_val(&mut i, "--pdf-max-inflate-mb")?;
+                pdf.max_decoded = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=65_536).contains(&n))
+                    .ok_or_else(|| {
+                        format!("invalid --pdf-max-inflate-mb '{s}' (MiB, 1 to 65536)")
+                    })?
+                    << 20;
+            }
             "--verbose" => verbose = true,
             "--debug-endpoints" => debug_endpoints = true,
             "--files-dir" => files_dir = Some(PathBuf::from(next_val(&mut i, "--files-dir")?)),
@@ -3006,6 +3045,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         vision_max_tokens,
         prefix_slots,
         mcp_proxy,
+        pdf,
         tls_cert,
         tls_key,
         tls_http,

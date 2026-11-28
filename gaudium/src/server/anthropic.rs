@@ -82,7 +82,7 @@ fn base64_encode(input: &[u8]) -> String {
     o
 }
 
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
+pub(super) fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() / 4 * 3);
     let mut acc = 0u32;
     let mut bits = 0u32;
@@ -193,7 +193,7 @@ fn system_text(v: &JsonValue, path: &str, ignored: &mut Vec<String>) -> R<String
     }
 }
 
-/// A document block as text (plain-text sources only).
+/// A document block as text (text sources; PDFs were turned into text sources before).
 fn document_text(b: &JsonValue, path: &str) -> R<String> {
     let Some(src) = b.get("source").filter(|x| x.as_object().is_some()) else {
         return bad(format!("{path}.source: Field required"));
@@ -219,9 +219,10 @@ fn document_text(b: &JsonValue, path: &str) -> R<String> {
         "base64" => {
             let media = src.get("media_type").and_then(JsonValue::as_str).unwrap_or("");
             if !media.starts_with("text/") {
+                // PDFs arrive here as text sources (`documents.rs`); other binary types do not
                 let what = if media.is_empty() { "this" } else { media };
                 return bad(format!(
-                    "{path}: {what} documents are not supported by this server (binary documents need a renderer); send the text"
+                    "{path}: {what} documents are not supported by this server (PDF and plain-text documents are); send the text"
                 ));
             }
             match base64_decode(text_of(src, "data", &sp)?).and_then(|b| String::from_utf8(b).ok()) {
@@ -229,13 +230,26 @@ fn document_text(b: &JsonValue, path: &str) -> R<String> {
                 None => return bad(format!("{sp}.data: invalid base64 text")),
             }
         }
-        k @ ("url" | "file") => {
+        "url" => {
             return bad(format!(
-                "{sp}: document {k} sources are not supported by this server; send the text (source type \"text\")"
+                "{sp}: document url sources are fetched through the server's outbound proxy, which is off; send the document as base64"
+            ))
+        }
+        "file" => {
+            return bad(format!(
+                "{sp}: document file sources are not supported by this server; send the document as base64 or as text"
             ))
         }
         k => return bad(format!("{sp}.type: unknown document source type '{k}'")),
     };
+    // `context`: what the client says about the document, read before it
+    if let Some(context) = b
+        .get("context")
+        .and_then(JsonValue::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        text = format!("{context}\n\n{text}");
+    }
     if let Some(title) = b
         .get("title")
         .and_then(JsonValue::as_str)

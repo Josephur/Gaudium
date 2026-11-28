@@ -2158,3 +2158,109 @@ fn hosts_are_read_without_their_port_brackets_or_root_dot() {
         assert_eq!(named_host(bad), NamedHost::Bad, "{bad:?}");
     }
 }
+
+// ------------------------------------------------------------------------------------------------
+// Document fetches (Messages document blocks with a url source)
+// ------------------------------------------------------------------------------------------------
+
+fn api_request(headers: &[(&str, &str)]) -> HttpRequest {
+    HttpRequest {
+        method: "POST".into(),
+        target: "/v1/messages".into(),
+        path: "/v1/messages".into(),
+        query: std::collections::HashMap::new(),
+        headers: headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: Vec::new(),
+    }
+}
+
+#[test]
+fn documents_are_fetched_under_the_proxy_rules() {
+    let t = target(None, |req, s| {
+        let doc = b"%PDF-1.4 not really";
+        match req.path.as_str() {
+            "/doc.pdf" => {
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {}\r\n\r\n",
+                    doc.len()
+                );
+                let _ = s.write_all(doc);
+            }
+            "/moved" => {
+                let _ = s.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /doc.pdf\r\nContent-Length: 0\r\n\r\n",
+                );
+            }
+            "/chunked" => {
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    doc.len()
+                );
+                let _ = s.write_all(doc);
+                let _ = s.write_all(b"\r\n0\r\n\r\n");
+            }
+            "/big" => {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\n");
+                let _ = s.write_all(&[b'x'; 5000]);
+            }
+            "/big-to-close" => {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+                let _ = s.write_all(&[b'x'; 5000]);
+            }
+            _ => {
+                let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        }
+    });
+    let p = proxy(&[], &["127.0.0.1"]);
+    let req = api_request(&[]);
+    for path in ["/doc.pdf", "/moved", "/chunked"] {
+        let (body, ctype) = p.fetch_document(&req, true, &t.url(path), 1000).unwrap();
+        assert_eq!(body, b"%PDF-1.4 not really", "{path}");
+        if path != "/chunked" {
+            assert_eq!(ctype.as_deref(), Some("application/pdf"));
+        }
+    }
+    // the cap holds whether the size is declared or not
+    for path in ["/big", "/big-to-close"] {
+        let e = p
+            .fetch_document(&req, true, &t.url(path), 1000)
+            .unwrap_err();
+        assert!(
+            e.contains("larger than the limit of 1000 bytes"),
+            "{path}: {e}"
+        );
+    }
+    let e = p
+        .fetch_document(&req, true, &t.url("/missing"), 1000)
+        .unwrap_err();
+    assert!(e.contains("answered HTTP 404"), "{e}");
+    // a page of another site, a target off the list, a proxy that is off, a missing key
+    let foreign = api_request(&[
+        ("origin", "http://elsewhere.example"),
+        ("sec-fetch-site", "cross-site"),
+    ]);
+    let e = p
+        .fetch_document(&foreign, true, &t.url("/doc.pdf"), 1000)
+        .unwrap_err();
+    assert!(e.contains("another origin"), "{e}");
+    let listed = proxy(&["mcp.example.com"], &[]);
+    let e = listed
+        .fetch_document(&req, true, &t.url("/doc.pdf"), 1000)
+        .unwrap_err();
+    assert!(e.contains("not in the allow-list"), "{e}");
+    let e = McpProxy::disabled()
+        .fetch_document(&req, true, &t.url("/doc.pdf"), 1000)
+        .unwrap_err();
+    assert!(e.contains("--mcp-proxy"), "{e}");
+    assert!(p
+        .fetch_document(&req, false, &t.url("/doc.pdf"), 1000)
+        .is_err());
+    // only the permitted fetches reached the target
+    assert_eq!(t.seen().len(), 7);
+}

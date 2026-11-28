@@ -23,6 +23,7 @@ pub mod live_report;
 pub mod model_spec;
 pub mod model_text;
 pub mod moe_cache;
+pub mod pdf;
 pub mod proto;
 pub mod safetensors;
 pub mod sampler;

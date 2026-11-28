@@ -194,3 +194,43 @@ def g_nat_min_le_mono_r(+b: Nat, +k: Nat, j: Nat) -> {Nat.is_le(Nat.min(b, k), N
       L.nat_le_zero(Nat.min(1n+bp, j))
     case 1n+bp 1n+kp:
       g_nat_min_le_mono_r(bp, kp, j)
+
+# `off <= size` and `len <= size - off` keep `off + len` within `size` (a span check).
+def g_span_fit(+o: Nat, +l: Nat, +s: Nat, b1: Bool, e1: {Nat.is_le(o, s) == b1 : Bool}, b2: Bool, e2: {Nat.is_le(l, Nat.sub(s, o)) == b2 : Bool}) -> {Bool.and(Bool.and(b1, b2), Nat.is_lt(s, Nat.add(o, l))) == False{} : Bool}:
+  match b1:
+    case False{}:
+      {==}
+    case True{}:
+      match b2:
+        case False{}:
+          {==}
+        case True{}:
+          L.nat_le_lt_false(s, Nat.add(o, l), L.nat_le_subst_r(Nat.add(o, l), Nat.add(o, Nat.sub(s, o)), s, Equal.trans(Nat, Nat.add(o, Nat.sub(s, o)), Nat.add(Nat.sub(s, o), o), s, L.nat_add_comm(o, Nat.sub(s, o)), L.nat_sub_add_cancel(s, o, e1)), L.nat_add_le_mono(o, o, l, Nat.sub(s, o), L.nat_le_refl(o), e2)))
+
+# `n <= a / (1 + ep)` keeps `n * (1 + ep)` within `a` (a count check against a quotient).
+def g_fit_within(+n: Nat, +ep: Nat, +a: Nat, b: Bool, e: {Nat.is_le(n, Nat.div(a, 1n+ep)) == b : Bool}) -> {Bool.and(b, Nat.is_lt(a, Nat.mul(n, 1n+ep))) == False{} : Bool}:
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      L.nat_le_lt_false(a, Nat.mul(n, 1n+ep), L.nat_le_trans(Nat.mul(n, 1n+ep), Nat.mul(Nat.div(a, 1n+ep), 1n+ep), a, L.nat_mul_le_mono_r(n, Nat.div(a, 1n+ep), 1n+ep, e), L.nat_le_subst_r(Nat.mul(Nat.div(a, 1n+ep), 1n+ep), Nat.add(Nat.mul(Nat.div(a, 1n+ep), 1n+ep), Nat.mod(a, 1n+ep)), a, L.nat_div_mod_r(a, ep), L.nat_add_le_r(Nat.mul(Nat.div(a, 1n+ep), 1n+ep), Nat.mod(a, 1n+ep)))))
+
+# Two true conditions make a true conjunction.
+def g_bool_and_tt(a: Bool, -b: Bool, ea: {a == True{} : Bool}, eb: {b == True{} : Bool}) -> {Bool.and(a, b) == True{} : Bool}:
+  match a:
+    case True{}:
+      eb
+    case False{}:
+      L.bool_absurd({Bool.and(False{}, b) == True{} : Bool}, ea)
+
+# `k < n` gives `k + 1 <= n`, with the successor written as a constructor.
+def g_nat_lt_succ_le(+k: Nat, +n: Nat, h: {Nat.is_lt(k, n) == True{} : Bool}) -> {Nat.is_le(1n+k, n) == True{} : Bool}:
+  match k n:
+    case 0n 0n:
+      L.bool_absurd({Nat.is_le(1n, 0n) == True{} : Bool}, h)
+    case 0n 1n+np:
+      L.nat_le_zero(np)
+    case 1n+kp 0n:
+      L.bool_absurd({Nat.is_le(1n+1n+kp, 0n) == True{} : Bool}, h)
+    case 1n+kp 1n+np:
+      g_nat_lt_succ_le(kp, np, h)

@@ -36,8 +36,9 @@ What the Rust engine does today:
   recurrent state and prefix reuse), the decoding lanes stepped together in one launch that
   reads the weights once, every stream token-identical to the same request run alone. Dense
   Qwen3 / Qwen3.5 / Qwen3.8 models, without a drafter or with DSpine, for now.
-- An OpenAI-compatible (and Anthropic-style) chat API with streaming, tool calls, an
-  optional MCP proxy for the Web UI, optional HTTPS on the same port, and A2UI interfaces.
+- An OpenAI-compatible (and Anthropic-style) chat API with streaming, tool calls, PDF input
+  (its text layer, read by the server's own PDF reader), an optional MCP proxy for the Web UI,
+  optional HTTPS on the same port, and A2UI interfaces.
 
 ## Architecture
 

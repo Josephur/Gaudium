@@ -876,6 +876,26 @@ fn file_ids_in_chat_file_parts() {
     let (status, text) = h.post("/v1/chat/completions", &body);
     assert_eq!(status, 200, "{text}");
     assert!(h.last_prompt().contains("From the other shape."));
+    // a PDF named by its id takes the path of an inline PDF
+    let (_, f) = upload(
+        st,
+        "",
+        &[
+            ("purpose", None, None, b"user_data"),
+            ("file", Some("paper.pdf"), None, b"%PDF-1.7 not really"),
+        ],
+    );
+    let pdf = s(&f, &["id"]).to_string();
+    let by_id = format!(
+        r#"{{"messages":[{{"role":"user","content":[{{"type":"file","file":{{"file_id":"{pdf}"}}}}]}}]}}"#
+    );
+    let inline = r#"{"messages":[{"role":"user","content":[{"type":"file","file":{"filename":"paper.pdf","file_data":"data:application/pdf;base64,JVBERi0xLjcgbm90IHJlYWxseQ=="}}]}]}"#;
+    let (status, by_id) = h.post("/v1/chat/completions", &by_id);
+    let (status_inline, inline) = h.post("/v1/chat/completions", inline);
+    assert_eq!(status, status_inline, "{by_id} / {inline}");
+    if status != 200 {
+        assert_eq!(by_id, inline);
+    }
     let body = r#"{"messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"file-0000000fffff000000000000"}}]}]}"#;
     let (status, text) = h.post("/v1/chat/completions", body);
     assert_eq!(status, 400);

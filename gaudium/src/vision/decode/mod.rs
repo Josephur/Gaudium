@@ -12,7 +12,7 @@ pub mod types;
 
 mod bmp;
 mod gif;
-mod inflate;
+pub(crate) mod inflate;
 mod jpeg;
 mod png;
 mod vp8;

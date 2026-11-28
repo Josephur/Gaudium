@@ -324,6 +324,16 @@ Serve options:
                         that a front end does not cut it
   --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets
                         besides the system's (an MCP server with a private certificate)
+  --pdf-max-mb <N>      Largest PDF read from a request, in MiB (default: 32). PDFs
+                        arrive as Messages document blocks (base64, or a url fetched
+                        through the MCP proxy's rules when --mcp-proxy is on) and as
+                        chat file parts (file_data); the model reads their text layer,
+                        page by page. A PDF without one (scanned pages), an encrypted
+                        one, or one over a limit is refused with a 400 that says why
+  --pdf-max-pages <N>   Most pages read from one PDF (default: 500)
+  --pdf-max-inflate-mb <N>  Most bytes one PDF's compressed streams may expand to, in
+                        MiB (default: 256; also the most text it may yield). Host
+                        memory a request may hold for it, on the request's own thread
   --verbose             Print server, HBM, and recipe diagnostics
   --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the
                         last 64 chat requests (job, reply id, endpoint, model,

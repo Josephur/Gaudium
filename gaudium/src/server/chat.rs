@@ -333,7 +333,11 @@ fn convert_parts(
                 return Err("audio input is not supported by this model".into())
             }
             "file" => {
-                return Err("file content parts are not supported (send the file's text)".into())
+                // parts with file_data were turned into text before (`documents.rs`)
+                return Err(
+                    "a file content part needs file_data (a base64 data: URL of a PDF or a text file); uploaded files (file_id) are not supported"
+                        .into(),
+                )
             }
             other => return Err(format!("unknown content part type '{other}'")),
         }
