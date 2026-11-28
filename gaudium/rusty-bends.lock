@@ -1521,9 +1521,15 @@ de612aa8edaa376c  lp_path_needs_readout  law lp_path_needs_readout : for w : Boo
 05208bf44588dbac  lp_path_unasked_keeps  law lp_path_unasked_keeps : for r : Bool { lp_path_keeps ( False { } , r ) == True { } : Bool }
 # promise lp_path_unasked_keeps: a request that does not ask for log-probabilities keeps its decode path, so it pays nothing for the readout
 # harm lp_path_unasked_keeps: requests without logprobs are moved off the speculative path and slow down
+245c976e3cc77a97  lp_ring_bytes_tight  law lp_ring_bytes_tight : for cap : Nat for rb : Nat { Nat.is_le ( Nat.sub ( Nat.sub ( Nat.sub ( lp_ring_bytes ( cap , rb ) , Nat.mul ( cap , rb ) ) , Nat.mul ( cap , rb ) ) , rb ) , rb ) == True { } : Bool }
+# promise lp_ring_bytes_tight: the host ring pins at most two slots of the rows it was sized for, plus one row of padding per slot
+# harm lp_ring_bytes_tight: every model load pins host memory that no copy ever writes, and a hostile size pins far more
 57f3ebc8aa48191d  lp_ring_rows_cover  law lp_ring_rows_cover : for b : Nat { Bool.and ( lp_copy_fits ( 1n , lp_ring_rows ( b ) ) , lp_copy_fits ( b , lp_ring_rows ( b ) ) ) == True { } : Bool }
 # promise lp_ring_rows_cover: every slot of the ring takes a one-row step and the widest verify launch it was sized for
 # harm lp_ring_rows_cover: a logprob request on a loaded engine is refused, or its copy overruns the slot
+c275fb163ff25306  lp_ring_rows_tight  law lp_ring_rows_tight : for b : Nat { Nat.is_le ( Nat.sub ( lp_ring_rows ( b ) , 1n ) , b ) == True { } : Bool }
+# promise lp_ring_rows_tight: each slot of the ring holds at most one row more than the widest launch it was sized for
+# harm lp_ring_rows_tight: every model load pins host memory that no launch ever writes
 f7eb2df0add925b5  lp_row_in_copy  law lp_row_in_copy : for i : Nat for d : Nat for rb : Nat { Nat.is_le ( Nat.add ( lp_row_start ( i , rb ) , rb ) , lp_copy_bytes ( Nat.add ( 1n + i , d ) , rb ) ) == True { } : Bool }
 # promise lp_row_in_copy: every row of a t-row readout copy, i < t, ends inside the copy
 # harm lp_row_in_copy: a token's log-probabilities are read from the next row or past the copied bytes
