@@ -14,9 +14,11 @@
 //! the reported launches cover every token seen. An engine without a launch feed gets one chunk
 //! per token and no launch counts.
 
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::anthropic::Builder;
 use super::conn::Conn;
@@ -27,9 +29,138 @@ use crate::live_report::{LaunchEvent, LaunchKind};
 /// Least time between two prefill progress chunks.
 const PROGRESS_EVERY_MS: u128 = 100;
 
+/// The connection of one streamed reply, shared by everything that writes to it: the request's
+/// own writer, the engine's launch feed and the keep-alive. Each write takes the lock, so a
+/// keep-alive line never lands inside another chunk, and the time of the last write tells the
+/// keep-alive when the stream has been quiet for a whole heartbeat.
+#[derive(Clone)]
+pub(super) struct SseSink {
+    inner: Arc<(Mutex<SinkState>, Condvar)>,
+}
+
+struct SinkState {
+    conn: Conn,
+    last_write: Instant,
+    /// A write failed (the client went away): every later write fails at once.
+    failed: bool,
+    /// The stream ended, or its writer is gone: the keep-alive writes nothing more.
+    done: bool,
+}
+
+impl SseSink {
+    /// A sink on a connection whose response head is already written.
+    pub fn new(conn: Conn) -> Self {
+        Self {
+            inner: Arc::new((
+                Mutex::new(SinkState {
+                    conn,
+                    last_write: Instant::now(),
+                    failed: false,
+                    done: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, SinkState> {
+        self.inner.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Writes one already-framed SSE payload as one chunk.
+    pub fn write(&self, payload: &[u8]) -> io::Result<()> {
+        let mut s = self.state();
+        if s.failed || s.done {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        match super::write_sse_chunk(&mut s.conn, payload) {
+            Ok(()) => {
+                s.last_write = Instant::now();
+                Ok(())
+            }
+            Err(e) => {
+                s.failed = true;
+                self.inner.1.notify_all();
+                Err(e)
+            }
+        }
+    }
+
+    /// A write failed: the client went away.
+    pub fn failed(&self) -> bool {
+        self.state().failed
+    }
+
+    /// Ends the stream: the terminating chunk, unless a write failed. Nothing is written after
+    /// it, by the keep-alive or anyone else.
+    pub fn end(&self) {
+        let mut s = self.state();
+        if !s.failed && !s.done {
+            super::write_sse_end(&mut s.conn);
+        }
+        s.done = true;
+        self.inner.1.notify_all();
+    }
+
+    /// Starts writing `line` whenever `every` passes without a write, until the stream ends or
+    /// the returned guard is dropped. A keep-alive write that fails sets `cancel` (the client
+    /// went away). `None`: the keep-alive thread could not start (the stream still works).
+    pub fn keep_alive(
+        &self,
+        line: String,
+        every: Duration,
+        cancel: Arc<AtomicBool>,
+    ) -> Option<KeepAlive> {
+        let sink = self.clone();
+        thread::Builder::new()
+            .name("gaudium-sse-keepalive".into())
+            .spawn(move || sink.keep_alive_loop(line.as_bytes(), every, &cancel))
+            .ok()
+            .map(|_| KeepAlive(self.clone()))
+    }
+
+    fn keep_alive_loop(&self, line: &[u8], every: Duration, cancel: &AtomicBool) {
+        let every = every.max(Duration::from_millis(1));
+        let mut s = self.state();
+        loop {
+            if s.done || s.failed {
+                return;
+            }
+            let quiet = s.last_write.elapsed();
+            if quiet < every {
+                s = self
+                    .inner
+                    .1
+                    .wait_timeout(s, every - quiet)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                continue;
+            }
+            // under the lock: no other chunk is half written
+            if super::write_sse_chunk(&mut s.conn, line).is_err() {
+                s.failed = true;
+                cancel.store(true, Ordering::Relaxed);
+                return;
+            }
+            s.last_write = Instant::now();
+        }
+    }
+}
+
+/// The keep-alive of a streamed reply; dropping it stops it (the stream itself stays open).
+pub(super) struct KeepAlive(SseSink);
+
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        let mut s = self.0.state();
+        s.done = true;
+        self.0.inner.1.notify_all();
+    }
+}
+
 pub(super) struct StreamOut {
     /// `None`: a non-streaming request (nothing is written; counters still run).
-    stream: Option<Conn>,
+    stream: Option<SseSink>,
     /// `"id":..,"object":"chat.completion.chunk","created":..,"model":..` of every chunk.
     chunk_head: String,
     timings_per_token: bool,
@@ -59,7 +190,7 @@ pub(super) struct StreamOut {
 impl StreamOut {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        stream: Option<Conn>,
+        stream: Option<SseSink>,
         req_id: &str,
         model_id: &str,
         created: u64,
@@ -243,8 +374,8 @@ impl StreamOut {
         if self.write_failed {
             return;
         }
-        if let Some(s) = self.stream.as_mut() {
-            if super::write_sse_chunk(s, payload.as_bytes()).is_err() {
+        if let Some(s) = self.stream.as_ref() {
+            if s.write(payload.as_bytes()).is_err() {
                 self.write_failed = true;
                 self.cancel.store(true, Ordering::Relaxed);
             }
@@ -340,7 +471,7 @@ mod tests {
 
     fn writer(tx: TcpStream, feed: bool, progress: bool) -> StreamOut {
         StreamOut::new(
-            Some(tx.into()),
+            Some(SseSink::new(tx.into())),
             "chatcmpl-1",
             "m",
             7,
@@ -575,5 +706,64 @@ mod tests {
                 .and_then(JsonValue::as_str),
             Some(",")
         );
+    }
+
+    #[test]
+    fn keep_alive_goes_out_only_when_the_stream_is_quiet_and_never_after_its_end() {
+        let (tx, mut rx) = pair();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let sink = SseSink::new(tx.into());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let every = Duration::from_millis(60);
+        let guard = sink
+            .keep_alive(": ka\n\n".into(), every, Arc::clone(&cancel))
+            .expect("the keep-alive thread starts");
+        // writes closer together than the heartbeat: no keep-alive between them
+        for i in 0..10 {
+            sink.write(format!("data: {i}\n\n").as_bytes()).unwrap();
+            thread::sleep(Duration::from_millis(15));
+        }
+        // a quiet stream gets one keep-alive per heartbeat
+        thread::sleep(every * 4);
+        sink.end();
+        // nothing is written after the end, by the keep-alive or by the writer
+        thread::sleep(every * 2);
+        assert!(sink.write(b"data: late\n\n").is_err());
+        drop(guard);
+        drop(sink);
+        let mut raw = String::new();
+        rx.read_to_string(&mut raw).unwrap();
+        let first_ka = raw.find(": ka").expect("a keep-alive");
+        let last_data = raw.rfind("data: 9").unwrap();
+        assert!(first_ka > last_data, "{raw:?}");
+        let n = raw.matches(": ka").count();
+        assert!((2..=5).contains(&n), "{n} keep-alives: {raw:?}");
+        assert!(raw.ends_with("0\r\n\r\n"), "{raw:?}");
+        assert!(!raw.contains("late"));
+        assert!(!cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_keep_alive_to_a_client_that_left_cancels_the_request() {
+        let (tx, rx) = pair();
+        drop(rx);
+        let sink = SseSink::new(tx.into());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _guard = sink.keep_alive(
+            ": ka\n\n".into(),
+            Duration::from_millis(10),
+            Arc::clone(&cancel),
+        );
+        let t = Instant::now();
+        while !cancel.load(Ordering::Relaxed) && t.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the failed write cancels the request"
+        );
+        // and the writer's next write fails at once
+        assert!(sink.write(b"data: x\n\n").is_err());
     }
 }

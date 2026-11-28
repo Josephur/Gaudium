@@ -90,7 +90,7 @@ use conn::Conn;
 pub use proxy::ProxyOptions;
 use outparse::{Delta, OutputFormat, OutputParser};
 use readout::{DrafterFacts, RunFacts, Timings};
-use stream_out::StreamOut;
+use stream_out::{SseSink, StreamOut};
 
 /// Largest request body. Images and video frames travel inside the request as base64.
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
@@ -414,6 +414,9 @@ struct AppState {
     lanes: lanes::LaneHub,
     /// The recent chat requests (`/gaudium/requests`, `/v1/streams/lookup`); reported only.
     recent: requests::RecentRequests,
+    /// How long a streamed chat reply goes without a write before a keep-alive goes out (ms):
+    /// [`SSE_HEARTBEAT`] in service, shorter in tests.
+    stream_heartbeat_ms: AtomicU64,
 }
 
 impl AppState {
@@ -1800,6 +1803,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
         host_cache,
         lanes: lanes::LaneHub::new(n_models),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
+        stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
     });
 
     // The recipe-cache trim starts once the first load has taken (and marked) its recipes, so it
@@ -2441,6 +2445,9 @@ fn handle_models_sse(state: &AppState, stream: &mut Conn) {
 
 /// How long an event stream goes without a write before a comment line keeps it open.
 const SSE_HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// [`SSE_HEARTBEAT`] in milliseconds, the start value of `AppState::stream_heartbeat_ms`.
+const SSE_HEARTBEAT_MS: u64 = SSE_HEARTBEAT.as_secs() * 1000;
 
 /// `handle_models_sse` with the heartbeat interval as a parameter, so a test can run it short.
 fn models_sse(state: &AppState, stream: &mut Conn, heartbeat: Duration) {
@@ -3117,6 +3124,15 @@ impl Api {
         }
     }
 
+    /// What keeps a streamed reply open while nothing else is written: a `ping` event on the
+    /// Messages stream, a comment line on the chat-completions stream (clients skip both).
+    fn keep_alive_line(self) -> String {
+        match self {
+            Api::Chat => ": keep-alive\n\n".to_string(),
+            Api::Messages { .. } => anthropic::sse("ping", "{\"type\":\"ping\"}"),
+        }
+    }
+
     /// An error after the event stream began (framed; the caller ends the stream).
     fn stream_error(self, status: u16, msg: &str) -> String {
         match self {
@@ -3416,6 +3432,38 @@ fn run_chat(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let max_new = budget.max_new().max(1);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    // A streamed request is admitted: its stream begins now, before it waits for the card (the
+    // queue, a model load, a lane) and for its prefill, and a keep-alive goes out whenever a
+    // heartbeat passes without a write, so no idle timeout cuts a reply that has not begun. A
+    // failure from here on is an error event in the stream. (The refusals above are a status.)
+    let sink = if stream_mode {
+        match stream.try_clone() {
+            Ok(c) if write_sse_headers(stream).is_ok() => Some(SseSink::new(c)),
+            // the client went away
+            _ => return,
+        }
+    } else {
+        None
+    };
+    if let (Some(s), Api::Messages { .. }) = (&sink, api) {
+        // the message as it begins; the client gets its blocks once the engine generates
+        let _ = s.write(anthropic::Builder::message_start(&req_id, &m.id, n_prompt).as_bytes());
+    }
+    let _keep_alive = sink.as_ref().and_then(|s| {
+        s.keep_alive(
+            api.keep_alive_line(),
+            Duration::from_millis(state.stream_heartbeat_ms.load(Ordering::Relaxed)),
+            Arc::clone(&cancel_flag),
+        )
+    });
+    // An error after the stream began: an error event, then the end of the stream.
+    let stream_fail = |status: u16, msg: &str| {
+        if let Some(s) = &sink {
+            let _ = s.write(api.stream_error(status, msg).as_bytes());
+            s.end();
+        }
+    };
     // the fields every `request` event of this job starts with
     let req_base = |phase: &str, queued_ms: f64| {
         format!(
@@ -3468,11 +3516,14 @@ fn run_chat(
                 jq(&e)
             ),
         );
-        api.error(stream, 503, "unavailable_error", &e);
+        if stream_mode {
+            stream_fail(503, &e);
+        } else {
+            api.error(stream, 503, "unavailable_error", &e);
+        }
         return;
     }
 
-    let cancel_flag = Arc::new(AtomicBool::new(false));
     state
         .cancels
         .lock()
@@ -3488,7 +3539,9 @@ fn run_chat(
         }
     }
 
-    if stream_mode && write_sse_headers(stream).is_err() {
+    // The client went away while the request waited (a keep-alive found it gone): the engine
+    // does not take the request.
+    if sink.as_ref().is_some_and(SseSink::failed) {
         state.cancels.lock().unwrap().remove(&req_id);
         rguard.cancel();
         debug_assert!(rguard.is_terminal());
@@ -3561,8 +3614,7 @@ fn run_chat(
                 ),
             );
             if stream_mode {
-                let _ = write_sse_chunk(stream, api.stream_error(503, &e).as_bytes());
-                write_sse_end(stream);
+                stream_fail(503, &e);
             } else {
                 api.error(stream, 503, "unavailable_error", &e);
             }
@@ -3611,8 +3663,7 @@ fn run_chat(
                     ),
                 );
                 if stream_mode {
-                    let _ = write_sse_chunk(stream, api.stream_error(503, msg).as_bytes());
-                    write_sse_end(stream);
+                    stream_fail(503, msg);
                 } else {
                     api.error(stream, 503, "unavailable_error", msg);
                 }
@@ -3656,14 +3707,8 @@ fn run_chat(
         .as_ref()
         .and_then(|e| e.live_profile())
         .filter(|h| h.is_live());
-    let out_stream = if stream_mode {
-        stream.try_clone().ok()
-    } else {
-        None
-    };
-    let stream_ok = !stream_mode || out_stream.is_some();
     let out = Arc::new(Mutex::new(StreamOut::new(
-        out_stream,
+        sink.clone(),
         &req_id,
         &model_id,
         created,
@@ -3673,24 +3718,22 @@ fn run_chat(
         live.is_some(),
         Arc::clone(&cancel_flag),
     )));
-    if !stream_ok {
-        cancel_flag.store(true, Ordering::Relaxed);
-    }
     {
-        // The role chunk goes out now, so a client times its request from the moment the engine
-        // took it.
+        // The chat role chunk goes out now, so a client times its request from the moment the
+        // engine took it. (The Messages stream began with `message_start` at admission.)
         let mut o = out.lock().unwrap();
-        let init_chunk = match api {
-            Api::Chat => format!(
-                "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
-                o.chunk_head(),
-            ),
+        match api {
+            Api::Chat => {
+                let init_chunk = format!(
+                    "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
+                    o.chunk_head(),
+                );
+                o.write(&init_chunk);
+            }
             Api::Messages { show_thinking } => {
                 o.anth = Some(anthropic::Builder::new(show_thinking));
-                anthropic::Builder::message_start(&req_id, &model_id, n_prompt)
             }
-        };
-        o.write(&init_chunk);
+        }
         // A forced tool call's opening is already in the prompt: the parser reads it first.
         if !prompt.forced_prefix.is_empty() {
             o.add(parser.feed(&prompt.forced_prefix));
@@ -4025,8 +4068,8 @@ fn run_chat(
                 if stream_mode {
                     out.write(&events);
                     out.write(&b.finish(stop, parser.matched_stop(), &usage, &extra));
-                    if !out.write_failed {
-                        write_sse_end(stream);
+                    if let Some(s) = &sink {
+                        s.end();
                     }
                 } else {
                     b.close();
@@ -4049,8 +4092,8 @@ fn run_chat(
                     jq(finish_reason),
                 );
                 out.write(&final_chunk);
-                if !out.write_failed {
-                    write_sse_end(stream);
+                if let Some(s) = &sink {
+                    s.end();
                 }
             } else {
                 // a reply that is only tool calls has no content
@@ -4097,7 +4140,9 @@ fn run_chat(
             );
             if stream_mode {
                 out.write(&api.stream_error(500, &e));
-                write_sse_end(stream);
+                if let Some(s) = &sink {
+                    s.end();
+                }
             } else {
                 api.error(stream, 500, "server_error", &e);
             }
