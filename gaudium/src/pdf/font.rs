@@ -489,6 +489,17 @@ const RANGE_COST: u64 =
 const SPACE_COST: u64 = size_of::<(usize, u32, u32)>() as u64;
 /// The memory one entry of a composite font's width table is charged for.
 const WIDTH_COST: u64 = size_of::<(u32, u32, f64)>() as u64;
+/// The memory a font is charged for besides its tables: the font itself, its shared
+/// allocation and its entry in the document's font cache.
+const FONT_COST: u64 =
+    (size_of::<Font>() + size_of::<(u32, std::rc::Rc<Font>)>() + 8 * size_of::<usize>()) as u64;
+/// The memory one entry of a simple font's code table is charged for, besides its text (an
+/// allocation of its own, charged as `TEXT_COST` plus its bytes).
+const CODE_COST: u64 = size_of::<Option<String>>() as u64;
+/// The memory one text allocation is charged for besides its bytes.
+const TEXT_COST: u64 = 2 * size_of::<usize>() as u64;
+/// The memory one entry of a simple font's width table is charged for.
+const SIMPLE_WIDTH_COST: u64 = size_of::<f64>() as u64;
 
 /// A CMap: code lengths (codespace ranges) and, for a ToUnicode CMap, the text of codes.
 #[derive(Default, Debug)]
@@ -749,6 +760,8 @@ impl Font {
     /// The font; only a broken limit is an error.
     pub fn new(p: FontParts) -> Result<Font, Fail> {
         let FontParts { mem, work, .. } = p;
+        // the font is kept until the document is read: its memory is charged before it is built
+        mem.take(FONT_COST)?;
         let subtype = p.dict.get(b"Subtype").and_then(Obj::as_name).unwrap_or(b"");
         let composite = subtype == b"Type0";
         let to_unicode = match p.to_unicode.as_deref() {
@@ -799,7 +812,7 @@ impl Font {
                 .get(b"BaseFont")
                 .and_then(Obj::as_name)
                 .unwrap_or(b"");
-            f.simple = simple_encoding(subtype, base_font, p.encoding.as_ref(), work)?;
+            f.simple = simple_encoding(subtype, base_font, p.encoding.as_ref(), mem, work)?;
             f.first_char = p
                 .dict
                 .get(b"FirstChar")
@@ -809,6 +822,8 @@ impl Font {
             if let Some(w) = &p.widths {
                 let kept = w.len().min(256);
                 work.take(kept as u64)?;
+                // at most 256 widths are kept
+                mem.take(SIMPLE_WIDTH_COST * kept as u64)?;
                 f.widths = w[..kept]
                     .iter()
                     .map(|o| o.as_f64().unwrap_or(0.0))
@@ -892,10 +907,13 @@ fn is_symbol_font(base_font: &[u8]) -> bool {
 
 /// The text of each code of a simple font: its base encoding with its /Differences. A font
 /// that names no base encoding uses its built-in one: the Symbol font's for the Symbol font.
+/// The table is kept with the font: its entries are charged to `mem` before it is made, and
+/// each text it holds as it is kept.
 fn simple_encoding(
     subtype: &[u8],
     base_font: &[u8],
     enc: Option<&Obj>,
+    mem: &mut Budget,
     work: &mut Budget,
 ) -> Result<Vec<Option<String>>, Fail> {
     let base_name: &[u8] = match enc {
@@ -912,7 +930,17 @@ fn simple_encoding(
         _ if subtype == b"TrueType" => win_ansi,
         _ => standard,
     };
-    let mut table: Vec<Option<String>> = (0..=255u8).map(|c| base(c).map(String::from)).collect();
+    let keep = |t: Option<String>, mem: &mut Budget| -> Result<Option<String>, Fail> {
+        if let Some(t) = &t {
+            mem.take(TEXT_COST + t.len() as u64)?;
+        }
+        Ok(t)
+    };
+    mem.take(256 * CODE_COST)?;
+    let mut table: Vec<Option<String>> = Vec::with_capacity(256);
+    for c in 0..=255u8 {
+        table.push(keep(base(c).map(String::from), mem)?);
+    }
     if let Some(Obj::Dict(d)) = enc {
         if let Some(Obj::Array(diff)) = d.get(b"Differences") {
             let mut code: Option<usize> = None;
@@ -922,7 +950,7 @@ fn simple_encoding(
                     Obj::Int(c) => code = usize::try_from(*c).ok().filter(|c| *c < 256),
                     Obj::Name(n) => {
                         if let Some(c) = code {
-                            table[c] = glyph_text(n);
+                            table[c] = keep(glyph_text(n), mem)?;
                             code = Some(c + 1).filter(|c| *c < 256);
                         }
                     }

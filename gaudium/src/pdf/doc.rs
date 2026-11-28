@@ -36,6 +36,9 @@ enum Loc {
     At(u64),
     /// Entry `index` of the object stream `stream`.
     InStream(u32, u64),
+    /// A free entry: the object was deleted, and an older section's definition of it does not
+    /// count (it reads as null).
+    Free,
 }
 
 struct ObjStm {
@@ -147,7 +150,8 @@ impl<'a> Doc<'a> {
             }
             let mut lx = Lexer::new(self.data, off as usize, self.objects);
             let trailer: Obj = if lx.eat_keyword(b"xref") {
-                let t = self.xref_table(&mut lx);
+                let mut free = Vec::new();
+                let t = self.xref_table(&mut lx, &mut free);
                 self.charge(&lx, off as usize, 0)?;
                 let t = t?;
                 if let Some(stm) = non_negative(t.get(b"XRefStm")) {
@@ -157,6 +161,12 @@ impl<'a> Doc<'a> {
                             return Err(e);
                         }
                     }
+                }
+                // the table's free entries hide the older sections' definitions; in a hybrid
+                // file they yield to the section's own stream (which lists the objects the
+                // table leaves free because they sit in object streams)
+                for num in free {
+                    self.insert(num, Loc::Free);
                 }
                 Obj::Dict(t)
             } else {
@@ -190,8 +200,9 @@ impl<'a> Doc<'a> {
         self.objects.take(extra)
     }
 
-    /// A classic xref table at the cursor (after `xref`), and the trailer that follows it.
-    fn xref_table(&mut self, lx: &mut Lexer) -> Result<Rc<Dict>, Fail> {
+    /// A classic xref table at the cursor (after `xref`), and the trailer that follows it. The
+    /// numbers of its free entries are added to `free` (the caller records them).
+    fn xref_table(&mut self, lx: &mut Lexer, free: &mut Vec<u32>) -> Result<Rc<Dict>, Fail> {
         loop {
             let save = lx.pos;
             let (Some(start), Some(count)) = (lx.read_uint(), lx.read_uint()) else {
@@ -216,8 +227,10 @@ impl<'a> Doc<'a> {
                     return Err(Fail::damaged("a damaged xref entry"));
                 };
                 let num = start.checked_add(k).and_then(|n| u32::try_from(n).ok());
-                if let (true, Some(num)) = (in_use && off > 0, num) {
-                    self.insert(num, Loc::At(off));
+                match (in_use, num) {
+                    (true, Some(num)) if off > 0 => self.insert(num, Loc::At(off)),
+                    (false, Some(num)) => free.push(num),
+                    _ => {}
                 }
             }
         }
@@ -291,6 +304,7 @@ impl<'a> Doc<'a> {
                     continue;
                 };
                 match kind {
+                    0 => self.insert(num, Loc::Free),
                     1 if f2 > 0 => self.insert(num, Loc::At(f2)),
                     2 => {
                         if let Ok(stm) = u32::try_from(f2) {
@@ -514,7 +528,7 @@ impl<'a> Doc<'a> {
         // a cycle back to this object sees null
         self.cache.insert(num, Obj::Null);
         let obj = match self.xref.get(&num).copied() {
-            None => Obj::Null,
+            None | Some(Loc::Free) => Obj::Null,
             Some(Loc::At(off)) => match self.parse_at(off, depth)? {
                 Some((n, o)) if n == num => o,
                 _ => Obj::Null,

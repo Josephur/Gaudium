@@ -1347,3 +1347,164 @@ fn budgets_keep_their_spend_on_a_refusal() {
 fn the_default_work_budget_is_pinned() {
     assert_eq!(Limits::default().max_work, 20_000_000);
 }
+
+/// A page that selects `n` distinct simple fonts (each its own object) and shows a code in each.
+fn many_fonts(n: usize) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let mut names = Vec::new();
+    let mut content = String::from("BT ");
+    for i in 0..n {
+        let f = p.add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        names.push(format!("/F{i} {f} 0 R"));
+        content.push_str(&format!("/F{i} 12 Tf (x) Tj "));
+    }
+    content.push_str("ET");
+    let c = p.add(stream("", content.as_bytes()));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 612 792] /Contents {c} 0 R /Resources << /Font << {} >> >> >>",
+        names.join(" ")
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+#[test]
+fn simple_font_tables_are_charged_to_the_object_budget() {
+    // Codex repro: 2,000 distinct simple fonts, each keeping a 256-entry code table
+    let file = many_fonts(2_000);
+    assert!(file.len() < 300_000, "{}", file.len());
+    let lim = Limits {
+        max_decoded: 4 << 20,
+        ..Limits::default()
+    };
+    let e = extract_text(&file, &lim).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("its objects take more than 4194304 bytes"),
+        "{e}"
+    );
+    // under the default limits the same page is read, and a few fonts fit the small budget
+    let got = extract_text(&file, &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "x".repeat(2_000));
+    let got = extract_text(&many_fonts(20), &lim).unwrap();
+    assert_eq!(got.pages[0].trim(), "x".repeat(20));
+}
+
+/// The offset the last `startxref` of a file names.
+fn last_startxref(file: &[u8]) -> u64 {
+    let at = file
+        .windows(9)
+        .rposition(|w| w == b"startxref")
+        .expect("a startxref")
+        + 9;
+    std::str::from_utf8(&file[at..])
+        .ok()
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|t| t.parse().ok())
+        .expect("its offset")
+}
+
+/// `base` with an incremental update appended: an xref section (classic table or xref stream)
+/// whose entries are `entries` (object number, `None` for free or `Some(offset)`), chained to
+/// the base file's own section by /Prev.
+fn updated(
+    base: &[u8],
+    root: u32,
+    size: u32,
+    entries: &[(u32, Option<u64>)],
+    as_stream: bool,
+) -> Vec<u8> {
+    let prev = last_startxref(base);
+    let mut out = base.to_vec();
+    let at = out.len();
+    if as_stream {
+        // W [1 4 2], unfiltered, one row per entry
+        let mut rows = Vec::new();
+        let mut index = Vec::new();
+        for (num, off) in entries {
+            index.push(format!("{num} 1"));
+            // type 1 at the offset, or type 0 (free, next generation 1)
+            rows.push(u8::from(off.is_some()));
+            rows.extend_from_slice(&(off.unwrap_or(0) as u32).to_be_bytes());
+            rows.extend_from_slice(&[0, u8::from(off.is_none())]);
+        }
+        out.extend_from_slice(format!("{size} 0 obj\n").as_bytes());
+        out.extend_from_slice(&stream(
+            &format!(
+                "/Type /XRef /Size {} /W [1 4 2] /Index [{}] /Root {root} 0 R /Prev {prev}",
+                size + 1,
+                index.join(" ")
+            ),
+            &rows,
+        ));
+        out.extend_from_slice(b"\nendobj\n");
+    } else {
+        out.extend_from_slice(b"xref\n");
+        for (num, off) in entries {
+            let line = match off {
+                Some(o) => format!("{num} 1\n{o:010} 00000 n\r\n"),
+                None => format!("{num} 1\n0000000000 00001 f\r\n"),
+            };
+            out.extend_from_slice(line.as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root {root} 0 R /Prev {prev} >>\n").as_bytes(),
+        );
+    }
+    out.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+    out
+}
+
+#[test]
+fn a_freed_object_stays_deleted() {
+    // Codex repro: an update frees the second page's content stream (object 6)
+    let (p, root) = doc(
+        &[
+            b"BT /F1 12 Tf (Kept) Tj ET",
+            b"BT /F1 12 Tf (Deleted secret) Tj ET",
+        ],
+        HELVETICA,
+        false,
+    );
+    let base = p.table(root, "");
+    assert_eq!(text_of(&base).unwrap(), vec!["Kept", "Deleted secret"]);
+    let size = p.objs.len() as u32 + 1;
+    // freed in a classic table
+    let file = updated(&base, root, size, &[(6, None)], false);
+    assert_eq!(text_of(&file).unwrap(), vec!["Kept", ""]);
+    // freed by a type-0 entry of an xref stream
+    let file = updated(&base, root, size, &[(6, None)], true);
+    assert_eq!(text_of(&file).unwrap(), vec!["Kept", ""]);
+    // an update that keeps the object (an in-use entry at its old offset) still reads it
+    let at = (base.windows(8).position(|w| w == b"\n6 0 obj").unwrap() + 1) as u64;
+    let file = updated(&base, root, size, &[(6, Some(at))], false);
+    assert_eq!(text_of(&file).unwrap(), vec!["Kept", "Deleted secret"]);
+}
+
+#[test]
+fn a_hybrid_tables_free_entries_yield_to_its_stream() {
+    // a hybrid file: the table leaves the objects of the object stream free, and its /XRefStm
+    // lists them in the stream
+    let (p, root) = doc(
+        &[b"BT /F1 12 Tf 72 700 Td (Packed objects) Tj ET"],
+        HELVETICA,
+        true,
+    );
+    let mut file = p.xref_stream(root, &[1, 2, 3]);
+    let stm = last_startxref(&file);
+    let at = file.len();
+    file.extend_from_slice(
+        format!(
+            "xref\n0 4\n0000000000 65535 f\r\n0000000000 00000 f\r\n0000000000 00000 f\r\n0000000000 00000 f\r\ntrailer\n<< /Size {} /Root {root} 0 R /XRefStm {stm} >>\nstartxref\n{at}\n%%EOF\n",
+            p.objs.len() + 3
+        )
+        .as_bytes(),
+    );
+    assert_eq!(text_of(&file).unwrap(), vec!["Packed objects"]);
+}
