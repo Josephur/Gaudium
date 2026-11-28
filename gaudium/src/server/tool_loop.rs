@@ -85,7 +85,12 @@ struct Registered<'a> {
 
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
-        self.state.cancels.lock().unwrap().remove(&self.id);
+        // a poisoned lock (a panic elsewhere) must not abort the process while unwinding
+        self.state
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
 }
 

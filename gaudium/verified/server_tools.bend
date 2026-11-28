@@ -970,12 +970,14 @@ def sv_cancelled_never_goes_on(n, b, l):
   {==}
 
 # LAW 6.6: A live reply goes on as the round decided.
-# promise: a reply not cancelled, without an output limit, whose round decision goes on generates another round
-# catches: sv_goes_on_live answers False{} always (the loop never reaches a second round)
+# promise: a reply not cancelled, whose round decision goes on, generates another round when it has no output limit (whatever is counted as left) or has output tokens left of its limit
+# harm: a tool loop would stop with pause_turn after its first round, for every request that sets max_tokens or for every request
+# catches: sv_goes_on_live asks the round rule with nothing left (sv_round_goes_on(n, limited, 0n)), so every limited reply stops after round 1
 law sv_live_round_goes_on:
-  {sv_goes_on_live(False{}, SvRunGoOn{}, False{}, 0n) == True{} : Bool}
+  for +l: Nat
+  {Bool.and(sv_goes_on_live(False{}, SvRunGoOn{}, False{}, l), sv_goes_on_live(False{}, SvRunGoOn{}, True{}, 1n+l)) == True{} : Bool}
 
-def sv_live_round_goes_on():
+def sv_live_round_goes_on(l):
   {==}
 
 # LAW 6.7: A live reply never goes on past what the round decided.
