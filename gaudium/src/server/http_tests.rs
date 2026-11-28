@@ -357,6 +357,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
         host_cache,
         lanes: lanes::LaneHub::new(1),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
+        stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
     });
     let _ = model; // (one resident model per harness)
     Harness {
@@ -432,6 +433,7 @@ fn model_harness(id: &str, template: &str, config: Option<&str>, spec: Option<&s
         host_cache: None,
         lanes: lanes::LaneHub::new(1),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
+        stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
     });
     Harness {
         state,
@@ -551,6 +553,7 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
         host_cache: None,
         lanes: lanes::LaneHub::new(1),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
+        stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
     });
     Harness {
         state,
@@ -1136,6 +1139,150 @@ fn messages_endpoint_returns_content_blocks() {
         (status, s(&r, &["type"]), s(&r, &["error", "type"])),
         (400, "error", "invalid_request_error")
     );
+}
+
+/// Sends a request on a fresh connection to the server and returns the connection.
+fn send_raw(state: &Arc<AppState>, path: &str, body: &str) -> TcpStream {
+    let mut c = TcpStream::connect(serve(state, 1)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        c,
+        "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    c
+}
+
+/// Reads from `c` until `raw` holds `n` copies of `needle`.
+fn read_until_count(c: &mut TcpStream, raw: &mut Vec<u8>, needle: &str, n: usize) {
+    let mut buf = [0u8; 4096];
+    while String::from_utf8_lossy(raw).matches(needle).count() < n {
+        match c.read(&mut buf) {
+            Ok(0) => panic!("the stream ended: {:?}", String::from_utf8_lossy(raw)),
+            Ok(k) => raw.extend_from_slice(&buf[..k]),
+            Err(e) => panic!(
+                "no {needle:?} within the timeout ({e}): {:?}",
+                String::from_utf8_lossy(raw)
+            ),
+        }
+    }
+}
+
+#[test]
+fn messages_stream_begins_and_pings_while_the_request_waits_for_the_card() {
+    // A streamed request that waits for the card (another request holds it) is admitted: its
+    // stream begins with `message_start`, and a `ping` goes out each heartbeat until the engine
+    // takes it, so no idle timeout cuts a reply before its first block.
+    let h = harness();
+    h.state.stream_heartbeat_ms.store(30, Ordering::Relaxed);
+    h.script("Looking.\n</think>\n\nSunny in Oslo.");
+    let turn = h.state.turns.acquire(0, || Some(0), TurnLimits::default);
+    let mut c = send_raw(
+        &h.state,
+        "/v1/messages",
+        r#"{"stream":true,"max_tokens":64,"messages":[{"role":"user","content":"Weather?"}]}"#,
+    );
+    let mut raw = Vec::new();
+    read_until_count(&mut c, &mut raw, "event: ping", 3);
+    let waiting = String::from_utf8_lossy(&raw).into_owned();
+    assert!(waiting.starts_with("HTTP/1.1 200"), "{waiting}");
+    assert!(!waiting.contains("content_block"), "{waiting}");
+    let evs = sse_events(&raw);
+    assert_eq!(s(&evs[0], &["type"]), "message_start");
+    assert!(
+        evs[1..].iter().all(|e| s(e, &["type"]) == "ping"),
+        "{waiting}"
+    );
+
+    drop(turn);
+    c.read_to_end(&mut raw).unwrap();
+    let (status, _, body) = split_response(&raw);
+    assert_eq!(status, 200);
+    let names: Vec<&str> = body
+        .split("\n\n")
+        .filter(|e| !e.is_empty())
+        .map(|e| e.lines().next().unwrap().strip_prefix("event: ").unwrap())
+        .collect();
+    // one message_start, then the pings of the wait, then the message as before
+    assert_eq!(names.iter().filter(|n| **n == "message_start").count(), 1);
+    assert_eq!(names[0], "message_start");
+    assert_eq!(names.last(), Some(&"message_stop"));
+    let text: String = sse_events(body.as_bytes())
+        .iter()
+        .filter(|e| s(e, &["type"]) == "content_block_delta")
+        .filter_map(|e| at(e, &["delta"]).get("text").and_then(JsonValue::as_str))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(text, "Sunny in Oslo.");
+}
+
+#[test]
+fn a_streamed_request_whose_client_left_while_it_waited_never_reaches_the_engine() {
+    let h = harness();
+    h.state.stream_heartbeat_ms.store(20, Ordering::Relaxed);
+    h.script("Looking.\n</think>\n\nSunny in Oslo.");
+    let turn = h.state.turns.acquire(0, || Some(0), TurnLimits::default);
+    let mut c = send_raw(
+        &h.state,
+        "/v1/messages",
+        r#"{"stream":true,"max_tokens":64,"messages":[{"role":"user","content":"Weather?"}]}"#,
+    );
+    let mut raw = Vec::new();
+    read_until_count(&mut c, &mut raw, "event: ping", 1);
+    drop(c);
+    // the keep-alives that follow find the client gone
+    thread::sleep(Duration::from_millis(300));
+    drop(turn);
+    // the request leaves the queue (it took the card, or it ended); then its turn ends
+    let t = Instant::now();
+    while h.state.slot.lock().unwrap().waiting[0] > 0 {
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "the request never left the queue"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(h.state.turns.acquire(0, || Some(0), TurnLimits::default));
+    // it gave the card back without running
+    assert!(h.prompts.lock().unwrap().is_empty());
+    assert_eq!(h.replies.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn chat_stream_keeps_alive_while_the_request_waits_for_the_card() {
+    // the chat-completions stream: comment lines while it waits; the role chunk still comes
+    // when the engine takes the request
+    let h = harness();
+    h.state.stream_heartbeat_ms.store(30, Ordering::Relaxed);
+    h.script("Looking.\n</think>\n\nSunny in Oslo.");
+    let turn = h.state.turns.acquire(0, || Some(0), TurnLimits::default);
+    let mut c = send_raw(
+        &h.state,
+        "/v1/chat/completions",
+        r#"{"stream":true,"messages":[{"role":"user","content":"Weather?"}]}"#,
+    );
+    let mut raw = Vec::new();
+    read_until_count(&mut c, &mut raw, ": keep-alive\n\n", 3);
+    assert!(
+        sse_events(&raw).is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&raw)
+    );
+
+    drop(turn);
+    c.read_to_end(&mut raw).unwrap();
+    let (status, _, body) = split_response(&raw);
+    assert_eq!(status, 200);
+    let st = collect_chat_stream(&body);
+    assert_eq!(st.content, "Sunny in Oslo.");
+    assert!(st.done, "{body}");
+    let first = body
+        .lines()
+        .find_map(|l| l.strip_prefix("data: "))
+        .map(|d| json::parse_json(d).unwrap())
+        .unwrap();
+    assert_eq!(s(&first, &["choices", "0", "delta", "role"]), "assistant");
 }
 
 #[test]
@@ -2629,6 +2776,7 @@ fn lane_harness(n: usize) -> Harness {
         host_cache: None,
         lanes: lanes::LaneHub::new(1),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
+        stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
     });
     Harness { state, ..h }
 }
