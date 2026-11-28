@@ -704,17 +704,17 @@ law sv_left_within_limit:
 def sv_left_within_limit(m, u):
   L.nat_le_refl(Nat.sub(m, u))
 
-# LAW 5.2: While tokens are left, the next round may generate.
-# promise: while output tokens are left of the request's limit, the next round is given at least one
-# catches: sv_tokens_left one short (Nat.pred(Nat.sub(most, used)))
-law sv_left_while_unspent:
+# LAW 5.2: A round is given everything that is left.
+# promise: the next round is given at least every output token left of the request's limit
+# harm: a round given less is cut by its own length limit, and the reply ends with max_tokens while the client's limit is far from spent
+# catches: sv_tokens_left capped at one token (Nat.min(Nat.sub(most, used), 1n))
+law sv_left_covers_unspent:
+  for +m: Nat
   for +u: Nat
-  for +r: Nat
-  {Nat.is_gt(sv_tokens_left(Nat.add(u, 1n+r), u), 0n) == True{} : Bool}
+  {Nat.is_le(Nat.sub(m, u), sv_tokens_left(m, u)) == True{} : Bool}
 
-def sv_left_while_unspent(u, r):
-  %Equal.sym(Nat, Nat.sub(Nat.add(u, 1n+r), u), 1n+r, L.nat_add_sub_cancel_l(u, 1n+r)) : {Nat.is_gt(_, 0n) == True{} : Bool}
-  {==}
+def sv_left_covers_unspent(m, u):
+  L.nat_le_refl(Nat.sub(m, u))
 
 # LAW 5.3: No round once the limit is spent.
 # promise: once the request's output-token limit is spent, the loop never generates another round
