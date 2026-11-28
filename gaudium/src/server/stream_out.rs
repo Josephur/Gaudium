@@ -901,6 +901,7 @@ mod tests {
             50,
             true,
             Arc::new(AtomicBool::new(false)),
+            ChunkForm::Chat,
         );
         w.anth = Some(Builder::new(true));
         for d in tokens {
