@@ -428,6 +428,16 @@ impl StreamOut {
         }
     }
 
+    /// The request's cancel flag is now `cancel` (a reply resumed after its thinking budget
+    /// runs under a fresh flag); a client already gone (a failed write of this stream or of its
+    /// keep-alive) cancels it too.
+    pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        if self.write_failed || self.stream.as_ref().is_some_and(SseSink::failed) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.cancel = cancel;
+    }
+
     /// Writes one already-framed SSE payload; a failed write cancels the request.
     pub fn write(&mut self, payload: &str) {
         if self.write_failed {

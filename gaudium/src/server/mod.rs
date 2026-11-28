@@ -27,6 +27,7 @@
 //! - Supports `--lazy` startup and `--idle-park` automatic card release so `/dev/accel/accel0` is
 //!   only held while actively serving or within the idle window.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -38,6 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::budget::SequenceBudget;
+use crate::core::think_budget::{ThinkBudget, ThinkStep};
 use crate::core::effort::EffortLevels;
 use crate::core::lifecycle::{can_switch_resident_model, is_backend_card_released, RequestGuard};
 use crate::core::tool_calls::{finish_reason_name, generation_end, stop_reason_name, GenEnd};
@@ -3426,6 +3428,81 @@ fn handle_apply_template(state: &AppState, req: &HttpRequest, stream: &mut Conn)
     }
 }
 
+/// The report of a reply resumed after a forced end of thinking: `first` up to the cut, then
+/// `second` (whose prefill counts as decode time, after the reply's first token). The caller sets
+/// the generated tokens to the reply as kept.
+fn resumed_report(
+    first: crate::engine::GenReport,
+    second: crate::engine::GenReport,
+) -> crate::engine::GenReport {
+    let decode_ms = first.decode_ms + second.ttft_ms + second.decode_ms;
+    let launches = first.launches + second.launches;
+    let mut generated_tokens = first.generated_tokens;
+    generated_tokens.extend(second.generated_tokens);
+    let n = generated_tokens.len();
+    let mut forks = first.forks;
+    forks.extend(second.forks);
+    crate::engine::GenReport {
+        generated_tokens,
+        decode_ms,
+        decode_tok_s: if decode_ms > 0.0 {
+            n.saturating_sub(1) as f64 / decode_ms * 1e3
+        } else {
+            0.0
+        },
+        ms_per_step: if launches > 0 {
+            decode_ms / launches as f64
+        } else {
+            0.0
+        },
+        tokens_per_launch: if launches > 0 {
+            n.saturating_sub(1) as f64 / launches as f64
+        } else {
+            0.0
+        },
+        stopped_by_eos: second.stopped_by_eos,
+        stopped_by_cancel: second.stopped_by_cancel,
+        forks,
+        launches,
+        drafted: first.drafted + second.drafted,
+        draft_accepted: first.draft_accepted + second.draft_accepted,
+        sample_check_rows: first.sample_check_rows + second.sample_check_rows,
+        sample_check_mismatches: first.sample_check_mismatches + second.sample_check_mismatches,
+        ..first
+    }
+}
+
+/// Puts `job` in the model's lane session (starting the session when it is not running) and
+/// waits for its lane: the job's events then come on the returned channel. `job.out` is
+/// replaced by the channel's sender.
+fn join_lanes(
+    state: &Arc<AppState>,
+    idx: usize,
+    mut job: LaneJob,
+) -> Result<std::sync::mpsc::Receiver<LaneOut>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    job.out = Box::new(move |ev| {
+        let _ = tx.send(ev);
+    });
+    if state.lanes.submit(idx, job) {
+        let st = Arc::clone(state);
+        if let Err(e) = thread::Builder::new()
+            .name("gaudium-lanes".into())
+            .spawn(move || drive_lanes(st, idx))
+        {
+            state
+                .lanes
+                .fail_waiting(idx, &format!("start the lane session: {e}"));
+        }
+    }
+    // the request waits for a lane; a session that cannot start ends it here
+    match rx.recv() {
+        Ok(LaneOut::Started { .. }) => Ok(rx),
+        Ok(LaneOut::Done(d)) => Err(d.report.err().unwrap_or_default()),
+        Ok(LaneOut::Token(_)) | Err(_) => Err("the lane session ended".to_string()),
+    }
+}
+
 /// Runs one chat request: prompt, card turn, generation, and the reply in the shape of `api`.
 /// `ignored`: request fields the caller already found accepted but not applied.
 fn run_chat(
@@ -3711,6 +3788,17 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let max_new = budget.max_new().max(1);
+    // `thinking_budget_tokens` (the Messages API's `thinking.budget_tokens`): when the reasoning
+    // span reaches the budget, the family's end-of-thinking marker is written in its place and
+    // the reply goes on with its answer (`core::think_budget`). A completion has no reasoning
+    // span (its output is its text as generated): the field is reported there as unknown.
+    let think_close_ids: Vec<i32> = m.tokenizer.encode(&m.format.think_close, true);
+    let think_budget = val
+        .get("thinking_budget_tokens")
+        .filter(|_| !matches!(api, Api::Completion { .. }))
+        .and_then(|v| v.as_u64())
+        .filter(|_| !think_close_ids.is_empty())
+        .map(|b| ThinkBudget::new(b, max_new, think_close_ids.len() as u64));
     let cancel_flag = Arc::new(AtomicBool::new(false));
     // A streamed request is admitted: its stream begins now, before it waits for the card (the
     // queue, a model load, a lane) and for its prefill, and a keep-alive goes out whenever a
@@ -3851,37 +3939,27 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
 
     // The engine takes the request: alone (the engine out of the slot for this request), or in
     // a lane of the model's lane session.
-    let mut media = media;
+    let mut images = media.map(|md| md.into_tower_inputs());
+    // a reply resumed after its thinking budget gives the engine the same images again
+    let images_again = images.clone().filter(|_| think_budget.is_some());
     let mut lane_rx: Option<std::sync::mpsc::Receiver<LaneOut>> = None;
     let mut _op = None;
     let (mut engine, hbm_bytes) = if lane_mode {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let job = LaneJob {
-            id: req_num,
-            prompt: prompt_ids.clone(),
-            params: params.clone(),
-            images: media.take().map(|md| md.into_tower_inputs()),
-            cancel: Arc::clone(&cancel_flag),
-            out: Box::new(move |ev| {
-                let _ = tx.send(ev);
-            }),
-        };
-        if state.lanes.submit(idx, job) {
-            let st = Arc::clone(state);
-            if let Err(e) = thread::Builder::new()
-                .name("gaudium-lanes".into())
-                .spawn(move || drive_lanes(st, idx))
-            {
-                state
-                    .lanes
-                    .fail_waiting(idx, &format!("start the lane session: {e}"));
-            }
-        }
-        // the request waits for a lane; a session that cannot start ends it here
-        let err = match rx.recv() {
-            Ok(LaneOut::Started { .. }) => None,
-            Ok(LaneOut::Done(d)) => Some(d.report.err().unwrap_or_default()),
-            Ok(LaneOut::Token(_)) | Err(_) => Some("the lane session ended".to_string()),
+        let started = join_lanes(
+            state,
+            idx,
+            LaneJob {
+                id: req_num,
+                prompt: prompt_ids.clone(),
+                params: params.clone(),
+                images: images.take(),
+                cancel: Arc::clone(&cancel_flag),
+                out: Box::new(|_| {}),
+            },
+        );
+        let (rx, err) = match started {
+            Ok(rx) => (Some(rx), None),
+            Err(e) => (None, Some(e)),
         };
         if let Some(e) = err {
             state.cancels.lock().unwrap().remove(&req_id);
@@ -3910,7 +3988,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         };
         state.publish_engine_event();
         step_request_guard(&mut rguard, ReqEvent::EvReqStartPrefill, &req_id);
-        lane_rx = Some(rx);
+        lane_rx = rx;
         (None, hbm)
     } else {
         // Acquire card op lock for exclusive Gaudi 2 execution.
@@ -4044,96 +4122,202 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
 
     let mut last_live_pub = Instant::now();
     let mut lane_done: Option<Box<LaneDone>> = None;
+    // The thinking budget's gate, which every generated token passes first; the reply's tokens
+    // as kept (a reply resumed after a forced end of thinking is prompted with them); the
+    // request's current cancel flag (a resumed reply runs under a fresh one).
+    let think = RefCell::new(think_budget);
+    let think_cut: Cell<Option<ThinkStep>> = Cell::new(None);
+    let client_cancelled = Cell::new(false);
+    let kept: RefCell<Vec<i32>> = RefCell::new(Vec::new());
+    let cancel_now = RefCell::new(Arc::clone(&cancel_flag));
     let report = {
         let mut on_token = |tok_id: i32| {
-            let piece = if tok_ref.is_special(tok_id) {
-                // a special token is text only when it is part of the family's tags
-                let text = String::from_utf8_lossy(tok_ref.token_bytes(tok_id)).into_owned();
-                if format.is_marker_piece(&text) {
-                    decoder.flush() + &text
-                } else {
-                    String::new()
+            let mut toks: &[i32] = std::slice::from_ref(&tok_id);
+            if let Some(tb) = think.borrow_mut().as_mut().filter(|_| !parser.stopped()) {
+                // the rest of the launch after a cut is dropped
+                if think_cut.get().is_some() {
+                    return;
                 }
-            } else {
-                decoder.push(tok_id)
-            };
-            let delta = if piece.is_empty() {
-                Delta::default()
-            } else {
-                parser.feed(&piece)
-            };
-            // a stop string, or the call limit: the generation ends here
-            if parser.stopped() {
-                cancel_flag.store(true, Ordering::Relaxed);
-            }
-            let (timings, seen) = {
-                let mut o = out.lock().unwrap();
-                o.push_token(delta);
-                (o.timings(), o.seen_tokens())
-            };
-            if !started_decode {
-                started_decode = true;
-                step_request_guard(&mut rguard, ReqEvent::EvReqPrefillDone, &req_id);
-                state.publish_request(
-                    req_num,
-                    format!(
-                        "{{{},\"timings\":{}}}",
-                        req_base("decode", queued_ms),
-                        timings.json()
-                    ),
-                );
-            }
-            let now = Instant::now();
-            if seen >= 3 && now.duration_since(last_live_pub).as_millis() >= 400 {
-                last_live_pub = now;
-                if let Some(h) = &live {
-                    let rec = readout::live_record_json(
-                        "decode",
-                        &method,
-                        h.request_rates().as_ref(),
-                        hbm_bytes,
-                        h.snapshot().as_deref(),
-                    );
-                    state.hub.publish(format!(
-                    "{{\"type\":\"live\",\"job\":{req_num},\"source\":\"engine\",\"record\":{rec}}}"
-                ));
-                }
-            }
-        };
-        match engine.as_mut() {
-            Some(engine) => {
-                // The request's tower inputs go to the engine first; it runs the tower inside
-                // its prefill.
-                let images_set = match media.take() {
-                    Some(md) => engine.set_request_images(md.into_tower_inputs()),
-                    None => Ok(()),
-                };
-                images_set.and_then(|()| {
-                    engine.generate_cancellable(
-                        &prompt_ids,
-                        &params,
-                        Some(&cancel_flag),
-                        &mut on_token,
-                    )
-                })
-            }
-            None => {
-                // a lane: tokens and the end come from the lane session
-                let rx = lane_rx.take().expect("a lane request has its channel");
-                loop {
-                    match rx.recv() {
-                        Ok(LaneOut::Token(t)) => on_token(t),
-                        Ok(LaneOut::Started { .. }) => {}
-                        Ok(LaneOut::Done(mut d)) => {
-                            let r = std::mem::replace(&mut d.report, Err(String::new()));
-                            lane_done = Some(d);
-                            break r;
+                match tb.step(parser.in_reasoning()) {
+                    ThinkStep::Keep => {}
+                    step @ (ThinkStep::Close | ThinkStep::End) => {
+                        // The engine stops this generation. A client cancel that came before
+                        // this point is on the old flag; one that comes later finds the new one.
+                        think_cut.set(Some(step));
+                        let fresh = Arc::new(AtomicBool::new(false));
+                        state
+                            .cancels
+                            .lock()
+                            .unwrap()
+                            .insert(req_id.clone(), Arc::clone(&fresh));
+                        out.lock().unwrap().set_cancel(Arc::clone(&fresh));
+                        let old = std::mem::replace(&mut *cancel_now.borrow_mut(), fresh);
+                        client_cancelled.set(old.swap(true, Ordering::Relaxed));
+                        if step == ThinkStep::End {
+                            return;
                         }
-                        Err(_) => break Err("the lane session ended".to_string()),
+                        // the marker goes in as if generated
+                        toks = &think_close_ids;
                     }
                 }
             }
-        }
+            for &tok_id in toks {
+                kept.borrow_mut().push(tok_id);
+                let piece = if tok_ref.is_special(tok_id) {
+                    // a special token is text only when it is part of the family's tags
+                    let text = String::from_utf8_lossy(tok_ref.token_bytes(tok_id)).into_owned();
+                    if format.is_marker_piece(&text) {
+                        decoder.flush() + &text
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    decoder.push(tok_id)
+                };
+                let delta = if piece.is_empty() {
+                    Delta::default()
+                } else {
+                    parser.feed(&piece)
+                };
+                // a stop string, or the call limit: the generation ends here
+                if parser.stopped() {
+                    cancel_now.borrow().store(true, Ordering::Relaxed);
+                }
+                let (timings, seen) = {
+                    let mut o = out.lock().unwrap();
+                    o.push_token(delta);
+                    (o.timings(), o.seen_tokens())
+                };
+                if !started_decode {
+                    started_decode = true;
+                    step_request_guard(&mut rguard, ReqEvent::EvReqPrefillDone, &req_id);
+                    state.publish_request(
+                        req_num,
+                        format!(
+                            "{{{},\"timings\":{}}}",
+                            req_base("decode", queued_ms),
+                            timings.json()
+                        ),
+                    );
+                }
+                let now = Instant::now();
+                if seen >= 3 && now.duration_since(last_live_pub).as_millis() >= 400 {
+                    last_live_pub = now;
+                    if let Some(h) = &live {
+                        let rec = readout::live_record_json(
+                            "decode",
+                            &method,
+                            h.request_rates().as_ref(),
+                            hbm_bytes,
+                            h.snapshot().as_deref(),
+                        );
+                        state.hub.publish(format!(
+                        "{{\"type\":\"live\",\"job\":{req_num},\"source\":\"engine\",\"record\":{rec}}}"
+                    ));
+                    }
+                }
+            }
+        };
+        // One generation on the engine (or in a lane: `rx` is the lane already joined, else the
+        // job joins the lane session here), under the request's current cancel flag.
+        let mut generate = |prompt: &[i32],
+                            params: &Qwen3GenParams,
+                            images: Option<Vec<crate::vision::PreparedImage>>,
+                            rx: Option<std::sync::mpsc::Receiver<LaneOut>>,
+                            on_token: &mut dyn FnMut(i32)|
+         -> Result<crate::engine::GenReport, String> {
+            let flag = cancel_now.borrow().clone();
+            match engine.as_mut() {
+                Some(engine) => {
+                    // The request's tower inputs go to the engine first; it runs the tower
+                    // inside its prefill.
+                    let images_set = match images {
+                        Some(v) => engine.set_request_images(v),
+                        None => Ok(()),
+                    };
+                    images_set.and_then(|()| {
+                        engine.generate_cancellable(prompt, params, Some(&flag), on_token)
+                    })
+                }
+                None => {
+                    // a lane: tokens and the end come from the lane session
+                    let rx = match rx {
+                        Some(rx) => rx,
+                        None => join_lanes(
+                            state,
+                            idx,
+                            LaneJob {
+                                id: req_num,
+                                prompt: prompt.to_vec(),
+                                params: params.clone(),
+                                images,
+                                cancel: flag,
+                                out: Box::new(|_| {}),
+                            },
+                        )?,
+                    };
+                    loop {
+                        match rx.recv() {
+                            Ok(LaneOut::Token(t)) => on_token(t),
+                            Ok(LaneOut::Started { .. }) => {}
+                            Ok(LaneOut::Done(mut d)) => {
+                                let r = std::mem::replace(&mut d.report, Err(String::new()));
+                                lane_done = Some(d);
+                                break r;
+                            }
+                            Err(_) => break Err("the lane session ended".to_string()),
+                        }
+                    }
+                }
+            }
+        };
+        let first = generate(
+            &prompt_ids,
+            &params,
+            images.take(),
+            lane_rx.take(),
+            &mut on_token,
+        );
+        // A forced end of thinking with room left: the reply resumes from the prompt, the tokens
+        // kept and the marker, with what is left of its token budget.
+        let resume = match (&first, think_cut.get()) {
+            (Ok(_), Some(ThinkStep::Close)) if !client_cancelled.get() => think
+                .borrow()
+                .as_ref()
+                .map(ThinkBudget::remaining)
+                .filter(|&r| r > 0),
+            _ => None,
+        };
+        let joined = match (first, resume) {
+            (Ok(rep1), Some(room)) => {
+                let prompt2: Vec<i32> = prompt_ids.iter().chain(kept.borrow().iter()).copied().collect();
+                let params2 = Qwen3GenParams {
+                    max_new: room,
+                    ..params.clone()
+                };
+                think_cut.set(None);
+                generate(
+                    &prompt2,
+                    &params2,
+                    images_again.clone(),
+                    None,
+                    &mut on_token,
+                )
+                .map(|rep2| resumed_report(rep1, rep2))
+            }
+            (r, _) => r,
+        };
+        // a reply the thinking budget cut reports the tokens it kept, and ends at its length
+        joined.map(|mut rep| {
+            if think_cut.get().is_some() || resume.is_some() {
+                rep.generated_tokens = kept.borrow().clone();
+            }
+            if think_cut.get().is_some() {
+                rep.stopped_by_eos = false;
+                rep.stopped_by_cancel = client_cancelled.get();
+            }
+            rep
+        })
     };
     if let Some(h) = &live {
         h.set_launch_sink(None);
@@ -4300,6 +4484,16 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             }
             if has_calls {
                 details.push_str(&format!(",\"tool_calls\":{}", parser.tool_calls().len()));
+            }
+            // the thinking budget: the reasoning cap, the reasoning tokens kept, and whether the
+            // end of thinking was forced
+            if let Some(tb) = think.borrow().as_ref() {
+                details.push_str(&format!(
+                    ",\"thinking\":{{\"cap\":{},\"reasoning_tokens\":{},\"forced_close\":{}}}",
+                    tb.cap(),
+                    tb.kept(),
+                    tb.forced()
+                ));
             }
             // prefix reuse: rows taken over from the previous request, and how many rows of
             // the prompt equal the one the engine held (a resume point lies below that)

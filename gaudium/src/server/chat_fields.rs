@@ -97,6 +97,8 @@ const FIELDS: &[Field] = &[
     applied("frequency_penalty"),
     applied("repetition_penalty"),
     applied("logit_bias"),
+    // the reasoning span's token budget (the Messages API's `thinking.budget_tokens`)
+    applied("thinking_budget_tokens"),
     // refused: ignoring them changes the reply without a sign
     refused(
         "n",
@@ -287,7 +289,8 @@ mod tests {
             r#"{"messages":[],"model":"m","stream":true,"temperature":0.7,"top_p":0.9,
             "top_k":20,"min_p":0.05,"seed":3,"max_tokens":10,"stop":["x"],"tools":[],
             "tool_choice":"auto","parallel_tool_calls":false,"reasoning_effort":"low",
-            "chat_template_kwargs":{},"cache_prompt":true,"gaudium_method":"default"}"#,
+            "chat_template_kwargs":{},"cache_prompt":true,"gaudium_method":"default",
+            "thinking_budget_tokens":256}"#,
         );
         assert_eq!(r, Ok(Vec::new()));
     }

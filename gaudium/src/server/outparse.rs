@@ -528,6 +528,15 @@ impl OutputParser {
         &self.calls
     }
 
+    /// The text routed so far leaves the reply inside its reasoning span (the thinking budget
+    /// counts the tokens generated there). Text held back as a possible tag is not routed yet.
+    pub fn in_reasoning(&self) -> bool {
+        match self.f.style {
+            CallStyle::Blocks => self.mb == MbState::MsThink,
+            _ => self.state == State::Reasoning,
+        }
+    }
+
     pub fn feed(&mut self, text: &str) -> Delta {
         let mut d = Delta::default();
         if self.stopped {
