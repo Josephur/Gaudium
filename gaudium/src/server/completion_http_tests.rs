@@ -218,7 +218,7 @@ fn completion_fields_not_applied_are_reported() {
     h.script("ok");
     let (status, text) = h.post(
         "/v1/completions",
-        r#"{"prompt":"a","logprobs":2,"frequency_penalty":0.4,"user":"u","n":1,"echo":false}"#,
+        r#"{"prompt":"a","logprobs":2,"frequency_penalty":0.4,"repeat_penalty":1.1,"user":"u","n":1,"echo":false}"#,
     );
     assert_eq!(status, 200, "{text}");
     let v = parsed(&text);
@@ -230,6 +230,7 @@ fn completion_fields_not_applied_are_reported() {
         .collect();
     assert_eq!(ignored.len(), 3, "{ignored:?}");
     assert!(ignored[0].starts_with("logprobs"));
-    assert!(ignored[1].starts_with("frequency_penalty"));
+    // frequency_penalty is applied by the shared run: not reported; the native name is
+    assert!(ignored[1].starts_with("repeat_penalty"), "{ignored:?}");
     assert_eq!(ignored[2], "user");
 }

@@ -53,6 +53,11 @@ const APPLIED: &[&str] = &[
     "draft_trunc",
     "gaudium_method",
     "gaudium_return_tokens",
+    // sampler penalties and the logit bias (the shared run parses them: `penalty_fields`)
+    "presence_penalty",
+    "frequency_penalty",
+    "repetition_penalty",
+    "logit_bias",
 ];
 
 /// Reads a completion request body. `Err`: a 400 with this message.
@@ -77,9 +82,7 @@ pub(super) fn parse(body: &JsonValue) -> Result<CompletionRequest, String> {
         }
         let name = match k.as_str() {
             "logprobs" | "n_probs" => format!("{k} (token log-probabilities are not reported yet)"),
-            "presence_penalty" | "frequency_penalty" | "repeat_penalty" | "logit_bias" => {
-                format!("{k} (the sampler applies no penalties or biases yet)")
-            }
+            "repeat_penalty" => format!("{k} (not applied: send repetition_penalty)"),
             _ => k.clone(),
         };
         if !ignored.contains(&name) {
@@ -118,7 +121,10 @@ fn refuse_unsupported(body: &JsonValue) -> Result<(), String> {
             return Err("'n': only one choice per request is supported (n = 1)".into());
         }
     }
-    if let Some(b) = body.get("best_of").filter(|v| !matches!(v, JsonValue::Null)) {
+    if let Some(b) = body
+        .get("best_of")
+        .filter(|v| !matches!(v, JsonValue::Null))
+    {
         if b.as_u64() != Some(1) {
             return Err("'best_of': only best_of = 1 is supported".into());
         }
@@ -129,7 +135,9 @@ fn refuse_unsupported(body: &JsonValue) -> Result<(), String> {
     match body.get("suffix") {
         None | Some(JsonValue::Null) => {}
         Some(JsonValue::Str(s)) if s.is_empty() => {}
-        Some(_) => return Err("'suffix': insertion (text after the completion) is not supported".into()),
+        Some(_) => {
+            return Err("'suffix': insertion (text after the completion) is not supported".into())
+        }
     }
     Ok(())
 }
@@ -143,10 +151,7 @@ fn is_default(key: &str, v: &JsonValue) -> bool {
         ("suffix", JsonValue::Str(s)) => s.is_empty(),
         ("logprobs", JsonValue::Bool(false)) => true,
         ("logprobs" | "n_probs", v) => v.as_u64() == Some(0),
-        ("presence_penalty" | "frequency_penalty", v) => v.as_f64() == Some(0.0),
         ("repeat_penalty", v) => v.as_f64() == Some(1.0),
-        ("logit_bias", JsonValue::Object(e)) => e.is_empty(),
-        ("logit_bias", JsonValue::Array(a)) => a.is_empty(),
         _ => false,
     }
 }
@@ -302,12 +307,13 @@ mod tests {
     #[test]
     fn fields_not_applied_are_reported() {
         let r = req(
-            r#"{"prompt":"a","temperature":0,"logprobs":5,"presence_penalty":0.5,"user":"u","future_field":1}"#,
+            r#"{"prompt":"a","temperature":0,"logprobs":5,"presence_penalty":0.5,"repeat_penalty":1.2,"user":"u","future_field":1}"#,
         )
         .unwrap();
+        // presence_penalty is applied (the shared run reads it): not reported
         assert_eq!(r.ignored.len(), 4, "{:?}", r.ignored);
         assert!(r.ignored[0].starts_with("logprobs"));
-        assert!(r.ignored[1].starts_with("presence_penalty"));
+        assert!(r.ignored[1].starts_with("repeat_penalty (not applied: send repetition_penalty)"));
         assert_eq!(r.ignored[2], "user");
         assert_eq!(r.ignored[3], "future_field");
     }
