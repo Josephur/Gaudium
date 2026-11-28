@@ -6,7 +6,10 @@
 //! the built-in encoding of the Symbol font) with its /Differences, whose glyph names are looked up in a table of common names and the
 //! `uniXXXX` / `uXXXX` forms. Composite (Type0) fonts take their code lengths from the
 //! codespace ranges of their CMap (two bytes for Identity-H / Identity-V); their text needs a
-//! ToUnicode CMap, except for the predefined Unicode (UCS2 / UTF16) CMaps.
+//! ToUnicode CMap, except for the predefined Unicode (UCS2 / UTF16) CMaps. Their widths (/W)
+//! are indexed by CID: an embedded encoding CMap's `cidchar` / `cidrange` mappings give the CID
+//! of each code (the text is still looked up by the code); with a predefined CMap the code is
+//! taken as the CID.
 //! The encoding tables follow Annex D of the specification.
 //!
 //! What a font keeps is charged to the document's budgets as it is built: each entry of its
@@ -485,6 +488,12 @@ const SINGLE_COST: u64 = (2 * size_of::<((usize, u32), String)>() + 4 * size_of:
 /// up to twice its entries, and the units are an allocation of their own).
 const RANGE_COST: u64 =
     (2 * size_of::<((usize, u32), (u32, Vec<u16>))>() + 4 * size_of::<usize>()) as u64;
+/// The memory an encoding CMap entry mapping one code to a CID is charged for (a hash table
+/// holds up to twice its entries).
+const CID_SINGLE_COST: u64 = (2 * size_of::<((usize, u32), u32)>()) as u64;
+/// The memory an encoding CMap range of codes to CIDs is charged for (a tree node holds up to
+/// twice its entries).
+const CID_RANGE_COST: u64 = (2 * size_of::<((usize, u32), (u32, u32))>()) as u64;
 /// The memory a codespace range is charged for (kept while the CMap is read, then indexed).
 const SPACE_COST: u64 = 2 * size_of::<(u32, u32)>() as u64;
 /// The memory one entry of a composite font's width table is charged for.
@@ -530,7 +539,8 @@ impl Space {
     }
 }
 
-/// A CMap: code lengths (codespace ranges) and, for a ToUnicode CMap, the text of codes.
+/// A CMap: code lengths (codespace ranges), for a ToUnicode CMap the text of codes, and for
+/// an encoding CMap the CID of codes.
 #[derive(Default, Debug)]
 pub(crate) struct CMap {
     /// The codespace ranges of codes of 1 to 4 bytes.
@@ -540,6 +550,10 @@ pub(crate) struct CMap {
     single: HashMap<(usize, u32), String>,
     /// keyed by (bytes, low): (high, destination UTF-16 units)
     ranges: BTreeMap<(usize, u32), (u32, Vec<u16>)>,
+    /// The CID of single codes (`cidchar`).
+    cid_single: HashMap<(usize, u32), u32>,
+    /// keyed by (bytes, low): (high, CID of the low code) (`cidrange`)
+    cid_ranges: BTreeMap<(usize, u32), (u32, u32)>,
 }
 
 fn code_of(b: &[u8]) -> Option<(usize, u32)> {
@@ -566,6 +580,8 @@ impl CMap {
             Space,
             Char,
             Range,
+            CidChar,
+            CidRange,
         }
         let mut mode = Mode::None;
         loop {
@@ -616,6 +632,34 @@ impl CMap {
                             args.clear();
                             lx.restart(*mem);
                         }
+                        Mode::CidChar if args.len() == 2 => {
+                            let cid = args[1].as_int().and_then(|c| u32::try_from(c).ok());
+                            if let (Obj::Str(src), Some(cid)) = (&args[0], cid) {
+                                if let Some(k) = code_of(src) {
+                                    work.take(1)?;
+                                    mem.take(CID_SINGLE_COST)?;
+                                    m.cid_single.insert(k, cid);
+                                }
+                            }
+                            args.clear();
+                            lx.restart(*mem);
+                        }
+                        Mode::CidRange if args.len() == 3 => {
+                            let cid = args[2].as_int().and_then(|c| u32::try_from(c).ok());
+                            if let (Obj::Str(lo), Obj::Str(hi), Some(cid)) =
+                                (&args[0], &args[1], cid)
+                            {
+                                if let (Some((n, l)), Some((n2, h))) = (code_of(lo), code_of(hi)) {
+                                    if n == n2 && l <= h {
+                                        work.take(1)?;
+                                        mem.take(CID_RANGE_COST)?;
+                                        m.cid_ranges.insert((n, l), (h, cid));
+                                    }
+                                }
+                            }
+                            args.clear();
+                            lx.restart(*mem);
+                        }
                         _ => {
                             if mode == Mode::None && args.len() > 16 {
                                 args.remove(0);
@@ -630,6 +674,8 @@ impl CMap {
                         b"begincodespacerange" => Mode::Space,
                         b"beginbfchar" => Mode::Char,
                         b"beginbfrange" => Mode::Range,
+                        b"begincidchar" => Mode::CidChar,
+                        b"begincidrange" => Mode::CidRange,
                         _ => Mode::None,
                     };
                 }
@@ -718,6 +764,24 @@ impl CMap {
         Some(String::from_utf16_lossy(&u))
     }
 
+    /// The CID of code `code` of `n` bytes in an encoding CMap: `code` itself when the CMap
+    /// maps no code to a CID (it gives only code lengths), and CID 0 (`.notdef`) for a code
+    /// it does not map.
+    pub fn cid(&self, n: usize, code: u32) -> u32 {
+        if self.cid_single.is_empty() && self.cid_ranges.is_empty() {
+            return code;
+        }
+        if let Some(c) = self.cid_single.get(&(n, code)) {
+            return *c;
+        }
+        self.cid_ranges
+            .range(..=(n, code))
+            .next_back()
+            .filter(|((rn, _), (hi, _))| *rn == n && code <= *hi)
+            .and_then(|((_, lo), (_, first))| first.checked_add(code - lo))
+            .unwrap_or(0)
+    }
+
     /// The length of the code at the start of `b` from the codespace ranges; `None` when the
     /// CMap has none.
     pub fn code_len(&self, b: &[u8]) -> Option<usize> {
@@ -749,7 +813,8 @@ enum CidText {
 pub(crate) struct Font {
     composite: bool,
     to_unicode: Option<CMap>,
-    /// Code lengths of a composite font (its encoding CMap), if not the ToUnicode one's.
+    /// The encoding CMap of a composite font, when embedded: code lengths (if not the
+    /// ToUnicode one's) and the CIDs of codes.
     encoding_cmap: Option<CMap>,
     cid_text: CidText,
     /// Simple fonts: the text of each code.
@@ -757,7 +822,7 @@ pub(crate) struct Font {
     /// Simple fonts: first code with a width, and the widths.
     first_char: u32,
     widths: Vec<f64>,
-    /// Composite fonts: width ranges (low, high, width) and the default width.
+    /// Composite fonts: width ranges by CID (low, high, width) and the default width.
     cid_widths: Vec<(u32, u32, f64)>,
     default_width: f64,
     /// Glyph units to text space (1/1000 for all but Type 3 fonts).
@@ -910,10 +975,12 @@ impl Font {
                 };
             }
             let w = if self.composite {
-                let at = self.cid_widths.partition_point(|r| r.0 <= code);
+                // /W is indexed by CID; the text above is looked up by the code itself
+                let cid = self.encoding_cmap.as_ref().map_or(code, |c| c.cid(n, code));
+                let at = self.cid_widths.partition_point(|r| r.0 <= cid);
                 at.checked_sub(1)
                     .map(|k| self.cid_widths[k])
-                    .filter(|r| code <= r.1)
+                    .filter(|r| cid <= r.1)
                     .map_or(self.default_width, |r| r.2)
             } else {
                 code.checked_sub(self.first_char)

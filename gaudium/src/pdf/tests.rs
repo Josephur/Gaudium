@@ -365,6 +365,61 @@ fn type0_identity_h_with_to_unicode() {
     );
 }
 
+/// A Type0 font whose embedded encoding CMap maps one-byte codes to CIDs: /W is indexed by
+/// CID, the ToUnicode CMap by code.
+fn type0_cid_mapped(encoding_cmap: &[u8], content: &[u8]) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let enc = p.add(stream("/Type /CMap", encoding_cmap));
+    let tu = p.add(stream(
+        "",
+        b"1 begincodespacerange <00> <FF> endcodespacerange 1 beginbfrange <41> <42> <0041> endbfrange",
+    ));
+    let desc =
+        p.add("<< /Type /Font /Subtype /CIDFontType0 /BaseFont /X /DW 1000 /W [1 [500 500]] >>");
+    let f1 = p.add(format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding {enc} 0 R /DescendantFonts [{desc} 0 R] /ToUnicode {tu} 0 R >>"
+    ));
+    let content = p.add(stream("", content));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+#[test]
+fn type0_widths_are_looked_up_by_cid() {
+    // Codex repro (#136): codes 0x41 / 0x42 map to CIDs 1 / 2, which /W gives 500 units; the
+    // two strings, nine points apart at 12 points, leave a gap of three points between them.
+    // Looking the width up by code found the default 1000 units, and the words ran together.
+    let content: &[u8] = b"BT /F1 12 Tf 72 700 Td <41> Tj 9 0 Td <42> Tj ET";
+    let chars = b"1 begincodespacerange <00> <FF> endcodespacerange\n\
+        2 begincidchar <41> 1 <42> 2 endcidchar";
+    assert_eq!(
+        text_of(&type0_cid_mapped(chars, content)).unwrap(),
+        vec!["A B"]
+    );
+    let range = b"1 begincodespacerange <00> <FF> endcodespacerange\n\
+        1 begincidrange <41> <42> 1 endcidrange";
+    assert_eq!(
+        text_of(&type0_cid_mapped(range, content)).unwrap(),
+        vec!["A B"]
+    );
+    // a code the CMap does not map is CID 0 (the default width): the strings overlap
+    let other = b"1 begincodespacerange <00> <FF> endcodespacerange\n\
+        1 begincidchar <43> 1 endcidchar";
+    assert_eq!(
+        text_of(&type0_cid_mapped(other, content)).unwrap(),
+        vec!["AB"]
+    );
+}
+
 #[test]
 fn xref_stream_object_stream_and_predictor() {
     let (p, root) = doc(
@@ -1896,10 +1951,20 @@ fn wide_font() -> String {
 fn rotated_text_splits_into_words_and_lines_like_unrotated() {
     // Codex repro: gaps measured on the page's axes merged rotated words ("HelloWorld")
     let font = wide_font();
-    for m in ["1 0 0 1", "0 1 -1 0", "-1 0 0 -1", "0 -1 1 0", "0.7071 0.7071 -0.7071 0.7071"] {
+    for m in [
+        "1 0 0 1",
+        "0 1 -1 0",
+        "-1 0 0 -1",
+        "0 -1 1 0",
+        "0.7071 0.7071 -0.7071 0.7071",
+    ] {
         let words = format!("BT /F1 12 Tf {m} 100 100 Tm (Hello) Tj 36 0 Td (World) Tj ET");
         let (p, root) = doc(&[words.as_bytes()], &font, false);
-        assert_eq!(text_of(&p.table(root, "")).unwrap(), vec!["Hello World"], "{m}");
+        assert_eq!(
+            text_of(&p.table(root, "")).unwrap(),
+            vec!["Hello World"],
+            "{m}"
+        );
         // a glyph's advance later on the same baseline: no space
         let joined = format!("BT /F1 12 Tf {m} 100 100 Tm (Hel) Tj 18 0 Td (lo) Tj ET");
         let (p, root) = doc(&[joined.as_bytes()], &font, false);
@@ -1907,7 +1972,11 @@ fn rotated_text_splits_into_words_and_lines_like_unrotated() {
         // a move across the baseline: a new line
         let lines = format!("BT /F1 12 Tf {m} 100 100 Tm (Hello) Tj 0 -14 Td (World) Tj ET");
         let (p, root) = doc(&[lines.as_bytes()], &font, false);
-        assert_eq!(text_of(&p.table(root, "")).unwrap(), vec!["Hello\nWorld"], "{m}");
+        assert_eq!(
+            text_of(&p.table(root, "")).unwrap(),
+            vec!["Hello\nWorld"],
+            "{m}"
+        );
     }
 }
 
@@ -1925,7 +1994,10 @@ fn inline_image_bytes_holding_ei_do_not_end_the_image() {
     let want = vec!["Before\nAfter".to_string()];
     // Codex repro: an unfiltered 8x1 8-bit gray image whose samples are " EI (xxx" ended at
     // the first " EI ", and the "(" left over swallowed the rest of the page
-    assert_eq!(around_image(b"BI /W 8 /H 1 /BPC 8 /CS /G ID  EI (xxx\nEI"), want);
+    assert_eq!(
+        around_image(b"BI /W 8 /H 1 /BPC 8 /CS /G ID  EI (xxx\nEI"),
+        want
+    );
     // its size from its width, components and bits: rows padded to whole bytes
     assert_eq!(
         around_image(b"BI /W 20 /H 2 /BPC 1 /CS /DeviceGray ID  EI (x EI\nEI"),
@@ -1935,7 +2007,10 @@ fn inline_image_bytes_holding_ei_do_not_end_the_image() {
         around_image(b"BI /W 1 /H 3 /BPC 8 /CS /RGB ID  EI (xxxx\nEI"),
         want
     );
-    assert_eq!(around_image(b"BI /W 40 /H 2 /IM true ID  EI (xxxxx\nEI"), want);
+    assert_eq!(
+        around_image(b"BI /W 40 /H 2 /IM true ID  EI (xxxxx\nEI"),
+        want
+    );
     assert_eq!(
         around_image(b"BI /W 8 /H 1 /BPC 8 /CS [/I /RGB 1 <000000ffffff>] ID  EI (xxx EI"),
         want
@@ -1964,7 +2039,10 @@ fn inline_image_bytes_holding_ei_do_not_end_the_image() {
         want
     );
     // a declared size that is wrong (no EI after it) falls back to the checked scan
-    assert_eq!(around_image(b"BI /W 2 /H 1 /BPC 8 /CS /G ID abc EI (x EI"), want);
+    assert_eq!(
+        around_image(b"BI /W 2 /H 1 /BPC 8 /CS /G ID abc EI (x EI"),
+        want
+    );
     // an image that runs to the end of the content
     let (p, root) = doc(
         &[b"BT /F1 12 Tf 72 700 Td (Only) Tj ET BI /W 99 /H 99 /BPC 8 /CS /G ID  EI (x"],
