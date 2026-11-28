@@ -1793,6 +1793,37 @@ a4f605578c25a7c8  pc_writing_not_readable  law pc_writing_not_readable : for + s
 1fe2bf0db086bfba  pc_writing_slot_not_usable  law pc_writing_slot_not_usable : for + t : Nat for + r : Bool for + m : Bool { pc_class_usable ( pc_victim_class ( PcWriting { t } , r , m ) ) == False { } : Bool }
 d34f2537e2e6aec8  pc_zeroed_rows_never_reused  law pc_zeroed_rows_never_reused : for + w : Bool for + s : Bool { pc_request_may_reuse ( w , True { } , s ) == False { } : Bool }
 1bca3abfb4f4fd87  pc_zeroed_table_is_void  law pc_zeroed_table_is_void : for + s : Bool { pc_table_void ( True { } , s ) == True { } : Bool }
+d697aad72e376926  pdf_below_within  law pdf_below_within : for + x : Nat for + m : Nat { Bool.and ( pdf_below ( x , m ) , Nat.is_le ( m , x ) ) == False { } : Bool }
+# promise pdf_below_within: a depth or count the limit check lets grow is always below the limit.
+# harm pdf_below_within: hostile nesting could recurse past the stack, or a page tree could yield more pages than configured.
+8b4887549c503f5e  pdf_count_within  law pdf_count_within : for + n : Nat for + e : Nat for + a : Nat { Bool.and ( pdf_count_fits ( n , e , a ) , Nat.is_lt ( a , Nat.mul ( n , e ) ) ) == False { } : Bool }
+# promise pdf_count_within: n entries of e bytes that the count check accepts never need more than the available bytes.
+# harm pdf_count_within: a hostile entry count could make the reader allocate or walk past the decoded data.
+d862d8ded703a7ef  pdf_objstm_pos_first  law pdf_objstm_pos_first : for + f : Nat { pdf_objstm_pos ( f , 0n ) == f : Nat }
+# promise pdf_objstm_pos_first: the object at offset zero of an object stream starts right after its header (the file format's layout).
+95bb44865538dc8b  pdf_objstm_pos_step  law pdf_objstm_pos_step : for + f : Nat for + o : Nat { pdf_objstm_pos ( f , 1n + o ) == 1n + pdf_objstm_pos ( f , o ) : Nat }
+# promise pdf_objstm_pos_step: an object's place in an object stream moves byte for byte with its offset (the file format's layout).
+ff41de95af8dc5f4  pdf_objstm_within  law pdf_objstm_within : for + f : Nat for + o : Nat for + d : Nat { Bool.and ( pdf_objstm_ok ( f , o , d ) , Nat.is_le ( d , pdf_objstm_pos ( f , o ) ) ) == False { } : Bool }
+# promise pdf_objstm_within: an object the reader takes from an object stream always starts inside the stream's decoded data.
+# harm pdf_objstm_within: a hostile /First or object offset could index past the decoded data.
+f2bc7146d9de08e2  pdf_row_first_at_start  law pdf_row_first_at_start : for + w : Nat { pdf_row_offset ( 0n , w ) == 0n : Nat }
+# promise pdf_row_first_at_start: the first row of an xref stream starts at its first byte (the file format's layout).
+eb388bc3438a9558  pdf_row_next_adjacent  law pdf_row_next_adjacent : for + k : Nat for + w : Nat { pdf_row_offset ( 1n + k , w ) == Nat.add ( w , pdf_row_offset ( k , w ) ) : Nat }
+# promise pdf_row_next_adjacent: each row of an xref stream starts right after the row before it (the file format's layout).
+ba7fea311669dfc4  pdf_row_within  law pdf_row_within : for + n : Nat for + w : Nat for + a : Nat for + k : Nat { Bool.and ( Bool.and ( pdf_count_fits ( n , w , a ) , Nat.is_lt ( k , n ) ) , Nat.is_lt ( a , Nat.add ( w , pdf_row_offset ( k , w ) ) ) ) == False { } : Bool }
+# promise pdf_row_within: every row below the accepted row count ends inside the available bytes.
+# harm pdf_row_within: an xref stream row could be read past the end of the decoded stream.
+7400cf530f60dc92  pdf_span_inside_accepted  law pdf_span_inside_accepted : for + o : Nat for + l : Nat for + r : Nat { pdf_span_ok ( o , l , Nat.add ( Nat.add ( o , l ) , r ) ) == True { } : Bool }
+# promise pdf_span_inside_accepted: every span that ends inside a buffer is accepted.
+d5786c1f960f5fc3  pdf_span_within  law pdf_span_within : for + o : Nat for + l : Nat for + s : Nat { Bool.and ( pdf_span_ok ( o , l , s ) , Nat.is_lt ( s , Nat.add ( o , l ) ) ) == False { } : Bool }
+# promise pdf_span_within: a span of a buffer the reader accepts never ends past the end of that buffer.
+# harm pdf_span_within: a stream /Length or an object-stream header from the file could make the reader slice past the buffer.
+1e5b03e6f1b31514  pdf_widths_within  law pdf_widths_within : for + a : Nat for + b : Nat for + c : Nat for + m : Nat { Bool.and ( pdf_widths_ok ( a , b , c , m ) , Bool.or ( Bool.or ( Nat.is_lt ( m , a ) , Nat.is_lt ( m , b ) ) , Nat.is_lt ( m , c ) ) ) == False { } : Bool }
+# promise pdf_widths_within: xref field widths the reader accepts are never wider than the limit they were checked against.
+# harm pdf_widths_within: a wider field would overflow the integer the reader assembles it into.
+3e84111971e66c33  pdf_within_limit  law pdf_within_limit : for + x : Nat for + m : Nat { Bool.and ( pdf_within ( x , m ) , Nat.is_lt ( m , x ) ) == False { } : Bool }
+# promise pdf_within_limit: a size the limit check accepts never exceeds the limit.
+# harm pdf_within_limit: a document larger than configured could be read into memory.
 4b28276029305698  pen_applied_path_allowed  law pen_applied_path_allowed : { pen_path_allowed ( True { } , True { } ) == True { } : Bool }
 # promise pen_applied_path_allowed: a penalised request may take a decode path that applies its penalties
 4c77590153cf6984  pen_banned_never_emitted  law pen_banned_never_emitted : for t : Nat for v : Nat { pen_emit_ok ( t , v , PbBan { } ) == False { } : Bool }
