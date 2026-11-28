@@ -8,8 +8,9 @@
 #   - The seed each choice runs with: choice 0 keeps the request's seed, no two choices of one
 #     request share a seed, and every seed stays in the seed range (it wraps past the top)
 #   - When a request with several generations is over: only after every one of them ended, so
-#     its answer never goes out while one still runs in a lane; cancelling all of them is
-#     idempotent and ends none of them by itself
+#     its answer never goes out while one still runs in a lane; the group waits for exactly the
+#     generations the request started, through any order of ends and cancels; cancelling all of
+#     them is idempotent and ends none of them by itself
 #   - How the request ends: a generation that failed is never answered as a success
 #
 # Where the generations run (lanes sharing the prompt's prefill) is the lane fork rule in
@@ -109,6 +110,33 @@ def ch_cancelled(+g: ChGroup) -> Bool:
   match g:
     case ChGroup{r, e, c}:
       c
+
+# The number of generations the group waits for: the count it was started with.
+def ch_expected(+g: ChGroup) -> Nat:
+  match g:
+    case ChGroup{r, e, c}:
+      r
+
+# The group after the events `evs`, in order: what the shell's `ch_step` calls, one per event it
+# delivers to the group, make of `g`.
+def ch_steps(evs: List<&2, ChEvent>, g: ChGroup) -> ChGroup:
+  match evs:
+    case Nil{}:
+      g
+    case Con{ev, rest}:
+      ch_steps(rest, ch_step(g, ev))
+
+# How many of the events `evs` are ends of a generation.
+def ch_ends_in(evs: List<&2, ChEvent>) -> Nat:
+  match evs:
+    case Nil{}:
+      0n
+    case Con{ev, rest}:
+      match ev:
+        case ChRunEnded{}:
+          1n+ch_ends_in(rest)
+        case ChCancelAll{}:
+          ch_ends_in(rest)
 
 # ============================================================================
 # 4. How the request ends
@@ -264,6 +292,84 @@ def ch_seed_within_from(+s: Nat, +room: Nat, +i: Nat, fi: Bool, efi: {fi == Nat.
       L.nat_add_le_mono(s, s, i, room, L.nat_le_refl(s), Equal.sym(Bool, True{}, Nat.is_le(i, room), efi))
     case False{}:
       L.nat_le_trans(Nat.sub(Nat.sub(i, room), 1n), i, Nat.add(room, s), L.nat_le_trans(Nat.sub(Nat.sub(i, room), 1n), Nat.sub(i, room), i, G.g_nat_sub_le_self(Nat.sub(i, room), 1n), G.g_nat_sub_le_self(i, room)), hi)
+
+# min(1 + min(x, r), r) = min(1 + x, r): counting one more end past a capped count caps it the same.
+def ch_min_succ_min(+x: Nat, +r: Nat) -> {Nat.min(1n+Nat.min(x, r), r) == Nat.min(1n+x, r) : Nat}:
+  match x r:
+    case 0n 0n:
+      {==}
+    case 0n 1n+rp:
+      {==}
+    case 1n+xp 0n:
+      {==}
+    case 1n+xp 1n+rp:
+      %ch_min_succ_min(xp, rp) : {1n+Nat.min(1n+Nat.min(xp, rp), rp) == 1n+_ : Nat}
+      {==}
+
+# A step keeps the count of generations the group waits for.
+def ch_step_expected_eq(+g: ChGroup, +ev: ChEvent) -> {ch_expected(ch_step(g, ev)) == ch_expected(g) : Nat}:
+  match g:
+    case ChGroup{r, e, c}:
+      match ev:
+        case ChRunEnded{}:
+          {==}
+        case ChCancelAll{}:
+          {==}
+
+# Any run of steps keeps the count of generations the group waits for.
+def ch_steps_expected(+evs: List<&2, ChEvent>, +g: ChGroup) -> {ch_expected(ch_steps(evs, g)) == ch_expected(g) : Nat}:
+  match evs:
+    case Nil{}:
+      {==}
+    case Con{ev, rest}:
+      %Equal.sym(Nat, ch_expected(ch_steps(rest, ch_step(g, ev))), ch_expected(ch_step(g, ev)), ch_steps_expected(rest, ch_step(g, ev))) : {_ == ch_expected(g) : Nat}
+      ch_step_expected_eq(g, ev)
+
+# After a run of steps from a group whose count of ends is min(x, r), the count of ends is
+# min(x + the ends in the run, r).
+def ch_steps_ended(+evs: List<&2, ChEvent>, +r: Nat, +x: Nat, +c: Bool) -> {ch_ended(ch_steps(evs, ChGroup{r, Nat.min(x, r), c})) == Nat.min(Nat.add(x, ch_ends_in(evs)), r) : Nat}:
+  match evs:
+    case Nil{}:
+      %Equal.sym(Nat, Nat.add(x, 0n), x, L.nat_add_zero_r(x)) : {Nat.min(x, r) == Nat.min(_, r) : Nat}
+      {==}
+    case Con{ev, rest}:
+      match ev:
+        case ChRunEnded{}:
+          %Equal.sym(Nat, Nat.min(1n+Nat.min(x, r), r), Nat.min(1n+x, r), ch_min_succ_min(x, r)) : {ch_ended(ch_steps(rest, ChGroup{r, _, c})) == Nat.min(Nat.add(x, 1n+ch_ends_in(rest)), r) : Nat}
+          %Equal.sym(Nat, Nat.add(x, 1n+ch_ends_in(rest)), 1n+Nat.add(x, ch_ends_in(rest)), L.nat_add_succ_r(x, ch_ends_in(rest))) : {ch_ended(ch_steps(rest, ChGroup{r, Nat.min(1n+x, r), c})) == Nat.min(_, r) : Nat}
+          ch_steps_ended(rest, r, 1n+x, c)
+        case ChCancelAll{}:
+          ch_steps_ended(rest, r, x, True{})
+
+# A group is over exactly when its count of ends reached the count it waits for.
+def ch_done_eq(+g: ChGroup) -> {ch_done(g) == Nat.is_le(ch_expected(g), ch_ended(g)) : Bool}:
+  match g:
+    case ChGroup{r, e, c}:
+      {==}
+
+# r <= min(k, r) and k < r never both hold.
+def ch_min_wait(+k: Nat, +r: Nat) -> {Bool.and(Nat.is_le(r, Nat.min(k, r)), Nat.is_lt(k, r)) == False{} : Bool}:
+  match k r:
+    case 0n 0n:
+      {==}
+    case 0n 1n+rp:
+      {==}
+    case 1n+kp 0n:
+      {==}
+    case 1n+kp 1n+rp:
+      ch_min_wait(kp, rp)
+
+# k < r, or r <= min(k, r).
+def ch_min_reach(+k: Nat, +r: Nat) -> {Bool.or(Nat.is_lt(k, r), Nat.is_le(r, Nat.min(k, r))) == True{} : Bool}:
+  match k r:
+    case 0n 0n:
+      {==}
+    case 0n 1n+rp:
+      {==}
+    case 1n+kp 0n:
+      {==}
+    case 1n+kp 1n+rp:
+      ch_min_reach(kp, rp)
 
 # ============================================================================
 # 6. Laws
@@ -576,3 +682,71 @@ def ch_think_rest_ok(n, b, c):
       match c:
         case True{}: {==}
         case False{}: {==}
+
+# promise: the group of a request waits for exactly the generations the request started, never a count of its own.
+# harm: a group that waits for fewer lets the request answer, and drop the rest of its generations' events, while their lanes still run; one that waits for more never answers.
+# catches: ch_new ignores runs and starts a group of one (ChGroup{1n, 0n, False{}})
+law ch_new_expects_runs:
+  for +r: Nat
+  {ch_expected(ch_new(r)) == r : Nat}
+
+def ch_new_expects_runs(r):
+  {==}
+
+# promise: whatever ends and cancels a request's group goes through, it still waits for the generations the request started.
+# catches: ch_step on ChRunEnded returns ChGroup{Nat.sub(r, 1n), Nat.min(1n+e, r), c}, counting each end twice
+law ch_steps_keep_expected:
+  for +r: Nat
+  for +evs: List<&2, ChEvent>
+  {ch_expected(ch_steps(evs, ch_new(r))) == r : Nat}
+
+def ch_steps_keep_expected(r, evs):
+  ch_steps_expected(evs, ch_new(r))
+
+# promise: a request that started r generations is never over, whatever cancels come between, before r of them delivered their end.
+# harm: the lane-event loop would stop at the early answer and drop the events of generations still running in their lanes.
+# catches: ch_new ignores runs and starts a group of one (ChGroup{1n, 0n, False{}})
+# catches: ch_step on ChRunEnded returns ChGroup{Nat.sub(r, 1n), Nat.min(1n+e, r), c}, counting each end twice
+law ch_steps_never_done_early:
+  for +r: Nat
+  for +evs: List<&2, ChEvent>
+  {Bool.and(ch_done(ch_steps(evs, ch_new(r))), Nat.is_lt(ch_ends_in(evs), r)) == False{} : Bool}
+
+def ch_steps_never_done_early(r, evs):
+  %Equal.sym(Bool, ch_done(ch_steps(evs, ch_new(r))), Nat.is_le(ch_expected(ch_steps(evs, ch_new(r))), ch_ended(ch_steps(evs, ch_new(r)))), ch_done_eq(ch_steps(evs, ch_new(r)))) : {Bool.and(_, Nat.is_lt(ch_ends_in(evs), r)) == False{} : Bool}
+  %Equal.sym(Nat, ch_expected(ch_steps(evs, ch_new(r))), r, ch_steps_expected(evs, ch_new(r))) : {Bool.and(Nat.is_le(_, ch_ended(ch_steps(evs, ch_new(r)))), Nat.is_lt(ch_ends_in(evs), r)) == False{} : Bool}
+  %Equal.sym(Nat, ch_ended(ch_steps(evs, ch_new(r))), Nat.min(ch_ends_in(evs), r), ch_steps_ended(evs, r, 0n, False{})) : {Bool.and(Nat.is_le(r, _), Nat.is_lt(ch_ends_in(evs), r)) == False{} : Bool}
+  ch_min_wait(ch_ends_in(evs), r)
+
+# promise: a request that started r generations is over, whatever cancels come between, once r of them delivered their end.
+# harm: the request would wait forever for a generation it never started.
+# catches: ch_new waits for one generation more than it started (ChGroup{1n+runs, 0n, False{}})
+law ch_steps_done_after_all:
+  for +r: Nat
+  for +evs: List<&2, ChEvent>
+  {Bool.or(Nat.is_lt(ch_ends_in(evs), r), ch_done(ch_steps(evs, ch_new(r)))) == True{} : Bool}
+
+def ch_steps_done_after_all(r, evs):
+  %Equal.sym(Bool, ch_done(ch_steps(evs, ch_new(r))), Nat.is_le(ch_expected(ch_steps(evs, ch_new(r))), ch_ended(ch_steps(evs, ch_new(r)))), ch_done_eq(ch_steps(evs, ch_new(r)))) : {Bool.or(Nat.is_lt(ch_ends_in(evs), r), _) == True{} : Bool}
+  %Equal.sym(Nat, ch_expected(ch_steps(evs, ch_new(r))), r, ch_steps_expected(evs, ch_new(r))) : {Bool.or(Nat.is_lt(ch_ends_in(evs), r), Nat.is_le(_, ch_ended(ch_steps(evs, ch_new(r))))) == True{} : Bool}
+  %Equal.sym(Nat, ch_ended(ch_steps(evs, ch_new(r))), Nat.min(ch_ends_in(evs), r), ch_steps_ended(evs, r, 0n, False{})) : {Bool.or(Nat.is_lt(ch_ends_in(evs), r), Nat.is_le(r, _)) == True{} : Bool}
+  ch_min_reach(ch_ends_in(evs), r)
+
+# promise: every choice of a request with at least one choice reads one of the generations the request starts, greedy or sampled.
+# catches: ch_runs returns Nat.min(n, 0n) for a greedy request, so every choice reads a generation that never ran
+law ch_run_of_started:
+  for +n: Nat
+  for +g: Bool
+  for +c: Nat
+  {Nat.is_lt(ch_run_of(c, ch_runs(1n+n, g)), ch_runs(1n+n, g)) == True{} : Bool}
+
+def ch_run_of_started(n, g, c):
+  match n g:
+    case 0n True{}:
+      L.nat_mod_lt(c, 0n)
+    case 0n False{}:
+      L.nat_mod_lt(c, 0n)
+    case 1n+np True{}:
+      L.nat_mod_lt(c, 0n)
+    case 1n+np False{}:
+      L.nat_mod_lt(c, 1n+np)
