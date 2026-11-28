@@ -36,7 +36,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,6 +61,8 @@ mod a2ui;
 mod anthropic;
 mod chat;
 mod chat_fields;
+mod choices;
+pub use choices::{DEFAULT_MAX_CHOICES, MAX_CHOICES};
 mod completion;
 mod conn;
 mod jinja;
@@ -179,6 +181,8 @@ pub struct ServerConfig {
     /// Requests a model runs at once (`--parallel`): lanes of their own, decoded together.
     /// Models whose engine or drafter has no batched steps are served with one lane.
     pub parallel: u64,
+    /// Choices a chat request may ask for (`n`, `--max-choices`).
+    pub max_choices: u64,
     /// Trim the recipe cache to a budget in the background (`--cache-max-gb`); `None` = never.
     pub cache_trim: Option<crate::synapse::recipe_trim::ServerTrim>,
     /// Device-trace windows (`--profile-steps`) of the batched launches of a model served with
@@ -414,7 +418,9 @@ struct AppState {
     slot: Mutex<EngineSlot>,
     /// Serializes device-level load/generate/unload operations without blocking status reads.
     card_op: Mutex<()>,
-    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The generations of every running request by its id (`/v1/chat/completions/control`, a
+    /// DELETE or a cancel of a response): a cancel stops all of them.
+    cancels: Mutex<HashMap<String, Arc<choices::ChoiceGroup>>>,
     next_req_id: AtomicU64,
     hub: EventHub,
     /// Data types of a model's step graph by `(model, fp8 weights, routed experts, FP8 K/V)`.
@@ -3308,9 +3314,9 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
         return;
     };
     let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let flag = state.cancels.lock().unwrap().get(id).cloned();
-    if let Some(flag) = flag {
-        flag.store(true, Ordering::Relaxed);
+    let group = state.cancels.lock().unwrap().get(id).cloned();
+    if let Some(group) = group {
+        group.cancel_all();
         // a request that waits for the card leaves the queue now
         state.turns.wake();
         write_json(stream, 200, "{\"ok\":true}");
@@ -3323,6 +3329,10 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
 /// over: their counts of the reasoning and a ban on the end-of-thinking marker. Not yet (#150):
 /// a budgeted request with penalties is refused (`think_penalties_ok`).
 const THINK_RESUME_CARRIES_PENALTIES: bool = false;
+
+/// Whether a resumed answer (after a thinking budget's forced close) runs for each choice of a
+/// request with `n > 1` on its own. Not yet: such a request is refused (`ch_think_ok`).
+const THINK_RESUME_PER_CHOICE: bool = false;
 
 /// Which API a chat request came in on: the shape of its reply and of its errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3382,7 +3392,7 @@ impl Api {
 /// A request's entry in the cancel table (`AppState::cancels`); dropping it removes the entry,
 /// so a request leaves no entry behind on any way out.
 struct CancelEntry<'a> {
-    cancels: &'a Mutex<HashMap<String, Arc<AtomicBool>>>,
+    cancels: &'a Mutex<HashMap<String, Arc<choices::ChoiceGroup>>>,
     id: &'a str,
 }
 
@@ -3682,8 +3692,8 @@ fn handle_stored_response(
                 // a response still being generated stops at its next step, or leaves the card's
                 // queue if it waits there, and is not kept
                 if found == response_store::Deleted::Running {
-                    if let Some(flag) = state.cancels.lock().unwrap().get(id) {
-                        flag.store(true, Ordering::Relaxed);
+                    if let Some(group) = state.cancels.lock().unwrap().get(id) {
+                        group.cancel_all();
                     }
                     state.turns.wake();
                 }
@@ -3714,10 +3724,10 @@ fn handle_stored_response(
             // a response still being generated stops at its next step; a finished one is final
             // the watch is taken first, so a reply that comes as soon as the flag is set is seen
             let watch = state.responses.watch(id);
-            let flag = state.cancels.lock().unwrap().get(id).cloned();
-            match (flag, watch) {
-                (Some(flag), Some(watch)) => {
-                    flag.store(true, Ordering::Relaxed);
+            let group = state.cancels.lock().unwrap().get(id).cloned();
+            match (group, watch) {
+                (Some(group), Some(watch)) => {
+                    group.cancel_all();
                     // (one that waits for the card leaves the queue now)
                     state.turns.wake();
                     // the reply is the response as its generation ends it (the same object its
@@ -3826,19 +3836,46 @@ fn set_token_rates(rep: &mut crate::engine::GenReport) {
     };
 }
 
-/// Puts `job` in the model's lane session (starting the session when it is not running) and
-/// waits for its lane: the job's events then come on the returned channel. `job.out` is
-/// replaced by the channel's sender.
+/// The events of a request's lane jobs, each tagged with its generation: first those that came
+/// while the request waited for its first job's lane, then the channel's.
+struct LaneEvents {
+    rx: std::sync::mpsc::Receiver<(usize, LaneOut)>,
+    early: VecDeque<(usize, LaneOut)>,
+}
+
+impl LaneEvents {
+    /// The next event; `None` once every job's sender is gone.
+    fn recv(&mut self) -> Option<(usize, LaneOut)> {
+        self.early.pop_front().or_else(|| self.rx.recv().ok())
+    }
+}
+
+/// Puts `jobs` (generations `0..`, queued together: the first prefills the prompt, the ones that
+/// find a lane beside it copy it from there) in the model's lane session, starting the session
+/// when it is not running, and waits for the first one's lane: the jobs' events then come tagged
+/// by generation. Each job's `out` is replaced by the channel's sender. A session that can not
+/// start ends them all here; with `group` (the jobs are its generations, counted there) the
+/// others are told to stop, and the error comes once each one delivered its end.
 fn join_lanes(
     state: &Arc<AppState>,
     idx: usize,
-    mut job: LaneJob,
-) -> Result<std::sync::mpsc::Receiver<LaneOut>, String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    job.out = Box::new(move |ev| {
-        let _ = tx.send(ev);
-    });
-    if state.lanes.submit(idx, job) {
+    jobs: Vec<LaneJob>,
+    group: Option<&choices::ChoiceGroup>,
+) -> Result<LaneEvents, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, LaneOut)>();
+    let jobs: Vec<LaneJob> = jobs
+        .into_iter()
+        .enumerate()
+        .map(|(r, mut job)| {
+            let tx = tx.clone();
+            job.out = Box::new(move |ev| {
+                let _ = tx.send((r, ev));
+            });
+            job
+        })
+        .collect();
+    drop(tx);
+    if state.lanes.submit_all(idx, jobs) {
         let st = Arc::clone(state);
         if let Err(e) = thread::Builder::new()
             .name("gaudium-lanes".into())
@@ -3849,12 +3886,41 @@ fn join_lanes(
                 .fail_waiting(idx, &format!("start the lane session: {e}"));
         }
     }
-    // the request waits for a lane; a session that cannot start ends it here
-    match rx.recv() {
-        Ok(LaneOut::Started { .. }) => Ok(rx),
-        Ok(LaneOut::Done(d)) => Err(d.report.err().unwrap_or_default()),
-        Ok(LaneOut::Token(_)) | Err(_) => Err("the lane session ended".to_string()),
+    // the request waits for its first job's lane; a session that cannot start ends it here
+    let mut early = VecDeque::new();
+    let err = loop {
+        match rx.recv() {
+            Ok((0, LaneOut::Started { .. })) => break None,
+            Ok((0, LaneOut::Done(d))) => {
+                if let Some(g) = group {
+                    g.run_ended();
+                }
+                break Some(d.report.err().unwrap_or_default());
+            }
+            Ok((0, LaneOut::Token(_))) | Err(_) => break Some("the lane session ended".to_string()),
+            Ok(other) => early.push_back(other),
+        }
+    };
+    let Some(e) = err else {
+        return Ok(LaneEvents { rx, early });
+    };
+    if let Some(g) = group {
+        // the other generations are stopped, and the request answers once each has ended
+        g.cancel_all();
+        for (_, ev) in early.drain(..) {
+            if matches!(ev, LaneOut::Done(_)) {
+                g.run_ended();
+            }
+        }
+        while !g.done() {
+            match rx.recv() {
+                Ok((_, LaneOut::Done(_))) => g.run_ended(),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
     }
+    Err(e)
 }
 
 /// Runs one chat request: prompt, card turn, generation, and the reply in the shape of `api`.
@@ -4169,6 +4235,19 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         }
     }
 
+    // `n` choices (chat completions; the other APIs have none, and the completion endpoints
+    // refuse n > 1 when they parse the request): a count the server's bound admits
+    let n_choices = match api {
+        Api::Chat => match choices::requested_n(val, state.cfg.max_choices) {
+            Ok(n) => n,
+            Err(e) => {
+                api.error(stream, 400, "invalid_request_error", &e);
+                return;
+            }
+        },
+        Api::Messages { .. } | Api::Completion { .. } | Api::Responses => 1,
+    };
+
     let req_num = state.next_req_id.fetch_add(1, Ordering::Relaxed);
     let req_id = match api {
         Api::Chat => format!("chatcmpl-gaudium-{req_num}"),
@@ -4235,7 +4314,28 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         );
         return;
     }
-    let cancel_flag = Arc::new(AtomicBool::new(false));
+    // A budgeted reply is cut and resumed as one second generation: with more than one choice,
+    // each would need a think gate and a resume of its own.
+    if !crate::verified::ch_think_ok(n_choices, think_budget.is_some(), THINK_RESUME_PER_CHOICE) {
+        api.error(
+            stream,
+            400,
+            "invalid_request_error",
+            &format!(
+                "{think_field} can not be combined with n > 1 yet: send n = 1, or leave the budget out"
+            ),
+        );
+        return;
+    }
+    // The request's generations (`ch_runs`: one per sampled choice, one for all the choices of a
+    // greedy request), each with a stop flag of its own; a cancel of the request stops them all.
+    let runs = crate::verified::ch_runs(n_choices, is_greedy) as usize;
+    let group = Arc::new(choices::ChoiceGroup::new(runs));
+    // what a failed write to the client calls (a stream's writer, its keep-alive)
+    let cancel: stream_out::Cancel = {
+        let g = Arc::clone(&group);
+        Arc::new(move || g.cancel_all())
+    };
     // The request can be cancelled from now on (`/v1/chat/completions/control`, a DELETE or a
     // cancel of a response), while it waits for the card too: a cancelled request leaves the
     // queue and never reaches the engine. The entry goes when this function returns.
@@ -4243,7 +4343,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         .cancels
         .lock()
         .unwrap()
-        .insert(req_id.clone(), Arc::clone(&cancel_flag));
+        .insert(req_id.clone(), Arc::clone(&group));
     let _cancel_entry = CancelEntry {
         cancels: &state.cancels,
         id: &req_id,
@@ -4287,7 +4387,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         s.keep_alive(
             api.keep_alive_line(),
             Duration::from_millis(state.stream_heartbeat_ms.load(Ordering::Relaxed)),
-            Arc::clone(&cancel_flag),
+            Arc::clone(&cancel),
         )
     });
     // An error after the stream began: an error event, then the end of the stream.
@@ -4338,7 +4438,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 idx,
                 || state.ready_model(),
                 || TurnLimits::read(state.cfg.queue_config.as_deref()),
-                || cancel_flag.load(Ordering::Relaxed),
+                || group.cancelled(),
             )
         })
         .flatten();
@@ -4377,7 +4477,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         }
     };
     // (before any model load: a deleted request never swaps the card's model)
-    if cancel_flag.load(Ordering::Relaxed) {
+    if group.cancelled() {
         drop(turn);
         rguard.cancel();
         debug_assert!(rguard.is_terminal());
@@ -4409,7 +4509,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
 
     // Cancelled while the model loaded (the client gone included: its keep-alive sets the flag):
     // the engine does not take the request.
-    if cancel_flag.load(Ordering::Relaxed) || sink.as_ref().is_some_and(SseSink::failed) {
+    if group.cancelled() || sink.as_ref().is_some_and(SseSink::failed) {
         drop(turn);
         rguard.cancel();
         debug_assert!(rguard.is_terminal());
@@ -4438,32 +4538,33 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         ..Qwen3GenParams::default()
     };
 
-    // The engine takes the request: alone (the engine out of the slot for this request), or in
-    // a lane of the model's lane session.
-    let mut images = media.map(|md| md.into_tower_inputs());
-    // a reply resumed after its thinking budget gives the engine the same images again
-    let images_again = if think_budget.is_some() {
-        images.clone()
-    } else {
-        None
+    // generation `r` runs with the seed of choice `r` (a greedy request's one generation with the
+    // request's seed)
+    let run_params = |r: usize| Qwen3GenParams {
+        seed: choices::choice_seed(seed, r as u64),
+        ..params.clone()
     };
-    let mut lane_rx: Option<std::sync::mpsc::Receiver<LaneOut>> = None;
+
+    // The engine takes the request: alone (the engine out of the slot for this request), or in
+    // lanes of the model's lane session (its generations queued together). Every generation, and
+    // a reply resumed after its thinking budget, gives the engine the same images.
+    let tower = media.map(|md| md.into_tower_inputs());
+    let mut lane_feed: Option<LaneEvents> = None;
     let mut _op = None;
     let (mut engine, hbm_bytes) = if lane_mode {
-        let started = join_lanes(
-            state,
-            idx,
-            LaneJob {
+        let jobs: Vec<LaneJob> = (0..runs)
+            .map(|r| LaneJob {
                 id: req_num,
                 prompt: prompt_ids.clone(),
-                params: params.clone(),
-                images: images.take(),
-                cancel: Arc::clone(&cancel_flag),
+                params: run_params(r),
+                images: tower.clone(),
+                cancel: group.flag(r),
                 out: Box::new(|_| {}),
-            },
-        );
-        let (rx, err) = match started {
-            Ok(rx) => (Some(rx), None),
+            })
+            .collect();
+        let started = join_lanes(state, idx, jobs, Some(&group));
+        let (feed, err) = match started {
+            Ok(feed) => (Some(feed), None),
             Err(e) => (None, Some(e)),
         };
         if let Some(e) = err {
@@ -4493,7 +4594,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         };
         state.publish_engine_event();
         step_request_guard(&mut rguard, ReqEvent::EvReqStartPrefill, &req_id);
-        lane_rx = rx;
+        lane_feed = feed;
         (None, hbm)
     } else {
         // Acquire card op lock for exclusive Gaudi 2 execution.
@@ -4541,22 +4642,39 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let queued_ms = t_arrival.elapsed().as_secs_f64() * 1e3;
     state.publish_request(req_num, format!("{{{}}}", req_base("prefill", queued_ms)));
 
-    let mut decoder = StreamDecoder::new(&m.tokenizer);
-    // Generated text -> reasoning, content and tool calls (and the request's stop strings).
-    // (a completion's text passes through as generated: its parser looks for no family tags)
-    let mut parser = OutputParser::new(
-        prompt.reasoning_open,
-        split_reasoning,
-        prompt.tools.clone(),
-        stop_seqs,
-        match api {
-            Api::Completion { .. } => outparse::OutputFormat::default(),
-            _ => m.format.clone(),
-        },
-    );
-    if prompt.single_call {
-        parser.set_max_calls(1);
+    // Each generation's text -> reasoning, content and tool calls (and the request's stop
+    // strings); the choices it answers, those that read it (`ch_run_of`: greedy, one generation
+    // for all of them; sampled, its own). (A completion's text passes through as generated: its
+    // parser looks for no family tags.)
+    struct Gen<'t> {
+        decoder: StreamDecoder<'t>,
+        parser: OutputParser,
+        choices: Vec<usize>,
     }
+    let n_out = n_choices as usize;
+    let mut gens: Vec<Gen<'_>> = (0..runs)
+        .map(|r| {
+            let mut parser = OutputParser::new(
+                prompt.reasoning_open,
+                split_reasoning,
+                prompt.tools.clone(),
+                stop_seqs.clone(),
+                match api {
+                    Api::Completion { .. } => outparse::OutputFormat::default(),
+                    _ => m.format.clone(),
+                },
+            );
+            if prompt.single_call {
+                parser.set_max_calls(1);
+            }
+            Gen {
+                decoder: StreamDecoder::new(&m.tokenizer),
+                parser,
+                choices: choices::choices_of(r, runs, n_out),
+            }
+        })
+        .collect();
+    let gen_choices: Vec<Vec<usize>> = gens.iter().map(|g| g.choices.clone()).collect();
     let format = &m.format;
     let mut started_decode = false;
     let tok_ref = Arc::clone(&m.tokenizer);
@@ -4576,34 +4694,43 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         .as_ref()
         .and_then(|e| e.live_profile())
         .filter(|h| h.is_live());
-    let out = Arc::new(Mutex::new(StreamOut::new(
-        sink.clone(),
-        &req_id,
-        &model_id,
-        created,
-        timings_per_token,
-        return_progress,
-        n_prompt,
-        live.is_some(),
-        Arc::clone(&cancel_flag),
-        match api {
-            Api::Chat | Api::Messages { .. } | Api::Responses => ChunkForm::Chat,
-            Api::Completion { native: false } => ChunkForm::Text,
-            Api::Completion { native: true } => ChunkForm::Native,
-        },
-    )));
-    {
+    // one writer per choice, all on the request's one stream
+    let outs: Vec<Arc<Mutex<StreamOut>>> = (0..n_out)
+        .map(|c| {
+            Arc::new(Mutex::new(
+                StreamOut::new(
+                    sink.clone(),
+                    &req_id,
+                    &model_id,
+                    created,
+                    timings_per_token,
+                    return_progress,
+                    n_prompt,
+                    live.is_some(),
+                    Arc::clone(&cancel),
+                    match api {
+                        Api::Chat | Api::Messages { .. } | Api::Responses => ChunkForm::Chat,
+                        Api::Completion { native: false } => ChunkForm::Text,
+                        Api::Completion { native: true } => ChunkForm::Native,
+                    },
+                )
+                .with_index(c as u64),
+            ))
+        })
+        .collect();
+    for (c, out) in outs.iter().enumerate() {
         // The chat role chunk goes out now, so a client times its request from the moment the
         // engine took it. (The Messages stream began with `message_start` at admission.)
         let mut o = out.lock().unwrap();
         match api {
             Api::Chat => {
                 let init_chunk = format!(
-                    "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
+                    "data: {{{},\"choices\":[{{\"index\":{c},\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
                     o.chunk_head(),
                 );
                 o.write(&init_chunk);
             }
+            // (one choice: the Messages API has no `n`)
             Api::Messages { show_thinking } => {
                 o.anth = Some(anthropic::Builder::new(show_thinking));
             }
@@ -4612,54 +4739,46 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 let init_chunk = o.text_chunk(None, "");
                 o.write(&init_chunk);
             }
-            // (the Responses stream began with `response.created` at admission)
+            // (the Responses stream began with `response.created` at admission; one choice)
             Api::Responses => o.resp = resp_start.take(),
         }
-        // A forced tool call's opening is already in the prompt: the parser reads it first.
-        if !prompt.forced_prefix.is_empty() {
-            o.add(parser.feed(&prompt.forced_prefix));
-        }
     }
-    if let Some(h) = &live {
-        let sink_out = Arc::clone(&out);
-        h.set_launch_sink(Some(Box::new(move |ev| {
-            sink_out.lock().unwrap().on_event(ev);
-        })));
+    // A forced tool call's opening is already in the prompt: each parser reads it first.
+    if !prompt.forced_prefix.is_empty() {
+        for g in gens.iter_mut() {
+            let d = g.parser.feed(&prompt.forced_prefix);
+            for &c in &g.choices {
+                outs[c].lock().unwrap().add(d.clone());
+            }
+        }
     }
 
     let mut last_live_pub = Instant::now();
     let mut lane_done: Option<Box<LaneDone>> = None;
-    // The thinking budget's gate, which every generated token passes first; the reply's tokens
-    // as kept (a reply resumed after a forced end of thinking is prompted with them); the
-    // request's current cancel flag (a resumed reply runs under a fresh one).
+    // The thinking budget's gate, which every generated token passes first (one choice:
+    // `ch_think_ok`); each generation's tokens as kept (a reply resumed after a forced end of
+    // thinking is prompted with them); whether the client cancelled before a cut.
     let think = RefCell::new(think_budget);
     let think_cut: Cell<Option<ThinkStep>> = Cell::new(None);
     let client_cancelled = Cell::new(false);
-    let kept: RefCell<Vec<i32>> = RefCell::new(Vec::new());
-    let cancel_now = RefCell::new(Arc::clone(&cancel_flag));
-    let report = {
-        let mut on_token = |tok_id: i32| {
+    let kept: RefCell<Vec<Vec<i32>>> = RefCell::new(vec![Vec::new(); runs]);
+    let reports: Vec<Result<crate::engine::GenReport, String>> = {
+        let mut on_token = |r: usize, tok_id: i32| {
+            let g = &mut gens[r];
             let mut toks: &[i32] = std::slice::from_ref(&tok_id);
-            if let Some(tb) = think.borrow_mut().as_mut().filter(|_| !parser.stopped()) {
+            if let Some(tb) = think.borrow_mut().as_mut().filter(|_| !g.parser.stopped()) {
                 // the rest of the launch after a cut is dropped
                 if think_cut.get().is_some() {
                     return;
                 }
-                match tb.step(parser.in_reasoning()) {
+                match tb.step(g.parser.in_reasoning()) {
                     ThinkStep::Keep => {}
                     step @ (ThinkStep::Close | ThinkStep::End) => {
-                        // The engine stops this generation. A client cancel that came before
-                        // this point is on the old flag; one that comes later finds the new one.
+                        // The engine stops this generation; what runs next runs under a fresh
+                        // flag, which a cancel of the request reaches like the old one.
                         think_cut.set(Some(step));
-                        let fresh = Arc::new(AtomicBool::new(false));
-                        state
-                            .cancels
-                            .lock()
-                            .unwrap()
-                            .insert(req_id.clone(), Arc::clone(&fresh));
-                        out.lock().unwrap().set_cancel(Arc::clone(&fresh));
-                        let old = std::mem::replace(&mut *cancel_now.borrow_mut(), fresh);
-                        client_cancelled.set(old.swap(true, Ordering::Relaxed));
+                        let (_fresh, cancelled) = group.renew(r);
+                        client_cancelled.set(cancelled);
                         if step == ThinkStep::End {
                             return;
                         }
@@ -4669,32 +4788,37 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 }
             }
             for &tok_id in toks {
-                kept.borrow_mut().push(tok_id);
+                kept.borrow_mut()[r].push(tok_id);
                 let piece = if tok_ref.is_special(tok_id) {
                     // a special token is text only when it is part of the family's tags
                     let text = String::from_utf8_lossy(tok_ref.token_bytes(tok_id)).into_owned();
                     if format.is_marker_piece(&text) {
-                        decoder.flush() + &text
+                        g.decoder.flush() + &text
                     } else {
                         String::new()
                     }
                 } else {
-                    decoder.push(tok_id)
+                    g.decoder.push(tok_id)
                 };
                 let delta = if piece.is_empty() {
                     Delta::default()
                 } else {
-                    parser.feed(&piece)
+                    g.parser.feed(&piece)
                 };
-                // a stop string, or the call limit: the generation ends here
-                if parser.stopped() {
-                    cancel_now.borrow().store(true, Ordering::Relaxed);
+                // a stop string, or the call limit: this generation ends here
+                if g.parser.stopped() {
+                    group.flag(r).store(true, Ordering::Relaxed);
                 }
-                let (timings, seen) = {
-                    let mut o = out.lock().unwrap();
-                    o.push_token(delta);
-                    (o.timings(), o.seen_tokens())
-                };
+                let mut timings = None;
+                let mut seen = 0;
+                for &c in &g.choices {
+                    let mut o = outs[c].lock().unwrap();
+                    o.push_token(delta.clone());
+                    if timings.is_none() {
+                        timings = Some(o.timings());
+                        seen = o.seen_tokens();
+                    }
+                }
                 if !started_decode {
                     started_decode = true;
                     step_request_guard(&mut rguard, ReqEvent::EvReqPrefillDone, &req_id);
@@ -4703,7 +4827,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                         format!(
                             "{{{},\"timings\":{}}}",
                             req_base("decode", queued_ms),
-                            timings.json()
+                            timings.unwrap_or_default().json()
                         ),
                     );
                 }
@@ -4725,108 +4849,153 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 }
             }
         };
-        // One generation on the engine (or in a lane: `rx` is the lane already joined, else the
-        // job joins the lane session here), under the request's current cancel flag.
-        let mut generate = |prompt: &[i32],
+        // One generation `r` on the engine, or in a lane (it joins the lane session here),
+        // under the generation's current flag; a lane's end comes with it.
+        let mut generate = |r: usize,
+                            prompt: &[i32],
                             params: &Qwen3GenParams,
                             images: Option<Vec<crate::vision::PreparedImage>>,
-                            rx: Option<std::sync::mpsc::Receiver<LaneOut>>,
-                            on_token: &mut dyn FnMut(i32)|
-         -> Result<crate::engine::GenReport, String> {
-            let flag = cancel_now.borrow().clone();
+                            on_token: &mut dyn FnMut(usize, i32)|
+         -> (
+            Result<crate::engine::GenReport, String>,
+            Option<Box<LaneDone>>,
+        ) {
+            let flag = group.flag(r);
             match engine.as_mut() {
                 Some(engine) => {
+                    // the launch feed goes to the writers of this generation's choices
+                    if let Some(h) = &live {
+                        let sink_outs: Vec<Arc<Mutex<StreamOut>>> =
+                            gen_choices[r].iter().map(|&c| Arc::clone(&outs[c])).collect();
+                        h.set_launch_sink(Some(Box::new(move |ev| {
+                            for o in &sink_outs {
+                                o.lock().unwrap().on_event(ev);
+                            }
+                        })));
+                    }
                     // The request's tower inputs go to the engine first; it runs the tower
                     // inside its prefill.
                     let images_set = match images {
                         Some(v) => engine.set_request_images(v),
                         None => Ok(()),
                     };
-                    images_set.and_then(|()| {
-                        engine.generate_cancellable(prompt, params, Some(&flag), on_token)
-                    })
+                    let rep = images_set.and_then(|()| {
+                        engine.generate_cancellable(prompt, params, Some(&flag), &mut |t| {
+                            on_token(r, t)
+                        })
+                    });
+                    (rep, None)
                 }
                 None => {
                     // a lane: tokens and the end come from the lane session
-                    let rx = match rx {
-                        Some(rx) => rx,
-                        None => join_lanes(
-                            state,
-                            idx,
-                            LaneJob {
-                                id: req_num,
-                                prompt: prompt.to_vec(),
-                                params: params.clone(),
-                                images,
-                                cancel: flag,
-                                out: Box::new(|_| {}),
-                            },
-                        )?,
+                    let job = LaneJob {
+                        id: req_num,
+                        prompt: prompt.to_vec(),
+                        params: params.clone(),
+                        images,
+                        cancel: flag,
+                        out: Box::new(|_| {}),
+                    };
+                    let mut feed = match join_lanes(state, idx, vec![job], None) {
+                        Ok(f) => f,
+                        Err(e) => return (Err(e), None),
                     };
                     loop {
-                        match rx.recv() {
-                            Ok(LaneOut::Token(t)) => on_token(t),
-                            Ok(LaneOut::Started { .. }) => {}
-                            Ok(LaneOut::Done(mut d)) => {
-                                let r = std::mem::replace(&mut d.report, Err(String::new()));
-                                lane_done = Some(d);
-                                break r;
+                        match feed.recv() {
+                            Some((_, LaneOut::Token(t))) => on_token(r, t),
+                            Some((_, LaneOut::Started { .. })) => {}
+                            Some((_, LaneOut::Done(mut d))) => {
+                                let rep = std::mem::replace(&mut d.report, Err(String::new()));
+                                break (rep, Some(d));
                             }
-                            Err(_) => break Err("the lane session ended".to_string()),
+                            None => break (Err("the lane session ended".to_string()), None),
                         }
                     }
                 }
             }
         };
-        let first = generate(
-            &prompt_ids,
-            &params,
-            images.take(),
-            lane_rx.take(),
-            &mut on_token,
-        );
-        // A forced end of thinking with room left: the reply resumes from the prompt, the tokens
-        // kept and the marker, with what is left of its token budget.
-        let resume = match (&first, think_cut.get()) {
-            (Ok(_), Some(ThinkStep::Close)) if !client_cancelled.get() => think
-                .borrow()
-                .as_ref()
-                .map(ThinkBudget::remaining)
-                .filter(|&r| r > 0),
-            _ => None,
-        };
-        let joined = match (first, resume) {
-            (Ok(rep1), Some(room)) => {
-                let prompt2: Vec<i32> = prompt_ids.iter().chain(kept.borrow().iter()).copied().collect();
-                let params2 = Qwen3GenParams {
-                    max_new: room,
-                    ..params.clone()
-                };
-                think_cut.set(None);
-                generate(
-                    &prompt2,
-                    &params2,
-                    images_again.clone(),
-                    None,
-                    &mut on_token,
-                )
-                .map(|rep2| resumed_report(rep1, rep2))
+        let mut reports: Vec<Option<Result<crate::engine::GenReport, String>>> =
+            (0..runs).map(|_| None).collect();
+        match lane_feed.take() {
+            // lanes: the generations already joined; their tokens and ends come tagged by
+            // generation, and the request goes on once every one delivered its end
+            Some(mut feed) => {
+                while !group.done() {
+                    match feed.recv() {
+                        Some((r, LaneOut::Token(t))) => on_token(r, t),
+                        Some((_, LaneOut::Started { .. })) => {}
+                        Some((r, LaneOut::Done(mut d))) => {
+                            reports[r] = Some(std::mem::replace(&mut d.report, Err(String::new())));
+                            lane_done = Some(d);
+                            group.run_ended();
+                        }
+                        None => break,
+                    }
+                }
             }
-            (r, _) => r,
-        };
-        // a reply the thinking budget cut reports the tokens it kept, and ends at its length
-        joined.map(|mut rep| {
-            if think_cut.get().is_some() || resume.is_some() {
-                // the rest of a launch past the cut was dropped: the rates count the kept tokens
-                rep.generated_tokens = kept.borrow().clone();
-                set_token_rates(&mut rep);
+            // one generation after the other in the one lane: each later one resumes from the
+            // position the engine's prefix table kept for the prompt
+            None => {
+                for (r, report) in reports.iter_mut().enumerate() {
+                    let (rep, _) = generate(r, &prompt_ids, &run_params(r), tower.clone(), &mut on_token);
+                    *report = Some(rep);
+                    group.run_ended();
+                }
             }
-            if think_cut.get().is_some() {
-                rep.stopped_by_eos = false;
-                rep.stopped_by_cancel = client_cancelled.get();
-            }
-            rep
-        })
+        }
+        let mut reports: Vec<Result<crate::engine::GenReport, String>> = reports
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err("the lane session ended".to_string())))
+            .collect();
+        // A forced end of thinking with room left (one choice, `ch_think_ok`): the reply resumes
+        // from the prompt, the tokens kept and the marker, with what is left of its token budget.
+        if think.borrow().is_some() {
+            let first = std::mem::replace(&mut reports[0], Err(String::new()));
+            let resume = match (&first, think_cut.get()) {
+                (Ok(_), Some(ThinkStep::Close)) if !client_cancelled.get() => think
+                    .borrow()
+                    .as_ref()
+                    .map(ThinkBudget::remaining)
+                    .filter(|&r| r > 0),
+                _ => None,
+            };
+            let joined = match (first, resume) {
+                (Ok(rep1), Some(room)) => {
+                    let prompt2: Vec<i32> = prompt_ids
+                        .iter()
+                        .chain(kept.borrow()[0].iter())
+                        .copied()
+                        .collect();
+                    let params2 = Qwen3GenParams {
+                        max_new: room,
+                        ..run_params(0)
+                    };
+                    think_cut.set(None);
+                    let (rep2, done2) =
+                        generate(0, &prompt2, &params2, tower.clone(), &mut on_token);
+                    if done2.is_some() {
+                        lane_done = done2;
+                    }
+                    rep2.map(|rep2| resumed_report(rep1, rep2))
+                }
+                (r, _) => r,
+            };
+            // a reply the thinking budget cut reports the tokens it kept, and ends at its length
+            reports[0] = joined.map(|mut rep| {
+                if think_cut.get().is_some() || resume.is_some() {
+                    // the rest of a launch past the cut was dropped: the rates count the kept
+                    // tokens
+                    rep.generated_tokens = kept.borrow()[0].clone();
+                    set_token_rates(&mut rep);
+                }
+                if think_cut.get().is_some() {
+                    rep.stopped_by_eos = false;
+                    rep.stopped_by_cancel = client_cancelled.get();
+                }
+                rep
+            });
+        }
+        reports
     };
     if let Some(h) = &live {
         h.set_launch_sink(None);
@@ -4866,392 +5035,494 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     drop(turn);
     state.cancels.lock().unwrap().remove(&req_id);
 
-    // Flush the decoder's and the parser's tail, after any output the last launch left unwritten
-    let tail = decoder.flush();
-    let mut tail_delta = parser.feed(&tail);
-    tail_delta.append(parser.finish());
-    let mut out = out.lock().unwrap();
-    out.add(tail_delta);
-    let pending = out.take_pending();
-    let builder = out.anth.take();
-    let mut resp_builder = out.resp.take();
-    let first_token_ms = out.first_token_ms();
+    // Flush each decoder's and parser's tail, after any output the last launch left unwritten
+    for g in gens.iter_mut() {
+        let tail = g.decoder.flush();
+        let mut tail_delta = g.parser.feed(&tail);
+        tail_delta.append(g.parser.finish());
+        for &c in &g.choices {
+            outs[c].lock().unwrap().add(tail_delta.clone());
+        }
+    }
+    let (builder, mut resp_builder, first_token_ms) = {
+        let mut o = outs[0].lock().unwrap();
+        (o.anth.take(), o.resp.take(), o.first_token_ms())
+    };
 
-    match report {
-        Ok(rep) => {
-            // How the generation ended and what the client is told: the verified selection.
-            let has_calls = !parser.tool_calls().is_empty();
-            let stop_string = !parser.matched_stop().is_empty();
+    // How the request ends: a generation that failed fails the request (`ch_end`).
+    let failed: Vec<&String> = reports.iter().filter_map(|r| r.as_ref().err()).collect();
+    if !crate::verified::ch_end_ok(crate::verified::ch_end(failed.len() as u64)) {
+        let e = failed.first().map_or_else(String::new, |e| e.to_string());
+        step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
+        debug_assert!(rguard.is_terminal());
+        state.publish_request(
+            req_num,
+            format!(
+                "{{{},\"message\":{}}}",
+                req_base("error", queued_ms),
+                jq(&e)
+            ),
+        );
+        if stream_mode {
+            // a response that began ends as failed, in its own sequence (after the events
+            // its output already built)
+            let mut out = outs[0].lock().unwrap();
+            let mut events = String::new();
+            if resp_builder.is_some() {
+                events.push_str(&out.take_held());
+            }
+            events.push_str(&stream_fail_events(api, resp_builder.as_mut(), 500, &e));
+            out.write(&events);
+            if let Some(s) = &sink {
+                s.end();
+            }
+        } else {
+            api.error(stream, 500, "server_error", &e);
+        }
+        return;
+    }
+    let reports: Vec<crate::engine::GenReport> =
+        reports.into_iter().map(|r| r.unwrap_or_default()).collect();
+
+    // How each generation ended and what the client is told: the verified selection.
+    let ends: Vec<(GenEnd, bool, bool)> = gens
+        .iter()
+        .zip(&reports)
+        .map(|(g, rep)| {
+            let has_calls = !g.parser.tool_calls().is_empty();
+            let stop_string = !g.parser.matched_stop().is_empty();
             let end = generation_end(
                 stop_string,
-                parser.stopped() && !stop_string,
+                g.parser.stopped() && !stop_string,
                 rep.stopped_by_eos,
                 rep.stopped_by_cancel,
             );
-            match end {
-                GenEnd::GeCancelled => {
-                    rguard.cancel();
-                }
-                GenEnd::GeLength => {
-                    step_request_guard(&mut rguard, ReqEvent::EvReqFinishLength, &req_id);
-                }
-                GenEnd::GeEos | GenEnd::GeStopString | GenEnd::GeCallLimit => {
-                    if !started_decode {
-                        step_request_guard(&mut rguard, ReqEvent::EvReqPrefillDone, &req_id);
-                    }
-                    step_request_guard(&mut rguard, ReqEvent::EvReqFinishStop, &req_id);
-                }
-            }
-            debug_assert!(rguard.is_terminal());
-            let finish_reason = finish_reason_name(end, has_calls);
-            // the readout's phases are stop / length / cancelled
-            let phase = if has_calls && end != GenEnd::GeCancelled {
-                "stop"
-            } else {
-                finish_reason
-            };
-            let n_gen = rep.generated_tokens.len() as u64;
-            let summary = live.as_ref().and_then(|h| h.request_summary());
-            // Launches: the engine's report; an engine whose report carries none is taken at its
-            // launch feed; with neither, the count is unknown and left out.
-            let launches = if rep.launches > 0 || n_gen <= 1 {
-                Some(rep.launches)
-            } else {
-                summary.as_ref().map(|s| s.launches)
-            };
-            let timings = Timings {
-                prompt_ms: rep.ttft_ms,
-                predicted_n: n_gen,
-                predicted_ms: rep.decode_ms,
-                launches,
-                draft_n: rep.drafted,
-                draft_n_accepted: rep.draft_accepted,
-                // the prompt as reused + prefilled rows
-                ..Timings::of_prompt(rep.prompt_tokens as u64, rep.reused_tokens)
-            };
-            let timings_json = timings.json();
-
-            let profile = live.as_ref().and_then(|h| h.final_snapshot());
-            let final_live = format!(
-                "{{\"type\":\"live\",\"job\":{req_num},\"source\":\"engine\",\"record\":{}}}",
-                readout::live_record_json(
-                    "decode",
-                    &method,
-                    summary.as_ref(),
-                    hbm_bytes,
-                    profile.as_deref(),
-                )
-            );
-            state.slot.lock().unwrap().last_live_json = Some(final_live.clone());
-            state.hub.publish(final_live);
-
-            let usage = format!(
-                "{{\"prompt_tokens\":{},\"completion_tokens\":{n_gen},\"total_tokens\":{},\
-                 \"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}",
-                rep.prompt_tokens,
-                rep.prompt_tokens as u64 + n_gen,
-                timings.cache_n,
-            );
-            let seed_json = if is_greedy {
-                "null".to_string()
-            } else {
-                seed.to_string()
-            };
-            // The request's details. Times: `queued_ms` request received -> the engine took it
-            // (model load, other requests); `reset_ms` the engine took it -> its prefill began
-            // (per-request state reset); `prefill_ms` the engine's own prefill clock up to the
-            // first token; `ttft_ms` the engine took it -> first token (reset + prefill).
-            let mut details = format!(
-                "{{\"method\":{},\"engine_method\":{},\"prefill_ms\":{:.2},\"decode_loop_ms\":{:.2},\
-                 \"queued_ms\":{queued_ms:.2}",
-                jq(&method),
-                jq(&rep.method),
-                rep.ttft_ms,
-                rep.decode_ms,
-            );
-            if let Some(t) = first_token_ms {
-                details.push_str(&format!(
-                    ",\"ttft_ms\":{t:.2},\"reset_ms\":{:.2}",
-                    (t - rep.ttft_ms).max(0.0)
-                ));
-            }
-            if let Some(l) = launches {
-                details.push_str(&format!(",\"steps\":{l}"));
-                if l > 0 {
-                    details.push_str(&format!(
-                        ",\"ms_per_step\":{:.3},\"tok_per_step\":{:.3},\"decode_tok_s\":{:.2}",
-                        rep.decode_ms / l as f64,
-                        n_gen.saturating_sub(1) as f64 / l as f64,
-                        rep.decode_tok_s,
-                    ));
-                }
-            }
-            if let Some(sum) = summary.as_ref().filter(|s| !s.log.is_empty()) {
-                details.push_str(&format!(",\"aseq\":{}", jq(&readout::aseq(&sum.log))));
-            }
-            if let Some(sec) = readout::spec_section_json(&timings) {
-                details.push_str(&format!(",\"spec\":{sec}"));
-            }
-            if has_calls {
-                details.push_str(&format!(",\"tool_calls\":{}", parser.tool_calls().len()));
-            }
-            // the thinking budget: the reasoning cap, the reasoning tokens kept, and whether the
-            // end of thinking was forced
-            if let Some(tb) = think.borrow().as_ref() {
-                details.push_str(&format!(
-                    ",\"thinking\":{{\"cap\":{},\"reasoning_tokens\":{},\"forced_close\":{}}}",
-                    tb.cap(),
-                    tb.kept(),
-                    tb.forced()
-                ));
-            }
-            // prefix reuse: rows taken over from the previous request, and how many rows of
-            // the prompt equal the one the engine held (a resume point lies below that)
-            if prefix_stats.is_some_and(|p| p.slots > 0) {
-                // `tier`: where the reused rows came from (device, host, or prefilled: none
-                // were reused); `host`: what the host-RAM tier copied for this request
-                details.push_str(&format!(
-                    ",\"prefix\":{{\"hit\":{},\"reused_tokens\":{},\"common_tokens\":{},\"tier\":\"{}\"",
-                    timings.cache_n > 0,
-                    timings.cache_n,
-                    rep.prefix_common,
-                    readout::tier_name(rep.host_tier.as_ref(), timings.cache_n),
-                ));
-                if let Some(t) = rep.host_tier.as_ref() {
-                    details.push_str(&format!(",\"host\":{}", readout::tier_json(t)));
-                }
-                details.push('}');
-            }
-            if n_images > 0 {
-                details.push_str(&format!(
-                    ",\"vision\":{}",
-                    readout::vision_section_json(
-                        &media_counts,
-                        media_host_ms,
-                        vision_report.as_ref(),
-                        rep.ttft_ms,
-                    )
-                ));
-            }
-            // `gaudium_return_tokens`: the generated token ids (exactness checks between runs)
-            if val.get("gaudium_return_tokens").and_then(|v| v.as_bool()) == Some(true) {
-                details.push_str(&format!(",\"tokens\":{}", ids_json(&rep.generated_tokens)));
-            }
-            if !ignored.is_empty() {
-                details.push_str(&format!(
-                    ",\"ignored\":[{}]",
-                    ignored.iter().map(|i| jq(i)).collect::<Vec<_>>().join(",")
-                ));
-            }
-            details.push_str(&format!(
-                ",\"sampling\":{{\"greedy\":{is_greedy},\"temperature\":{temperature:.3},\"top_k\":{top_k},\
-                 \"top_p\":{top_p:.3},\"min_p\":{min_p:.3},\"seed\":{seed_json}}}}}"
-            ));
-            state.publish_request(
-                req_num,
-                format!(
-                    "{{{},\"timings\":{timings_json},\"details\":{details}}}",
-                    req_base(phase, queued_ms)
-                ),
-            );
-
-            if api == Api::Responses {
-                let mut b = resp_builder.unwrap_or_else(|| {
-                    responses::Builder::new(
-                        state.responses.head(&req_id).unwrap_or_default(),
-                        &req_id,
-                        &model_id,
-                        created,
-                        temperature,
-                        top_p,
-                    )
-                });
-                let ending = match end {
-                    GenEnd::GeCancelled => responses::Ending::Cancelled,
-                    GenEnd::GeLength => responses::Ending::Incomplete,
-                    GenEnd::GeEos | GenEnd::GeStopString | GenEnd::GeCallLimit => {
-                        responses::Ending::Completed
-                    }
-                };
-                // reasoning tokens: the reasoning text as the tokenizer counts it
-                let reasoning_tokens = if parser.reasoning().is_empty() {
-                    0
-                } else {
-                    tok_ref.encode(parser.reasoning(), false).len() as u64
-                };
-                let usage = responses::usage_json(
-                    rep.prompt_tokens as u64,
-                    rep.reused_tokens,
-                    n_gen,
-                    reasoning_tokens,
-                );
-                let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
-                let mut events = out.take_held() + &b.feed(&pending);
-                let (end_events, resp) =
-                    end_response(state, &mut b, &req_id, ending, &usage, &extra);
-                events.push_str(&end_events);
-                if stream_mode {
-                    out.write(&events);
-                    if let Some(s) = &sink {
-                        s.end();
-                    }
-                } else {
-                    write_json(stream, 200, &resp);
-                }
-            } else if let Api::Messages { show_thinking } = api {
-                let mut b = builder.unwrap_or_else(|| anthropic::Builder::new(show_thinking));
-                let stop = stop_reason_name(end, has_calls);
-                let usage = anthropic::usage_json_cached(
-                    rep.prompt_tokens as u64,
-                    rep.reused_tokens,
-                    n_gen,
-                );
-                let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
-                let events = out.take_held() + &b.feed(&pending);
-                if stream_mode {
-                    out.write(&events);
-                    out.write(&b.finish(stop, parser.matched_stop(), &usage, &extra));
-                    if let Some(s) = &sink {
-                        s.end();
-                    }
-                } else {
-                    b.close();
-                    let msg = b.message(
-                        &req_id,
-                        &model_id,
-                        stop,
-                        parser.matched_stop(),
-                        &usage,
-                        &extra,
-                    );
-                    write_json(stream, 200, &msg);
-                }
-            } else if let Api::Completion { native } = api {
-                // the generated text; in a stream, what the chunks before have not carried
-                let text = if stream_mode {
-                    stream_out::plain_text(&pending)
-                } else {
-                    format!("{}{}", parser.reasoning(), parser.content())
-                };
-                let body = if native {
-                    // the native shape names how the generation ended
-                    let stop_type = match finish_reason {
-                        "length" => "limit",
-                        "cancelled" => "none",
-                        _ if stop_string => "word",
-                        _ => "eos",
-                    };
-                    format!(
-                        "{{\"content\":{},\"id\":{},\"model\":{},\"stop\":true,\"stop_type\":\"{stop_type}\",\
-                         \"stopping_word\":{},\"tokens_predicted\":{n_gen},\"tokens_evaluated\":{},\
-                         \"tokens_cached\":{},\"truncated\":false,\"usage\":{usage},\"timings\":{timings_json},\
-                         \"gaudium\":{details}}}",
-                        jq(&text),
-                        jq(&req_id),
-                        jq(&model_id),
-                        jq(parser.matched_stop()),
-                        rep.prompt_tokens,
-                        timings.cache_n,
-                    )
-                } else {
-                    let head = if stream_mode {
-                        out.chunk_head().to_string()
-                    } else {
-                        format!(
-                            "\"id\":{},\"object\":\"text_completion\",\"created\":{created},\"model\":{}",
-                            jq(&req_id),
-                            jq(&model_id)
-                        )
-                    };
-                    format!(
-                        "{{{head},\"choices\":[{{\"index\":0,\"text\":{},\"logprobs\":null,\"finish_reason\":{}}}],\
-                         \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}",
-                        jq(&text),
-                        jq(finish_reason),
-                    )
-                };
-                if stream_mode {
-                    // a native stream has no end marker
-                    let end = if native { "" } else { "data: [DONE]\n\n" };
-                    out.write(&format!("data: {body}\n\n{end}"));
-                    if !out.write_failed {
-                        write_sse_end(stream);
-                    }
-                } else {
-                    write_json(stream, 200, &body);
-                }
-            } else if stream_mode {
-                let final_chunk = format!(
-                    "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{},\"finish_reason\":{}}}],\
-                     \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}\n\ndata: [DONE]\n\n",
-                    out.chunk_head(),
-                    stream_out::delta_json(&pending),
-                    jq(finish_reason),
-                );
-                out.write(&final_chunk);
-                if let Some(s) = &sink {
-                    s.end();
-                }
-            } else {
-                // a reply that is only tool calls has no content
-                let content = if parser.content().is_empty() && has_calls {
-                    "null".to_string()
-                } else {
-                    jq(parser.content())
-                };
-                let mut msg = format!("{{\"role\":\"assistant\",\"content\":{content}");
-                if !parser.reasoning().is_empty() {
-                    msg.push_str(&format!(
-                        ",\"reasoning_content\":{}",
-                        jq(parser.reasoning())
-                    ));
-                }
-                if has_calls {
-                    msg.push_str(&format!(
-                        ",\"tool_calls\":{}",
-                        chat::tool_calls_json(parser.tool_calls()).dump()
-                    ));
-                }
-                msg.push('}');
-                let resp = format!(
-                    "{{\"id\":{},\"object\":\"chat.completion\",\"created\":{created},\"model\":{},\
-                     \"choices\":[{{\"index\":0,\"message\":{msg},\"finish_reason\":{}}}],\
-                     \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}",
-                    jq(&req_id),
-                    jq(&model_id),
-                    jq(finish_reason),
-                );
-                write_json(stream, 200, &resp);
-            }
+            (end, has_calls, stop_string)
+        })
+        .collect();
+    // the request's lifecycle follows its first generation
+    let (end, has_calls, stop_string) = ends[0];
+    match end {
+        GenEnd::GeCancelled => {
+            rguard.cancel();
         }
-        Err(e) => {
-            step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
-            debug_assert!(rguard.is_terminal());
-            state.publish_request(
-                req_num,
-                format!(
-                    "{{{},\"message\":{}}}",
-                    req_base("error", queued_ms),
-                    jq(&e)
-                ),
-            );
-            if stream_mode {
-                // a response that began ends as failed, in its own sequence (after the events
-                // its output already built)
-                let mut events = String::new();
-                if resp_builder.is_some() {
-                    events.push_str(&out.take_held());
-                }
-                events.push_str(&stream_fail_events(api, resp_builder.as_mut(), 500, &e));
-                out.write(&events);
-                if let Some(s) = &sink {
-                    s.end();
-                }
-            } else {
-                api.error(stream, 500, "server_error", &e);
+        GenEnd::GeLength => {
+            step_request_guard(&mut rguard, ReqEvent::EvReqFinishLength, &req_id);
+        }
+        GenEnd::GeEos | GenEnd::GeStopString | GenEnd::GeCallLimit => {
+            if !started_decode {
+                step_request_guard(&mut rguard, ReqEvent::EvReqPrefillDone, &req_id);
             }
+            step_request_guard(&mut rguard, ReqEvent::EvReqFinishStop, &req_id);
         }
     }
+    debug_assert!(rguard.is_terminal());
+    let rep = &reports[0];
+    let parser = &gens[0].parser;
+    let finish_reason = finish_reason_name(end, has_calls);
+    // the readout's phases are stop / length / cancelled
+    let phase = if has_calls && end != GenEnd::GeCancelled {
+        "stop"
+    } else {
+        finish_reason
+    };
+    let n_gen = rep.generated_tokens.len() as u64;
+    let summary = live.as_ref().and_then(|h| h.request_summary());
+    // Launches: the engine's report; an engine whose report carries none is taken at its
+    // launch feed; with neither, the count is unknown and left out.
+    let launches = if rep.launches > 0 || n_gen <= 1 {
+        Some(rep.launches)
+    } else {
+        summary.as_ref().map(|s| s.launches)
+    };
+    let timings = Timings {
+        prompt_ms: rep.ttft_ms,
+        predicted_n: n_gen,
+        predicted_ms: rep.decode_ms,
+        launches,
+        draft_n: rep.drafted,
+        draft_n_accepted: rep.draft_accepted,
+        // the prompt as reused + prefilled rows
+        ..Timings::of_prompt(rep.prompt_tokens as u64, rep.reused_tokens)
+    };
+    let timings_json = timings.json();
+
+    let profile = live.as_ref().and_then(|h| h.final_snapshot());
+    let final_live = format!(
+        "{{\"type\":\"live\",\"job\":{req_num},\"source\":\"engine\",\"record\":{}}}",
+        readout::live_record_json(
+            "decode",
+            &method,
+            summary.as_ref(),
+            hbm_bytes,
+            profile.as_deref(),
+        )
+    );
+    state.slot.lock().unwrap().last_live_json = Some(final_live.clone());
+    state.hub.publish(final_live);
+
+    // The generation each choice reads, and what it generated (a greedy request's choices are
+    // copies of its one generation, and count as the tokens they return).
+    let gen_of = |c: usize| choices::run_of(c, runs);
+    let per_run: Vec<u64> = reports
+        .iter()
+        .map(|r| r.generated_tokens.len() as u64)
+        .collect();
+    let completion = choices::completion_tokens(&per_run, n_out);
+    // usage: the prompt once, the completions of every choice
+    let usage = format!(
+        "{{\"prompt_tokens\":{},\"completion_tokens\":{completion},\"total_tokens\":{},\
+         \"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}",
+        rep.prompt_tokens,
+        rep.prompt_tokens as u64 + completion,
+        timings.cache_n,
+    );
+    let seed_json = |s: u64| {
+        if is_greedy {
+            "null".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let return_tokens = val.get("gaudium_return_tokens").and_then(|v| v.as_bool()) == Some(true);
+    // The request's details. Times: `queued_ms` request received -> the engine took it
+    // (model load, other requests); `reset_ms` the engine took it -> its prefill began
+    // (per-request state reset); `prefill_ms` the engine's own prefill clock up to the
+    // first token; `ttft_ms` the engine took it -> first token (reset + prefill).
+    let mut details = format!(
+        "{{\"method\":{},\"engine_method\":{},\"prefill_ms\":{:.2},\"decode_loop_ms\":{:.2},\
+         \"queued_ms\":{queued_ms:.2}",
+        jq(&method),
+        jq(&rep.method),
+        rep.ttft_ms,
+        rep.decode_ms,
+    );
+    if let Some(t) = first_token_ms {
+        details.push_str(&format!(
+            ",\"ttft_ms\":{t:.2},\"reset_ms\":{:.2}",
+            (t - rep.ttft_ms).max(0.0)
+        ));
+    }
+    if let Some(l) = launches {
+        details.push_str(&format!(",\"steps\":{l}"));
+        if l > 0 {
+            details.push_str(&format!(
+                ",\"ms_per_step\":{:.3},\"tok_per_step\":{:.3},\"decode_tok_s\":{:.2}",
+                rep.decode_ms / l as f64,
+                n_gen.saturating_sub(1) as f64 / l as f64,
+                rep.decode_tok_s,
+            ));
+        }
+    }
+    if let Some(sum) = summary.as_ref().filter(|s| !s.log.is_empty()) {
+        details.push_str(&format!(",\"aseq\":{}", jq(&readout::aseq(&sum.log))));
+    }
+    if let Some(sec) = readout::spec_section_json(&timings) {
+        details.push_str(&format!(",\"spec\":{sec}"));
+    }
+    if has_calls {
+        details.push_str(&format!(",\"tool_calls\":{}", parser.tool_calls().len()));
+    }
+    // the thinking budget: the reasoning cap, the reasoning tokens kept, and whether the
+    // end of thinking was forced
+    if let Some(tb) = think.borrow().as_ref() {
+        details.push_str(&format!(
+            ",\"thinking\":{{\"cap\":{},\"reasoning_tokens\":{},\"forced_close\":{}}}",
+            tb.cap(),
+            tb.kept(),
+            tb.forced()
+        ));
+    }
+    // prefix reuse: rows taken over from the previous request, and how many rows of
+    // the prompt equal the one the engine held (a resume point lies below that)
+    if prefix_stats.is_some_and(|p| p.slots > 0) {
+        // `tier`: where the reused rows came from (device, host, or prefilled: none
+        // were reused); `host`: what the host-RAM tier copied for this request
+        details.push_str(&format!(
+            ",\"prefix\":{{\"hit\":{},\"reused_tokens\":{},\"common_tokens\":{},\"tier\":\"{}\"",
+            timings.cache_n > 0,
+            timings.cache_n,
+            rep.prefix_common,
+            readout::tier_name(rep.host_tier.as_ref(), timings.cache_n),
+        ));
+        if let Some(t) = rep.host_tier.as_ref() {
+            details.push_str(&format!(",\"host\":{}", readout::tier_json(t)));
+        }
+        details.push('}');
+    }
+    if n_images > 0 {
+        details.push_str(&format!(
+            ",\"vision\":{}",
+            readout::vision_section_json(
+                &media_counts,
+                media_host_ms,
+                vision_report.as_ref(),
+                rep.ttft_ms,
+            )
+        ));
+    }
+    // `gaudium_return_tokens`: the generated token ids (exactness checks between runs)
+    if return_tokens {
+        details.push_str(&format!(",\"tokens\":{}", ids_json(&rep.generated_tokens)));
+    }
+    if n_out > 1 {
+        // every choice: its seed (choice `i` equals the request sent alone with that seed and
+        // n = 1), what it generated and how it ended, and the prompt rows its generation took
+        // over (from the lane that prefilled the prompt, or the position the lane kept)
+        let per: Vec<String> = (0..n_out)
+            .map(|c| {
+                let r = gen_of(c);
+                let (e, calls, _) = ends[r];
+                let g = &reports[r];
+                let mut s = format!(
+                    "{{\"index\":{c},\"seed\":{},\"completion_tokens\":{},\"finish_reason\":{},\
+                     \"prompt_ms\":{:.2},\"reused_tokens\":{},\"decode_tok_s\":{:.2}",
+                    seed_json(choices::choice_seed(seed, r as u64)),
+                    g.generated_tokens.len(),
+                    jq(finish_reason_name(e, calls)),
+                    g.ttft_ms,
+                    g.reused_tokens,
+                    g.decode_tok_s,
+                );
+                if g.drafted > 0 {
+                    s.push_str(&format!(
+                        ",\"draft_n\":{},\"draft_n_accepted\":{}",
+                        g.drafted, g.draft_accepted
+                    ));
+                }
+                if return_tokens {
+                    s.push_str(&format!(",\"tokens\":{}", ids_json(&g.generated_tokens)));
+                }
+                s.push('}');
+                s
+            })
+            .collect();
+        details.push_str(&format!(
+            ",\"n\":{n_out},\"generations\":{runs},\"choices\":[{}]",
+            per.join(",")
+        ));
+    }
+    if !ignored.is_empty() {
+        details.push_str(&format!(
+            ",\"ignored\":[{}]",
+            ignored.iter().map(|i| jq(i)).collect::<Vec<_>>().join(",")
+        ));
+    }
+    details.push_str(&format!(
+        ",\"sampling\":{{\"greedy\":{is_greedy},\"temperature\":{temperature:.3},\"top_k\":{top_k},\
+         \"top_p\":{top_p:.3},\"min_p\":{min_p:.3},\"seed\":{}}}}}",
+        seed_json(seed)
+    ));
+    state.publish_request(
+        req_num,
+        format!(
+            "{{{},\"timings\":{timings_json},\"details\":{details}}}",
+            req_base(phase, queued_ms)
+        ),
+    );
+
+    if api == Api::Responses {
+        // (one choice: the Responses API has no `n`)
+        let mut out = outs[0].lock().unwrap();
+        let pending = out.take_pending();
+        let mut b = resp_builder.unwrap_or_else(|| {
+            responses::Builder::new(
+                state.responses.head(&req_id).unwrap_or_default(),
+                &req_id,
+                &model_id,
+                created,
+                temperature,
+                top_p,
+            )
+        });
+        let ending = match end {
+            GenEnd::GeCancelled => responses::Ending::Cancelled,
+            GenEnd::GeLength => responses::Ending::Incomplete,
+            GenEnd::GeEos | GenEnd::GeStopString | GenEnd::GeCallLimit => {
+                responses::Ending::Completed
+            }
+        };
+        // reasoning tokens: the reasoning text as the tokenizer counts it
+        let reasoning_tokens = if parser.reasoning().is_empty() {
+            0
+        } else {
+            tok_ref.encode(parser.reasoning(), false).len() as u64
+        };
+        let usage = responses::usage_json(
+            rep.prompt_tokens as u64,
+            rep.reused_tokens,
+            n_gen,
+            reasoning_tokens,
+        );
+        let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
+        let mut events = out.take_held() + &b.feed(&pending);
+        let (end_events, resp) = end_response(state, &mut b, &req_id, ending, &usage, &extra);
+        events.push_str(&end_events);
+        if stream_mode {
+            out.write(&events);
+            if let Some(s) = &sink {
+                s.end();
+            }
+        } else {
+            write_json(stream, 200, &resp);
+        }
+    } else if let Api::Messages { show_thinking } = api {
+        // (one choice: the Messages API has no `n`)
+        let mut out = outs[0].lock().unwrap();
+        let pending = out.take_pending();
+        let mut b = builder.unwrap_or_else(|| anthropic::Builder::new(show_thinking));
+        let stop = stop_reason_name(end, has_calls);
+        let usage = anthropic::usage_json_cached(rep.prompt_tokens as u64, rep.reused_tokens, n_gen);
+        let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
+        let events = out.take_held() + &b.feed(&pending);
+        if stream_mode {
+            out.write(&events);
+            out.write(&b.finish(stop, parser.matched_stop(), &usage, &extra));
+            if let Some(s) = &sink {
+                s.end();
+            }
+        } else {
+            b.close();
+            let msg = b.message(
+                &req_id,
+                &model_id,
+                stop,
+                parser.matched_stop(),
+                &usage,
+                &extra,
+            );
+            write_json(stream, 200, &msg);
+        }
+    } else if let Api::Completion { native } = api {
+        // (one choice: the completion endpoints refuse n > 1)
+        let mut out = outs[0].lock().unwrap();
+        let pending = out.take_pending();
+        // the generated text; in a stream, what the chunks before have not carried
+        let text = if stream_mode {
+            stream_out::plain_text(&pending)
+        } else {
+            format!("{}{}", parser.reasoning(), parser.content())
+        };
+        let body = if native {
+            // the native shape names how the generation ended
+            let stop_type = match finish_reason {
+                "length" => "limit",
+                "cancelled" => "none",
+                _ if stop_string => "word",
+                _ => "eos",
+            };
+            format!(
+                "{{\"content\":{},\"id\":{},\"model\":{},\"stop\":true,\"stop_type\":\"{stop_type}\",\
+                 \"stopping_word\":{},\"tokens_predicted\":{n_gen},\"tokens_evaluated\":{},\
+                 \"tokens_cached\":{},\"truncated\":false,\"usage\":{usage},\"timings\":{timings_json},\
+                 \"gaudium\":{details}}}",
+                jq(&text),
+                jq(&req_id),
+                jq(&model_id),
+                jq(parser.matched_stop()),
+                rep.prompt_tokens,
+                timings.cache_n,
+            )
+        } else {
+            let head = if stream_mode {
+                out.chunk_head().to_string()
+            } else {
+                format!(
+                    "\"id\":{},\"object\":\"text_completion\",\"created\":{created},\"model\":{}",
+                    jq(&req_id),
+                    jq(&model_id)
+                )
+            };
+            format!(
+                "{{{head},\"choices\":[{{\"index\":0,\"text\":{},\"logprobs\":null,\"finish_reason\":{}}}],\
+                 \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}",
+                jq(&text),
+                jq(finish_reason),
+            )
+        };
+        if stream_mode {
+            // a native stream has no end marker
+            let end = if native { "" } else { "data: [DONE]\n\n" };
+            out.write(&format!("data: {body}\n\n{end}"));
+            if !out.write_failed {
+                write_sse_end(stream);
+            }
+        } else {
+            write_json(stream, 200, &body);
+        }
+    } else if stream_mode {
+        // each choice's last chunk with its finish reason; the last of them carries the
+        // request's usage, timings and details
+        for (c, out) in outs.iter().enumerate() {
+            let mut out = out.lock().unwrap();
+            let pending = out.take_pending();
+            let (e, calls, _) = ends[gen_of(c)];
+            let tail = if c + 1 == n_out {
+                format!(
+                    ",\"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}\n\ndata: [DONE]\n\n"
+                )
+            } else {
+                "}\n\n".to_string()
+            };
+            let chunk = format!(
+                "data: {{{},\"choices\":[{{\"index\":{c},\"delta\":{},\"finish_reason\":{}}}]{tail}",
+                out.chunk_head(),
+                stream_out::delta_json(&pending),
+                jq(finish_reason_name(e, calls)),
+            );
+            out.write(&chunk);
+        }
+        if let Some(s) = &sink {
+            s.end();
+        }
+    } else {
+        let choices_json: Vec<String> = (0..n_out)
+            .map(|c| {
+                let g = &gens[gen_of(c)];
+                let (e, calls, _) = ends[gen_of(c)];
+                format!(
+                    "{{\"index\":{c},\"message\":{},\"finish_reason\":{}}}",
+                    assistant_message_json(&g.parser),
+                    jq(finish_reason_name(e, calls)),
+                )
+            })
+            .collect();
+        let resp = format!(
+            "{{\"id\":{},\"object\":\"chat.completion\",\"created\":{created},\"model\":{},\
+             \"choices\":[{}],\"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}",
+            jq(&req_id),
+            jq(&model_id),
+            choices_json.join(","),
+        );
+        write_json(stream, 200, &resp);
+    }
+}
+
+/// The `message` of a non-streaming chat choice: content, reasoning and tool calls as the output
+/// parser read them.
+fn assistant_message_json(parser: &OutputParser) -> String {
+    let has_calls = !parser.tool_calls().is_empty();
+    // a reply that is only tool calls has no content
+    let content = if parser.content().is_empty() && has_calls {
+        "null".to_string()
+    } else {
+        jq(parser.content())
+    };
+    let mut msg = format!("{{\"role\":\"assistant\",\"content\":{content}");
+    if !parser.reasoning().is_empty() {
+        msg.push_str(&format!(
+            ",\"reasoning_content\":{}",
+            jq(parser.reasoning())
+        ));
+    }
+    if has_calls {
+        msg.push_str(&format!(
+            ",\"tool_calls\":{}",
+            chat::tool_calls_json(parser.tool_calls()).dump()
+        ));
+    }
+    msg.push('}');
+    msg
 }
 
 // ============================================================================

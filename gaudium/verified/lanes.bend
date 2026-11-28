@@ -13,6 +13,7 @@
 import Base
 import nat_lemmas.bend as L
 import tensor_bounds.bend as TB
+import prefix_reuse.bend as PR
 
 # ============================================================================
 # 1. Lane lifecycle
@@ -2727,3 +2728,245 @@ def ln_step_kept_counts_every_draft(r, e):
       {==}
     case 1n+rp:
       ln_step_kept_sub_aux(e, rp)
+
+# ============================================================================
+# 16. A lane's prompt rows from another lane
+# ============================================================================
+#
+# A request admitted into a lane may take over the start of its prompt from another lane that
+# holds it (the choices of one chat request share their prompt): the K/V rows of the whole tiles
+# up to a position that lane kept, and the recurrent state it kept there, are copied on the card,
+# and the request's prefill resumes there. Resuming at a kept position after whole tiles is the
+# prefix-reuse rule (`prefix_reuse.bend`): the tiles left are the same recipes on the same rows a
+# cold prefill runs, so the stream is the one a cold prefill gives.
+
+# Does lane `src` (in state `s`), whose prefill of this prompt would resume at `offer`, give a
+# request more than the `have` rows it takes over already? A lane whose prefill is running is
+# never copied from (its kept positions are being written).
+def ln_fork_takes(+s: LaneState, +have: Nat, +offer: Nat) -> Bool:
+  match s:
+    case LnPrefill{}:
+      False{}
+    case _:
+      Nat.is_gt(offer, have)
+
+# The whole tiles of `tile` rows a fork of `rows` rows copies.
+def ln_fork_tiles(+rows: Nat, +tile: Nat) -> Nat:
+  Nat.div(rows, tile)
+
+# o > h and o <= h never hold together.
+def ln_fork_gt_le_false(+o: Nat, +h: Nat) -> {Bool.and(Nat.is_gt(o, h), Nat.is_le(o, h)) == False{} : Bool}:
+  match o h:
+    case 0n 0n:
+      {==}
+    case 0n 1n+hp:
+      {==}
+    case 1n+op 0n:
+      {==}
+    case 1n+op 1n+hp:
+      ln_fork_gt_le_false(op, hp)
+
+def ln_fork_ge_refl(+k: Nat) -> {Nat.is_ge(k, k) == True{} : Bool}:
+  match k:
+    case 0n:
+      {==}
+    case 1n+kp:
+      ln_fork_ge_refl(kp)
+
+# promise: a request never copies rows from another lane unless that gives it more of its prompt than it takes over already.
+# catches: ln_fork_takes compares Nat.is_ge(offer, have), copying when the lane already holds as much
+law ln_fork_needs_gain:
+  for +s: LaneState
+  for +h: Nat
+  for +o: Nat
+  {Bool.and(ln_fork_takes(s, h, o), Nat.is_le(o, h)) == False{} : Bool}
+
+def ln_fork_needs_gain(s, h, o):
+  match s:
+    case LnFree{}:
+      ln_fork_gt_le_false(o, h)
+    case LnPrefill{}:
+      {==}
+    case LnDecode{}:
+      ln_fork_gt_le_false(o, h)
+    case LnDrain{}:
+      ln_fork_gt_le_false(o, h)
+
+# promise: a lane whose prefill is running is never copied from.
+# catches: ln_fork_takes returns Nat.is_gt(offer, have) for a lane in prefill, copying kept positions still being written
+law ln_fork_never_from_prefill:
+  for +h: Nat
+  for +o: Nat
+  {ln_fork_takes(LnPrefill{}, h, o) == False{} : Bool}
+
+def ln_fork_never_from_prefill(h, o):
+  {==}
+
+# promise: a request that holds nothing of its prompt takes it over from a decoding lane that holds some of it.
+# catches: ln_fork_takes returns False{} for every lane, so the choices of a request all prefill the whole prompt
+law ln_fork_from_decoding:
+  for +o: Nat
+  {ln_fork_takes(LnDecode{}, 0n, 1n+o) == True{} : Bool}
+
+def ln_fork_from_decoding(o):
+  {==}
+
+# promise: a fork never copies rows past the position it resumes at.
+# catches: ln_fork_tiles rounds up (Nat.div(rows + tile - 1, tile)), copying a tile the other lane's kept position does not cover
+law ln_fork_tiles_within:
+  for +r: Nat
+  for +tp: Nat
+  {Nat.is_le(Nat.mul(ln_fork_tiles(r, 1n+tp), 1n+tp), r) == True{} : Bool}
+
+def ln_fork_tiles_within(r, tp):
+  L.nat_align_down_le(r, tp)
+
+# promise: a fork of a position after whole tiles copies every one of those tiles.
+# catches: ln_fork_tiles returns Nat.sub(Nat.div(rows, tile), 1n), leaving a kept tile's rows behind
+law ln_fork_tiles_cover:
+  for +k: Nat
+  for +tp: Nat
+  {Nat.is_ge(ln_fork_tiles(Nat.mul(k, 1n+tp), 1n+tp), k) == True{} : Bool}
+
+def ln_fork_tiles_cover(k, tp):
+  %L.nat_div_mul(k, tp) : {Nat.is_ge(Nat.div(Nat.mul(k, 1n+tp), 1n+tp), _) == True{} : Bool}
+  ln_fork_ge_refl(Nat.div(Nat.mul(k, 1n+tp), 1n+tp))
+
+# May lane `src` be the one a request on lane `dst` takes the start of its prompt from? `same`:
+# `src` is `dst` itself; `s`: the state of `src`; `have`: the rows the request takes over already
+# (by itself, or from a lane looked at before); `offer`: where the table of `src` would resume the
+# prompt; `held`: the rows of the prompt `src` holds the tokens of; `kept`: `src` keeps the
+# recurrent state at the end of the whole tiles `offer` covers (`ln_fork_tiles`). A lane is never
+# its own source (its table may describe rows the request's reset just zeroed), and a source holds
+# the tokens and the state of every row it gives.
+def ln_fork_source(+same: Bool, +s: LaneState, +have: Nat, +offer: Nat, +tile: Nat, +held: Nat, +kept: Bool) -> Bool:
+  match same:
+    case True{}:
+      False{}
+    case False{}:
+      match kept:
+        case False{}:
+          False{}
+        case True{}:
+          Bool.and(ln_fork_takes(s, have, offer), Nat.is_le(PR.pc_boundary(ln_fork_tiles(offer, tile), tile), held))
+
+# a <= b and b < a never hold together, whatever comes before them.
+def ln_fork_le_lt_false(+a: Nat, +b: Nat) -> {Bool.and(Nat.is_le(a, b), Nat.is_lt(b, a)) == False{} : Bool}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      {==}
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      ln_fork_le_lt_false(ap, bp)
+
+def ln_fork_and_le_lt_false(+c: Bool, +a: Nat, +b: Nat) -> {Bool.and(Bool.and(c, Nat.is_le(a, b)), Nat.is_lt(b, a)) == False{} : Bool}:
+  match c:
+    case True{}:
+      ln_fork_le_lt_false(a, b)
+    case False{}:
+      {==}
+
+# (c and x) and not c is false.
+def ln_fork_and_not_false(+c: Bool, +x: Bool) -> {Bool.and(Bool.and(c, x), Bool.not(c)) == False{} : Bool}:
+  match c x:
+    case True{} True{}:
+      {==}
+    case True{} False{}:
+      {==}
+    case False{} True{}:
+      {==}
+    case False{} False{}:
+      {==}
+
+# promise: a request never takes the start of its prompt from its own lane.
+# catches: ln_fork_source ignores `same`, so a lane whose rows its reset just zeroed copies them onto themselves and claims them valid
+law ln_fork_source_never_self:
+  for +s: LaneState
+  for +h: Nat
+  for +o: Nat
+  for +t: Nat
+  for +hl: Nat
+  for +k: Bool
+  {ln_fork_source(True{}, s, h, o, t, hl, k) == False{} : Bool}
+
+def ln_fork_source_never_self(s, h, o, t, hl, k):
+  {==}
+
+# promise: a lane is chosen as the source only when the lane fork rule (ln_fork_takes) takes it.
+# catches: ln_fork_source drops ln_fork_takes, copying from a lane in prefill or one that gives nothing more
+law ln_fork_source_takes:
+  for +f: Bool
+  for +s: LaneState
+  for +h: Nat
+  for +o: Nat
+  for +t: Nat
+  for +hl: Nat
+  for +k: Bool
+  {Bool.and(ln_fork_source(f, s, h, o, t, hl, k), Bool.not(ln_fork_takes(s, h, o))) == False{} : Bool}
+
+def ln_fork_source_takes(f, s, h, o, t, hl, k):
+  match f:
+    case True{}:
+      {==}
+    case False{}:
+      match k:
+        case True{}:
+          ln_fork_and_not_false(ln_fork_takes(s, h, o), Nat.is_le(PR.pc_boundary(ln_fork_tiles(o, t), t), hl))
+        case False{}:
+          {==}
+
+# promise: a source holds the tokens of every row the fork copies from it.
+# catches: ln_fork_source drops the held-rows check, so a fork copies rows whose tokens the other lane no longer holds
+law ln_fork_source_covers:
+  for +f: Bool
+  for +s: LaneState
+  for +h: Nat
+  for +o: Nat
+  for +t: Nat
+  for +hl: Nat
+  for +k: Bool
+  {Bool.and(ln_fork_source(f, s, h, o, t, hl, k), Nat.is_lt(hl, PR.pc_boundary(ln_fork_tiles(o, t), t))) == False{} : Bool}
+
+def ln_fork_source_covers(f, s, h, o, t, hl, k):
+  match f:
+    case True{}:
+      {==}
+    case False{}:
+      match k:
+        case True{}:
+          ln_fork_and_le_lt_false(ln_fork_takes(s, h, o), PR.pc_boundary(ln_fork_tiles(o, t), t), hl)
+        case False{}:
+          {==}
+
+# promise: a source keeps the recurrent state at the position the fork resumes at.
+# catches: ln_fork_source ignores `kept`, so a fork resumes after rows without the state their prefill left
+law ln_fork_source_kept:
+  for +f: Bool
+  for +s: LaneState
+  for +h: Nat
+  for +o: Nat
+  for +t: Nat
+  for +hl: Nat
+  {ln_fork_source(f, s, h, o, t, hl, False{}) == False{} : Bool}
+
+def ln_fork_source_kept(f, s, h, o, t, hl):
+  match f:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# promise: a request that holds nothing of its prompt takes at least one whole tile of it from another decoding lane that holds those rows and keeps the state there.
+# catches: ln_fork_source returns False{} for every lane, so the choices of a request all prefill the whole prompt
+# The offer and the held rows are whole tiles (at least one), so a gate that refuses a fork copying no whole tile stays allowed.
+law ln_fork_source_some:
+  for +k: Nat
+  for +tp: Nat
+  {ln_fork_source(False{}, LnDecode{}, 0n, Nat.mul(1n+k, 1n+tp), 1n+tp, Nat.mul(1n+k, 1n+tp), True{}) == True{} : Bool}
+
+def ln_fork_source_some(k, tp):
+  %Equal.sym(Nat, Nat.div(Nat.mul(1n+k, 1n+tp), 1n+tp), 1n+k, L.nat_div_mul(1n+k, tp)) : {Bool.and(Nat.is_gt(Nat.mul(1n+k, 1n+tp), 0n), Nat.is_le(Nat.mul(_, 1n+tp), Nat.mul(1n+k, 1n+tp))) == True{} : Bool}
+  L.nat_le_refl(Nat.mul(1n+k, 1n+tp))

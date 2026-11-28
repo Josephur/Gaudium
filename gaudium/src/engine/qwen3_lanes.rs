@@ -984,6 +984,237 @@ pub(super) fn idle_work(eng: &mut Qwen3Engine, waiting: &dyn Fn() -> u64) {
     }
 }
 
+/// One lane as the choice of a fork's source sees it ([`fork_source`]).
+#[derive(Debug, Clone)]
+pub(super) struct ForkOffer {
+    /// The lane's state in the lane table.
+    pub state: crate::verified::LaneState,
+    /// Where the lane's prefix table would resume the prompt.
+    pub offer: u64,
+    /// The rows of the prompt the lane holds the tokens of.
+    pub held: u64,
+    /// The whole-tile counts at which the lane keeps a recurrent state.
+    pub kept: Vec<u64>,
+}
+
+/// The source a fork copies from, and what it copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ForkChoice {
+    pub lane: usize,
+    /// The whole tiles copied (`ln_fork_tiles`).
+    pub tiles: u64,
+    /// The rows those tiles cover (`pc_boundary`).
+    pub rows: u64,
+}
+
+/// Which lane, of `lanes`, the request on lane `me` takes the start of its prompt from, when it
+/// takes over `own` rows by itself and the tiles are `tile` rows: the verified `ln_fork_source`,
+/// lane by lane, each later lane asked against the most the request has so far. `None`: no lane
+/// gives more than the request has.
+pub(super) fn fork_source(me: usize, own: u64, tile: u64, lanes: &[ForkOffer]) -> Option<ForkChoice> {
+    let mut best = own;
+    let mut src = None;
+    for (j, l) in lanes.iter().enumerate() {
+        let kept = l.kept.contains(&crate::verified::ln_fork_tiles(l.offer, tile));
+        if crate::verified::ln_fork_source(j == me, l.state, best, l.offer, tile, l.held, kept) {
+            best = l.offer;
+            src = Some(j);
+        }
+    }
+    let tiles = crate::verified::ln_fork_tiles(best, tile);
+    src.map(|lane| ForkChoice {
+        lane,
+        tiles,
+        rows: crate::verified::pc_boundary(tiles, tile),
+    })
+}
+
+/// [lanes] The start of `prompt` from another lane, for the request about to prefill on the active
+/// lane (the choices of one chat request share their prompt). Another lane whose prefix table would
+/// resume this prompt further than the active lane's own, and that holds the tokens and the kept
+/// state of the rows (`ln_fork_source`, through [`fork_source`]), is copied from on the card: the K/V rows of the whole tiles up to the position it kept (`ln_fork_tiles`) and the
+/// recurrent state it kept there go into the active lane's caches and a slot of its table, which
+/// then describes those rows (`PrefixCache::adopt_restored`). The prefill resumes at that
+/// position, which is the prefix-reuse rule: the tiles left are the ones a cold prefill runs on
+/// the same rows, from the same state. The drafter's context rows are not copied: they are valid
+/// in the active lane from the fork position on (`hc_ring_floor` without a copy).
+///
+/// Returns what [`prefix_cache::PrefixCache::plan_from`] takes, `(common token prefix, shared
+/// rows)` of the prompt and the other lane's held prompt, or `None` when nothing was copied. After
+/// a copy the rows the table describes were written after the request's reset, so the plan is
+/// made as for rows that were not zeroed.
+pub(super) fn fork_prompt(
+    eng: &mut Qwen3Engine,
+    prompt: &[i32],
+    wanted: bool,
+    rows_zeroed: bool,
+) -> Result<Option<(u64, u64)>, String> {
+    let Some(rt) = eng.lanes.as_ref() else {
+        return Ok(None);
+    };
+    // (the request's reset already ran: a reset that zeroed this lane's rows, as the first request
+    // of a lane's does, came before the copy, which writes the rows the table then describes)
+    if !crate::verified::pc_request_may_reuse(wanted, false, eng.prefix.enabled()) {
+        return Ok(None);
+    }
+    let me = rt.active;
+    let images = eng.prefix_images.clone();
+    // what the active lane takes over by itself, and the lane that gives more (the verified rule).
+    // Another lane's table describes only rows written since its last reset (a request of it that
+    // fails clears it), so it is asked as a table whose rows were not zeroed: its reset state
+    // marks a running request unclean, which concerns its own next reset, not the rows it holds.
+    let own = eng.prefix.peek(prompt, &images, wanted, rows_zeroed).resume;
+    let offers: Vec<ForkOffer> = rt
+        .bufs
+        .iter()
+        .enumerate()
+        .map(|(j, b)| ForkOffer {
+            state: rt.table.state(j),
+            offer: b.prefix.peek(prompt, &images, wanted, false).resume,
+            held: b.prefix.held().0.len() as u64,
+            kept: b.prefix.held_slots().iter().map(|&(t, _)| t).collect(),
+        })
+        .collect();
+    let Some(choice) = fork_source(me, own, eng.prefix.tile(), &offers) else {
+        return Ok(None);
+    };
+    let ForkChoice { lane: j, tiles, rows } = choice;
+    let b = &rt.bufs[j];
+    // the state at that position, which the other lane kept, and the tokens of the rows
+    // (`ln_fork_source` chose a lane that has both)
+    let src_slot = b
+        .prefix
+        .held_slots()
+        .iter()
+        .find(|&&(t, _)| t == tiles)
+        .map(|&(_, s)| s)
+        .ok_or_else(|| format!("lane fork: lane {j} keeps no state at tile {tiles}"))?;
+    let (held, held_images) = b.prefix.held();
+    let tokens = held
+        .get(..rows as usize)
+        .map(<[i32]>::to_vec)
+        .ok_or_else(|| format!("lane fork: lane {j} holds {} of {rows} rows", held.len()))?;
+    let tok_images: Vec<prefix_cache::ImageId> = held_images
+        .iter()
+        .copied()
+        .filter(|im| im.start < rows)
+        .collect();
+    // what the prompt shares with the other lane's whole held prompt, as `plan_from` takes it after
+    // a restore: its resume rule needs the shared rows to reach past the resume position
+    // (`pfx_reuse_valid`: snap_pos < lcp), so the rows copied alone would resume nowhere. The rows
+    // the table describes are the copied ones all the same: `adopt_restored` keeps no slot past them.
+    let shared = prefix_cache::shared_rows(prompt, &images, held, held_images);
+    let src_kv = b.kv_addr.clone();
+    let src_state = b
+        .prefix_slots
+        .get(src_slot)
+        .map(|m| host_tier::slot_ranges(m, &b.gdn_state))
+        .ok_or_else(|| format!("lane {j}: kept slot {src_slot} has no state buffers"))?;
+    let src_rows = host_tier::rows_layout(eng, &src_kv)?;
+    let dst_rows = host_tier::rows_layout(eng, &eng.kv_addr)?;
+    let ring_bytes: u64 = match eng.specdec.as_ref() {
+        Some(sd) if sd.context_rows() > 0 => sd.cache_regions().iter().map(|&(_, n)| n).sum(),
+        _ => 0,
+    };
+    let ring_from = crate::verified::hc_ring_floor(ring_bytes, false, 0, rows);
+
+    // the table describes the copied rows from here on; the state's slot is in the middle of a
+    // write until the copy has ended
+    let t0 = Instant::now();
+    if rows_zeroed {
+        // nothing the table kept from before the reset is the rows the device holds now
+        eng.prefix.clear();
+    }
+    let dst_slot = eng
+        .prefix
+        .adopt_restored(&tokens, &tok_images, tiles, ring_from);
+    let copied = (|| -> Result<u64, String> {
+        // (source, destination, bytes) of every piece, each inside its cache (`tile_ranges`)
+        let mut pieces: Vec<(u64, u64, u64)> = Vec::new();
+        for t in 0..tiles {
+            let (from, to) = (src_rows.tile_ranges(t)?, dst_rows.tile_ranges(t)?);
+            if from.len() != to.len() {
+                return Err(format!(
+                    "lane fork: tile {t} has {} source and {} destination ranges",
+                    from.len(),
+                    to.len()
+                ));
+            }
+            for (&(a, n), &(d, m)) in from.iter().zip(&to) {
+                if n != m {
+                    return Err(format!("lane fork: a K/V range of {n} bytes against {m}"));
+                }
+                pieces.push((a, d, n));
+            }
+        }
+        if let Some(ds) = dst_slot {
+            let to = eng
+                .prefix_slots
+                .get(ds)
+                .map(|m| host_tier::slot_ranges(m, &eng.gdn_state))
+                .ok_or_else(|| format!("lane fork: slot {ds} has no state buffers"))?;
+            if to.len() != src_state.len()
+                || to.iter().zip(&src_state).any(|(&(_, m), &(_, n))| m != n)
+            {
+                return Err("lane fork: the two lanes' kept states differ in layout".into());
+            }
+            pieces.extend(
+                src_state
+                    .iter()
+                    .zip(&to)
+                    .map(|(&(a, n), &(d, _))| (a, d, n)),
+            );
+        }
+        // ranges that follow each other in both lanes go as one copy
+        pieces.sort_unstable();
+        let mut merged: Vec<(u64, u64, u64)> = Vec::with_capacity(pieces.len());
+        for p in pieces {
+            match merged.last_mut() {
+                Some(l) if l.0 + l.2 == p.0 && l.1 + l.2 == p.1 => l.2 += p.2,
+                _ => merged.push(p),
+            }
+        }
+        let mut bytes = 0u64;
+        for &(a, d, n) in &merged {
+            eng.dev
+                .copy_d2d_compute(a, n, d)
+                .map_err(|e| format!("lane fork: copy {n} bytes from lane {j}: {e}"))?;
+            bytes += n;
+        }
+        // the prefill that follows reads these rows; a copy that failed shows here
+        unsafe { eng.dev.sync_stream(eng.dev.compute_stream()) }
+            .map_err(|e| format!("lane fork: sync after the copy: {e}"))?;
+        Ok(bytes)
+    })();
+    match copied {
+        Err(e) => {
+            // nothing of a copy that failed may be read later, by the table or by the host-RAM
+            // tier (a part of the copy may have landed)
+            eng.prefix.restore_done(0);
+            eng.prefix.clear();
+            if let Some(h) = eng.host.as_mut() {
+                h.rows_replaced(tiles);
+            }
+            Err(e)
+        }
+        Ok(bytes) => {
+            eng.prefix.restore_done(tiles);
+            if let Some(h) = eng.host.as_mut() {
+                h.rows_replaced(tiles);
+            }
+            if eng.verbose {
+                eprintln!(
+                    "[gaudium] lanes: lane {me} took {rows} of {} prompt rows from lane {j} ({own} of its own; {:.1} MiB in {:.2} ms)",
+                    prompt.len(),
+                    bytes as f64 / (1u64 << 20) as f64,
+                    t0.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            Ok(Some(shared))
+        }
+    }
+}
+
 /// Swaps the engine's own lane fields with `b`.
 fn swap_fields(eng: &mut Qwen3Engine, b: &mut LaneBufs) {
     std::mem::swap(&mut eng.kv_addr, &mut b.kv_addr);
@@ -2305,6 +2536,59 @@ fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::verified::LaneState;
+
+    fn lane(state: LaneState, offer: u64, held: u64, kept: &[u64]) -> ForkOffer {
+        ForkOffer {
+            state,
+            offer,
+            held,
+            kept: kept.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_fork_takes_the_lane_that_gives_most_and_never_its_own() {
+        use LaneState::*;
+        let pick = |me, own, lanes: &[ForkOffer]| fork_source(me, own, 128, lanes);
+        // lane 0 asks; its own entry offers most (a table whose rows its reset just zeroed) and is
+        // never the source
+        let lanes = [
+            lane(LnDecode, 1024, 1024, &[8]),
+            lane(LnDecode, 256, 300, &[1, 2]),
+            lane(LnFree, 384, 400, &[3]),
+        ];
+        assert_eq!(
+            pick(0, 0, &lanes),
+            Some(ForkChoice { lane: 2, tiles: 3, rows: 384 })
+        );
+        // only its own lane holds the prompt: nothing is copied
+        assert_eq!(pick(0, 0, &lanes[..1]), None);
+        // a lane in prefill is never copied from
+        let lanes = [lane(LnPrefill, 0, 0, &[]), lane(LnPrefill, 512, 512, &[4])];
+        assert_eq!(pick(0, 0, &lanes), None);
+        // a lane that keeps no state at its tiles, or no longer holds the rows' tokens, is passed
+        // over for one that gives less but has both
+        let lanes = [
+            lane(LnPrefill, 0, 0, &[]),
+            lane(LnDecode, 512, 512, &[1, 2, 3]),
+            lane(LnDecode, 384, 200, &[3]),
+            lane(LnDrain, 256, 256, &[2]),
+        ];
+        assert_eq!(
+            pick(0, 0, &lanes),
+            Some(ForkChoice { lane: 3, tiles: 2, rows: 256 })
+        );
+        // a lane gives nothing more than the request takes over by itself
+        assert_eq!(pick(0, 256, &lanes), None);
+        // a resume point after part of a tile copies the whole tiles below it
+        let lanes = [lane(LnPrefill, 0, 0, &[]), lane(LnDecode, 300, 300, &[2])];
+        let c = pick(0, 0, &lanes).unwrap();
+        assert_eq!((c.lane, c.tiles, c.rows), (1, 2, 256));
+        assert!(c.rows <= 300);
+    }
+
 
     #[test]
     fn width_costs_learn_the_narrow_step_first_then_the_extra_of_a_wide_slot() {

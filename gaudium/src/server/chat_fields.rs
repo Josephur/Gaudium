@@ -3,12 +3,12 @@
 //! - **applied**: the chat path reads the field and acts on it;
 //! - **ignored**: accepted but not applied; the reply names it in `gaudium.ignored`;
 //! - **refused**: a 400 that names the field, because ignoring it would change what the client
-//!   gets in a way the client cannot see (`n: 3` and one choice back, `logprobs: true` and no
-//!   log probabilities back).
+//!   gets in a way the client cannot see (`logprobs: true` and no log probabilities back).
 //!
 //! A field outside the table is reported in `gaudium.ignored` as unknown, never refused, so a
 //! client written for a newer API keeps working. An ignored or refused field whose value changes
-//! nothing (`n: 1`, `logprobs: false`, `stream_options: {"include_usage": true}`, or `null`) is neither reported nor refused. As a feature lands, its field moves to `Applied`
+//! nothing (`logprobs: false`, `stream_options: {"include_usage": true}`, or `null`) is neither
+//! reported nor refused. As a feature lands, its field moves to `Applied`
 //! here (and the code that reads it moves into the chat path).
 //!
 //! This is request parsing (AGENTS.md 3a, second list): it decides only whether the request is
@@ -100,12 +100,9 @@ const FIELDS: &[Field] = &[
     applied("thinking_budget_tokens"),
     // structured output (`server/structured.rs` parses it)
     applied("response_format"),
+    // choices (`server/choices.rs` parses and bounds it, `--max-choices`)
+    applied("n"),
     // refused: ignoring them changes the reply without a sign
-    refused(
-        "n",
-        "this server returns one choice per request; send n: 1 or leave it out",
-        is_one,
-    ),
     refused(
         "logprobs",
         "token log probabilities are not returned yet",
@@ -231,10 +228,6 @@ fn is_zero(v: &JsonValue) -> bool {
     v.as_f64() == Some(0.0)
 }
 
-fn is_one(v: &JsonValue) -> bool {
-    v.as_f64() == Some(1.0)
-}
-
 fn is_empty_array(v: &JsonValue) -> bool {
     v.as_array().is_some_and(|a| a.is_empty())
 }
@@ -281,7 +274,7 @@ mod tests {
             "top_k":20,"min_p":0.05,"seed":3,"max_tokens":10,"stop":["x"],"tools":[],
             "tool_choice":"auto","parallel_tool_calls":false,"reasoning_effort":"low",
             "chat_template_kwargs":{},"cache_prompt":true,"gaudium_method":"default",
-            "thinking_budget_tokens":256}"#,
+            "thinking_budget_tokens":256,"n":3}"#,
         );
         assert_eq!(r, Ok(Vec::new()));
     }
@@ -316,8 +309,6 @@ mod tests {
     #[test]
     fn refused_fields_name_the_field() {
         for (body, field) in [
-            (r#"{"n":3}"#, "n"),
-            (r#"{"n":0}"#, "n"),
             (r#"{"logprobs":true}"#, "logprobs"),
             (r#"{"top_logprobs":5}"#, "top_logprobs"),
         ] {
@@ -330,7 +321,7 @@ mod tests {
     #[test]
     fn a_long_value_is_cut_in_the_message() {
         let long = "x".repeat(500);
-        let e = run(&format!(r#"{{"n":{{"s":"{long}"}}}}"#)).unwrap_err();
+        let e = run(&format!(r#"{{"logprobs":{{"s":"{long}"}}}}"#)).unwrap_err();
         assert!(e.message.len() < 300, "{}", e.message);
         assert!(e.message.contains("..."));
     }

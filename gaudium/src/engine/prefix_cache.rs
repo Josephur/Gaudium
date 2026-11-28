@@ -755,6 +755,24 @@ mod tests {
         plan
     }
 
+    /// A lane fork (`lanes_rt::fork_prompt`) adopts the copied rows and plans with the rows the
+    /// prompt shares with the source lane's whole held prompt: the request resumes at the copied
+    /// rows. Shared rows taken against the copied rows alone end where they do, and the resume
+    /// rule (a shared row past the resume point) then resumes nowhere.
+    #[test]
+    fn a_fork_resumes_at_the_copied_rows_with_the_whole_source_prompt_shared() {
+        let src = prompt(3000, 9);
+        let (tiles, rows) = (5u64, 5 * T);
+        let fork = |shared: (u64, u64)| {
+            let mut c = cache(4);
+            assert!(c.adopt_restored(&src[..rows as usize], &[], tiles, 0).is_some());
+            c.restore_done(tiles);
+            c.plan_from(&src, &[], true, false, Some(shared)).resume
+        };
+        assert_eq!(fork(shared_rows(&src, &[], &src, &[])), rows);
+        assert_eq!(fork(shared_rows(&src, &[], &src[..rows as usize], &[])), 0);
+    }
+
     #[test]
     fn a_first_request_is_cold_and_keeps_a_ladder_behind_its_prompt_end() {
         let mut c = cache(8);

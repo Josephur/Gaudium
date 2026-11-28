@@ -36,6 +36,10 @@ What the Rust engine does today:
   recurrent state and prefix reuse), the decoding lanes stepped together in one launch that
   reads the weights once, every stream token-identical to the same request run alone. Dense
   Qwen3 / Qwen3.5 / Qwen3.8 models, without a drafter or with DSpine, for now.
+- Several choices per chat completion (`n`, up to `--max-choices`): a greedy request runs once
+  and returns that stream as every choice; sampled choice `i` runs with seed + i and equals the
+  request sent alone with that seed. With lanes the choices run beside each other and the
+  prompt is prefilled once (the other lanes copy its rows on the card).
 - An OpenAI-compatible (and Anthropic-style) chat API with streaming, tool calls, an
   optional MCP proxy for the Web UI, optional HTTPS on the same port, and A2UI interfaces.
 
