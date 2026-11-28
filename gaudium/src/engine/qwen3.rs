@@ -96,6 +96,8 @@ pub struct Qwen3Config {
     pub fp8_cache: Option<PathBuf>,
     /// [moe/fp8] Calibration load: BF16 graphs, every prefill records the GEMM input sites.
     pub fp8_calibrate: bool,
+    /// [moe] Requested MoE execution form (`--moe-form`: `auto`, `dense`, `routed`).
+    pub moe_form: crate::verified::IkMoeForm,
     /// [moe] Routed MoE form: stacked BF16 experts read through the vendor expert-select node
     /// (decode reads only the routed experts); default: the dense-masked wide MLP.
     pub moe_routed: bool,
@@ -151,6 +153,7 @@ impl Qwen3Config {
             fp8_act: None,
             fp8_cache: None,
             fp8_calibrate: false,
+            moe_form: crate::verified::IkMoeForm::IkMoeAuto,
             moe_routed: false,
             prefill_warm_rows: 0,
             request_reset: None,
@@ -244,6 +247,10 @@ pub struct Qwen3GenReport {
     pub stopped_by_cancel: bool,
     /// Teacher-forced positions where the engine's greedy token differed from the forced one.
     pub forks: Vec<ForkRecord>,
+    /// Sum of exact f64 negative log-likelihoods across teacher-forced positions (`0.0` when unset).
+    pub teacher_nll_sum: f64,
+    /// Number of teacher-forced positions included in `teacher_nll_sum`.
+    pub teacher_nll_count: u64,
     /// Decode launches after the first token (`K = 0`: one per token).
     pub launches: u64,
     /// Decode tokens per launch (`K = 0`: 1.0).
@@ -3835,6 +3842,8 @@ impl Qwen3Engine {
                 stopped_by_eos: out.stopped_by_eos,
                 stopped_by_cancel: out.stopped_by_cancel,
                 forks,
+                teacher_nll_sum: 0.0,
+                teacher_nll_count: 0,
                 launches,
                 tokens_per_launch: if launches > 0 {
                     out.decode_tokens as f64 / launches as f64

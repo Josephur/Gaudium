@@ -207,9 +207,11 @@ fn print_usage() {
          \x20                       ends in -assistant (4 drafts), otherwise DSpine. <id>=mtp\n\
          \x20                       drafts with the model's own MTP head (no checkpoint; 4 drafts,\n\
          \x20                       3 in the routed mixture-of-experts form; an Inkling 2 model:\n\
-         \x20                       its block drafter, 7 drafts, as --spec mtp finds it)\n\
-         \x20 --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster\n\
-         \x20                       decode, more device memory, its own token stream)\n\
+         \x20                       its block drafter, 1 draft in its routed form, 7 dense, as\n\
+         \x20                       --spec mtp finds it)\n\
+         \x20 --moe-form <id=f>     Mixture-of-experts model <id>: auto (default: routed for\n\
+         \x20                       Inkling 2 when supported, dense otherwise), dense or routed\n\
+         \x20                       (faster decode, its own token stream)\n\
          \x20 --model-ctx <id=N>    Context size for model <id> instead of --max-ctx\n\
          \x20 --effort-levels <id=l,..>  Reasoning-effort levels of model <id> instead of the ones\n\
          \x20                       read from its chat template (each one the template renders\n\
@@ -590,10 +592,10 @@ fn print_usage() {
          \x20                       its prefill runs 256-row tiles)\n\
          \x20 --kv-scales <file>    K/V calibration the FP8 scale tables are made from (default:\n\
          \x20                       <model_dir>-gaudium-pc/kv_scales.txt)\n\
-         \x20 --moe-form <f>        MoE expert execution: dense (default: one masked wide MLP per layer)\n\
-         \x20                       or routed (stacked BF16 experts, only the routed ones are read;\n\
-         \x20                       faster decode, more device memory, its own token stream: the\n\
-         \x20                       two forms round differently)\n\
+         \x20 --moe-form <f>        MoE expert execution: auto (default: routed on Inkling 2 when\n\
+         \x20                       geometry fits, else dense), dense (one masked wide MLP per\n\
+         \x20                       layer) or routed (only the selected experts are read; its own\n\
+         \x20                       token stream)\n\
          \x20 --request-reset <m>   Device state zeroed before each request: auto (default: the\n\
          \x20                       DeltaNet start state; KV rows past the cursor are masked),\n\
          \x20                       dirty (also the KV rows earlier requests wrote) or full\n\
@@ -820,7 +822,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     let mut fp8_cache: Option<PathBuf> = None;
     let mut kv_dtype = gaudium::verified::KvDtype::KvBf16;
     let mut kv_scales: Option<PathBuf> = None;
-    let mut moe_routed = false;
+    let mut moe_form = gaudium::verified::IkMoeForm::IkMoeAuto;
     let mut prefill_opts: Option<String> = None;
     let mut params = Qwen3GenParams::default();
     // (request, raw RGB8?, path / WxH:path): an image belongs to request 0 unless it follows a
@@ -1089,10 +1091,13 @@ fn run_generate(args: &[String]) -> Result<(), String> {
             }
             "--kv-scales" => kv_scales = Some(PathBuf::from(next_val(&mut i, "--kv-scales")?)),
             "--moe-form" => {
-                moe_routed = match next_val(&mut i, "--moe-form")?.as_str() {
-                    "dense" => false,
-                    "routed" => true,
-                    other => return Err(format!("invalid --moe-form '{other}' (dense, routed)")),
+                moe_form = match next_val(&mut i, "--moe-form")?.as_str() {
+                    "auto" => gaudium::verified::IkMoeForm::IkMoeAuto,
+                    "dense" => gaudium::verified::IkMoeForm::IkMoeDense,
+                    "routed" => gaudium::verified::IkMoeForm::IkMoeRouted,
+                    other => {
+                        return Err(format!("invalid --moe-form '{other}' (auto, dense, routed)"))
+                    }
                 };
             }
             "--request-reset" => request_reset = Some(next_val(&mut i, "--request-reset")?),
@@ -1141,6 +1146,9 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     // the model's text resources: a checkpoint directory or a GGUF file
     let text = gaudium::model_text::ModelText::open(&model_dir)?;
     let tok = text.tokenizer()?;
+    let is_inkling2 = text
+        .spec()
+        .is_ok_and(|s| s.family == gaudium::model_spec::ModelFamily::Inkling2);
     // `--chat`: the family's built-in chat form, or the model's own template (`mt_cli_chat`)
     let builtin_chat = text.spec().map_or(true, |s| has_builtin_chat_form(s.family));
     let one_turn = if gaudium::verified::mt_cli_wants_template(chat, builtin_chat) {
@@ -1267,7 +1275,8 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     cfg.fp8_cache = fp8_cache;
     cfg.kv_dtype = kv_dtype;
     cfg.kv_scales = kv_scales;
-    cfg.moe_routed = moe_routed;
+    cfg.moe_form = moe_form;
+    cfg.moe_routed = matches!(moe_form, gaudium::verified::IkMoeForm::IkMoeRouted);
     cfg.prefill_warm_rows = prefill_warm;
     cfg.request_reset = request_reset;
     cfg.prefix_slots = prefix_slots;
@@ -1311,7 +1320,7 @@ fn run_generate(args: &[String]) -> Result<(), String> {
     }
     let sweep_widths: Vec<u64> = draft_k.clone();
     if let Some(method) = spec_method {
-        if draft_k.is_empty() {
+        if draft_k.is_empty() && !(method == "mtp" && is_inkling2) {
             draft_k.push(match method.as_str() {
                 "dflash2" => 7,
                 "mtp" | "assistant" => 4,
@@ -1614,6 +1623,17 @@ fn run_generate(args: &[String]) -> Result<(), String> {
                 report.generated_tokens.len(),
                 report.forks.len()
             );
+            if report.teacher_nll_count > 0 {
+                let mean_nll = report.teacher_nll_sum / report.teacher_nll_count as f64;
+                eprintln!(
+                    "[gaudium] teacher-forced NLL: {:.6} | PPL: {:.6} ({} tokens, top-1 agree: {:.2}%)",
+                    mean_nll,
+                    mean_nll.exp(),
+                    report.teacher_nll_count,
+                    100.0 * (report.teacher_nll_count.saturating_sub(report.forks.len() as u64)) as f64
+                        / report.teacher_nll_count as f64,
+                );
+            }
             for f in &report.forks {
                 eprintln!(
                     "FORK @{}: engine {} (logit {:.4}) vs forced {} (logit {:.4}) gap {:.4}",
@@ -2567,15 +2587,16 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             "--moe-form" => {
                 let raw = next_val(&mut i, "--moe-form")?;
                 let (opts, form) = model_opt(&mut per_model, &raw, "--moe-form")?;
-                opts.moe_routed = match form.to_str() {
-                    Some("routed") => true,
-                    Some("dense") => false,
+                opts.moe_form = Some(match form.to_str() {
+                    Some("auto") => gaudium::verified::IkMoeForm::IkMoeAuto,
+                    Some("routed") => gaudium::verified::IkMoeForm::IkMoeRouted,
+                    Some("dense") => gaudium::verified::IkMoeForm::IkMoeDense,
                     _ => {
                         return Err(format!(
-                            "--moe-form expects <model id>=dense|routed, got '{raw}'"
+                            "--moe-form expects <model id>=auto|dense|routed, got '{raw}'"
                         ))
                     }
-                };
+                });
             }
             "--precision" => {
                 let raw = next_val(&mut i, "--precision")?;

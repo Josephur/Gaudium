@@ -328,7 +328,7 @@ impl GraphBuilder {
             .iter()
             .filter(|t| t.section.is_some())
             .map(|t| {
-                let elems: u64 = t.dims.iter().copied().product();
+                let elems: u64 = t.dims.iter().copied().fold(1u64, u64::saturating_mul);
                 (
                     t.name.clone(),
                     t.dtype,

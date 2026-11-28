@@ -16,6 +16,8 @@
 //!   `value * 2^(scale - 127)` in f32, rounded to nearest even.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use super::IkDims;
 use crate::core::gemma4::{lane_in_block, natural_channel};
@@ -23,7 +25,9 @@ use crate::fp8::{bf16_to_f32, f32_to_bf16_rne};
 use crate::safetensors::{SafetensorsStore, TensorMeta};
 use crate::verified::{
     ik_bias_src, ik_f8_row_ok, ik_f8_row_scales, ik_nib_row_bytes, ik_nib_row_scales, ik_row_admit,
-    ik_row_at, ik_stacked_bytes,
+    ik_row_at, ik_stacked_bytes, ikr_dn_tiles, ikr_gu_tiles, ikr_scale_bytes, ikr_scale_lane_pos,
+    ikr_scale_vec_off, ikr_src_row, ikr_w4_code_bytes, ikr_w4_col_off, ikr_w8_code_bytes,
+    ikr_w8_col_off,
 };
 
 /// Values of the sixteen 4-bit codes (sign, two exponent bits, one mantissa bit). Code 8 is a
@@ -92,6 +96,302 @@ pub trait ExpertRows: Sync {
     fn decode(&self, e: usize, r: usize, out: &mut [u8]) -> Result<(), String>;
 }
 
+/// Quantized format for one Inkling 2 layer's routed expert pools on-card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IkExpertFmt {
+    W4,
+    W8,
+}
+
+/// Verified dimensions and exact byte extents of one layer's packed routed expert code/scale pools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RoutedLayerExtents {
+    pub blk: u64,
+    pub nblk: u64,
+    pub inner_cols: u64,
+    pub code_dims: [u64; 4],
+    pub scale_dims: [u64; 4],
+    pub code_bytes: u64,
+    pub scale_bytes: u64,
+}
+
+pub(super) fn routed_layer_extents(
+    fmt: IkExpertFmt,
+    in_cols: u64,
+    tiles: u64,
+    ne: u64,
+) -> Result<RoutedLayerExtents, String> {
+    if tiles == 0 || ne == 0 {
+        return Err(format!(
+            "routed expert extents require non-zero tiles and experts, got tiles={tiles} ne={ne}"
+        ));
+    }
+    match fmt {
+        IkExpertFmt::W4 => {
+            let inner_cols = ik_nib_row_bytes(in_cols);
+            if inner_cols == 0 {
+                return Err(format!(
+                    "routed W4 packing requires non-zero columns % 16 == 0, got {in_cols}"
+                ));
+            }
+            let nblk = ik_nib_row_scales(in_cols);
+            let code_bytes = ikr_w4_code_bytes(in_cols, tiles, ne)
+                .ok_or_else(|| "routed W4 code pool byte size overflows u64".to_string())?;
+            let scale_bytes = ikr_scale_bytes(in_cols, 16, tiles, ne)
+                .ok_or_else(|| "routed W4 scale pool byte size overflows u64".to_string())?;
+            Ok(RoutedLayerExtents {
+                blk: 16,
+                nblk,
+                inner_cols,
+                code_dims: [256, inner_cols, tiles, ne],
+                scale_dims: [256, nblk, tiles, ne],
+                code_bytes,
+                scale_bytes,
+            })
+        }
+        IkExpertFmt::W8 => {
+            if !ik_f8_row_ok(in_cols) {
+                return Err(format!(
+                    "routed W8 packing requires non-zero columns % 32 == 0, got {in_cols}"
+                ));
+            }
+            let nblk = ik_f8_row_scales(in_cols);
+            let code_bytes = ikr_w8_code_bytes(in_cols, tiles, ne)
+                .ok_or_else(|| "routed W8 code pool byte size overflows u64".to_string())?;
+            let scale_bytes = ikr_scale_bytes(in_cols, 32, tiles, ne)
+                .ok_or_else(|| "routed W8 scale pool byte size overflows u64".to_string())?;
+            Ok(RoutedLayerExtents {
+                blk: 32,
+                nblk,
+                inner_cols: in_cols,
+                code_dims: [256, in_cols, tiles, ne],
+                scale_dims: [256, nblk, tiles, ne],
+                code_bytes,
+                scale_bytes,
+            })
+        }
+    }
+}
+
+/// Round-to-nearest-even IEEE 754 `f32 -> fp16` (`u16` bit pattern).
+#[inline]
+pub fn f32_to_f16_rne(f: f32) -> u16 {
+    let u = f.to_bits();
+    let sign = ((u >> 16) & 0x8000) as u16;
+    let exp = ((u >> 23) & 0xFF) as i32;
+    let mant = u & 0x007F_FFFF;
+    if exp == 0xFF {
+        if mant != 0 {
+            return sign | 0x7E00 | ((mant >> 13) as u16).max(1);
+        }
+        return sign | 0x7C00;
+    }
+    if exp == 0 {
+        return sign;
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let sig = 0x0080_0000 | mant;
+        let sh = (14 - e) as u32;
+        let half_sig = sig >> sh;
+        let rem = sig & ((1 << sh) - 1);
+        let mid = 1 << (sh - 1);
+        let round = u32::from(rem > mid || (rem == mid && (half_sig & 1) != 0));
+        return sign | ((half_sig + round) as u16);
+    }
+    let mut m = mant >> 13;
+    let rem = mant & 0x1FFF;
+    if rem > 0x1000 || (rem == 0x1000 && (m & 1) != 0) {
+        m += 1;
+        if m >= 1024 {
+            let ne = e + 1;
+            if ne >= 31 {
+                return sign | 0x7C00;
+            }
+            return sign | ((ne as u16) << 10);
+        }
+    }
+    sign | ((e as u16) << 10) | (m as u16)
+}
+
+/// Exact IEEE 754 `fp16` (`u16`) -> `f32`.
+#[inline]
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exp = u32::from((h >> 10) & 0x1F);
+    let mant = u32::from(h & 0x03FF);
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        let s = if sign != 0 { -1.0f32 } else { 1.0f32 };
+        return s * (mant as f32) * 2f32.powi(-24);
+    }
+    if exp == 31 {
+        return f32::from_bits(sign | 0x7F80_0000 | (mant << 13));
+    }
+    f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+}
+
+/// 256-byte `int8(2 * E2M1)` LUT replicated across all 16-byte SIMD groups for `gaudium_ik_w4_*`.
+pub fn ik_nvfp4_lut() -> Vec<u8> {
+    const LV: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    let mut out = Vec::with_capacity(256);
+    for _ in 0..16 {
+        for &v in &LV {
+            out.push(v as u8);
+        }
+    }
+    out
+}
+
+#[inline]
+fn routed_src_row(is_gu: bool, tt: u64, lane: u64) -> u64 {
+    ikr_src_row(is_gu, tt, lane)
+}
+
+fn pack_w8_rows_with<S, M, F>(
+    ne: u64,
+    tiles: u64,
+    in_cols: u64,
+    is_gu: bool,
+    panic_msg: &'static str,
+    make_scratch: M,
+    decode_f32: F,
+) -> Result<(Vec<u8>, Vec<u8>), String>
+where
+    M: Fn() -> S + Sync,
+    F: Fn(&mut S, usize, u64, &mut [f32]) -> Result<(), String> + Sync,
+{
+    let ext = routed_layer_extents(IkExpertFmt::W8, in_cols, tiles, ne)?;
+    let exp = routed_layer_extents(IkExpertFmt::W8, in_cols, tiles, 1)?;
+    let nblk = ext.nblk;
+    let code_bytes = ext.code_bytes;
+    let scale_bytes = ext.scale_bytes;
+    let exp_code = exp.code_bytes as usize;
+    let exp_scale = exp.scale_bytes as usize;
+
+    let col_offs_per_tile: Vec<Vec<usize>> = (0..tiles)
+        .map(|tt| {
+            (0..in_cols)
+                .map(|col| {
+                    ikr_w8_col_off(0, tiles, in_cols, tt, col)
+                        .map(|o| o as usize)
+                        .ok_or_else(|| "routed W8 col offset overflow".to_string())
+                })
+                .collect::<Result<_, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+    let vec_offs_per_tile: Vec<Vec<usize>> = (0..tiles)
+        .map(|tt| {
+            (0..nblk)
+                .map(|b| {
+                    ikr_scale_vec_off(0, tiles, nblk, tt, b)
+                        .map(|o| o as usize * 2)
+                        .ok_or_else(|| "routed W8 scale offset overflow".to_string())
+                })
+                .collect::<Result<_, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut codes = vec![0u8; code_bytes as usize];
+    let mut scales = vec![0u8; scale_bytes as usize];
+    let scale_pos: [usize; 256] = std::array::from_fn(|i| ikr_scale_lane_pos(i as u64) as usize);
+
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 32);
+    let per = (ne as usize).div_ceil(threads).max(1);
+    std::thread::scope(|sc| {
+        let mut handles = Vec::new();
+        for (chunk_idx, (c_chunk, s_chunk)) in codes
+            .chunks_mut(per * exp_code)
+            .zip(scales.chunks_mut(per * exp_scale))
+            .enumerate()
+        {
+            let e0 = chunk_idx * per;
+            let cnt = c_chunk.len() / exp_code;
+            let make_scratch = &make_scratch;
+            let decode_f32 = &decode_f32;
+            let col_offs_ref = &col_offs_per_tile;
+            let vec_offs_ref = &vec_offs_per_tile;
+            let sp = &scale_pos;
+            handles.push(sc.spawn(move || -> Result<(), String> {
+                let mut scratch = make_scratch();
+                let mut row_vals = vec![0f32; in_cols as usize];
+                for le in 0..cnt {
+                    let e = e0 + le;
+                    let c_dst = &mut c_chunk[le * exp_code..(le + 1) * exp_code];
+                    let s_dst = &mut s_chunk[le * exp_scale..(le + 1) * exp_scale];
+                    for tt in 0..tiles as usize {
+                        let col_offs = &col_offs_ref[tt];
+                        let vec_offs = &vec_offs_ref[tt];
+                        for i in 0..256usize {
+                            let row = routed_src_row(is_gu, tt as u64, i as u64);
+                            decode_f32(&mut scratch, e, row, &mut row_vals)?;
+                            for b in 0..nblk as usize {
+                                let base_c = b * 32;
+                                let vals = &row_vals[base_c..base_c + 32];
+                                let mut amax = 0.0f32;
+                                for &v in vals {
+                                    amax = amax.max(v.abs());
+                                }
+                                let s_h = if amax == 0.0 {
+                                    0u16
+                                } else {
+                                    f32_to_f16_rne(amax / 127.0)
+                                };
+                                let sv = f16_to_f32(s_h);
+                                let inv = if sv == 0.0 { 0.0 } else { 1.0 / sv };
+                                let sb = vec_offs[b] + sp[i] * 2;
+                                s_dst[sb..sb + 2].copy_from_slice(&s_h.to_le_bytes());
+                                for c in 0..32 {
+                                    let q = (vals[c] * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
+                                    c_dst[col_offs[base_c + c] + i] = q as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| panic_msg.to_string())??;
+        }
+        Ok::<(), String>(())
+    })?;
+    Ok((codes, scales))
+}
+
+fn pack_w8_from_rows(
+    ex: &dyn ExpertRows,
+    ne: u64,
+    tiles: u64,
+    in_cols: u64,
+    is_gu: bool,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    pack_w8_rows_with(
+        ne,
+        tiles,
+        in_cols,
+        is_gu,
+        "routed W8 packer thread panicked",
+        || vec![0u8; in_cols as usize * 2],
+        |bf_buf, e, row, vals| {
+            ex.decode(e, row as usize, bf_buf)?;
+            for (dst, ch) in vals.iter_mut().zip(bf_buf.chunks_exact(2)) {
+                *dst = bf16_to_f32(u16::from_le_bytes([ch[0], ch[1]]));
+            }
+            Ok(())
+        },
+    )
+}
+
 /// Where the packer reads a checkpoint: its tensors under the publisher's names (the part after
 /// `model.llm.`) and in the publisher's shapes and element order, whatever the file format.
 pub trait IkSource: Sync {
@@ -109,6 +409,29 @@ pub trait IkSource: Sync {
         rows: u64,
         cols: u64,
     ) -> Result<Box<dyn ExpertRows + '_>, String>;
+    /// Preferred routed-kernel weight format for layer `l`.
+    fn expert_fmt(&self, _l: usize) -> Result<IkExpertFmt, String> {
+        Ok(IkExpertFmt::W8)
+    }
+    /// Packs `ne` routed experts of layer `l` into native W4 (`(u8, f16)`) or W8 (`(i8, f16)`) pools.
+    fn pack_routed_experts(
+        &self,
+        l: usize,
+        key: &str,
+        ne: u64,
+        out_rows: u64,
+        in_cols: u64,
+        is_gu: bool,
+    ) -> Result<(Vec<u8>, Vec<u8>, IkExpertFmt), String> {
+        let tiles = if is_gu {
+            ikr_gu_tiles(out_rows / 2)
+        } else {
+            ikr_dn_tiles(out_rows)
+        };
+        let ex = self.experts(l, key, ne, out_rows, in_cols)?;
+        let (codes, scales) = pack_w8_from_rows(ex.as_ref(), ne, tiles, in_cols, is_gu)?;
+        Ok((codes, scales, IkExpertFmt::W8))
+    }
 }
 
 /// A stacked expert tensor of the publisher's checkpoint in its stored form.
@@ -195,6 +518,22 @@ impl<'a> StSource<'a> {
         self
     }
 
+    fn amax_per_expert(&self, suffix: &str, ne: u64) -> Result<Vec<f32>, String> {
+        let (full, t) = self.meta(suffix)?;
+        let n: u64 = t.shape.iter().product();
+        if n == ne {
+            return self.f32s(suffix, ne);
+        }
+        if n == 1 {
+            let v = self.f32s(suffix, 1)?[0];
+            return Ok(vec![v; ne as usize]);
+        }
+        Err(format!(
+            "checkpoint tensor '{full}' has {n} values ({:?}), expected 1 or {ne}",
+            t.shape
+        ))
+    }
+
     fn meta(&self, suffix: &str) -> Result<(String, &'a TensorMeta), String> {
         let full = format!("{}{}", self.prefix, suffix);
         let meta = self
@@ -276,7 +615,7 @@ impl IkSource for StSource<'_> {
                         "expert tensor '{full}': {cols} columns are not whole blocks of 16 codes"
                     ));
                 }
-                let amax = self.f32s(&format!("{base}_amax"), ne)?;
+                let amax = self.amax_per_expert(&format!("{base}_amax"), ne)?;
                 let den = self.f32s(&format!("{base}_outer_scale_denominator"), 1)?[0];
                 let rf = |x: f32| {
                     if self.amax_bf16 {
@@ -329,6 +668,231 @@ impl IkSource for StSource<'_> {
             f8: e4m3_table(),
         }))
     }
+
+    fn expert_fmt(&self, l: usize) -> Result<IkExpertFmt, String> {
+        let (_, w13) = self.meta(&format!("layers.{l}.mlp.experts.w13_weight"))?;
+        let (_, w2) = self.meta(&format!("layers.{l}.mlp.experts.w2_weight"))?;
+        if w13.dtype == "U8" && w2.dtype == "U8" {
+            Ok(IkExpertFmt::W4)
+        } else {
+            Ok(IkExpertFmt::W8)
+        }
+    }
+
+    fn pack_routed_experts(
+        &self,
+        l: usize,
+        key: &str,
+        ne: u64,
+        out_rows: u64,
+        in_cols: u64,
+        is_gu: bool,
+    ) -> Result<(Vec<u8>, Vec<u8>, IkExpertFmt), String> {
+        let base = format!("layers.{l}.mlp.experts.{key}_weight");
+        let (full, t) = self.meta(&base)?;
+        let tiles = if is_gu {
+            ikr_gu_tiles(out_rows / 2)
+        } else {
+            ikr_dn_tiles(out_rows)
+        };
+        if tiles == 0 {
+            return Err(format!("routed expert '{full}' produced 0 tiles"));
+        }
+        match t.dtype.as_str() {
+            "U8" if self.expert_fmt(l)? == IkExpertFmt::W4 => {
+                let rb = ik_nib_row_bytes(in_cols);
+                if rb == 0 {
+                    return Err(format!(
+                        "expert tensor '{full}': {in_cols} columns are not whole blocks of 16 codes"
+                    ));
+                }
+                if t.shape != [ne, out_rows, rb] {
+                    return Err(format!(
+                        "expert tensor '{full}' has shape {:?}, expected {:?}",
+                        t.shape,
+                        [ne, out_rows, rb]
+                    ));
+                }
+                let rs = ik_nib_row_scales(in_cols);
+                let w = self.mapped(&full)?;
+                let scale_raw = self.raw(&format!("{base}_scale"), "F8_E4M3", &[ne, out_rows, rs])?;
+                for (what, bytes, bpr) in [("", w, rb), ("_scale", scale_raw, rs)] {
+                    if !holds_stacked_rows(bytes.len(), ne, out_rows, bpr) {
+                        return Err(format!(
+                            "expert tensor '{full}{what}' holds {} bytes, fewer than {ne} x {out_rows} rows of {bpr}",
+                            bytes.len()
+                        ));
+                    }
+                }
+                let amax = self.amax_per_expert(&format!("{base}_amax"), ne)?;
+                let den = self.f32s(&format!("{base}_outer_scale_denominator"), 1)?[0];
+                let rf = |x: f32| {
+                    if self.amax_bf16 {
+                        bf16_to_f32(f32_to_bf16_rne(x))
+                    } else {
+                        x
+                    }
+                };
+                let factors: Vec<f32> = amax.iter().map(|&a| 0.5 * (rf(a) / rf(den))).collect();
+                let f8 = e4m3_table();
+
+                let ext = routed_layer_extents(IkExpertFmt::W4, in_cols, tiles, ne)?;
+                let exp = routed_layer_extents(IkExpertFmt::W4, in_cols, tiles, 1)?;
+                let nblk = ext.nblk;
+                let cp_cnt = ext.inner_cols;
+                let code_bytes = ext.code_bytes;
+                let scale_bytes = ext.scale_bytes;
+                let exp_code = exp.code_bytes as usize;
+                let exp_scale = exp.scale_bytes as usize;
+
+                let col_offs_per_tile: Vec<Vec<usize>> = (0..tiles)
+                    .map(|tt| {
+                        (0..in_cols)
+                            .map(|col| {
+                                ikr_w4_col_off(0, tiles, cp_cnt, tt, col)
+                                    .map(|o| o as usize)
+                                    .ok_or_else(|| "routed W4 col offset overflow".to_string())
+                            })
+                            .collect::<Result<_, _>>()
+                    })
+                    .collect::<Result<_, _>>()?;
+                let vec_offs_per_tile: Vec<Vec<usize>> = (0..tiles)
+                    .map(|tt| {
+                        (0..nblk)
+                            .map(|b| {
+                                ikr_scale_vec_off(0, tiles, nblk, tt, b)
+                                    .map(|o| o as usize * 2)
+                                    .ok_or_else(|| "routed W4 scale offset overflow".to_string())
+                            })
+                            .collect::<Result<_, _>>()
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                let mut codes = vec![0u8; code_bytes as usize];
+                let mut scales = vec![0u8; scale_bytes as usize];
+                let scale_pos: [usize; 256] =
+                    std::array::from_fn(|i| ikr_scale_lane_pos(i as u64) as usize);
+
+                let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 32);
+                let per = (ne as usize).div_ceil(threads).max(1);
+                let full_ref = &full;
+                std::thread::scope(|sc| {
+                    let mut handles = Vec::new();
+                    for (chunk_idx, (c_chunk, s_chunk)) in codes
+                        .chunks_mut(per * exp_code)
+                        .zip(scales.chunks_mut(per * exp_scale))
+                        .enumerate()
+                    {
+                        let e0 = chunk_idx * per;
+                        let cnt = c_chunk.len() / exp_code;
+                        let fac_ref = &factors;
+                        let f8_ref = &f8;
+                        let sp = &scale_pos;
+                        let col_offs_ref = &col_offs_per_tile;
+                        let vec_offs_ref = &vec_offs_per_tile;
+                        handles.push(sc.spawn(move || -> Result<(), String> {
+                            for le in 0..cnt {
+                                let e = e0 + le;
+                                let fac = fac_ref[e];
+                                let c_dst = &mut c_chunk[le * exp_code..(le + 1) * exp_code];
+                                let s_dst = &mut s_chunk[le * exp_scale..(le + 1) * exp_scale];
+                                for tt in 0..tiles as usize {
+                                    let col_offs = &col_offs_ref[tt];
+                                    let vec_offs = &vec_offs_ref[tt];
+                                    for i in 0..256usize {
+                                        let row = routed_src_row(is_gu, tt as u64, i as u64);
+                                        if !ik_row_admit(out_rows, row) {
+                                            return Err(format!("expert {e} row {row} out of range"));
+                                        }
+                                        let w_row = stacked_row(w, e, out_rows as usize, row as usize, rb as usize)
+                                            .ok_or_else(|| format!("short expert '{full_ref}' row {row}"))?;
+                                        let s_row = stacked_row(scale_raw, e, out_rows as usize, row as usize, rs as usize)
+                                            .ok_or_else(|| format!("short expert '{full_ref}_scale' row {row}"))?;
+                                        let byte_off = i >> 1;
+                                        let shift = 4 * (i & 1);
+                                        for col in 0..in_cols as usize {
+                                            let nib = (w_row[col >> 1] >> (4 * (col & 1))) & 0x0F;
+                                            c_dst[col_offs[col] + byte_off] |= nib << shift;
+                                        }
+                                        for b in 0..nblk as usize {
+                                            let s_h = f32_to_f16_rne(f8_ref[s_row[b] as usize] * fac);
+                                            let sb = vec_offs[b] + sp[i] * 2;
+                                            s_dst[sb..sb + 2].copy_from_slice(&s_h.to_le_bytes());
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }));
+                    }
+                    for h in handles {
+                        h.join().map_err(|_| "routed W4 packer thread panicked".to_string())??;
+                    }
+                    Ok::<(), String>(())
+                })?;
+                Ok((codes, scales, IkExpertFmt::W4))
+            }
+            "F8_E4M3" => {
+                if !ik_f8_row_ok(in_cols) {
+                    return Err(format!(
+                        "expert tensor '{full}': {in_cols} columns are not whole blocks of 32 values"
+                    ));
+                }
+                if t.shape != [ne, out_rows, in_cols] {
+                    return Err(format!(
+                        "expert tensor '{full}' has shape {:?}, expected {:?}",
+                        t.shape,
+                        [ne, out_rows, in_cols]
+                    ));
+                }
+                let rs = ik_f8_row_scales(in_cols);
+                let w = self.mapped(&full)?;
+                let scale_raw = self.raw(&format!("{base}_scale"), "U8", &[ne, out_rows, rs])?;
+                for (what, bytes, bpr) in [("", w, in_cols), ("_scale", scale_raw, rs)] {
+                    if !holds_stacked_rows(bytes.len(), ne, out_rows, bpr) {
+                        return Err(format!(
+                            "expert tensor '{full}{what}' holds {} bytes, fewer than {ne} x {out_rows} rows of {bpr}",
+                            bytes.len()
+                        ));
+                    }
+                }
+                let f8 = e4m3_table();
+                let nblk = rs;
+                let full_ref = &full;
+                let (codes, scales) = pack_w8_rows_with(
+                    ne,
+                    tiles,
+                    in_cols,
+                    is_gu,
+                    "routed F8->W8 packer thread panicked",
+                    || (),
+                    |_, e, row, row_vals| {
+                        if !ik_row_admit(out_rows, row) {
+                            return Err(format!("expert {e} row {row} out of range"));
+                        }
+                        let w_row = stacked_row(w, e, out_rows as usize, row as usize, in_cols as usize)
+                            .ok_or_else(|| format!("short expert '{full_ref}' row {row}"))?;
+                        let s_row = stacked_row(scale_raw, e, out_rows as usize, row as usize, rs as usize)
+                            .ok_or_else(|| format!("short expert '{full_ref}_scale' row {row}"))?;
+                        for b in 0..nblk as usize {
+                            let ds = 2f32.powi(i32::from(s_row[b]) - 127);
+                            let base_c = b * 32;
+                            for c in 0..32 {
+                                row_vals[base_c + c] = f8[w_row[base_c + c] as usize] * ds;
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+                Ok((codes, scales, IkExpertFmt::W8))
+            }
+            _ => {
+                let ex = self.experts(l, key, ne, out_rows, in_cols)?;
+                let (codes, scales) = pack_w8_from_rows(ex.as_ref(), ne, tiles, in_cols, is_gu)?;
+                Ok((codes, scales, IkExpertFmt::W8))
+            }
+        }
+    }
 }
 
 /// A job over a range of output rows: `(first row, the rows' bytes)`.
@@ -363,6 +927,7 @@ pub struct IkPacker<'a> {
     src: &'a dyn IkSource,
     d: &'a IkDims,
     max_ctx: u64,
+    routed_cache: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -435,7 +1000,47 @@ pub fn tau_table(floor: u64, alpha: f32, lmax: u64) -> Vec<f32> {
 
 impl<'a> IkPacker<'a> {
     pub fn new(src: &'a dyn IkSource, d: &'a IkDims, max_ctx: u64) -> Self {
-        Self { src, d, max_ctx }
+        Self {
+            src,
+            d,
+            max_ctx,
+            routed_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn routed_part(
+        &self,
+        l: usize,
+        key: &str,
+        out_rows: u64,
+        in_cols: u64,
+        is_gu: bool,
+        want_scales: bool,
+    ) -> Result<Vec<u8>, String> {
+        let tag = if is_gu { "W13" } else { "W2" };
+        let want_name = format!("L{l}_{tag}_{}", if want_scales { "s" } else { "c" });
+        if let Some(hit) = self
+            .routed_cache
+            .lock()
+            .expect("routed cache poisoned")
+            .remove(&want_name)
+        {
+            return Ok(hit);
+        }
+        let other_name = format!("L{l}_{tag}_{}", if want_scales { "c" } else { "s" });
+        let (codes, scales, _) =
+            self.src
+                .pack_routed_experts(l, key, self.d.ne, out_rows, in_cols, is_gu)?;
+        let (ret, store) = if want_scales {
+            (scales, codes)
+        } else {
+            (codes, scales)
+        };
+        self.routed_cache
+            .lock()
+            .expect("routed cache poisoned")
+            .insert(other_name, store);
+        Ok(ret)
     }
 
     fn raw(&self, suffix: &str, _dtype: &str, shape: &[u64]) -> Result<Cow<'a, [u8]>, String> {
@@ -591,6 +1196,7 @@ impl<'a> IkPacker<'a> {
                     0,
                 ])))
             }
+            "ik_nvfp4_lut" => return Ok(Cow::Owned(ik_nvfp4_lut())),
             _ => {}
         }
         if let Some(rest) = name.strip_prefix('A') {
@@ -720,6 +1326,10 @@ impl<'a> IkPacker<'a> {
             "W_gate" => Cow::Owned(self.pack_gate_up(l, false)?),
             "W_up" => Cow::Owned(self.pack_gate_up(l, true)?),
             "W_down" => Cow::Owned(self.pack_down(l)?),
+            "W13_c" => Cow::Owned(self.routed_part(l, "w13", 2 * d.ef, hid, true, false)?),
+            "W13_s" => Cow::Owned(self.routed_part(l, "w13", 2 * d.ef, hid, true, true)?),
+            "W2_c" => Cow::Owned(self.routed_part(l, "w2", hid, d.ef, false, false)?),
+            "W2_s" => Cow::Owned(self.routed_part(l, "w2", hid, d.ef, false, true)?),
             _ => {
                 let ctrl = |which: &str| match which {
                     "q" => Some("attn"),
@@ -865,5 +1475,262 @@ mod tests {
         assert_eq!(t[8191], 1.0);
         assert!(t[8192] > 1.0 && t[8192] < 1.0001);
         assert!((t[16383] - (1.0 + 0.1 * 2f32.ln())).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f16_roundtrip_and_rne() {
+        for &v in &[0.0f32, -0.0, 1.0, -1.5, 6.0, 448.0, 65504.0, 2f32.powi(-14), 2f32.powi(-24)] {
+            let h = f32_to_f16_rne(v);
+            let back = f16_to_f32(h);
+            assert_eq!(back.to_bits(), v.to_bits(), "v={v}");
+        }
+        // ties-to-even at midpoint between 1.0 (0x3C00) and 1.0 + 2^-10 (0x3C01)
+        let mid_even = 1.0f32 + 0.5 * 2f32.powi(-10);
+        assert_eq!(f32_to_f16_rne(mid_even), 0x3C00);
+        let mid_odd = 1.0f32 + 1.5 * 2f32.powi(-10);
+        assert_eq!(f32_to_f16_rne(mid_odd), 0x3C02);
+        // overflow clamps to infinity
+        assert_eq!(f32_to_f16_rne(100_000.0), 0x7C00);
+        assert_eq!(f32_to_f16_rne(-100_000.0), 0xFC00);
+    }
+
+    fn ref_matvec_bf16(ex: &dyn ExpertRows, e: usize, rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+        let mut bf = vec![0u8; cols * 2];
+        let mut out = vec![0f32; rows];
+        for r in 0..rows {
+            ex.decode(e, r, &mut bf).unwrap();
+            let mut acc = 0.0f32;
+            for (c, ch) in bf.chunks_exact(2).enumerate() {
+                let w = bf16_to_f32(u16::from_le_bytes([ch[0], ch[1]]));
+                acc += w * x[c];
+            }
+            out[r] = acc;
+        }
+        out
+    }
+
+    #[test]
+    fn routed_w4_packing_matches_decoded_gu_and_dn_matvec() {
+        let lut_bytes = ik_nvfp4_lut();
+        let lut: Vec<f32> = lut_bytes.iter().map(|&b| f32::from(b as i8)).collect();
+
+        // GU: ne=2, ef=128 (1 tile), in_cols=64 (4 blocks of 16)
+        let (ne, ef, cols) = (2usize, 128usize, 64usize);
+        let out_rows = 2 * ef;
+        let rb = cols / 2;
+        let rs = cols / 16;
+        let mut w_raw = vec![0u8; ne * out_rows * rb];
+        let mut s_raw = vec![0u8; ne * out_rows * rs];
+        for (idx, b) in w_raw.iter_mut().enumerate() {
+            *b = (((idx * 7 + 3) & 0x0F) | (((idx * 11 + 5) & 0x0F) << 4)) as u8;
+        }
+        // Include E4M3 exponent 15 (0x78 -> 256.0, 0x7F? skip NaN) to test exp==15 scale survival
+        let valid_f8: Vec<u8> = (0x20..=0x7Eu8).collect();
+        for (idx, b) in s_raw.iter_mut().enumerate() {
+            *b = valid_f8[idx % valid_f8.len()];
+        }
+        let factors = [0.25f32, 0.5f32]; // 0.5 * (amax / den)
+        let f8 = e4m3_table();
+        let ex = StExperts {
+            w: &w_raw,
+            scale: &s_raw,
+            factor: Some(factors.to_vec()),
+            rows: out_rows,
+            cols,
+            f8,
+        };
+        let x: Vec<f32> = (0..cols).map(|c| ((c as f32) - 31.5) * 0.03).collect();
+
+        // Pack GU directly using same W4 kernel layout helper via StSource logic
+        let tiles = ikr_gu_tiles(ef as u64);
+        let nblk = (cols / 16) as u64;
+        let cp_cnt = (cols / 2) as u64;
+        let code_bytes = ikr_w4_code_bytes(cols as u64, tiles, ne as u64).unwrap() as usize;
+        let scale_bytes = ikr_scale_bytes(cols as u64, 16, tiles, ne as u64).unwrap() as usize;
+        let exp_code = ikr_w4_code_bytes(cols as u64, tiles, 1).unwrap() as usize;
+        let exp_scale = ikr_scale_bytes(cols as u64, 16, tiles, 1).unwrap() as usize;
+        let mut codes = vec![0u8; code_bytes];
+        let mut scales = vec![0u8; scale_bytes];
+        for e in 0..ne {
+            let fac = 0.5 * factors[e];
+            let c_dst = &mut codes[e * exp_code..(e + 1) * exp_code];
+            let s_dst = &mut scales[e * exp_scale..(e + 1) * exp_scale];
+            for tt in 0..tiles {
+                for i in 0..256usize {
+                    let row = routed_src_row(true, tt, i as u64) as usize;
+                    let w_row = stacked_row(&w_raw, e, out_rows, row, rb).unwrap();
+                    let s_row = stacked_row(&s_raw, e, out_rows, row, rs).unwrap();
+                    for col in 0..cols {
+                        let nib = (w_row[col >> 1] >> (4 * (col & 1))) & 0x0F;
+                        let off = ikr_w4_col_off(0, tiles, cp_cnt, tt, col as u64).unwrap() as usize;
+                        c_dst[off + (i >> 1)] |= nib << (4 * (i & 1));
+                    }
+                    for b in 0..nblk as usize {
+                        let s_h = f32_to_f16_rne(f8[s_row[b] as usize] * fac);
+                        let vo = ikr_scale_vec_off(0, tiles, nblk, tt, b as u64).unwrap() as usize * 2;
+                        let sb = vo + ikr_scale_lane_pos(i as u64) as usize * 2;
+                        s_dst[sb..sb + 2].copy_from_slice(&s_h.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        // Verify reconstructed GU weights and matvec against ref_matvec_bf16
+        let mut bf_buf = vec![0u8; cols * 2];
+        for e in 0..ne {
+            let ref_y = ref_matvec_bf16(&ex, e, out_rows, cols, &x);
+            let c_exp = &codes[e * exp_code..(e + 1) * exp_code];
+            let s_exp = &scales[e * exp_scale..(e + 1) * exp_scale];
+            for i in 0..256usize {
+                let row = routed_src_row(true, 0, i as u64) as usize;
+                ex.decode(e, row, &mut bf_buf).unwrap();
+                let mut acc = 0.0f32;
+                let mut l1_x = 0.0f32;
+                for col in 0..cols {
+                    let off = ikr_w4_col_off(0, tiles, cp_cnt, 0, col as u64).unwrap() as usize;
+                    let byte = c_exp[off + (i >> 1)];
+                    let nib = ((byte >> (4 * (i & 1))) & 0x0F) as usize;
+                    let b = col / 16;
+                    let vo = ikr_scale_vec_off(0, tiles, nblk, 0, b as u64).unwrap() as usize * 2;
+                    let sb = vo + ikr_scale_lane_pos(i as u64) as usize * 2;
+                    let sh = u16::from_le_bytes([s_exp[sb], s_exp[sb + 1]]);
+                    let sv = f16_to_f32(sh);
+                    let w_rec = lut[nib] * sv;
+                    let w_ref = bf16_to_f32(u16::from_le_bytes([bf_buf[col * 2], bf_buf[col * 2 + 1]]));
+                    assert!(
+                        (w_rec - w_ref).abs() <= 0.01 * w_ref.abs().max(1e-4),
+                        "W4 GU e={e} row={row} col={col}: w_rec={w_rec} w_ref={w_ref}"
+                    );
+                    l1_x += w_ref.abs() * x[col].abs();
+                    acc += w_rec * x[col];
+                }
+                let diff = (acc - ref_y[row]).abs();
+                assert!(
+                    diff <= 0.01 * l1_x.max(1e-4),
+                    "GU e={e} row={row}: acc={acc} ref={} diff={diff}",
+                    ref_y[row]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routed_w8_packing_matches_decoded_gu_and_dn_matvec() {
+        struct DummyEx {
+            data: Vec<u16>,
+            rows: usize,
+            cols: usize,
+        }
+        impl ExpertRows for DummyEx {
+            fn decode(&self, e: usize, r: usize, out: &mut [u8]) -> Result<(), String> {
+                let start = (e * self.rows + r) * self.cols;
+                for (i, o) in out.chunks_exact_mut(2).enumerate() {
+                    o.copy_from_slice(&self.data[start + i].to_le_bytes());
+                }
+                Ok(())
+            }
+        }
+
+        for is_gu in [true, false] {
+            let (ne, cols, out_rows) = if is_gu { (2usize, 64usize, 256usize) } else { (2usize, 128usize, 256usize) };
+            let tiles = if is_gu { ikr_gu_tiles(128) } else { ikr_dn_tiles(256) };
+            let nblk = (cols / 32) as u64;
+            let mut data = vec![0u16; ne * out_rows * cols];
+            for (idx, d) in data.iter_mut().enumerate() {
+                let v = (((idx % 97) as f32) - 48.0) * 0.015;
+                *d = f32_to_bf16_rne(v);
+            }
+            let ex = DummyEx { data, rows: out_rows, cols };
+            let (codes, scales) = pack_w8_from_rows(&ex, ne as u64, tiles, cols as u64, is_gu).unwrap();
+            let exp_code = ikr_w8_code_bytes(cols as u64, tiles, 1).unwrap() as usize;
+            let exp_scale = ikr_scale_bytes(cols as u64, 32, tiles, 1).unwrap() as usize;
+            let x: Vec<f32> = (0..cols).map(|c| ((c as f32) - 30.0) * 0.05).collect();
+            let mut bf_buf = vec![0u8; cols * 2];
+
+            for e in 0..ne {
+                let ref_y = ref_matvec_bf16(&ex, e, out_rows, cols, &x);
+                let c_exp = &codes[e * exp_code..(e + 1) * exp_code];
+                let s_exp = &scales[e * exp_scale..(e + 1) * exp_scale];
+                for i in 0..256usize {
+                    let row = routed_src_row(is_gu, 0, i as u64) as usize;
+                    ex.decode(e, row, &mut bf_buf).unwrap();
+                    let mut acc = 0.0f32;
+                    let mut l1_bound = 0.0f32;
+                    for col in 0..cols {
+                        let off = ikr_w8_col_off(0, tiles, cols as u64, 0, col as u64).unwrap() as usize;
+                        let q = c_exp[off + i] as i8;
+                        let b = col / 32;
+                        let vo = ikr_scale_vec_off(0, tiles, nblk, 0, b as u64).unwrap() as usize * 2;
+                        let sb = vo + ikr_scale_lane_pos(i as u64) as usize * 2;
+                        let sh = u16::from_le_bytes([s_exp[sb], s_exp[sb + 1]]);
+                        let sv = f16_to_f32(sh);
+                        let w_rec = f32::from(q) * sv;
+                        let w_ref = bf16_to_f32(u16::from_le_bytes([bf_buf[col * 2], bf_buf[col * 2 + 1]]));
+                        assert!(
+                            (w_rec - w_ref).abs() <= 0.55 * sv + 1e-5,
+                            "W8 is_gu={is_gu} e={e} row={row} col={col}: w_rec={w_rec} w_ref={w_ref} sv={sv}"
+                        );
+                        l1_bound += 0.55 * sv * x[col].abs();
+                        acc += w_rec * x[col];
+                    }
+                    let diff = (acc - ref_y[row]).abs();
+                    assert!(
+                        diff <= l1_bound + 1e-4,
+                        "W8 is_gu={is_gu} e={e} row={row}: acc={acc} ref={} diff={diff} bound={l1_bound}",
+                        ref_y[row]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ikr_use_routed_defaults_to_routed_only_for_valid_inkling2() {
+        use crate::verified::{ikr_use_routed, IkMoeForm};
+        assert!(ikr_use_routed(true, IkMoeForm::IkMoeAuto, true));
+        assert!(!ikr_use_routed(true, IkMoeForm::IkMoeAuto, false));
+        assert!(!ikr_use_routed(true, IkMoeForm::IkMoeDense, true));
+        assert!(ikr_use_routed(true, IkMoeForm::IkMoeRouted, true));
+        assert!(!ikr_use_routed(true, IkMoeForm::IkMoeRouted, false));
+        assert!(!ikr_use_routed(false, IkMoeForm::IkMoeAuto, true));
+    }
+
+    #[test]
+    fn routed_layer_extents_uses_verified_guards_and_sizes() {
+        let w4 = routed_layer_extents(IkExpertFmt::W4, 2304, 9, 128).unwrap();
+        assert_eq!((w4.blk, w4.nblk, w4.inner_cols), (16, 144, 1152));
+        assert_eq!(w4.code_dims, [256, 1152, 9, 128]);
+        assert_eq!(w4.scale_dims, [256, 144, 9, 128]);
+        assert_eq!(w4.code_bytes, 256 * 1152 * 9 * 128);
+        assert_eq!(w4.scale_bytes, 256 * 144 * 9 * 128 * 2);
+
+        let w8 = routed_layer_extents(IkExpertFmt::W8, 2304, 9, 128).unwrap();
+        assert_eq!((w8.blk, w8.nblk, w8.inner_cols), (32, 72, 2304));
+        assert_eq!(w8.code_dims, [256, 2304, 9, 128]);
+        assert_eq!(w8.scale_dims, [256, 72, 9, 128]);
+        assert_eq!(w8.code_bytes, 256 * 2304 * 9 * 128);
+        assert_eq!(w8.scale_bytes, 256 * 72 * 9 * 128 * 2);
+
+        assert!(routed_layer_extents(IkExpertFmt::W8, 0, 9, 128).is_err());
+        assert!(routed_layer_extents(IkExpertFmt::W4, 0, 9, 128).is_err());
+        assert!(routed_layer_extents(IkExpertFmt::W8, 16, 9, 128).is_err());
+        assert!(routed_layer_extents(IkExpertFmt::W4, 8, 9, 128).is_err());
+        assert!(routed_layer_extents(IkExpertFmt::W4, 2304, 0, 128).is_err());
+        assert!(routed_layer_extents(IkExpertFmt::W8, 2304, 9, 0).is_err());
+    }
+
+    #[test]
+    fn routed_src_row_bijects_all_256_lanes_per_tile() {
+        for is_gu in [false, true] {
+            for tt in [0u64, 3u64] {
+                let mut seen = std::collections::BTreeSet::new();
+                for lane in 0..256u64 {
+                    let row = routed_src_row(is_gu, tt, lane);
+                    assert!(row >= tt * 256 && row < (tt + 1) * 256);
+                    assert!(seen.insert(row));
+                }
+                assert_eq!(seen.len(), 256);
+            }
+        }
     }
 }

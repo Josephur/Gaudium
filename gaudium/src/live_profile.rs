@@ -94,7 +94,12 @@ fn has_layer_prefix(name: &str, c: char) -> bool {
 
 /// Default node-name rules: which phase of a step a node belongs to.
 pub fn phase_of(node_name: &str, guid: &str) -> Phase {
-    if node_name.contains("logits") || guid.contains("argmax") || guid.contains("samp_") {
+    if node_name.contains("logits")
+        || guid.contains("argmax")
+        || guid.contains("samp_")
+        || guid.contains("softcap")
+        || guid.contains("mcap")
+    {
         return Phase::Readout;
     }
     if node_name.starts_with("mtp_")
@@ -203,16 +208,23 @@ impl Traffic {
                 }
                 seen.push(t.id);
                 let mut by = t.bytes as f64;
+                let mut expert_scaled = false;
                 let last = t.dims.last().copied().unwrap_or(1).max(1) as f64;
+                let is_routed_expert = rules.experts_per_row > 0
+                    && ((t.dims.len() == 3
+                        && (t.name.ends_with("EW12") || t.name.ends_with("EW3")))
+                        || (t.dims.len() == 4
+                            && (t.name.ends_with("W13_c")
+                                || t.name.ends_with("W13_s")
+                                || t.name.ends_with("W2_c")
+                                || t.name.ends_with("W2_s"))));
                 if gather && i == 0 {
                     by = out0;
                 } else if t.name.contains("rope") {
                     by = by * rows.min(last) / last;
-                } else if rules.experts_per_row > 0
-                    && (t.name.ends_with("EW12") || t.name.ends_with("EW3"))
-                    && t.dims.len() == 3
-                {
+                } else if is_routed_expert {
                     by = by * (rows * rules.experts_per_row as f64).min(last) / last;
+                    expert_scaled = true;
                 } else if (t.name.ends_with("S_in") || t.name.ends_with("cs_in"))
                     && t.dims.len() >= 3
                     && last > 1.0
@@ -220,7 +232,7 @@ impl Traffic {
                     by /= last;
                 }
                 let kind = kind_fn(t.name);
-                if kind == Kind::Weight && custom_kernel && by > INDEXED_TABLE_MIN {
+                if !expert_scaled && kind == Kind::Weight && custom_kernel && by > INDEXED_TABLE_MIN {
                     // a TPC kernel indexes a large table (candidate rows, codes, scores): it
                     // does not stream it the way a GEMM streams a weight matrix
                     by = INDEXED_TABLE_CHARGE;

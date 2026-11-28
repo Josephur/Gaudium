@@ -94,7 +94,7 @@ extern "C" {
 uint64_t GetLibVersion() { return 78813002322618477ULL; }   // the interface version the other glue libraries report
 GlueCodeReturn GetShapeInference(_IN_ DeviceId, _IN_ const ShapeInferenceParams*, _OUT_ ShapeInferenceOutput*) { return GLUE_SUCCESS; }
 
-static const char* GUIDS[] = {"gaudium_ik_mix", "gaudium_ik_gin", "gaudium_ik_mgate", "gaudium_ik_norm", "gaudium_ik_save", "gaudium_ik_conv", "gaudium_ik_qprep", "gaudium_ik_kvprep", "gaudium_ik_softmax", "gaudium_ik_combine", "gaudium_ik_route", "gaudium_ik_moe_act", "gaudium_ik_argmax", "gaudium_ik_dmix", "gaudium_ik_dkv", "gaudium_ik_dqprep", "gaudium_ik_dsoft", "gaudium_ik_dcomb", "gaudium_ik_dswiglu", "gaudium_ik_mstep", "gaudium_ik_margmax"};
+static const char* GUIDS[] = {"gaudium_ik_mix", "gaudium_ik_gin", "gaudium_ik_mgate", "gaudium_ik_norm", "gaudium_ik_save", "gaudium_ik_conv", "gaudium_ik_qprep", "gaudium_ik_kvprep", "gaudium_ik_softmax", "gaudium_ik_combine", "gaudium_ik_route", "gaudium_ik_moe_act", "gaudium_ik_argmax", "gaudium_ik_dmix", "gaudium_ik_dkv", "gaudium_ik_dqprep", "gaudium_ik_dsoft", "gaudium_ik_dcomb", "gaudium_ik_dswiglu", "gaudium_ik_mstep", "gaudium_ik_margmax", "gaudium_ik_route_r", "gaudium_ik_w4_plan", "gaudium_ik_w4_q8", "gaudium_ik_w8_q8", "gaudium_ik_w4_gu", "gaudium_ik_w4_dn", "gaudium_ik_w8_gu", "gaudium_ik_w8_dn", "gaudium_ik_w4_comb", "gaudium_ik_softcap", "gaudium_ik_mcap"};
 GlueCodeReturn GetKernelGuids(_IN_ DeviceId deviceId, _INOUT_ uint32_t* kernelCount, _OUT_ GuidInfo* guids) {
     const uint32_t n = sizeof(GUIDS) / sizeof(GUIDS[0]);
     if (deviceId != DEVICE_ID_GAUDI2) { if (kernelCount) *kernelCount = 0; return GLUE_SUCCESS; }
@@ -446,6 +446,131 @@ GlueCodeReturn InstantiateTpcKernel(_IN_ HabanaKernelParams* p, _INOUT_ HabanaKe
         all_whole(p, out);
         out->kernel.paramsNr = 2; out->kernel.scalarParams[0] = node_u32(p, 0); out->kernel.scalarParams[1] = node_u32(p, 1);
         return put_elf(out, "GAUDIUM_IKMARGMAX_ELF");
+    }
+    if (g == "gaudium_ik_route_r") {   // logits bf16 {E, T}, rb f32 {E} -> ids i32 {K, T}, w f32 {K, T}; node params: K, route_scale (f32 bits)
+        NIN(2) NOUT(2)
+        const TensorDataType in[2] = {DATA_BF16, DATA_F32}, ot[2] = {DATA_I32, DATA_F32};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (!has_params(p, 2)) return GLUE_FAILED;
+        const uint64_t E = dim(IN(0), 0), T = dim(IN(0), 1); const uint32_t K = node_u32(p, 0);
+        if (IN(0).geometry.dims != 2 || E == 0 || E % 128 || E > 512 || K == 0 || K > 12 || K > E || IN(1).geometry.dims != 1 || dim(IN(1), 0) != E) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (OUT(0).geometry.dims != 2 || dim(OUT(0), 0) != K || dim(OUT(0), 1) != T) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        if (OUT(1).geometry.dims != 2 || dim(OUT(1), 0) != K || dim(OUT(1), 1) != T) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = T;
+        all_whole(p, out);
+        out->kernel.paramsNr = 2; out->kernel.scalarParams[0] = K; out->kernel.scalarParams[1] = node_u32(p, 1);
+        return put_elf(out, "GAUDIUM_IKROUTER_ELF");
+    }
+    if (g == "gaudium_ik_w4_plan") {   // ids i32 {K, T} -> plan i32 {>= 1 + 5 K T}; node param: E
+        NIN(1) NOUT(1)
+        const TensorDataType in[1] = {DATA_I32}, ot[1] = {DATA_I32};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (!has_params(p, 1)) return GLUE_FAILED;
+        const uint64_t K = dim(IN(0), 0), T = dim(IN(0), 1); const uint32_t E = node_u32(p, 0);
+        if (IN(0).geometry.dims != 2 || K == 0 || K > 12 || T == 0 || E == 0 || E > 512) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (OUT(0).geometry.dims != 1 || dim(OUT(0), 0) < 1 + 5 * K * T) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 1;
+        all_whole(p, out);
+        out->kernel.paramsNr = 3; out->kernel.scalarParams[0] = (uint32_t)K; out->kernel.scalarParams[1] = (uint32_t)T; out->kernel.scalarParams[2] = E;
+        return put_elf(out, "GAUDIUM_IKPLAN_ELF");
+    }
+    if (g == "gaudium_ik_w4_q8" || g == "gaudium_ik_w8_q8") {   // x bf16 {H, T} -> xq i8 {256, H/32, T}, xs f32 {64, H/blk, T}
+        NIN(1) NOUT(2)
+        const bool w8 = g == "gaudium_ik_w8_q8"; const uint64_t blk = w8 ? 32 : 16;
+        const TensorDataType in[1] = {DATA_BF16}, ot[2] = {DATA_I8, DATA_F32};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        const uint64_t H = dim(IN(0), 0), T = dim(IN(0), 1);
+        if (IN(0).geometry.dims != 2 || H == 0 || H % 128 || T == 0) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (OUT(0).geometry.dims != 3 || dim(OUT(0), 0) != 256 || dim(OUT(0), 1) != H / 32 || dim(OUT(0), 2) != T) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        if (OUT(1).geometry.dims != 3 || dim(OUT(1), 0) != 64 || dim(OUT(1), 1) != H / blk || dim(OUT(1), 2) != T) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        out->indexSpaceRank = 2; out->indexSpaceGeometry[0] = H / 128; out->indexSpaceGeometry[1] = T;
+        all_whole(p, out);
+        out->kernel.paramsNr = 0;
+        return put_elf(out, w8 ? "GAUDIUM_IKW8Q8_ELF" : "GAUDIUM_IKW4Q8_ELF");
+    }
+    if (g == "gaudium_ik_w4_gu" || g == "gaudium_ik_w4_dn" || g == "gaudium_ik_w8_gu" || g == "gaudium_ik_w8_dn") {
+        const bool gu = (g == "gaudium_ik_w4_gu" || g == "gaudium_ik_w8_gu");
+        const bool w8 = (g == "gaudium_ik_w8_gu" || g == "gaudium_ik_w8_dn");
+        const uint32_t nin = w8 ? 5 : 6, nout = gu ? 2 : 1;
+        if (p->inputTensorNr != nin) { p->inputTensorNr = nin; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
+        if (p->outputTensorNr != nout) { p->outputTensorNr = nout; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
+        const TensorDataType in[6] = {DATA_I8, DATA_F32, DATA_I32, w8 ? DATA_I8 : DATA_U8, DATA_F16, DATA_I8};
+        const TensorDataType ot[2] = {gu ? DATA_I8 : DATA_F32, DATA_F32};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (gu && !has_params(p, 2)) return GLUE_FAILED;
+        const uint64_t blk = w8 ? 32 : 16;
+        const uint64_t NBLK = dim(IN(4), 1), NT = dim(IN(3), 2), E = dim(IN(3), 3);
+        const uint64_t IN_C = NBLK * blk;
+        if (IN_C == 0 || NT == 0 || E == 0) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (IN(3).geometry.dims != 4 || dim(IN(3), 0) != 256 || dim(IN(3), 1) != (w8 ? IN_C : IN_C / 2)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (IN(4).geometry.dims != 4 || dim(IN(4), 0) != 256 || dim(IN(4), 2) != NT || dim(IN(4), 3) != E) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (!w8 && (IN(5).geometry.dims != 1 || dim(IN(5), 0) != 256)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        uint64_t K = 0, T = 0;
+        if (gu) {
+            if (OUT(0).geometry.dims != 4 || OUT(1).geometry.dims != 4) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+            const uint64_t EF = dim(OUT(0), 1) * 16;
+            K = dim(OUT(0), 2); T = dim(OUT(0), 3);
+            if (dim(OUT(0), 0) != 256 || EF == 0 || EF % 128 || EF / 128 != NT) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+            if (dim(OUT(1), 0) != 64 || dim(OUT(1), 1) != EF / blk || dim(OUT(1), 2) != K || dim(OUT(1), 3) != T) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+            if (IN(0).geometry.dims != 3 || dim(IN(0), 0) != 256 || dim(IN(0), 1) != IN_C / 32 || dim(IN(0), 2) != T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+            if (IN(1).geometry.dims != 3 || dim(IN(1), 0) != 64 || dim(IN(1), 1) != NBLK || dim(IN(1), 2) != T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        } else {
+            if (OUT(0).geometry.dims != 3) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+            const uint64_t H = dim(OUT(0), 0); K = dim(OUT(0), 1); T = dim(OUT(0), 2);
+            if (H == 0 || H % 256 || H / 256 != NT) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+            if (IN(0).geometry.dims != 4 || dim(IN(0), 0) != 256 || dim(IN(0), 1) != IN_C / 16 || dim(IN(0), 2) != K || dim(IN(0), 3) != T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+            if (IN(1).geometry.dims != 4 || dim(IN(1), 0) != 64 || dim(IN(1), 1) != NBLK || dim(IN(1), 2) != K || dim(IN(1), 3) != T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        }
+        if (K == 0 || K > 12 || T == 0 || IN(2).geometry.dims != 1 || dim(IN(2), 0) < 1 + 5 * K * T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        uint64_t M = K * T; if (M > 240) M = 240; if (M == 0) M = 1;
+        out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = NT * M;
+        all_whole(p, out);
+        out->kernel.paramsNr = gu ? 5 : 3;
+        out->kernel.scalarParams[0] = (uint32_t)NT; out->kernel.scalarParams[1] = (uint32_t)M; out->kernel.scalarParams[2] = (uint32_t)(K * T);
+        if (gu) { out->kernel.scalarParams[3] = node_u32(p, 0); out->kernel.scalarParams[4] = node_u32(p, 1); }
+        const char* env = w8 ? (gu ? "GAUDIUM_IKW8GU_ELF" : "GAUDIUM_IKW8DN_ELF") : (gu ? "GAUDIUM_IKW4GU_ELF" : "GAUDIUM_IKW4DN_ELF");
+        return put_elf(out, env);
+    }
+    if (g == "gaudium_ik_w4_comb") {   // y f32 {H, K, T}, w f32 {K, T} -> out bf16 {H, T}; node param: K
+        NIN(2) NOUT(1)
+        const TensorDataType in[2] = {DATA_F32, DATA_F32}, ot[1] = {DATA_BF16};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (!has_params(p, 1)) return GLUE_FAILED;
+        const uint64_t H = dim(OUT(0), 0), T = dim(OUT(0), 1); const uint32_t K = node_u32(p, 0);
+        if (OUT(0).geometry.dims != 2 || H == 0 || H % 128 || T == 0 || K == 0 || K > 12) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        if (IN(0).geometry.dims != 3 || dim(IN(0), 0) != H || dim(IN(0), 1) != K || dim(IN(0), 2) != T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (IN(1).geometry.dims != 2 || dim(IN(1), 0) != K || dim(IN(1), 1) != T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        out->indexSpaceRank = 2; out->indexSpaceGeometry[0] = H / 128; out->indexSpaceGeometry[1] = T;
+        all_whole(p, out);
+        out->kernel.paramsNr = 1; out->kernel.scalarParams[0] = K;
+        return put_elf(out, "GAUDIUM_IKW4COMB_ELF");
+    }
+    if (g == "gaudium_ik_softcap") {   // x bf16 {V, T} -> y bf16 {V, T}; node params: cap_bits, NV
+        NIN(1) NOUT(1)
+        const TensorDataType in[1] = {DATA_BF16}, ot[1] = {DATA_BF16};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (!has_params(p, 2)) return GLUE_FAILED;
+        const uint64_t V = dim(IN(0), 0), T = dim(IN(0), 1); const uint32_t NV = node_u32(p, 1);
+        if (IN(0).geometry.dims != 2 || V == 0 || V % 128 || T == 0 || NV > V) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (OUT(0).geometry.dims != 2 || dim(OUT(0), 0) != V || dim(OUT(0), 1) != T) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        out->indexSpaceRank = 2; out->indexSpaceGeometry[0] = V / 128; out->indexSpaceGeometry[1] = T;
+        all_whole(p, out);
+        out->kernel.paramsNr = 2; out->kernel.scalarParams[0] = node_u32(p, 0); out->kernel.scalarParams[1] = NV;
+        return put_elf(out, "GAUDIUM_IKSOFTCAP_ELF");
+    }
+    if (g == "gaudium_ik_mcap") {   // base bf16 {V, TR}, bias bf16 {V, 1}, bf bf16 {V} -> y bf16 {V, 1}; node params: col, NV, cap_bits
+        NIN(3) NOUT(1)
+        const TensorDataType in[3] = {DATA_BF16, DATA_BF16, DATA_BF16}, ot[1] = {DATA_BF16};
+        if (!all_dtype(p, in, ot)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (!has_params(p, 3)) return GLUE_FAILED;
+        const uint64_t V = dim(IN(0), 0); const uint32_t col = node_u32(p, 0), NV = node_u32(p, 1);
+        if (IN(0).geometry.dims != 2 || V == 0 || V % 128 || col >= dim(IN(0), 1) || NV > V) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (IN(1).geometry.dims != 2 || dim(IN(1), 0) != V || dim(IN(1), 1) != 1 || IN(2).geometry.dims != 1 || dim(IN(2), 0) != V) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (OUT(0).geometry.dims != 2 || dim(OUT(0), 0) != V || dim(OUT(0), 1) != 1) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = V / 128;
+        all_whole(p, out);
+        out->kernel.paramsNr = 3; for (int i = 0; i < 3; ++i) out->kernel.scalarParams[i] = node_u32(p, i);
+        return put_elf(out, "GAUDIUM_IKMCAP_ELF");
     }
     return GLUE_NODE_NOT_FOUND;
 }

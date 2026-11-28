@@ -55,6 +55,9 @@ pub(super) const MTP_ELFS: &[&str] = &[
     "GAUDIUM_GARMSNORM_ELF",
 ];
 
+/// Additional kernel ELFs used by the coupled sampled block drafter graph.
+pub(super) const MTP_SAMP_ELFS: &[&str] = &["GAUDIUM_IKMCAP_ELF"];
+
 /// Channels of a head (fixed in the drafter kernels).
 const DH: u64 = 128;
 /// Rows of one level of the rotary tables (`pos = 256 hi + lo`).
@@ -253,6 +256,7 @@ pub struct MtpGeom {
     pub vocab_in: u64,
     pub vocab_out: u64,
     pub vocab_pad: u64,
+    pub logit_softcap: f32,
 }
 
 impl MtpGeom {
@@ -277,6 +281,7 @@ impl MtpGeom {
             vocab_in: d.vocab_in,
             vocab_out: d.vocab_out,
             vocab_pad: d.vocab_pad,
+            logit_softcap: d.logit_softcap,
             c,
         })
     }
@@ -532,16 +537,41 @@ fn append_layer(
     out
 }
 
-/// Block recipe `g_ikd_blk_C{nch}`: the anchor `mt_anchor` at position `mt_ctl[0]`, the first
-/// numbers of context positions the layers see in `mt_ctl[1]` (global) and `mt_ctl[2]` (windowed) (the global
-/// layer reads `nch` chunks of its cache), the Markov context from column `mt_fidx` of `mt_c3`
-/// -> `mt_drafts {1, block - 1}`.
+/// Block recipe `g_ikd_blk_B{block}_C{nch}_R{ring}_X{ctx_rows}`: the anchor `mt_anchor` at
+/// position `mt_ctl[0]`, the numbers of context positions the layers see in `mt_ctl[1]`
+/// (global) and `mt_ctl[2]` (windowed) (the global layer reads `nch` chunks of its cache), the
+/// Markov context from column `mt_fidx` of `mt_c3` -> `mt_drafts {1, block - 1}`.
 pub fn build_block_graph(g: &MtpGeom, nch: u64, elf_hashes: &[(String, String)]) -> GraphBuilder {
+    build_block_graph_inner(g, nch, elf_hashes, false)
+}
+
+/// Coupled sampled variant `g_ikd_sblk_B{block}_...`: adds the head bias and softcap on card and
+/// draws each draft with the shared sampler parameters (`samp_f`/`samp_i`/`samp_rsel`) at
+/// position `mt_ctl[0] + (i - 1)` with `role = 1`.
+pub fn build_block_graph_samp(
+    g: &MtpGeom,
+    nch: u64,
+    elf_hashes: &[(String, String)],
+) -> GraphBuilder {
+    build_block_graph_inner(g, nch, elf_hashes, true)
+}
+
+fn build_block_graph_inner(
+    g: &MtpGeom,
+    nch: u64,
+    elf_hashes: &[(String, String)],
+    sampled: bool,
+) -> GraphBuilder {
     let c = &g.c;
     let (bf, i32t) = (SynDataType::Bf16, SynDataType::Int32);
     let b = c.block;
     let mut gb = ik_graph(
-        format!("g_ikd_blk_B{b}_C{nch}_R{}_X{}", g.ring, g.ctx_rows),
+        format!(
+            "g_ikd_{}_B{b}_C{nch}_R{}_X{}",
+            if sampled { "sblk" } else { "blk" },
+            g.ring,
+            g.ctx_rows
+        ),
         elf_hashes,
     );
     let anchor = gb.add_persistent_tensor("mt_anchor", i32t, &[1]);
@@ -607,13 +637,40 @@ pub fn build_block_graph(g: &MtpGeom, nch: u64, elf_hashes: &[(String, String)])
             &format!("mt_bias{i}"),
         );
         let di = gb.add_persistent_tensor(format!("mt_d{i}"), i32t, &[1, 1]);
-        gb.add_node(
-            "gaudium_ik_margmax",
-            format!("mt_argmax{i}"),
-            &[logits, bias, bfold],
-            &[di],
-            &u32_params(&[i as u32, g.vocab_out as u32]),
-        );
+        if sampled {
+            let cap_l = gb.add_intermediate(format!("mt_cap{i}"), bf, &[g.vocab_pad, 1]);
+            gb.add_node(
+                "gaudium_ik_mcap",
+                format!("mt_mcap{i}"),
+                &[logits, bias, bfold],
+                &[cap_l],
+                &u32_params(&[i as u32, g.vocab_out as u32, f32_bits(g.logit_softcap)]),
+            );
+            let at = crate::engine::sampler::SamplerAt {
+                base: ctl,
+                off: (i - 1) as u32,
+                role: 1,
+            };
+            let _ = crate::engine::sampler::append_sampler_as(
+                &mut gb,
+                cap_l,
+                g.vocab_pad,
+                1,
+                &at,
+                &format!("mt_ds{i}"),
+                crate::engine::sampler::SAMP_F,
+                crate::engine::sampler::SAMP_I,
+                Some(di),
+            );
+        } else {
+            gb.add_node(
+                "gaudium_ik_margmax",
+                format!("mt_argmax{i}"),
+                &[logits, bias, bfold],
+                &[di],
+                &u32_params(&[i as u32, g.vocab_out as u32]),
+            );
+        }
         prev = ik_view(&mut gb, di, &format!("mt_dv{i}"), i32t, &[1]);
         s = sn;
         drafts.push(di);
@@ -661,7 +718,10 @@ fn role(name: &str) -> Role {
         Role::Weight
     } else if name.starts_with("mts_") {
         Role::State
-    } else if name.starts_with("mti_") || MAIN_SHARED.contains(&name) {
+    } else if name.starts_with("mti_")
+        || MAIN_SHARED.contains(&name)
+        || crate::engine::sampler::is_sampler_param(name)
+    {
         Role::External
     } else {
         Role::Act
@@ -1038,6 +1098,7 @@ pub(super) struct MtpState {
     pub g: MtpGeom,
     pub taps: [MtpTap; 4],
     elf_hashes: Vec<(String, String)>,
+    samp_elf_hashes: Vec<(String, String)>,
     pub plan: MtpPlan,
     addr: BTreeMap<String, u64>,
     ctx_recipes: HashMap<u64, CompiledRecipe>,
@@ -1045,6 +1106,7 @@ pub(super) struct MtpState {
     /// prefill launch the tile's row buffers).
     ctx_prepared: HashMap<(u64, bool), PreparedLaunch>,
     blk: BTreeMap<u64, (CompiledRecipe, PreparedLaunch)>,
+    blk_samp: BTreeMap<u64, (CompiledRecipe, PreparedLaunch)>,
     /// Column of `mt_c3` that holds the Markov context of the next block (the last committed
     /// position before its anchor).
     pub fidx: u64,
@@ -1057,17 +1119,20 @@ impl MtpState {
         g: MtpGeom,
         taps: [MtpTap; 4],
         elf_hashes: Vec<(String, String)>,
+        samp_elf_hashes: Vec<(String, String)>,
         plan: MtpPlan,
     ) -> Self {
         Self {
             g,
             taps,
             elf_hashes,
+            samp_elf_hashes,
             plan,
             addr: BTreeMap::new(),
             ctx_recipes: HashMap::new(),
             ctx_prepared: HashMap::new(),
             blk: BTreeMap::new(),
+            blk_samp: BTreeMap::new(),
             fidx: 0,
             stats: MtpStats::default(),
             dump_dir: std::env::var_os("GAUDIUM_IK_MTP_DUMP").map(std::path::PathBuf::from),
@@ -1108,6 +1173,17 @@ impl Inkling2Engine {
         let mut pool = self.mtp_ref().addr.clone();
         for n in MAIN_SHARED {
             pool.insert((*n).to_string(), self.weights_addr[*n]);
+        }
+        if self.samp_ready {
+            for name in [
+                crate::engine::sampler::SAMP_F,
+                crate::engine::sampler::SAMP_I,
+                crate::engine::sampler::SAMP_RSEL,
+            ] {
+                if let Some(&(addr, _)) = self.step_act_addr.get(name) {
+                    pool.insert(name.to_string(), addr);
+                }
+            }
         }
         pool
     }
@@ -1248,11 +1324,26 @@ impl Inkling2Engine {
         self.mtp_mut().fidx = mtp_frnn_row(row, rows);
     }
 
-    fn mtp_ensure_block(&mut self, nch: u64) -> Result<(), String> {
-        if self.mtp_ref().blk.contains_key(&nch) {
+    fn mtp_ensure_block(&mut self, nch: u64, sampled: bool) -> Result<(), String> {
+        let st = self.mtp_ref();
+        let use_samp = sampled && self.samp_ready && !st.samp_elf_hashes.is_empty();
+        if use_samp {
+            if st.blk_samp.contains_key(&nch) {
+                return Ok(());
+            }
+            let gb = build_block_graph_samp(&st.g, nch, &st.samp_elf_hashes);
+            let r = self.compile(&gb, &format!("drafter sampled block ({nch} chunks)"))?;
+            let exact = select_exact_bindings(&r, &self.mtp_pool())?;
+            let prepared = r
+                .prepare_launch(&exact)
+                .map_err(|e| format!("prepare drafter sampled block: {e}"))?;
+            self.mtp_mut().blk_samp.insert(nch, (r, prepared));
             return Ok(());
         }
-        let gb = build_block_graph(&self.mtp_ref().g, nch, &self.mtp_ref().elf_hashes);
+        if st.blk.contains_key(&nch) {
+            return Ok(());
+        }
+        let gb = build_block_graph(&st.g, nch, &st.elf_hashes);
         let r = self.compile(&gb, &format!("drafter block ({nch} chunks)"))?;
         let exact = select_exact_bindings(&r, &self.mtp_pool())?;
         let prepared = r
@@ -1269,21 +1360,31 @@ impl Inkling2Engine {
 
     /// Compiles the block recipe a block at anchor position `p` needs (first use is not decode
     /// time). Returns the milliseconds spent.
-    pub(super) fn mtp_prepare_block(&mut self, p: u64) -> Result<f64, String> {
+    pub(super) fn mtp_prepare_block(&mut self, p: u64, sampled: bool) -> Result<f64, String> {
         let t0 = Instant::now();
         let nch = self.mtp_bucket(p);
-        self.mtp_ensure_block(nch)?;
+        self.mtp_ensure_block(nch, sampled)?;
         Ok(t0.elapsed().as_secs_f64() * 1000.0)
     }
 
     /// Drafts the block anchored on `anchor` at position `p` (the context must hold every
     /// position before `p`): returns the `block - 1` drafted tokens.
-    pub(super) fn mtp_draft(&mut self, anchor: i32, p: u64) -> Result<Vec<i32>, String> {
+    pub(super) fn mtp_draft(
+        &mut self,
+        anchor: i32,
+        p: u64,
+        sampled: bool,
+    ) -> Result<Vec<i32>, String> {
         let nch = self.mtp_bucket(p);
-        self.mtp_ensure_block(nch)?;
-        let (b, window, fidx) = {
+        self.mtp_ensure_block(nch, sampled)?;
+        let (b, window, fidx, use_samp) = {
             let st = self.mtp_ref();
-            (st.g.c.block as usize, st.g.c.window, st.fidx)
+            (
+                st.g.c.block as usize,
+                st.g.c.window,
+                st.fidx,
+                sampled && self.samp_ready && !st.samp_elf_hashes.is_empty(),
+            )
         };
         let seen_w = mtp_ctx_seen(p, window, true);
         let seen_g = mtp_ctx_seen(p, window, false);
@@ -1314,7 +1415,11 @@ impl Inkling2Engine {
             .map_err(|e| format!("write drafter inputs H2D: {e}"))?;
         {
             let st = self.mtp_ref();
-            let (r, prepared) = &st.blk[&nch];
+            let (r, prepared) = if use_samp {
+                &st.blk_samp[&nch]
+            } else {
+                &st.blk[&nch]
+            };
             r.launch_prepared(&self.dev, prepared)
                 .map_err(|e| format!("launch drafter block (p={p}): {e}"))?;
         }
@@ -1570,5 +1675,37 @@ mod tests {
             - hi[h * 256 + 128 + lane] * lo[l * 256 + 128 + lane];
         let f = 1.0e6f64.powf(-(2.0 * 11.0) / 128.0);
         assert!((c as f64 - (pos as f64 * f).cos()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sampled_block_graph_aligns_positions_and_keeps_plan_unchanged() {
+        let c = MtpConfig::from_config_json(MTP_JSON).unwrap();
+        let d = mini_dims(256);
+        let g = MtpGeom::new(c, &d, 8192, 256).unwrap();
+        let greedy = build_block_graph(&g, 1, &[]);
+        let samp = build_block_graph_samp(&g, 1, &[]);
+        assert_ne!(greedy.fingerprint("x"), samp.fingerprint("x"));
+
+        let g_names: Vec<String> = greedy.persistent_tensor_specs().into_iter().map(|t| t.0).collect();
+        let s_names: Vec<String> = samp.persistent_tensor_specs().into_iter().map(|t| t.0).collect();
+        let mut extra: Vec<&str> = s_names
+            .iter()
+            .filter(|n| !g_names.contains(n))
+            .map(String::as_str)
+            .collect();
+        extra.sort_unstable();
+        assert_eq!(extra, ["samp_f", "samp_i", "samp_rsel"]);
+
+        let views = samp.node_io_views();
+        assert!(views.iter().any(|n| n.guid == "gaudium_ik_mcap"));
+        assert!(!views.iter().any(|n| n.guid == "gaudium_ik_margmax"));
+        let gums: Vec<_> = views
+            .iter()
+            .filter(|n| n.guid == "gaudium_samp_gumbel")
+            .collect();
+        assert_eq!(gums.len(), (g.c.block - 1) as usize);
+        for gum in gums {
+            assert_eq!(gum.inputs[2].name, "mt_ctl");
+        }
     }
 }

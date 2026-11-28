@@ -7,18 +7,18 @@
 //! never compiled, launched or fingerprinted. The live reporter caches each result by key, so a
 //! model is built once per recipe shape.
 //!
-//! What is charged ([`Traffic`]): every persistent tensor a node reads or writes. The experts run
-//! dense-masked, so every expert matrix of every layer application is charged on every pass (no
-//! cap by the experts a row selects), and a looped layer's matrices are charged once per
-//! application. A global layer's cache is read over the chunks of its recipe's bucket, a sliding
-//! layer's ring in full; a pass writes its own rows of either. The short convolutions' history
-//! rings are charged in full on every pass (an upper bound: the kernels touch a few positions of
-//! them; together they are well under 1% of a step).
+//! What is charged ([`Traffic`]): every persistent tensor a node reads or writes. In the dense
+//! form, every expert matrix of every layer application is charged on every pass; in the routed
+//! form, the 4D packed expert pools are scaled by `min(rows * ek, ne) / ne`, and a looped
+//! layer's matrices are charged once per application. A global layer's cache is read over the
+//! chunks of its recipe's bucket, a sliding layer's ring in full; a pass writes its own rows of
+//! either. The short convolutions' history rings are charged in full on every pass (an upper bound:
+//! the kernels touch a few positions of them; together they are well under 1% of a step).
 //!
-//! Phases: in the decode step (the verify pass) the head (logits and arg-max) is `readout` and
-//! every other node is the verify trunk; every node of the drafter's two launches (its block,
-//! whose own readout drafts the tokens, and its context pass over the verified rows) is `drafts`.
-//! Not modelled: the vision tower, an image tile's embedding, the host's sampling.
+//! Phases: in the decode step (the verify pass) the head (logits, softcap, and arg-max or
+//! sampler) is `readout` and every other node is the verify trunk; every node of the drafter's
+//! two launches (its block, whose own readout drafts the tokens, and its context pass over the
+//! verified rows) is `drafts`. Not modelled: the vision tower, an image tile's embedding.
 
 use super::mtp::{build_block_graph, build_ctx_graph, MtpGeom};
 use super::*;
@@ -89,13 +89,13 @@ fn kv_positions_of(name: &str, dims: &[u64], nkv: u64) -> Option<u64> {
 /// One launch of `gb`: `rows` rows per pass, global caches of `nch` chunks, `nkv` key / value
 /// heads. A state tensor's write is charged for the pass's rows out of the positions that tensor
 /// holds (a ring's slots stay the same whatever the bucket).
-fn charge(gb: &GraphBuilder, rows: u64, nch: u64, nkv: u64) -> Traffic {
+fn charge(gb: &GraphBuilder, rows: u64, nch: u64, nkv: u64, experts_per_row: u64) -> Traffic {
     Traffic::from_graph_positions(
         gb,
         TrafficRules {
             rows,
             kv_positions: IK_CHUNK * nch,
-            experts_per_row: 0,
+            experts_per_row,
         },
         &kind_of_name,
         &|name, dims| kv_positions_of(name, dims, nkv),
@@ -131,7 +131,7 @@ fn fold_phases(mut tr: Traffic, keep: Option<Phase>, to: Phase) -> Traffic {
 pub(super) fn verify(d: &IkDims, lmax: u64, rows: u64, bucket: u64) -> Traffic {
     let gb = build_step_graph(d, lmax, bucket, rows, &[]);
     fold_phases(
-        charge(&gb, rows, bucket, d.nkv),
+        charge(&gb, rows, bucket, d.nkv, if d.routed { d.ek } else { 0 }),
         Some(Phase::Readout),
         Phase::Verify,
     )
@@ -140,13 +140,17 @@ pub(super) fn verify(d: &IkDims, lmax: u64, rows: u64, bucket: u64) -> Traffic {
 /// One launch of the drafter's block recipe whose global layer reads `nch` chunks.
 pub(super) fn draft_block(g: &MtpGeom, nch: u64) -> Traffic {
     let gb = build_block_graph(g, nch, &[]);
-    fold_phases(charge(&gb, g.c.block, nch, g.c.nkv), None, Phase::Draft)
+    fold_phases(charge(&gb, g.c.block, nch, g.c.nkv, 0), None, Phase::Draft)
 }
 
 /// One launch of the drafter's context recipe over `rows` rows.
 pub(super) fn draft_ctx(g: &MtpGeom, rows: u64) -> Traffic {
     let gb = build_ctx_graph(g, rows, &[]);
-    fold_phases(charge(&gb, rows, g.max_chunks, g.c.nkv), None, Phase::Draft)
+    fold_phases(
+        charge(&gb, rows, g.max_chunks, g.c.nkv, 0),
+        None,
+        Phase::Draft,
+    )
 }
 
 /// The launches one `step` of the decode loop consumes: the verify pass of `rows` rows over
@@ -187,17 +191,19 @@ pub(super) fn prefill_tile(
     drafter: Option<&MtpGeom>,
     last: bool,
 ) -> Traffic {
-    let mut tr = charge(&build_embed_graph(d, t, &[]), t, nch, d.nkv);
-    // every application adds the traffic of its own launch; the four graph kinds are built once
+    let ek = if d.routed { d.ek } else { 0 };
+    let mut tr = charge(&build_embed_graph(d, t, &[]), t, nch, d.nkv, 0);
+    // every application adds the traffic of its own launch; the distinct graph kinds are built once
     let mut built: Vec<(IkKind, Traffic)> = Vec::new();
     for app in d.run_apps() {
         let k = IkKind {
             sliding: app.sliding,
             msgs: app.msgs,
+            expert_fmt: d.routed.then(|| d.layer_fmt[app.layer]),
         };
         if !built.iter().any(|(c, _)| *c == k) {
             let gb = build_app_graph(d, k, t, lmax, nch, &[]);
-            built.push((k, charge(&gb, t, nch, d.nkv)));
+            built.push((k, charge(&gb, t, nch, d.nkv, ek)));
         }
         if let Some((_, app_tr)) = built.iter().find(|(c, _)| *c == k) {
             tr.add(app_tr, 1.0);
@@ -205,7 +211,7 @@ pub(super) fn prefill_tile(
     }
     let has_drafter = drafter.is_some();
     if ik_tile_runs_final(has_drafter, last) {
-        tr.add(&charge(&build_final_graph(d, t, &[]), t, nch, d.nkv), 1.0);
+        tr.add(&charge(&build_final_graph(d, t, &[]), t, nch, d.nkv, 0), 1.0);
     }
     if ik_tile_runs_ctx(has_drafter) {
         if let Some(g) = drafter {
@@ -213,7 +219,7 @@ pub(super) fn prefill_tile(
         }
     }
     if ik_tile_runs_head(last) {
-        tr.add(&charge(&build_head_graph(d, &[]), 1, nch, d.nkv), 1.0);
+        tr.add(&charge(&build_head_graph(d, &[]), 1, nch, d.nkv, 0), 1.0);
     }
     tr
 }
@@ -442,6 +448,23 @@ mod tests {
         assert_ne!(step_key(8, 1, Some(1)), step_key(8, 1, None));
         assert_ne!(step_key(8, 1, Some(1)), step_key(8, 2, Some(1)));
         assert_ne!(step_key(8, 1, Some(0)), step_key(8, 1, None));
+    }
+
+    #[test]
+    fn routed_decode_step_scales_experts_by_active_rows() {
+        let mut fmts = vec![packer::IkExpertFmt::W4; 24];
+        for f in fmts.iter_mut().skip(20) {
+            *f = packer::IkExpertFmt::W8;
+        }
+        let d = dims(8).with_routed(true, fmts);
+        let one = verify(&d, CTX, 1, 1);
+        let five = verify(&d, CTX, 5, 1);
+        let w1 = one.bytes[Phase::Verify as usize][W];
+        let w5 = five.bytes[Phase::Verify as usize][W];
+        // At T=1 with 8 active experts of 128 across 48 apps + shared attn/gates: ~4.9 GB (vs ~101 GB dense)
+        assert!(w1 > 4.0e9 && w1 < 6.0e9, "routed T=1 verify weights {:.2} GB", w1 / GB);
+        // At T=5 with 40 active expert lookups of 128, verify weights grow much less than 5x because shared weights are read once
+        assert!(w5 > 2.0 * w1 && w5 <= 3.5 * w1, "w1={w1} w5={w5}");
     }
 
     #[test]

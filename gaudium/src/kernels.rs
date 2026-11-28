@@ -207,6 +207,18 @@ const STATIC_ELF_VARS: &[(&str, &str)] = &[
     ("GAUDIUM_IKDSWIGLU_ELF", "ik_dswiglu_gaudi2.o"),
     ("GAUDIUM_IKMSTEP_ELF", "ik_mstep_gaudi2.o"),
     ("GAUDIUM_IKMARGMAX_ELF", "ik_margmax_gaudi2.o"),
+    // Inkling 2 routed experts & softcap kernels (libgaudium_ik.so)
+    ("GAUDIUM_IKROUTER_ELF", "ik_route_r_gaudi2.o"),
+    ("GAUDIUM_IKPLAN_ELF", "ik_w4_plan_gaudi2.o"),
+    ("GAUDIUM_IKW4Q8_ELF", "ik_w4_q8_gaudi2.o"),
+    ("GAUDIUM_IKW8Q8_ELF", "ik_w8_q8_gaudi2.o"),
+    ("GAUDIUM_IKW4GU_ELF", "ik_w4_gu_gaudi2.o"),
+    ("GAUDIUM_IKW4DN_ELF", "ik_w4_dn_gaudi2.o"),
+    ("GAUDIUM_IKW8GU_ELF", "ik_w8_gu_gaudi2.o"),
+    ("GAUDIUM_IKW8DN_ELF", "ik_w8_dn_gaudi2.o"),
+    ("GAUDIUM_IKW4COMB_ELF", "ik_w4_comb_gaudi2.o"),
+    ("GAUDIUM_IKSOFTCAP_ELF", "ik_softcap_gaudi2.o"),
+    ("GAUDIUM_IKMCAP_ELF", "ik_mcap_gaudi2.o"),
     // Gemma 4 kernels (libgaudium_ga.so)
     ("GAUDIUM_GAPREP_ELF", "ga_prep_gaudi2.o"),
     ("GAUDIUM_GAPREPK_ELF", "ga_prepk_gaudi2.o"),

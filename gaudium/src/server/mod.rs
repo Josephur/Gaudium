@@ -183,8 +183,8 @@ pub struct ModelRunOptions {
     pub precision: Option<crate::engine::fp8_graph::WeightPrecision>,
     /// Speculative decoding with the model's own MTP head (no drafter checkpoint).
     pub own_mtp: bool,
-    /// Mixture-of-experts model: the routed expert form instead of the dense-masked one.
-    pub moe_routed: bool,
+    /// Mixture-of-experts execution form (`--moe-form`): `None` defaults to `auto`.
+    pub moe_form: Option<crate::verified::IkMoeForm>,
     /// Context size for this model instead of the server-wide one (still clamped to the
     /// model's own limit).
     pub max_ctx: Option<u64>,
@@ -483,11 +483,15 @@ impl AppState {
                     _ => m.spec.fp8_quantized,
                 }
             },
-            moe_routed: self
-                .cfg
-                .per_model
-                .iter()
-                .any(|(id, o)| *id == m.id && o.moe_routed),
+            moe_routed: planned_moe_routed(
+                &m.spec,
+                self.cfg
+                    .per_model
+                    .iter()
+                    .find(|(id, _)| *id == m.id)
+                    .and_then(|(_, o)| o.moe_form)
+                    .unwrap_or(crate::verified::IkMoeForm::IkMoeAuto),
+            ),
             kv_dtype: self
                 .cfg
                 .per_model
@@ -1226,7 +1230,8 @@ fn planned_drafter_of(
     let (_, opts) = cfg.per_model.iter().find(|(k, _)| k == id)?;
     if opts.own_mtp {
         let dir = cfg.models.iter().find(|m| m.id == id).map(|m| m.dir.as_path());
-        return Some((None, "mtp", vec![own_mtp_width(dir, opts.moe_routed)]));
+        let form = opts.moe_form.unwrap_or(crate::verified::IkMoeForm::IkMoeAuto);
+        return Some((None, "mtp", vec![own_mtp_width(dir, form)]));
     }
     let dir = opts.draft_model.as_ref()?;
     let name = dir
@@ -1284,26 +1289,62 @@ fn lanes_of(cfg: &ServerConfig, id: &str, spec: &ModelSpec) -> usize {
     n
 }
 
-/// Drafts per launch of a model's own MTP drafter (`--draft-model <id>=mtp`): the widths that
-/// measured best on the card. Inkling 2's block drafter fills a block of 7 drafts in one launch
-/// that costs about 3% of a verify pass, so it runs at the full block.
-fn own_mtp_width(dir: Option<&Path>, moe_routed: bool) -> u64 {
-    static INKLING: std::sync::OnceLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
-    let inkling = dir.is_some_and(|d| {
-        let mut seen = INKLING
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *seen.entry(d.to_path_buf()).or_insert_with(|| {
-            ModelText::open(d)
-                .and_then(|t| t.spec())
-                .is_ok_and(|s| s.family == ModelFamily::Inkling2)
+fn planned_moe_routed(spec: &ModelSpec, form: crate::verified::IkMoeForm) -> bool {
+    let is_ik = spec.family == ModelFamily::Inkling2;
+    let dims_ok = if is_ik {
+        crate::engine::inkling2::inkling2_routed_ok(spec)
+    } else {
+        spec.is_moe()
+    };
+    crate::verified::ikr_use_routed(is_ik, form, dims_ok)
+}
+
+/// Drafts per launch of a model's own MTP drafter (`--draft-model <id>=mtp`): delegates routed vs
+/// dense width selection for Inkling 2 to `verified::ikr_mtp_width`.
+fn own_mtp_width(dir: Option<&Path>, moe_form: crate::verified::IkMoeForm) -> u64 {
+    use crate::engine::inkling2::mtp::MtpConfig;
+    use crate::verified::{ikr_mtp_width, ikr_use_routed, IkMoeForm};
+    let (inkling, dims_ok, block) = dir
+        .map(|d| {
+            let spec = ModelText::open(d).and_then(|t| t.spec()).ok();
+            let is_ik = spec
+                .as_ref()
+                .is_some_and(|s| s.family == ModelFamily::Inkling2);
+            let ok = spec
+                .as_ref()
+                .is_some_and(crate::engine::inkling2::inkling2_routed_ok);
+            let block = if is_ik {
+                std::fs::read_to_string(d.join("config.json"))
+                    .ok()
+                    .and_then(|t| MtpConfig::from_config_json(&t).ok())
+                    .map(|c| c.block)
+                    .or_else(|| {
+                        crate::gguf::looks_like_gguf(d)
+                            .then(|| {
+                                crate::gguf::Gguf::open(d)
+                                    .ok()
+                                    .and_then(|g| {
+                                        crate::engine::inkling2::mtp::gguf::model_drafter(d, &g)
+                                            .ok()
+                                    })
+                                    .map(|c| c.block)
+                            })
+                            .flatten()
+                    })
+                    .unwrap_or(8)
+            } else {
+                8
+            };
+            (is_ik, ok, block)
         })
-    });
-    match (inkling, moe_routed) {
-        (true, _) => 7,
-        (false, true) => 3,
-        (false, false) => 4,
+        .unwrap_or((false, false, 8));
+    if inkling {
+        let routed = ikr_use_routed(true, moe_form, dims_ok);
+        ikr_mtp_width(routed, block)
+    } else if matches!(moe_form, IkMoeForm::IkMoeRouted) {
+        3
+    } else {
+        4
     }
 }
 
@@ -1446,9 +1487,13 @@ fn engine_config_of(
     qcfg.verbose = cfg.verbose;
     qcfg.step.profile = cfg.profile.clone();
     qcfg.prefix_slots = cfg.prefix_slots;
-    qcfg.lanes = ModelText::open(dir)
-        .and_then(|t| t.spec())
-        .map_or(1, |spec| served_lanes(cfg, id, &spec).0 as u64);
+    let spec = ModelText::open(dir).and_then(|t| t.spec()).ok();
+    qcfg.lanes = spec
+        .as_ref()
+        .map_or(1, |s| served_lanes(cfg, id, s).0 as u64);
+    let is_inkling2 = spec
+        .as_ref()
+        .is_some_and(|s| s.family == ModelFamily::Inkling2);
     if let Some((patches, tokens)) = vision_plan_of(cfg, id, dir, max_ctx) {
         // The tower's buffers are planned for the largest image. Its recipes are compiled at
         // load for that size (so the shared workspace covers them); other image sizes compile
@@ -1464,7 +1509,9 @@ fn engine_config_of(
     if let Some((_, opts)) = cfg.per_model.iter().find(|(k, _)| k == id) {
         qcfg.fp8_act = opts.fp8_act.clone();
         qcfg.fp8_cache = opts.fp8_cache.clone();
-        qcfg.moe_routed = opts.moe_routed;
+        let form = opts.moe_form.unwrap_or(crate::verified::IkMoeForm::IkMoeAuto);
+        qcfg.moe_form = form;
+        qcfg.moe_routed = matches!(form, crate::verified::IkMoeForm::IkMoeRouted);
         if let Some(d) = opts.kv_dtype {
             qcfg.kv_dtype = d;
         }
@@ -1473,18 +1520,23 @@ fn engine_config_of(
             qcfg.precision = p;
         }
     }
-    let drafter_dir = planned_drafter_of(cfg, id).and_then(|(dir, kind, draft_k)| {
+    let drafter_dir = planned_drafter_of(cfg, id).and_then(|(dir, kind, mut draft_k)| {
         use crate::engine::qwen3::spec::{SpecConfig, SpecMethod};
         let method = match (kind, dir.clone()) {
             ("dflash2", Some(draft_model)) => SpecMethod::DFlash2 { draft_model },
             ("mtp", Some(draft_model)) => SpecMethod::Assistant { draft_model },
-            // the model's own MTP head; draft readouts over the low token ids and the
-            // control-token block only (drafts are guesses: the output is unchanged)
-            ("mtp", None) => SpecMethod::Mtp {
-                tree: None,
-                reference: Vec::new(),
-                draft_vocab: OWN_MTP_DRAFT_VOCAB,
-            },
+            // Leave Inkling 2's own MTP default empty so `Inkling2Engine::load` resolves
+            // `ikr_mtp_width` identically for both CLI and server.
+            ("mtp", None) => {
+                if is_inkling2 {
+                    draft_k.clear();
+                }
+                SpecMethod::Mtp {
+                    tree: None,
+                    reference: Vec::new(),
+                    draft_vocab: OWN_MTP_DRAFT_VOCAB,
+                }
+            }
             (_, Some(draft_model)) => SpecMethod::DSpine { draft_model },
             (_, None) => return None,
         };

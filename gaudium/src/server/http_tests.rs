@@ -3215,3 +3215,138 @@ fn models_sse_is_behind_the_api_key() {
     assert_eq!(status, 401);
     assert!(body.contains("authentication_error"), "{body}");
 }
+
+#[test]
+fn inkling2_server_mtp_config_reflects_updated_block_and_defers_default_width_to_loader() {
+    struct CleanDir(PathBuf);
+    impl Drop for CleanDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = CleanDir(std::env::temp_dir().join(format!(
+        "gaudium-ik-mtp-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let cfg_json = |block: u64| {
+        format!(
+            r#"{{
+              "architectures": ["Inkling2LoopForConditionalGeneration"],
+              "model_type": "inkling2_loop",
+              "text_config": {{
+                "model_type": "inkling2_loop_text",
+                "hidden_size": 2304,
+                "num_hidden_layers": 24,
+                "vocab_size": 201024,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "d_rel": 16,
+                "rel_extent": 1024,
+                "log_scaling_n_floor": 8192,
+                "log_scaling_alpha": 0.1,
+                "rms_norm_eps": 1e-06,
+                "qk_l2_clip_threshold": 22.6,
+                "rel_l2_clip_threshold": 8.0,
+                "local_layer_ids": [0, 1],
+                "sconv_kernel_size": 4,
+                "unpadded_vocab_size": 200058,
+                "final_logit_softcapping": 30.0,
+                "sliding_window_size": 1024,
+                "n_layers_per_attn_res_block": 6,
+                "n_routed_experts": 128,
+                "num_experts_per_tok": 8,
+                "intermediate_size": 1152,
+                "mlp_gate_softcap": 4.0,
+                "mlp_up_softcap": 25.0,
+                "route_scale": 8.0,
+                "loop_config": {{"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64}}
+              }},
+              "mtp_config": {{
+                "hidden_size": 2304,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "intermediate_size": 1152,
+                "local_layer_ids": [0],
+                "sliding_window_size": 1024,
+                "block_size": {block},
+                "markov_rank": 128,
+                "markov_head_type": "rnn_hidden",
+                "rope_theta": 10000.0,
+                "target_layer_ids": [0, 1, 2, 3]
+              }}
+            }}"#
+        )
+    };
+    let cfg_path = dir.0.join("config.json");
+    std::fs::write(&cfg_path, cfg_json(8)).unwrap();
+    assert_eq!(
+        own_mtp_width(Some(&dir.0), crate::verified::IkMoeForm::IkMoeDense),
+        7
+    );
+    std::fs::write(&cfg_path, cfg_json(16)).unwrap();
+    assert_eq!(
+        own_mtp_width(Some(&dir.0), crate::verified::IkMoeForm::IkMoeDense),
+        15
+    );
+
+    let mut own = ModelRunOptions::default();
+    own.own_mtp = true;
+    own.moe_form = Some(crate::verified::IkMoeForm::IkMoeDense);
+    let cfg = ServerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        models: Vec::new(),
+        kernels_dir: PathBuf::from("/kernels"),
+        ui_dir: None,
+        max_ctx: 8192,
+        cache_dir: None,
+        no_cache: false,
+        lazy: true,
+        idle_park_secs: 0,
+        queue_config: None,
+        api_key: None,
+        a2ui: false,
+        a2ui_prompt: None,
+        verbose: false,
+        debug_endpoints: false,
+        per_model: vec![("ik".into(), own)],
+        draft_k: Vec::new(),
+        vision: false,
+        vision_max_patches: DEFAULT_VISION_MAX_PATCHES,
+        vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
+        prefix_slots: 0,
+        mcp_proxy: ProxyOptions::default(),
+        tls_cert: None,
+        tls_key: None,
+        tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
+        hsts_max_age: super::DEFAULT_HSTS_MAX_AGE,
+        cache_ram_bytes: Some(0),
+        parallel: 1,
+        cache_trim: None,
+        profile: Vec::new(),
+    };
+    let (q, drafter) = engine_config_of(&cfg, "ik", &dir.0, 8192);
+    assert!(drafter.is_none());
+    let spec = q.spec.expect("own MTP configured");
+    assert!(
+        spec.draft_k.is_empty(),
+        "server should leave Inkling 2 default draft_k empty so loader owns width: {:?}",
+        spec.draft_k
+    );
+
+    let mut cfg_with_dspine_k = cfg;
+    cfg_with_dspine_k.draft_k = vec![7, 15];
+    let (q_k, _) = engine_config_of(&cfg_with_dspine_k, "ik", &dir.0, 8192);
+    assert!(
+        q_k.spec.expect("own MTP configured").draft_k.is_empty(),
+        "global DSpine --draft-k should not fix Inkling 2's own MTP default"
+    );
+}

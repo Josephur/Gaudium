@@ -1213,7 +1213,7 @@ pub(super) fn engine_text(cfg: &Qwen3Config, eng: &Qwen3Engine) -> String {
         format!("{sc:?}|{dir}")
     });
     format!(
-        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8={}|kv8={}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
+        "model={}|files={}|spec={:?}|ctx={}|tile={}|prefill={:?}|precision={:?}|fp8={}|kv8={}|moe_form={:?}|moe_routed={}|reset={:?}|step={:?}|kernels={:?}|kernel_files={}|driver={}|drafter={:?}|ctx_rows={}|vision={}/{}/{}",
         cfg.model_dir.display(),
         files_of(&cfg.model_dir, false),
         eng.spec,
@@ -1225,6 +1225,7 @@ pub(super) fn engine_text(cfg: &Qwen3Config, eng: &Qwen3Engine) -> String {
         eng.fp8_id,
         // [kv8] the K/V dtype is in `spec`; the scale tables' calibration here
         eng.kv8_id,
+        cfg.moe_form,
         cfg.moe_routed,
         cfg.request_reset,
         cfg.step,

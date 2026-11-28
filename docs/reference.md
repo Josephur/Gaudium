@@ -180,9 +180,11 @@ Serve options:
                         ends in -assistant (4 drafts), otherwise DSpine. <id>=mtp
                         drafts with the model's own MTP head (no checkpoint; 4 drafts,
                         3 in the routed mixture-of-experts form; an Inkling 2 model:
-                        its block drafter, 7 drafts, as --spec mtp finds it)
-  --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster
-                        decode, more device memory, its own token stream)
+                        its block drafter, 1 draft in its routed form, 7 dense, as
+                        --spec mtp finds it)
+  --moe-form <id=f>     Mixture-of-experts model <id>: auto (default: routed for
+                        Inkling 2 when supported, dense otherwise), dense or routed
+                        (faster decode, its own token stream)
   --model-ctx <id=N>    Context size for model <id> instead of --max-ctx
   --effort-levels <id=l,..>  Reasoning-effort levels of model <id> instead of the ones
                         read from its chat template (each one the template renders
@@ -563,10 +565,10 @@ Generate options:
                         its prefill runs 256-row tiles)
   --kv-scales <file>    K/V calibration the FP8 scale tables are made from (default:
                         <model_dir>-gaudium-pc/kv_scales.txt)
-  --moe-form <f>        MoE expert execution: dense (default: one masked wide MLP per layer)
-                        or routed (stacked BF16 experts, only the routed ones are read;
-                        faster decode, more device memory, its own token stream: the
-                        two forms round differently)
+  --moe-form <f>        MoE expert execution: auto (default: routed on Inkling 2 when
+                        geometry fits, else dense), dense (one masked wide MLP per
+                        layer) or routed (only the selected experts are read; its own
+                        token stream)
   --request-reset <m>   Device state zeroed before each request: auto (default: the
                         DeltaNet start state; KV rows past the cursor are masked),
                         dirty (also the KV rows earlier requests wrote) or full

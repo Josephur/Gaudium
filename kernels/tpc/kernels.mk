@@ -600,5 +600,18 @@ $$(KDIR)/$(1)_gaudi2.o: $$(TPC_SRC)/$(2) $$(TPC_SRC)/ik_common.h $$(TPC_SRC)/ik_
 KERNEL_OBJS += $$(KDIR)/$(1)_gaudi2.o
 endef
 $(foreach k,$(IKD_KERNELS),$(eval $(call IKD_RULE,$(word 1,$(subst :, ,$(k))),$(word 2,$(subst :, ,$(k))),$(word 3,$(subst :, ,$(k))))))
+# Inkling 2 routed experts & on-card softcap/sampler kernels (build with -ffp-contract=off for exact FTZ+DAZ matching)
+IK_MV_DEPS := $(TPC_SRC)/moe_w4_common.h $(TPC_SRC)/ik_w4_mv_body.h
+IK_FAST_KERNELS := ik_route_r:ik_route_r_gaudi2.c: ik_w4_plan:ik_w4_plan_gaudi2.c: \
+  ik_w4_q8:ik_w4_q8_gaudi2.c: ik_w8_q8:ik_w4_q8_gaudi2.c:-DBLK32 \
+  ik_w4_gu:ik_w4_mv_gaudi2.c:-DGU ik_w4_dn:ik_w4_mv_gaudi2.c: \
+  ik_w8_gu:ik_w4_mv_gaudi2.c:-DGU+-DW8 ik_w8_dn:ik_w4_mv_gaudi2.c:-DW8 \
+  ik_w4_comb:ik_w4_comb_gaudi2.c: ik_softcap:ik_softcap_gaudi2.c: ik_mcap:ik_mcap_gaudi2.c:
+define IK_FAST_RULE
+$$(KDIR)/$(1)_gaudi2.o: $$(TPC_SRC)/$(2) $$(TPC_SRC)/ik_common.h $$(IK_MV_DEPS) | $$(KDIR)
+	cd $$(TPC_SRC) && $$(TPC_CC) -march=gaudi2 -O2 -ffp-contract=off $(subst +, ,$(3)) -x c++ -c $(2) -o $$@
+KERNEL_OBJS += $$(KDIR)/$(1)_gaudi2.o
+endef
+$(foreach k,$(IK_FAST_KERNELS),$(eval $(call IK_FAST_RULE,$(word 1,$(subst :, ,$(k))),$(word 2,$(subst :, ,$(k))),$(word 3,$(subst :, ,$(k))))))
 $(KDIR)/libgaudium_ik.so: $(GLUE_SRC)/ik_glue.cpp $(GLUE_SRC)/elf_record.inc | $(KDIR)
 	$(CXX) -O2 -std=c++17 -fPIC -shared -I$(HABANA_INC) $< -o $@
