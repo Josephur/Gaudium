@@ -186,23 +186,6 @@ def hn_same_extended(+m: List<&2, Nat>, +y: Nat, +ys: List<&2, Nat>) -> {hn_same
       %Equal.sym(Bool, Nat.is_eq(hn_fold(x), hn_fold(x)), True{}, G.g_nat_eq_refl(hn_fold(x))) : {Bool.and(_, hn_same(hn_name_cat(xs, Con{y, ys}), xs)) == False{} : Bool}
       hn_same_extended(xs, y, ys)
 
-# Two names with the same start never compare the same when the next bytes differ once folded.
-def hn_same_split(
-  +p: List<&2, Nat>,
-  +a: Nat,
-  +b: Nat,
-  +xs: List<&2, Nat>,
-  +ys: List<&2, Nat>,
-  ok: {Nat.is_eq(hn_fold(a), hn_fold(b)) == False{} : Bool}
-) -> {hn_same(hn_name_cat(p, Con{a, xs}), hn_name_cat(p, Con{b, ys})) == False{} : Bool}:
-  match p:
-    case Nil{}:
-      %Equal.sym(Bool, Nat.is_eq(hn_fold(a), hn_fold(b)), False{}, ok) : {Bool.and(_, hn_same(xs, ys)) == False{} : Bool}
-      {==}
-    case Con{+x, +ps}:
-      %Equal.sym(Bool, Nat.is_eq(hn_fold(x), hn_fold(x)), True{}, G.g_nat_eq_refl(hn_fold(x))) : {Bool.and(_, hn_same(hn_name_cat(ps, Con{a, xs}), hn_name_cat(ps, Con{b, ys}))) == False{} : Bool}
-      hn_same_split(ps, a, b, xs, ys, ok)
-
 # Two names that compare the same never compare the same once each has a next byte and those
 # bytes differ once folded.
 def hn_same_split_same(
