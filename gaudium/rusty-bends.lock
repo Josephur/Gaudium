@@ -1565,6 +1565,27 @@ a1e1d13137bf7fec  recipe_ws_fail_never_launches  law recipe_ws_fail_never_launch
 1f4af7eeefaac3d0  remaining_zero_at_limit  law remaining_zero_at_limit : for + m : Nat for + over : Nat { remaining_budget ( Nat.add ( m , over ) , m ) == 0n : Nat }
 50e5c88a1ed73b76  req_cancel_idempotent  law req_cancel_idempotent : for s : ReqState { req_cancel ( req_cancel ( s ) ) == req_cancel ( s ) : ReqState }
 4156536946afa0e3  req_terminal_absorbing  law req_terminal_absorbing : for + s : ReqState for ev : ReqEvent { Bool.or ( Bool.not ( req_is_terminal ( s ) ) , req_eq ( req_step ( s , ev ) , s ) ) == True { } : Bool }
+aae570f6c15475ea  route_admin_needs_key  law route_admin_needs_key : for a : Bool for r : Bool { route_admit ( RouteAdmin { } , a , r , True { } , False { } ) == False { } : Bool }
+# promise route_admin_needs_key: with an API key configured, a route that operates the server is never answered without it
+# harm route_admin_needs_key: anyone who can reach the port could unload the model, park the engine, stop other clients' replies or use the server to reach MCP servers
+29b7c4b2e4d3353a  route_inference_needs_key  law route_inference_needs_key : for a : Bool for r : Bool { route_admit ( RouteInference { } , a , r , True { } , False { } ) == False { } : Bool }
+# promise route_inference_needs_key: with an API key configured, an inference route is never answered without it
+# harm route_inference_needs_key: anyone who can reach the port could run prompts on the card and read what it writes
+672e00e38da03626  route_no_key_configured_admits  law route_no_key_configured_admits : for k : RouteKind for a : Bool for r : Bool for v : Bool { route_admit ( k , a , r , False { } , v ) == True { } : Bool }
+# promise route_no_key_configured_admits: a server started without an API key answers every request, whatever route it reaches and whatever the request carries
+# harm route_no_key_configured_admits: a server run without a key would refuse its own Web UI and every client
+36c6cc82931d768c  route_status_needs_key  law route_status_needs_key : for a : Bool for r : Bool { route_admit ( RouteStatus { } , a , r , True { } , False { } ) == False { } : Bool }
+# promise route_status_needs_key: with an API key configured, a route that reads server state is never answered without it
+# harm route_status_needs_key: recent requests, model names and engine state would be visible to anyone who can reach the port
+1b261810df7e0456  route_unlisted_api_path_needs_key  law route_unlisted_api_path_needs_key : for r : Bool { route_admit ( RouteUnlisted { } , True { } , r , True { } , False { } ) == False { } : Bool }
+# promise route_unlisted_api_path_needs_key: with an API key configured, a request on a path the API owns that the route table does not list is never answered without it
+# harm route_unlisted_api_path_needs_key: a route added to the router and forgotten in the route table would be served without the key
+51dec3eba0ae5995  route_unlisted_write_needs_key  law route_unlisted_write_needs_key : for + a : Bool { route_admit ( RouteUnlisted { } , a , False { } , True { } , False { } ) == False { } : Bool }
+# promise route_unlisted_write_needs_key: with an API key configured, a request that is not a read and that the route table does not list is never answered without it, whatever its path
+# harm route_unlisted_write_needs_key: a new POST route under a path outside the API's namespaces, forgotten in the route table, would run without the key
+0f8948560d8cf402  route_valid_key_admits  law route_valid_key_admits : for k : RouteKind for a : Bool for r : Bool { route_admit ( k , a , r , True { } , True { } ) == True { } : Bool }
+# promise route_valid_key_admits: a request that carries the configured API key is never refused by the key gate, whatever route it reaches
+# harm route_valid_key_admits: clients holding the key would be locked out of the routes the key exists to open
 83030691075e6413  router_no_switch_while_active  law router_no_switch_while_active : for act : Nat for st : BackendState { router_can_switch ( 1n + act , st ) == False { } : Bool }
 c2cbe6cec354675c  router_no_switch_while_loading  law router_no_switch_while_loading : for act : Nat { router_can_switch ( act , BeLoading { } ) == False { } : Bool }
 b4a7e0b48da9b054  router_no_switch_while_ready  law router_no_switch_while_ready : for act : Nat { router_can_switch ( act , BeReady { } ) == False { } : Bool }
