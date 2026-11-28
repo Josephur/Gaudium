@@ -429,21 +429,26 @@ impl AppState {
         }
     }
 
+    /// The model a chat request names: the resident one when it names none, the first one when
+    /// it names one that is not served (clients send model names of their own).
     fn find_model(&self, requested: Option<&str>) -> usize {
         let Some(name) = requested.filter(|s| !s.is_empty()) else {
             return self.slot.lock().unwrap().resident_idx.unwrap_or(0);
         };
-        if let Some(i) = self.models.iter().position(|m| m.id == name) {
-            return i;
-        }
-        if let Some(i) = self
-            .models
+        self.model_named(name).unwrap_or(0)
+    }
+
+    /// The served model of id `name` (an exact match first, then one that differs only in case);
+    /// `None`: no served model has that id.
+    fn model_named(&self, name: &str) -> Option<usize> {
+        self.models
             .iter()
-            .position(|m| m.id.eq_ignore_ascii_case(name))
-        {
-            return i;
-        }
-        0
+            .position(|m| m.id == name)
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .position(|m| m.id.eq_ignore_ascii_case(name))
+            })
     }
 
     fn publish_engine_event(&self) {
@@ -841,12 +846,17 @@ impl AppState {
         drop(s);
 
         let n_ctx_train = m.n_ctx_train.map_or("null".to_string(), |n| n.to_string());
+        // both API shapes in one object: `object`, `owned_by` and `created` (OpenAI), `type`,
+        // `display_name` and `created_at` (Messages); the two share `id` and clash nowhere
         let mut out = format!(
-            "{{\"id\":{},\"object\":\"model\",\"owned_by\":\"gaudium\",\"created\":0,\
+            "{{\"id\":{},\"object\":\"model\",\"owned_by\":\"gaudium\",\"created\":{MODEL_CREATED},\
+             \"type\":\"model\",\"display_name\":{},\"created_at\":{},\
              \"context_length\":{},\"architecture\":{{\"input_modalities\":[\"text\"]}},\
              \"meta\":{{\"n_ctx_train\":{n_ctx_train},\"speculative\":{},\"precision\":{},\
              \"greedy\":{},\"sampled\":{},\"family\":{},\"layers\":{},\"hidden\":{}",
             jq(&m.id),
+            jq(&m.id),
+            jq(MODEL_CREATED_AT),
             m.max_ctx,
             facts.drafter.is_some(),
             jq(readout::precision_word(&facts)),
@@ -2305,13 +2315,21 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
             let json = state.props_json(idx, model_q.is_none());
             write_json(&mut stream, 200, &json);
         }
-        ("GET", "/v1/models") | ("GET", "/models") => {
-            write_json(&mut stream, 200, &models_list_json(&state));
-        }
+        ("GET", "/v1/models") | ("GET", "/models") => match models_page_of(&state, &req) {
+            Ok(page) => write_json(&mut stream, 200, &models_page_json(&state, &page)),
+            Err(msg) => api_of(&req).error(&mut stream, 400, "invalid_request_error", &msg),
+        },
         ("GET", p) if p.starts_with("/v1/models/") => {
             let id = &p["/v1/models/".len()..];
-            let idx = state.find_model(Some(id));
-            write_json(&mut stream, 200, &state.model_entry_json(idx));
+            match state.model_named(id) {
+                Some(idx) => write_json(&mut stream, 200, &state.model_entry_json(idx)),
+                None => api_of(&req).error(
+                    &mut stream,
+                    404,
+                    "not_found_error",
+                    &format!("model {id:?} is not served here"),
+                ),
+            }
         }
         ("GET", "/models/sse") => handle_models_sse(&state, &mut stream),
         ("POST", "/models/load") => handle_model_load(&state, &req, &mut stream, true),
@@ -2413,12 +2431,104 @@ fn handle_events_sse(state: &AppState, stream: &mut Conn) {
     write_sse_end(stream);
 }
 
-/// The served models as `GET /v1/models` lists them.
-fn models_list_json(state: &AppState) -> String {
-    let entries: Vec<String> = (0..state.models.len())
-        .map(|i| state.model_entry_json(i))
+/// `created` of every model entry: the engine has no creation date of its own for a model.
+const MODEL_CREATED: u64 = 0;
+/// [`MODEL_CREATED`] in RFC 3339 (`created_at` of the Messages shape).
+const MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+
+/// The API shape of a request's errors outside the chat endpoints: the Messages shape when the
+/// request carries an `anthropic-version` header, the OpenAI shape otherwise.
+fn api_of(req: &HttpRequest) -> Api {
+    if req.headers.contains_key("anthropic-version") {
+        Api::Messages {
+            show_thinking: true,
+        }
+    } else {
+        Api::Chat
+    }
+}
+
+/// One page of the model list, as the query of `GET /v1/models` asks for it (positions in
+/// `AppState::models`; `verified/model_list.bend` decides which positions are on the page).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelsPage {
+    /// The position after the `after_id` model (0: no `after_id`).
+    lo: u64,
+    /// The position of the `before_id` model (the list length: no `before_id`).
+    hi: u64,
+    /// The most entries the page holds (`limit`; no `limit`: the whole list).
+    limit: u64,
+    /// The page ends at the `before_id` cursor (a `before_id` without an `after_id`).
+    back: bool,
+}
+
+impl ModelsPage {
+    /// The whole list.
+    fn all(n: usize) -> Self {
+        Self {
+            lo: 0,
+            hi: n as u64,
+            limit: u64::MAX,
+            back: false,
+        }
+    }
+}
+
+/// The page the query of a `GET /v1/models` request asks for: `limit` (at least 1; none: the
+/// whole list), `after_id` and `before_id` (ids of served models). `Err`: the reason the query
+/// is refused.
+fn models_page_of(state: &AppState, req: &HttpRequest) -> Result<ModelsPage, String> {
+    let mut page = ModelsPage::all(state.models.len());
+    if let Some(v) = req.query.get("limit") {
+        page.limit = match v.trim().parse::<u64>() {
+            Ok(n) if n >= 1 => n,
+            _ => return Err(format!("limit must be a whole number of at least 1, not {v:?}")),
+        };
+    }
+    let cursor = |key: &str| -> Result<Option<u64>, String> {
+        match req.query.get(key) {
+            None => Ok(None),
+            Some(id) => match state.model_named(id) {
+                Some(i) => Ok(Some(i as u64)),
+                None => Err(format!("{key} {id:?} is not the id of a served model")),
+            },
+        }
+    };
+    let after = cursor("after_id")?;
+    let before = cursor("before_id")?;
+    if let Some(a) = after {
+        page.lo = a + 1;
+    }
+    if let Some(b) = before {
+        page.hi = b;
+    }
+    page.back = before.is_some() && after.is_none();
+    Ok(page)
+}
+
+/// A page of the served models as `GET /v1/models` lists them: the OpenAI list (`object`,
+/// `data`) and the Messages list (`data`, `has_more`, `first_id`, `last_id`) in one object.
+fn models_page_json(state: &AppState, page: &ModelsPage) -> String {
+    let n = state.models.len() as u64;
+    let on_page: Vec<usize> = (0..state.models.len())
+        .filter(|&i| {
+            crate::verified::ml_on_page(i as u64, n, page.lo, page.hi, page.limit, page.back)
+        })
         .collect();
-    format!("{{\"object\":\"list\",\"data\":[{}]}}", entries.join(","))
+    let more = crate::verified::ml_more(n, page.lo, page.hi, page.limit);
+    let id_of = |i: Option<&usize>| i.map_or("null".to_string(), |&i| jq(&state.models[i].id));
+    let entries: Vec<String> = on_page.iter().map(|&i| state.model_entry_json(i)).collect();
+    format!(
+        "{{\"object\":\"list\",\"data\":[{}],\"has_more\":{more},\"first_id\":{},\"last_id\":{}}}",
+        entries.join(","),
+        id_of(on_page.first()),
+        id_of(on_page.last()),
+    )
+}
+
+/// The served models as `GET /v1/models` lists them without a query (the whole list).
+fn models_list_json(state: &AppState) -> String {
+    models_page_json(state, &ModelsPage::all(state.models.len()))
 }
 
 /// `GET /models/sse`: the model list of `GET /v1/models` as server-sent events, for a model

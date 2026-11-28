@@ -619,6 +619,11 @@ impl Harness {
     }
 
     fn exchange(&self, method: &str, path: &str, body: &str) -> (u16, String) {
+        self.exchange_with(method, path, "", body)
+    }
+
+    /// [`Self::exchange`] with extra header lines (`headers`: each line ending in `\r\n`).
+    fn exchange_with(&self, method: &str, path: &str, headers: &str, body: &str) -> (u16, String) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let state = Arc::clone(&self.state);
@@ -629,7 +634,7 @@ impl Harness {
         let mut c = TcpStream::connect(addr).unwrap();
         write!(
             c,
-            "{method} {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: test\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
@@ -3580,5 +3585,184 @@ fn without_an_api_key_no_route_needs_one() {
         let (status, _, body) =
             plain_exchange(&h.state, &format!("{head} HTTP/1.1\r\nHost: localhost"), "");
         assert_ne!(status, 401, "{head}: {body}");
+    }
+}
+
+/// [`two_model_harness`] with a third served model, `third`: models `tags`, `other`, `third`.
+fn three_model_harness() -> Harness {
+    let Harness {
+        state,
+        replies,
+        prompts,
+        images,
+        tier,
+    } = two_model_harness();
+    let mut st = Arc::try_unwrap(state)
+        .ok()
+        .expect("the harness owns its state");
+    let m = &st.models[1];
+    let third = RegisteredModel {
+        id: "third".into(),
+        dir: m.dir.clone(),
+        spec: m.spec.clone(),
+        format: m.format.clone(),
+        chat: None,
+        tokenizer: Arc::clone(&m.tokenizer),
+        extra_eos_ids: Vec::new(),
+        max_ctx: m.max_ctx,
+        gemma_closes_thought: false,
+        gen_defaults: m.gen_defaults,
+        vision: None,
+        n_ctx_train: None,
+        lanes: 1,
+    };
+    st.models.push(third);
+    st.slot.get_mut().unwrap().waiting = vec![0; 3];
+    Harness {
+        state: Arc::new(st),
+        replies,
+        prompts,
+        images,
+        tier,
+    }
+}
+
+const MESSAGES_HEADERS: &str = "anthropic-version: 2023-06-01\r\n";
+
+/// The ids of a model list, its `has_more`, `first_id` and `last_id`.
+fn model_page(body: &str) -> (Vec<String>, bool, Option<String>, Option<String>) {
+    let v = json::parse_json(body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    let ids = match at(&v, &["data"]) {
+        JsonValue::Array(items) => items
+            .iter()
+            .map(|m| s(m, &["id"]).to_string())
+            .collect(),
+        other => panic!("data is not a list: {}", other.dump()),
+    };
+    let more = match at(&v, &["has_more"]) {
+        JsonValue::Bool(b) => *b,
+        other => panic!("has_more is not a boolean: {}", other.dump()),
+    };
+    let id = |k: &str| at(&v, &[k]).as_str().map(str::to_string);
+    (ids, more, id("first_id"), id("last_id"))
+}
+
+#[test]
+fn models_list_carries_both_api_shapes() {
+    let h = two_model_harness();
+    for path in ["/v1/models", "/models"] {
+        let (status, body) = h.get(path);
+        assert_eq!(status, 200, "{path}: {body}");
+        let v = json::parse_json(&body).unwrap();
+        // the OpenAI list
+        assert_eq!(s(&v, &["object"]), "list");
+        // the Messages list
+        assert_eq!(
+            model_page(&body),
+            (
+                vec!["tags".to_string(), "other".to_string()],
+                false,
+                Some("tags".into()),
+                Some("other".into())
+            )
+        );
+        let entry = at(&v, &["data", "0"]);
+        assert_eq!(s(entry, &["object"]), "model");
+        assert_eq!(s(entry, &["owned_by"]), "gaudium");
+        assert_eq!(at(entry, &["created"]).as_u64(), Some(MODEL_CREATED));
+        assert_eq!(s(entry, &["type"]), "model");
+        assert_eq!(s(entry, &["display_name"]), "tags");
+        assert_eq!(s(entry, &["created_at"]), MODEL_CREATED_AT);
+        // the Gaudium extension fields stay
+        assert!(at(entry, &["context_length"]).as_u64().is_some(), "{body}");
+        assert_eq!(s(entry, &["status", "value"]), "loaded");
+    }
+    // the same entry by id, in either shape
+    let (_, list) = h.get("/v1/models");
+    let listed = json::parse_json(&list).unwrap();
+    for headers in ["", MESSAGES_HEADERS] {
+        let (status, body) = h.exchange_with("GET", "/v1/models/other", headers, "");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(json::parse_json(&body).unwrap(), *at(&listed, &["data", "1"]));
+    }
+}
+
+#[test]
+fn model_created_at_is_created_in_rfc_3339() {
+    // `created` (Unix seconds) and `created_at` name the same instant
+    assert_eq!(MODEL_CREATED, 0);
+    assert_eq!(MODEL_CREATED_AT, "1970-01-01T00:00:00Z");
+}
+
+#[test]
+fn unknown_model_id_is_not_found_in_the_callers_error_shape() {
+    let h = two_model_harness();
+    // a differently cased id is the same model
+    let (status, body) = h.get("/v1/models/OTHER");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(s(&json::parse_json(&body).unwrap(), &["id"]), "other");
+
+    // the OpenAI shape
+    let (status, body) = h.get("/v1/models/no-such-model");
+    assert_eq!(status, 404, "{body}");
+    let v = json::parse_json(&body).unwrap();
+    assert_eq!(s(&v, &["error", "type"]), "not_found_error");
+    assert!(s(&v, &["error", "message"]).contains("no-such-model"), "{body}");
+
+    // the Messages shape
+    let (status, body) = h.exchange_with("GET", "/v1/models/no-such-model", MESSAGES_HEADERS, "");
+    assert_eq!(status, 404, "{body}");
+    let v = json::parse_json(&body).unwrap();
+    assert_eq!(s(&v, &["type"]), "error");
+    assert_eq!(s(&v, &["error", "type"]), "not_found_error");
+
+    // a chat request that names an unknown model still falls back to a served one
+    assert_eq!(h.state.find_model(Some("no-such-model")), 0);
+}
+
+#[test]
+fn models_list_pages_by_limit_and_cursors() {
+    let h = three_model_harness();
+    let page = |q: &str| {
+        let (status, body) = h.exchange_with("GET", &format!("/v1/models?{q}"), MESSAGES_HEADERS, "");
+        assert_eq!(status, 200, "{q}: {body}");
+        model_page(&body)
+    };
+    let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let id = |s: &str| Some(s.to_string());
+
+    // forward from the start, then on from the last id
+    assert_eq!(page("limit=2"), (ids(&["tags", "other"]), true, id("tags"), id("other")));
+    assert_eq!(page("limit=2&after_id=other"), (ids(&["third"]), false, id("third"), id("third")));
+    assert_eq!(page("after_id=tags"), (ids(&["other", "third"]), false, id("other"), id("third")));
+    // past the end: an empty page that says no more follow
+    assert_eq!(page("after_id=third"), (ids(&[]), false, None, None));
+    // a limit larger than the list
+    assert_eq!(page("limit=1000"), (ids(&["tags", "other", "third"]), false, id("tags"), id("third")));
+
+    // backward: the entries just before the cursor, then on back from the first id
+    assert_eq!(page("before_id=third&limit=1"), (ids(&["other"]), true, id("other"), id("other")));
+    assert_eq!(page("before_id=other&limit=1"), (ids(&["tags"]), false, id("tags"), id("tags")));
+    assert_eq!(page("before_id=tags"), (ids(&[]), false, None, None));
+
+    // both cursors: the entries between them, read forward
+    assert_eq!(page("after_id=tags&before_id=third"), (ids(&["other"]), false, id("other"), id("other")));
+    assert_eq!(page("after_id=third&before_id=tags"), (ids(&[]), false, None, None));
+}
+
+#[test]
+fn models_list_refuses_a_bad_page_query() {
+    let h = two_model_harness();
+    for q in ["limit=0", "limit=-1", "limit=two", "after_id=nope", "before_id=nope"] {
+        let path = format!("/v1/models?{q}");
+        let (status, body) = h.get(&path);
+        assert_eq!(status, 400, "{q}: {body}");
+        let v = json::parse_json(&body).unwrap();
+        assert_eq!(s(&v, &["error", "type"]), "invalid_request_error", "{body}");
+        let (status, body) = h.exchange_with("GET", &path, MESSAGES_HEADERS, "");
+        assert_eq!(status, 400, "{q}: {body}");
+        let v = json::parse_json(&body).unwrap();
+        assert_eq!(s(&v, &["type"]), "error", "{body}");
+        assert_eq!(s(&v, &["error", "type"]), "invalid_request_error", "{body}");
     }
 }
