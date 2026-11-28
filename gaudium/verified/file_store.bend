@@ -843,6 +843,20 @@ law fs_restore_keeps_next:
 def fs_restore_keeps_next(u, f, n, i, s):
   L.nat_max_ge_l(n, 1n+i)
 
+# promise: counting a file found on disk that fits the free bytes takes its bytes from them: used + free stays the quota.
+# harm: the files kept across a restart would leave the whole quota free for new uploads
+# catches: fs_restore leaving the free bytes unchanged
+law fs_restore_conserved:
+  for +l: FsLedger
+  for +i: Nat
+  for +x: Nat
+  {fs_quota(fs_restore(l, i, Nat.sub(fs_free(l), x))) == fs_quota(l) : Nat}
+
+def fs_restore_conserved(l, i, x):
+  match l:
+    case FsLedger{+u, +f, +n}:
+      fs_take_conserved(u, f, Nat.sub(f, x), G.g_nat_sub_le_self(f, x))
+
 # promise: counting a file found on disk never adds free bytes.
 # harm: after a restart the store could take uploads past its quota
 # catches: fs_restore adding the restored size to the free bytes

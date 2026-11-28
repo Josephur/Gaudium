@@ -17,7 +17,7 @@
 //!   `fs_kill`), at commit or when the upload is dropped;
 //! - `fs_commit` decides a staged upload: refused past its reservation or the id limit, else as
 //!   `fs_upload` decides it against the per-file cap and the free bytes, handing out the id;
-//! - `fs_delete` / `fs_kill` give a deleted file's bytes back once;
+//! - `fs_delete` gives a deleted file's bytes back, and the file leaves the index;
 //! - `fs_visible` decides who sees a file.
 //!
 //! This module streams the bytes, writes and reads the directory, and keeps the ledger in memory
@@ -236,8 +236,8 @@ impl Drop for Staged<'_> {
 
 struct Held {
     meta: FileMeta,
-    /// The ledger's view of the file: a deleted file stays here, no longer live
-    /// (`fs_kill`), until the next start, so a repeated delete finds it already freed.
+    /// The ledger's view of the file. A delete gives its bytes back (`fs_delete`) and removes
+    /// it from the index, so a repeated delete finds nothing to free.
     entry: FsEntry,
 }
 
@@ -786,7 +786,8 @@ impl FileStore {
     }
 
     /// Deletes `id`: its metadata first (the file is gone from then on), then its data; the
-    /// ledger gives its bytes back once.
+    /// ledger gives its bytes back, and the file leaves the index (its id stays retired by the
+    /// saved counter).
     pub fn delete(&self, owner: &Owner, id: &str) -> Result<FileMeta, FileError> {
         let mut g = self.lock();
         let num = id_num(id)
@@ -803,11 +804,9 @@ impl FileStore {
             Err(e) => return Err(io_err("file metadata", e)),
         }
         let _ = fs::remove_file(self.dir.join(format!("{id}.data")));
-        let entry = g.files[&num].entry;
-        g.ledger = fs_delete(g.ledger, entry);
-        let held = g.files.get_mut(&num).expect("checked above");
-        held.entry = fs_kill(entry);
-        Ok(held.meta.clone())
+        let held = g.files.remove(&num).expect("checked above");
+        g.ledger = fs_delete(g.ledger, held.entry);
+        Ok(held.meta)
     }
 }
 
@@ -880,6 +879,8 @@ mod tests {
         assert_eq!(s.usage().0, 72);
         assert!(matches!(s.delete(&me, &a.id), Err(FileError::NotFound(_))));
         assert_eq!(s.usage().0, 72);
+        // a deleted file leaves the index
+        assert_eq!(s.lock().files.len(), 2);
         drop(s);
         // a restart reads the files back, and never hands out a deleted id again
         let s = FileStore::open(&d, 100, 60).unwrap();
