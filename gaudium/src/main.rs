@@ -368,7 +368,9 @@ fn print_usage() {
          \x20                       file belongs to the key that uploaded it. Off by default: the\n\
          \x20                       paths answer 404\n\
          \x20 --files-quota-gb <N>  With --files-dir: GiB all files may hold together (decimals\n\
-         \x20                       allowed; default: 16). An upload that does not fit is refused\n\
+         \x20                       allowed; default: 16), uploads in progress included. An upload\n\
+         \x20                       that does not fit is refused; a start whose files already hold\n\
+         \x20                       more is refused (docs/files-api.md)\n\
          \x20 --files-max-mb <N>    With --files-dir: largest single file in MiB (default: 512)\n\
          \n\
          Live status environment variables:\n\

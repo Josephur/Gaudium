@@ -1816,6 +1816,14 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
                 "[server] Files API on: {used} of {quota} bytes in use, {free} free, files up to {} bytes",
                 st.cap()
             );
+            let (n, bytes) = st.unreachable(&file_store::Owner::of_config(cfg.api_key.as_deref()));
+            if n > 0 {
+                eprintln!(
+                    "[server] Files API: {n} files ({bytes} bytes) are not served (stored under \
+                     another API key or none, or with unreadable metadata) and count against the \
+                     quota; docs/files-api.md says how to remove them"
+                );
+            }
             Some(Arc::new(st))
         }
         None => None,

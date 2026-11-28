@@ -61,6 +61,14 @@ impl<R: Read> BodyReader<R> {
         })
     }
 
+    /// The body's length when the headers declare it (`Content-Length`); asked before reading.
+    pub fn declared_len(&self) -> Option<u64> {
+        match self.mode {
+            Mode::Length(n) => Some(n),
+            Mode::Chunked { .. } => None,
+        }
+    }
+
     fn line(&mut self) -> io::Result<String> {
         let mut line = Vec::new();
         let n = (&mut self.inner)

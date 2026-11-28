@@ -403,7 +403,10 @@ fn uploads_past_the_cap_or_the_quota_are_refused_with_their_numbers() {
     assert_eq!(status, 400);
     let msg = s(&e, &["error", "message"]);
     assert!(
-        msg.contains("6 bytes") && msg.contains("15 of 20 bytes are in use and 5 are free"),
+        msg.contains("more than 5 bytes")
+            && msg.contains(
+                "15 of 20 bytes are in use or reserved by uploads in progress, and 5 are free"
+            ),
         "{msg}"
     );
     let (status, e) = upload(st, ANTHROPIC, &[("file", Some("f"), None, &[b'x'; 6])]);
@@ -526,6 +529,20 @@ fn the_files_api_is_off_without_a_directory() {
         body.contains("--files-dir") && body.contains("\"type\":\"error\""),
         "{body}"
     );
+    // a client waiting for 100 Continue gets the refusal without sending its body
+    let addr = serve(&h.state, 1);
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        c,
+        "POST /v1/files HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary={BOUNDARY}\r\nExpect: 100-continue\r\nContent-Length: 100000\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    let _ = c.read_to_end(&mut raw);
+    let (status, _, text) = split_response(&raw);
+    assert_eq!(status, 404, "{text}");
     let req = r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file-000000000000000000000000"}}]}]}"#;
     let (status, text) = h.post("/v1/messages", req);
     assert_eq!(status, 400);

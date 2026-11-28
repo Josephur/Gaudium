@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use crate::json::JsonValue;
 
 use super::conn::Conn;
-use super::file_store::{FileError, FileMeta, FileStore, Owner};
+use super::file_store::{is_media_type, FileError, FileMeta, FileStore, Owner};
 use super::multipart::{boundary, BodyReader, Multipart};
 use super::readout::jq;
 use super::{anthropic, write_error, write_json, AppState, HttpRequest, MAX_REQUEST_BODY_BYTES};
@@ -107,15 +107,12 @@ fn file_error(shape: Shape, stream: &mut Conn, e: &FileError) {
     error(shape, stream, e.status(), &e.message())
 }
 
+const FILES_OFF: &str = "the Files API is off on this server: start it with --files-dir <dir>";
+
 fn store<'a>(state: &'a AppState, shape: Shape, stream: &mut Conn) -> Option<&'a FileStore> {
     let s = state.files.as_deref();
     if s.is_none() {
-        error(
-            shape,
-            stream,
-            404,
-            "the Files API is off on this server: start it with --files-dir <dir>",
-        );
+        error(shape, stream, 404, FILES_OFF);
     }
     s
 }
@@ -169,9 +166,29 @@ fn drain(body: &mut dyn Read) {
     let _ = std::io::copy(&mut body.take(DRAIN_BYTES), &mut std::io::sink());
 }
 
+/// Refuses an upload before its body is read: the answer first, then (only when the client is
+/// sending the body, not waiting for a `100 Continue`) what is left of the body.
+fn refuse_unread(
+    shape: Shape,
+    stream: &mut Conn,
+    body: &mut dyn Read,
+    expect: bool,
+    status: u16,
+    msg: &str,
+) {
+    error(shape, stream, status, msg);
+    if !expect {
+        drain(body);
+    }
+}
+
 /// `POST /v1/files`: one multipart `file` part, streamed to the store.
 pub(super) fn handle_upload(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let shape = shape_of(req);
+    let expect = req
+        .headers
+        .get("expect")
+        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
     let prefix = req.streamed.clone().unwrap_or_default();
     let Ok(conn) = stream.try_clone() else {
         return error(shape, stream, 500, "cannot read the upload");
@@ -181,27 +198,22 @@ pub(super) fn handle_upload(state: &AppState, req: &HttpRequest, stream: &mut Co
         Ok(b) => b,
         Err(e) => return error(shape, stream, 400, &e),
     };
-    let Some(store) = store_or_drain(state, shape, stream, &mut body) else {
-        return;
+    let Some(store) = state.files.as_deref() else {
+        return refuse_unread(shape, stream, &mut body, expect, 404, FILES_OFF);
     };
     let ct = req.headers.get("content-type").map_or("", String::as_str);
     let b = match boundary(ct) {
         Ok(b) => b,
-        Err(e) => {
-            drain(&mut body);
-            return error(shape, stream, 400, &e);
-        }
+        Err(e) => return refuse_unread(shape, stream, &mut body, expect, 400, &e),
     };
-    if req
-        .headers
-        .get("expect")
-        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
-    {
+    if expect {
         let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
         let _ = stream.flush();
     }
     let owner = owner_of(state, req);
-    let parsed = read_upload(store, &mut body, &b, shape);
+    // the file part is at most the body: the store reserves that much (or its cap) before reading
+    let declared = body.declared_len();
+    let parsed = read_upload(store, &mut body, &b, shape, declared);
     // what follows the closing delimiter, or the rest of a refused upload
     drain(&mut body);
     match parsed {
@@ -237,31 +249,20 @@ pub(super) fn handle_upload(state: &AppState, req: &HttpRequest, stream: &mut Co
     }
 }
 
-fn store_or_drain<'a>(
-    state: &'a AppState,
-    shape: Shape,
-    stream: &mut Conn,
-    body: &mut dyn Read,
-) -> Option<&'a FileStore> {
-    if state.files.is_none() {
-        drain(body);
-    }
-    store(state, shape, stream)
-}
-
-struct Upload {
-    staged: super::file_store::Staged,
+struct Upload<'a> {
+    staged: super::file_store::Staged<'a>,
     filename: Option<String>,
     content_type: Option<String>,
     purpose: Option<String>,
 }
 
-fn read_upload(
-    store: &FileStore,
+fn read_upload<'a>(
+    store: &'a FileStore,
     body: &mut dyn Read,
     boundary: &str,
     shape: Shape,
-) -> Result<Upload, FileError> {
+    declared: Option<u64>,
+) -> Result<Upload<'a>, FileError> {
     let io = |e: std::io::Error| FileError::BadUpload(format!("invalid multipart body: {e}"));
     let bad = |m: String| FileError::BadUpload(m);
     let mut mp = Multipart::new(body, boundary);
@@ -273,9 +274,9 @@ fn read_upload(
                 if file.is_some() {
                     return Err(bad("an upload holds one 'file' part".into()));
                 }
-                let staged = store.stage(&mut mp.part())?;
+                let staged = store.stage(declared, &mut mp.part())?;
                 // a file the store will refuse is not read further
-                store.precheck(staged.size())?;
+                store.precheck(&staged)?;
                 file = Some((staged, head.filename, head.content_type));
             }
             "purpose" => {
@@ -515,6 +516,12 @@ fn send_content(stream: &mut Conn, m: &FileMeta, mut f: std::fs::File) {
             }
         })
         .collect();
+    // a type read back from a file written before types were checked is not sent as it is
+    let mime = if is_media_type(&m.mime_type) {
+        m.mime_type.as_str()
+    } else {
+        "application/octet-stream"
+    };
     let head = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: {}\r\n\
@@ -524,7 +531,7 @@ fn send_content(stream: &mut Conn, m: &FileMeta, mut f: std::fs::File) {
          Access-Control-Allow-Origin: *\r\n\
          {}\
          Connection: close\r\n\r\n",
-        m.mime_type,
+        mime,
         m.bytes,
         stream.hsts_line()
     );
@@ -585,11 +592,12 @@ fn get_mut<'a>(v: &'a mut JsonValue, key: &str) -> Option<&'a mut JsonValue> {
     }
 }
 
-/// Reads `id` for use in a request: its metadata and bytes, at most the size an inline request
-/// body may have.
+/// Reads `id` for use in a request: its metadata and bytes. All the files one request names hold
+/// at most the size an inline request body may have, together (`left`: what is left of it).
 struct Resolver<'a> {
     store: Option<&'a FileStore>,
     owner: Owner,
+    left: std::cell::Cell<u64>,
 }
 
 impl Resolver<'_> {
@@ -599,10 +607,17 @@ impl Resolver<'_> {
                 "{path}: file_id sources need the Files API, which is off on this server (start it with --files-dir <dir>)"
             ));
         };
-        match store.read_limited(&self.owner, id, MAX_REQUEST_BODY_BYTES as u64) {
-            Ok(Ok(x)) => Ok(x),
-            Ok(Err(size)) => Err(format!(
+        let left = self.left.get();
+        match store.read_limited(&self.owner, id, left) {
+            Ok(Ok(x)) => {
+                self.left.set(left - x.1.len() as u64);
+                Ok(x)
+            }
+            Ok(Err(size)) if size > MAX_REQUEST_BODY_BYTES as u64 => Err(format!(
                 "{path}: file '{id}' has {size} bytes, more than a request may hold ({MAX_REQUEST_BODY_BYTES})"
+            )),
+            Ok(Err(size)) => Err(format!(
+                "{path}: file '{id}' ({size} bytes) takes the files this request names past the {MAX_REQUEST_BODY_BYTES} bytes a request may hold together"
             )),
             Err(FileError::NotFound(_)) => Err(format!("{path}: file '{id}' not found")),
             Err(e) => Err(format!("{path}: {}", e.message())),
@@ -725,6 +740,7 @@ fn resolver<'a>(state: &'a AppState, req: &HttpRequest) -> Resolver<'a> {
     Resolver {
         store: state.files.as_deref(),
         owner: owner_of(state, req),
+        left: std::cell::Cell::new(MAX_REQUEST_BODY_BYTES as u64),
     }
 }
 
@@ -771,6 +787,33 @@ pub(super) fn resolve_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_files_one_request_names_share_one_budget() {
+        let d = std::env::temp_dir().join(format!("gaudium-files-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let store = FileStore::open(&d, 100, 100).unwrap();
+        let f = store
+            .create(
+                &Owner::everyone(),
+                "a.txt",
+                None,
+                "user_data",
+                false,
+                b"0123456789",
+            )
+            .unwrap();
+        let r = Resolver {
+            store: Some(&store),
+            owner: Owner::everyone(),
+            left: std::cell::Cell::new(15),
+        };
+        assert_eq!(r.read(&f.id, "a").unwrap().1, b"0123456789");
+        // the same file named again does not fit the 5 bytes left
+        let e = r.read(&f.id, "b").unwrap_err();
+        assert!(e.contains("together"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn dates_and_base64() {

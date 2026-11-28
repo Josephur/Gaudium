@@ -8,13 +8,25 @@
 //! deleted file is never handed out again, also across restarts.
 //!
 //! Which upload is stored, what the quota holds and which id a file gets are decided by the
-//! verified ledger (`verified/file_store.bend`): `fs_upload` decides an upload against the
-//! per-file cap and the free bytes and hands out the id, `fs_delete` / `fs_kill` give a deleted
-//! file's bytes back once, `fs_restore` counts the files found at start. This module streams the
-//! bytes, writes and reads the directory, and keeps the ledger in memory behind a lock.
+//! verified ledger (`verified/file_store.bend`):
+//! - `fs_restore` counts the files found at start and `fs_start` refuses to start when they hold
+//!   more than the configured quota (a quota lowered since);
+//! - `fs_hold` reserves an upload's room before its bytes are read (its declared size, or the
+//!   per-file cap, at most the free bytes), so uploads in progress never stage more than the
+//!   quota; the reservation counts as used and its ticket is given back once (`fs_delete`, then
+//!   `fs_kill`), at commit or when the upload is dropped;
+//! - `fs_commit` decides a staged upload: refused past its reservation or the id limit, else as
+//!   `fs_upload` decides it against the per-file cap and the free bytes, handing out the id;
+//! - `fs_delete` / `fs_kill` give a deleted file's bytes back once;
+//! - `fs_visible` decides who sees a file.
 //!
-//! Ownership: with API keys configured, a file belongs to the key that stored it ([`Owner`]);
-//! another key (or none) finds no such file. Without keys every client shares the store.
+//! This module streams the bytes, writes and reads the directory, and keeps the ledger in memory
+//! behind a lock.
+//!
+//! Ownership: with an API key configured, a file belongs to the key that stored it ([`Owner`]);
+//! another key (or none) finds no such file. Without a key every client shares the store. Files
+//! of a key the server no longer has are not served and still count against the quota: the start
+//! reports them, and `docs/files-api.md` says how to remove them.
 //!
 //! The internal API other parts of the server use (the batch APIs read their input here):
 //! [`FileStore::create`] stores bytes, [`FileStore::open_content`] opens a file for reading.
@@ -29,8 +41,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{parse_json, JsonValue};
 use crate::verified::{
-    fs_delete, fs_free, fs_kill, fs_live, fs_next, fs_open, fs_quota, fs_restore, fs_upload,
-    fs_upload_ledger, fs_used, FsEntry, FsLedger, FsUpload,
+    fs_commit, fs_delete, fs_free, fs_hold, fs_hold_ledger, fs_hold_ticket, fs_kill, fs_live,
+    fs_next, fs_open, fs_quota, fs_restore, fs_size, fs_start, fs_upload_ledger, fs_used,
+    fs_visible, FsEntry, FsLedger, FsStart, FsUpload,
 };
 
 use super::readout::jq;
@@ -39,7 +52,8 @@ use super::readout::jq;
 pub const DEFAULT_QUOTA_BYTES: u64 = 16 << 30;
 /// The default largest file (`--files-max-mb`), in bytes.
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 512 << 20;
-/// Ids are 12 hexadecimal digits of the counter; a counter at this value is refused.
+/// Ids are 12 hexadecimal digits of the counter: values from `ID_LIMIT - 1` on are not handed out
+/// (`fs_commit`'s id limit) and not read back.
 const ID_LIMIT: u64 = 1 << 48;
 /// The longest file name kept, in characters.
 const MAX_FILENAME_CHARS: usize = 255;
@@ -86,7 +100,14 @@ impl Owner {
         Owner(format!("key:{}", &digest[..32]))
     }
 
-    fn may_use(&self, file_owner: &str) -> bool {
+    /// The owner of a server's authorised clients: the holder of its API key, or everyone.
+    pub fn of_config(api_key: Option<&str>) -> Owner {
+        api_key.map_or_else(Owner::everyone, Owner::of_key)
+    }
+
+    /// Whether this is the owner recorded for a file (a digest comparison; what it decides is
+    /// `fs_visible`'s).
+    fn is(&self, file_owner: &str) -> bool {
         self.0 == file_owner
     }
 }
@@ -117,12 +138,14 @@ pub enum FileError {
     /// The file is larger than the per-file cap (`size` is at least `cap + 1`: the upload stops
     /// reading there).
     TooLarge { cap: u64 },
-    /// The file does not fit the free bytes of the quota.
+    /// The file does not fit the free bytes of the quota. `partial`: the upload ran past the
+    /// room it could reserve (`free`), so it was not read to its end and `size` is a lower bound.
     OverQuota {
         size: u64,
         used: u64,
         free: u64,
         quota: u64,
+        partial: bool,
     },
     /// Every id has been handed out.
     IdsExhausted,
@@ -155,10 +178,19 @@ impl FileError {
                 used,
                 free,
                 quota,
-            } => format!(
-                "the file of {size} bytes does not fit the file store: {used} of {quota} bytes \
-                 are in use and {free} are free (delete files or raise --files-quota-gb)"
-            ),
+                partial,
+            } => {
+                let file = if *partial {
+                    format!("the file (more than {free} bytes)")
+                } else {
+                    format!("the file of {size} bytes")
+                };
+                format!(
+                    "{file} does not fit the file store: {used} of {quota} bytes are in use or \
+                     reserved by uploads in progress, and {free} are free (delete files or raise \
+                     --files-quota-gb)"
+                )
+            }
             FileError::IdsExhausted => "the file store has handed out every file id".into(),
             FileError::BadUpload(e) => format!("the upload could not be read: {e}"),
             FileError::Io(e) => format!("the file store could not write to its directory: {e}"),
@@ -170,24 +202,35 @@ fn io_err(what: &str, e: io::Error) -> FileError {
     FileError::Io(format!("{what}: {e}"))
 }
 
-/// An upload streamed to a staging file, not yet a file of the store. Dropped uncommitted, it
-/// removes its staging file.
-pub struct Staged {
+/// An upload streamed to a staging file, not yet a file of the store, and the reservation that
+/// holds its room in the ledger. Dropped uncommitted, it removes its staging file and gives the
+/// reservation back.
+pub struct Staged<'a> {
+    store: &'a FileStore,
+    /// The reservation (`fs_hold`): live until given back, at commit or at drop.
+    ticket: FsEntry,
     path: PathBuf,
+    /// Bytes the upload has: those written to the staging file, plus one when the source had
+    /// more than the reservation (then they were not read further).
     size: u64,
+    /// Whether the source had more bytes than the reservation.
+    partial: bool,
     head: Vec<u8>,
 }
 
-impl Staged {
-    /// Bytes staged (at most the per-file cap + 1).
+impl Staged<'_> {
+    /// Bytes the upload has (one past the reservation when it ran past it).
     pub fn size(&self) -> u64 {
         self.size
     }
 }
 
-impl Drop for Staged {
+impl Drop for Staged<'_> {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+        // After a commit the ticket is no longer live and this changes nothing (fs_delete_killed).
+        let mut g = self.store.lock();
+        g.ledger = fs_delete(g.ledger, self.ticket);
     }
 }
 
@@ -199,8 +242,13 @@ struct Held {
 }
 
 impl Held {
-    fn visible_to(&self, owner: &Owner, id: &str) -> bool {
-        fs_live(self.entry) && self.meta.id == id && owner.may_use(&self.meta.owner)
+    /// Whether `owner` asking for `id` (or for every file, `id == None`) sees this file.
+    fn visible_to(&self, owner: &Owner, id: Option<&str>) -> bool {
+        fs_visible(
+            self.entry,
+            owner.is(&self.meta.owner),
+            id.is_none_or(|id| self.meta.id == id),
+        )
     }
 }
 
@@ -216,6 +264,9 @@ pub struct FileStore {
     cap: u64,
     inner: Mutex<Inner>,
     staging: AtomicU64,
+    /// Files found at start whose metadata could not be read: (count, bytes). Their bytes stay
+    /// counted; reported at start.
+    unreadable: (u64, u64),
 }
 
 /// The counter value of an id `file-<12 hex digits><12 hex digits>`.
@@ -291,7 +342,7 @@ pub fn detect_mime(hint: Option<&str>, filename: &str, head: &[u8]) -> String {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
-        if t.contains('/') && t != "application/octet-stream" && t.len() <= 255 {
+        if is_media_type(&t) && t != "application/octet-stream" {
             return t;
         }
     }
@@ -327,6 +378,17 @@ pub fn detect_mime(hint: Option<&str>, filename: &str, head: &[u8]) -> String {
     } else {
         "application/octet-stream".into()
     }
+}
+
+/// Whether `t` is a media type `type/subtype` of HTTP token characters (RFC 9110), at most 255
+/// bytes: nothing that could end a header line or break the header it is sent in.
+pub fn is_media_type(t: &str) -> bool {
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    };
+    t.len() <= 255 && t.split_once('/').is_some_and(|(a, b)| token(a) && token(b))
 }
 
 /// Writes `bytes` to `path` through a temporary file and a rename.
@@ -371,7 +433,8 @@ fn meta_from_json(text: &str, num: u64) -> Option<FileMeta> {
 }
 
 impl FileStore {
-    /// Opens (or creates) the store in `dir` and counts the files it holds.
+    /// Opens (or creates) the store in `dir` and counts the files it holds. Refused, with the
+    /// numbers, when they hold more than `quota` bytes.
     pub fn open(dir: &Path, quota: u64, cap: u64) -> Result<FileStore, String> {
         fs::create_dir_all(dir)
             .map_err(|e| format!("--files-dir {}: cannot create it: {e}", dir.display()))?;
@@ -392,6 +455,7 @@ impl FileStore {
         };
         let mut ledger = fs_open(quota, saved_next);
         let mut files = BTreeMap::new();
+        let mut unreadable = (0u64, 0u64);
         let entries =
             fs::read_dir(dir).map_err(|e| format!("--files-dir {}: {e}", dir.display()))?;
         let mut data_ids = Vec::new();
@@ -416,7 +480,9 @@ impl FileStore {
             };
             let data = dir.join(format!("{id}.data"));
             let Ok(size) = fs::metadata(&data).map(|m| m.len()) else {
-                eprintln!("[files] {id}: metadata without data; the file is not served");
+                // a file whose data was removed by hand: nothing to serve or count
+                eprintln!("[files] {id}: metadata without data; removing the metadata");
+                let _ = fs::remove_file(ent.path());
                 continue;
             };
             // the bytes on disk are counted whether or not the file can be served
@@ -442,9 +508,13 @@ impl FileStore {
                         },
                     );
                 }
-                None => eprintln!(
-                    "[files] {id}: unreadable metadata; its {size} bytes stay counted, the file is not served"
-                ),
+                None => {
+                    eprintln!(
+                        "[files] {id}: unreadable metadata; its {size} bytes stay counted, the file is not served"
+                    );
+                    unreadable.0 += 1;
+                    unreadable.1 += size;
+                }
             }
         }
         // data whose metadata was never written: an upload a stop cut short (its id is retired
@@ -454,12 +524,25 @@ impl FileStore {
                 let _ = fs::remove_file(dir.join(format!("{id}.data")));
             }
         }
+        let ledger = match fs_start(ledger, quota) {
+            FsStart::FsReady(l) => l,
+            FsStart::FsOverfull => {
+                return Err(format!(
+                    "--files-dir {}: its files hold {} bytes, more than --files-quota-gb allows \
+                     ({quota} bytes): raise the quota, or stop the server and remove files from the \
+                     directory (docs/files-api.md)",
+                    dir.display(),
+                    fs_used(ledger)
+                ))
+            }
+        };
         Ok(FileStore {
             dir: dir.to_path_buf(),
             quota,
             cap,
             inner: Mutex::new(Inner { ledger, files }),
             staging: AtomicU64::new(0),
+            unreadable,
         })
     }
 
@@ -472,27 +555,54 @@ impl FileStore {
         self.cap
     }
 
-    /// `(used, free, quota)` bytes. `quota` is the configured one; files found at start may hold
-    /// more than a quota lowered since.
+    /// `(used, free, quota)` bytes; `used` counts the stored files and the reservations of
+    /// uploads in progress.
     pub fn usage(&self) -> (u64, u64, u64) {
         let l = self.lock().ledger;
         (fs_used(l), fs_free(l), self.quota)
     }
 
-    /// Streams `src` to a staging file: up to the per-file cap + 1 bytes (one byte past the cap
-    /// is enough for the ledger to refuse the file).
-    pub fn stage(&self, src: &mut dyn Read) -> Result<Staged, FileError> {
+    /// Live files `owner` does not see (stored under another API key, or under none when the
+    /// server now has one), and files whose metadata could not be read: `(count, bytes)`. Their
+    /// bytes count against the quota; reported at start.
+    pub fn unreachable(&self, owner: &Owner) -> (u64, u64) {
+        let g = self.lock();
+        let (mut n, mut bytes) = self.unreadable;
+        for h in g.files.values() {
+            if fs_live(h.entry) && !h.visible_to(owner, None) {
+                n += 1;
+                bytes += h.meta.bytes;
+            }
+        }
+        (n, bytes)
+    }
+
+    /// Reserves room for an upload of `want` bytes (`None`: the size is not known; the per-file
+    /// cap is reserved), at most the free bytes, and streams `src` to a staging file: up to the
+    /// reservation, plus one byte to tell that the source has more (that byte is not written).
+    pub fn stage(&self, want: Option<u64>, src: &mut dyn Read) -> Result<Staged<'_>, FileError> {
+        let ticket = {
+            let mut g = self.lock();
+            let h = fs_hold(g.ledger, self.cap, want.unwrap_or(self.cap));
+            g.ledger = fs_hold_ledger(h);
+            fs_hold_ticket(h)
+        };
         let k = self.staging.fetch_add(1, Ordering::Relaxed);
         let path = self
             .dir
             .join(format!(".staging-{}-{k}", std::process::id()));
-        let mut f = fs::File::create(&path).map_err(|e| io_err("staging file", e))?;
+        // from here a drop gives the reservation back
         let mut staged = Staged {
+            store: self,
+            ticket,
             path,
             size: 0,
+            partial: false,
             head: Vec::new(),
         };
-        let mut limited = src.take(self.cap.saturating_add(1));
+        let room = fs_size(ticket);
+        let mut f = fs::File::create(&staged.path).map_err(|e| io_err("staging file", e))?;
+        let mut limited = src.take(room.saturating_add(1));
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             let n = match limited.read(&mut buf) {
@@ -505,34 +615,46 @@ impl FileStore {
                 let take = (SNIFF_BYTES - staged.head.len()).min(n);
                 staged.head.extend_from_slice(&buf[..take]);
             }
-            f.write_all(&buf[..n])
+            // the bytes within the reservation go to disk; one past it only tells there are more
+            let keep = n.min((room - staged.size.min(room)) as usize);
+            f.write_all(&buf[..keep])
                 .map_err(|e| io_err("staging file", e))?;
+            staged.partial |= keep < n;
             staged.size += n as u64;
         }
         f.sync_all().map_err(|e| io_err("staging file", e))?;
         Ok(staged)
     }
 
-    /// Whether the ledger would store a file of `size` bytes now (the decision of
-    /// [`commit`](Self::commit), taken early so a refused upload is not read to its end).
-    pub fn precheck(&self, size: u64) -> Result<(), FileError> {
-        let l = self.lock().ledger;
-        match fs_upload(l, self.cap, size) {
-            FsUpload::FsTooLarge => Err(FileError::TooLarge { cap: self.cap }),
-            FsUpload::FsOverQuota(free) => Err(FileError::OverQuota {
-                size,
+    fn refusal(&self, r: FsUpload, l: FsLedger, staged: &Staged) -> FileError {
+        match r {
+            FsUpload::FsTooLarge => FileError::TooLarge { cap: self.cap },
+            FsUpload::FsOverQuota(free) => FileError::OverQuota {
+                size: staged.size,
                 used: fs_used(l),
                 free,
                 quota: fs_quota(l),
-            }),
+                partial: staged.partial,
+            },
+            FsUpload::FsNoIds => FileError::IdsExhausted,
+            FsUpload::FsStored(..) => FileError::Io("an upload stored without a commit".into()),
+        }
+    }
+
+    /// Whether the ledger would store the staged upload now (the decision of
+    /// [`commit`](Self::commit), taken early so a refused upload is not read further).
+    pub fn precheck(&self, staged: &Staged) -> Result<(), FileError> {
+        let l = fs_delete(self.lock().ledger, staged.ticket);
+        match fs_commit(l, self.cap, ID_LIMIT - 1, staged.ticket, staged.size) {
             FsUpload::FsStored(..) => Ok(()),
+            r => Err(self.refusal(r, l, staged)),
         }
     }
 
     /// Makes a staged upload a file of the store, if the ledger stores it.
     pub fn commit(
         &self,
-        staged: Staged,
+        mut staged: Staged,
         owner: &Owner,
         filename: &str,
         mime_hint: Option<&str>,
@@ -542,29 +664,21 @@ impl FileStore {
         let filename = clean_filename(filename);
         let mime_type = detect_mime(mime_hint, &filename, &staged.head);
         let size = staged.size;
+        // `g` is a local, so it is released before `staged` (a parameter) drops and locks again.
         let mut g = self.lock();
-        let before = g.ledger;
-        let decided = fs_upload(before, self.cap, size);
+        // the reservation is given back, once: the decision is taken against the ledger without it
+        let released = fs_delete(g.ledger, staged.ticket);
+        let decided = fs_commit(released, self.cap, ID_LIMIT - 1, staged.ticket, size);
+        let after = fs_upload_ledger(released, decided);
+        g.ledger = after;
+        staged.ticket = fs_kill(staged.ticket);
         let num = match decided {
-            FsUpload::FsTooLarge => return Err(FileError::TooLarge { cap: self.cap }),
-            FsUpload::FsOverQuota(free) => {
-                return Err(FileError::OverQuota {
-                    size,
-                    used: fs_used(before),
-                    free,
-                    quota: fs_quota(before),
-                })
-            }
             FsUpload::FsStored(num, _) => num,
+            r => return Err(self.refusal(r, released, &staged)),
         };
-        if num >= ID_LIMIT - 1 {
-            return Err(FileError::IdsExhausted);
-        }
-        let after = fs_upload_ledger(before, decided);
         let entry = FsEntry::FsEntry(size, true);
         // From here the id is taken: the ledger keeps the counter even if the disk refuses
         // (the bytes are then given back through the verified delete).
-        g.ledger = after;
         let id = format!("file-{num:012x}{:012x}", id_tail());
         let meta = FileMeta {
             id: id.clone(),
@@ -618,7 +732,7 @@ impl FileStore {
         downloadable: bool,
         bytes: &[u8],
     ) -> Result<FileMeta, FileError> {
-        let staged = self.stage(&mut &bytes[..])?;
+        let staged = self.stage(Some(bytes.len() as u64), &mut &bytes[..])?;
         self.commit(staged, owner, filename, mime_type, purpose, downloadable)
     }
 
@@ -627,7 +741,7 @@ impl FileStore {
         let g = self.lock();
         id_num(id)
             .and_then(|n| g.files.get(&n))
-            .filter(|h| h.visible_to(owner, id))
+            .filter(|h| h.visible_to(owner, Some(id)))
             .map(|h| h.meta.clone())
             .ok_or_else(|| FileError::NotFound(id.to_string()))
     }
@@ -637,7 +751,7 @@ impl FileStore {
         self.lock()
             .files
             .values()
-            .filter(|h| fs_live(h.entry) && owner.may_use(&h.meta.owner))
+            .filter(|h| h.visible_to(owner, None))
             .map(|h| h.meta.clone())
             .collect()
     }
@@ -676,7 +790,11 @@ impl FileStore {
     pub fn delete(&self, owner: &Owner, id: &str) -> Result<FileMeta, FileError> {
         let mut g = self.lock();
         let num = id_num(id)
-            .filter(|n| g.files.get(n).is_some_and(|h| h.visible_to(owner, id)))
+            .filter(|n| {
+                g.files
+                    .get(n)
+                    .is_some_and(|h| h.visible_to(owner, Some(id)))
+            })
             .ok_or_else(|| FileError::NotFound(id.to_string()))?;
         let meta_path = self.dir.join(format!("{id}.json"));
         match fs::remove_file(&meta_path) {
@@ -743,17 +861,20 @@ mod tests {
         );
         s.create(&me, "c", None, "batch", false, &[b'x'; 60])
             .unwrap();
+        // the upload can reserve only the 23 free bytes: it is refused past them, unread
         match s.create(&me, "d", None, "batch", false, &[b'x'; 30]) {
             Err(FileError::OverQuota {
                 size,
                 used,
                 free,
                 quota,
+                partial,
             }) => {
-                assert_eq!((size, used, free, quota), (30, 77, 23, 100))
+                assert_eq!((size, used, free, quota, partial), (24, 77, 23, 100, true))
             }
             r => panic!("{r:?}"),
         }
+        assert_eq!(s.usage(), (77, 23, 100));
         // a delete gives the bytes back once
         s.delete(&me, &a.id).unwrap();
         assert_eq!(s.usage().0, 72);
@@ -799,7 +920,132 @@ mod tests {
     }
 
     #[test]
+    fn a_quota_lowered_below_the_files_kept_is_refused_at_start() {
+        // the review's scenario: quota 100, files of 60 + 40 bytes, restart at 50. Before the
+        // start check, deleting the 60-byte file freed 60 bytes against the quota of 50 and a
+        // 60-byte upload was then stored (100 bytes held against 50).
+        let d = tmp("lowered");
+        let me = Owner::everyone();
+        let s = FileStore::open(&d, 100, 100).unwrap();
+        let big = s
+            .create(&me, "a", None, "batch", false, &[b'a'; 60])
+            .unwrap();
+        s.create(&me, "b", None, "batch", false, &[b'b'; 40])
+            .unwrap();
+        drop(s);
+        let e = FileStore::open(&d, 50, 100).err().expect("refused");
+        assert!(
+            e.contains("hold 100 bytes") && e.contains("(50 bytes)"),
+            "{e}"
+        );
+        // at the old quota it starts; with the 60-byte file gone the lower quota is kept
+        let s = FileStore::open(&d, 100, 100).unwrap();
+        s.delete(&me, &big.id).unwrap();
+        drop(s);
+        let s = FileStore::open(&d, 50, 100).unwrap();
+        assert_eq!(s.usage(), (40, 10, 50));
+        assert!(matches!(
+            s.create(&me, "c", None, "batch", false, &[b'c'; 60]),
+            Err(FileError::OverQuota { .. })
+        ));
+        assert_eq!(s.usage(), (40, 10, 50));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn uploads_in_progress_reserve_their_room_and_give_it_back_once() {
+        let d = tmp("reserve");
+        let me = Owner::everyone();
+        let s = FileStore::open(&d, 100, 60).unwrap();
+        // a declared 60 bytes are reserved before any byte is read
+        let a = s.stage(Some(60), &mut &[b'a'; 60][..]).unwrap();
+        assert_eq!(s.usage(), (60, 40, 100));
+        // an upload of unknown size reserves the cap, at most the free bytes: it stages 40
+        // bytes and is refused past them
+        let b = s.stage(None, &mut &[b'b'; 50][..]).unwrap();
+        assert_eq!(s.usage(), (100, 0, 100));
+        assert_eq!(b.size(), 41);
+        assert!(matches!(
+            s.precheck(&b),
+            Err(FileError::OverQuota {
+                free: 40,
+                partial: true,
+                ..
+            })
+        ));
+        assert_eq!(fs::metadata(&b.path).unwrap().len(), 40);
+        drop(b);
+        assert_eq!(s.usage(), (60, 40, 100));
+        // a commit gives the reservation back and takes the file's bytes, once
+        let m = s.commit(a, &me, "a", None, "batch", false).unwrap();
+        assert_eq!((m.bytes, s.usage()), (60, (60, 40, 100)));
+        let c = s.stage(None, &mut &b"small"[..]).unwrap();
+        assert_eq!(s.usage(), (100, 0, 100));
+        s.commit(c, &me, "c", None, "batch", false).unwrap();
+        assert_eq!(s.usage(), (65, 35, 100));
+        // a refused commit gives the reservation back too
+        let e = s.stage(Some(10), &mut &[b'e'; 20][..]).unwrap();
+        assert!(s.commit(e, &me, "e", None, "batch", false).is_err());
+        assert_eq!(s.usage(), (65, 35, 100));
+        let leftovers: Vec<_> = fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".staging-"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn no_upload_is_stored_once_the_ids_run_out() {
+        let d = tmp("ids");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join(NEXT_FILE), format!("{}\n", ID_LIMIT - 2)).unwrap();
+        let me = Owner::everyone();
+        let s = FileStore::open(&d, 100, 100).unwrap();
+        let last = s.create(&me, "a", None, "batch", false, b"a").unwrap();
+        assert_eq!(id_num(&last.id), Some(ID_LIMIT - 2));
+        assert_eq!(
+            s.create(&me, "b", None, "batch", false, b"b"),
+            Err(FileError::IdsExhausted)
+        );
+        assert_eq!(s.usage(), (1, 99, 100));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn files_of_another_key_are_hidden_and_reported() {
+        let d = tmp("foreign");
+        let s = FileStore::open(&d, 100, 100).unwrap();
+        let old = Owner::of_key("old");
+        let f = s.create(&old, "a", None, "batch", false, b"abc").unwrap();
+        drop(s);
+        // the key changed: the file is not served to the new one, and counted at start
+        let s = FileStore::open(&d, 100, 100).unwrap();
+        let new = Owner::of_config(Some("new"));
+        assert!(s.list(&new).is_empty());
+        assert!(matches!(s.get(&new, &f.id), Err(FileError::NotFound(_))));
+        assert!(matches!(s.delete(&new, &f.id), Err(FileError::NotFound(_))));
+        assert_eq!(s.unreachable(&new), (1, 3));
+        assert_eq!(s.unreachable(&old), (0, 0));
+        assert_eq!(s.get(&old, &f.id).unwrap().id, f.id);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn names_and_media_types() {
+        assert_eq!(
+            detect_mime(Some("text/html\n\n<script>alert(1)</script>"), "a", b"x"),
+            "text/plain"
+        );
+        assert_eq!(
+            detect_mime(Some("text/html\r\nX-Other: 1"), "a.png", b"x"),
+            "image/png"
+        );
+        assert!(is_media_type("application/vnd.api+json"));
+        assert!(!is_media_type("text/html x"));
+        assert!(!is_media_type("text/"));
+        assert!(!is_media_type("text/a/b"));
         assert_eq!(clean_filename("C:\\x\\y.pdf"), "y.pdf");
         assert_eq!(clean_filename("../"), "unnamed");
         assert_eq!(clean_filename("a\u{0}b"), "ab");

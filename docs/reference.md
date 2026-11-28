@@ -339,7 +339,9 @@ Serve options:
                         file belongs to the key that uploaded it. Off by default: the
                         paths answer 404
   --files-quota-gb <N>  With --files-dir: GiB all files may hold together (decimals
-                        allowed; default: 16). An upload that does not fit is refused
+                        allowed; default: 16), uploads in progress included. An upload
+                        that does not fit is refused; a start whose files already hold
+                        more is refused (docs/files-api.md)
   --files-max-mb <N>    With --files-dir: largest single file in MiB (default: 512)
 
 Live status environment variables:
