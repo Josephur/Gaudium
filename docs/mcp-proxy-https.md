@@ -85,7 +85,13 @@ server's `authorization_token` goes as a bearer header and never follows a redir
 origin), and the same size and time limits. They are counted and listed with the page's
 (`GET /gaudium/proxy`, `"by":"server"` on a refusal). A server started without `--mcp-proxy`
 refuses a request with `mcp_servers`, and a server whose address the lists do not allow refuses
-the request before generation starts.
+the request before generation starts. What is decided before any server is reached (the proxy is
+off, too many servers, a page of another site) is the request's HTTP status, streamed or not. A
+streamed reply then begins, with its keep-alive, before the servers' handshakes and tool lists,
+which may take longer than a front end's idle timeout: a failure from there on (a server that
+cannot be reached or is not allowed, a name clash) is an `error` event that ends the stream, and
+a client that goes away meanwhile stops the discovery (no further server or page is asked). A
+reply that is not streamed gets every failure as its status.
 
 The site rule of `/cors-proxy` holds here too: a `POST /v1/messages` or
 `POST /v1/messages/count_tokens` request with `mcp_servers` sent by a page of another site (its
@@ -113,7 +119,8 @@ not browsers (no `Origin`, no `Sec-Fetch-Site`) are not either.
   reached (`pause_turn`: send the reply back as the assistant turn to go on). A round cut by
   `max_tokens`, a stop sequence or a cancel runs none of its calls, also when the parser closed
   the call that was cut (with `disable_parallel_tool_use` too). A call the model left unfinished
-  in a round it ended (an end-of-sequence token inside the call) is never sent: it gets an error
+  in a round it ended (an end-of-sequence token inside the call, also inside the one call
+  `disable_parallel_tool_use` allows) is never sent: it gets an error
   result, and the next round goes on from it. A forced `tool_choice`
   applies to the first round. `max_tokens` holds for the whole reply: each round gets what the
   rounds before left of it, and a reply that spends it stops with `max_tokens` (after the calls
@@ -122,8 +129,8 @@ not browsers (no `Origin`, no `Sec-Fetch-Site`) are not either.
   round goes by. `POST /v1/chat/completions/control` with `{"id": ...}` cancels the reply in any
   round: the round that runs stops, a call that waits for its server is the last one sent (the
   calls after it get an error result), and no round follows. A streamed reply gets its keep-alive
-  (`event: ping`, every 10 s without a write) from its first round to its end, also while the
-  server waits for its MCP calls.
+  (`event: ping`, every 10 s without a write) from before its MCP servers are reached to its end,
+  also while the server waits for its MCP calls; pings may come before `message_start`.
 - Limits per request: 8 servers, 10 generation rounds, 64 calls of MCP tools (later calls get an
   error result), 128 KiB of each result in the prompt (its parts as the prompt joins them, one
   newline between two; the rest is cut, with a note), 16 pages of

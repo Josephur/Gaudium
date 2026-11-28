@@ -4270,7 +4270,7 @@ fn run_prompt(
     let penalties = match penalty_fields::parse(val, emit_vocab) {
         Ok(p) => p,
         Err(e) => {
-            api.error(stream, 400, "invalid_request_error", &e);
+            refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &e);
             return;
         }
     };
@@ -4279,7 +4279,7 @@ fn run_prompt(
     let structured_req = match structured::request(val, &prompt) {
         Ok(r) => r,
         Err(e) => {
-            api.error(stream, 400, "invalid_request_error", &crate::grammar::build::message(&e));
+            refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &crate::grammar::build::message(&e));
             return;
         }
     };
@@ -4293,8 +4293,10 @@ fn run_prompt(
             (_, Some(r)) => format!("sampling penalties, logit_bias or {}", r.label),
             _ => "sampling penalties or logit_bias".to_string(),
         };
-        api.error(
+        refuse(
+            api,
             stream,
+            begun.as_ref(),
             400,
             "invalid_request_error",
             &format!(
@@ -4322,7 +4324,7 @@ fn run_prompt(
             match structured::plan(r, &prompt, &m.format, table, !split_reasoning) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    api.error(stream, 400, "invalid_request_error", &crate::grammar::build::message(&e));
+                    refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &crate::grammar::build::message(&e));
                     return;
                 }
             }
@@ -4426,8 +4428,10 @@ fn run_prompt(
             Some(r) => format!("sampling penalties, logit_bias or {}", r.label),
             None => "sampling penalties or logit_bias".to_string(),
         };
-        api.error(
+        refuse(
+            api,
             stream,
+            begun.as_ref(),
             400,
             "invalid_request_error",
             &format!("{think_field} can not be combined with {what} yet: send one or the other"),
@@ -4491,9 +4495,15 @@ fn run_prompt(
     } else {
         None
     };
-    if let (Some(s), Api::Messages { .. }, None) = (&sink, api, &begun) {
+    // (a reply with server-side tools may have begun its stream before its first round, while it
+    // reached its MCP servers: its first round writes the `message_start`)
+    let started = rounds.as_deref().is_some_and(|r| r.started);
+    if let (Some(s), Api::Messages { .. }, false) = (&sink, api, started) {
         // the message as it begins; the client gets its blocks once the engine generates
         let _ = s.write(anthropic::Builder::message_start(&req_id, &m.id, n_prompt).as_bytes());
+        if let Some(r) = rounds.as_deref_mut() {
+            r.started = true;
+        }
     }
     // A response's output items are built from admission on: its stream begins with
     // `response.created` and `response.in_progress`, so the client has the response's id (to

@@ -22,6 +22,10 @@ const PROTOCOL: &str = "2025-06-18";
 /// HTTP and the three methods it uses).
 const PROTOCOLS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 
+/// Why the servers' tools were not all listed: the reply was cancelled (or its client went
+/// away) while they were.
+const STOPPED: &str = "not listed: the request was cancelled or its client went away";
+
 /// The bounds of one request's server-side tools. The rules that use them are verified; the
 /// values are tuning (pinned by the tests below).
 #[derive(Debug, Clone, Copy)]
@@ -335,12 +339,20 @@ impl<'a> Session<'a> {
     }
 
     /// Every tool the server lists, up to the page bound; `true` with them when the bound cut
-    /// the list.
-    pub fn list_tools(&mut self, most_pages: u64) -> Result<(Vec<Tool>, bool), String> {
+    /// the list. `stopped` is asked before each page after the first: once it answers `true`
+    /// (the client went away), no further page is asked for.
+    pub fn list_tools(
+        &mut self,
+        most_pages: u64,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<(Vec<Tool>, bool), String> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         let mut pages = 0u64;
         loop {
+            if pages > 0 && stopped() {
+                return Err(STOPPED.to_string());
+            }
             let params = match &cursor {
                 Some(c) => format!("{{\"cursor\":{}}}", crate::json::quote_json(c)),
                 None => "{}".to_string(),
@@ -566,7 +578,14 @@ pub(super) struct Connector<'a> {
 
 impl<'a> Connector<'a> {
     /// Opens every server and lists its tools. The error names the server that failed.
-    pub fn open(proxy: &'a McpProxy, caller: Caller, specs: &[ServerSpec]) -> Result<Self, String> {
+    /// `stopped` is asked before each server and each page of a tool list: once it answers
+    /// `true` (the client of a streamed reply went away), nothing more is sent to any server.
+    pub fn open(
+        proxy: &'a McpProxy,
+        caller: Caller,
+        specs: &[ServerSpec],
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Self, String> {
         let mut c = Connector {
             sessions: Vec::new(),
             tools: Vec::new(),
@@ -576,9 +595,15 @@ impl<'a> Connector<'a> {
         };
         for (i, spec) in specs.iter().enumerate() {
             let fail = |e: String| format!("mcp_servers.{i} ({}): {e}", spec.name);
+            if stopped() {
+                return Err(fail(STOPPED.to_string()));
+            }
             let mut session =
                 Session::open(proxy, caller, &spec.url, spec.token.as_deref()).map_err(fail)?;
-            let (tools, cut) = session.list_tools(BOUNDS.list_pages).map_err(fail)?;
+            if stopped() {
+                return Err(fail(STOPPED.to_string()));
+            }
+            let (tools, cut) = session.list_tools(BOUNDS.list_pages, stopped).map_err(fail)?;
             if cut {
                 c.notes.push(format!(
                     "mcp_servers.{i} ({}): only the first {} pages of its tool list were read",

@@ -581,6 +581,41 @@ law ge_stop_string_closed_wins:
 def ge_stop_string_closed_wins(st, r, eos, c):
   {==}
 
+# promise: a generation the model ended with an end-of-sequence token inside a call the parser then closed is one the model ended, also when the parser's cleanup reached the call limit
+# harm: the round would end the reply without the unfinished call's error result and without the continuation the model asked for
+# catches: the end-of-sequence flag dropped once the parser stopped (gen_end(stop_string, Bool.and(stopped, Bool.not(repaired)), Bool.and(eos, Bool.not(stopped)), cancelled)): an EOS inside the only call under the one-call limit counts as a length cut
+law ge_repaired_eos_model_end:
+  for +st: Bool
+  for +c: Bool
+  {ge_model_ended(gen_end_closed(False{}, st, True{}, True{}, c)) == True{} : Bool}
+
+def ge_repaired_eos_model_end(st, c):
+  match st c:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a generation whose last call the parser closed ends as the engine ended it (an end-of-sequence token, the length limit or a cancel), whether or not the parser's cleanup stopped it
+# harm: a cancelled round whose cleanup reached the call limit would report a length cut (or a stop string) instead of the cancel
+# catches: the cancel flag dropped once the parser stopped (gen_end(stop_string, Bool.and(stopped, Bool.not(repaired)), eos, Bool.and(cancelled, Bool.not(stopped)))): a cancel inside the only call under the one-call limit is reported as max_tokens
+law ge_repaired_ends_as_engine:
+  for +st: Bool
+  for +eos: Bool
+  for +c: Bool
+  {gen_end_closed(False{}, st, True{}, eos, c) == gen_end(False{}, False{}, eos, c) : GenEnd}
+
+def ge_repaired_ends_as_engine(st, eos, c):
+  match st eos c:
+    case True{} True{} True{}: {==}
+    case True{} True{} False{}: {==}
+    case True{} False{} True{}: {==}
+    case True{} False{} False{}: {==}
+    case False{} True{} True{}: {==}
+    case False{} True{} False{}: {==}
+    case False{} False{} True{}: {==}
+    case False{} False{} False{}: {==}
+
 type FinishReason is Data:
   FrStop{}
   FrLength{}

@@ -16,6 +16,7 @@ const TOKEN: &str = "tok-SECRET-123";
 #[derive(Debug, Clone)]
 struct Seen {
     method: String,
+    path: String,
     headers: Vec<(String, String)>,
     body: String,
 }
@@ -53,7 +54,9 @@ fn read_request(s: &mut TcpStream) -> Option<Seen> {
     };
     let head = String::from_utf8_lossy(&buf[..end]).into_owned();
     let mut lines = head.lines();
-    let method = lines.next()?.split(' ').next()?.to_string();
+    let mut first = lines.next()?.split(' ');
+    let method = first.next()?.to_string();
+    let path = first.next().unwrap_or("").to_string();
     let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
@@ -73,13 +76,15 @@ fn read_request(s: &mut TcpStream) -> Option<Seen> {
     }
     Some(Seen {
         method,
+        path,
         headers,
         body: String::from_utf8_lossy(&body).into_owned(),
     })
 }
 
-/// A small MCP server: `initialize` (JSON, assigns a session), `tools/list` (JSON, two pages),
-/// `tools/call` (an event stream with a notification before the answer).
+/// A small MCP server: `initialize` (JSON, assigns a session), `tools/list` (JSON, two pages;
+/// each page takes [`SLOW_LIST_MS`] on the path `/slow-list`), `tools/call` (an event stream
+/// with a notification before the answer).
 struct McpServer {
     port: u16,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -113,6 +118,9 @@ impl McpServer {
     }
 }
 
+/// How long one page of the tool list takes on the path `/slow-list`.
+const SLOW_LIST_MS: u64 = 400;
+
 fn answer(req: &Seen, s: &mut TcpStream) {
     let json_reply = |s: &mut TcpStream, extra: &str, body: &str| {
         let _ = write!(
@@ -139,6 +147,9 @@ fn answer(req: &Seen, s: &mut TcpStream) {
             let _ = write!(s, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
         }
         "tools/list" => {
+            if req.path == "/slow-list" {
+                thread::sleep(std::time::Duration::from_millis(SLOW_LIST_MS));
+            }
             let second = v.get("params").and_then(|p| p.get("cursor")).is_some();
             let body = if second {
                 format!(
@@ -1010,4 +1021,171 @@ fn a_heartbeat_that_finds_the_client_gone_cancels_the_round_that_runs() {
     let after = Arc::new(AtomicBool::new(false));
     entry.attach(&after);
     assert!(after.load(Ordering::Relaxed));
+}
+
+fn tools_lists(mcp: &McpServer) -> usize {
+    mcp.seen().iter().filter(|x| x.rpc() == "tools/list").count()
+}
+
+/// The `type` of each event of a stream (a block start with its block's type).
+fn event_kinds(body: &str) -> Vec<String> {
+    sse_events(body.as_bytes())
+        .iter()
+        .map(|e| match s(e, &["type"]) {
+            "content_block_start" => format!("start:{}", s(e, &["content_block", "type"])),
+            t => t.to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn the_stream_begins_and_keeps_alive_while_the_mcp_servers_are_listed() {
+    // the servers' handshakes and tool lists may outlast a front end's idle timeout: a streamed
+    // reply begins before them, and pings go out while they run (Codex on #134)
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    h.state.stream_heartbeat_ms.store(30, Ordering::Relaxed);
+    h.script(ROUND_END);
+    let slow = mcp.url().replace("/mcp", "/slow-list");
+    let (status, body) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"stream":true,"max_tokens":256,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+            servers(&slow)
+        ),
+    );
+    assert_eq!(status, 200, "{body}");
+    let kinds = event_kinds(&body);
+    let start_at = kinds.iter().position(|k| k == "message_start").expect("a message_start");
+    assert!(
+        kinds[..start_at].iter().any(|k| k == "ping"),
+        "no ping while the tools were listed: {kinds:?}"
+    );
+    assert!(
+        kinds[..start_at].iter().all(|k| k == "ping"),
+        "only pings before the message begins: {kinds:?}"
+    );
+    assert_eq!(kinds.iter().filter(|k| *k == "message_start").count(), 1);
+    assert_eq!(kinds.last().map(String::as_str), Some("message_stop"), "{kinds:?}");
+    assert_eq!(tools_lists(&mcp), 2);
+    // the servers' tools reached the prompt
+    assert!(h.last_prompt().contains("mcp__clock__get_time"));
+}
+
+#[test]
+fn a_streamed_discovery_failure_is_an_error_event() {
+    // once a streamed reply began, a server that cannot be reached, or a name clash its tool
+    // list shows, is an `error` event that ends the stream; no round runs
+    let mcp = McpServer::start();
+    let before_seen = mcp.seen().len();
+    let h = harness_with_proxy("192.0.2.7");
+    let before = h.prompts.lock().unwrap().len();
+    let (status, body) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"stream":true,"max_tokens":64,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    assert_eq!(status, 200, "{body}");
+    let evs = sse_events(body.as_bytes());
+    let last = evs.last().expect("an event");
+    assert_eq!(s(last, &["type"]), "error", "{body}");
+    assert_eq!(s(last, &["error", "type"]), "invalid_request_error", "{body}");
+    let msg = s(last, &["error", "message"]);
+    assert!(msg.contains("mcp_servers.0 (clock)") && msg.contains("not in the allow-list"), "{body}");
+    assert!(!body.contains(TOKEN), "{body}");
+    assert!(!body.contains("message_start"), "{body}");
+    assert_eq!(mcp.seen().len(), before_seen, "the refused server was contacted");
+    // a client tool of the same name as a server's tool
+    let h = harness_with_proxy("127.0.0.1");
+    let (status, body) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"stream":true,"max_tokens":64,{},"tools":[{{"name":"mcp__clock__get_time"}}],"messages":[{{"role":"user","content":"x"}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    assert_eq!(status, 200, "{body}");
+    let evs = sse_events(body.as_bytes());
+    assert_eq!(s(evs.last().unwrap(), &["type"]), "error", "{body}");
+    assert!(s(evs.last().unwrap(), &["error", "message"]).contains("client tool"), "{body}");
+    assert_eq!(h.prompts.lock().unwrap().len(), before, "no round runs");
+}
+
+#[test]
+fn admission_refusals_of_a_streamed_request_stay_statuses() {
+    // what is decided before any server is reached (the proxy is off, too many servers, a page
+    // of another site) is the request's HTTP status, streamed or not
+    let mcp = McpServer::start();
+    let ask = format!(
+        r#"{{"stream":true,"max_tokens":64,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+        servers(&mcp.url())
+    );
+    let (status, text) = harness().post("/v1/messages", &ask);
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("--mcp-proxy") && !text.contains("event:"), "{text}");
+    let h = harness_with_proxy("127.0.0.1");
+    let many: Vec<String> = (0..=mcp_client::BOUNDS.servers)
+        .map(|i| format!(r#"{{"type":"url","url":"{}","name":"s{i}"}}"#, mcp.url()))
+        .collect();
+    let (status, text) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"stream":true,"max_tokens":64,"mcp_servers":[{}],"messages":[{{"role":"user","content":"x"}}]}}"#,
+            many.join(",")
+        ),
+    );
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("at most") && !text.contains("event:"), "{text}");
+    let (status, text) = h.exchange_with("POST", "/v1/messages", &FOREIGN, &ask);
+    assert_eq!(status, 403, "{text}");
+    assert!(text.contains("permission_error") && !text.contains("event:"), "{text}");
+    assert!(mcp.seen().is_empty(), "{:?}", mcp.seen());
+}
+
+#[test]
+fn a_client_gone_while_the_tools_are_listed_stops_the_discovery() {
+    // the client leaves while the first page of the tool list is slow: a heartbeat finds it
+    // gone, and no further page, call or round follows
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    h.state.stream_heartbeat_ms.store(10, Ordering::Relaxed);
+    h.script(ROUND_END);
+    let before = h.prompts.lock().unwrap().len();
+    let slow = mcp.url().replace("/mcp", "/slow-list");
+    let body = format!(
+        r#"{{"stream":true,"max_tokens":256,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+        servers(&slow)
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::clone(&h.state);
+    let server = thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        handle_connection(state, s);
+    });
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    write!(
+        c,
+        "POST /v1/messages HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    // the stream began (its head and a first ping) while the first page is still being listed
+    let mut raw = Vec::new();
+    read_until_count(&mut c, &mut raw, "event: ping", 1);
+    assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
+    let t0 = std::time::Instant::now();
+    while tools_lists(&mcp) < 1 {
+        assert!(t0.elapsed().as_secs() < 10, "the tool list was never asked for");
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    drop(c);
+    server.join().unwrap();
+    assert_eq!(tools_lists(&mcp), 1, "a page was asked for after the client went away");
+    assert!(tools_calls(&mcp).is_empty());
+    assert_eq!(h.prompts.lock().unwrap().len(), before, "a round ran for a client that left");
 }

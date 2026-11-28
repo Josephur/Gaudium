@@ -14,6 +14,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::anthropic::{self, Translated};
 use super::conn::Conn;
@@ -64,11 +65,14 @@ pub(super) struct Rounds {
     /// What a cancel by `id` reaches, registered for the whole reply: the reply, and the round
     /// that runs.
     pub cancel: Arc<CancelEntry>,
-    /// The reply's stream, once its first round began it.
+    /// The reply's stream: begun before the request's MCP servers are reached (a streamed
+    /// reply), or by its first round.
     pub sink: Option<SseSink>,
-    /// The stream's keep-alive, from the first round to the end of the reply: it also runs while
-    /// the server waits for its tools.
+    /// The stream's keep-alive, from the stream's start to the end of the reply: it also runs
+    /// while the server reaches its MCP servers and waits for its tools.
     pub keep_alive: Option<KeepAlive>,
+    /// The reply's `message_start` is written (by its first round).
+    pub started: bool,
     /// The reply's content blocks so far.
     pub builder: Option<anthropic::Builder>,
     /// How the last round ended; `None` after a round that answered the request itself (an
@@ -185,10 +189,20 @@ pub(super) fn open_server_tools<'a>(
     body: &JsonValue,
     t: &mut Translated,
 ) -> Result<Option<Connector<'a>>, Refused> {
+    if !admit_server_tools(state, caller, t)? {
+        return Ok(None);
+    }
+    discover_server_tools(state, caller, body, t, &|| false).map(Some)
+}
+
+/// Whether the request's MCP servers may be reached (`false`: it names none). It is decided
+/// before anything is sent to any server, and before a streamed reply begins: the error is the
+/// request's HTTP status.
+fn admit_server_tools(state: &AppState, caller: Caller, t: &Translated) -> Result<bool, Refused> {
     let asked = t.mcp.len() as u64;
     let admit = sv_admit(asked, state.proxy.enabled(), caller.site_ok, BOUNDS.servers);
     if sv_admit_is_none(admit) {
-        return Ok(None);
+        return Ok(false);
     }
     if !sv_admit_runs(admit) {
         return Err(match admit {
@@ -222,8 +236,21 @@ pub(super) fn open_server_tools<'a>(
             .into(),
         });
     }
+    Ok(true)
+}
+
+/// Opens the admitted request's MCP servers and adds their tools to its chat body. `stopped`:
+/// once it answers `true` (the reply was cancelled, or the client of its stream went away),
+/// nothing more is sent to any server and the error says so.
+fn discover_server_tools<'a>(
+    state: &'a AppState,
+    caller: Caller,
+    body: &JsonValue,
+    t: &mut Translated,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Connector<'a>, Refused> {
     let client = chat_tool_names(&t.chat);
-    let c = Connector::open(&state.proxy, caller, &t.mcp)?;
+    let c = Connector::open(&state.proxy, caller, &t.mcp, stopped)?;
     if let Some(name) = c
         .names()
         .find(|n| sv_route_clash(sv_route(true, client.iter().any(|x| x == n))))
@@ -242,12 +269,19 @@ pub(super) fn open_server_tools<'a>(
     extend_list(&mut t.chat, "tools", c.offered.clone());
     extend_list(&mut t.chat, "gaudium_hidden_tools", c.deferred.clone());
     t.ignored.extend(c.notes.iter().cloned());
-    Ok(Some(c))
+    Ok(c)
 }
 
 /// `POST /v1/messages` once translated: a request without tool servers runs as one round, as
 /// any chat request; one with them runs the tool loop. `caller`: the verdicts of the HTTP
 /// request.
+///
+/// A refusal of admission (the proxy is off, a page of another site, too many servers) is the
+/// request's HTTP status. A streamed reply then begins, with its keep-alive, before the MCP
+/// servers are reached: their handshakes and tool lists may take longer than a front end's idle
+/// timeout. A failure from there on is an `error` event in the stream, and a client that goes
+/// away meanwhile (a heartbeat finds it gone) stops the discovery. A reply that is not streamed
+/// gets every failure as its status.
 pub(super) fn run_messages(
     state: &Arc<AppState>,
     caller: Caller,
@@ -258,10 +292,9 @@ pub(super) fn run_messages(
     let api = Api::Messages {
         show_thinking: t.show_thinking,
     };
-    let client = chat_tool_names(&t.chat);
-    let mut tools = match open_server_tools(state, caller, body, &mut t) {
-        Ok(Some(c)) => c,
-        Ok(None) => {
+    match admit_server_tools(state, caller, &t) {
+        Ok(true) => {}
+        Ok(false) => {
             run_chat(state, &t.chat, stream, api, t.ignored, None);
             return;
         }
@@ -269,9 +302,54 @@ pub(super) fn run_messages(
             api.error(stream, e.status, e.kind, &e.message);
             return;
         }
+    }
+    let client = chat_tool_names(&t.chat);
+    // one id for the whole reply, registered for cancels until its last round ends
+    let id = format!(
+        "msg_gaudium_{}",
+        state.next_req_id.fetch_add(1, Ordering::Relaxed)
+    );
+    let cancel = CancelEntry::rounds();
+    state
+        .cancels
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), Arc::clone(&cancel));
+    let _registered = Registered {
+        state,
+        id: id.clone(),
     };
-    let labels = tools.labels();
-    run_loop(state, t, stream, &mut tools, &client, labels);
+    let mut rounds = Rounds {
+        id,
+        cancel: Arc::clone(&cancel),
+        sink: None,
+        keep_alive: None,
+        started: false,
+        builder: None,
+        end: None,
+    };
+    if t.chat.get("stream").and_then(JsonValue::as_bool) == Some(true) {
+        let sink = match stream.try_clone() {
+            Ok(c) if super::write_sse_headers(stream).is_ok() => SseSink::new(c),
+            _ => return, // the client went away
+        };
+        let heartbeat = Duration::from_millis(state.stream_heartbeat_ms.load(Ordering::Relaxed));
+        // a heartbeat that finds the client gone cancels the reply, which stops the discovery
+        rounds.keep_alive = sink.keep_alive(api.keep_alive_line(), heartbeat, cancel.clone());
+        rounds.sink = Some(sink);
+    }
+    let stopped = || cancel.cancelled();
+    let mut tools = match discover_server_tools(state, caller, body, &mut t, &stopped) {
+        Ok(c) => c,
+        Err(e) => {
+            let sink = rounds.sink.as_ref();
+            super::refuse(api, stream, sink, e.status, e.kind, &e.message);
+            return;
+        }
+    };
+    let builder = anthropic::Builder::new(t.show_thinking).with_server_tools(tools.labels());
+    rounds.builder = Some(builder);
+    run_loop(state, t, stream, &mut tools, &client, rounds);
     tools.finish();
 }
 
@@ -335,7 +413,7 @@ fn run_loop(
     stream: &mut Conn,
     tools: &mut dyn ServerTools,
     client: &[String],
-    labels: Vec<(String, String, String)>,
+    mut rounds: Rounds,
 ) {
     let Translated {
         mut chat,
@@ -343,6 +421,7 @@ fn run_loop(
         ignored,
         ..
     } = t;
+    let (id, cancel) = (rounds.id.clone(), Arc::clone(&rounds.cancel));
     let stream_mode = chat.get("stream").and_then(JsonValue::as_bool) == Some(true);
     // the request's output limit holds for the whole reply, over every round (0 or none: the
     // chat path's own limit, the end of the context)
@@ -350,29 +429,6 @@ fn run_loop(
         .get("max_tokens")
         .and_then(JsonValue::as_u64)
         .filter(|&v| v > 0);
-    // one id for the whole reply, registered for cancels until its last round ends
-    let id = format!(
-        "msg_gaudium_{}",
-        state.next_req_id.fetch_add(1, Ordering::Relaxed)
-    );
-    let cancel = CancelEntry::rounds();
-    state
-        .cancels
-        .lock()
-        .unwrap()
-        .insert(id.clone(), Arc::clone(&cancel));
-    let _registered = Registered {
-        state,
-        id: id.clone(),
-    };
-    let mut rounds = Rounds {
-        id: id.clone(),
-        cancel: Arc::clone(&cancel),
-        sink: None,
-        keep_alive: None,
-        builder: Some(anthropic::Builder::new(show_thinking).with_server_tools(labels)),
-        end: None,
-    };
     let api = Api::Messages { show_thinking };
     let (mut done, mut calls_run) = (0u64, 0u64);
     let (mut input, mut cached, mut output) = (0u64, 0u64, 0u64);
