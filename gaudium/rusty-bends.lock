@@ -119,6 +119,9 @@ f6771bf6b09c4e0c  force_none_when_not_forced  law force_none_when_not_forced : f
 3e1516f653c0cf49  fs_commit_is_upload  law fs_commit_is_upload : for + l : FsLedger for + c : Nat for + m : Nat for + t : FsEntry for + s : Nat { fs_when_stored ( fs_commit ( l , c , m , t , s ) , fs_upload ( l , c , s ) ) == fs_commit ( l , c , m , t , s ) : FsUpload }
 # promise fs_commit_is_upload: a commit that stores an upload stores exactly what fs_upload decides for it, so the cap, quota, id and byte laws of fs_upload hold for every stored commit.
 # harm fs_commit_is_upload: a commit could store a file the ledger never admitted, or count other bytes than the file's
+fe5aa25154da3f0c  fs_commit_refused_keeps  law fs_commit_refused_keeps : for + l : FsLedger for + c : Nat for + m : Nat for + t : FsEntry for + s : Nat { fs_kept_if_refused ( fs_commit ( l , c , m , t , s ) , fs_upload_ledger ( l , fs_commit ( l , c , m , t , s ) ) , l ) == fs_upload_ledger ( l , fs_commit ( l , c , m , t , s ) ) : FsLedger }
+# promise fs_commit_refused_keeps: a refused commit, whatever the refusal, leaves the ledger the store keeps after it equal to the ledger it was decided against.
+# harm fs_commit_refused_keeps: a refusal could zero the used bytes and the id counter: the quota would be lost and ids handed out again
 990979b17904da0b  fs_commit_refused_rightly  law fs_commit_refused_rightly : for + l : FsLedger for + c : Nat for + m : Nat for + t : FsEntry for + s : Nat { fs_refused_rightly ( s , c , Nat.min ( fs_free ( l ) , fs_size ( t ) ) , fs_commit ( l , c , m , t , s ) ) == True { } : Bool }
 # promise fs_commit_refused_rightly: a commit is refused as too large only when the upload is larger than the per-file cap, and as over the quota only when it is larger than its reservation or the free bytes.
 # harm fs_commit_refused_rightly: the store could refuse uploads it has room for, or give the client the wrong reason
@@ -141,6 +144,9 @@ e252eca0a4f957d4  fs_delete_conserved  law fs_delete_conserved : for + l : FsLed
 6974045981f4249f  fs_hold_conserved  law fs_hold_conserved : for + l : FsLedger for + c : Nat for + w : Nat { fs_quota ( fs_hold_ledger ( fs_hold ( l , c , w ) ) ) == fs_quota ( l ) : Nat }
 # promise fs_hold_conserved: a reservation leaves used + free equal to the quota: its bytes move from free to used.
 # harm fs_hold_conserved: uploads in progress could stage more bytes on disk than the quota has room for
+76d7734ba5a8a5ec  fs_hold_covers_ask  law fs_hold_covers_ask : for + u : Nat for + w : Nat for + x : Nat for + y : Nat for + n : Nat { Nat.is_le ( w , fs_size ( fs_hold_ticket ( fs_hold ( FsLedger { u , Nat.add ( w , x ) , n } , Nat.add ( w , y ) , w ) ) ) ) == True { } : Bool }
+# promise fs_hold_covers_ask: an upload that asks for no more than the per-file cap and the free bytes is reserved all it asked for.
+# harm fs_hold_covers_ask: uploads that fit the cap and the quota could be refused as over the quota
 f485c85b5096b001  fs_hold_released  law fs_hold_released : for + l : FsLedger for + c : Nat for + w : Nat { fs_delete ( fs_hold_ledger ( fs_hold ( l , c , w ) ) , fs_hold_ticket ( fs_hold ( l , c , w ) ) ) == l : FsLedger }
 # promise fs_hold_released: giving a reservation's ticket back returns the ledger to what it was before the reservation.
 # harm fs_hold_released: a dropped upload could keep its reserved bytes, or free more than it held
