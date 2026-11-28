@@ -558,6 +558,40 @@ cfcc46b0912bc3ed  hm_fresh_within_need  law hm_fresh_within_need : for + n : Nat
 80cbb11270a55b9d  hm_never_admits_beyond_available  law hm_never_admits_beyond_available : for + n : Nat for + a : Nat { Bool.and ( hm_admit ( n , a ) , Nat.is_lt ( a , n ) ) == False { } : Bool }
 a47dbeb2f055e0dd  hm_never_covers_beyond_the_leave  law hm_never_covers_beyond_the_leave : for + l : Nat for + b : Nat { Bool.and ( hm_covers ( l , b ) , Nat.is_lt ( l , b ) ) == False { } : Bool }
 9111006def5018cb  hm_taken_and_left_within_the_leave  law hm_taken_and_left_within_the_leave : for + b : Nat for + r : Nat { Nat.is_le ( Nat.add ( b , hm_left ( Nat.add ( b , r ) , b ) ) , Nat.add ( b , r ) ) == True { } : Bool }
+dba295b9ab03590f  hn_bad_host_refused  law hn_bad_host_refused : for fs : List < & 2 , HnHost > for ns : List < & 2 , List < & 2 , Nat > > { hn_request_ours ( HnBad { } , fs , ns ) == False { } : Bool }
+# promise hn_bad_host_refused: a request whose Host is neither an address nor a name never names this server
+92316c29d857e50f  hn_fold_capitals  law hn_fold_capitals : for + i : Nat for ok : { Nat.is_lt ( i , 26n ) == True { } : Bool } { hn_fold ( Nat.add ( 65n , i ) ) == Nat.add ( 97n , i ) : Nat }
+# promise hn_fold_capitals: an ASCII capital letter compares as its small letter
+3fe8e2327b98d96f  hn_fold_keeps_high  law hn_fold_keeps_high : for b : Nat { hn_fold ( Nat.add ( 91n , b ) ) == Nat.add ( 91n , b ) : Nat }
+# promise hn_fold_keeps_high: a byte above the capitals is compared as it is
+5036c97bd01978bd  hn_fold_keeps_low  law hn_fold_keeps_low : for + b : Nat for ok : { Nat.is_lt ( b , 65n ) == True { } : Bool } { hn_fold ( b ) == b : Nat }
+# promise hn_fold_keeps_low: a byte below the capitals is compared as it is
+327bcffc217ae93d  hn_fold_last_capital  law hn_fold_last_capital : { hn_fold ( 90n ) == 122n : Nat }
+# promise hn_fold_last_capital: the last capital, Z, compares as z (the sampled capitals of hn_fold_capitals stop short of it)
+6df6a6e0fd335d02  hn_foreign_host_refused  law hn_foreign_host_refused : for + h : HnHost for + fs : List < & 2 , HnHost > for + ns : List < & 2 , List < & 2 , Nat > > for ok : { hn_host_ours ( h , ns ) == False { } : Bool } { hn_request_ours ( h , fs , ns ) == False { } : Bool }
+# promise hn_foreign_host_refused: a request whose Host does not name this server is refused whatever the front-end headers name
+cc6b1a7435c91cf2  hn_listed_name_passes  law hn_listed_name_passes : for + n : List < & 2 , Nat > for + ns : List < & 2 , List < & 2 , Nat > > { hn_request_ours ( HnName { n } , Nil { } , Con { n , ns } ) == True { } : Bool }
+# promise hn_listed_name_passes: a request whose Host is one of the server's names, and that names no other host, names this server
+f521cb4fa13f14d3  hn_name_case_ignored  law hn_name_case_ignored : for + i : Nat for ok : { Nat.is_lt ( i , 26n ) == True { } : Bool } for + xs : List < & 2 , Nat > for + ns : List < & 2 , List < & 2 , Nat > > { hn_request_ours ( HnName { Con { Nat.add ( 65n , i ) , xs } } , Nil { } , Con { Con { Nat.add ( 97n , i ) , xs } , ns } ) == True { } : Bool }
+# promise hn_name_case_ignored: a name in capitals passes as the same name in small letters
+db446ae36877c579  hn_no_names_no_name  law hn_no_names_no_name : for n : List < & 2 , Nat > for fs : List < & 2 , HnHost > { hn_request_ours ( HnName { n } , fs , Nil { } ) == False { } : Bool }
+# promise hn_no_names_no_name: with no names of its own, no request that names a host by name names this server
+2440690d69a2b050  hn_other_name_adds_nothing  law hn_other_name_adds_nothing : for + n : List < & 2 , Nat > for + m : List < & 2 , Nat > for + ns : List < & 2 , List < & 2 , Nat > > for ok : { hn_same ( n , m ) == False { } : Bool } { hn_request_ours ( HnName { n } , Nil { } , Con { m , ns } ) == hn_request_ours ( HnName { n } , Nil { } , ns ) : Bool }
+# promise hn_other_name_adds_nothing: a name of the server's that is not the requested name never lets the request through
+e50b325f753cc368  hn_same_byte_differs  law hn_same_byte_differs : for + x : Nat for + y : Nat for + xs : List < & 2 , Nat > for + ys : List < & 2 , Nat > for ok : { Nat.is_eq ( hn_fold ( x ) , hn_fold ( y ) ) == False { } : Bool } { hn_same ( Con { x , xs } , Con { y , ys } ) == False { } : Bool }
+# promise hn_same_byte_differs: two names whose bytes differ, once case is set aside, are not the same name
+cc7a38515f4d9d28  hn_same_longer  law hn_same_longer : for x : Nat for xs : List < & 2 , Nat > { hn_same ( Con { x , xs } , Nil { } ) == False { } : Bool }
+# promise hn_same_longer: a name never compares the same as a shorter name
+646d125acefd9d53  hn_same_rest_differs  law hn_same_rest_differs : for + x : Nat for + y : Nat for + xs : List < & 2 , Nat > for + ys : List < & 2 , Nat > for ok : { hn_same ( xs , ys ) == False { } : Bool } { hn_same ( Con { x , xs } , Con { y , ys } ) == False { } : Bool }
+# promise hn_same_rest_differs: two names that differ after their first byte are not the same name
+9e8a60775b52c32c  hn_same_shorter  law hn_same_shorter : for y : Nat for ys : List < & 2 , Nat > { hn_same ( Nil { } , Con { y , ys } ) == False { } : Bool }
+# promise hn_same_shorter: a name never compares the same as a longer name
+1ad0301838a50dc5  hn_site_foreign_host_refused  law hn_site_foreign_host_refused : for s : Bool { hn_site_ok ( False { } , s ) == False { } : Bool }
+# promise hn_site_foreign_host_refused: a request that does not name this server never passes the proxy's site rule
+94cb2228860a6367  hn_site_never_widens  law hn_site_never_widens : for + h : Bool { hn_site_ok ( h , False { } ) == False { } : Bool }
+# promise hn_site_never_widens: naming this server never overturns a refusal of the site rule
+5cce5b171a2e8173  hn_site_own_host_passes  law hn_site_own_host_passes : { hn_site_ok ( True { } , True { } ) == True { } : Bool }
+# promise hn_site_own_host_passes: a request that names this server and passes the site rule passes
 d21532af3aa140c6  hold_conserved  law hold_conserved : for + b : Nat for + t : Nat { Nat.add ( hold_max ( b , t ) , hold_release ( b , hold_max ( b , t ) ) ) == b : Nat }
 06a1321d4cd0be64  hold_empty_tag_holds_nothing  law hold_empty_tag_holds_nothing : for b : Nat { hold_max ( b , 0n ) == 0n : Nat }
 c6f5145e48e1bb00  hold_max_keeps_partial_tag  law hold_max_keeps_partial_tag : for + b : Nat for + t : Nat { Nat.is_le ( Nat.min ( b , t ) , hold_max ( b , 1n + t ) ) == True { } : Bool }
