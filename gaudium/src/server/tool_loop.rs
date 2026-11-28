@@ -12,6 +12,7 @@
 //! follows, and the bounds on calls and result sizes. The runner of the tools is a trait
 //! ([`ServerTools`]), so other tools the server runs itself use the same loop.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::anthropic::{self, Translated};
@@ -19,13 +20,14 @@ use super::conn::Conn;
 use super::mcp_client::{Connector, BOUNDS};
 use super::outparse::ToolCall;
 use super::proxy::Caller;
-use super::{run_chat, write_json, write_sse_chunk, write_sse_end, Api, AppState};
+use super::stream_out::{KeepAlive, SseSink};
+use super::{run_chat, write_json, Api, AppState, CancelEntry};
 use crate::core::tool_calls::{stop_reason_name, GenEnd};
 use crate::json::{parse_json, JsonValue};
 use crate::verified::{
     ge_model_ended, pc_prefill_rows, pc_reused_rows, sv_admit, sv_admit_is_none, sv_admit_runs,
-    sv_budget_spent, sv_calls_take, sv_next, sv_round_goes_on, sv_route, sv_route_clash,
-    sv_route_server, sv_runs, sv_tokens_left, sv_waits_client, SvAdmit,
+    sv_budget_spent, sv_call_runs, sv_calls_take, sv_goes_on_live, sv_next, sv_route,
+    sv_route_clash, sv_route_server, sv_runs, sv_tokens_left, sv_waits_client, SvAdmit,
 };
 
 /// Tools the server runs itself while it answers a request.
@@ -56,6 +58,17 @@ impl ToolOutput {
 
 /// What the rounds of one reply share (`run_chat` takes it for each round).
 pub(super) struct Rounds {
+    /// The reply's id: the one in its `message_start` (or its message), which every round goes by
+    /// and the client cancels by.
+    pub id: String,
+    /// What a cancel by `id` reaches, registered for the whole reply: the reply, and the round
+    /// that runs.
+    pub cancel: Arc<CancelEntry>,
+    /// The reply's stream, once its first round began it.
+    pub sink: Option<SseSink>,
+    /// The stream's keep-alive, from the first round to the end of the reply: it also runs while
+    /// the server waits for its tools.
+    pub keep_alive: Option<KeepAlive>,
     /// The reply's content blocks so far.
     pub builder: Option<anthropic::Builder>,
     /// How the last round ended; `None` after a round that answered the request itself (an
@@ -63,10 +76,22 @@ pub(super) struct Rounds {
     pub end: Option<RoundEnd>,
 }
 
+/// The reply's entry in the server's cancel table, from before its first round to the end of its
+/// last.
+struct Registered<'a> {
+    state: &'a AppState,
+    id: String,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        self.state.cancels.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// One generation round's outcome.
 pub(super) struct RoundEnd {
-    /// The round's request id and model.
-    pub id: String,
+    /// The round's model.
     pub model: String,
     pub end: GenEnd,
     /// Every whole call the model made in the round.
@@ -77,6 +102,9 @@ pub(super) struct RoundEnd {
     pub prompt_tokens: u64,
     pub reused: u64,
     pub output_tokens: u64,
+    /// The last of `calls` was cut by the end of generation and closed by the parser: the model
+    /// never finished it.
+    pub repaired: bool,
     /// The round's `timings` and `gaudium` fields (`,"key":value` text).
     pub extra: String,
     /// Writing the stream to the client failed.
@@ -215,7 +243,6 @@ pub(super) fn run_messages(
 ) {
     let api = Api::Messages {
         show_thinking: t.show_thinking,
-        begun: false,
     };
     let client = chat_tool_names(&t.chat);
     let mut tools = match open_server_tools(state, caller, body, &mut t) {
@@ -309,19 +336,34 @@ fn run_loop(
         .get("max_tokens")
         .and_then(JsonValue::as_u64)
         .filter(|&v| v > 0);
+    // one id for the whole reply, registered for cancels until its last round ends
+    let id = format!(
+        "msg_gaudium_{}",
+        state.next_req_id.fetch_add(1, Ordering::Relaxed)
+    );
+    let cancel = CancelEntry::rounds();
+    state
+        .cancels
+        .lock()
+        .unwrap()
+        .insert(id.clone(), Arc::clone(&cancel));
+    let _registered = Registered {
+        state,
+        id: id.clone(),
+    };
     let mut rounds = Rounds {
+        id: id.clone(),
+        cancel: Arc::clone(&cancel),
+        sink: None,
+        keep_alive: None,
         builder: Some(anthropic::Builder::new(show_thinking).with_server_tools(labels)),
         end: None,
     };
+    let api = Api::Messages { show_thinking };
     let (mut done, mut calls_run) = (0u64, 0u64);
     let (mut input, mut cached, mut output) = (0u64, 0u64, 0u64);
-    let mut first: Option<(String, String)> = None;
+    let mut model: Option<String> = None;
     loop {
-        let api = Api::Messages {
-            show_thinking,
-            // a stream that began takes a later round's error as an event
-            begun: stream_mode && done > 0,
-        };
         run_chat(
             state,
             &chat,
@@ -338,11 +380,11 @@ fn run_loop(
         cached += pc_reused_rows(end.prompt_tokens, end.reused);
         output += end.output_tokens;
         let left = sv_tokens_left(limit.unwrap_or(0), output);
-        let (id, model) = first
-            .get_or_insert_with(|| (end.id.clone(), end.model.clone()))
-            .clone();
-        let (server, client_calls): (Vec<&ToolCall>, Vec<&ToolCall>) =
-            end.calls.iter().partition(|c| {
+        let model = model.get_or_insert_with(|| end.model.clone()).clone();
+        // the call the parser closed at the end of generation, if any, is the round's last
+        let cut = end.calls.len().checked_sub(1).filter(|_| end.repaired);
+        let (server, client_calls): (Vec<_>, Vec<_>) =
+            end.calls.iter().enumerate().partition(|(_, c)| {
                 sv_route_server(sv_route(
                     tools.owns(&c.name),
                     client.iter().any(|n| *n == c.name),
@@ -355,6 +397,7 @@ fn run_loop(
             done,
             BOUNDS.rounds,
         );
+        let sink = rounds.sink.clone();
         let Some(b) = rounds.builder.as_mut() else {
             return;
         };
@@ -364,10 +407,13 @@ fn run_loop(
             stop_sequence = end.stop_sequence.clone();
             stop_reason_name(end.end, !end.calls.is_empty())
         } else {
-            let take = sv_calls_take(calls_run, server.len() as u64, BOUNDS.calls) as usize;
-            calls_run += take as u64;
+            // a call the parser closed at the end of generation never runs, and does not count
+            // against the request's calls
+            let whole = server.iter().filter(|(k, _)| Some(*k) != cut).count();
+            let take = sv_calls_take(calls_run, whole as u64, BOUNDS.calls);
+            calls_run += take;
             let (mut calls, mut results) = (Vec::new(), Vec::new());
-            for (i, c) in server.iter().enumerate() {
+            for (i, &(k, c)) in server.iter().enumerate() {
                 if write_failed {
                     return; // the client is gone: no further call is sent anywhere
                 }
@@ -375,20 +421,28 @@ fn run_loop(
                 let args = parse_json(&c.arguments)
                     .ok()
                     .filter(|v| v.as_object().is_some());
-                let out = match (&args, i < take) {
+                let is_whole = Some(k) != cut;
+                let cancelled = cancel.cancelled();
+                let out = match (&args, sv_call_runs(is_whole, cancelled, i as u64, take)) {
                     (Some(a), true) => tools.run(&c.name, a),
                     (None, true) => ToolOutput::error("the call's arguments are not a JSON object"),
+                    // why it did not run, for the model
+                    (_, false) if !is_whole => ToolOutput::error(
+                        "not run: the end of generation cut the call off before it was complete",
+                    ),
+                    (_, false) if cancelled => {
+                        ToolOutput::error("not run: the request was cancelled")
+                    }
                     (_, false) => ToolOutput::error(format!(
                         "not run: this request reached its limit of {} server-side tool calls",
                         BOUNDS.calls
                     )),
                 };
                 let events = b.push_result(&block_id, out.is_error, &out.texts);
-                if stream_mode
-                    && !write_failed
-                    && write_sse_chunk(stream, events.as_bytes()).is_err()
-                {
-                    write_failed = true;
+                if let Some(s) = &sink {
+                    if !write_failed && s.write(events.as_bytes()).is_err() {
+                        write_failed = true;
+                    }
                 }
                 calls.push(JsonValue::Object(vec![
                     ("id".to_string(), JsonValue::Str(block_id.clone())),
@@ -413,14 +467,18 @@ fn run_loop(
             if write_failed {
                 return; // the client is gone
             }
-            if sv_round_goes_on(next, limit.is_some(), left) {
+            let cancelled = cancel.cancelled();
+            if sv_goes_on_live(cancelled, next, limit.is_some(), left) {
                 next_round_chat(&mut chat, &end, calls, results);
                 if limit.is_some() {
                     set_field(&mut chat, "max_tokens", Some(JsonValue::Int(left as i64)));
                 }
                 continue;
             }
-            if sv_budget_spent(next, limit.is_some(), left) {
+            if cancelled {
+                // cancelled between the round's calls or after them: the reply ends here
+                stop_reason_name(GenEnd::GeCancelled, !client_calls.is_empty())
+            } else if sv_budget_spent(next, limit.is_some(), left) {
                 "max_tokens" // the request's output limit is spent over the rounds
             } else if sv_waits_client(next) {
                 "tool_use" // the client's own calls wait for it
@@ -433,14 +491,14 @@ fn run_loop(
             "{},\"gaudium_tool_loop\":{{\"rounds\":{done},\"server_calls\":{calls_run}}}",
             end.extra
         );
-        if stream_mode {
+        if let Some(s) = &sink {
             if !write_failed {
                 let events = b.finish(stop, &stop_sequence, &usage, &extra);
-                if write_sse_chunk(stream, events.as_bytes()).is_ok() {
-                    write_sse_end(stream);
+                if s.write(events.as_bytes()).is_ok() {
+                    s.end();
                 }
             }
-        } else {
+        } else if !stream_mode {
             b.close();
             write_json(
                 stream,

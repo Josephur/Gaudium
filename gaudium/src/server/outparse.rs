@@ -421,6 +421,8 @@ pub struct OutputParser {
     content: String,
     reasoning: String,
     calls: Vec<ToolCall>,
+    /// The last call was closed by the end of generation, not by the model ([`Self::repaired`]).
+    repaired: bool,
     /// The verified lifecycle of this reply's tool calls (header before fragments, call limit).
     stream: CallStream,
     // the tool call being parsed
@@ -481,6 +483,7 @@ impl OutputParser {
             content: String::new(),
             reasoning: String::new(),
             calls: Vec::new(),
+            repaired: false,
             stream: CallStream::new(),
             ts: Ts::Open,
             tb: String::new(),
@@ -509,6 +512,12 @@ impl OutputParser {
     /// A stop string matched (or the call limit was reached): the caller ends generation.
     pub fn stopped(&self) -> bool {
         self.stopped
+    }
+
+    /// The last call was cut by the end of generation and closed by the parser ([`Self::finish`]),
+    /// not finished by the model: its arguments may be incomplete.
+    pub fn repaired(&self) -> bool {
+        self.repaired
     }
 
     /// The stop string that matched (empty: none did).
@@ -865,9 +874,11 @@ impl OutputParser {
                 self.tool_args(d, if self.nparams > 0 { "}" } else { "{}" });
             }
         }
+        let before = self.calls.len();
         if self.push_call(d) {
             self.stopped = true;
         }
+        self.repaired = self.calls.len() > before;
         self.tb.clear();
         self.raw.clear();
         self.ts = Ts::Open;

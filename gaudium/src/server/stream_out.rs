@@ -26,6 +26,18 @@ use super::outparse::Delta;
 use super::readout::{jq, Timings};
 use crate::live_report::{LaunchEvent, LaunchKind};
 
+/// What a keep-alive that finds the client gone cancels: a request's cancel flag, or the entry
+/// of a reply that runs several generations (the reply and the generation it runs then).
+pub(super) trait Cancel: Send + Sync {
+    fn cancel(&self);
+}
+
+impl Cancel for AtomicBool {
+    fn cancel(&self) {
+        self.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Least time between two prefill progress chunks.
 const PROGRESS_EVERY_MS: u128 = 100;
 
@@ -45,9 +57,10 @@ struct SinkState {
     failed: bool,
     /// The stream ended, or its writer is gone: the keep-alive writes nothing more.
     done: bool,
-    /// The flag a failed keep-alive sets: the request's current cancel flag (a resumed
-    /// generation gets a fresh one, `retarget_cancel`).
-    cancel: Option<Arc<AtomicBool>>,
+    /// What a failed keep-alive cancels: the request's current cancel flag (a resumed
+    /// generation gets a fresh one, `retarget_cancel`), or the entry of a reply of several
+    /// generations.
+    cancel: Option<Arc<dyn Cancel>>,
 }
 
 impl SseSink {
@@ -113,7 +126,7 @@ impl SseSink {
         &self,
         line: String,
         every: Duration,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<dyn Cancel>,
     ) -> Option<KeepAlive> {
         self.state().cancel = Some(cancel);
         let sink = self.clone();
@@ -126,10 +139,10 @@ impl SseSink {
 
     /// The request's cancel flag changed (a resumed generation): a keep-alive that finds the
     /// client gone sets this one from now on. A client already gone sets it at once.
-    pub fn retarget_cancel(&self, cancel: Arc<AtomicBool>) {
+    pub fn retarget_cancel(&self, cancel: Arc<dyn Cancel>) {
         let mut s = self.state();
         if s.failed {
-            cancel.store(true, Ordering::Relaxed);
+            cancel.cancel();
         }
         s.cancel = Some(cancel);
     }
@@ -155,7 +168,7 @@ impl SseSink {
             if super::write_sse_chunk(&mut s.conn, line).is_err() {
                 s.failed = true;
                 if let Some(c) = &s.cancel {
-                    c.store(true, Ordering::Relaxed);
+                    c.cancel();
                 }
                 return;
             }
@@ -457,13 +470,14 @@ impl StreamOut {
 
     /// The request's cancel flag is now `cancel` (a reply resumed after its thinking budget
     /// runs under a fresh flag); a client already gone (a failed write of this stream or of its
-    /// keep-alive) cancels it too.
-    pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>) {
+    /// keep-alive) cancels it too. `keep_alive`: the stream's keep-alive follows the new flag
+    /// (not for a round of a reply of several generations, whose keep-alive cancels the reply's
+    /// entry, which reaches the new flag itself).
+    pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>, keep_alive: bool) {
         if self.write_failed || self.stream.as_ref().is_some_and(SseSink::failed) {
             cancel.store(true, Ordering::Relaxed);
         }
-        // the keep-alive follows the request's current flag too
-        if let Some(s) = self.stream.as_ref() {
+        if let Some(s) = self.stream.as_ref().filter(|_| keep_alive) {
             s.retarget_cancel(Arc::clone(&cancel));
         }
         self.cancel = cancel;

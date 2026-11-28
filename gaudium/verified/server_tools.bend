@@ -873,3 +873,143 @@ law sv_spent_says_so:
 
 def sv_spent_says_so():
   {==}
+
+# ============================================================================
+# 6. Which Calls of a Round Run, and Whether the Reply Goes On
+# ============================================================================
+
+# Whether call `i` (0 first) of a round's server-side calls is sent to its server. whole: the model
+# finished the call (the parser did not close it at the end of generation); cancelled: the reply
+# was cancelled, or its client went away; take: the calls the round may run (sv_calls_take).
+# A call that does not run is answered with an error result.
+def sv_call_runs(whole: Bool, cancelled: Bool, i: Nat, take: Nat) -> Bool:
+  Bool.and(Bool.and(whole, Bool.not(cancelled)), Nat.is_lt(i, take))
+
+# LAW 6.1: A call the model never finished never runs.
+# promise: a call the parser closed at the end of generation (not finished by the model) is never sent to its server
+# harm: a call whose arguments were cut mid-value would run remotely with the partial value
+# catches: the whole flag ignored (Bool.and(Bool.not(cancelled), Nat.is_lt(i, take)))
+law sv_repaired_call_never_runs:
+  for +c: Bool
+  for +i: Nat
+  for +t: Nat
+  {sv_call_runs(False{}, c, i, t) == False{} : Bool}
+
+def sv_repaired_call_never_runs(c, i, t):
+  match c:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW 6.2: No call runs once the reply is cancelled.
+# promise: once the reply is cancelled (or its client is gone), no further call is sent to any server
+# harm: a cancelled request would go on causing side effects on remote tool servers
+# catches: the cancelled flag ignored (Bool.and(whole, Nat.is_lt(i, take)))
+law sv_cancelled_call_never_runs:
+  for +w: Bool
+  for +i: Nat
+  for +t: Nat
+  {sv_call_runs(w, True{}, i, t) == False{} : Bool}
+
+def sv_cancelled_call_never_runs(w, i, t):
+  match w:
+    case True{}: {==}
+    case False{}: {==}
+
+# LAW 6.3: A whole call within the take runs while the reply lives.
+# promise: a call the model finished, inside the round's take, of a reply not cancelled, is run
+# catches: sv_call_runs answers False{} always (no server-side call ever runs)
+law sv_whole_live_call_runs:
+  for +i: Nat
+  for +d: Nat
+  {sv_call_runs(True{}, False{}, i, Nat.add(i, 1n+d)) == True{} : Bool}
+
+def sv_whole_live_call_runs(i, d):
+  match i:
+    case 0n: {==}
+    case 1n+ip:
+      sv_whole_live_call_runs(ip, d)
+
+# LAW 6.4: No call past the round's take runs.
+# promise: a call at or past the number of calls the round may run is never sent
+# harm: a round could exceed the per-request call limit by one call
+# catches: the index bound off by one (Nat.is_le(i, take))
+law sv_call_past_take_never_runs:
+  for +w: Bool
+  for +c: Bool
+  for +t: Nat
+  for +d: Nat
+  {sv_call_runs(w, c, Nat.add(t, d), t) == False{} : Bool}
+
+def sv_call_past_take_never_runs(w, c, t, d):
+  match w c:
+    case True{} False{}:
+      match t d:
+        case 0n 0n: {==}
+        case 0n 1n+dp: {==}
+        case 1n+tp _:
+          sv_call_past_take_never_runs(True{}, False{}, tp, d)
+    case True{} True{}: {==}
+    case False{} _: {==}
+
+# After a round's calls ran: another round is generated only when the round's decision and the
+# output limit let it (sv_round_goes_on) and the reply was not cancelled.
+def sv_goes_on_live(cancelled: Bool, n: SvNext, limited: Bool, left: Nat) -> Bool:
+  Bool.and(Bool.not(cancelled), sv_round_goes_on(n, limited, left))
+
+# LAW 6.5: A cancelled reply generates no further round.
+# promise: once the reply is cancelled (or its client is gone), the loop never generates another round
+# harm: a cancel sent with the reply's id would be ignored after the first round, and the card would keep generating for nobody
+# catches: the cancelled flag ignored (sv_goes_on_live answers sv_round_goes_on(n, limited, left))
+law sv_cancelled_never_goes_on:
+  for +n: SvNext
+  for +b: Bool
+  for +l: Nat
+  {sv_goes_on_live(True{}, n, b, l) == False{} : Bool}
+
+def sv_cancelled_never_goes_on(n, b, l):
+  {==}
+
+# LAW 6.6: A live reply goes on as the round decided.
+# promise: a reply not cancelled, without an output limit, whose round decision goes on generates another round
+# catches: sv_goes_on_live answers False{} always (the loop never reaches a second round)
+law sv_live_round_goes_on:
+  {sv_goes_on_live(False{}, SvRunGoOn{}, False{}, 0n) == True{} : Bool}
+
+def sv_live_round_goes_on():
+  {==}
+
+# LAW 6.7: A live reply never goes on past what the round decided.
+# promise: the loop never generates a round that the round's own decision or the output limit refuses, cancelled or not
+# harm: a reply would run past its round bound or its max_tokens while nobody cancelled it
+# catches: the round decision dropped (sv_goes_on_live answers Bool.not(cancelled) alone)
+law sv_live_within_rules:
+  for +c: Bool
+  for +n: SvNext
+  for +b: Bool
+  for +l: Nat
+  {Bool.and(sv_goes_on_live(c, n, b, l), Bool.not(sv_round_goes_on(n, b, l))) == False{} : Bool}
+
+def sv_live_within_rules(c, n, b, l):
+  match c:
+    case True{}: {==}
+    case False{}:
+      match n:
+        case SvRunGoOn{}:
+          match b:
+            case False{}: {==}
+            case True{}:
+              match l:
+                case 0n: {==}
+                case 1n+lp: {==}
+        case SvStop{}:
+          match b:
+            case False{}: {==}
+            case True{}: {==}
+        case SvRunStop{}:
+          match b:
+            case False{}: {==}
+            case True{}: {==}
+        case SvRunPause{}:
+          match b:
+            case False{}: {==}
+            case True{}: {==}

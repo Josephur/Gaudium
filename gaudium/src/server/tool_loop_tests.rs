@@ -163,6 +163,9 @@ fn answer(req: &Seen, s: &mut TcpStream) {
             if zone == "SLOW" {
                 thread::sleep(std::time::Duration::from_millis(200));
             }
+            if zone == "VERYSLOW" {
+                thread::sleep(std::time::Duration::from_millis(1500));
+            }
             let body = format!(
                 "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{}}}}\n\n\
                  event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"12:00 in {zone}\"}}],\"isError\":false}}}}\n\n"
@@ -749,4 +752,187 @@ fn a_tool_reference_finds_a_deferred_mcp_tool() {
     );
     assert!(p.contains("The time."), "{p}");
     assert!(!p.contains("is not available"), "{p}");
+}
+
+/// A round with one call of the clock tool for `zone`.
+fn call_round(zone: &str) -> String {
+    format!("Need the time.\n</think>\n\nChecking.\n\n<tool_call>\n<function=mcp__clock__get_time>\n<parameter=zone>\n{zone}\n</parameter>\n</function>\n</tool_call>")
+}
+
+fn tools_calls(mcp: &McpServer) -> Vec<Seen> {
+    mcp.seen()
+        .into_iter()
+        .filter(|x| x.rpc() == "tools/call")
+        .collect()
+}
+
+#[test]
+fn a_call_cut_by_the_output_limit_never_runs() {
+    // a parameter-block model with parallel calls off (a limit of one call), cut by max_tokens
+    // inside the value of its first call: the parser closes the call at the end, but the model
+    // never finished it, so the round ends as cut (max_tokens) and the call is never sent
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    let round = call_round("Europe/Amsterdam");
+    let tok = &h.state.models[0].tokenizer;
+    let ids = tok.encode(&round, true);
+    let cut = (1..ids.len())
+        .find(|&n| tok.decode(&ids[..n], false).contains("<parameter=zone>\nEuro"))
+        .expect("a cut inside the value");
+    assert!(!tok.decode(&ids[..cut], false).contains("Amsterdam"));
+    h.script(&round);
+    h.script(&round);
+    let before = h.prompts.lock().unwrap().len();
+    for stream in [false, true] {
+        let (status, text) = h.post(
+            "/v1/messages",
+            &format!(
+                r#"{{"stream":{stream},"max_tokens":{cut},{},"tool_choice":{{"type":"auto","disable_parallel_tool_use":true}},"messages":[{{"role":"user","content":"Time in Amsterdam?"}}]}}"#,
+                servers(&mcp.url())
+            ),
+        );
+        assert_eq!(status, 200, "{text}");
+        assert!(!text.contains("mcp_tool_result"), "{text}");
+        if stream {
+            assert!(text.contains(r#""stop_reason":"max_tokens""#), "{text}");
+        } else {
+            let r = json::parse_json(&text).unwrap();
+            assert_eq!(s(&r, &["stop_reason"]), "max_tokens", "{text}");
+            assert_eq!(at(&r, &["gaudium_tool_loop", "rounds"]).as_u64(), Some(1));
+            assert_eq!(at(&r, &["gaudium_tool_loop", "server_calls"]).as_u64(), Some(0));
+        }
+    }
+    assert!(tools_calls(&mcp).is_empty(), "{:?}", tools_calls(&mcp));
+    // one round each: no round followed the cut one
+    assert_eq!(h.prompts.lock().unwrap().len() - before, 2);
+}
+
+#[test]
+fn a_call_the_model_left_unfinished_is_answered_but_never_sent() {
+    // the model ends its output inside a call (an end-of-sequence token): the round is one the
+    // model ended, but its last call is one the parser closed, so that call gets an error result
+    // instead of running, and the next round goes on from it
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    h.script("Need the time.\n</think>\n\n<tool_call>\n<function=mcp__clock__get_time>\n<parameter=zone>\nEuro");
+    h.script(ROUND_END);
+    let (status, text) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"max_tokens":512,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    assert_eq!(status, 200, "{text}");
+    assert!(tools_calls(&mcp).is_empty(), "{:?}", tools_calls(&mcp));
+    let r = json::parse_json(&text).unwrap();
+    let blocks = at(&r, &["content"]).as_array().unwrap();
+    let res = blocks
+        .iter()
+        .find(|b| s(b, &["type"]) == "mcp_tool_result")
+        .expect("the cut call has its result");
+    assert_eq!(at(res, &["is_error"]).as_bool(), Some(true));
+    assert!(s(res, &["content", "0", "text"]).contains("cut the call off"), "{text}");
+    assert_eq!(at(&r, &["gaudium_tool_loop", "server_calls"]).as_u64(), Some(0));
+    assert_eq!(at(&r, &["gaudium_tool_loop", "rounds"]).as_u64(), Some(2));
+    assert_eq!(s(&r, &["stop_reason"]), "end_turn");
+}
+
+#[test]
+fn the_reply_id_cancels_the_loop_in_a_later_round() {
+    // the id in message_start stays the reply's for every round: a cancel by it while the
+    // second round's call runs stops the loop there (no further call, no third round)
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    h.script(&call_round("UTC"));
+    h.script(&call_round("VERYSLOW"));
+    h.script(ROUND_END);
+    let before = h.prompts.lock().unwrap().len();
+    let mut c = send_raw(
+        &h.state,
+        "/v1/messages",
+        &format!(
+            r#"{{"stream":true,"max_tokens":4096,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    c.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    let mut raw = Vec::new();
+    read_until_count(&mut c, &mut raw, "event: message_start", 1);
+    let start = sse_events(&raw)
+        .into_iter()
+        .find(|e| s(e, &["type"]) == "message_start")
+        .unwrap();
+    let id = s(&start, &["message", "id"]).to_string();
+    // the second round's (slow) call is out
+    let t0 = std::time::Instant::now();
+    while tools_calls(&mcp).len() < 2 {
+        assert!(t0.elapsed().as_secs() < 10, "the second call never went out");
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let (status, ok) = h.post(
+        "/v1/chat/completions/control",
+        &format!(r#"{{"id":"{id}"}}"#),
+    );
+    assert_eq!((status, ok.as_str()), (200, r#"{"ok":true}"#), "{id}");
+    c.read_to_end(&mut raw).unwrap();
+    let (status, _, body) = split_response(&raw);
+    assert_eq!(status, 200);
+    let evs = sse_events(body.as_bytes());
+    assert_eq!(s(evs.last().unwrap(), &["type"]), "message_stop", "{body}");
+    assert_eq!(
+        evs.iter().filter(|e| s(e, &["type"]) == "message_start").count(),
+        1
+    );
+    // no third round, no further call; the reply ends where it was cancelled
+    assert_eq!(h.prompts.lock().unwrap().len() - before, 2, "{body}");
+    assert_eq!(tools_calls(&mcp).len(), 2);
+    assert!(body.contains(r#""stop_reason":"end_turn""#), "{body}");
+    // the reply's entry is gone once it ends
+    let (_, ok) = h.post(
+        "/v1/chat/completions/control",
+        &format!(r#"{{"id":"{id}"}}"#),
+    );
+    assert_eq!(ok, r#"{"ok":false}"#);
+}
+
+#[test]
+fn the_stream_keeps_alive_while_a_tool_runs() {
+    // a slow MCP call: the Messages stream gets keep-alive pings while the server waits for it
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    h.state.stream_heartbeat_ms.store(30, Ordering::Relaxed);
+    h.script(&call_round("SLOW"));
+    h.script(ROUND_END);
+    let (status, body) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"stream":true,"max_tokens":512,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    assert_eq!(status, 200, "{body}");
+    let evs = sse_events(body.as_bytes());
+    let kinds: Vec<String> = evs
+        .iter()
+        .map(|e| {
+            let t = s(e, &["type"]);
+            match t {
+                "content_block_start" => format!("start:{}", s(e, &["content_block", "type"])),
+                _ => t.to_string(),
+            }
+        })
+        .collect();
+    let use_at = kinds.iter().position(|k| k == "start:mcp_tool_use").unwrap();
+    let result_at = kinds
+        .iter()
+        .position(|k| k == "start:mcp_tool_result")
+        .unwrap();
+    assert!(
+        kinds[use_at..result_at].iter().any(|k| k == "ping"),
+        "{kinds:?}"
+    );
+    assert_eq!(kinds.last().map(String::as_str), Some("message_stop"));
+    assert_eq!(kinds.iter().filter(|k| *k == "message_start").count(), 1);
 }

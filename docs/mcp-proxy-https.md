@@ -111,16 +111,27 @@ not browsers (no `Origin`, no `Sec-Fetch-Site`) are not either.
   generates again, until the model ends its turn (`end_turn`), calls a client tool (the calls of
   MCP tools in that round are still run; the reply stops with `tool_use`), or the round limit is
   reached (`pause_turn`: send the reply back as the assistant turn to go on). A round cut by
-  `max_tokens`, a stop sequence or a cancel runs none of its calls. A forced `tool_choice`
+  `max_tokens`, a stop sequence or a cancel runs none of its calls, also when the parser closed
+  the call that was cut (with `disable_parallel_tool_use` too). A call the model left unfinished
+  in a round it ended (an end-of-sequence token inside the call) is never sent: it gets an error
+  result, and the next round goes on from it. A forced `tool_choice`
   applies to the first round. `max_tokens` holds for the whole reply: each round gets what the
   rounds before left of it, and a reply that spends it stops with `max_tokens` (after the calls
   of that round ran). Once the client's connection is gone, no further call is sent.
+- One id for the whole reply: the id in `message_start` (or of the message) is the one every
+  round goes by. `POST /v1/chat/completions/control` with `{"id": ...}` cancels the reply in any
+  round: the round that runs stops, a call that waits for its server is the last one sent (the
+  calls after it get an error result), and no round follows. A streamed reply gets its keep-alive
+  (`event: ping`, every 10 s without a write) from its first round to its end, also while the
+  server waits for its MCP calls.
 - Limits per request: 8 servers, 10 generation rounds, 64 calls of MCP tools (later calls get an
   error result), 128 KiB of each result in the prompt (its parts as the prompt joins them, one
   newline between two; the rest is cut, with a note), 16 pages of
   a server's tool list. Usage sums every round; `gaudium_tool_loop` gives the rounds and calls.
-- The decisions (admission, where a call goes, whether a round's calls run and whether another
-  round follows, the output limit over the rounds, and the bounds) are in `gaudium/verified/server_tools.bend`; the loop is
+- The decisions (admission, where a call goes, whether a round's calls run, whether each call
+  runs and whether another round follows, the output limit over the rounds, and the bounds) are
+  in `gaudium/verified/server_tools.bend`, how a generation ended (a call the parser closed never
+  counts as the call limit) in `gaudium/verified/tool_calls.bend`; the loop is
   `gaudium/src/server/tool_loop.rs`, the client `gaudium/src/server/mcp_client.rs`.
 
 ## Threat model and guards
