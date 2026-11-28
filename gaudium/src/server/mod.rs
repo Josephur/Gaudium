@@ -53,6 +53,7 @@ use crate::vision::VisionSpec;
 mod a2ui;
 mod anthropic;
 mod chat;
+mod chat_fields;
 mod conn;
 mod jinja;
 mod lanes;
@@ -2084,6 +2085,18 @@ fn write_error(stream: &mut Conn, status: u16, err_type: &str, msg: &str) {
     write_json(stream, status, &body);
 }
 
+/// An error about one request field, named in `param`.
+fn write_param_error(stream: &mut Conn, status: u16, err_type: &str, param: &str, msg: &str) {
+    let body = format!(
+        "{{\"error\":{{\"message\":{},\"type\":{},\"param\":{},\"code\":{}}}}}",
+        jq(msg),
+        jq(err_type),
+        jq(param),
+        status
+    );
+    write_json(stream, status, &body);
+}
+
 fn write_sse_headers(stream: &mut Conn) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 200 OK\r\n\
@@ -3203,7 +3216,16 @@ fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mu
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
         return;
     };
-    run_chat(state, &val, stream, Api::Chat, Vec::new());
+    // fields this server does not apply: reported in the reply, or refused when ignoring them
+    // would change the reply without a sign (`chat_fields`)
+    let ignored = match chat_fields::check(&val) {
+        Ok(ignored) => ignored,
+        Err(r) => {
+            write_param_error(stream, 400, "invalid_request_error", &r.field, &r.message);
+            return;
+        }
+    };
+    run_chat(state, &val, stream, Api::Chat, ignored);
 }
 
 /// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path.
