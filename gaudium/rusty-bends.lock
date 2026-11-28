@@ -108,6 +108,11 @@ a48ebc35bc083fa3  ch_no_failure_ok  law ch_no_failure_ok : { ch_end_ok ( ch_end 
 # promise ch_runs_some: a request with at least one choice runs at least one generation.
 8c580df3826c640c  ch_runs_within_n  law ch_runs_within_n : for + n : Nat for + g : Bool { Nat.is_le ( ch_runs ( n , g ) , n ) == True { } : Bool }
 # promise ch_runs_within_n: the choices never take more generations than there are choices.
+8fe97b6e344f540a  ch_think_many_only_per_choice  law ch_think_many_only_per_choice : for + k : Nat for + c : Bool { Bool.and ( ch_think_ok ( 2n + k , True { } , c ) , Bool.not ( c ) ) == False { } : Bool }
+# promise ch_think_many_only_per_choice: a request with more than one choice never runs with a thinking budget unless the resume after a forced end of thinking runs for each choice.
+# harm ch_think_many_only_per_choice: the choices would share one think gate and one resumed generation, so every choice past the first would be cut at the wrong token or answered with another choice's reply.
+7c79b2cc975835af  ch_think_rest_ok  law ch_think_rest_ok : for + n : Nat for + b : Bool for + c : Bool { Bool.and ( ch_think_ok ( 1n , b , c ) , ch_think_ok ( n , False { } , c ) ) == True { } : Bool }
+# promise ch_think_rest_ok: a request with one choice, or without a thinking budget, is never refused by this rule.
 96f409b922e6e3d4  clamp_top_k_within_input  law clamp_top_k_within_input : for + k : Nat for + v : Nat { Nat.is_le ( clamp_top_k ( k , v ) , k ) == True { } : Bool }
 # promise clamp_top_k_within_input: clamp_top_k never exceeds the input top_k
 f63d6f88affafb04  ctx_for_prompt_admits  law ctx_for_prompt_admits : for + p : Nat for + extra : Nat { prompt_admitted ( 1n + p , Nat.add ( ctx_for_prompt ( 1n + p ) , extra ) ) == True { } : Bool }
