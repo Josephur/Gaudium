@@ -17,7 +17,16 @@
 //! read of a stream, filtered or not, and the work of a PNG predictor), the bytes its object
 //! parses read and the memory their objects take (objects may overlap), the text it yields, and
 //! the form XObjects it draws. So a zip bomb, a stream listed many times, overlapping objects
-//! and a form drawing itself all stop at a cap. Encrypted PDFs are refused.
+//! and a form drawing itself all stop at a cap.
+//!
+//! Beside those, one budget covers the reader's work on the file's structure, whatever kind of
+//! work it is (`--pdf-max-work`): every step that touches something taken from the file costs at
+//! least one unit (a page-tree node visited, an object resolved, a stream read, a filter stage,
+//! an element of a /Contents, /Filter, /W or /Differences array, an entry a width list or a
+//! CMap expands to, a content-stream operator). Structure the file shares many times over (one
+//! array listed by many nodes, one stream read many times, one width list repeated) is charged
+//! for every use, so a path that misses a specific budget is still bounded by this one.
+//! Encrypted PDFs are refused.
 
 mod content;
 mod doc;
@@ -42,6 +51,8 @@ pub const DEFAULT_MAX_PAGES: u64 = 500;
 pub const DEFAULT_MAX_INFLATE_MB: u64 = 256;
 /// `--pdf-max-forms` default: most form XObjects one PDF may draw, all pages together.
 pub const DEFAULT_MAX_FORMS: u64 = 100_000;
+/// `--pdf-max-work` default: most steps of work the reader may take over one PDF's structure.
+pub const DEFAULT_MAX_WORK: u64 = 20_000_000;
 
 /// Deepest nesting of arrays and dictionaries.
 pub(crate) const MAX_NEST: u64 = 64;
@@ -69,6 +80,8 @@ pub struct Limits {
     pub max_decoded: u64,
     /// Form XObjects drawn, all pages together (a form drawn again counts again).
     pub max_forms: u64,
+    /// Steps of work over the file's structure (see the module documentation).
+    pub max_work: u64,
 }
 
 impl Default for Limits {
@@ -78,6 +91,7 @@ impl Default for Limits {
             max_pages: DEFAULT_MAX_PAGES,
             max_decoded: DEFAULT_MAX_INFLATE_MB << 20,
             max_forms: DEFAULT_MAX_FORMS,
+            max_work: DEFAULT_MAX_WORK,
         }
     }
 }
@@ -126,10 +140,13 @@ impl std::fmt::Display for Fail {
 
 /// The flag that sets the byte budgets of a document.
 pub(crate) const INFLATE_FLAG: &str = "--pdf-max-inflate-mb";
+/// The flag that sets the work budget of a document.
+pub(crate) const WORK_FLAG: &str = "--pdf-max-work";
 
 /// A budget of one document: the bytes its streams may still decode to, the memory its parsed
-/// objects may still take, the text it may still yield, or the form XObjects it may still draw.
-/// Every charge goes through the verified core (`pdf_budget_fits`, `pdf_budget_take`).
+/// objects may still take, the text it may still yield, the form XObjects it may still draw, or
+/// the steps of work it may still cost. Every charge goes through the verified core
+/// (`pdf_budget_charge`: counted when it fits, refused with the spend unchanged when not).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Budget {
     used: u64,
@@ -150,14 +167,6 @@ impl Budget {
         }
     }
 
-    /// The same budget with `used` spent (no more than it has spent now).
-    pub fn restarted_at(&self, used: u64) -> Self {
-        Budget {
-            used: used.min(self.used),
-            ..*self
-        }
-    }
-
     /// What one more charge may take.
     pub fn room(&self) -> u64 {
         v::pdf_budget_room(self.used, self.max)
@@ -168,13 +177,15 @@ impl Budget {
         self.used
     }
 
-    /// Charges `n`; refused past the budget.
+    /// Charges `n`; refused past the budget (the spend then stays as it was).
     pub fn take(&mut self, n: u64) -> Result<(), Fail> {
-        if !v::pdf_budget_fits(self.used, n, self.max) {
-            return Err(self.over());
+        let fits = v::pdf_budget_fits(self.used, n, self.max);
+        self.used = v::pdf_budget_charge(self.used, n, self.max);
+        if fits {
+            Ok(())
+        } else {
+            Err(self.over())
         }
-        self.used = v::pdf_budget_take(self.used, n);
-        Ok(())
     }
 
     pub fn over(&self) -> Fail {
@@ -239,6 +250,7 @@ pub fn extract_text(bytes: &[u8], limits: &Limits) -> Result<Extracted, Fail> {
             "bytes",
             INFLATE_FLAG,
         ),
+        Budget::new(limits.max_work, "it costs", "steps of work", WORK_FLAG),
     )?;
     let pages = page_list(&mut doc, limits.max_pages)?;
     let mut fonts = content::FontCache::default();
@@ -254,7 +266,7 @@ pub fn extract_text(bytes: &[u8], limits: &Limits) -> Result<Extracted, Fail> {
         // the content streams of a page are one stream split at token boundaries
         let data = contents(&mut doc, &p.contents)?;
         let mut page = content::Page::new(&mut doc, &mut fonts, &mut text_budget, &mut forms);
-        page.run(&data, &p.resources, content::M0::ID, 0)?;
+        page.run(&data, &p.resources, content::Start::page(), 0)?;
         out.push(page.out);
     }
     if out.iter().all(|t| t.trim().is_empty()) {
@@ -277,9 +289,18 @@ fn page_list(doc: &mut Doc, max_pages: u64) -> Result<Vec<PageRef>, Fail> {
     };
     let pages = catalog.get(b"Pages").cloned().unwrap_or(Obj::Null);
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = Seen::default();
     walk(doc, &pages, None, 0, &mut seen, &mut out, max_pages)?;
     Ok(out)
+}
+
+/// The page-tree nodes already visited, by their shared allocation (a node reached again, by
+/// a reference or through a Kids array listed twice, is read once). Each node is kept here, so
+/// its address is not reused while the tree is walked.
+#[derive(Default)]
+struct Seen {
+    at: HashSet<*const Dict>,
+    keep: Vec<Obj>,
 }
 
 fn walk(
@@ -287,24 +308,25 @@ fn walk(
     node: &Obj,
     inherited: Option<&Rc<Dict>>,
     depth: u64,
-    seen: &mut HashSet<u32>,
+    seen: &mut Seen,
     out: &mut Vec<PageRef>,
     max_pages: u64,
 ) -> Result<(), Fail> {
+    // every node visited costs a step, a node seen before too
+    doc.work.take(1)?;
     if !v::pdf_below(depth, MAX_TREE_DEPTH) {
         return Err(Fail::damaged(format!(
             "a page tree deeper than {MAX_TREE_DEPTH} levels"
         )));
     }
-    if let Obj::Ref(n, _) = node {
-        if !seen.insert(*n) {
-            return Ok(()); // a cycle, or a node listed twice
-        }
-    }
     let obj = doc.get(node)?;
     let Some(d) = obj.as_dict() else {
         return Ok(());
     };
+    if !seen.at.insert(d as *const Dict) {
+        return Ok(()); // a cycle, or a node listed twice
+    }
+    seen.keep.push(obj.clone());
     let resources = match doc.entry(d, b"Resources")? {
         Obj::Dict(r) => Some(r),
         _ => inherited.cloned(),
@@ -344,6 +366,7 @@ fn contents(doc: &mut Doc, c: &Obj) -> Result<Vec<u8>, Fail> {
     };
     let mut out = Vec::new();
     for p in parts.iter() {
+        doc.work.take(1)?;
         if let Obj::Stream(s) = doc.get(p)? {
             match doc.decode(&s, 0) {
                 Ok(d) => {

@@ -367,6 +367,11 @@ fn print_usage() {
          \x20                       Host memory a request may hold for it, on its own thread\n\
          \x20 --pdf-max-forms <N>   Most form XObjects one PDF may draw, all pages together, a\n\
          \x20                       form drawn again counted again (default: 100000)\n\
+         \x20 --pdf-max-work <N>    Most steps of work the reader may take over one PDF's\n\
+         \x20                       structure, whatever the kind (default: 20000000): each\n\
+         \x20                       page-tree node visited, object resolved, stream read, filter\n\
+         \x20                       stage, array element, width or CMap entry and content-stream\n\
+         \x20                       operator is a step, counted again each time it is reached\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \x20 --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the\n\
          \x20                       last 64 chat requests (job, reply id, endpoint, model,\n\
@@ -2935,6 +2940,14 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                     .ok()
                     .filter(|&n| (1..=100_000_000).contains(&n))
                     .ok_or_else(|| format!("invalid --pdf-max-forms '{s}' (1 to 100000000)"))?;
+            }
+            "--pdf-max-work" => {
+                let s = next_val(&mut i, "--pdf-max-work")?;
+                pdf.max_work = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=10_000_000_000).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-work '{s}' (1 to 10000000000)"))?;
             }
             "--verbose" => verbose = true,
             "--debug-endpoints" => debug_endpoints = true,

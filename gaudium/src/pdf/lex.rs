@@ -230,12 +230,15 @@ impl<'a> Lexer<'a> {
 
     /// The memory the objects read so far take.
     pub fn spent(&self) -> u64 {
-        self.mem.used() - self.from
+        crate::verified::pdf_budget_spent(self.from, self.mem.used())
     }
 
-    /// Starts the count again (a content stream drops its operands at each operator).
-    pub fn restart(&mut self) {
-        self.mem = self.mem.restarted_at(self.from);
+    /// Starts the count again from (a copy of) `mem`, the document's budget as it is now: the
+    /// objects read so far are dropped (a content stream drops its operands at each operator, a
+    /// CMap at each entry), and what the document has charged since takes its room.
+    pub fn restart(&mut self, mem: Budget) {
+        self.mem = mem;
+        self.from = mem.used();
     }
 
     fn charge(&mut self, n: u64) -> Result<(), Fail> {

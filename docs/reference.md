@@ -338,6 +338,11 @@ Serve options:
                         Host memory a request may hold for it, on its own thread
   --pdf-max-forms <N>   Most form XObjects one PDF may draw, all pages together, a
                         form drawn again counted again (default: 100000)
+  --pdf-max-work <N>    Most steps of work the reader may take over one PDF's
+                        structure, whatever the kind (default: 20000000): each
+                        page-tree node visited, object resolved, stream read, filter
+                        stage, array element, width or CMap entry and content-stream
+                        operator is a step, counted again each time it is reached
   --verbose             Print server, HBM, and recipe diagnostics
   --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the
                         last 64 chat requests (job, reply id, endpoint, model,

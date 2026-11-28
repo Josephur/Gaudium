@@ -9,6 +9,10 @@
 //! object headers), so every parse is charged to the document's object budget: the bytes it
 //! reads and the memory its objects take. A stream's data is not copied: it stays a span of the
 //! file, and each decode of it is charged to the decode budget.
+//!
+//! Every object resolved (a cached one too) and every stream read (an empty one too) costs a
+//! step of the work budget, as does each element of a stream's filter and parameter arrays and
+//! each key of a trailer merged.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -53,6 +57,8 @@ pub(crate) struct Doc<'a> {
     pub budget: Budget,
     /// The bytes object parses may still read, and the memory their objects may still take.
     pub objects: Budget,
+    /// The steps of work the reader may still take over the file's structure.
+    pub work: Budget,
 }
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -74,7 +80,12 @@ fn non_negative(o: Option<&Obj>) -> Option<u64> {
 }
 
 impl<'a> Doc<'a> {
-    pub fn open(data: &'a [u8], budget: Budget, objects: Budget) -> Result<Doc<'a>, Fail> {
+    pub fn open(
+        data: &'a [u8],
+        budget: Budget,
+        objects: Budget,
+        work: Budget,
+    ) -> Result<Doc<'a>, Fail> {
         let head = &data[..data.len().min(1024)];
         if find(head, b"%PDF-", 0).is_none() {
             return Err(Fail::NotPdf);
@@ -88,6 +99,7 @@ impl<'a> Doc<'a> {
             endstreams: None,
             budget,
             objects,
+            work,
         };
         let read = doc.read_xref();
         if read.is_err() || doc.trailer.get(b"Root").is_none() {
@@ -155,6 +167,7 @@ impl<'a> Doc<'a> {
             };
             next = non_negative(trailer.get(b"Prev"));
             for (k, val) in trailer.iter() {
+                self.work.take(1)?;
                 if self.trailer.get(k).is_none() && k != b"Prev" {
                     self.trailer.set(k.to_vec(), val.clone());
                 }
@@ -488,6 +501,8 @@ impl<'a> Doc<'a> {
 
     /// Object `num` (null when the file has no such object).
     pub fn resolve(&mut self, num: u32, depth: u64) -> Result<Obj, Fail> {
+        // every object resolved costs a step, an object read before too
+        self.work.take(1)?;
         if !v::pdf_below(depth, MAX_REF_DEPTH) {
             return Err(Fail::damaged(format!(
                 "references nested more than {MAX_REF_DEPTH} deep"
@@ -591,14 +606,18 @@ impl<'a> Doc<'a> {
         got
     }
 
-    /// The decoded data of a stream, charged to the decompression budget.
+    /// The decoded data of a stream, charged to the decompression budget. Each read costs a
+    /// step, and each filter and parameter entry another (so each stage run is paid for).
     pub fn decode(&mut self, s: &Stream, depth: u64) -> Result<Vec<u8>, Fail> {
+        self.work.take(1)?;
         // filters and their parameters may be indirect
         let mut dict = Dict::default();
         for key in [&b"Filter"[..], b"DecodeParms", b"F", b"DP"] {
             if let Some(o) = s.dict.get(key) {
                 let mut val = self.get_depth(o, depth)?;
+                self.work.take(1)?;
                 if let Obj::Array(items) = &val {
+                    self.work.take(items.len() as u64)?;
                     if items.iter().any(|it| matches!(it, Obj::Ref(..))) {
                         let mut out = Vec::with_capacity(items.len());
                         for it in items.iter() {

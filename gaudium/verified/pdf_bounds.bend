@@ -13,10 +13,13 @@
 #   - the byte offset of row k of an xref stream;
 #   - the place of an object inside an object stream (/First plus its offset);
 #   - the field widths of an xref stream (/W);
-#   - the byte budgets of a document (the room one more decode may use, whether a charge fits,
-#     and the running total): the bytes its streams decode to (filtered or not), the memory its
-#     parsed objects take, the text it yields, and the form XObjects it draws, so that a zip
-#     bomb, overlapping objects or a form drawing itself stop at a cap;
+#   - the budgets of a document (the room one more decode may use, whether a charge fits, the
+#     spend after a charge, counted or refused, and what a lexer spent since it started): the
+#     bytes its streams decode to (filtered or not), the memory its parsed objects, CMaps and
+#     width tables take, the text it yields, the form XObjects it draws, and the steps of work
+#     the reader takes over its structure (every node, object, read, stage, element, entry and
+#     operator it reaches, each time it reaches it), so that a zip bomb, overlapping objects, a
+#     form drawing itself or structure shared many times over stop at a cap;
 #   - the rows a PNG predictor walks, and whether that work fits the budget;
 #   - depth and count limits (nesting of arrays and dictionaries, chains of references, the
 #     page tree, form XObjects, pages) and the document size limit.
@@ -84,6 +87,23 @@ def pdf_budget_fits(+used: Nat, +n: Nat, +max: Nat) -> Bool:
 # The bytes spent after a decode of `n` bytes.
 def pdf_budget_take(used: Nat, n: Nat) -> Nat:
   Nat.add(used, n)
+
+# The spend after a charge of `n` that fits (`fits`) or is refused.
+def pdf_budget_settle(fits: Bool, +used: Nat, +n: Nat) -> Nat:
+  match fits:
+    case True{}: pdf_budget_take(used, n)
+    case False{}: used
+
+# What a budget has spent after a charge of `n` when `used` of `max` are spent: the charge is
+# counted when it fits, and refused (the spend stays) when it does not. Every budget of a
+# document is charged through this: its decoded bytes, its object memory, its text, its forms
+# and its work (the steps the reader takes over the file's structure).
+def pdf_budget_charge(+used: Nat, +n: Nat, +max: Nat) -> Nat:
+  pdf_budget_settle(pdf_budget_fits(used, n, max), used, n)
+
+# What a budget has spent between two of its spends, `from` (when a lexer started) and `used`.
+def pdf_budget_spent(+from: Nat, +used: Nat) -> Nat:
+  Nat.sub(used, from)
 
 # ============================================================================
 # 3. Limits
@@ -310,16 +330,17 @@ law pdf_budget_inside_accepted:
 def pdf_budget_inside_accepted(u, n, r):
   pdf_span_inside_accepted(u, n, r)
 
-# promise: while the budget is not spent, the next decode gets some room.
-# catches: a constant zero room (pdf_budget_room returning 0n)
-law pdf_budget_room_positive:
+# promise: the room a budget leaves covers everything it has left.
+# harm: a room smaller than what is left would refuse decodes the budget still holds (every compressed PDF, with a room of one byte).
+# catches: a room of at most one byte (Nat.sub(max, used) replaced by Nat.min(1n, Nat.sub(max, used)))
+law pdf_budget_room_covers:
   for +u: Nat
   for +d: Nat
-  {Nat.is_gt(pdf_budget_room(u, Nat.add(u, 1n+d)), 0n) == True{} : Bool}
+  {Nat.is_le(d, pdf_budget_room(u, Nat.add(u, d))) == True{} : Bool}
 
-def pdf_budget_room_positive(u, d):
-  %Equal.sym(Nat, Nat.sub(Nat.add(u, 1n+d), u), 1n+d, L.nat_add_sub_cancel_l(u, 1n+d)) : {Nat.is_gt(_, 0n) == True{} : Bool}
-  {==}
+def pdf_budget_room_covers(u, d):
+  %Equal.sym(Nat, Nat.sub(Nat.add(u, d), u), d, L.nat_add_sub_cancel_l(u, d)) : {Nat.is_le(d, _) == True{} : Bool}
+  L.nat_le_refl(d)
 
 # promise: a depth or count the limit check lets grow is always below the limit.
 # harm: hostile nesting could recurse past the stack, or a page tree could yield more pages than configured.
@@ -473,3 +494,86 @@ law pdf_predict_inside_accepted:
 
 def pdf_predict_inside_accepted(l, rp, x):
   G.g_div_mul_add_ge(pdf_predict_rows(l, 1n+rp), rp, x)
+
+def pdf_fits_not_over(+u: Nat, +n: Nat, +m: Nat, e: {pdf_budget_fits(u, n, m) == True{} : Bool}) -> {Nat.is_lt(m, pdf_budget_take(u, n)) == False{} : Bool}:
+  %e : {Bool.and(_, Nat.is_lt(m, pdf_budget_take(u, n))) == False{} : Bool}
+  pdf_budget_within(u, n, m)
+
+def pdf_settle_le(+u: Nat, +d: Nat, +n: Nat, b: Bool, e: {pdf_budget_fits(u, n, Nat.add(u, d)) == b : Bool}) -> {Nat.is_le(pdf_budget_settle(b, u, n), Nat.add(u, d)) == True{} : Bool}:
+  match b:
+    case False{}:
+      L.nat_add_le_r(u, d)
+    case True{}:
+      L.nat_not_lt_imp_le(Nat.add(u, d), pdf_budget_take(u, n), pdf_fits_not_over(u, n, Nat.add(u, d), e))
+
+def pdf_settle_keep(+u: Nat, +n: Nat, b: Bool) -> {Bool.pick(Nat, b, u, pdf_budget_settle(b, u, n)) == u : Nat}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+def pdf_settle_take(+u: Nat, +n: Nat, b: Bool, e: {b == True{} : Bool}) -> {pdf_budget_settle(b, u, n) == pdf_budget_take(u, n) : Nat}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      L.bool_absurd_tf({pdf_budget_settle(False{}, u, n) == pdf_budget_take(u, n) : Nat}, Equal.sym(Bool, False{}, True{}, e))
+
+# promise: while a budget is not overspent, no charge, counted or refused, takes its spend past the budget.
+# harm: hostile input could make the reader take more steps, or hold more memory, than configured.
+# catches: a refused charge counted anyway (the refused arm of pdf_budget_settle returning pdf_budget_take(used, n))
+law pdf_budget_charge_within:
+  for +u: Nat
+  for +d: Nat
+  for +n: Nat
+  {Nat.is_le(pdf_budget_charge(u, n, Nat.add(u, d)), Nat.add(u, d)) == True{} : Bool}
+
+def pdf_budget_charge_within(u, d, n):
+  pdf_settle_le(u, d, n, pdf_budget_fits(u, n, Nat.add(u, d)), {==})
+
+# promise: a charge the budget refuses leaves its spend as it was.
+# harm: a refused charge that filled or reset the budget would refuse the rest of a good document, or let a later charge past the cap.
+# catches: a refused charge that fills the budget (pdf_budget_charge returning max when the charge does not fit)
+law pdf_budget_charge_refused_keeps:
+  for +u: Nat
+  for +n: Nat
+  for +m: Nat
+  {Bool.pick(Nat, pdf_budget_fits(u, n, m), u, pdf_budget_charge(u, n, m)) == u : Nat}
+
+def pdf_budget_charge_refused_keeps(u, n, m):
+  pdf_settle_keep(u, n, pdf_budget_fits(u, n, m))
+
+# promise: a charge that fits is counted in full.
+# harm: a charge that fits but is not counted would let many small steps run past the cap.
+# catches: an accepted charge not counted (the accepted arm of pdf_budget_settle returning used)
+law pdf_budget_charge_counts_accepted:
+  for +u: Nat
+  for +n: Nat
+  for +r: Nat
+  {pdf_budget_charge(u, n, Nat.add(Nat.add(u, n), r)) == pdf_budget_take(u, n) : Nat}
+
+def pdf_budget_charge_counts_accepted(u, n, r):
+  pdf_settle_take(u, n, pdf_budget_fits(u, n, Nat.add(Nat.add(u, n), r)), pdf_budget_inside_accepted(u, n, r))
+
+# promise: a charge never lowers what a budget has spent, a charge of nothing included.
+# harm: a zero charge (an empty stream, an empty stage) that reset the spend would reopen a bomb split over streams.
+# catches: a zero charge resetting the spend (pdf_budget_take returning 0n when n is 0)
+law pdf_budget_take_keeps_spent:
+  for +u: Nat
+  for +n: Nat
+  {Nat.is_le(u, pdf_budget_take(u, n)) == True{} : Bool}
+
+def pdf_budget_take_keeps_spent(u, n):
+  L.nat_add_le_r(u, n)
+
+# promise: what a lexer charged since it started is exactly what its budget spent since then.
+# harm: an undercount would let the objects of a parse go uncharged; an overcount would charge the earlier spend again and refuse good files.
+# catches: the earlier spend counted again (Nat.sub(used, from) replaced by used)
+law pdf_budget_spent_counts:
+  for +f: Nat
+  for +d: Nat
+  {pdf_budget_spent(f, Nat.add(f, d)) == d : Nat}
+
+def pdf_budget_spent_counts(f, d):
+  L.nat_add_sub_cancel_l(f, d)

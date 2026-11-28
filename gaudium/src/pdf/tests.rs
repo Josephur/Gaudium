@@ -853,6 +853,125 @@ fn wide_predictor(times: usize) -> Vec<u8> {
     )
 }
 
+/// A page tree `levels` deep in which each level is one shared Kids array of `fan` direct
+/// dictionaries, all pointing to the next level's array (`fan`^`levels` paths), with one page
+/// at the bottom.
+fn shared_kids(fan: usize, levels: usize) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let f1 = p.add(HELVETICA);
+    let content = p.add(stream("", b"BT /F1 12 Tf (x) Tj ET"));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    let mut next = p.add(format!("[{page} 0 R]"));
+    for _ in 0..levels {
+        let items = vec![format!("<< /Kids {next} 0 R >>"); fan].join(" ");
+        next = p.add(format!("[{items}]"));
+    }
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids {next} 0 R /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+/// `pages` pages sharing one /Contents array of `times` references to one stream.
+fn shared_contents(stream_dict: &str, data: &[u8], times: usize, pages: usize) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let root = p.reserve();
+    let f1 = p.add(HELVETICA);
+    let content = p.add(stream(stream_dict, data));
+    let parts = p.add(format!(
+        "[{}]",
+        vec![format!("{content} 0 R"); times].join(" ")
+    ));
+    let kids: Vec<String> = (0..pages)
+        .map(|_| {
+            let k = p.add(format!(
+                "<< /Type /Page /Parent {root} 0 R /Contents {parts} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+            ));
+            format!("{k} 0 R")
+        })
+        .collect();
+    p.set(
+        root,
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {pages} >>",
+            kids.join(" ")
+        ),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {root} 0 R >>"));
+    p.table(catalog, "")
+}
+
+/// An empty stream with `filters` ASCIIHex filters, listed `times` times by one page.
+fn long_filter_chain(filters: usize, times: usize) -> Vec<u8> {
+    let chain = vec!["/AHx"; filters].join(" ");
+    repeated_contents(&format!("/Filter [{chain}]"), b"", times)
+}
+
+/// A Type0 font whose /W lists `entries` width lists, all one shared array of `widths` numbers.
+fn shared_widths(entries: usize, widths: usize) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let list = p.add(format!("[{}]", vec!["500"; widths].join(" ")));
+    let w = vec![format!("0 {list} 0 R"); entries].join(" ");
+    let cid = p.add(format!(
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /W [{w}] >>"
+    ));
+    let to_unicode = p.add(stream(
+        "",
+        b"1 begincodespacerange <0000> <FFFF> endcodespacerange 1 beginbfchar <0001> <0078> endbfchar",
+    ));
+    let f1 = p.add(format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /DescendantFonts [{cid} 0 R] /ToUnicode {to_unicode} 0 R >>"
+    ));
+    let content = p.add(stream("", b"BT /F1 12 Tf <0001> Tj ET"));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+/// A simple font whose ToUnicode CMap maps `entries` three-byte codes one by one (`bfchar`).
+fn large_cmap(entries: usize) -> Vec<u8> {
+    let mut cmap = b"1 begincodespacerange <00> <FF> endcodespacerange\n".to_vec();
+    for chunk in (0..entries).collect::<Vec<_>>().chunks(100) {
+        cmap.extend_from_slice(format!("{} beginbfchar\n", chunk.len()).as_bytes());
+        for &k in chunk {
+            cmap.extend_from_slice(format!("<{k:06X}> <{:04X}>\n", 0x4E00 + k % 0x5000).as_bytes());
+        }
+        cmap.extend_from_slice(b"endbfchar\n");
+    }
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let to_unicode = p.add(stream("", &cmap));
+    let f1 = p.add(format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode {to_unicode} 0 R >>"
+    ));
+    let content = p.add(stream("", b"BT /F1 12 Tf (x) Tj ET"));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
 fn quick(what: &str, start: std::time::Instant) {
     let took = start.elapsed();
     assert!(took.as_secs() < 30, "{what} took {took:?}");
@@ -1023,4 +1142,208 @@ fn the_symbol_font_uses_its_built_in_encoding() {
     let (p, root) = doc(&[b"BT /F1 12 Tf (abg) Tj ET"], HELVETICA, false);
     let got = extract_text(&p.table(root, ""), &Limits::default()).unwrap();
     assert_eq!(got.pages[0].trim(), "abg");
+}
+
+#[test]
+fn a_shared_page_tree_is_walked_once() {
+    // second review, repro 1: each level one shared Kids array of 10 direct nodes, 20 levels
+    // deep (10^20 paths in a 5 KB file); a node is read once, whichever way it is reached
+    let file = shared_kids(10, 20);
+    assert!(file.len() < 6_000, "{}", file.len());
+    let start = std::time::Instant::now();
+    let got = extract_text(&file, &Limits::default()).unwrap();
+    quick("the shared page tree", start);
+    assert_eq!(got.pages.len(), 1);
+    assert_eq!(got.pages[0].trim(), "x");
+    // every node visited is a step of work, so a small work budget stops the walk
+    let lim = Limits {
+        max_work: 50,
+        ..Limits::default()
+    };
+    let e = extract_text(&file, &lim).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("it costs more than 50 steps of work (--pdf-max-work)"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_long_filter_chain_read_many_times_is_charged() {
+    // second review, repro 2: an empty stream with 10,000 filters, read 10,000 times
+    let file = long_filter_chain(10_000, 10_000);
+    let start = std::time::Instant::now();
+    let e = extract_text(&file, &Limits::default()).unwrap_err();
+    quick("the long filter chain", start);
+    assert!(e.to_string().contains("(--pdf-max-work)"), "{e}");
+    // a short chain read a few times is read
+    let e = extract_text(&long_filter_chain(3, 3), &Limits::default()).unwrap_err();
+    assert!(matches!(e, Fail::NoText { pages: 1 }), "{e}");
+}
+
+#[test]
+fn empty_reads_are_charged() {
+    // second review, repro 3: 100,000 references to one empty stream, shared by 500 pages
+    let file = shared_contents("", b"", 100_000, 500);
+    let start = std::time::Instant::now();
+    let e = extract_text(&file, &Limits::default()).unwrap_err();
+    quick("the empty reads", start);
+    assert!(e.to_string().contains("(--pdf-max-work)"), "{e}");
+    // a shared /Contents array is still read for every page
+    let got = extract_text(
+        &shared_contents("", b"BT /F1 12 Tf (x) Tj ET", 2, 3),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(got.pages.len(), 3);
+    assert!(got.pages.iter().all(|p| p.contains('x')), "{got:?}");
+}
+
+#[test]
+fn a_shared_width_list_is_charged_by_its_expanded_size() {
+    // second review, repro 4: /W lists 1,000 times one shared array of 100,000 widths
+    let file = shared_widths(1_000, 100_000);
+    let start = std::time::Instant::now();
+    let e = extract_text(&file, &Limits::default()).unwrap_err();
+    quick("the shared width list", start);
+    assert!(matches!(e, Fail::TooLarge(_)), "{e}");
+    // a few entries are read
+    let got = extract_text(&shared_widths(2, 10), &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "x");
+}
+
+#[test]
+fn cmap_entries_are_charged_to_the_object_budget() {
+    // second review, repro 5: a ToUnicode CMap of 1,000,000 entries (16 MB decoded)
+    let file = large_cmap(1_000_000);
+    let got = extract_text(&file, &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "x");
+    // the entries it keeps take more memory than 32 MiB: under that budget it is refused,
+    // though its 16 MB decode fits
+    let lim = Limits {
+        max_decoded: 32 << 20,
+        ..Limits::default()
+    };
+    let e = extract_text(&file, &lim).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("its objects take more than 33554432 bytes"),
+        "{e}"
+    );
+}
+
+#[test]
+fn glyph_text_is_charged_before_it_is_kept() {
+    // Codex repro: one code mapped to 64 characters, shown 10,000 times, 20,000-byte budget
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let dst = "0041".repeat(64);
+    let to_unicode = p.add(stream(
+        "",
+        format!("1 begincodespacerange <00> <FF> endcodespacerange 1 beginbfchar <61> <{dst}> endbfchar")
+            .as_bytes(),
+    ));
+    let f1 = p.add(format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode {to_unicode} 0 R >>"
+    ));
+    let shown = "61".repeat(10_000);
+    let content = p.add(stream(
+        "/Filter /ASCIIHexDecode",
+        format!(
+            "{}>",
+            hex(format!("BT /F1 12 Tf <{shown}> Tj ET").as_bytes())
+        )
+        .as_bytes(),
+    ));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    let lim = Limits {
+        max_decoded: 200_000,
+        ..Limits::default()
+    };
+    let e = extract_text(&p.table(catalog, ""), &lim).unwrap_err();
+    assert!(
+        e.to_string().contains("its text is more than 200000 bytes"),
+        "{e}"
+    );
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[test]
+fn a_form_starts_in_the_state_of_its_do() {
+    // Codex repro: the font is selected on the page, the form shows text with it
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let f1 = p.add(HELVETICA);
+    let form = p.add(stream(
+        "/Type /XObject /Subtype /Form",
+        b"BT (Inside) Tj ET",
+    ));
+    let content = p.add(stream(
+        "",
+        b"BT /F1 12 Tf 72 700 Td (Page) Tj ET /F1 12 Tf /X Do",
+    ));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> /XObject << /X {form} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    let got = extract_text(&p.table(catalog, ""), &Limits::default()).unwrap();
+    assert!(got.pages[0].contains("Inside"), "{:?}", got.pages[0]);
+    assert!(got.pages[0].contains("Page"), "{:?}", got.pages[0]);
+}
+
+#[test]
+fn an_ext_g_state_selects_a_font() {
+    // Codex repro: /GS1 << /Font [F 12] >> selects the font that `Tj` shows with
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let f = p.add(HELVETICA);
+    let content = p.add(stream("", b"/GS1 gs BT 72 700 Td (Hello GS) Tj ET"));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /ExtGState << /GS1 << /Font [{f} 0 R 12] >> >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    let got = extract_text(&p.table(catalog, ""), &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "Hello GS");
+}
+
+#[test]
+fn budgets_keep_their_spend_on_a_refusal() {
+    // a refused charge leaves the spend as it was, and the next charge that fits is counted
+    let mut b = Budget::new(10, "test", "steps", "--test");
+    b.take(7).unwrap();
+    assert!(b.take(4).is_err());
+    assert_eq!(b.used(), 7);
+    assert_eq!(b.room(), 3);
+    b.take(0).unwrap();
+    assert_eq!(b.used(), 7);
+    b.take(3).unwrap();
+    assert_eq!(b.used(), 10);
+    assert!(b.take(1).is_err());
+    assert_eq!(b.used(), 10);
+}
+
+#[test]
+fn the_default_work_budget_is_pinned() {
+    assert_eq!(Limits::default().max_work, 20_000_000);
 }

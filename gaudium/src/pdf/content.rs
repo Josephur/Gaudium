@@ -4,14 +4,17 @@
 //! Text is placed by its position: a move to another baseline starts a new line, and a gap on
 //! the same baseline wider than a fraction of the font size becomes a space (words placed by
 //! `Td`, `TJ` adjustments or separate strings). Form XObjects are followed; inline images are
-//! skipped; graphics other than text are ignored.
+//! skipped; graphics other than text are ignored. A form starts in the graphics state of the
+//! `Do` that draws it (its font and text state included), and a font may also be selected by an
+//! ExtGState's /Font entry (`gs`).
 //!
 //! What one document may make the interpreter do is bounded: every content stream it reads is a
 //! fresh decode charged to the decode budget, so the bytes interpreted never exceed it; every
 //! form XObject drawn is charged to the form budget (`--pdf-max-forms`), so a form drawing
 //! itself many times stops at the cap; the operands held at any time are charged to the room
-//! the object budget leaves. Resources and objects are shared (`Rc`), and looking up a font or
-//! a form by name does not copy the resource dictionary.
+//! the object budget leaves; every operator costs a step of the work budget; the text of each
+//! glyph is charged to the text budget before it is kept. Resources and objects are shared
+//! (`Rc`), and looking up a font or a form by name does not copy the resource dictionary.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -150,16 +153,17 @@ impl<'d, 'a> Page<'d, 'a> {
         }
     }
 
-    /// Interprets a page's content (`depth` 0) or a form's (deeper). A damaged content stream
-    /// ends its interpretation with the text read so far; only a broken limit is an error.
+    /// Interprets a page's content (`depth` 0) or a form's (deeper), from the graphics state
+    /// `start`. A damaged content stream ends its interpretation with the text read so far;
+    /// only a broken limit is an error.
     pub fn run(
         &mut self,
         content: &[u8],
         resources: &Rc<Dict>,
-        ctm: M0,
+        start: Start,
         depth: u64,
     ) -> Result<(), Fail> {
-        let mut gs = GState::new(ctm.0);
+        let mut gs = start.0;
         let mut stack: Vec<GState> = Vec::new();
         let mut tm = M::ID;
         let mut tlm = M::ID;
@@ -183,8 +187,10 @@ impl<'d, 'a> Page<'d, 'a> {
                 }
                 Token::Op(op) => op,
             };
-            // the operands are dropped at each operator
-            lx.restart();
+            // every operator is a step; its operands are dropped, and what the document has
+            // charged since (a font read) takes their room
+            self.doc.work.take(1)?;
+            lx.restart(self.doc.objects);
             if op == b"Do" {
                 let name = match args.first() {
                     Some(Obj::Name(n)) => Some(n.clone()),
@@ -192,7 +198,7 @@ impl<'d, 'a> Page<'d, 'a> {
                 };
                 args.clear();
                 if let Some(name) = name {
-                    self.form(resources, &name, gs.ctm, depth)?;
+                    self.form(resources, &name, &gs, depth)?;
                 }
                 continue;
             }
@@ -222,6 +228,15 @@ impl<'d, 'a> Page<'d, 'a> {
                         let name = name.clone();
                         gs.font = self.font(resources, &name)?;
                         gs.size = size;
+                    }
+                }
+                b"gs" => {
+                    if let Some(Obj::Name(name)) = args.first() {
+                        let name = name.clone();
+                        if let Some((font, size)) = self.state_font(resources, &name)? {
+                            gs.font = font;
+                            gs.size = size;
+                        }
                     }
                 }
                 b"Tc" => gs.tc = num(0).unwrap_or(gs.tc),
@@ -298,18 +313,22 @@ impl<'d, 'a> Page<'d, 'a> {
         let height = gs.size.abs() * trm.c.hypot(trm.d);
         let em = gs.size.abs() * trm.a.hypot(trm.b);
         let mut text = String::new();
+        let budget = &mut *self.text_budget;
         font.glyphs(s, |g| {
             if let Some(t) = g.text {
+                // charged before it is kept: one code may map to a long text
+                budget.take(t.len() as u64)?;
                 text.extend(t.chars().map(|c| if c.is_control() { ' ' } else { c }));
             }
             let adv = (g.width * gs.size + gs.tc + if g.space { gs.tw } else { 0.0 }) * gs.th;
             *tm = M::translate(adv, 0.0).then(*tm);
-        });
+            Ok(())
+        })?;
         if text.is_empty() {
             return Ok(());
         }
         self.place(trm.e, trm.f, height, em);
-        self.push(&text)?;
+        self.out.push_str(&text);
         let end = tm.then(gs.ctm);
         self.last = Some((end.e, end.f, height));
         Ok(())
@@ -342,12 +361,6 @@ impl<'d, 'a> Page<'d, 'a> {
         }
     }
 
-    fn push(&mut self, t: &str) -> Result<(), Fail> {
-        self.text_budget.take(t.len() as u64)?;
-        self.out.push_str(t);
-        Ok(())
-    }
-
     /// The font named `name` in the resources (`None`: no such font; its text is not shown).
     fn font(&mut self, resources: &Dict, name: &[u8]) -> Result<Option<Rc<Font>>, Fail> {
         let fonts = soft(self.doc.entry(resources, b"Font"))?;
@@ -357,6 +370,36 @@ impl<'d, 'a> Page<'d, 'a> {
         let Some(entry) = fonts.get(name).cloned() else {
             return Ok(None);
         };
+        self.font_at(entry)
+    }
+
+    /// The font and size an ExtGState named `name` selects with its /Font entry (`None`: it
+    /// selects none).
+    fn state_font(
+        &mut self,
+        resources: &Dict,
+        name: &[u8],
+    ) -> Result<Option<(Option<Rc<Font>>, f64)>, Fail> {
+        let states = soft(self.doc.entry(resources, b"ExtGState"))?;
+        let Some(entry) = states.as_dict().and_then(|d| d.get(name)).cloned() else {
+            return Ok(None);
+        };
+        let state = soft(self.doc.get(&entry))?;
+        let Some(state) = state.as_dict() else {
+            return Ok(None);
+        };
+        let spec = soft(self.doc.entry(state, b"Font"))?;
+        let Some([font, size]) = spec.as_array() else {
+            return Ok(None);
+        };
+        let Some(size) = soft(self.doc.get(size))?.as_f64() else {
+            return Ok(None);
+        };
+        Ok(Some((self.font_at(font.clone())?, size)))
+    }
+
+    /// The font a resource entry names (a reference or a direct dictionary), read once.
+    fn font_at(&mut self, entry: Obj) -> Result<Option<Rc<Font>>, Fail> {
         let key = match entry {
             Obj::Ref(n, _) => Some(n),
             _ => None,
@@ -421,6 +464,7 @@ impl<'d, 'a> Page<'d, 'a> {
                 let df = soft(self.doc.get(&first))?;
                 if let Some(df) = df.as_dict() {
                     if let Obj::Array(w) = soft(self.doc.entry(df, b"W"))? {
+                        self.doc.work.take(w.len() as u64)?;
                         let mut out = Vec::with_capacity(w.len());
                         for x in w.iter() {
                             out.push(soft(self.doc.get(x))?);
@@ -441,20 +485,28 @@ impl<'d, 'a> Page<'d, 'a> {
                     .filter(|w| *w > 0.0);
             }
         }
-        Ok(Font::new(FontParts {
+        Font::new(FontParts {
             dict,
             to_unicode,
             encoding,
             encoding_cmap,
             widths,
             default_width,
-            mem: self.doc.objects,
-        }))
+            mem: &mut self.doc.objects,
+            work: &mut self.doc.work,
+        })
     }
 
-    /// Follows `Do` into a form XObject. Each form drawn is charged to the form budget, and
-    /// each draw decodes the form again, charged to the decode budget.
-    fn form(&mut self, resources: &Rc<Dict>, name: &[u8], ctm: M, depth: u64) -> Result<(), Fail> {
+    /// Follows `Do` into a form XObject, which starts in the graphics state `gs` of the `Do`.
+    /// Each form drawn is charged to the form budget, and each draw decodes the form again,
+    /// charged to the decode budget.
+    fn form(
+        &mut self,
+        resources: &Rc<Dict>,
+        name: &[u8],
+        gs: &GState,
+        depth: u64,
+    ) -> Result<(), Fail> {
         if !v::pdf_below(depth + 1, MAX_FORM_DEPTH) {
             return Ok(());
         }
@@ -482,16 +534,22 @@ impl<'d, 'a> Page<'d, 'a> {
             .and_then(Obj::as_array)
             .and_then(M::from)
             .unwrap_or(M::ID);
-        self.run(&data, &own, M0(matrix.then(ctm)), depth + 1)
+        let start = GState {
+            ctm: matrix.then(gs.ctm),
+            ..gs.clone()
+        };
+        self.run(&data, &own, Start(start), depth + 1)
     }
 }
 
-/// The page space a content stream starts in.
-#[derive(Clone, Copy)]
-pub(crate) struct M0(M);
+/// The graphics state a content stream starts in.
+pub(crate) struct Start(GState);
 
-impl M0 {
-    pub const ID: M0 = M0(M::ID);
+impl Start {
+    /// A page's: page space, no font selected.
+    pub fn page() -> Start {
+        Start(GState::new(M::ID))
+    }
 }
 
 /// Keeps a broken limit as the error and turns other failures into nothing: a damaged font or

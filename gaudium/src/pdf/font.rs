@@ -8,10 +8,17 @@
 //! codespace ranges of their CMap (two bytes for Identity-H / Identity-V); their text needs a
 //! ToUnicode CMap, except for the predefined Unicode (UCS2 / UTF16) CMaps.
 //! The encoding tables follow Annex D of the specification.
+//!
+//! What a font keeps is charged to the document's budgets as it is built: each entry of its
+//! CMaps and of its expanded width lists costs its memory (object budget) and a step (work
+//! budget), and each element of its /Widths and /Differences arrays a step, so a width list or
+//! a CMap shared by many entries or fonts is paid for every time it is expanded.
 
 use std::collections::{BTreeMap, HashMap};
+use std::mem::size_of;
 
 use super::lex::{Dict, Lexer, Obj, Token};
+use super::{Budget, Fail};
 
 /// The Unicode text of codes 0x20..=0x7E in StandardEncoding: ASCII, except the two quotes.
 fn standard(code: u8) -> Option<char> {
@@ -471,6 +478,18 @@ const MAX_SPACE_RANGES: usize = 256;
 /// Longest text one code may map to, in UTF-16 units (longer mappings are not used).
 const MAX_DST_UNITS: usize = 64;
 
+/// The memory a CMap entry mapping one code is charged for, besides its text: a hash table
+/// holds up to twice its entries, and the text is an allocation of its own.
+const SINGLE_COST: u64 = (2 * size_of::<((usize, u32), String)>() + 4 * size_of::<usize>()) as u64;
+/// The memory a CMap range entry is charged for, besides its UTF-16 units (a tree node holds
+/// up to twice its entries, and the units are an allocation of their own).
+const RANGE_COST: u64 =
+    (2 * size_of::<((usize, u32), (u32, Vec<u16>))>() + 4 * size_of::<usize>()) as u64;
+/// The memory a codespace range is charged for.
+const SPACE_COST: u64 = size_of::<(usize, u32, u32)>() as u64;
+/// The memory one entry of a composite font's width table is charged for.
+const WIDTH_COST: u64 = size_of::<(u32, u32, f64)>() as u64;
+
 /// A CMap: code lengths (codespace ranges) and, for a ToUnicode CMap, the text of codes.
 #[derive(Default, Debug)]
 pub(crate) struct CMap {
@@ -489,11 +508,12 @@ fn code_of(b: &[u8]) -> Option<(usize, u32)> {
 }
 
 impl CMap {
-    /// Parses a CMap stream's decoded bytes; the operands held at a time may take the room
-    /// `mem` leaves. Unknown parts are skipped.
-    pub fn parse(data: &[u8], mem: super::Budget) -> CMap {
+    /// Parses a CMap stream's decoded bytes. Each entry kept is charged to `mem` (its memory)
+    /// and to `work` (a step); the operands held at a time may take the room `mem` leaves.
+    /// Unknown parts are skipped; only a broken limit is an error.
+    pub fn parse(data: &[u8], mem: &mut Budget, work: &mut Budget) -> Result<CMap, Fail> {
         let mut m = CMap::default();
-        let mut lx = Lexer::new(data, 0, mem);
+        let mut lx = Lexer::new(data, 0, *mem);
         let mut args: Vec<Obj> = Vec::new();
         #[derive(PartialEq)]
         enum Mode {
@@ -503,7 +523,13 @@ impl CMap {
             Range,
         }
         let mut mode = Mode::None;
-        while let Ok(Some(t)) = lx.token(0, true) {
+        loop {
+            let t = match lx.token(0, true) {
+                Ok(Some(t)) => t,
+                Ok(None) => break,
+                Err(e @ Fail::TooLarge(_)) => return Err(e),
+                Err(_) => break,
+            };
             match t {
                 Token::Obj(o) => {
                     args.push(o);
@@ -512,12 +538,14 @@ impl CMap {
                             if let (Obj::Str(lo), Obj::Str(hi)) = (&args[0], &args[1]) {
                                 if let (Some((n, l)), Some((n2, h))) = (code_of(lo), code_of(hi)) {
                                     if n == n2 && l <= h && m.space.len() < MAX_SPACE_RANGES {
+                                        work.take(1)?;
+                                        mem.take(SPACE_COST)?;
                                         m.space.push((n, l, h));
                                     }
                                 }
                             }
                             args.clear();
-                            lx.restart();
+                            lx.restart(*mem);
                         }
                         Mode::Char if args.len() == 2 => {
                             if let (Obj::Str(src), dst) = (&args[0], &args[1]) {
@@ -530,17 +558,17 @@ impl CMap {
                                         _ => None,
                                     };
                                     if let Some(t) = text {
-                                        m.single.insert(k, t);
+                                        m.single_entry(k, t, mem, work)?;
                                     }
                                 }
                             }
                             args.clear();
-                            lx.restart();
+                            lx.restart(*mem);
                         }
                         Mode::Range if args.len() == 3 => {
-                            m.add_range(&args[0], &args[1], &args[2]);
+                            m.add_range(&args[0], &args[1], &args[2], mem, work)?;
                             args.clear();
-                            lx.restart();
+                            lx.restart(*mem);
                         }
                         _ => {
                             if mode == Mode::None && args.len() > 16 {
@@ -551,7 +579,7 @@ impl CMap {
                 }
                 Token::Op(op) => {
                     args.clear();
-                    lx.restart();
+                    lx.restart(*mem);
                     mode = match op.as_slice() {
                         b"begincodespacerange" => Mode::Space,
                         b"beginbfchar" => Mode::Char,
@@ -561,18 +589,39 @@ impl CMap {
                 }
             }
         }
-        m
+        Ok(m)
     }
 
-    fn add_range(&mut self, lo: &Obj, hi: &Obj, dst: &Obj) {
+    /// Keeps the text of one code, charged.
+    fn single_entry(
+        &mut self,
+        k: (usize, u32),
+        t: String,
+        mem: &mut Budget,
+        work: &mut Budget,
+    ) -> Result<(), Fail> {
+        work.take(1)?;
+        mem.take(SINGLE_COST + t.len() as u64)?;
+        self.single.insert(k, t);
+        Ok(())
+    }
+
+    fn add_range(
+        &mut self,
+        lo: &Obj,
+        hi: &Obj,
+        dst: &Obj,
+        mem: &mut Budget,
+        work: &mut Budget,
+    ) -> Result<(), Fail> {
         let (Obj::Str(lo), Obj::Str(hi)) = (lo, hi) else {
-            return;
+            return Ok(());
         };
         let (Some((n, l)), Some((n2, h))) = (code_of(lo), code_of(hi)) else {
-            return;
+            return Ok(());
         };
         if n != n2 || l > h {
-            return;
+            return Ok(());
         }
         match dst {
             Obj::Str(d) if !d.is_empty() && d.len() <= 2 * MAX_DST_UNITS => {
@@ -580,22 +629,26 @@ impl CMap {
                     .chunks(2)
                     .map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]))
                     .collect();
+                work.take(1)?;
+                mem.take(RANGE_COST + 2 * units.len() as u64)?;
                 self.ranges.insert((n, l), (h, units));
             }
             Obj::Array(items) => {
                 for (i, it) in items.iter().enumerate() {
+                    work.take(1)?;
                     let Some(code) = l.checked_add(i as u32).filter(|c| *c <= h) else {
                         break;
                     };
                     if let Obj::Str(d) = it {
                         if d.len() <= 2 * MAX_DST_UNITS {
-                            self.single.insert((n, code), utf16be(d));
+                            self.single_entry((n, code), utf16be(d), mem, work)?;
                         }
                     }
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// The text of code `code` of `n` bytes.
@@ -686,16 +739,22 @@ pub(crate) struct FontParts<'a> {
     pub widths: Option<std::rc::Rc<[Obj]>>,
     /// The descendant font's /DW, or the /MissingWidth of a simple font's descriptor.
     pub default_width: Option<f64>,
-    /// The object budget the objects of its CMaps are charged to while they are read (they
-    /// take the room it leaves; the CMaps themselves are small).
-    pub mem: super::Budget,
+    /// The document's object budget: the memory of what the font keeps is charged to it.
+    pub mem: &'a mut Budget,
+    /// The document's work budget: each entry the font expands is a step.
+    pub work: &'a mut Budget,
 }
 
 impl Font {
-    pub fn new(p: FontParts) -> Font {
+    /// The font; only a broken limit is an error.
+    pub fn new(p: FontParts) -> Result<Font, Fail> {
+        let FontParts { mem, work, .. } = p;
         let subtype = p.dict.get(b"Subtype").and_then(Obj::as_name).unwrap_or(b"");
         let composite = subtype == b"Type0";
-        let to_unicode = p.to_unicode.as_deref().map(|d| CMap::parse(d, p.mem));
+        let to_unicode = match p.to_unicode.as_deref() {
+            Some(d) => Some(CMap::parse(d, mem, work)?),
+            None => None,
+        };
         let scale = if subtype == b"Type3" {
             p.dict
                 .get(b"FontMatrix")
@@ -726,10 +785,12 @@ impl Font {
                     f.cid_text = CidText::Unicode;
                 }
             }
-            f.encoding_cmap = p.encoding_cmap.as_deref().map(|d| CMap::parse(d, p.mem));
+            if let Some(d) = p.encoding_cmap.as_deref() {
+                f.encoding_cmap = Some(CMap::parse(d, mem, work)?);
+            }
             f.default_width = p.default_width.unwrap_or(1000.0);
             if let Some(w) = &p.widths {
-                f.cid_widths = cid_widths(w);
+                f.cid_widths = cid_widths(w, mem, work)?;
                 f.cid_widths.sort_by_key(|r| r.0);
             }
         } else {
@@ -738,7 +799,7 @@ impl Font {
                 .get(b"BaseFont")
                 .and_then(Obj::as_name)
                 .unwrap_or(b"");
-            f.simple = simple_encoding(subtype, base_font, p.encoding.as_ref());
+            f.simple = simple_encoding(subtype, base_font, p.encoding.as_ref(), work)?;
             f.first_char = p
                 .dict
                 .get(b"FirstChar")
@@ -746,9 +807,10 @@ impl Font {
                 .and_then(|c| u32::try_from(c).ok())
                 .unwrap_or(0);
             if let Some(w) = &p.widths {
-                f.widths = w
+                let kept = w.len().min(256);
+                work.take(kept as u64)?;
+                f.widths = w[..kept]
                     .iter()
-                    .take(256)
                     .map(|o| o.as_f64().unwrap_or(0.0))
                     .collect();
             }
@@ -756,11 +818,15 @@ impl Font {
                 p.default_width
                     .unwrap_or(if f.widths.is_empty() { 500.0 } else { 0.0 });
         }
-        f
+        Ok(f)
     }
 
-    /// Splits `s` into codes and calls `out` for each.
-    pub fn glyphs(&self, s: &[u8], mut out: impl FnMut(Glyph)) {
+    /// Splits `s` into codes and calls `out` for each (stopping at its first error).
+    pub fn glyphs(
+        &self,
+        s: &[u8],
+        mut out: impl FnMut(Glyph) -> Result<(), Fail>,
+    ) -> Result<(), Fail> {
         let mut i = 0usize;
         while i < s.len() {
             let rest = &s[i..];
@@ -805,8 +871,9 @@ impl Font {
                 text,
                 width: w * self.scale,
                 space: n == 1 && code == 32,
-            });
+            })?;
         }
+        Ok(())
     }
 }
 
@@ -825,7 +892,12 @@ fn is_symbol_font(base_font: &[u8]) -> bool {
 
 /// The text of each code of a simple font: its base encoding with its /Differences. A font
 /// that names no base encoding uses its built-in one: the Symbol font's for the Symbol font.
-fn simple_encoding(subtype: &[u8], base_font: &[u8], enc: Option<&Obj>) -> Vec<Option<String>> {
+fn simple_encoding(
+    subtype: &[u8],
+    base_font: &[u8],
+    enc: Option<&Obj>,
+    work: &mut Budget,
+) -> Result<Vec<Option<String>>, Fail> {
     let base_name: &[u8] = match enc {
         Some(Obj::Name(n)) => n,
         Some(Obj::Dict(d)) => d.get(b"BaseEncoding").and_then(Obj::as_name).unwrap_or(b""),
@@ -844,6 +916,7 @@ fn simple_encoding(subtype: &[u8], base_font: &[u8], enc: Option<&Obj>) -> Vec<O
     if let Some(Obj::Dict(d)) = enc {
         if let Some(Obj::Array(diff)) = d.get(b"Differences") {
             let mut code: Option<usize> = None;
+            work.take(diff.len() as u64)?;
             for item in diff.iter() {
                 match item {
                     Obj::Int(c) => code = usize::try_from(*c).ok().filter(|c| *c < 256),
@@ -858,22 +931,34 @@ fn simple_encoding(subtype: &[u8], base_font: &[u8], enc: Option<&Obj>) -> Vec<O
             }
         }
     }
-    table
+    Ok(table)
 }
 
-/// A composite font's /W array: `c [w1 w2 ...]` and `c1 c2 w` entries.
-fn cid_widths(w: &[Obj]) -> Vec<(u32, u32, f64)> {
+/// A composite font's /W array: `c [w1 w2 ...]` and `c1 c2 w` entries. Each entry kept is
+/// charged to `mem` (its memory) and `work` (a step), and each element of /W a step.
+fn cid_widths(
+    w: &[Obj],
+    mem: &mut Budget,
+    work: &mut Budget,
+) -> Result<Vec<(u32, u32, f64)>, Fail> {
     let mut out = Vec::new();
     let mut i = 0usize;
+    let mut keep = |out: &mut Vec<(u32, u32, f64)>, e: (u32, u32, f64)| -> Result<(), Fail> {
+        mem.take(WIDTH_COST)?;
+        out.push(e);
+        Ok(())
+    };
     while i < w.len() {
+        work.take(1)?;
         let Some(c) = w[i].as_int().and_then(|c| u32::try_from(c).ok()) else {
             break;
         };
         match w.get(i + 1) {
             Some(Obj::Array(list)) => {
                 for (k, x) in list.iter().enumerate() {
+                    work.take(1)?;
                     if let (Some(code), Some(v)) = (c.checked_add(k as u32), x.as_f64()) {
-                        out.push((code, code, v));
+                        keep(&mut out, (code, code, v))?;
                     }
                 }
                 i += 2;
@@ -885,11 +970,11 @@ fn cid_widths(w: &[Obj]) -> Vec<(u32, u32, f64)> {
                 ) else {
                     break;
                 };
-                out.push((c, hi, v));
+                keep(&mut out, (c, hi, v))?;
                 i += 3;
             }
             None => break,
         }
     }
-    out
+    Ok(out)
 }
