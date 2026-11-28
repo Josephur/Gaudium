@@ -524,29 +524,25 @@ impl ToolOutput {
         }
     }
 
-    /// The result cut to `cap` bytes of text in all (`sv_result_keep`), at a character
-    /// boundary, with a note where it was cut.
+    /// The result cut to `cap` bytes of the text it puts into the prompt (`sv_result_keep`),
+    /// at a character boundary, with a note where it was cut. The length measured is that of
+    /// the parts as the prompt joins them (`ToolOutput::prompt_text`), separators included, so
+    /// many short or empty parts cannot pass the cap either. A result that is cut becomes one
+    /// part (the joined text, cut) and the note.
     pub fn within(mut self, cap: u64) -> Self {
-        let total: u64 = self.texts.iter().map(|t| t.len() as u64).sum();
+        let joined = self.texts.join("\n");
+        let total = joined.len() as u64;
         let keep = sv_result_keep(total, cap);
         if keep == total {
             return self;
         }
-        let mut left = keep as usize;
+        let mut end = (keep as usize).min(joined.len());
+        while !joined.is_char_boundary(end) {
+            end -= 1;
+        }
         let mut kept = Vec::new();
-        for t in self.texts {
-            if left == 0 {
-                break;
-            }
-            let mut end = left.min(t.len());
-            while !t.is_char_boundary(end) {
-                end -= 1;
-            }
-            left -= end;
-            kept.push(t[..end].to_string());
-            if end < t.len() {
-                break;
-            }
+        if end > 0 {
+            kept.push(joined[..end].to_string());
         }
         kept.push(format!(
             "[the result was cut: at most {keep} of its {total} bytes are shown]"
@@ -716,9 +712,27 @@ mod tests {
             texts: vec!["ab".into(), "héllo".into()],
         }
         .within(4);
-        assert_eq!(cut.texts[0], "ab");
-        assert_eq!(cut.texts[1], "h");
-        assert!(cut.texts[2].contains("4 of its 8 bytes"));
+        assert_eq!(cut.texts[0], "ab\nh");
+        assert!(cut.texts[1].contains("4 of its 9 bytes"));
+        // the separators the prompt puts between parts count: many empty parts are cut too
+        let empties = ToolOutput {
+            is_error: false,
+            texts: vec![String::new(); 300],
+        };
+        assert_eq!(empties.prompt_text().len(), 299);
+        let cut = empties.within(100);
+        assert_eq!(cut.texts.len(), 2);
+        assert_eq!(cut.texts[0], "\n".repeat(100));
+        assert!(cut.texts[1].contains("100 of its 299 bytes"));
+        // the cut text plus its note is all the prompt gets
+        assert!(cut.prompt_text().len() <= 100 + 1 + cut.texts[1].len());
+        // parts that fit with their separators stay as they are
+        let fits = ToolOutput {
+            is_error: false,
+            texts: vec!["ab".into(), "cd".into()],
+        };
+        assert_eq!(fits.clone().within(5), fits);
+        assert_eq!(fits.within(4).texts[0], "ab\nc");
         let whole = ToolOutput {
             is_error: false,
             texts: vec!["ab".into()],

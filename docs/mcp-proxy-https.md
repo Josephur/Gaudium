@@ -101,7 +101,9 @@ not browsers (no `Origin`, no `Sec-Fetch-Site`) are not either.
   either `tool_configuration` (`enabled`, `allowed_tools`) or an `mcp_toolset` entry in `tools`
   (`mcp_server_name`, `default_config` and per-tool `configs` with `enabled` and
   `defer_loading`). Tools reach the model as `mcp__<server>__<tool>`; a client tool of the same
-  name refuses the request.
+  name refuses the request. A `tool_reference` in the history (a tool search result) may name a
+  server's tool, deferred ones included: its definition is put in its place once the servers'
+  tools are listed.
 - Transport: Streamable HTTP (`initialize`, `tools/list` with its pages, `tools/call`; answers as
   JSON or as an event stream; the session id the server assigns). Tool results are passed on as
   text (an image or audio part becomes a note).
@@ -110,12 +112,15 @@ not browsers (no `Origin`, no `Sec-Fetch-Site`) are not either.
   MCP tools in that round are still run; the reply stops with `tool_use`), or the round limit is
   reached (`pause_turn`: send the reply back as the assistant turn to go on). A round cut by
   `max_tokens`, a stop sequence or a cancel runs none of its calls. A forced `tool_choice`
-  applies to the first round.
+  applies to the first round. `max_tokens` holds for the whole reply: each round gets what the
+  rounds before left of it, and a reply that spends it stops with `max_tokens` (after the calls
+  of that round ran). Once the client's connection is gone, no further call is sent.
 - Limits per request: 8 servers, 10 generation rounds, 64 calls of MCP tools (later calls get an
-  error result), 128 KiB of each result in the prompt (the rest is cut, with a note), 16 pages of
+  error result), 128 KiB of each result in the prompt (its parts as the prompt joins them, one
+  newline between two; the rest is cut, with a note), 16 pages of
   a server's tool list. Usage sums every round; `gaudium_tool_loop` gives the rounds and calls.
 - The decisions (admission, where a call goes, whether a round's calls run and whether another
-  round follows, and the bounds) are in `gaudium/verified/server_tools.bend`; the loop is
+  round follows, the output limit over the rounds, and the bounds) are in `gaudium/verified/server_tools.bend`; the loop is
   `gaudium/src/server/tool_loop.rs`, the client `gaudium/src/server/mcp_client.rs`.
 
 ## Threat model and guards

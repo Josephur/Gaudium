@@ -24,8 +24,8 @@ use crate::core::tool_calls::{stop_reason_name, GenEnd};
 use crate::json::{parse_json, JsonValue};
 use crate::verified::{
     ge_model_ended, pc_prefill_rows, pc_reused_rows, sv_admit, sv_admit_is_none, sv_admit_runs,
-    sv_calls_take, sv_goes_on, sv_next, sv_route, sv_route_clash, sv_route_server, sv_runs,
-    sv_waits_client, SvAdmit,
+    sv_budget_spent, sv_calls_take, sv_next, sv_round_goes_on, sv_route, sv_route_clash,
+    sv_route_server, sv_runs, sv_tokens_left, sv_waits_client, SvAdmit,
 };
 
 /// Tools the server runs itself while it answers a request.
@@ -47,14 +47,10 @@ pub(super) struct ToolOutput {
 }
 
 impl ToolOutput {
-    /// The result as the next round's prompt has it.
-    fn prompt_text(&self) -> String {
-        let text = self.texts.join("\n");
-        if self.is_error {
-            format!("Error: {text}")
-        } else {
-            text
-        }
+    /// The result as the next round's prompt has it (and as a replayed history has it,
+    /// [`anthropic::mcp_result_text`]).
+    pub(super) fn prompt_text(&self) -> String {
+        anthropic::mcp_result_text(self.is_error, &self.texts)
     }
 }
 
@@ -147,11 +143,13 @@ impl From<String> for Refused {
 }
 
 /// Opens the request's MCP servers and adds their tools to its chat body (`None`: it names
-/// none). `caller`: the verdicts of the HTTP request that carries it. The error is the reason
-/// the request is refused; nothing is sent to any server before admission lets it run.
+/// none). `caller`: the verdicts of the HTTP request that carries it; `body`: the Messages body
+/// `t` was translated from. The error is the reason the request is refused; nothing is sent to
+/// any server before admission lets it run.
 pub(super) fn open_server_tools<'a>(
     state: &'a AppState,
     caller: Caller,
+    body: &JsonValue,
     t: &mut Translated,
 ) -> Result<Option<Connector<'a>>, Refused> {
     let asked = t.mcp.len() as u64;
@@ -193,6 +191,12 @@ pub(super) fn open_server_tools<'a>(
         )
         .into());
     }
+    // a tool search result in the history may name one of the servers' tools (a deferred one
+    // above all): the history is translated again, now that their definitions are known
+    if anthropic::has_tool_reference(body) {
+        let known: Vec<JsonValue> = c.offered.iter().chain(&c.deferred).cloned().collect();
+        *t = anthropic::translate_with(body, &known)?;
+    }
     extend_list(&mut t.chat, "tools", c.offered.clone());
     extend_list(&mut t.chat, "gaudium_hidden_tools", c.deferred.clone());
     t.ignored.extend(c.notes.iter().cloned());
@@ -205,6 +209,7 @@ pub(super) fn open_server_tools<'a>(
 pub(super) fn run_messages(
     state: &Arc<AppState>,
     caller: Caller,
+    body: &JsonValue,
     mut t: Translated,
     stream: &mut Conn,
 ) {
@@ -213,7 +218,7 @@ pub(super) fn run_messages(
         begun: false,
     };
     let client = chat_tool_names(&t.chat);
-    let mut tools = match open_server_tools(state, caller, &mut t) {
+    let mut tools = match open_server_tools(state, caller, body, &mut t) {
         Ok(Some(c)) => c,
         Ok(None) => {
             run_chat(state, &t.chat, stream, api, t.ignored, None);
@@ -298,6 +303,12 @@ fn run_loop(
         ..
     } = t;
     let stream_mode = chat.get("stream").and_then(JsonValue::as_bool) == Some(true);
+    // the request's output limit holds for the whole reply, over every round (0 or none: the
+    // chat path's own limit, the end of the context)
+    let limit = chat
+        .get("max_tokens")
+        .and_then(JsonValue::as_u64)
+        .filter(|&v| v > 0);
     let mut rounds = Rounds {
         builder: Some(anthropic::Builder::new(show_thinking).with_server_tools(labels)),
         end: None,
@@ -326,6 +337,7 @@ fn run_loop(
         input += pc_prefill_rows(end.prompt_tokens, end.reused);
         cached += pc_reused_rows(end.prompt_tokens, end.reused);
         output += end.output_tokens;
+        let left = sv_tokens_left(limit.unwrap_or(0), output);
         let (id, model) = first
             .get_or_insert_with(|| (end.id.clone(), end.model.clone()))
             .clone();
@@ -356,6 +368,9 @@ fn run_loop(
             calls_run += take as u64;
             let (mut calls, mut results) = (Vec::new(), Vec::new());
             for (i, c) in server.iter().enumerate() {
+                if write_failed {
+                    return; // the client is gone: no further call is sent anywhere
+                }
                 let block_id = b.call_block_id(&c.id, &c.name);
                 let args = parse_json(&c.arguments)
                     .ok()
@@ -398,11 +413,16 @@ fn run_loop(
             if write_failed {
                 return; // the client is gone
             }
-            if sv_goes_on(next) {
+            if sv_round_goes_on(next, limit.is_some(), left) {
                 next_round_chat(&mut chat, &end, calls, results);
+                if limit.is_some() {
+                    set_field(&mut chat, "max_tokens", Some(JsonValue::Int(left as i64)));
+                }
                 continue;
             }
-            if sv_waits_client(next) {
+            if sv_budget_spent(next, limit.is_some(), left) {
+                "max_tokens" // the request's output limit is spent over the rounds
+            } else if sv_waits_client(next) {
                 "tool_use" // the client's own calls wait for it
             } else {
                 "pause_turn" // no round is left: the client may send the reply back to go on

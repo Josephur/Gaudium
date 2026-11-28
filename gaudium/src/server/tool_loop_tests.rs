@@ -159,6 +159,10 @@ fn answer(req: &Seen, s: &mut TcpStream) {
                 .and_then(JsonValue::as_str)
                 .unwrap_or("?")
                 .to_string();
+            // a slow tool: the answer comes after a while
+            if zone == "SLOW" {
+                thread::sleep(std::time::Duration::from_millis(200));
+            }
             let body = format!(
                 "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{}}}}\n\n\
                  event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"12:00 in {zone}\"}}],\"isError\":false}}}}\n\n"
@@ -392,10 +396,11 @@ fn the_round_bound_pauses_the_turn() {
         h.script(ROUND_CALL);
     }
     let before = h.prompts.lock().unwrap().len();
+    // the output limit holds over every round: it leaves room for all of them here
     let (status, text) = h.post(
         "/v1/messages",
         &format!(
-            r#"{{"max_tokens":256,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+            r#"{{"max_tokens":4096,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
             servers(&mcp.url())
         ),
     );
@@ -610,4 +615,138 @@ fn the_servers_own_page_runs_the_mcp_servers() {
         "{text}"
     );
     assert!(mcp.seen().iter().any(|x| x.rpc() == "tools/call"));
+}
+
+/// `max_tokens` with the tokens of the first round, plus `extra`.
+fn first_round_plus(h: &Harness, extra: u64) -> u64 {
+    h.state.models[0].tokenizer.encode(ROUND_CALL, true).len() as u64 + extra
+}
+
+#[test]
+fn the_output_limit_holds_over_every_round() {
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    // the first round fits, and leaves 3 tokens for the second
+    let max = first_round_plus(&h, 3);
+    assert!(h.state.models[0].tokenizer.encode(ROUND_END, true).len() > 3);
+    h.script(ROUND_CALL);
+    h.script(ROUND_END);
+    let (status, text) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"max_tokens":{max},{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert_eq!(at(&r, &["gaudium_tool_loop", "rounds"]).as_u64(), Some(2));
+    // the second round had only what was left: the reply is cut there
+    assert_eq!(s(&r, &["stop_reason"]), "max_tokens", "{text}");
+    let out = at(&r, &["usage", "output_tokens"]).as_u64().unwrap();
+    assert!(out <= max, "{out} output tokens over a limit of {max}");
+
+    // a first round that spends the whole limit: its calls run, and no round follows
+    let h = harness_with_proxy("127.0.0.1");
+    let max = first_round_plus(&h, 0);
+    h.script(ROUND_CALL);
+    h.script(ROUND_END);
+    let before = h.prompts.lock().unwrap().len();
+    let (status, text) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"max_tokens":{max},{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert_eq!(h.prompts.lock().unwrap().len() - before, 1);
+    assert_eq!(s(&r, &["stop_reason"]), "max_tokens", "{text}");
+    let blocks = at(&r, &["content"]).as_array().unwrap();
+    assert_eq!(kinds(blocks).last().map(String::as_str), Some("mcp_tool_result"));
+    assert!(at(&r, &["usage", "output_tokens"]).as_u64().unwrap() <= max);
+}
+
+#[test]
+fn no_call_is_sent_once_the_client_is_gone() {
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    let call = |zone: &str| {
+        format!("<tool_call>\n<function=mcp__clock__get_time>\n<parameter=zone>\n{zone}\n</parameter>\n</function>\n</tool_call>")
+    };
+    h.script(&format!(
+        "Three.\n</think>\n\n{}\n{}\n{}",
+        call("SLOW"),
+        call("UTC"),
+        call("CET")
+    ));
+    h.script(ROUND_END);
+    let body = format!(
+        r#"{{"stream":true,"max_tokens":4096,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+        servers(&mcp.url())
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::clone(&h.state);
+    let server = thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        handle_connection(state, s);
+    });
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    write!(
+        c,
+        "POST /v1/messages HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    // the client reads the round up to its third call, and goes away while the first (slow) call
+    // runs
+    let mut seen = Vec::new();
+    while String::from_utf8_lossy(&seen)
+        .matches("\"type\":\"mcp_tool_use\"")
+        .count()
+        < 3
+    {
+        let mut b = [0u8; 4096];
+        match c.read(&mut b) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen.extend_from_slice(&b[..n]),
+        }
+    }
+    thread::sleep(std::time::Duration::from_millis(50));
+    drop(c);
+    server.join().unwrap();
+    let calls = mcp.seen().iter().filter(|x| x.rpc() == "tools/call").count();
+    // the result that found the client gone is the last: the calls after it are never sent
+    // (the write that finds the connection closed is the first or the second one after it)
+    assert!(calls < 3, "{calls} calls sent after the client went away");
+}
+
+#[test]
+fn a_tool_reference_finds_a_deferred_mcp_tool() {
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    h.script("</think>\n\nOk.");
+    let (status, text) = h.post(
+        "/v1/messages",
+        &format!(
+            r#"{{"max_tokens":64,{},"tools":[{{"name":"search","input_schema":{{"type":"object"}}}},
+                {{"type":"mcp_toolset","mcp_server_name":"clock","configs":{{"get_time":{{"defer_loading":true}}}}}}],
+              "messages":[{{"role":"user","content":"Find a clock tool"}},
+                {{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"search","input":{{}}}}]}},
+                {{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":[{{"type":"tool_reference","tool_name":"mcp__clock__get_time"}}]}}]}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    assert_eq!(status, 200, "{text}");
+    let p = h.last_prompt();
+    assert!(
+        p.contains("Tool mcp__clock__get_time is now available:"),
+        "{p}"
+    );
+    assert!(p.contains("The time."), "{p}");
+    assert!(!p.contains("is not available"), "{p}");
 }

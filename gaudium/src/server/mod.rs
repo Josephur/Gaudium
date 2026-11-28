@@ -3656,7 +3656,7 @@ fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) 
     match anthropic::translate(&val) {
         Ok(t) => {
             let caller = state.proxy.caller(req, check_auth(&state.cfg, req));
-            tool_loop::run_messages(state, caller, t, stream);
+            tool_loop::run_messages(state, caller, &val, t, stream);
         }
         Err(e) => api.error(stream, 400, "invalid_request_error", &e),
     }
@@ -3682,7 +3682,7 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut Conn)
         .map_err(tool_loop::Refused::from)
         .and_then(|mut t| {
             // the MCP servers' tools are part of the prompt: they are listed for the count too
-            let _tools = tool_loop::open_server_tools(state, caller, &mut t)?;
+            let _tools = tool_loop::open_server_tools(state, caller, &val, &mut t)?;
             let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
             let p = prepare_prompt(state.cfg.a2ui, m, &t.chat)?;
             Ok(tokenize_prompt(m, &p, false).map(|(ids, _)| ids.len())?)

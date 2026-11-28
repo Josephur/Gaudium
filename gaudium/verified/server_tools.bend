@@ -9,6 +9,8 @@
 #     whether it generates again, within a bound on the rounds
 #   - The bounds on the calls run per request, on the size of one tool result put back into the
 #     prompt, and on the pages of a server's tool list
+#   - The request's output-token limit over the rounds: what each round may generate, and when
+#     the reply stops because the limit is spent
 
 import Base
 import nat_lemmas.bend as L
@@ -661,3 +663,213 @@ law sv_list_follows_cursor:
 
 def sv_list_follows_cursor(n, d):
   sv_lt_add_succ(n, d)
+
+# ============================================================================
+# 5. The request's output-token limit across rounds
+# ============================================================================
+
+# The output tokens the next round may generate: what is left of the request's limit `most`
+# after the `used` tokens of the rounds before.
+def sv_tokens_left(most: Nat, used: Nat) -> Nat:
+  Nat.sub(most, used)
+
+# Whether the loop generates another round: the round's decision goes on (`sv_goes_on`), and the
+# request has output tokens left. `limited`: the request set an output limit; `left`: what is
+# left of it (`sv_tokens_left`).
+def sv_round_goes_on(n: SvNext, limited: Bool, left: Nat) -> Bool:
+  match limited:
+    case False{}:
+      sv_goes_on(n)
+    case True{}:
+      Bool.and(sv_goes_on(n), Nat.is_gt(left, 0n))
+
+# The round's decision goes on, but the request's output limit is spent: the reply stops there,
+# for the limit (`max_tokens`).
+def sv_budget_spent(n: SvNext, limited: Bool, left: Nat) -> Bool:
+  match limited:
+    case False{}:
+      False{}
+    case True{}:
+      Bool.and(sv_goes_on(n), Nat.is_eq(left, 0n))
+
+# LAW 5.1: A round is never given more output tokens than are left of the request's limit.
+# promise: a round is never given more output tokens than are left of the request's limit after the rounds before
+# harm: one reply could generate many times the max_tokens its client asked for
+# catches: sv_tokens_left answers `most` alone (every round given the whole limit)
+law sv_left_within_limit:
+  for +m: Nat
+  for +u: Nat
+  {Nat.is_le(sv_tokens_left(m, u), Nat.sub(m, u)) == True{} : Bool}
+
+def sv_left_within_limit(m, u):
+  L.nat_le_refl(Nat.sub(m, u))
+
+# LAW 5.2: While tokens are left, the next round may generate.
+# promise: while output tokens are left of the request's limit, the next round is given at least one
+# catches: sv_tokens_left one short (Nat.pred(Nat.sub(most, used)))
+law sv_left_while_unspent:
+  for +u: Nat
+  for +r: Nat
+  {Nat.is_gt(sv_tokens_left(Nat.add(u, 1n+r), u), 0n) == True{} : Bool}
+
+def sv_left_while_unspent(u, r):
+  %Equal.sym(Nat, Nat.sub(Nat.add(u, 1n+r), u), 1n+r, L.nat_add_sub_cancel_l(u, 1n+r)) : {Nat.is_gt(_, 0n) == True{} : Bool}
+  {==}
+
+# LAW 5.3: No round once the limit is spent.
+# promise: once the request's output-token limit is spent, the loop never generates another round
+# harm: a round given no limit (0 means none to the chat path) would generate to the end of the context
+# catches: sv_round_goes_on answers sv_goes_on(n) alone (the limit ignored)
+law sv_spent_never_goes_on:
+  for +n: SvNext
+  {sv_round_goes_on(n, True{}, 0n) == False{} : Bool}
+
+def sv_spent_never_goes_on(n):
+  match n:
+    case SvStop{}: {==}
+    case SvRunGoOn{}: {==}
+    case SvRunStop{}: {==}
+    case SvRunPause{}: {==}
+
+# LAW 5.4: The limit never makes a round the round's own decision stops.
+# promise: the loop never generates a round that the round's own decision stops, whatever is left of the limit
+# catches: sv_round_goes_on answers the tokens-left check alone (the round decision ignored)
+law sv_round_within_rules:
+  for +n: SvNext
+  for +b: Bool
+  for +l: Nat
+  {Bool.and(sv_round_goes_on(n, b, l), Bool.not(sv_goes_on(n))) == False{} : Bool}
+
+def sv_round_within_rules(n, b, l):
+  match n:
+    case SvRunGoOn{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+    case SvStop{}:
+      match b:
+        case False{}: {==}
+        case True{}: {==}
+    case SvRunStop{}:
+      match b:
+        case False{}: {==}
+        case True{}: {==}
+    case SvRunPause{}:
+      match b:
+        case False{}: {==}
+        case True{}: {==}
+
+# LAW 5.5: With tokens left, the loop goes on as the round decided.
+# promise: a round the round's decision continues generates again while output tokens are left of the limit
+# catches: sv_round_goes_on off by one (Nat.is_gt(left, 1n): the last token left never used)
+law sv_left_goes_on:
+  for +b: Bool
+  for +l: Nat
+  {sv_round_goes_on(SvRunGoOn{}, b, 1n+l) == True{} : Bool}
+
+def sv_left_goes_on(b, l):
+  match b:
+    case False{}: {==}
+    case True{}: {==}
+
+# LAW 5.6: Without a limit, the loop goes on as the round decided.
+# promise: a request without an output limit generates its rounds as the round decision says, without a token bound
+# catches: sv_round_goes_on ignores `limited` (a request without a limit stops after its first round)
+law sv_unlimited_goes_on:
+  for +l: Nat
+  {sv_round_goes_on(SvRunGoOn{}, False{}, l) == True{} : Bool}
+
+def sv_unlimited_goes_on(l):
+  {==}
+
+# LAW 5.7: The reply stops for the limit only when the limit is set and spent.
+# promise: the reply stops for the output limit only when the request set one and none of it is left
+# catches: sv_budget_spent answers sv_goes_on(n) alone (max_tokens while tokens are left)
+law sv_spent_only_when_spent:
+  for +n: SvNext
+  for +b: Bool
+  for +l: Nat
+  {Bool.and(sv_budget_spent(n, b, l), Bool.or(Bool.not(b), Nat.is_gt(l, 0n))) == False{} : Bool}
+
+def sv_spent_only_when_spent(n, b, l):
+  match n:
+    case SvStop{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+    case SvRunGoOn{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+    case SvRunStop{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+    case SvRunPause{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+
+# LAW 5.8: A round that stops on its own keeps its stop reason.
+# promise: a round whose own decision stops (client calls waiting, no round left, nothing to run) never stops for the output limit instead
+# catches: sv_budget_spent answers the tokens-left check alone (tool_use or pause_turn reported as max_tokens)
+law sv_spent_keeps_stop_reason:
+  for +n: SvNext
+  for +b: Bool
+  for +l: Nat
+  {Bool.and(sv_budget_spent(n, b, l), Bool.not(sv_goes_on(n))) == False{} : Bool}
+
+def sv_spent_keeps_stop_reason(n, b, l):
+  match n:
+    case SvStop{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+    case SvRunGoOn{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+    case SvRunStop{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+    case SvRunPause{}:
+      match b:
+        case False{}: {==}
+        case True{}:
+          match l:
+            case 0n: {==}
+            case 1n+lp: {==}
+
+# LAW 5.9: A spent limit is named as the stop reason.
+# promise: a reply whose round decision goes on but whose output limit is spent stops for the limit
+# catches: sv_budget_spent answers False{} always (a spent limit reported as pause_turn)
+law sv_spent_says_so:
+  {sv_budget_spent(SvRunGoOn{}, True{}, 0n) == True{} : Bool}
+
+def sv_spent_says_so():
+  {==}
