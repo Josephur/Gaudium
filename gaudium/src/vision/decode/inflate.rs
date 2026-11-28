@@ -17,9 +17,8 @@
 /// Inflates a zlib stream. `max_out`: refuse (Err) as soon as the output would exceed this
 /// many bytes.
 ///
-/// The PNG decoder uses the prefix form below, so without another caller this strict form is
-/// only reached from tests.
-#[allow(dead_code)]
+/// The PDF reader's FlateDecode uses this strict form; the PNG decoder uses the prefix form
+/// below.
 pub fn zlib_decompress(data: &[u8], max_out: usize) -> Result<Vec<u8>, String> {
     inflate_zlib(data, max_out, 0, AtLimit::Refuse)
 }

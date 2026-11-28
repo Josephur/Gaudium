@@ -353,6 +353,34 @@ fn print_usage() {
          \x20                       that a front end does not cut it\n\
          \x20 --mcp-proxy-ca <file>  PEM certificate authorities the proxy trusts for https targets\n\
          \x20                       besides the system's (an MCP server with a private certificate)\n\
+         \x20 --pdf-max-mb <N>      Largest PDF read from a request, in MiB (default: 32). PDFs\n\
+         \x20                       arrive as Messages document blocks (base64, or a url fetched\n\
+         \x20                       through the MCP proxy's rules when --mcp-proxy is on) and as\n\
+         \x20                       chat file parts (file_data); the model reads their text layer,\n\
+         \x20                       page by page. A PDF without one (scanned pages), an encrypted\n\
+         \x20                       one, or one over a limit is refused with a 400 that says why\n\
+         \x20 --pdf-max-pages <N>   Most pages read from one PDF (default: 500)\n\
+         \x20 --pdf-max-inflate-mb <N>  Most bytes one PDF's streams may decode to, in MiB, every\n\
+         \x20                       read of a stream counted, filtered or not (default: 256).\n\
+         \x20                       Also, each on its own: the most bytes its object parses may\n\
+         \x20                       read and their objects take, and the most text it may yield;\n\
+         \x20                       the text all the documents of one request keep together is\n\
+         \x20                       capped at the same number\n\
+         \x20 --pdf-max-forms <N>   Most form XObjects one PDF may draw, all pages together, a\n\
+         \x20                       form drawn again counted again (default: 100000)\n\
+         \x20 --pdf-max-work <N>    Most steps of work the reader may take over one PDF's\n\
+         \x20                       structure, whatever the kind (default: 20000000): each\n\
+         \x20                       page-tree node visited, object resolved, stream read, filter\n\
+         \x20                       stage, array element, width or CMap entry and content-stream\n\
+         \x20                       operator is a step, counted again each time it is reached\n\
+         \x20 --pdf-max-heap-mb <N>  Most heap the reader may hold while it reads one PDF, in\n\
+         \x20                       MiB, as the allocator counts it on the reading thread\n\
+         \x20                       (default: 1024): checked at every charge of the budgets above,\n\
+         \x20                       so memory no budget covers is still refused. The documents of\n\
+         \x20                       one request hold at most this much together, each read\n\
+         \x20                       counted with what the request held before it\n\
+         \x20 --pdf-max-docs <N>    Most documents (PDFs and text files, Messages document blocks\n\
+         \x20                       and chat file parts) one request may carry (default: 100)\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \x20 --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the\n\
          \x20                       last 64 chat requests (job, reply id, endpoint, model,\n\
@@ -2564,6 +2592,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut files_max_mb: Option<f64> = None;
     let mut files_max_count: Option<u64> = None;
     let mut mcp_proxy = ProxyOptions::default();
+    let mut pdf = gaudium::pdf::Limits::default();
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut tls_http = gaudium::core::listener::PlainHttpMode::LsHttpRedirect;
@@ -2885,6 +2914,69 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             "--mcp-proxy-ca" => {
                 mcp_proxy.ca_file = Some(PathBuf::from(next_val(&mut i, "--mcp-proxy-ca")?))
             }
+            "--pdf-max-mb" => {
+                let s = next_val(&mut i, "--pdf-max-mb")?;
+                pdf.max_bytes = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=4096).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-mb '{s}' (MiB, 1 to 4096)"))?
+                    << 20;
+            }
+            "--pdf-max-pages" => {
+                let s = next_val(&mut i, "--pdf-max-pages")?;
+                pdf.max_pages = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=1_000_000).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-pages '{s}' (1 to 1000000)"))?;
+            }
+            "--pdf-max-inflate-mb" => {
+                let s = next_val(&mut i, "--pdf-max-inflate-mb")?;
+                pdf.max_decoded = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=65_536).contains(&n))
+                    .ok_or_else(|| {
+                        format!("invalid --pdf-max-inflate-mb '{s}' (MiB, 1 to 65536)")
+                    })?
+                    << 20;
+            }
+            "--pdf-max-heap-mb" => {
+                let s = next_val(&mut i, "--pdf-max-heap-mb")?;
+                pdf.max_heap = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=1_048_576).contains(&n))
+                    .ok_or_else(|| {
+                        format!("invalid --pdf-max-heap-mb '{s}' (MiB, 1 to 1048576)")
+                    })?
+                    << 20;
+            }
+            "--pdf-max-docs" => {
+                let s = next_val(&mut i, "--pdf-max-docs")?;
+                pdf.max_docs = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=100_000).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-docs '{s}' (1 to 100000)"))?;
+            }
+            "--pdf-max-forms" => {
+                let s = next_val(&mut i, "--pdf-max-forms")?;
+                pdf.max_forms = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=100_000_000).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-forms '{s}' (1 to 100000000)"))?;
+            }
+            "--pdf-max-work" => {
+                let s = next_val(&mut i, "--pdf-max-work")?;
+                pdf.max_work = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=10_000_000_000).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-work '{s}' (1 to 10000000000)"))?;
+            }
             "--verbose" => verbose = true,
             "--debug-endpoints" => debug_endpoints = true,
             "--files-dir" => files_dir = Some(PathBuf::from(next_val(&mut i, "--files-dir")?)),
@@ -3006,6 +3098,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         vision_max_tokens,
         prefix_slots,
         mcp_proxy,
+        pdf,
         tls_cert,
         tls_key,
         tls_http,

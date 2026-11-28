@@ -1570,6 +1570,25 @@ d9c2a2fe466391df  media_oversized_refused  law media_oversized_refused : for + m
 25c6c5b940cf3cbe  media_remote_follows_setting  law media_remote_follows_setting : for a : Bool { media_source_allowed ( MsRemote { } , a ) == a : Bool }
 ef45a806ccc81bf8  media_zero_height_refused  law media_zero_height_refused : for + w : Nat for m : Nat { media_canvas_ok ( w , 0n , m ) == False { } : Bool }
 61de762b8557772c  media_zero_width_refused  law media_zero_width_refused : for h : Nat for m : Nat { media_canvas_ok ( 0n , h , m ) == False { } : Bool }
+1e1601cd522a8172  meter_owns_before_next  law meter_owns_before_next : for + s : Nat for + d : Nat for + e : Nat { meter_owns ( s , Nat.add ( s , d ) , True { } , Nat.add ( Nat.add ( s , d ) , 1n + e ) ) == True { } : Bool }
+# promise meter_owns_before_next: a frame with another frame on top of it owns the blocks recorded between its own start and that frame's start.
+e049c14e75e46d17  meter_owns_earlier_refused  law meter_owns_earlier_refused : for + s : Nat for + d : Nat for later : Bool for + next : Nat { meter_owns ( Nat.add ( s , 1n + d ) , s , later , next ) == False { } : Bool }
+# promise meter_owns_earlier_refused: a frame never owns a block recorded before it started, so releasing memory allocated before the meter (or by an enclosing frame) never lowers its count.
+# harm meter_owns_earlier_refused: a request could free its own body's buffers to cancel the heap its documents hold and keep more than its cap.
+a295fd1082346b8e  meter_owns_later_refused  law meter_owns_later_refused : for + start : Nat for + next : Nat for + d : Nat { meter_owns ( start , Nat.add ( next , d ) , True { } , next ) == False { } : Bool }
+# promise meter_owns_later_refused: while a frame started inside another is on, the outer frame never owns a block recorded by the inner one.
+# harm meter_owns_later_refused: a release inside a document read could credit the request's count for the read's own block and let the two counts drift apart.
+900788ee659f28a1  meter_owns_own_block  law meter_owns_own_block : for + s : Nat for + d : Nat for + next : Nat { meter_owns ( s , Nat.add ( s , d ) , False { } , next ) == True { } : Bool }
+# promise meter_owns_own_block: the top frame owns every block recorded since it started.
+a041942959670dbc  meter_regrow_charges  law meter_regrow_charges : for + c : Nat for + o : Nat for + n : Nat { Bool.and ( Nat.is_le ( c , o ) , Nat.is_lt ( Nat.add ( meter_regrow ( c , o , n ) , Nat.sub ( o , n ) ) , Nat.add ( c , Nat.sub ( n , o ) ) ) ) == False { } : Bool }
+# promise meter_regrow_charges: a reallocation charges every byte it adds and credits no more than the bytes it removes (new charge plus bytes removed is at least old charge plus bytes added).
+# harm meter_regrow_charges: growing a block under the meter without charging the growth, or shrinking it to credit more than it gave back, would let a document hold heap its count does not show.
+063c48175a2d6f02  meter_regrow_inside  law meter_regrow_inside : for + c : Nat for + o : Nat for + n : Nat { Bool.and ( Nat.is_le ( c , o ) , Nat.is_lt ( n , meter_regrow ( c , o , n ) ) ) == False { } : Bool }
+# promise meter_regrow_inside: a reallocated block is never charged for more bytes than its new size, when it was charged no more than its old size.
+# harm meter_regrow_inside: a charge above the block's size would later be credited against blocks the frame still holds.
+8bebe05ee4c99e35  meter_regrow_no_overcharge  law meter_regrow_no_overcharge : for + c : Nat for + o : Nat for + n : Nat { Nat.is_lt ( Nat.add ( c , Nat.sub ( n , o ) ) , meter_regrow ( c , o , n ) ) == False { } : Bool }
+# promise meter_regrow_no_overcharge: a reallocation never charges more than the block was charged plus the bytes it adds.
+# harm meter_regrow_no_overcharge: a block allocated before the meter would be charged its whole size when it grows, and a request refused for memory it never allocated.
 a9143821fed967ff  ml_last_page_reaches_end  law ml_last_page_reaches_end : for + n : Nat for + lo : Nat for + hi : Nat for + p : Nat for nm : { ml_more ( n , lo , hi , 1n + p ) == False { } : Bool } { Bool.or ( Nat.is_le ( Nat.min ( hi , n ) , lo ) , ml_on_page ( Nat.sub ( Nat.min ( hi , n ) , 1n ) , n , lo , hi , 1n + p , False { } ) ) == True { } : Bool }
 # promise ml_last_page_reaches_end: a forward page of at least one entry that does not say more entries follow ends at the last entry before the before_id cursor or the list's end
 # harm ml_last_page_reaches_end: a client would stop paging one entry short
@@ -1793,6 +1812,86 @@ a4f605578c25a7c8  pc_writing_not_readable  law pc_writing_not_readable : for + s
 1fe2bf0db086bfba  pc_writing_slot_not_usable  law pc_writing_slot_not_usable : for + t : Nat for + r : Bool for + m : Bool { pc_class_usable ( pc_victim_class ( PcWriting { t } , r , m ) ) == False { } : Bool }
 d34f2537e2e6aec8  pc_zeroed_rows_never_reused  law pc_zeroed_rows_never_reused : for + w : Bool for + s : Bool { pc_request_may_reuse ( w , True { } , s ) == False { } : Bool }
 1bca3abfb4f4fd87  pc_zeroed_table_is_void  law pc_zeroed_table_is_void : for + s : Bool { pc_table_void ( True { } , s ) == True { } : Bool }
+543ab574ece21582  pdf_below_inside_accepted  law pdf_below_inside_accepted : for + x : Nat for + r : Nat { pdf_below ( x , Nat.add ( x , 1n + r ) ) == True { } : Bool }
+# promise pdf_below_inside_accepted: a depth or count below the limit may always grow by one more.
+d697aad72e376926  pdf_below_within  law pdf_below_within : for + x : Nat for + m : Nat { Bool.and ( pdf_below ( x , m ) , Nat.is_le ( m , x ) ) == False { } : Bool }
+# promise pdf_below_within: a depth or count the limit check lets grow is always below the limit.
+# harm pdf_below_within: hostile nesting could recurse past the stack, or a page tree could yield more pages than configured.
+28724d9a130c7b38  pdf_budget_charge_counts_accepted  law pdf_budget_charge_counts_accepted : for + u : Nat for + n : Nat for + r : Nat { pdf_budget_charge ( u , n , Nat.add ( Nat.add ( u , n ) , r ) ) == pdf_budget_take ( u , n ) : Nat }
+# promise pdf_budget_charge_counts_accepted: a charge that fits is counted in full.
+# harm pdf_budget_charge_counts_accepted: a charge that fits but is not counted would let many small steps run past the cap.
+4361f8a6d0cb020b  pdf_budget_charge_refused_keeps  law pdf_budget_charge_refused_keeps : for + u : Nat for + n : Nat for + m : Nat { Bool.pick ( Nat , pdf_budget_fits ( u , n , m ) , u , pdf_budget_charge ( u , n , m ) ) == u : Nat }
+# promise pdf_budget_charge_refused_keeps: a charge the budget refuses leaves its spend as it was.
+# harm pdf_budget_charge_refused_keeps: a refused charge that filled or reset the budget would refuse the rest of a good document, or let a later charge past the cap.
+124dea063532290f  pdf_budget_charge_within  law pdf_budget_charge_within : for + u : Nat for + d : Nat for + n : Nat { Nat.is_le ( pdf_budget_charge ( u , n , Nat.add ( u , d ) ) , Nat.add ( u , d ) ) == True { } : Bool }
+# promise pdf_budget_charge_within: while a budget is not overspent, no charge, counted or refused, takes its spend past the budget.
+# harm pdf_budget_charge_within: hostile input could make the reader take more steps, or hold more memory, than configured.
+3b94f5a6c2b91292  pdf_budget_inside_accepted  law pdf_budget_inside_accepted : for + u : Nat for + n : Nat for + r : Nat { pdf_budget_fits ( u , n , Nat.add ( Nat.add ( u , n ) , r ) ) == True { } : Bool }
+# promise pdf_budget_inside_accepted: every charge that fits in the bytes the budget has left is accepted.
+572fc7558c1c3f2f  pdf_budget_room_covers  law pdf_budget_room_covers : for + u : Nat for + d : Nat { Nat.is_le ( d , pdf_budget_room ( u , Nat.add ( u , d ) ) ) == True { } : Bool }
+# promise pdf_budget_room_covers: the room a budget leaves covers everything it has left.
+# harm pdf_budget_room_covers: a room smaller than what is left would refuse decodes the budget still holds (every compressed PDF, with a room of one byte).
+e1c1ab8c97071c81  pdf_budget_room_fits  law pdf_budget_room_fits : for + u : Nat for + d : Nat for + r : Nat { pdf_budget_fits ( u , Nat.sub ( pdf_budget_room ( u , Nat.add ( u , d ) ) , r ) , Nat.add ( u , d ) ) == True { } : Bool }
+# promise pdf_budget_room_fits: while the budget is not overspent, every decode no larger than the room it leaves is accepted.
+7dd59611a763685d  pdf_budget_spent_counts  law pdf_budget_spent_counts : for + f : Nat for + d : Nat { pdf_budget_spent ( f , Nat.add ( f , d ) ) == d : Nat }
+# promise pdf_budget_spent_counts: what a lexer charged since it started is exactly what its budget spent since then.
+# harm pdf_budget_spent_counts: an undercount would let the objects of a parse go uncharged; an overcount would charge the earlier spend again and refuse good files.
+7928f2e7f0dd417f  pdf_budget_take_counts_all  law pdf_budget_take_counts_all : for + u : Nat for + n : Nat { Nat.sub ( pdf_budget_take ( u , n ) , u ) == n : Nat }
+# promise pdf_budget_take_counts_all: a decode adds exactly its bytes to the bytes spent, no fewer.
+# harm pdf_budget_take_counts_all: an undercounted spend would let many streams together decode past the budget (a zip bomb split over streams).
+336cd157e19ca00f  pdf_budget_take_keeps_spent  law pdf_budget_take_keeps_spent : for + u : Nat for + n : Nat { Nat.is_le ( u , pdf_budget_take ( u , n ) ) == True { } : Bool }
+# promise pdf_budget_take_keeps_spent: a charge never lowers what a budget has spent, a charge of nothing included.
+# harm pdf_budget_take_keeps_spent: a zero charge (an empty stream, an empty stage) that reset the spend would reopen a bomb split over streams.
+eb66daee20514a73  pdf_budget_within  law pdf_budget_within : for + u : Nat for + n : Nat for + m : Nat { Bool.and ( pdf_budget_fits ( u , n , m ) , Nat.is_lt ( m , pdf_budget_take ( u , n ) ) ) == False { } : Bool }
+# promise pdf_budget_within: a decode the budget accepts never takes the bytes spent past the budget.
+# harm pdf_budget_within: a zip bomb could make the reader hold more decompressed bytes than configured.
+ec84a8f722ea0fdd  pdf_count_inside_accepted  law pdf_count_inside_accepted : for + n : Nat for + ep : Nat for + r : Nat { pdf_count_fits ( n , 1n + ep , Nat.add ( Nat.mul ( n , 1n + ep ) , r ) ) == True { } : Bool }
+# promise pdf_count_inside_accepted: n entries of a nonzero size are accepted whenever the available bytes hold them all.
+8b4887549c503f5e  pdf_count_within  law pdf_count_within : for + n : Nat for + e : Nat for + a : Nat { Bool.and ( pdf_count_fits ( n , e , a ) , Nat.is_lt ( a , Nat.mul ( n , e ) ) ) == False { } : Bool }
+# promise pdf_count_within: n entries of e bytes that the count check accepts never need more than the available bytes.
+# harm pdf_count_within: a hostile entry count could make the reader allocate or walk past the decoded data.
+92417eb484472e06  pdf_objstm_inside_accepted  law pdf_objstm_inside_accepted : for + f : Nat for + o : Nat for + r : Nat { pdf_objstm_ok ( f , o , Nat.add ( Nat.add ( f , o ) , 1n + r ) ) == True { } : Bool }
+# promise pdf_objstm_inside_accepted: every object that starts inside the decoded data after the header is accepted.
+d862d8ded703a7ef  pdf_objstm_pos_first  law pdf_objstm_pos_first : for + f : Nat { pdf_objstm_pos ( f , 0n ) == f : Nat }
+# promise pdf_objstm_pos_first: the object at offset zero of an object stream starts right after its header (the file format's layout).
+95bb44865538dc8b  pdf_objstm_pos_step  law pdf_objstm_pos_step : for + f : Nat for + o : Nat { pdf_objstm_pos ( f , 1n + o ) == 1n + pdf_objstm_pos ( f , o ) : Nat }
+# promise pdf_objstm_pos_step: an object's place in an object stream moves byte for byte with its offset (the file format's layout).
+ff41de95af8dc5f4  pdf_objstm_within  law pdf_objstm_within : for + f : Nat for + o : Nat for + d : Nat { Bool.and ( pdf_objstm_ok ( f , o , d ) , Nat.is_le ( d , pdf_objstm_pos ( f , o ) ) ) == False { } : Bool }
+# promise pdf_objstm_within: an object the reader takes from an object stream always starts inside the stream's decoded data.
+# harm pdf_objstm_within: a hostile /First or object offset could index past the decoded data.
+1f5013bb29b625f1  pdf_predict_inside_accepted  law pdf_predict_inside_accepted : for + l : Nat for + rp : Nat for + x : Nat { pdf_predict_fits ( l , 1n + rp , Nat.add ( Nat.mul ( pdf_predict_rows ( l , 1n + rp ) , 1n + rp ) , x ) ) == True { } : Bool }
+# promise pdf_predict_inside_accepted: a predictor over rows of a nonzero width is accepted whenever the room holds its work.
+d8ac337535d8be04  pdf_predict_rows_cover  law pdf_predict_rows_cover : for + l : Nat for + r : Nat { Nat.is_le ( l , Nat.mul ( pdf_predict_rows ( l , r ) , 1n + r ) ) == True { } : Bool }
+# promise pdf_predict_rows_cover: the rows a PNG predictor walks cover every byte of its data.
+# harm pdf_predict_rows_cover: bytes past the last row would be dropped from a decoded xref stream or content stream.
+333ce7a06d8c247c  pdf_predict_rows_tight  law pdf_predict_rows_tight : for + l : Nat for + r : Nat { Nat.is_le ( Nat.mul ( pdf_predict_rows ( l , r ) , 1n + r ) , Nat.add ( l , r ) ) == True { } : Bool }
+# promise pdf_predict_rows_tight: a PNG predictor walks no row that starts past the end of its data.
+# harm pdf_predict_rows_tight: an extra row would be walked (and charged) for bytes the stream does not have.
+061c26314f7e7124  pdf_predict_within  law pdf_predict_within : for + l : Nat for + r : Nat for + m : Nat { Bool.and ( pdf_predict_fits ( l , r , m ) , Nat.is_lt ( m , Nat.mul ( pdf_predict_rows ( l , r ) , r ) ) ) == False { } : Bool }
+# promise pdf_predict_within: the work a PNG predictor is allowed (its rows times the row width) never exceeds the room it was checked against.
+# harm pdf_predict_within: a tiny stream declaring huge rows could make the reader walk megabytes per decode.
+f2bc7146d9de08e2  pdf_row_first_at_start  law pdf_row_first_at_start : for + w : Nat { pdf_row_offset ( 0n , w ) == 0n : Nat }
+# promise pdf_row_first_at_start: the first row of an xref stream starts at its first byte (the file format's layout).
+eb388bc3438a9558  pdf_row_next_adjacent  law pdf_row_next_adjacent : for + k : Nat for + w : Nat { pdf_row_offset ( 1n + k , w ) == Nat.add ( w , pdf_row_offset ( k , w ) ) : Nat }
+# promise pdf_row_next_adjacent: each row of an xref stream starts right after the row before it (the file format's layout).
+ba7fea311669dfc4  pdf_row_within  law pdf_row_within : for + n : Nat for + w : Nat for + a : Nat for + k : Nat { Bool.and ( Bool.and ( pdf_count_fits ( n , w , a ) , Nat.is_lt ( k , n ) ) , Nat.is_lt ( a , Nat.add ( w , pdf_row_offset ( k , w ) ) ) ) == False { } : Bool }
+# promise pdf_row_within: every row below the accepted row count ends inside the available bytes.
+# harm pdf_row_within: an xref stream row could be read past the end of the decoded stream.
+7400cf530f60dc92  pdf_span_inside_accepted  law pdf_span_inside_accepted : for + o : Nat for + l : Nat for + r : Nat { pdf_span_ok ( o , l , Nat.add ( Nat.add ( o , l ) , r ) ) == True { } : Bool }
+# promise pdf_span_inside_accepted: every span that ends inside a buffer is accepted.
+d5786c1f960f5fc3  pdf_span_within  law pdf_span_within : for + o : Nat for + l : Nat for + s : Nat { Bool.and ( pdf_span_ok ( o , l , s ) , Nat.is_lt ( s , Nat.add ( o , l ) ) ) == False { } : Bool }
+# promise pdf_span_within: a span of a buffer the reader accepts never ends past the end of that buffer.
+# harm pdf_span_within: a stream /Length or an object-stream header from the file could make the reader slice past the buffer.
+f27de79156b8f975  pdf_widths_inside_accepted  law pdf_widths_inside_accepted : for + a : Nat for + b : Nat for + c : Nat for + r : Nat { pdf_widths_ok ( a , b , c , Nat.add ( Nat.max ( a , Nat.max ( b , c ) ) , r ) ) == True { } : Bool }
+# promise pdf_widths_inside_accepted: field widths that are each within the limit are always accepted.
+1e5b03e6f1b31514  pdf_widths_within  law pdf_widths_within : for + a : Nat for + b : Nat for + c : Nat for + m : Nat { Bool.and ( pdf_widths_ok ( a , b , c , m ) , Bool.or ( Bool.or ( Nat.is_lt ( m , a ) , Nat.is_lt ( m , b ) ) , Nat.is_lt ( m , c ) ) ) == False { } : Bool }
+# promise pdf_widths_within: xref field widths the reader accepts are never wider than the limit they were checked against.
+# harm pdf_widths_within: a wider field would overflow the integer the reader assembles it into.
+4905646a1034de2a  pdf_within_inside_accepted  law pdf_within_inside_accepted : for + x : Nat for + r : Nat { pdf_within ( x , Nat.add ( x , r ) ) == True { } : Bool }
+# promise pdf_within_inside_accepted: every size up to the limit is accepted.
+3e84111971e66c33  pdf_within_limit  law pdf_within_limit : for + x : Nat for + m : Nat { Bool.and ( pdf_within ( x , m ) , Nat.is_lt ( m , x ) ) == False { } : Bool }
+# promise pdf_within_limit: a size the limit check accepts never exceeds the limit.
+# harm pdf_within_limit: a document larger than configured could be read into memory.
 4b28276029305698  pen_applied_path_allowed  law pen_applied_path_allowed : { pen_path_allowed ( True { } , True { } ) == True { } : Bool }
 # promise pen_applied_path_allowed: a penalised request may take a decode path that applies its penalties
 4c77590153cf6984  pen_banned_never_emitted  law pen_banned_never_emitted : for t : Nat for v : Nat { pen_emit_ok ( t , v , PbBan { } ) == False { } : Bool }

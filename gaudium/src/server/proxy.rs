@@ -1732,6 +1732,230 @@ impl McpProxy {
         }
     }
 
+    /// Fetches a document a request names by URL (a Messages `document` block with a `url`
+    /// source) under the proxy's rules: the proxy must be on, the request must not come from a
+    /// page of another site, the target and every address it resolves to must be allowed,
+    /// redirects go through the same checks, and the body is capped at `max_bytes` (and at
+    /// `--mcp-proxy-max-mb`). Returns the body and its content type. `key_ok`: the request
+    /// carries the server's API key, or there is none.
+    pub fn fetch_document(
+        &self,
+        req: &HttpRequest,
+        key_ok: bool,
+        url: &str,
+        max_bytes: u64,
+    ) -> Result<(Vec<u8>, Option<String>), String> {
+        let (site, has_origin, origin_is_host) = request_site(req);
+        let (host, forwarded) = request_hosts(req);
+        let hosts_ours = names::request_ours(&host, &forwarded, &self.own_names);
+        let site_ok = names::site_ok(hosts_ours, rule::site_ok(site, has_origin, origin_is_host));
+        match rule::gate(key_ok, self.enabled(), site_ok, true) {
+            Gate::PxGateRun => {}
+            Gate::PxGateDisabled => {
+                return Err(
+                    "document url sources are fetched through the server's outbound proxy, and this server was started without --mcp-proxy; send the document as base64"
+                        .into(),
+                )
+            }
+            Gate::PxGateNoKey => return Err("invalid or missing API key".into()),
+            Gate::PxGateForeign if !hosts_ours => {
+                return Err(format!(
+                    "the request names a host that is not one of this server's names (it may come from a page of another site that points its own name at this server); document urls are not fetched for it. Its names are {}, its addresses, and the names given with --server-name",
+                    self.server_names.join(", ")
+                ))
+            }
+            Gate::PxGateForeign => {
+                return Err(
+                    "the request comes from a page of another origin; document urls are not fetched for it"
+                        .into(),
+                )
+            }
+            Gate::PxGateMethod => return Err("the document url cannot be fetched".into()),
+        }
+        let refused = |why: String| {
+            self.note(
+                &self.refused,
+                format!("refused document {}: {why}", shown_url(url)),
+                format!(
+                    "\"result\":\"refused\",\"method\":\"GET\",\"url\":{},\"status\":403,\"reason\":{}",
+                    jq(&shown_url(url)),
+                    jq(&why)
+                ),
+            );
+            format!("the document url was refused: {why}")
+        };
+        let tls_state = self.tls.as_ref().map(|_| ()).map_err(String::as_str);
+        let mut target = parse_target(url, tls_state).map_err(refused)?;
+        let cap = max_bytes.min(self.limits.max_response);
+        let headers = vec![
+            (
+                "accept".to_string(),
+                "application/pdf, text/plain;q=0.9, text/*;q=0.8".to_string(),
+            ),
+            (
+                "user-agent".to_string(),
+                "gaudium-document-fetch".to_string(),
+            ),
+        ];
+        let mut redirects_left = self.limits.redirects;
+        let started = Instant::now();
+        loop {
+            let step = self.checked_addresses(&target).and_then(|addrs| {
+                let mut up = self.connect(&target, &addrs)?;
+                let mut buf = Vec::new();
+                let head = self.exchange(
+                    &mut up,
+                    &target,
+                    Method::PxGet,
+                    &headers,
+                    None,
+                    &mut buf,
+                    started,
+                )?;
+                Ok((up, buf, head))
+            });
+            let (up, buf, head) = match step {
+                Ok(x) => x,
+                Err(Failure::Refused(_, why)) => return Err(refused(why)),
+                Err(Failure::Unreachable(why)) => {
+                    self.note(
+                        &self.failed,
+                        format!("failed document {}: {why}", target.shown()),
+                        format!(
+                            "\"result\":\"failed\",\"method\":\"GET\",\"url\":{},\"reason\":{}",
+                            jq(&target.shown()),
+                            jq(&why)
+                        ),
+                    );
+                    return Err(format!("the document url could not be fetched: {why}"));
+                }
+            };
+            let location = head.get("location").filter(|l| !l.trim().is_empty());
+            let kind = rule::redirect_kind(head.status, location.is_some());
+            if let (true, Some(location)) = (rule::redirect_follows(kind), location) {
+                drop(up);
+                if !rule::redirect_may(redirects_left) {
+                    return Err(refused(format!(
+                        "too many redirects (more than {})",
+                        self.limits.redirects
+                    )));
+                }
+                redirects_left = rule::redirect_left(redirects_left);
+                target = parse_target(&resolve_location(&target, location), tls_state)
+                    .map_err(|why| refused(format!("redirect from {}: {why}", target.shown())))?;
+                continue;
+            }
+            if !(200..300).contains(&head.status) {
+                return Err(format!(
+                    "fetching the document url {} answered HTTP {}",
+                    target.shown(),
+                    head.status
+                ));
+            }
+            if head
+                .get("content-encoding")
+                .is_some_and(|v| !v.trim().eq_ignore_ascii_case("identity"))
+            {
+                return Err(format!(
+                    "the document url {} answered with an encoded body",
+                    target.shown()
+                ));
+            }
+            let body = self.read_document(up, buf, &head, cap, started)?;
+            self.note(
+                &self.proxied,
+                format!(
+                    "document {} -> {} ({} bytes)",
+                    target.shown(),
+                    head.status,
+                    body.len()
+                ),
+                format!(
+                    "\"result\":\"proxied\",\"method\":\"GET\",\"url\":{},\"status\":{}",
+                    jq(&target.shown()),
+                    head.status
+                ),
+            );
+            return Ok((body, head.get("content-type").map(str::to_string)));
+        }
+    }
+
+    /// The whole body of a document fetch, at most `cap` bytes.
+    fn read_document(
+        &self,
+        mut up: Upstream,
+        mut buf: Vec<u8>,
+        head: &Head,
+        cap: u64,
+        started: Instant,
+    ) -> Result<Vec<u8>, String> {
+        let chunked = head
+            .get("transfer-encoding")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+        let mut framing = if matches!(head.status, 204) {
+            Framing::Empty
+        } else if chunked {
+            Framing::Chunked(ChunkState::Size)
+        } else {
+            match head.get("content-length").map(|v| v.parse::<u64>()) {
+                Some(Ok(n)) => Framing::Length(n),
+                Some(Err(_)) => {
+                    return Err("the document url sent an invalid Content-Length".into())
+                }
+                None => Framing::ToClose,
+            }
+        };
+        let too_large = || {
+            format!("the document is larger than the limit of {cap} bytes (--pdf-max-mb, --mcp-proxy-max-mb)")
+        };
+        if let Framing::Length(n) = framing {
+            if rule::resp_cut(0, n, cap) {
+                return Err(too_large());
+            }
+        }
+        let mut body: Vec<u8> = Vec::new();
+        let mut last = Instant::now();
+        loop {
+            match body_step(&mut framing, &mut buf) {
+                Step::End => return Ok(body),
+                Step::Bad(why) => {
+                    return Err(format!("the document url sent a damaged body: {why}"))
+                }
+                Step::Data(n) => {
+                    if rule::resp_cut(body.len() as u64, n as u64, cap) {
+                        return Err(too_large());
+                    }
+                    let take = rule::resp_take(body.len() as u64, n as u64, cap) as usize;
+                    body.extend_from_slice(&buf[..take]);
+                    buf.drain(..n);
+                    last = Instant::now();
+                }
+                Step::More => {
+                    let idle = ms_since(last);
+                    let total = ms_since(started);
+                    if rule::expired(idle, self.limits.idle_ms)
+                        || rule::expired(total, self.limits.total_ms)
+                    {
+                        return Err(format!("the document url was silent for {} s", idle / 1000));
+                    }
+                    up.set_read_timeout(rule::read_wait(
+                        rule::time_left(idle, self.limits.idle_ms),
+                        rule::time_left(total, self.limits.total_ms),
+                        self.limits.idle_ms,
+                    ));
+                    let mut chunk = [0u8; 16 * 1024];
+                    match up.read(&mut chunk) {
+                        Ok(0) if framing == Framing::ToClose => return Ok(body),
+                        Ok(0) => return Err("the document url closed the connection early".into()),
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(e) if timed_out(&e) || e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(format!("reading the document failed: {e}")),
+                    }
+                }
+            }
+        }
+    }
+
     /// Passes a target's answer to the page as it arrives.
     fn relay(
         &self,

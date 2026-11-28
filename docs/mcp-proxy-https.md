@@ -74,6 +74,16 @@ Streamable HTTP, DELETE ends a session).
   and shown without their query and fragment, which may hold a credential, and without a user
   part (`user:password@`), also when the URL is refused or malformed.
 
+### Documents named by URL
+
+A Messages request may name a document by URL (a `document` block with a `url` source). The
+server fetches it only while the proxy is on, through the same rules as a proxied request: the
+allow-lists, the check of every address the name resolves to, redirects through the same
+checks, and the refusal of a request sent by a page of another site. It sends a `GET` with no
+header of the request, reads at most `--pdf-max-mb` (and `--mcp-proxy-max-mb`) bytes, and
+lists the fetch among the proxy's decisions. With the proxy off, such a request is answered
+with a 400 that asks for the document as base64.
+
 ## Threat model and guards
 
 A route that fetches a URL named by the request is a forwarder inside the operator's network.

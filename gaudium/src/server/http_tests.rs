@@ -349,6 +349,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
             prefix_slots: 0,
             mcp_proxy: ProxyOptions::default(),
+            pdf: crate::pdf::Limits::default(),
             tls_cert: None,
             tls_key: None,
             tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
@@ -1701,6 +1702,7 @@ fn served_engine_configuration_follows_the_server_options() {
         vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
         prefix_slots: 5,
         mcp_proxy: ProxyOptions::default(),
+        pdf: crate::pdf::Limits::default(),
         tls_cert: None,
         tls_key: None,
         tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
@@ -2261,6 +2263,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         vision_max_tokens: DEFAULT_VISION_MAX_TOKENS,
         prefix_slots: 0,
         mcp_proxy: ProxyOptions::default(),
+        pdf: crate::pdf::Limits::default(),
         tls_cert: None,
         tls_key: None,
         tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
@@ -4866,4 +4869,35 @@ fn a_responses_text_format_is_held_to_its_schema() {
     assert_eq!(status, 400, "{text}");
     assert!(text.contains("'pattern'"), "{text}");
     assert_eq!(h.prompts.lock().unwrap().len(), before);
+}
+
+#[test]
+fn a_page_of_another_site_cannot_make_a_request_fetch_a_document() {
+    // a document url is fetched under the same site rule as /cors-proxy (`px_gate` with the
+    // site check of the request's own headers): a page of another site gets a 400, and the
+    // target is never contacted
+    let h = net_harness(loopback_proxy(false), None, None);
+    let (port, seen) = json_target("{\"not\":\"a pdf\"}");
+    let body = format!(
+        "{{\"model\":\"any\",\"max_tokens\":8,\"messages\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"document\",\"source\":{{\"type\":\"url\",\"url\":\"http://127.0.0.1:{port}/doc.pdf\"}}}},{{\"type\":\"text\",\"text\":\"Sum up\"}}]}}]}}"
+    );
+    let (status, _, text) = plain_exchange(
+        &h.state,
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nOrigin: http://elsewhere.example\r\nSec-Fetch-Site: cross-site",
+        &body,
+    );
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("another origin"), "{text}");
+    assert!(seen.lock().unwrap().is_empty());
+    // the same request from the server's own page reaches the target, whose JSON answer
+    // (`application/json`, a text type) is read as the document's text
+    h.script("Ok.");
+    let (status, _, text) = plain_exchange(
+        &h.state,
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nOrigin: http://localhost\r\nSec-Fetch-Site: same-origin",
+        &body,
+    );
+    assert_eq!(status, 200, "{text}");
+    assert!(h.last_prompt().contains("{\"not\":\"a pdf\"}"), "{}", h.last_prompt());
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }
