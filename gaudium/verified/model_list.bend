@@ -293,7 +293,7 @@ def ml_more_only_past_limit(n, lo, hi, limit, ok):
 
 # promise: a page of at least one entry that does not say more entries follow holds every entry between the cursors
 # harm: a client would stop paging with entries it never saw
-# catches: has_more off by one (`Nat.is_lt(limit, ...)` replaced by `Nat.is_lt(Nat.add(limit, 1n), ...)`)
+# catches: has_more never said (`ml_more` returns `False{}`)
 law ml_page_complete_without_more:
   for +i: Nat
   for +n: Nat
@@ -310,3 +310,28 @@ def ml_page_complete_without_more(i, n, lo, hi, p, back, nm, hw):
   +hlt = ml_and_r(Nat.is_le(lo, i), Nat.is_lt(i, Nat.min(hi, n)), hw)
   +hcap = L.nat_not_lt_imp_le(1n+p, Nat.sub(Nat.min(hi, n), lo), nm)
   ml_and_intro(ml_in_window(i, n, lo, hi), ml_in_reach(i, n, lo, hi, 1n+p, back), hw, ml_reach_all(i, n, lo, hi, 1n+p, back, hle, hlt, hcap))
+
+# A window that is not empty ends at an entry inside it.
+def ml_last_or(+n: Nat, +lo: Nat, +hi: Nat, +p: Nat, b: Bool, eb: {b == Nat.is_le(Nat.min(hi, n), lo) : Bool}, nm: {ml_more(n, lo, hi, 1n+p) == False{} : Bool}) -> {Bool.or(b, ml_on_page(Nat.sub(Nat.min(hi, n), 1n), n, lo, hi, 1n+p, False{})) == True{} : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      +hlt = G.g_nat_not_le_imp_lt(Nat.min(hi, n), lo, Equal.sym(Bool, False{}, Nat.is_le(Nat.min(hi, n), lo), eb))
+      +hlast = ml_back_last(Nat.min(hi, n), lo, 1n+p, hlt, {==})
+      +hwin = ml_and_l(Bool.and(Nat.is_le(lo, Nat.sub(Nat.min(hi, n), 1n)), Nat.is_lt(Nat.sub(Nat.min(hi, n), 1n), Nat.min(hi, n))), Nat.is_le(Nat.sub(Nat.min(hi, n), Nat.sub(Nat.min(hi, n), 1n)), 1n+p), hlast)
+      ml_page_complete_without_more(Nat.sub(Nat.min(hi, n), 1n), n, lo, hi, p, False{}, nm, hwin)
+
+# promise: a forward page of at least one entry that does not say more entries follow ends at the last entry before the before_id cursor or the list's end
+# harm: a client would stop paging one entry short
+# catches: has_more off by one (`Nat.is_lt(limit, ...)` replaced by `Nat.is_lt(Nat.add(limit, 1n), ...)`)
+law ml_last_page_reaches_end:
+  for +n: Nat
+  for +lo: Nat
+  for +hi: Nat
+  for +p: Nat
+  for nm: {ml_more(n, lo, hi, 1n+p) == False{} : Bool}
+  {Bool.or(Nat.is_le(Nat.min(hi, n), lo), ml_on_page(Nat.sub(Nat.min(hi, n), 1n), n, lo, hi, 1n+p, False{})) == True{} : Bool}
+
+def ml_last_page_reaches_end(n, lo, hi, p, nm):
+  ml_last_or(n, lo, hi, p, Nat.is_le(Nat.min(hi, n), lo), {==}, nm)
