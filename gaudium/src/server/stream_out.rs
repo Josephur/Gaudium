@@ -45,6 +45,9 @@ struct SinkState {
     failed: bool,
     /// The stream ended, or its writer is gone: the keep-alive writes nothing more.
     done: bool,
+    /// The flag a failed keep-alive sets: the request's current cancel flag (a resumed
+    /// generation gets a fresh one, `retarget_cancel`).
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl SseSink {
@@ -57,6 +60,7 @@ impl SseSink {
                     last_write: Instant::now(),
                     failed: false,
                     done: false,
+                    cancel: None,
                 }),
                 Condvar::new(),
             )),
@@ -111,15 +115,26 @@ impl SseSink {
         every: Duration,
         cancel: Arc<AtomicBool>,
     ) -> Option<KeepAlive> {
+        self.state().cancel = Some(cancel);
         let sink = self.clone();
         thread::Builder::new()
             .name("gaudium-sse-keepalive".into())
-            .spawn(move || sink.keep_alive_loop(line.as_bytes(), every, &cancel))
+            .spawn(move || sink.keep_alive_loop(line.as_bytes(), every))
             .ok()
             .map(|_| KeepAlive(self.clone()))
     }
 
-    fn keep_alive_loop(&self, line: &[u8], every: Duration, cancel: &AtomicBool) {
+    /// The request's cancel flag changed (a resumed generation): a keep-alive that finds the
+    /// client gone sets this one from now on. A client already gone sets it at once.
+    pub fn retarget_cancel(&self, cancel: Arc<AtomicBool>) {
+        let mut s = self.state();
+        if s.failed {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        s.cancel = Some(cancel);
+    }
+
+    fn keep_alive_loop(&self, line: &[u8], every: Duration) {
         let every = every.max(Duration::from_millis(1));
         let mut s = self.state();
         loop {
@@ -139,7 +154,9 @@ impl SseSink {
             // under the lock: no other chunk is half written
             if super::write_sse_chunk(&mut s.conn, line).is_err() {
                 s.failed = true;
-                cancel.store(true, Ordering::Relaxed);
+                if let Some(c) = &s.cancel {
+                    c.store(true, Ordering::Relaxed);
+                }
                 return;
             }
             s.last_write = Instant::now();
@@ -434,6 +451,10 @@ impl StreamOut {
     pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>) {
         if self.write_failed || self.stream.as_ref().is_some_and(SseSink::failed) {
             cancel.store(true, Ordering::Relaxed);
+        }
+        // the keep-alive follows the request's current flag too
+        if let Some(s) = self.stream.as_ref() {
+            s.retarget_cancel(Arc::clone(&cancel));
         }
         self.cancel = cancel;
     }
@@ -820,6 +841,34 @@ mod tests {
         assert!(raw.ends_with("0\r\n\r\n"), "{raw:?}");
         assert!(!raw.contains("late"));
         assert!(!cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_keep_alive_cancels_the_flag_it_was_retargeted_to() {
+        let (tx, rx) = pair();
+        let sink = SseSink::new(tx.into());
+        let first = Arc::new(AtomicBool::new(false));
+        let _guard = sink.keep_alive(
+            ": ka\n\n".into(),
+            Duration::from_millis(10),
+            Arc::clone(&first),
+        );
+        // a resumed generation's fresh flag, before the client leaves
+        let fresh = Arc::new(AtomicBool::new(false));
+        sink.retarget_cancel(Arc::clone(&fresh));
+        drop(rx);
+        let t = Instant::now();
+        while !fresh.load(Ordering::Relaxed) && t.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            fresh.load(Ordering::Relaxed),
+            "the current flag is cancelled"
+        );
+        // and a flag given after the client left starts cancelled
+        let later = Arc::new(AtomicBool::new(false));
+        sink.retarget_cancel(Arc::clone(&later));
+        assert!(later.load(Ordering::Relaxed));
     }
 
     #[test]
