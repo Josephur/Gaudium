@@ -510,6 +510,146 @@ fn files_belong_to_their_key_and_outlive_a_restart() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The ids of the files a `GET /v1/files` with `headers` lists.
+fn listed(st: &Arc<AppState>, headers: &str) -> Vec<String> {
+    let (status, l) = get_json(st, "GET", "/v1/files", headers);
+    assert_eq!(status, 200, "{headers}");
+    at(&l, &["data"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| s(m, &["id"]).to_string())
+        .collect()
+}
+
+#[test]
+fn files_belong_to_the_key_that_let_the_request_in() {
+    let dir = tmp_dir("credential");
+    let h = with_files(harness(), &dir, 1 << 20, 1 << 16, Some("k1"));
+    let st = &h.state;
+    // the configured key as x-api-key, a Bearer token that is not it
+    let both = "x-api-key: k1\r\nAuthorization: Bearer wrong";
+    let (status, up) = upload(
+        st,
+        both,
+        &[
+            ("purpose", None, None, b"batch"),
+            ("file", Some("mine.txt"), None, b"mine"),
+        ],
+    );
+    assert_eq!(status, 200, "{up:?}");
+    let mine = s(&up, &["id"]).to_string();
+    // the key alone, in either header, sees, reads and deletes it
+    for key in ["x-api-key: k1", "Authorization: Bearer k1", both] {
+        assert_eq!(listed(st, key), [mine.as_str()], "{key}");
+        let (status, _, body) = send(st, "GET", &format!("/v1/files/{mine}/content"), key, b"");
+        assert_eq!((status, body.as_str()), (200, "mine"), "{key}");
+    }
+    let (status, _, body) = send(
+        st,
+        "DELETE",
+        &format!("/v1/files/{mine}"),
+        "x-api-key: k1",
+        b"",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(listed(st, "x-api-key: k1").is_empty());
+
+    // files under a key the server no longer has (rotated), and under no key
+    let store = st.files.as_ref().unwrap();
+    let old = store
+        .create(
+            &file_store::Owner::of_key("old"),
+            "old.txt",
+            None,
+            "batch",
+            false,
+            b"old",
+        )
+        .unwrap();
+    let open = store
+        .create(
+            &file_store::Owner::everyone(),
+            "open.txt",
+            None,
+            "batch",
+            false,
+            b"open",
+        )
+        .unwrap();
+    // a wrong key, alone or beside the configured one, never selects their namespace
+    for wrong in [
+        "Authorization: Bearer old",
+        "x-api-key: old",
+        "Authorization: Bearer ",
+    ] {
+        let (status, _) = upload(st, wrong, &[("file", Some("f"), None, b"x")]);
+        assert_eq!(status, 401, "{wrong}");
+        for id in [&old.id, &open.id] {
+            for (m, p) in [
+                ("GET", "/v1/files".to_string()),
+                ("GET", format!("/v1/files/{id}")),
+                ("GET", format!("/v1/files/{id}/content")),
+                ("DELETE", format!("/v1/files/{id}")),
+            ] {
+                let (status, _, body) = send(st, m, &p, wrong, b"");
+                assert_eq!(status, 401, "{wrong}: {m} {p}: {body}");
+            }
+        }
+    }
+    for mixed in [
+        "x-api-key: k1\r\nAuthorization: Bearer old",
+        "x-api-key: old\r\nAuthorization: Bearer k1",
+    ] {
+        assert!(listed(st, mixed).is_empty(), "{mixed}");
+        for id in [&old.id, &open.id] {
+            for (m, p) in [
+                ("GET", format!("/v1/files/{id}")),
+                ("GET", format!("/v1/files/{id}/content")),
+                ("DELETE", format!("/v1/files/{id}")),
+            ] {
+                let (status, _, body) = send(st, m, &p, mixed, b"");
+                assert_eq!(status, 404, "{mixed}: {m} {p}: {body}");
+            }
+        }
+        let (status, up) = upload(
+            st,
+            mixed,
+            &[
+                ("purpose", None, None, b"batch"),
+                ("file", Some("k1.txt"), None, b"k1"),
+            ],
+        );
+        assert_eq!(status, 200, "{up:?}");
+        let id = s(&up, &["id"]).to_string();
+        assert_eq!(listed(st, "x-api-key: k1"), [id.as_str()], "{mixed}");
+        let (status, _, _) = send(
+            st,
+            "DELETE",
+            &format!("/v1/files/{id}"),
+            "x-api-key: k1",
+            b"",
+        );
+        assert_eq!(status, 200);
+    }
+    // the files under the old key and under none are still there, for their owners
+    assert_eq!(
+        store
+            .get(&file_store::Owner::of_key("old"), &old.id)
+            .unwrap()
+            .id,
+        old.id
+    );
+    assert_eq!(
+        store
+            .get(&file_store::Owner::everyone(), &open.id)
+            .unwrap()
+            .id,
+        open.id
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_files_api_is_off_without_a_directory() {
     let h = harness();

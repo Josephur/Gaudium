@@ -1028,6 +1028,36 @@ def fs_hold_within_ask(l, c, w):
     case FsLedger{+u, +f, +n}:
       L.nat_min_le_l(Nat.min(w, c), f)
 
+# promise: a reservation counts exactly its ticket's bytes as used in the ledger the store installs from it.
+# harm: uploads in progress could stage more bytes than the ledger has taken from the quota
+# catches: fs_hold_go returning the ledger unchanged beside a full-sized ticket
+# catches: the ticket half the size of the bytes the ledger takes
+law fs_hold_used_is_ticket:
+  for +l: FsLedger
+  for +c: Nat
+  for +w: Nat
+  {fs_used(fs_hold_ledger(fs_hold(l, c, w))) == Nat.add(fs_used(l), fs_size(fs_hold_ticket(fs_hold(l, c, w)))) : Nat}
+
+def fs_hold_used_is_ticket(l, c, w):
+  match l:
+    case FsLedger{+u, +f, +n}:
+      {==}
+
+# promise: a reservation takes exactly its ticket's bytes from the free bytes of the ledger the store installs from it.
+# harm: concurrent uploads could together stage more than the quota
+# catches: fs_hold_go returning the ledger unchanged beside a full-sized ticket
+# catches: the free bytes reduced by the size asked for instead of the ticket's size
+law fs_hold_free_is_ticket:
+  for +l: FsLedger
+  for +c: Nat
+  for +w: Nat
+  {Nat.add(fs_free(fs_hold_ledger(fs_hold(l, c, w))), fs_size(fs_hold_ticket(fs_hold(l, c, w)))) == fs_free(l) : Nat}
+
+def fs_hold_free_is_ticket(l, c, w):
+  match l:
+    case FsLedger{+u, +f, +n}:
+      L.nat_sub_add_cancel(f, Nat.min(Nat.min(w, c), f), L.nat_min_le_r(Nat.min(w, c), f))
+
 # promise: giving a reservation's ticket back returns the ledger to what it was before the reservation.
 # harm: a dropped upload could keep its reserved bytes, or free more than it held
 # catches: the ticket handed out already given back (not live), so the reservation is never released

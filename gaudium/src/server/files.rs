@@ -65,21 +65,17 @@ fn shape_of(req: &HttpRequest) -> Shape {
     }
 }
 
-/// The owner a request acts as: the key it presented when the server has API keys.
-pub(super) fn owner_of(state: &AppState, req: &HttpRequest) -> Owner {
-    if state.cfg.api_key.is_none() {
-        return Owner::everyone();
-    }
-    let bearer = req
-        .headers
-        .get("authorization")
-        .and_then(|a| a.strip_prefix("Bearer "))
-        .map(str::trim);
-    let key = bearer
-        .or_else(|| req.headers.get("x-api-key").map(|k| k.trim()))
-        .unwrap_or("");
-    Owner::of_key(key)
+/// The owner a request acts as: the configured API key that let it in (`super::credential`, the
+/// function authentication reads too), or everyone on a server without one. `None` for a request
+/// no credential lets in: it acts as no owner at all.
+pub(super) fn owner_of(state: &AppState, req: &HttpRequest) -> Option<Owner> {
+    super::credential(&state.cfg, req).map(|c| match c {
+        super::Credential::Open => Owner::everyone(),
+        super::Credential::Key(k) => Owner::of_key(k),
+    })
 }
+
+const NO_OWNER: &str = "invalid or missing API key";
 
 fn error(shape: Shape, stream: &mut Conn, status: u16, msg: &str) {
     match shape {
@@ -201,6 +197,9 @@ pub(super) fn handle_upload(state: &AppState, req: &HttpRequest, stream: &mut Co
     let Some(store) = state.files.as_deref() else {
         return refuse_unread(shape, stream, &mut body, expect, 404, FILES_OFF);
     };
+    let Some(owner) = owner_of(state, req) else {
+        return refuse_unread(shape, stream, &mut body, expect, 401, NO_OWNER);
+    };
     let ct = req.headers.get("content-type").map_or("", String::as_str);
     let b = match boundary(ct) {
         Ok(b) => b,
@@ -210,7 +209,6 @@ pub(super) fn handle_upload(state: &AppState, req: &HttpRequest, stream: &mut Co
         let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
         let _ = stream.flush();
     }
-    let owner = owner_of(state, req);
     // the file part is at most the body: the store reserves that much (or its cap) before reading
     let declared = body.declared_len();
     let parsed = read_upload(store, &mut body, &b, shape, declared);
@@ -348,7 +346,10 @@ pub(super) fn handle_list(state: &AppState, req: &HttpRequest, stream: &mut Conn
     let Some(store) = store(state, shape, stream) else {
         return;
     };
-    let mut files = store.list(&owner_of(state, req));
+    let Some(owner) = owner_of(state, req) else {
+        return error(shape, stream, 401, NO_OWNER);
+    };
+    let mut files = store.list(&owner);
     match list_json(shape, req, &mut files) {
         Ok(j) => write_json(stream, 200, &j),
         Err(e) => error(shape, stream, 400, &e),
@@ -454,7 +455,9 @@ pub(super) fn handle_file(state: &AppState, req: &HttpRequest, stream: &mut Conn
     let Some(store) = store(state, shape, stream) else {
         return;
     };
-    let owner = owner_of(state, req);
+    let Some(owner) = owner_of(state, req) else {
+        return error(shape, stream, 401, NO_OWNER);
+    };
     let rest = &req.path["/v1/files/".len()..];
     let (id, content) = match rest.strip_suffix("/content") {
         Some(id) => (id, true),
@@ -596,7 +599,8 @@ fn get_mut<'a>(v: &'a mut JsonValue, key: &str) -> Option<&'a mut JsonValue> {
 /// at most the size an inline request body may have, together (`left`: what is left of it).
 struct Resolver<'a> {
     store: Option<&'a FileStore>,
-    owner: Owner,
+    /// `None`: the request is let in by no credential, and no file is read for it.
+    owner: Option<Owner>,
     left: std::cell::Cell<u64>,
 }
 
@@ -607,8 +611,11 @@ impl Resolver<'_> {
                 "{path}: file_id sources need the Files API, which is off on this server (start it with --files-dir <dir>)"
             ));
         };
+        let Some(owner) = &self.owner else {
+            return Err(format!("{path}: {NO_OWNER}"));
+        };
         let left = self.left.get();
-        match store.read_limited(&self.owner, id, left) {
+        match store.read_limited(owner, id, left) {
             Ok(Ok(x)) => {
                 self.left.set(left - x.1.len() as u64);
                 Ok(x)
@@ -805,7 +812,7 @@ mod tests {
             .unwrap();
         let r = Resolver {
             store: Some(&store),
-            owner: Owner::everyone(),
+            owner: Some(Owner::everyone()),
             left: std::cell::Cell::new(15),
         };
         assert_eq!(r.read(&f.id, "a").unwrap().1, b"0123456789");

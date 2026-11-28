@@ -2251,20 +2251,38 @@ fn write_sse_end(stream: &mut Conn) {
     let _ = stream.flush();
 }
 
-fn check_auth(cfg: &ServerConfig, req: &HttpRequest) -> bool {
+/// The credential a request authenticated with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Credential<'a> {
+    /// The server has no API key: every request is let in.
+    Open,
+    /// The server's configured key, which the request presented as a Bearer token or as
+    /// `x-api-key` (the configured value, never the text the request sent).
+    Key(&'a str),
+}
+
+/// The credential that lets `req` in, or `None` when it presents none that matches. A request may
+/// carry both headers; one of them matching the configured key is enough, and the other is
+/// ignored. Authentication (`check_auth`) and file ownership (`files::owner_of`) both read this,
+/// so a file always belongs to the key that let its request in, never to a header that did not.
+fn credential<'a>(cfg: &'a ServerConfig, req: &HttpRequest) -> Option<Credential<'a>> {
     let Some(expected) = cfg.api_key.as_deref() else {
-        return true;
+        return Some(Credential::Open);
     };
-    if let Some(auth) = req.headers.get("authorization") {
-        if let Some(tok) = auth.strip_prefix("Bearer ") {
-            if tok.trim() == expected {
-                return true;
-            }
-        }
-    }
-    req.headers
+    let bearer = req
+        .headers
+        .get("authorization")
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .is_some_and(|t| t.trim() == expected);
+    let x_key = req
+        .headers
         .get("x-api-key")
-        .is_some_and(|k| k.trim() == expected)
+        .is_some_and(|k| k.trim() == expected);
+    (bearer || x_key).then_some(Credential::Key(expected))
+}
+
+fn check_auth(cfg: &ServerConfig, req: &HttpRequest) -> bool {
+    credential(cfg, req).is_some()
 }
 
 /// Serves one accepted socket: plain HTTP, or TLS when the client opens with a handshake and the
