@@ -3950,6 +3950,29 @@ fn a_thinking_budget_closes_the_reasoning_and_the_answer_follows() {
     );
     assert!(s(&r, &["choices", "0", "message", "content"]).contains("shown"));
     assert_eq!(h.prompts.lock().unwrap().len(), 5);
+
+    // a completion has no reasoning span: the budget is not applied (one generation, the text
+    // as generated) and the field is reported as unknown
+    h.script(&format!("{thought}\n</think>\n\nall of it"));
+    let (status, text) = h.post(
+        "/v1/completions",
+        r#"{"model":"any","prompt":"Go.","max_tokens":256,"thinking_budget_tokens":4}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert_eq!(
+        s(&r, &["choices", "0", "text"]),
+        format!("{thought}\n</think>\n\nall of it"),
+        "{text}"
+    );
+    assert!(
+        at(&r, &["gaudium", "ignored"])
+            .dump()
+            .contains("thinking_budget_tokens"),
+        "{text}"
+    );
+    assert!(r.get("gaudium").and_then(|g| g.get("thinking")).is_none(), "{text}");
+    assert_eq!(h.prompts.lock().unwrap().len(), 6);
 }
 
 /// A report whose tokens the server replaced (a thinking-budget cut) or joined gives its rates
