@@ -2291,6 +2291,9 @@ ad7b60e79797d231  sv_list_ends_without_cursor  law sv_list_ends_without_cursor :
 491519d44ff55632  sv_list_within_pages  law sv_list_within_pages : for + c : Bool for + m : Nat for + d : Nat { sv_list_more ( c , Nat.add ( m , d ) , m ) == False { } : Bool }
 # promise sv_list_within_pages: once `most` pages of a tool list were read, no further page is asked for
 # harm sv_list_within_pages: a server that always answers with a cursor would hold the request forever
+0da8a1aef6c22213  sv_live_round_goes_on  law sv_live_round_goes_on : for + l : Nat { Bool.and ( sv_goes_on_live ( False { } , SvRunGoOn { } , False { } , l ) , sv_goes_on_live ( False { } , SvRunGoOn { } , True { } , 1n + l ) ) == True { } : Bool }
+# promise sv_live_round_goes_on: a reply not cancelled, whose round decision goes on, generates another round when it has no output limit (whatever is counted as left) or has output tokens left of its limit
+# harm sv_live_round_goes_on: a tool loop would stop with pause_turn after its first round, for every request that sets max_tokens or for every request
 e72d1bedb1489661  sv_live_within_rules  law sv_live_within_rules : for + c : Bool for + n : SvNext for + b : Bool for + l : Nat { Bool.and ( sv_goes_on_live ( c , n , b , l ) , Bool.not ( sv_round_goes_on ( n , b , l ) ) ) == False { } : Bool }
 # promise sv_live_within_rules: the loop never generates a round that the round's own decision or the output limit refuses, cancelled or not
 # harm sv_live_within_rules: a reply would run past its round bound or its max_tokens while nobody cancelled it
