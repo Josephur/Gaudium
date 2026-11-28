@@ -212,6 +212,9 @@ pub struct Qwen3GenParams {
     /// request runs on the host-picked `K = 0` path too (`gram_host_pick`), each position masked
     /// to the tokens the grammar admits.
     pub grammar: Option<std::sync::Arc<crate::grammar::constraint::Plan>>,
+    /// Per-token log-probabilities: every emitted token's entry goes to this tap before the
+    /// token goes to `on_token` (`None`: the request does not ask; nothing is read back).
+    pub logprobs: Option<crate::logprobs::LogprobTap>,
 }
 
 impl Qwen3GenParams {
@@ -243,6 +246,7 @@ impl Default for Qwen3GenParams {
             cache_prompt: true,
             penalties: crate::sampler_penalty::Penalties::default(),
             grammar: None,
+            logprobs: None,
         }
     }
 }
@@ -341,6 +345,9 @@ pub(super) struct PrefillFirst {
 
 #[path = "qwen3_samp.rs"]
 mod samp_rt;
+// per-token log-probabilities (`Qwen3GenParams::logprobs`)
+#[path = "qwen3_logprobs.rs"]
+mod lp_rt;
 #[path = "spec.rs"]
 pub mod spec;
 // [moe hook] routed-form prefill: the routed-experts recipe of a tile
@@ -1229,6 +1236,8 @@ pub struct Qwen3Engine {
 
     // Reusable pinned host staging buffers (must drop before `dev`)
     stage_io: PinnedBuf, // small scalar + logits D2H/H2D
+    /// Host ring of the log-probability readout (allocated at load, sized for the widest launch).
+    lp_ring: lp_rt::LpRing,
 
     // HBM address maps (all sub-allocated from sealed arenas owned by `dev`)
     weights_addr: BTreeMap<String, u64>,
@@ -1254,6 +1263,8 @@ pub struct Qwen3Engine {
     step_cursor: u64,
     step_tokens: u64,
     step_logits: u64,
+    /// Bytes of the step recipes' `logits` buffer.
+    step_logits_bytes: u64,
     hbm_bytes: [u64; 5],
     /// Per-request reset bookkeeping (mode, KV high-water mark, last reset time).
     reset: request_reset::ResetState,
@@ -1295,6 +1306,10 @@ pub struct Qwen3Engine {
     pen: crate::sampler_penalty::PenaltyState,
     /// The running request's grammar state (`crate::grammar`), when it has one.
     gram: Option<crate::grammar::constraint::Constraint>,
+    /// The row the host pick of the current token sampled from (penalised, and masked to the
+    /// grammar's tokens), kept for the log-probability readout of that token (`pick_penalised`;
+    /// taken by `lp_rt::row_now`).
+    lp_pen_row: Option<Vec<u16>>,
 
     // Device handle (dropped LAST!)
     dev: HpuDevice,
@@ -2682,6 +2697,20 @@ impl Qwen3Engine {
         let stage_io = dev
             .alloc_pinned(stage_io_bytes)
             .map_err(|e| format!("alloc pinned io stage: {e}"))?;
+        // the readout ring: every launch of this engine fits a slot (one row without a drafter)
+        let lp_ring = lp_rt::LpRing::alloc(
+            &dev,
+            specdec.as_ref().map_or(0, |sd| sd.verify_rows()),
+            spec.vocab * 2,
+        )?;
+        if cfg.verbose {
+            eprintln!(
+                "[gaudium] pinned host buffers: io stage {:.2} MiB, logprob ring {:.2} MiB (2 slots of {} rows)",
+                stage_io_bytes as f64 / (1024.0 * 1024.0),
+                lp_ring.bytes() as f64 / (1024.0 * 1024.0),
+                lp_ring.cap_rows()
+            );
+        }
 
         if cfg.verbose {
             let dt = t_up.elapsed().as_secs_f64();
@@ -2754,6 +2783,7 @@ impl Qwen3Engine {
         let step_cursor = *step_act_addr.get("cursor").ok_or("missing step 'cursor'")?;
         let step_tokens = *step_act_addr.get("tokens").ok_or("missing step 'tokens'")?;
         let step_logits = *step_act_addr.get("logits").ok_or("missing step 'logits'")?;
+        let step_logits_bytes = step_act_specs["logits"];
         // [step] enqueue-ahead bindings of the same step recipes (`engine/qwen3_k0pipe.rs`)
         let step_cursor_b = step_act_addr["cursor_b"];
         let mut step_fb_launches = Vec::new();
@@ -2814,6 +2844,7 @@ impl Qwen3Engine {
             wave_recipes,
             moe_rx,
             stage_io,
+            lp_ring,
             weights_addr,
             kv_addr,
             gdn_state,
@@ -2831,6 +2862,7 @@ impl Qwen3Engine {
             step_cursor,
             step_tokens,
             step_logits,
+            step_logits_bytes,
             hbm_bytes,
             reset: request_reset::ResetState::new(reset_mode, cfg.verbose),
             prefix: prefix_cache::PrefixCache::new(
@@ -2864,6 +2896,7 @@ impl Qwen3Engine {
             lanes: lane_rt,
             pen: crate::sampler_penalty::PenaltyState::default(),
             gram: None,
+            lp_pen_row: None,
             dev,
         };
         eng.warm_prefill_tiles(cfg.prefill_warm_rows, cfg.verbose)?;
@@ -3174,14 +3207,18 @@ impl Qwen3Engine {
             .collect();
         let dev_sp = samp_rt::dev_params(params, self.spec.vocab);
         let mask = self.gram.as_mut().map(|g| g.mask()).transpose()?;
-        crate::sampler_penalty::pick_masked(
+        let tok = crate::sampler_penalty::pick_masked(
             &params.penalties,
             &self.pen,
             &mut bf16,
             &dev_sp,
             n,
             mask.as_deref(),
-        )
+        );
+        // the readout reports the distribution the token was drawn from: `pick_masked` leaves
+        // the row penalised and masked (a token the grammar refuses at -inf), as it sampled it
+        self.lp_pen_row = lp_rt::wanted(params).then_some(bf16);
+        tok
     }
 
     /// The token of a readout row: read from the card (greedy argmax, or the on-card sampler of
@@ -3864,6 +3901,8 @@ impl Qwen3Engine {
             budget.record_emitted(1);
             generated.push(first_tok);
             self.live.first_token(Some(ttft_ms), 1);
+            let lp = lp_rt::row_now(self, first_logits_hbm, first_tok, params)?;
+            lp_rt::push(params, lp);
             on_token(first_tok);
             if params.stop_on_eos && is_eos(first_tok) {
                 stopped_by_eos = true;
@@ -3880,6 +3919,11 @@ impl Qwen3Engine {
             && !params.non_speculative
             // the verify picks its tokens on the card, without the penalties
             && crate::verified::pen_path_allowed(penalised, false)
+            // a path without a readout is never taken by a request that asks for logprobs
+            && crate::verified::lp_path_keeps(
+                lp_rt::wanted(params),
+                self.specdec.as_ref().is_some_and(|sd| sd.has_logprob_readout()),
+            )
             && !stopped_by_eos
             && !stopped_by_cancel
             && !generated.is_empty()
@@ -4043,6 +4087,8 @@ impl Qwen3Engine {
                 &mut forks,
             )?;
 
+            let step_logits = self.step_logits;
+            let lp = lp_rt::row_now(self, step_logits, next_tok, params)?;
             decode_steps += 1;
             if penalised {
                 self.commit_host_picked(params, next_tok)?;
@@ -4050,6 +4096,7 @@ impl Qwen3Engine {
             budget.record_emitted(1);
             generated.push(next_tok);
             self.live.step(1, 0, 0);
+            lp_rt::push(params, lp);
             on_token(next_tok);
             cur_tok = next_tok;
 

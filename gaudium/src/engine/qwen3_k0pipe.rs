@@ -79,6 +79,9 @@ pub(super) fn decode(
         eos: false,
         cancel: false,
     };
+    if lp_rt::wanted(params) {
+        lp_rt::loop_fits(eng, 1)?;
+    }
     let mut launched = 0usize;
     let mut flights: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     // From here on a launch may be queued: every error path drains the device before returning.
@@ -119,6 +122,11 @@ pub(super) fn decode(
                 .launch_prepared(&eng.dev, &eng.step_fb_launches[nch - 1][p])
                 .map_err(|e| format!("launch decode step {launched} (cursor={cursor_val}): {e}")));
             eng.live.launch_submitted();
+            if lp_rt::wanted(params) {
+                // the step's logits row, before the step queued behind it overwrites it
+                let (logits, bytes) = (eng.step_logits, eng.step_logits_bytes);
+                tryd!(lp_rt::enqueue_rows(eng, logits, bytes, 1, p));
+            }
             tryd!(events[p]
                 .record_compute(&eng.dev)
                 .map_err(|e| format!("record step event: {e}")));
@@ -137,10 +145,12 @@ pub(super) fn decode(
             .synchronize()
             .map_err(|e| format!("wait decode step {}: {e}", out.steps)));
         let tok = tryd!(eng.read_i32_scalar(tok_addr[1 - fp]));
+        let lp = tryd!(lp_rt::slot_entries(eng, fp, 1, &[tok], params)).pop();
         out.steps += 1;
         budget.record_emitted(1);
         generated.push(tok);
         eng.live.step(1, 0, 0);
+        lp_rt::push(params, lp);
         on_token(tok);
         if params.stop_on_eos && is_eos(tok) {
             out.eos = true;

@@ -203,6 +203,18 @@ impl GenEngine for ScriptedEngine {
                 break;
             }
             rep.generated_tokens.push(id);
+            // as the engine's readout: the token's entry goes to the tap before the token
+            if let Some(tap) = params.logprobs.as_ref() {
+                let n = rep.generated_tokens.len() as f64;
+                let alts = (0..tap.top as i32)
+                    .map(|j| (id + j, -0.5 * (j as f64 + n)))
+                    .collect();
+                tap.push(crate::logprobs::TokenLogprob {
+                    token: id,
+                    logprob: -0.5 * n,
+                    top: alts,
+                });
+            }
             on_token(id);
             // a test holds the generation here, as a long one would be held
             let n = rep.generated_tokens.len();
@@ -3637,8 +3649,6 @@ fn chat_refuses_fields_whose_ignoring_would_go_unseen() {
     let before = h.prompts.lock().unwrap().len();
     for (extra, field) in [
         (",\"n\":2", "n"),
-        (",\"logprobs\":true", "logprobs"),
-        (",\"logprobs\":true,\"top_logprobs\":3", "logprobs"),
     ] {
         let (status, r) = h.chat(extra);
         assert_eq!(status, 400, "{extra}: {}", r.dump());
@@ -4893,6 +4903,196 @@ fn a_responses_text_format_is_held_to_its_schema() {
     assert_eq!(status, 400, "{text}");
     assert!(text.contains("'pattern'"), "{text}");
     assert_eq!(h.prompts.lock().unwrap().len(), before);
+}
+
+/// The `logprobs.content` entries of a chat reply, or of every chunk of a stream, in order.
+fn logprob_entries(v: &[&JsonValue]) -> Vec<JsonValue> {
+    v.iter()
+        .filter_map(|c| c.get("logprobs").and_then(|l| l.get("content")))
+        .flat_map(|c| c.as_array().unwrap().to_vec())
+        .collect()
+}
+
+#[test]
+fn chat_logprobs_give_one_entry_per_generated_token() {
+    let h = harness();
+    let tok = Arc::clone(&h.state.models[0].tokenizer);
+    // a reply with a character of several bytes, split over tokens or not
+    let reply = "Snow in Oslo \u{2744} today.";
+    let ids = tok.encode(reply, true);
+    h.script(reply);
+    let (status, r) = h.chat(",\"logprobs\":true,\"top_logprobs\":3");
+    assert_eq!(status, 200, "{}", r.dump());
+    let choice = at(&r, &["choices", "0"]);
+    let entries = logprob_entries(&[choice]);
+    assert_eq!(entries.len(), ids.len(), "{}", r.dump());
+    let mut bytes = Vec::new();
+    for (i, (e, &id)) in entries.iter().zip(&ids).enumerate() {
+        let b: Vec<u8> = at(e, &["bytes"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(b, tok.token_bytes(id), "entry {i}");
+        let text = s(e, &["token"]);
+        match std::str::from_utf8(&b) {
+            Ok(t) => assert_eq!(text, t),
+            Err(_) => assert!(text.starts_with("bytes:\\x"), "{text}"),
+        }
+        bytes.extend_from_slice(&b);
+        let lp = at(e, &["logprob"]).as_f64().unwrap();
+        assert!((lp + 0.5 * (i as f64 + 1.0)).abs() < 1e-12);
+        assert_eq!(at(e, &["top_logprobs"]).as_array().unwrap().len(), 3);
+    }
+    // the entries' bytes spell the reply
+    assert_eq!(String::from_utf8(bytes).unwrap(), reply);
+    // a request that does not ask gets no logprobs member
+    h.script(reply);
+    let (_, r) = h.chat("");
+    assert!(at(&r, &["choices", "0"]).get("logprobs").is_none());
+}
+
+#[test]
+fn streamed_logprobs_cover_every_token_once_in_order() {
+    let h = harness();
+    let tok = Arc::clone(&h.state.models[0].tokenizer);
+    let reply = "Rain, then sun.";
+    let ids = tok.encode(reply, true);
+    h.script(reply);
+    let body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Weather?\"}],\"stream\":true,\"logprobs\":true}";
+    let (status, text) = h.post("/v1/chat/completions", body);
+    assert_eq!(status, 200, "{text}");
+    let chunks: Vec<JsonValue> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|l| *l != "[DONE]")
+        .map(|l| json::parse_json(l).unwrap())
+        .collect();
+    let choices: Vec<&JsonValue> = chunks.iter().map(|c| at(c, &["choices", "0"])).collect();
+    let entries = logprob_entries(&choices);
+    assert_eq!(entries.len(), ids.len(), "{text}");
+    for (e, &id) in entries.iter().zip(&ids) {
+        let b: Vec<u8> = at(e, &["bytes"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(b, tok.token_bytes(id));
+        // no alternatives asked for: an empty list
+        assert!(at(e, &["top_logprobs"]).as_array().unwrap().is_empty());
+    }
+    let st = collect_chat_stream(&text);
+    assert_eq!(format!("{}{}", st.reasoning, st.content), reply);
+}
+
+#[test]
+fn logprob_fields_out_of_range_are_refused() {
+    let h = harness();
+    for extra in [
+        ",\"logprobs\":true,\"top_logprobs\":21",
+        ",\"logprobs\":true,\"top_logprobs\":-1",
+        ",\"logprobs\":true,\"top_logprobs\":2.5",
+        ",\"top_logprobs\":2",
+        ",\"logprobs\":\"yes\"",
+    ] {
+        let (status, r) = h.chat(extra);
+        assert_eq!(status, 400, "{extra}: {}", r.dump());
+    }
+    // the bounds themselves are accepted
+    for extra in [
+        ",\"logprobs\":true,\"top_logprobs\":20",
+        ",\"logprobs\":false,\"top_logprobs\":0",
+    ] {
+        h.script("Fine.");
+        let (status, r) = h.chat(extra);
+        assert_eq!(status, 200, "{extra}: {}", r.dump());
+    }
+    // a model whose engine has no readout refuses rather than answering without logprobs
+    let h = model_harness(
+        "gemma",
+        CALL_FORM_TEMPLATE,
+        Some(CALL_FORM_CONFIG),
+        Some(GEMMA4_SPEC),
+    );
+    let (status, r) = h.chat(",\"logprobs\":true");
+    assert_eq!(status, 400, "{}", r.dump());
+}
+
+/// A thinking budget's forced end of thinking: the entries cover the kept reasoning (first
+/// generation), the marker (reported as forced: logprob 0, no alternatives) and the resumed
+/// answer (second generation); the dropped token of the cut has none.
+#[test]
+fn logprobs_cover_a_reply_resumed_after_its_thinking_budget() {
+    let h = harness();
+    let tok = Arc::clone(&h.state.models[0].tokenizer);
+    let thought = "one two three four five six seven eight nine ten";
+    h.script(&format!("{thought}\n</think>\n\nnever shown"));
+    h.script("\n\nThe answer.");
+    let (status, r) = h.chat(
+        r#","max_tokens":64,"thinking_budget_tokens":4,"gaudium_return_tokens":true,"logprobs":true,"top_logprobs":2"#,
+    );
+    assert_eq!(status, 200, "{}", r.dump());
+    let kept: Vec<i32> = tok.encode(thought, true)[..4].to_vec();
+    let close = tok.encode("</think>", true);
+    let answer = tok.encode("\n\nThe answer.", true);
+    let entries = logprob_entries(&[at(&r, &["choices", "0"])]);
+    assert_eq!(
+        entries.len(),
+        kept.len() + close.len() + answer.len(),
+        "{}",
+        r.dump()
+    );
+    let bytes_of = |e: &JsonValue| -> Vec<u8> {
+        at(e, &["bytes"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u8)
+            .collect()
+    };
+    let want: Vec<i32> = kept.iter().chain(&close).chain(&answer).copied().collect();
+    for (i, (e, &id)) in entries.iter().zip(&want).enumerate() {
+        assert_eq!(bytes_of(e), tok.token_bytes(id), "entry {i}");
+        let lp = at(e, &["logprob"]).as_f64().unwrap();
+        let forced = e.get("gaudium_forced").is_some();
+        if i < kept.len() {
+            // the first generation's readout: token n (from 1) reports -0.5 n
+            assert!((lp + 0.5 * (i as f64 + 1.0)).abs() < 1e-12, "entry {i}");
+            assert!(!forced);
+        } else if i < kept.len() + close.len() {
+            assert_eq!(lp, 0.0, "entry {i}");
+            assert_eq!(e.get("gaudium_forced"), Some(&JsonValue::Bool(true)));
+            assert!(at(e, &["top_logprobs"]).as_array().unwrap().is_empty());
+        } else {
+            // the resumed generation's own readout, counted from its own first token
+            let n = (i - kept.len() - close.len()) as f64 + 1.0;
+            assert!((lp + 0.5 * n).abs() < 1e-12, "entry {i}");
+            assert!(!forced);
+            assert_eq!(at(e, &["top_logprobs"]).as_array().unwrap().len(), 2);
+        }
+    }
+
+    // streamed: the same entries, in order
+    h.script(&format!("{thought}\n</think>\n\nnever shown"));
+    h.script("\n\nThe answer.");
+    let body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"stream\":true,\
+                \"max_tokens\":64,\"thinking_budget_tokens\":4,\"logprobs\":true,\"top_logprobs\":2}";
+    let (status, text) = h.post("/v1/chat/completions", body);
+    assert_eq!(status, 200, "{text}");
+    let chunks: Vec<JsonValue> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|l| *l != "[DONE]")
+        .map(|l| json::parse_json(l).unwrap())
+        .collect();
+    let choices: Vec<&JsonValue> = chunks.iter().map(|c| at(c, &["choices", "0"])).collect();
+    let streamed = logprob_entries(&choices);
+    assert_eq!(
+        streamed.iter().map(|e| e.dump()).collect::<Vec<_>>(),
+        entries.iter().map(|e| e.dump()).collect::<Vec<_>>()
+    );
 }
 
 #[path = "tool_loop_tests.rs"]

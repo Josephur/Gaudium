@@ -112,7 +112,7 @@ pub use proxy::ProxyOptions;
 pub use response_store::{StoreLimits as ResponseStoreLimits, DEFAULT_ENTRIES as DEFAULT_RESPONSE_STORE_ENTRIES, DEFAULT_MIB as DEFAULT_RESPONSE_STORE_MIB};
 use outparse::{Delta, OutputFormat, OutputParser};
 use readout::{DrafterFacts, RunFacts, Timings};
-use stream_out::{ChunkForm, SseSink, StreamOut};
+use stream_out::{ChunkForm, LpEntry, SseSink, StreamOut};
 
 /// Largest request body. Images and video frames travel inside the request as base64.
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
@@ -4100,7 +4100,7 @@ fn handle_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Con
         api.error(stream, 400, "invalid_request_error", "invalid JSON body");
         return;
     };
-    let creq = match completion::parse(&val) {
+    let creq = match completion::parse(&val, native) {
         Ok(c) => c,
         Err(e) => {
             api.error(stream, 400, "invalid_request_error", &e);
@@ -4328,6 +4328,30 @@ fn run_prompt(
                     return;
                 }
             }
+        }
+    };
+    // Per-token log-probabilities: chat completions (`logprobs`, `top_logprobs`) and text
+    // completions in the OpenAI shape (`logprobs: <int>`). (The native completion's `n_probs`,
+    // the Messages API and the Responses API report or refuse their fields as not applied.)
+    let lp_asked = match api {
+        Api::Chat => logprob_request(val),
+        Api::Completion { native: false } => completion::logprobs_field(val),
+        Api::Completion { native: true } | Api::Messages { .. } | Api::Responses => Ok(None),
+    };
+    let logprobs = match lp_asked {
+        Ok(Some(_)) if !crate::engine::has_logprob_readout(m.spec.family, m.lanes) => {
+            api.error(
+                stream,
+                400,
+                "invalid_request_error",
+                "logprobs are not available for this model: its engine has no log-probability readout yet",
+            );
+            return;
+        }
+        Ok(t) => t.map(crate::logprobs::LogprobTap::new),
+        Err(e) => {
+            api.error(stream, 400, "invalid_request_error", &e);
+            return;
         }
     };
 
@@ -4675,6 +4699,7 @@ fn run_prompt(
             .unwrap_or(true),
         penalties,
         grammar,
+        logprobs: logprobs.clone(),
         ..Qwen3GenParams::default()
     };
 
@@ -4832,6 +4857,7 @@ fn run_prompt(
             Api::Completion { native: true } => ChunkForm::Native,
         },
     )));
+    out.lock().unwrap().logprobs = logprobs.is_some();
     {
         // The chat role chunk goes out now, so a client times its request from the moment the
         // engine took it. (The Messages stream began with `message_start` at admission.)
@@ -4882,8 +4908,14 @@ fn run_prompt(
     let client_cancelled = Cell::new(false);
     let kept: RefCell<Vec<i32>> = RefCell::new(Vec::new());
     let cancel_now = RefCell::new(Arc::clone(&cancel_flag));
+    // characters of output text before the next token (a text completion's `text_offset`)
+    let mut lp_chars: u64 = 0;
     let report = {
         let mut on_token = |tok_id: i32| {
+            // The token's log-probability entry: the engine pushed it before the token. It is
+            // taken for every token handed over, kept or dropped, so the tap stays in step.
+            let mut lp_read = logprobs.as_ref().map(|tap| tap.pop());
+            let mut forced = false;
             let mut toks: &[i32] = std::slice::from_ref(&tok_id);
             if let Some(tb) = think.borrow_mut().as_mut().filter(|_| !parser.stopped()) {
                 // the rest of the launch after a cut is dropped
@@ -4918,8 +4950,10 @@ fn run_prompt(
                         if step == ThinkStep::End {
                             return;
                         }
-                        // the marker goes in as if generated
+                        // the marker goes in as if generated (no draw picked it: its
+                        // log-probability entries report it as forced)
                         toks = &think_close_ids;
+                        forced = true;
                     }
                 }
             }
@@ -4945,8 +4979,20 @@ fn run_prompt(
                 if parser.stopped() {
                     cancel_now.borrow().store(true, Ordering::Relaxed);
                 }
+                let lp_entry = logprobs.as_ref().map(|_| {
+                    let src = if forced {
+                        LpSrc::Forced
+                    } else {
+                        LpSrc::Read(lp_read.take().flatten())
+                    };
+                    logprob_entry(api, &tok_ref, tok_id, src, lp_chars)
+                });
+                lp_chars += piece.chars().count() as u64;
                 let (timings, seen) = {
                     let mut o = out.lock().unwrap();
+                    if let Some(e) = lp_entry {
+                        o.push_logprob(e);
+                    }
                     o.push_token(delta);
                     (o.timings(), o.seen_tokens())
                 };
@@ -5052,6 +5098,10 @@ fn run_prompt(
         };
         let joined = match (first, resume) {
             (Ok(rep1), Some(room)) => {
+                // (every entry of the first generation was taken with its token)
+                if let Some(tap) = logprobs.as_ref() {
+                    while tap.pop().is_some() {}
+                }
                 let prompt2: Vec<i32> = prompt_ids.iter().chain(kept.borrow().iter()).copied().collect();
                 let params2 = Qwen3GenParams {
                     max_new: room,
@@ -5444,8 +5494,9 @@ fn run_prompt(
                             jq(&model_id)
                         )
                     };
+                    let lp = out.take_logprobs_json();
                     format!(
-                        "{{{head},\"choices\":[{{\"index\":0,\"text\":{},\"logprobs\":null,\"finish_reason\":{}}}],\
+                        "{{{head},\"choices\":[{{\"index\":0,\"text\":{},{lp}\"finish_reason\":{}}}],\
                          \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}",
                         jq(&text),
                         jq(finish_reason),
@@ -5462,8 +5513,9 @@ fn run_prompt(
                     write_json(stream, 200, &body);
                 }
             } else if stream_mode {
+                let lp = out.take_logprobs_json();
                 let final_chunk = format!(
-                    "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{},\"finish_reason\":{}}}],\
+                    "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{},{lp}\"finish_reason\":{}}}],\
                      \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}\n\ndata: [DONE]\n\n",
                     out.chunk_head(),
                     stream_out::delta_json(&pending),
@@ -5494,9 +5546,10 @@ fn run_prompt(
                     ));
                 }
                 msg.push('}');
+                let lp = out.take_logprobs_json();
                 let resp = format!(
                     "{{\"id\":{},\"object\":\"chat.completion\",\"created\":{created},\"model\":{},\
-                     \"choices\":[{{\"index\":0,\"message\":{msg},\"finish_reason\":{}}}],\
+                     \"choices\":[{{\"index\":0,\"message\":{msg},{lp}\"finish_reason\":{}}}],\
                      \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}",
                     jq(&req_id),
                     jq(&model_id),
@@ -5532,6 +5585,137 @@ fn run_prompt(
                 api.error(stream, 500, "server_error", &e);
             }
         }
+    }
+}
+
+/// The request's `logprobs` / `top_logprobs`: `Some(n)` asks for every token's log-probability
+/// with `n` alternatives each, `None` asks for none. `top_logprobs` needs `logprobs: true` and is
+/// an integer in the verified range (`crate::logprobs::top_ok`).
+fn logprob_request(val: &JsonValue) -> Result<Option<u64>, String> {
+    let want = match val.get("logprobs") {
+        None | Some(JsonValue::Null) => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or("logprobs must be a boolean (true or false)")?,
+    };
+    let top = match val.get("top_logprobs") {
+        None | Some(JsonValue::Null) => None,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .filter(|&n| v.as_f64() == Some(n as f64))
+                .ok_or_else(|| {
+                    format!(
+                        "top_logprobs must be an integer from 0 to {}",
+                        crate::logprobs::max_top()
+                    )
+                })?;
+            if !crate::logprobs::top_ok(n) {
+                return Err(format!(
+                    "top_logprobs must be an integer from 0 to {} (got {n})",
+                    crate::logprobs::max_top()
+                ));
+            }
+            Some(n)
+        }
+    };
+    match (want, top) {
+        (false, Some(n)) if n > 0 => Err("top_logprobs needs logprobs: true".to_string()),
+        (false, _) => Ok(None),
+        (true, t) => Ok(Some(t.unwrap_or(0))),
+    }
+}
+
+/// What a token's log-probability entry reports.
+enum LpSrc {
+    /// The readout's entry (`None`: none was pushed, never for an engine with a readout).
+    Read(Option<crate::logprobs::TokenLogprob>),
+    /// A token the server put in, which no draw picked: the end-of-thinking marker a thinking
+    /// budget forces. It reports `logprob` 0 (it was certain) and no alternatives; a chat entry
+    /// also says `"gaudium_forced": true`.
+    Forced,
+}
+
+/// One token's log-probability entry in the shape of the request's API. `offset`: characters
+/// of output text before the token (a text completion's `text_offset`).
+fn logprob_entry(api: Api, tok: &Tokenizer, id: i32, src: LpSrc, offset: u64) -> LpEntry {
+    use crate::logprobs::{logprob_json, token_text};
+    match api {
+        Api::Completion { native: false } => {
+            let (lp, top) = match &src {
+                LpSrc::Read(Some(e)) => (e.logprob, e.top.as_slice()),
+                LpSrc::Read(None) => (f64::NEG_INFINITY, &[][..]),
+                LpSrc::Forced => (0.0, &[][..]),
+            };
+            // `{text: logprob}` of the alternatives; two ids with one text keep the likelier
+            let mut seen: Vec<String> = Vec::new();
+            let mut parts = Vec::new();
+            for &(t, l) in top {
+                let text = token_text(tok.token_bytes(t));
+                if !seen.contains(&text) {
+                    parts.push(format!("{}:{}", jq(&text), logprob_json(l)));
+                    seen.push(text);
+                }
+            }
+            LpEntry::Text {
+                token: jq(&token_text(tok.token_bytes(id))),
+                logprob: logprob_json(lp),
+                top: format!("{{{}}}", parts.join(",")),
+                offset,
+            }
+        }
+        _ => LpEntry::Chat(match src {
+            LpSrc::Read(e) => logprob_entry_json(tok, id, e),
+            LpSrc::Forced => {
+                let b = tok.token_bytes(id);
+                format!(
+                    "{{\"token\":{},\"logprob\":0.0,\"bytes\":[{}],\"top_logprobs\":[],\"gaudium_forced\":true}}",
+                    jq(&token_text(b)),
+                    b.iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+        }),
+    }
+}
+
+/// One token's entry of `choices[].logprobs.content`: `token`, `logprob`, `bytes` (the token's
+/// exact bytes, also when they are not whole UTF-8) and `top_logprobs`.
+fn logprob_entry_json(
+    tok: &Tokenizer,
+    id: i32,
+    e: Option<crate::logprobs::TokenLogprob>,
+) -> String {
+    use crate::logprobs::{logprob_json, token_text};
+    let one = |id: i32, lp: f64| {
+        let b = tok.token_bytes(id);
+        format!(
+            "\"token\":{},\"logprob\":{},\"bytes\":[{}]",
+            jq(&token_text(b)),
+            logprob_json(lp),
+            b.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    match e {
+        Some(e) => {
+            let tops: Vec<String> = e
+                .top
+                .iter()
+                .map(|&(t, lp)| format!("{{{}}}", one(t, lp)))
+                .collect();
+            format!(
+                "{{{},\"top_logprobs\":[{}]}}",
+                one(id, e.logprob),
+                tops.join(",")
+            )
+        }
+        // (never for a token of an engine with a readout: the engine pushes every entry)
+        None => format!("{{{},\"top_logprobs\":[]}}", one(id, f64::NEG_INFINITY)),
     }
 }
 

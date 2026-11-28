@@ -100,21 +100,15 @@ const FIELDS: &[Field] = &[
     applied("thinking_budget_tokens"),
     // structured output (`server/structured.rs` parses it)
     applied("response_format"),
+    // per-token log-probabilities (the chat path reads and range-checks them:
+    // `logprob_request`)
+    applied("logprobs"),
+    applied("top_logprobs"),
     // refused: ignoring them changes the reply without a sign
     refused(
         "n",
         "this server returns one choice per request; send n: 1 or leave it out",
         is_one,
-    ),
-    refused(
-        "logprobs",
-        "token log probabilities are not returned yet",
-        is_false,
-    ),
-    refused(
-        "top_logprobs",
-        "token log probabilities are not returned yet",
-        is_zero,
     ),
     // ignored and reported
     ignored(
@@ -227,10 +221,6 @@ fn is_false(v: &JsonValue) -> bool {
     matches!(v, JsonValue::Bool(false))
 }
 
-fn is_zero(v: &JsonValue) -> bool {
-    v.as_f64() == Some(0.0)
-}
-
 fn is_one(v: &JsonValue) -> bool {
     v.as_f64() == Some(1.0)
 }
@@ -308,6 +298,14 @@ mod tests {
     }
 
     #[test]
+    fn logprob_fields_are_applied() {
+        assert_eq!(
+            run(r#"{"messages":[],"logprobs":true,"top_logprobs":5}"#),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
     fn unknown_fields_are_reported_never_refused() {
         let r = run(r#"{"messages":[],"some_future_field":{"a":1}}"#).unwrap();
         assert_eq!(r, vec!["some_future_field (unknown field)".to_string()]);
@@ -318,8 +316,6 @@ mod tests {
         for (body, field) in [
             (r#"{"n":3}"#, "n"),
             (r#"{"n":0}"#, "n"),
-            (r#"{"logprobs":true}"#, "logprobs"),
-            (r#"{"top_logprobs":5}"#, "top_logprobs"),
         ] {
             let e = run(body).unwrap_err();
             assert_eq!(e.field, field, "{body}");

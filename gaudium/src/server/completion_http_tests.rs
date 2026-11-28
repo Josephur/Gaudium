@@ -228,9 +228,127 @@ fn completion_fields_not_applied_are_reported() {
         .iter()
         .map(|x| x.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(ignored.len(), 3, "{ignored:?}");
-    assert!(ignored[0].starts_with("logprobs"));
-    // frequency_penalty is applied by the shared run: not reported; the native name is
-    assert!(ignored[1].starts_with("repeat_penalty"), "{ignored:?}");
-    assert_eq!(ignored[2], "user");
+    // logprobs and frequency_penalty are applied by the shared run: not reported; the native
+    // name of the repetition penalty is
+    assert_eq!(ignored.len(), 2, "{ignored:?}");
+    assert!(ignored[0].starts_with("repeat_penalty"), "{ignored:?}");
+    assert_eq!(ignored[1], "user");
+    assert!(
+        at(&v, &["choices", "0", "logprobs", "tokens"])
+            .as_array()
+            .is_some(),
+        "{text}"
+    );
+}
+
+/// The OpenAI shape's `logprobs` of one choice: `(tokens, token_logprobs, top_logprobs sizes,
+/// text_offset)`.
+fn legacy_logprobs(choice: &JsonValue) -> (Vec<String>, Vec<f64>, Vec<usize>, Vec<u64>) {
+    let lp = at(choice, &["logprobs"]);
+    let arr = |k: &str| at(lp, &[k]).as_array().unwrap().to_vec();
+    (
+        arr("tokens")
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect(),
+        arr("token_logprobs")
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect(),
+        arr("top_logprobs")
+            .iter()
+            .map(|x| x.as_object().unwrap().len())
+            .collect(),
+        arr("text_offset")
+            .iter()
+            .map(|x| x.as_u64().unwrap())
+            .collect(),
+    )
+}
+
+/// `logprobs: <int>` on `/v1/completions`: one entry per generated token in the legacy shape,
+/// whole and streamed; the native `/completion` reports the field as not applied.
+#[test]
+fn completion_logprobs_have_the_legacy_shape() {
+    let h = harness();
+    let tok = Arc::clone(&h.state.models[0].tokenizer);
+    let reply = "Snow in Oslo \u{2744} today.";
+    let ids = tok.encode(reply, true);
+    h.script(reply);
+    let (status, text) = h.post(
+        "/v1/completions",
+        r#"{"prompt":"Weather:","temperature":0,"logprobs":2}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    let v = parsed(&text);
+    let choice = at(&v, &["choices", "0"]);
+    let (tokens, lps, tops, offs) = legacy_logprobs(choice);
+    assert_eq!(tokens.len(), ids.len(), "{text}");
+    assert_eq!(
+        (lps.len(), tops.len(), offs.len()),
+        (ids.len(), ids.len(), ids.len())
+    );
+    // the scripted readout: token n (from 1) reports -0.5 n, with 2 alternatives
+    for (i, &lp) in lps.iter().enumerate() {
+        assert!((lp + 0.5 * (i as f64 + 1.0)).abs() < 1e-12, "{text}");
+    }
+    assert!(tops.iter().all(|&n| (1..=2).contains(&n)), "{tops:?}");
+    // each offset is where the token's text starts in the completion's text
+    let mut chars = 0u64;
+    let mut held: Vec<u8> = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        assert_eq!(offs[i], chars, "token {i}: {text}");
+        held.extend_from_slice(tok.token_bytes(id));
+        if let Ok(t) = std::str::from_utf8(&held) {
+            chars += t.chars().count() as u64;
+            held.clear();
+        }
+    }
+    assert_eq!(chars, reply.chars().count() as u64);
+    assert!(at(&v, &["gaudium"]).get("ignored").is_none(), "{text}");
+
+    // streamed: the chunks' entries, in order, are the whole reply's
+    h.script(reply);
+    let (status, body) = h.post(
+        "/v1/completions",
+        r#"{"prompt":"Weather:","temperature":0,"logprobs":2,"stream":true}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    let (chunks, _) = stream_payloads(&body);
+    let (mut st_tokens, mut st_offs) = (Vec::new(), Vec::new());
+    for c in &chunks {
+        let choice = at(c, &["choices", "0"]);
+        if matches!(at(choice, &["logprobs"]), JsonValue::Null) {
+            continue;
+        }
+        let (t, _, _, o) = legacy_logprobs(choice);
+        st_tokens.extend(t);
+        st_offs.extend(o);
+    }
+    assert_eq!(st_tokens, tokens, "{body}");
+    assert_eq!(st_offs, offs, "{body}");
+
+    // no logprobs asked: null, as before
+    h.script(reply);
+    let (_, text) = h.post(
+        "/v1/completions",
+        r#"{"prompt":"Weather:","temperature":0}"#,
+    );
+    assert!(matches!(
+        at(&parsed(&text), &["choices", "0", "logprobs"]),
+        JsonValue::Null
+    ));
+    // out of range: refused
+    let (status, _) = h.post("/v1/completions", r#"{"prompt":"W","logprobs":21}"#);
+    assert_eq!(status, 400);
+
+    // the native shape runs without them and says so
+    h.script(reply);
+    let (status, text) = h.post("/completion", r#"{"prompt":"W","logprobs":2,"n_probs":2}"#);
+    assert_eq!(status, 200, "{text}");
+    let ignored = at(&parsed(&text), &["gaudium", "ignored"]).dump();
+    assert!(
+        ignored.contains("logprobs") && ignored.contains("n_probs"),
+        "{ignored}"
+    );
 }

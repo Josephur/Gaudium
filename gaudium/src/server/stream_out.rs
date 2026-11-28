@@ -234,6 +234,25 @@ pub(super) struct StreamOut {
     pub write_failed: bool,
     /// Text chunks written (the role chunk and progress chunks are not counted).
     pub chunks: u64,
+    /// The request asks for per-token log-probabilities (`choices[].logprobs`).
+    pub logprobs: bool,
+    /// Log-probability entries not written yet (one per token, in order).
+    lp_pending: Vec<LpEntry>,
+}
+
+/// One generated token's log-probability entry, in the shape of the stream's form (each field
+/// already JSON).
+pub(super) enum LpEntry {
+    /// An entry of a chat completion's `logprobs.content`.
+    Chat(String),
+    /// A text completion's token: its `tokens`, `token_logprobs`, `top_logprobs` (an object of
+    /// text to logprob) and `text_offset` values.
+    Text {
+        token: String,
+        logprob: String,
+        top: String,
+        offset: u64,
+    },
 }
 
 impl StreamOut {
@@ -280,6 +299,8 @@ impl StreamOut {
             last_progress: None,
             write_failed: false,
             chunks: 0,
+            logprobs: false,
+            lp_pending: Vec::new(),
         }
     }
 
@@ -352,6 +373,63 @@ impl StreamOut {
         };
         if self.stream.is_some() {
             self.held.push_str(&events);
+        }
+    }
+
+    /// One generated token's log-probability entry (before its [`Self::push_token`]). It goes
+    /// out with the first chunk that carries text from then on (or the final chunk / message).
+    pub fn push_logprob(&mut self, entry: LpEntry) {
+        self.lp_pending.push(entry);
+    }
+
+    /// The `"logprobs":..,` member of a choice with the entries not written yet: a chat
+    /// completion's `{"content": [..]}`, a text completion's `{"tokens": [..],
+    /// "token_logprobs": [..], "top_logprobs": [..], "text_offset": [..]}`. A request that does
+    /// not ask gets no member (chat) or `null` (text); a native completion none.
+    pub fn take_logprobs_json(&mut self) -> String {
+        let entries = std::mem::take(&mut self.lp_pending);
+        match self.form {
+            ChunkForm::Native => String::new(),
+            ChunkForm::Chat if !self.logprobs => String::new(),
+            ChunkForm::Text if !self.logprobs => "\"logprobs\":null,".to_string(),
+            ChunkForm::Chat => {
+                let content: Vec<&str> = entries
+                    .iter()
+                    .filter_map(|e| match e {
+                        LpEntry::Chat(c) => Some(c.as_str()),
+                        LpEntry::Text { .. } => None,
+                    })
+                    .collect();
+                format!(
+                    "\"logprobs\":{{\"content\":[{}],\"refusal\":null}},",
+                    content.join(",")
+                )
+            }
+            ChunkForm::Text => {
+                let (mut tokens, mut lps, mut tops, mut offs) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for e in &entries {
+                    if let LpEntry::Text {
+                        token,
+                        logprob,
+                        top,
+                        offset,
+                    } = e
+                    {
+                        tokens.push(token.as_str());
+                        lps.push(logprob.as_str());
+                        tops.push(top.as_str());
+                        offs.push(offset.to_string());
+                    }
+                }
+                format!(
+                    "\"logprobs\":{{\"tokens\":[{}],\"token_logprobs\":[{}],\"top_logprobs\":[{}],\"text_offset\":[{}]}},",
+                    tokens.join(","),
+                    lps.join(","),
+                    tops.join(","),
+                    offs.join(",")
+                )
+            }
         }
     }
 
@@ -442,7 +520,13 @@ impl StreamOut {
         } else {
             String::new()
         };
-        let chunk = self.text_chunk(Some(&pending), &timings);
+        // a chunk without text keeps the entries for the next one that has text
+        let lp = if has_text {
+            self.take_logprobs_json()
+        } else {
+            String::new()
+        };
+        let chunk = self.text_chunk_lp(Some(&pending), &lp, &timings);
         self.chunks += 1;
         self.write(&chunk);
     }
@@ -450,16 +534,23 @@ impl StreamOut {
     /// One framed chunk of this stream's form that has not ended: `d` its text (`None`: no
     /// text), `extra` further top-level members (each led by a comma).
     pub fn text_chunk(&self, d: Option<&Delta>, extra: &str) -> String {
+        self.text_chunk_lp(d, "", extra)
+    }
+
+    /// [`Self::text_chunk`] whose choice carries `lp`, a `"logprobs":..,` member (empty: none;
+    /// a text completion's chunk then says `"logprobs":null`).
+    fn text_chunk_lp(&self, d: Option<&Delta>, lp: &str, extra: &str) -> String {
         match self.form {
             ChunkForm::Chat => format!(
-                "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{},\"finish_reason\":null}}]{extra}}}\n\n",
+                "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{},{lp}\"finish_reason\":null}}]{extra}}}\n\n",
                 self.chunk_head,
                 d.map_or_else(|| "{}".to_string(), delta_json),
             ),
             ChunkForm::Text => format!(
-                "data: {{{},\"choices\":[{{\"index\":0,\"text\":{},\"logprobs\":null,\"finish_reason\":null}}]{extra}}}\n\n",
+                "data: {{{},\"choices\":[{{\"index\":0,\"text\":{},{}\"finish_reason\":null}}]{extra}}}\n\n",
                 self.chunk_head,
                 jq(&d.map(plain_text).unwrap_or_default()),
+                if lp.is_empty() { "\"logprobs\":null," } else { lp },
             ),
             ChunkForm::Native => format!(
                 "data: {{\"content\":{},\"stop\":false{extra}}}\n\n",

@@ -60,13 +60,18 @@ const APPLIED: &[&str] = &[
     "logit_bias",
 ];
 
-/// Reads a completion request body. `Err`: a 400 with this message.
-pub(super) fn parse(body: &JsonValue) -> Result<CompletionRequest, String> {
+/// Reads a completion request body (`native`: the native `/completion` shape). `Err`: a 400
+/// with this message.
+pub(super) fn parse(body: &JsonValue, native: bool) -> Result<CompletionRequest, String> {
     let Some(fields) = body.as_object() else {
         return Err("the request body must be a JSON object".into());
     };
     let prompt = parse_prompt(body.get("prompt"))?;
     refuse_unsupported(body)?;
+    if !native {
+        // (applied by the shared run, which reads it again)
+        logprobs_field(body)?;
+    }
     let max_tokens = match body.get("max_tokens") {
         // as on the chat path: 0 or absent names no limit
         Some(v) if !matches!(v, JsonValue::Null) => match v.as_u64() {
@@ -77,11 +82,13 @@ pub(super) fn parse(body: &JsonValue) -> Result<CompletionRequest, String> {
     };
     let mut ignored = Vec::new();
     for (k, v) in fields {
-        if APPLIED.contains(&k.as_str()) || is_default(k, v) {
+        if APPLIED.contains(&k.as_str()) || is_default(k, v) || (!native && k == "logprobs") {
             continue;
         }
         let name = match k.as_str() {
-            "logprobs" | "n_probs" => format!("{k} (token log-probabilities are not reported yet)"),
+            "logprobs" | "n_probs" => format!(
+                "{k} (token log-probabilities are not reported in the native shape yet: send logprobs to /v1/completions)"
+            ),
             "repeat_penalty" => format!("{k} (not applied: send repetition_penalty)"),
             _ => k.clone(),
         };
@@ -94,6 +101,28 @@ pub(super) fn parse(body: &JsonValue) -> Result<CompletionRequest, String> {
         max_tokens,
         ignored,
     })
+}
+
+/// The OpenAI shape's `logprobs`: `Some(n)` asks for every token's log-probability with its
+/// `n` likeliest alternatives (`n = 0`: none), `None` (absent, `null` or `false`) for none. `n`
+/// is an integer in the verified range (`crate::logprobs::top_ok`).
+pub(super) fn logprobs_field(body: &JsonValue) -> Result<Option<u64>, String> {
+    let max = crate::logprobs::max_top();
+    match body.get("logprobs") {
+        None | Some(JsonValue::Null) | Some(JsonValue::Bool(false)) => Ok(None),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .filter(|&n| v.as_f64() == Some(n as f64))
+                .ok_or_else(|| format!("'logprobs' must be an integer from 0 to {max}"))?;
+            if !crate::logprobs::top_ok(n) {
+                return Err(format!(
+                    "'logprobs' must be an integer from 0 to {max} (got {n})"
+                ));
+            }
+            Ok(Some(n))
+        }
+    }
 }
 
 /// The native `n_predict`: a negative value (or none) names no limit; 0 (process the prompt
@@ -150,6 +179,7 @@ fn is_default(key: &str, v: &JsonValue) -> bool {
         ("echo", JsonValue::Bool(false)) => true,
         ("suffix", JsonValue::Str(s)) => s.is_empty(),
         ("logprobs", JsonValue::Bool(false)) => true,
+        // (the native shape reports none either way; the OpenAI shape applies `logprobs`)
         ("logprobs" | "n_probs", v) => v.as_u64() == Some(0),
         ("repeat_penalty", v) => v.as_f64() == Some(1.0),
         _ => false,
@@ -227,7 +257,11 @@ mod tests {
     use crate::json::parse_json;
 
     fn req(body: &str) -> Result<CompletionRequest, String> {
-        parse(&parse_json(body).unwrap())
+        parse(&parse_json(body).unwrap(), false)
+    }
+
+    fn native_req(body: &str) -> Result<CompletionRequest, String> {
+        parse(&parse_json(body).unwrap(), true)
     }
 
     #[test]
@@ -310,12 +344,41 @@ mod tests {
             r#"{"prompt":"a","temperature":0,"logprobs":5,"presence_penalty":0.5,"repeat_penalty":1.2,"user":"u","future_field":1}"#,
         )
         .unwrap();
-        // presence_penalty is applied (the shared run reads it): not reported
-        assert_eq!(r.ignored.len(), 4, "{:?}", r.ignored);
-        assert!(r.ignored[0].starts_with("logprobs"));
-        assert!(r.ignored[1].starts_with("repeat_penalty (not applied: send repetition_penalty)"));
-        assert_eq!(r.ignored[2], "user");
-        assert_eq!(r.ignored[3], "future_field");
+        // presence_penalty and logprobs are applied (the shared run reads them): not reported
+        assert_eq!(r.ignored.len(), 3, "{:?}", r.ignored);
+        assert!(r.ignored[0].starts_with("repeat_penalty (not applied: send repetition_penalty)"));
+        assert_eq!(r.ignored[1], "user");
+        assert_eq!(r.ignored[2], "future_field");
+        // the native shape reports logprobs and n_probs as not applied
+        let r = native_req(r#"{"prompt":"a","logprobs":5,"n_probs":3}"#).unwrap();
+        assert_eq!(r.ignored.len(), 2, "{:?}", r.ignored);
+        assert!(r.ignored[0].starts_with("logprobs (token log-probabilities are not reported"));
+        assert!(r.ignored[1].starts_with("n_probs"));
+    }
+
+    #[test]
+    fn openai_logprobs_field_is_an_integer_in_range() {
+        let f = |b: &str| logprobs_field(&parse_json(b).unwrap());
+        assert_eq!(f(r#"{}"#), Ok(None));
+        assert_eq!(f(r#"{"logprobs":null}"#), Ok(None));
+        assert_eq!(f(r#"{"logprobs":false}"#), Ok(None));
+        assert_eq!(f(r#"{"logprobs":0}"#), Ok(Some(0)));
+        assert_eq!(f(r#"{"logprobs":5}"#), Ok(Some(5)));
+        assert_eq!(f(r#"{"logprobs":20}"#), Ok(Some(20)));
+        for bad in [
+            r#"{"logprobs":21}"#,
+            r#"{"logprobs":-1}"#,
+            r#"{"logprobs":2.5}"#,
+            r#"{"logprobs":true}"#,
+            r#"{"logprobs":"5"}"#,
+        ] {
+            assert!(f(bad).is_err(), "{bad}");
+            // and the request is refused before it runs
+            assert!(
+                req(&bad.replace('{', r#"{"prompt":"a","#)).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
