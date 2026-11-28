@@ -27,6 +27,7 @@ fn json_mode() -> Grammar {
         open: "<tool_call>".into(),
         close: "</tool_call>".into(),
         form: CallForm::Params,
+        think: None,
     };
     build::reply(Some(&Answer::JsonObject), &[], &tags).unwrap()
 }
@@ -276,6 +277,7 @@ fn params_tags() -> CallTags {
         open: "<tool_call>".into(),
         close: "</tool_call>".into(),
         form: CallForm::Params,
+        think: None,
     }
 }
 
@@ -478,4 +480,18 @@ fn the_cache_serves_a_repeated_state() {
     // the string body is one state, built once before its first byte
     assert_eq!(c.stats.masks_built, built);
     assert!(c.stats.cache_hits >= 7);
+}
+
+#[test]
+fn a_reply_may_open_its_own_reasoning() {
+    let tags = CallTags {
+        think: Some(("<think>".into(), "</think>".into())),
+        ..params_tags()
+    };
+    let g = build::reply(Some(&Answer::JsonObject), &[], &tags).unwrap();
+    assert!(accepts(&g, "<think>\nanything [ goes\n</think>\n\n{\"a\": 1}"));
+    assert!(accepts(&g, "{\"a\": 1}"));
+    // never ends inside the reasoning, and the answer after it is held
+    assert!(refuses(&g, "<think>\nstill thinking"));
+    assert!(refuses(&g, "<think>x</think> no json"));
 }

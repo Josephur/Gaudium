@@ -69,6 +69,10 @@ pub struct CallTags {
     pub open: String,
     pub close: String,
     pub form: CallForm,
+    /// The reasoning tags the reply may open with, when the prompt did not open the reasoning
+    /// itself (a model that writes its opening tag): `(open, close)`. The reasoning between them
+    /// is free text; the reply can not end inside it.
+    pub think: Option<(String, String)>,
 }
 
 /// A reply's grammar: an answer form, the tools it may call, or both.
@@ -101,6 +105,18 @@ pub fn reply(answer: Option<&Answer>, tools: &[ToolDef], tags: &CallTags) -> Res
             call: body,
         }),
         (None, None) => return Err("internal: a reply grammar with nothing to hold".into()),
+    };
+    let root = match &tags.think {
+        Some((open, close)) if !open.is_empty() && !close.is_empty() => {
+            let o = b.lit(open);
+            let free = b.push(Node::Raw {
+                term: Pat::new(close.as_bytes()),
+                forbid: Vec::new(),
+            });
+            let thought = b.seq(vec![o, free, root]);
+            b.push(Node::Alt(vec![thought, root]))
+        }
+        _ => root,
     };
     b.finish(root)
 }

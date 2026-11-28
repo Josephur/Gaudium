@@ -143,6 +143,10 @@ pub fn plan(
         open: format.tool_open.clone(),
         close: format.tool_close.clone(),
         form,
+        // a reply the prompt did not start in the reasoning may still open it (a model that
+        // writes its own opening tag); a forced call's opening is already the reply's start
+        think: (!prompt.reasoning_open && prompt.forced_prefix.is_empty())
+            .then(|| (format.think_open.clone(), format.think_close.clone())),
     };
     let grammar = build::reply(req.answer.as_ref(), &req.tools, &tags)?;
     let start = grammar
