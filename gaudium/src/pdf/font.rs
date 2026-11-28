@@ -6,7 +6,8 @@
 //! the built-in encoding of the Symbol font) with its /Differences, whose glyph names are looked up in a table of common names and the
 //! `uniXXXX` / `uXXXX` forms. Composite (Type0) fonts take their code lengths from the
 //! codespace ranges of their CMap (two bytes for Identity-H / Identity-V); their text needs a
-//! ToUnicode CMap, except for the predefined Unicode (UCS2 / UTF16) CMaps. Their widths (/W)
+//! ToUnicode CMap, except for the predefined Unicode (UCS2 / UTF16) CMaps (whose UTF-16
+//! surrogate pairs are four-byte codes when no CMap is embedded). Their widths (/W)
 //! are indexed by CID: an embedded encoding CMap's `cidchar` / `cidrange` mappings give the CID
 //! of each code (the text is still looked up by the code); with a predefined CMap the code is
 //! taken as the CID.
@@ -803,8 +804,11 @@ impl CMap {
 /// How a composite font's codes become text when it has no ToUnicode CMap.
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum CidText {
-    /// The codes are Unicode (a predefined UCS2 / UTF16 CMap).
-    Unicode,
+    /// The codes are UCS-2 (a predefined `*-UCS2-*` CMap): two bytes each.
+    Ucs2,
+    /// The codes are UTF-16BE (a predefined `*-UTF16-*` CMap): two bytes each, except a high
+    /// surrogate followed by a low one, which is one four-byte code.
+    Utf16,
     /// Not known.
     None,
 }
@@ -896,8 +900,10 @@ impl Font {
         if composite {
             if let Some(Obj::Name(n)) = &p.encoding {
                 let n = String::from_utf8_lossy(n);
-                if n.contains("UCS2") || n.contains("UTF16") {
-                    f.cid_text = CidText::Unicode;
+                if n.contains("UTF16") {
+                    f.cid_text = CidText::Utf16;
+                } else if n.contains("UCS2") {
+                    f.cid_text = CidText::Ucs2;
                 }
             }
             if let Some(d) = p.encoding_cmap.as_deref() {
@@ -956,7 +962,10 @@ impl Font {
                     .as_ref()
                     .and_then(|c| c.code_len(rest))
                     .or_else(|| self.to_unicode.as_ref().and_then(|c| c.code_len(rest)))
-                    .unwrap_or(2)
+                    .unwrap_or_else(|| match self.cid_text {
+                        CidText::Utf16 if is_surrogate_pair(rest) => 4,
+                        _ => 2,
+                    })
             } else {
                 1
             }
@@ -968,7 +977,7 @@ impl Font {
             if text.is_none() {
                 text = if self.composite {
                     match self.cid_text {
-                        CidText::Unicode => Some(utf16be(&rest[..n])),
+                        CidText::Ucs2 | CidText::Utf16 => Some(utf16be(&rest[..n])),
                         CidText::None => None,
                     }
                 } else {
@@ -998,6 +1007,13 @@ impl Font {
         }
         Ok(())
     }
+}
+
+/// Whether `b` starts with a UTF-16BE surrogate pair: a high surrogate (D800-DBFF) followed by
+/// a low one (DC00-DFFF), which the predefined UTF16 CMaps read as one four-byte code. A lone
+/// surrogate is a two-byte code of its own.
+fn is_surrogate_pair(b: &[u8]) -> bool {
+    b.len() >= 4 && (0xD8..=0xDB).contains(&b[0]) && (0xDC..=0xDF).contains(&b[2])
 }
 
 /// Whether a /BaseFont names the Symbol font (with a subset tag or a style suffix).

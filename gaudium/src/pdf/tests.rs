@@ -420,6 +420,74 @@ fn type0_widths_are_looked_up_by_cid() {
     );
 }
 
+/// A Type0 font with a predefined Unicode encoding `encoding` (no embedded CMap, no ToUnicode
+/// CMap): the text is the codes themselves. /W gives CID 0xD840 3000 units, so a width looked
+/// up by the first half of a surrogate pair pushes the next string away.
+fn type0_predefined_unicode(encoding: &str, content: &[u8]) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let desc = p.add(
+        "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /X /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> /DW 1000 /W [55360 [3000]] >>",
+    );
+    let f1 = p.add(format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /{encoding} /DescendantFonts [{desc} 0 R] >>"
+    ));
+    let content = p.add(stream("", content));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+#[test]
+fn utf16_cmaps_read_surrogate_pairs_as_one_code() {
+    // Codex repro (#136): with /UniJIS-UTF16-H and no embedded CMap, <D840DC0B> was read as two
+    // two-byte codes and became two U+FFFD. The UTF16 CMaps read a surrogate pair as one
+    // four-byte code: one character, and one glyph with one width (the default 1000 units, 12
+    // points at 12 points). The next string, 10 points on, overlaps it by two points: no space
+    // (two widths, or the 3000 units of CID 0xD840, would put it more than a font size back,
+    // and a zero width eight points ahead, both of which read as a space).
+    let content: &[u8] = b"BT /F1 12 Tf 72 700 Td <D840DC0B> Tj 10 0 Td <0041> Tj ET";
+    for enc in [
+        "UniJIS-UTF16-H",
+        "UniJIS-UTF16-V",
+        "UniGB-UTF16-H",
+        "UniCNS-UTF16-V",
+        "UniKS-UTF16-H",
+        "UniJIS2004-UTF16-H",
+        "UniJISX0213-UTF16-H",
+    ] {
+        assert_eq!(
+            text_of(&type0_predefined_unicode(enc, content)).unwrap(),
+            vec!["\u{2000B}A"],
+            "{enc}"
+        );
+    }
+    // a lone surrogate is a two-byte code of its own (U+FFFD); the bytes after it are read on
+    let lone: &[u8] = b"BT /F1 12 Tf 72 700 Td <D8400041DC0B0042D840> Tj ET";
+    assert_eq!(
+        text_of(&type0_predefined_unicode("UniJIS-UTF16-H", lone)).unwrap(),
+        vec!["\u{FFFD}A\u{FFFD}B\u{FFFD}"]
+    );
+    // two high surrogates: the first is lone, the second pairs with the low one after it
+    let two: &[u8] = b"BT /F1 12 Tf 72 700 Td <D840D840DC0B> Tj ET";
+    assert_eq!(
+        text_of(&type0_predefined_unicode("UniJIS-UTF16-H", two)).unwrap(),
+        vec!["\u{FFFD}\u{2000B}"]
+    );
+    // the UCS2 CMaps have no surrogates: every code is two bytes
+    assert_eq!(
+        text_of(&type0_predefined_unicode("UniJIS-UCS2-H", content)).unwrap(),
+        vec!["\u{FFFD}\u{FFFD} A"]
+    );
+}
+
 #[test]
 fn xref_stream_object_stream_and_predictor() {
     let (p, root) = doc(

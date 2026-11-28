@@ -4889,13 +4889,15 @@ fn a_page_of_another_site_cannot_make_a_request_fetch_a_document() {
     assert_eq!(status, 400, "{text}");
     assert!(text.contains("another origin"), "{text}");
     assert!(seen.lock().unwrap().is_empty());
-    // the same request from the server's own page reaches the target (which sends no PDF)
+    // the same request from the server's own page reaches the target, whose JSON answer
+    // (`application/json`, a text type) is read as the document's text
+    h.script("Ok.");
     let (status, _, text) = plain_exchange(
         &h.state,
         "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nOrigin: http://localhost\r\nSec-Fetch-Site: same-origin",
         &body,
     );
-    assert_eq!(status, 400, "{text}");
-    assert!(!text.contains("another origin"), "{text}");
+    assert_eq!(status, 200, "{text}");
+    assert!(h.last_prompt().contains("{\"not\":\"a pdf\"}"), "{}", h.last_prompt());
     assert_eq!(seen.lock().unwrap().len(), 1);
 }

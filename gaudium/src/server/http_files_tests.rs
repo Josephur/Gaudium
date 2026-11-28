@@ -902,3 +902,78 @@ fn file_ids_in_chat_file_parts() {
     assert!(text.contains("not found"), "{text}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A one-page PDF without an xref table that shows `text`.
+fn small_pdf(text: &str) -> Vec<u8> {
+    let content = format!("BT /F1 12 Tf 72 700 Td ({text}) Tj ET");
+    format!(
+        "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+         2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+         3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n\
+         4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n\
+         5 0 obj << /Length {} >>\nstream\n{content}\nendstream endobj\n\
+         trailer << /Root 1 0 R >>\n%%EOF\n",
+        content.len()
+    )
+    .into_bytes()
+}
+
+#[test]
+fn file_ids_are_read_by_their_recorded_media_type() {
+    // Codex (#136): an explicit text type is honoured, also when the text mentions `%PDF-`; only
+    // a file recorded as generic binary is sniffed for a PDF
+    let dir = tmp_dir("media-types");
+    let h = with_files(vision_harness(4096, 4096), &dir, 1 << 22, 1 << 21, None);
+    let st = &h.state;
+    let (_, f) = upload(
+        st,
+        ANTHROPIC,
+        &[(
+            "file",
+            Some("notes.txt"),
+            Some("text/plain"),
+            b"Our files start with %PDF-1.7 and end with %%EOF.",
+        )],
+    );
+    assert_eq!(s(&f, &["mime_type"]), "text/plain", "{}", f.dump());
+    let txt = s(&f, &["id"]).to_string();
+    let mut blob = b"\x00\x01 a header\n".to_vec();
+    blob.extend(small_pdf("Sniffed by id"));
+    let (_, f) = upload(
+        st,
+        ANTHROPIC,
+        &[(
+            "file",
+            Some("blob"),
+            Some("application/octet-stream"),
+            &blob,
+        )],
+    );
+    assert_eq!(
+        s(&f, &["mime_type"]),
+        "application/octet-stream",
+        "{}",
+        f.dump()
+    );
+    let bin = s(&f, &["id"]).to_string();
+    for (id, seen) in [
+        (&txt, "start with %PDF-1.7 and end"),
+        (&bin, "--- Page 1 ---\nSniffed by id"),
+    ] {
+        h.script("Ok.");
+        let chat = format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"file","file":{{"file_id":"{id}"}}}}]}}]}}"#
+        );
+        let (status, text) = h.post("/v1/chat/completions", &chat);
+        assert_eq!(status, 200, "{text}");
+        assert!(h.last_prompt().contains(seen), "{}", h.last_prompt());
+        h.script("Ok.");
+        let messages = format!(
+            r#"{{"model":"vl","max_tokens":8,"messages":[{{"role":"user","content":[{{"type":"document","source":{{"type":"file","file_id":"{id}"}}}}]}}]}}"#
+        );
+        let (status, text) = h.post("/v1/messages", &messages);
+        assert_eq!(status, 200, "{text}");
+        assert!(h.last_prompt().contains(seen), "{}", h.last_prompt());
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

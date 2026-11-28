@@ -2,6 +2,12 @@
 //! `url`) and chat-completions `file` parts become the text of the document before the request
 //! is translated and rendered.
 //!
+//! The media type a document is sent with decides how it is read (`read_as`): a PDF type as a
+//! PDF, a text type as UTF-8 text (even when the text mentions `%PDF-`), and no type or a
+//! generic binary one (`application/octet-stream`) by its bytes: a PDF when its first 1,024
+//! bytes show the PDF header, else UTF-8 text. A `url` source's type is its response's
+//! `Content-Type`, an uploaded file's the type the file store recorded.
+//!
 //! A PDF is reduced to its text layer (`crate::pdf`), page by page; a PDF without one is
 //! refused with a 400 that says so. Rendering pages to images for a vision model would plug in
 //! here, beside the text: it is not done yet (it needs a font rasteriser).
@@ -55,8 +61,48 @@ fn admit(req: &mut pdf::Request, path: &str) -> R<()> {
     req.admit().map_err(|e| format!("{path}: {e}"))
 }
 
+/// How a document is read, by the media type it was sent with.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Read {
+    /// Named a PDF.
+    Pdf,
+    /// Named a text type: read as UTF-8 text, even when it mentions `%PDF-`.
+    Text,
+    /// Named no type, or a generic binary one: a PDF if its first bytes show one, else UTF-8
+    /// text.
+    Sniff,
+    /// Named a type this server does not read.
+    Other,
+}
+
+/// The essence of a media type (`type/subtype`, lower case, without parameters).
+fn essence(media: &str) -> String {
+    media
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// How a document sent as `media` is read. An explicit type is honoured; the bytes are sniffed
+/// only when the type says nothing about them.
+fn read_as(media: &str) -> Read {
+    let m = essence(media);
+    match m.as_str() {
+        "application/pdf" | "application/x-pdf" => Read::Pdf,
+        ""
+        | "application/octet-stream"
+        | "binary/octet-stream"
+        | "application/binary"
+        | "application/unknown" => Read::Sniff,
+        _ if super::files::is_text(&m) => Read::Text,
+        _ => Read::Other,
+    }
+}
+
 /// The text of a document's bytes: a PDF's text layer, or UTF-8 text, charged to the
-/// request's text budget before it is kept.
+/// request's text budget before it is kept. The media type decides which (`read_as`).
 fn bytes_text(
     bytes: &[u8],
     media: &str,
@@ -64,18 +110,20 @@ fn bytes_text(
     req: &mut pdf::Request,
     path: &str,
 ) -> R<String> {
-    let media = media.trim().to_ascii_lowercase();
-    let text = if media.starts_with("application/pdf") || pdf::is_pdf(bytes) {
-        pdf::extract_text(bytes, &ctx.limits)
+    let how = match read_as(media) {
+        Read::Sniff if pdf::is_pdf(bytes) => Read::Pdf,
+        Read::Sniff => Read::Text,
+        r => r,
+    };
+    let text = match how {
+        Read::Pdf => pdf::extract_text(bytes, &ctx.limits)
             .map(|e| e.text())
-            .map_err(|e| format!("{path}: {e}"))?
-    } else if let Some(t) = (media.starts_with("text/") || media.is_empty())
-        .then(|| std::str::from_utf8(bytes).ok())
-        .flatten()
-    {
-        t.to_string()
-    } else {
-        return Err(unsupported(&media, path));
+            .map_err(|e| format!("{path}: {e}"))?,
+        Read::Text => match std::str::from_utf8(bytes) {
+            Ok(t) => t.to_string(),
+            Err(_) => return Err(unsupported(&essence(media), path)),
+        },
+        Read::Sniff | Read::Other => return Err(unsupported(&essence(media), path)),
     };
     req.keep(text.len() as u64)
         .map_err(|e| format!("{path}: {e}"))?;
@@ -151,15 +199,21 @@ fn document(
                 .get("media_type")
                 .and_then(JsonValue::as_str)
                 .unwrap_or("");
-            if !media.trim().eq_ignore_ascii_case("application/pdf") {
-                return Ok(()); // text documents, and the refusal of other types, stay as they were
+            // a PDF, or a generic binary type whose bytes show a PDF; text documents, and the
+            // refusal of other types, stay as they were for the translation
+            let how = read_as(media);
+            if how != Read::Pdf && how != Read::Sniff {
+                return Ok(());
             }
             let Some(data) = src.get("data").and_then(JsonValue::as_str) else {
                 return Err(format!("{sp}.data: Field required (a string)"));
             };
             admit(req, path)?;
             let bytes = decode_base64(data, &format!("{sp}.data"))?;
-            bytes_text(&bytes, media, ctx, req, path)?
+            if how == Read::Sniff && !pdf::is_pdf(&bytes) {
+                return Ok(());
+            }
+            bytes_text(&bytes, "application/pdf", ctx, req, path)?
         }
         "url" => {
             let Some(url) = src.get("url").and_then(JsonValue::as_str) else {
@@ -575,5 +629,114 @@ mod tests {
         let before = b.dump();
         expand_chat(&mut b, &ctx()).unwrap();
         assert_eq!(b.dump(), before);
+    }
+
+    /// Text that mentions the PDF header in its first 1,024 bytes.
+    const MENTIONS_PDF: &str = "PDF files start with %PDF-1.7 and end with %%EOF.";
+
+    #[test]
+    fn an_explicit_media_type_is_honoured_and_only_generic_ones_are_sniffed() {
+        assert_eq!(read_as("application/pdf"), Read::Pdf);
+        assert_eq!(read_as(" Application/PDF; x=1"), Read::Pdf);
+        assert_eq!(read_as("text/plain"), Read::Text);
+        assert_eq!(read_as("text/markdown; charset=utf-8"), Read::Text);
+        assert_eq!(read_as("application/json"), Read::Text);
+        assert_eq!(read_as(""), Read::Sniff);
+        assert_eq!(read_as("application/octet-stream"), Read::Sniff);
+        assert_eq!(read_as("image/png"), Read::Other);
+        // Codex repro (#136): a text/plain file that mentions `%PDF-` was read as a PDF and
+        // refused (`no document catalog`); it is text
+        let one = format!("data:text/plain;base64,{}", b64(MENTIONS_PDF.as_bytes()));
+        let mut b = chat_files(1, &one);
+        expand_chat(&mut b, &ctx()).unwrap();
+        assert!(
+            b.dump().contains("start with %PDF-1.7 and end"),
+            "{}",
+            b.dump()
+        );
+        let one = format!(
+            "data:text/plain;charset=utf-8;base64,{}",
+            b64(MENTIONS_PDF.as_bytes())
+        );
+        expand_chat(&mut chat_files(1, &one), &ctx()).unwrap();
+        // a type that names nothing is sniffed: a PDF, else UTF-8 text
+        let mut junk = b"\x00\x01 leading bytes\n".to_vec();
+        junk.extend(pdf("Sniffed PDF"));
+        let one = format!("data:application/octet-stream;base64,{}", b64(&junk));
+        let mut b = chat_files(1, &one);
+        expand_chat(&mut b, &ctx()).unwrap();
+        assert!(
+            b.dump().contains("--- Page 1 ---\\nSniffed PDF"),
+            "{}",
+            b.dump()
+        );
+        let one = format!("data:application/octet-stream;base64,{}", b64(b"plain"));
+        let mut b = chat_files(1, &one);
+        expand_chat(&mut b, &ctx()).unwrap();
+        assert!(b.dump().contains("\"text\":\"plain\""), "{}", b.dump());
+        // an explicit PDF is read as one, an explicit other type is not sniffed
+        let one = format!(
+            "data:application/pdf;base64,{}",
+            b64(MENTIONS_PDF.as_bytes())
+        );
+        let e = expand_chat(&mut chat_files(1, &one), &ctx()).unwrap_err();
+        assert!(e.contains("damaged or not supported"), "{e}");
+        let one = format!("data:image/png;base64,{}", b64(&pdf("Not sniffed")));
+        let e = expand_chat(&mut chat_files(1, &one), &ctx()).unwrap_err();
+        assert!(e.contains("image/png documents are not supported"), "{e}");
+    }
+
+    #[test]
+    fn messages_documents_honour_their_media_type() {
+        // base64 text/plain that mentions `%PDF-` stays text (the translation decodes it)
+        let block = format!(
+            "{{\"type\":\"document\",\"source\":{{\"type\":\"base64\",\"media_type\":\"text/plain\",\"data\":\"{}\"}}}}",
+            b64(MENTIONS_PDF.as_bytes())
+        );
+        let mut body = messages_body(&block);
+        expand_messages(&mut body, &ctx()).unwrap();
+        let chat = super::super::anthropic::translate(&body)
+            .unwrap()
+            .chat
+            .dump();
+        assert!(chat.contains("start with %PDF-1.7 and end"), "{chat}");
+        // base64 with a generic binary type: a PDF is read, anything else is left alone
+        let block = format!(
+            "{{\"type\":\"document\",\"source\":{{\"type\":\"base64\",\"media_type\":\"application/octet-stream\",\"data\":\"{}\"}}}}",
+            b64(&pdf("Generic PDF"))
+        );
+        let mut body = messages_body(&block);
+        expand_messages(&mut body, &ctx()).unwrap();
+        assert!(
+            body.dump().contains("--- Page 1 ---\\nGeneric PDF"),
+            "{}",
+            body.dump()
+        );
+        let block = "{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/octet-stream\",\"data\":\"AAAA\"}}";
+        let mut body = messages_body(block);
+        let before = body.dump();
+        expand_messages(&mut body, &ctx()).unwrap();
+        assert_eq!(body.dump(), before);
+        // url sources take the response's Content-Type
+        let block = "{\"type\":\"document\",\"source\":{\"type\":\"url\",\"url\":\"https://docs.example/a\"}}";
+        let fetched = |ctype: Option<&str>, bytes: Vec<u8>| {
+            let fetch = move |_: &str, _: u64| Ok((bytes.clone(), ctype.map(str::to_string)));
+            let c = Ctx {
+                limits: pdf::Limits::default(),
+                fetch: Some(&fetch),
+            };
+            let mut body = messages_body(block);
+            expand_messages(&mut body, &c).map(|_| body.dump())
+        };
+        let t = fetched(Some("text/plain; charset=utf-8"), MENTIONS_PDF.into()).unwrap();
+        assert!(t.contains("start with %PDF-1.7 and end"), "{t}");
+        let t = fetched(Some("application/octet-stream"), pdf("Served PDF")).unwrap();
+        assert!(t.contains("--- Page 1 ---\\nServed PDF"), "{t}");
+        let t = fetched(None, pdf("Untyped PDF")).unwrap();
+        assert!(t.contains("--- Page 1 ---\\nUntyped PDF"), "{t}");
+        let t = fetched(Some("Application/PDF"), pdf("Typed PDF")).unwrap();
+        assert!(t.contains("--- Page 1 ---\\nTyped PDF"), "{t}");
+        let e = fetched(Some("text/html"), vec![0xff, 0xfe]).unwrap_err();
+        assert!(e.contains("text/html documents are not supported"), "{e}");
     }
 }

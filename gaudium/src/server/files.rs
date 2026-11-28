@@ -572,7 +572,8 @@ fn base64(data: &[u8]) -> String {
     s
 }
 
-fn is_text(mime: &str) -> bool {
+/// Whether `mime` (an essence, lower case) is a text type: the file is UTF-8 text.
+pub(super) fn is_text(mime: &str) -> bool {
     mime.starts_with("text/")
         || matches!(
             mime,
