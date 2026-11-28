@@ -409,11 +409,26 @@ affa30b5d1f8bee0  gram_alive_within_cap_ok  law gram_alive_within_cap_ok : for +
 # harm gram_answer_absorbing: tokens after a second closing tag would escape the constraint
 a8e24d7dc4cd86dc  gram_answer_accepts_when_complete  law gram_answer_accepts_when_complete : for c : Bool { gram_accepting ( GpAnswer { } , c ) == c : Bool }
 # promise gram_answer_accepts_when_complete: in the answer, the reply may end exactly when the grammar accepts it
+2f710bb17fffd754  gram_cache_clear_empties  law gram_cache_clear_empties : for h : Nat for a : Nat { gram_cache_held ( GcClear { } , h , a ) == 0n : Nat }
+# promise gram_cache_clear_empties: an emptied cache counts no bytes
+c9f61d003d68d297  gram_cache_keep_counts  law gram_cache_keep_counts : for h : Nat for a : Nat { gram_cache_held ( GcKeep { } , h , a ) == Nat.add ( h , a ) : Nat }
+# promise gram_cache_keep_counts: a kept entry's bytes are counted beside what the cache held
+# harm gram_cache_keep_counts: an undercounted ledger would let the cache grow past its cap
+cd64370c2bafe7b8  gram_cache_keeps_what_fits  law gram_cache_keeps_what_fits : for + h : Nat for + a : Nat for + e : Nat { gram_cache_act ( h , a , Nat.add ( h , Nat.add ( a , e ) ) ) == GcKeep { } : GramCacheAct }
+# promise gram_cache_keeps_what_fits: an entry that fits beside what the cache holds is kept
+9ef1362a3e0949dd  gram_cache_within_cap  law gram_cache_within_cap : for + h : Nat for + r : Nat for + a : Nat { Nat.is_le ( gram_cache_held ( gram_cache_act ( h , a , Nat.add ( h , r ) ) , h , a ) , Nat.add ( h , r ) ) == True { } : Bool }
+# promise gram_cache_within_cap: a mask cache within its cap stays within it after any new entry
+# harm gram_cache_within_cap: a schema whose every step is a new state (a counted array) would fill the host's memory with masks
 7078336ccdbe7151  gram_constrained_host_picked  law gram_constrained_host_picked : for p : Bool { gram_host_pick ( p , True { } ) == True { } : Bool }
 # promise gram_constrained_host_picked: a constrained request always has its tokens picked on the host, where the mask applies
 # harm gram_constrained_host_picked: a constrained request on a card-picked path would emit tokens the grammar refuses
 75427ab189613495  gram_content_follows_steps  law gram_content_follows_steps : for a : Bool for s : Bool { gram_admit ( False { } , a , s ) == s : Bool }
 # promise gram_content_follows_steps: any other token is admitted exactly when its bytes keep the grammar alive
+e7a5d8bc0e008f00  gram_control_free_in_think  law gram_control_free_in_think : { gram_control_free ( GpThink { } ) == True { } : Bool }
+# promise gram_control_free_in_think: while the model reasons, a control token stays free
+fa0ba3c046d0f2d7  gram_control_refused_in_answer  law gram_control_refused_in_answer : { gram_control_free ( GpAnswer { } ) == False { } : Bool }
+# promise gram_control_refused_in_answer: a control token is never admitted in the constrained answer
+# harm gram_control_refused_in_answer: a token that adds no text would pass the mask, and the model could end or switch modes outside the format
 256bcea91088e540  gram_empty_mask_refused  law gram_empty_mask_refused : { gram_can_pick ( 0n ) == False { } : Bool }
 # promise gram_empty_mask_refused: a mask that admits no token never leads to a pick
 # harm gram_empty_mask_refused: the sampler would return its fallback token, which the grammar does not admit
