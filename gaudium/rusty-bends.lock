@@ -397,6 +397,84 @@ fc9ae56db70bf935  gg_vhead_src_one_to_one  law gg_vhead_src_one_to_one : for + i
 # promise gg_vhead_src_one_to_one: over a tensor of exactly its leading entries and its value heads (`gg_vhead_len`), no two entries are read from the same place.
 # harm gg_vhead_src_one_to_one: two rows or columns of the checkpoint would carry the same stored values and one would be lost
 53fe9947235719b6  gqa_zero_kv_rejected  law gqa_zero_kv_rejected : for + nh : Nat for + dh : Nat { gqa_dims_valid ( nh , 0n , dh ) == False { } : Bool }
+c89e81c8a9c6f58a  gram_admitted_keeps_bias  law gram_admitted_keeps_bias : for b : PenBias { gram_token_class ( True { } , b ) == b : PenBias }
+# promise gram_admitted_keeps_bias: a token the grammar admits keeps its logit_bias class (a ban stays a ban, a plain token stays emittable)
+bd9ed4acd541dff4  gram_alive_past_cap_refused  law gram_alive_past_cap_refused : for + c : Nat for e : Nat { gram_alive_ok ( 1n + Nat.add ( c , e ) , c ) == False { } : Bool }
+# promise gram_alive_past_cap_refused: the automaton never follows more alternatives than its capacity
+# harm gram_alive_past_cap_refused: an ambiguous schema would make every step's work grow without bound
+affa30b5d1f8bee0  gram_alive_within_cap_ok  law gram_alive_within_cap_ok : for + n : Nat for + e : Nat { gram_alive_ok ( n , Nat.add ( n , e ) ) == True { } : Bool }
+# promise gram_alive_within_cap_ok: the automaton may follow as many alternatives as its capacity
+9ba645c04767ac3d  gram_answer_absorbing  law gram_answer_absorbing : for c : Bool { gram_phase_step ( GpAnswer { } , c ) == GpAnswer { } : GramPhase }
+# promise gram_answer_absorbing: once the answer has begun, the reply never returns to the free reasoning phase
+# harm gram_answer_absorbing: tokens after a second closing tag would escape the constraint
+a8e24d7dc4cd86dc  gram_answer_accepts_when_complete  law gram_answer_accepts_when_complete : for c : Bool { gram_accepting ( GpAnswer { } , c ) == c : Bool }
+# promise gram_answer_accepts_when_complete: in the answer, the reply may end exactly when the grammar accepts it
+a6b44e3308558588  gram_budget_charge_adds  law gram_budget_charge_adds : for + u : Nat for + a : Nat for + e : Nat { gram_budget_charge ( u , a , Nat.add ( u , Nat.add ( a , e ) ) ) == Nat.add ( u , a ) : Nat }
+# promise gram_budget_charge_adds: a charge the budget accepts adds exactly what was charged to the ledger
+# harm gram_budget_charge_adds: an undercounted ledger would let a client's schema spend past its cap
+af4690129887f52f  gram_budget_over_refused  law gram_budget_over_refused : for + c : Nat for + e : Nat for + a : Nat { gram_budget_ok ( 1n + Nat.add ( c , e ) , a , c ) == False { } : Bool }
+# promise gram_budget_over_refused: a ledger already past its budget accepts no charge, not even an empty one
+c2344af25f07a9df  gram_budget_over_stays_over  law gram_budget_over_stays_over : for + c : Nat for + e : Nat for a : Nat for b : Nat { gram_budget_ok ( gram_budget_charge ( 1n + Nat.add ( c , e ) , a , c ) , b , c ) == False { } : Bool }
+# promise gram_budget_over_stays_over: a ledger already past its cap stays past it after any charge
+bce12ad615727581  gram_budget_past_cap_refused  law gram_budget_past_cap_refused : for + u : Nat for + r : Nat for + e : Nat { gram_budget_ok ( u , 1n + Nat.add ( r , e ) , Nat.add ( u , r ) ) == False { } : Bool }
+# promise gram_budget_past_cap_refused: a charge that does not fit in what is left of a budget is refused
+# harm gram_budget_past_cap_refused: a hostile schema would make the compiler, or one mask, take memory or time without bound
+02cf5d14df8914d9  gram_budget_refused_latches  law gram_budget_refused_latches : for + u : Nat for + r : Nat for + e : Nat for b : Nat { gram_budget_ok ( gram_budget_charge ( u , 1n + Nat.add ( r , e ) , Nat.add ( u , r ) ) , b , Nat.add ( u , r ) ) == False { } : Bool }
+# promise gram_budget_refused_latches: after a charge that does not fit, every later charge to the ledger is refused, an empty one included
+# harm gram_budget_refused_latches: a mask cut short by its work cap would pass as complete, and the reply could leave its format
+b1310618752ed7a4  gram_budget_within_cap_ok  law gram_budget_within_cap_ok : for + u : Nat for + a : Nat for + e : Nat { gram_budget_ok ( u , a , Nat.add ( u , Nat.add ( a , e ) ) ) == True { } : Bool }
+# promise gram_budget_within_cap_ok: a charge that fits in what is left of a budget is accepted
+2f710bb17fffd754  gram_cache_clear_empties  law gram_cache_clear_empties : for h : Nat for a : Nat { gram_cache_held ( GcClear { } , h , a ) == 0n : Nat }
+# promise gram_cache_clear_empties: an emptied cache counts no bytes
+c9f61d003d68d297  gram_cache_keep_counts  law gram_cache_keep_counts : for h : Nat for a : Nat { gram_cache_held ( GcKeep { } , h , a ) == Nat.add ( h , a ) : Nat }
+# promise gram_cache_keep_counts: a kept entry's bytes are counted beside what the cache held
+# harm gram_cache_keep_counts: an undercounted ledger would let the cache grow past its cap
+cd64370c2bafe7b8  gram_cache_keeps_what_fits  law gram_cache_keeps_what_fits : for + h : Nat for + a : Nat for + e : Nat { gram_cache_act ( h , a , Nat.add ( h , Nat.add ( a , e ) ) ) == GcKeep { } : GramCacheAct }
+# promise gram_cache_keeps_what_fits: an entry that fits beside what the cache holds is kept
+9ef1362a3e0949dd  gram_cache_within_cap  law gram_cache_within_cap : for + h : Nat for + r : Nat for + a : Nat { Nat.is_le ( gram_cache_held ( gram_cache_act ( h , a , Nat.add ( h , r ) ) , h , a ) , Nat.add ( h , r ) ) == True { } : Bool }
+# promise gram_cache_within_cap: a mask cache within its cap stays within it after any new entry
+# harm gram_cache_within_cap: a schema whose every step is a new state (a counted array) would fill the host's memory with masks
+7078336ccdbe7151  gram_constrained_host_picked  law gram_constrained_host_picked : for p : Bool { gram_host_pick ( p , True { } ) == True { } : Bool }
+# promise gram_constrained_host_picked: a constrained request always has its tokens picked on the host, where the mask applies
+# harm gram_constrained_host_picked: a constrained request on a card-picked path would emit tokens the grammar refuses
+75427ab189613495  gram_content_follows_steps  law gram_content_follows_steps : for a : Bool for s : Bool { gram_admit ( False { } , a , s ) == s : Bool }
+# promise gram_content_follows_steps: any other token is admitted exactly when its bytes keep the grammar alive
+e7a5d8bc0e008f00  gram_control_free_in_think  law gram_control_free_in_think : { gram_control_free ( GpThink { } ) == True { } : Bool }
+# promise gram_control_free_in_think: while the model reasons, a control token stays free
+fa0ba3c046d0f2d7  gram_control_refused_in_answer  law gram_control_refused_in_answer : { gram_control_free ( GpAnswer { } ) == False { } : Bool }
+# promise gram_control_refused_in_answer: a control token is never admitted in the constrained answer
+# harm gram_control_refused_in_answer: a token that adds no text would pass the mask, and the model could end or switch modes outside the format
+256bcea91088e540  gram_empty_mask_refused  law gram_empty_mask_refused : { gram_can_pick ( 0n ) == False { } : Bool }
+# promise gram_empty_mask_refused: a mask that admits no token never leads to a pick
+# harm gram_empty_mask_refused: the sampler would return its fallback token, which the grammar does not admit
+0123ddc4d976d662  gram_end_admitted_complete  law gram_end_admitted_complete : for s : Bool { gram_admit ( True { } , True { } , s ) == True { } : Bool }
+# promise gram_end_admitted_complete: an end-of-sequence token is admitted once the reply is complete
+# harm gram_end_admitted_complete: a complete reply could never stop and would run to its token limit
+2a9b51d2416db68d  gram_end_refused_incomplete  law gram_end_refused_incomplete : for s : Bool { gram_admit ( True { } , False { } , s ) == False { } : Bool }
+# promise gram_end_refused_incomplete: an end-of-sequence token is never admitted while the reply is incomplete
+# harm gram_end_refused_incomplete: the reply would stop with half a JSON value or half a tool call
+48cd78d2b84e8200  gram_nonempty_mask_picks  law gram_nonempty_mask_picks : for n : Nat { gram_can_pick ( 1n + n ) == True { } : Bool }
+# promise gram_nonempty_mask_picks: a mask that admits at least one token leads to a pick
+02168852c436dd34  gram_penalised_host_picked  law gram_penalised_host_picked : for c : Bool { gram_host_pick ( True { } , c ) == True { } : Bool }
+# promise gram_penalised_host_picked: a penalised request always has its tokens picked on the host
+0b89044f99494a99  gram_plain_not_host_picked  law gram_plain_not_host_picked : { gram_host_pick ( False { } , False { } ) == False { } : Bool }
+# promise gram_plain_not_host_picked: a request with neither penalties nor a grammar keeps every decode path
+ae36f20369c21612  gram_push_at_cap_refused  law gram_push_at_cap_refused : for + c : Nat for + e : Nat { gram_push_ok ( Nat.add ( c , e ) , c ) == False { } : Bool }
+# promise gram_push_at_cap_refused: a frame is never pushed onto a stack that already holds the capacity or more
+# harm gram_push_at_cap_refused: a hostile schema or a runaway recursion would grow the automaton's stack without bound
+6ac717ed84ca003f  gram_push_below_cap_ok  law gram_push_below_cap_ok : for + d : Nat for e : Nat { gram_push_ok ( d , 1n + Nat.add ( d , e ) ) == True { } : Bool }
+# promise gram_push_below_cap_ok: a frame may be pushed onto a stack below its capacity
+ba75b21973d16aa8  gram_refused_never_emitted  law gram_refused_never_emitted : for t : Nat for v : Nat for b : PenBias { pen_emit_ok ( t , v , gram_token_class ( False { } , b ) ) == False { } : Bool }
+# promise gram_refused_never_emitted: a token the grammar refuses is never emitted, whatever its id, vocabulary or bias
+# harm gram_refused_never_emitted: the reply would leave its JSON schema or tool schema
+ac5224799a4788a2  gram_think_closes_into_answer  law gram_think_closes_into_answer : { gram_phase_step ( GpThink { } , True { } ) == GpAnswer { } : GramPhase }
+# promise gram_think_closes_into_answer: the reasoning's closing tag starts the constrained answer
+289e5b315f44fe72  gram_think_never_accepts  law gram_think_never_accepts : for c : Bool { gram_accepting ( GpThink { } , c ) == False { } : Bool }
+# promise gram_think_never_accepts: a reply never ends inside the model's reasoning
+# harm gram_think_never_accepts: a constrained request would end with no answer at all
+c99d07ad1584d94b  gram_think_stays_free  law gram_think_stays_free : { gram_phase_step ( GpThink { } , False { } ) == GpThink { } : GramPhase }
+# promise gram_think_stays_free: inside the reasoning, a token that does not close it leaves the reply free
+# harm gram_think_stays_free: the schema would be applied to the model's reasoning
 22d66bf5996db2a1  greedy_request_always_admitted  law greedy_request_always_admitted : for cap : Bool { sampling_request_admitted ( cap , False { } ) == True { } : Bool }
 517d5b7e787fa37f  hbm_fit_partition_exact  law hbm_fit_partition_exact : for + p : Nat for + u : Nat { hbm_fit_reconstruct_lhs ( hbm_check_fit ( p , u ) , p , u ) == hbm_fit_reconstruct_rhs ( hbm_check_fit ( p , u ) , p , u ) : Nat }
 f81a59d79982e9f9  hbm_ledger_add_conserved  law hbm_ledger_add_conserved : for + w : Nat for + kv : Nat for + ck : Nat for + sc : Nat for + ot : Nat for cat : HbmCat for + b : Nat { hbm_ledger_total ( hbm_ledger_add ( HbmLedger { w , kv , ck , sc , ot } , cat , b ) ) == Nat.add ( hbm_ledger_total ( HbmLedger { w , kv , ck , sc , ot } ) , b ) : Nat }

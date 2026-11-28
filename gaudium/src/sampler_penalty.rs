@@ -254,6 +254,21 @@ pub fn pick(
     dev: &DevSampleParams,
     seq_pos: u32,
 ) -> Result<i32, String> {
+    pick_masked(p, st, logits, dev, seq_pos, None)
+}
+
+/// [`pick`] with the position's grammar mask (`crate::grammar`): a token the mask does not admit
+/// is set to -inf before the sampler sees the row, and is classed as banned for the emission
+/// check (`gram_token_class`), so it is never emitted; a mask that admits nothing refuses the
+/// pick (`gram_can_pick`) instead of letting the sampler fall back to a token.
+pub fn pick_masked(
+    p: &Penalties,
+    st: &PenaltyState,
+    logits: &mut [u16],
+    dev: &DevSampleParams,
+    seq_pos: u32,
+    mask: Option<&crate::grammar::constraint::Mask>,
+) -> Result<i32, String> {
     // the request's ids, bounded again by the row actually read back
     let vocab = verified::pen_emit_vocab(logits.len() as u64, p.vocab);
     if !verified::pen_counts_match(st.total, seq_pos as u64, st.prompt_len) {
@@ -263,6 +278,18 @@ pub fn pick(
         ));
     }
     apply(p, st, logits);
+    if let Some(m) = mask {
+        if !verified::gram_can_pick(m.count()) {
+            return Err(format!(
+                "the response format admits no token at sequence index {seq_pos}: the reply can not continue in its format"
+            ));
+        }
+        for (id, slot) in logits.iter_mut().enumerate() {
+            if !m.has(id as u32) {
+                *slot = BF16_NEG_INF;
+            }
+        }
+    }
     if let Some(i) = logits.iter().position(|&b| unorderable(b)) {
         return Err(format!(
             "the penalised logits row holds a non-finite value at token {i} (sequence index {seq_pos}): the penalties overflowed or the row was not finite"
@@ -272,11 +299,14 @@ pub fn pick(
     let class = match logits.get(tok as usize) {
         // a -inf pick is the sampler's fallback over a row with nothing left to pick
         Some(&BF16_NEG_INF) | None => PenBias::PbBan,
-        Some(_) => p.bias.class(tok as u32),
+        Some(_) => verified::gram_token_class(
+            mask.is_none_or(|m| m.has(tok as u32)),
+            p.bias.class(tok as u32),
+        ),
     };
     if !verified::pen_emit_ok(tok as u64, vocab, class) {
         return Err(format!(
-            "the penalised sampler found no token to emit at sequence index {seq_pos} (token {tok} is banned, at -inf, or outside the {vocab} token ids of the vocabulary)"
+            "the penalised sampler found no token to emit at sequence index {seq_pos} (token {tok} is banned, refused by the response format, at -inf, or outside the {vocab} token ids of the vocabulary)"
         ));
     }
     Ok(tok as i32)

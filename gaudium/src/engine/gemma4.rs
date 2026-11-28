@@ -2558,8 +2558,8 @@ impl Gemma4Engine {
             return Err("prompt must contain at least 1 token".into());
         }
         // this engine picks its tokens without the penalties (`sampler_penalty`)
-        if !crate::verified::pen_path_allowed(params.penalties.active(), false) {
-            return Err("sampling penalties and logit_bias are not applied by the Gemma 4 engine yet".into());
+        if !crate::verified::pen_path_allowed(params.host_picked(), false) {
+            return Err("sampling penalties, logit_bias and structured output are not applied by the Gemma 4 engine yet".into());
         }
         if let Some(&bad) = prompt_ids
             .iter()

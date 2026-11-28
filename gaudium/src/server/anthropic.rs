@@ -510,6 +510,31 @@ pub struct Translated {
 
 /// Messages request -> chat body. `Err`: what this server cannot serve (unknown block types,
 /// server tools, images, binary documents, ...).
+/// `output_config.format` `{"type": "json_schema", "schema": {...}}` as a chat
+/// `response_format` (the text block's JSON follows the schema).
+fn output_format(fmt: &JsonValue, at: &str) -> R<JsonValue> {
+    if fmt.as_object().is_none() {
+        return bad(format!("{at}: must be an object {{\"type\": \"json_schema\", \"schema\": {{...}}}}"));
+    }
+    if kind(fmt) != "json_schema" {
+        return bad(format!("{at}.type: must be \"json_schema\""));
+    }
+    let Some(schema) = fmt.get("schema").filter(|x| x.as_object().is_some()) else {
+        return bad(format!("{at}.schema: must be a JSON schema object"));
+    };
+    Ok(obj(vec![
+        ("type", s("json_schema")),
+        (
+            "json_schema",
+            obj(vec![
+                ("name", s("output")),
+                ("schema", schema.clone()),
+                ("strict", JsonValue::Bool(true)),
+            ]),
+        ),
+    ]))
+}
+
 pub fn translate(body: &JsonValue) -> R<Translated> {
     if body.as_object().is_none() {
         return bad("the request body must be a JSON object");
@@ -566,6 +591,12 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
                         }
                     },
                 ));
+                // strict: a call's input follows input_schema (constrained decoding)
+                match x.get("strict") {
+                    None | Some(JsonValue::Null) => {}
+                    Some(JsonValue::Bool(b)) => f.push(("strict", JsonValue::Bool(*b))),
+                    Some(_) => return bad(format!("{p}.strict: must be a boolean")),
+                }
                 let tool = obj(vec![("type", s("function")), ("function", obj(f))]);
                 all.push(tool.clone());
                 if x.get("defer_loading").and_then(JsonValue::as_bool) == Some(true) {
@@ -763,9 +794,13 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
             }
             chat.push(("reasoning_effort", s(e)));
         }
-        if present(oc, "format").is_some() {
-            ignored.push("output_config.format (constrained decoding is not available)".into());
+        if let Some(fmt) = present(oc, "format") {
+            chat.push(("response_format", output_format(&fmt, "output_config.format")?));
         }
+    }
+    // the deprecated name of output_config.format
+    if let Some(fmt) = present(body, "output_format") {
+        chat.push(("response_format", output_format(&fmt, "output_format")?));
     }
     // extension: explicit template arguments win
     if let Some(extra) = body

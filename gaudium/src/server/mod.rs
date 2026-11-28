@@ -73,6 +73,7 @@ mod requests;
 mod routes;
 mod response_store;
 mod responses;
+mod structured;
 mod stream_out;
 
 use chat::{ChatPrompt, ChatTemplate};
@@ -4081,17 +4082,31 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             return;
         }
     };
-    let penalised = penalties.active();
+    // Structured output (`response_format`, strict tools): the reply's grammar, applied per
+    // position on the same host-picked path.
+    let structured_req = match structured::request(val, &prompt) {
+        Ok(r) => r,
+        Err(e) => {
+            api.error(stream, 400, "invalid_request_error", &crate::grammar::build::message(&e));
+            return;
+        }
+    };
+    let penalised = crate::verified::gram_host_pick(penalties.active(), structured_req.is_some());
     if !crate::verified::pen_path_allowed(
         penalised,
         crate::engine::applies_penalties(m.spec.family, m.lanes),
     ) {
+        let what = match (penalties.active(), &structured_req) {
+            (_, Some(r)) if !penalties.active() => r.label.clone(),
+            (_, Some(r)) => format!("sampling penalties, logit_bias or {}", r.label),
+            _ => "sampling penalties or logit_bias".to_string(),
+        };
         api.error(
             stream,
             400,
             "invalid_request_error",
             &format!(
-                "model '{}' does not apply sampling penalties or logit_bias{}",
+                "model '{}' does not apply {what}{}",
                 m.id,
                 if m.lanes > 1 {
                     " while it is served with lanes (--parallel)"
@@ -4102,6 +4117,25 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         );
         return;
     }
+    let grammar = match &structured_req {
+        None => None,
+        Some(r) => {
+            let mut end_ids = m.spec.eos_token_ids.clone();
+            for &id in &m.extra_eos_ids {
+                if !end_ids.contains(&id) {
+                    end_ids.push(id);
+                }
+            }
+            let table = structured::table(&m.id, &m.tokenizer, emit_vocab, &end_ids, &m.format);
+            match structured::plan(r, &prompt, &m.format, table, !split_reasoning) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    api.error(stream, 400, "invalid_request_error", &crate::grammar::build::message(&e));
+                    return;
+                }
+            }
+        }
+    };
 
     // The method this request takes follows from the model's drafter and from greedy / sampled;
     // a request may name it (`gaudium_method`) but can not pick another one. A penalised request
@@ -4181,18 +4215,23 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     };
     // The answer after a forced close is a second generation: the penalties' counts of the
     // reasoning and a ban on the end-of-thinking marker would not carry over to it.
+    // (a constrained reply is picked on the host as a penalised one is, and its grammar's
+    // reasoning phase would not carry over either)
     if !crate::verified::think_penalties_ok(
         think_budget.is_some(),
         penalised,
         THINK_RESUME_CARRIES_PENALTIES,
     ) {
+        let what = match &structured_req {
+            Some(r) if !penalties.active() => r.label.clone(),
+            Some(r) => format!("sampling penalties, logit_bias or {}", r.label),
+            None => "sampling penalties or logit_bias".to_string(),
+        };
         api.error(
             stream,
             400,
             "invalid_request_error",
-            &format!(
-                "{think_field} can not be combined with sampling penalties or logit_bias yet: send one or the other"
-            ),
+            &format!("{think_field} can not be combined with {what} yet: send one or the other"),
         );
         return;
     }
@@ -4395,6 +4434,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         penalties,
+        grammar,
         ..Qwen3GenParams::default()
     };
 

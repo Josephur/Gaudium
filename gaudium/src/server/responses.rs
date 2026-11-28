@@ -13,8 +13,10 @@
 //!
 //! Each top-level request field is in one class (the same rule as the chat endpoint's table):
 //! applied, ignored and reported in `gaudium.ignored`, or refused with a 400 that names it when
-//! ignoring it would change the reply without a sign (`background`, `conversation`, a JSON
-//! `text.format`, built-in tools, log probabilities). A field outside the table is reported as
+//! ignoring it would change the reply without a sign (`background`, `conversation`, built-in
+//! tools, log probabilities). `text.format` (`json_object`, `json_schema`) becomes the chat
+//! `response_format` and a function tool's `strict` stays on it, so both are held to the reply
+//! grammar of the chat path (`server::structured`). A field outside the table is reported as
 //! unknown, never refused. This is request parsing and an outside wire format (AGENTS.md 3a,
 //! second list); the store's bound and accounting are verified (`response_store.rs`).
 
@@ -283,6 +285,8 @@ pub struct Head {
     pub reasoning_effort: Option<String>,
     pub reasoning_summary: Option<String>,
     pub text_verbosity: Option<String>,
+    /// `text.format` as sent (JSON text), `{"type":"text"}` when not given.
+    pub text_format: String,
     /// `metadata` as sent (JSON text).
     pub metadata: String,
     /// Echoed as sent (they are not applied), each value as JSON text.
@@ -309,6 +313,7 @@ impl Default for Head {
             reasoning_effort: None,
             reasoning_summary: None,
             text_verbosity: None,
+            text_format: "{\"type\":\"text\"}".to_string(),
             metadata: "{}".to_string(),
             echo: Vec::new(),
             input: "[]".to_string(),
@@ -338,6 +343,7 @@ impl Head {
             + self.tools.capacity()
             + self.tool_choice.capacity()
             + self.metadata.capacity()
+            + self.text_format.capacity()
             + self.echo.capacity() * std::mem::size_of::<(&'static str, String)>()
             + self.echo.iter().map(|(_, v)| v.capacity()).sum::<usize>()
             + opt(&self.previous_response_id)
@@ -449,22 +455,15 @@ pub fn translate(
         head.metadata = m.dump();
     }
 
-    // text: plain text only (constrained decoding is not available yet, #107)
+    // text: the format becomes the chat response_format (the reply grammar holds it)
+    let mut response_format = None;
     if let Some(t) = present(body, "text") {
         if t.as_object().is_none() {
             return refuse("text", "text: must be an object");
         }
         if let Some(f) = present(t, "format") {
-            match kind(f) {
-                "text" => {}
-                k @ ("json_object" | "json_schema") => {
-                    return refuse(
-                        "text.format",
-                        format!("text.format={}: constrained output ({k}) is not available yet; only {{\"type\": \"text\"}} is accepted", short(f)),
-                    )
-                }
-                _ => return refuse("text.format", "text.format.type: must be \"text\", \"json_object\" or \"json_schema\""),
-            }
+            response_format = convert_text_format(f)?;
+            head.text_format = f.dump();
         }
         if let Some(v) = present(t, "verbosity") {
             head.text_verbosity = v.as_str().map(str::to_string);
@@ -556,10 +555,7 @@ pub fn translate(
     items.extend(own);
 
     // tools
-    let (tools, strict_note) = convert_tools(body.get("tools"))?;
-    if strict_note {
-        ignored.push("tools[].strict (function arguments are not constrained to their schema while decoding)".into());
-    }
+    let tools = convert_tools(body.get("tools"))?;
     if let Some(t) = present(body, "tools") {
         if t.as_array().is_some() {
             head.tools = t.dump();
@@ -622,6 +618,9 @@ pub fn translate(
     }
     if let Some(e) = effort {
         chat.push(("reasoning_effort", JsonValue::Str(e)));
+    }
+    if let Some(rf) = response_format {
+        chat.push(("response_format", rf));
     }
     if let Some(st) = present(body, "stream") {
         if st.as_bool().is_none() {
@@ -719,15 +718,59 @@ fn item_kind(item: &JsonValue) -> &str {
     }
 }
 
-/// The function tools of the request, in the chat shape; whether any asked for `strict`.
-fn convert_tools(tools: Option<&JsonValue>) -> R<(Vec<JsonValue>, bool)> {
+/// `text.format` as a chat `response_format` (`None`: plain text, nothing to hold).
+fn convert_text_format(f: &JsonValue) -> R<Option<JsonValue>> {
+    if f.as_object().is_none() {
+        return refuse("text.format", "text.format: must be an object");
+    }
+    match kind(f) {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(obj(vec![("type", s("json_object"))]))),
+        "json_schema" => {
+            let mut js = Vec::new();
+            match present(f, "name") {
+                None => {}
+                Some(JsonValue::Str(n)) => js.push(("name", s(n))),
+                Some(_) => return refuse("text.format.name", "text.format.name: must be a string"),
+            }
+            if let Some(d) = present(f, "description") {
+                js.push(("description", d.clone()));
+            }
+            match present(f, "schema") {
+                Some(schema @ JsonValue::Object(_)) => js.push(("schema", schema.clone())),
+                _ => {
+                    return refuse(
+                        "text.format.schema",
+                        "text.format.schema: a JSON schema object is required for 'json_schema'",
+                    )
+                }
+            }
+            match present(f, "strict") {
+                None => {}
+                Some(b @ JsonValue::Bool(_)) => js.push(("strict", b.clone())),
+                Some(_) => return refuse("text.format.strict", "text.format.strict: must be a boolean"),
+            }
+            Ok(Some(obj(vec![
+                ("type", s("json_schema")),
+                ("json_schema", obj(js)),
+            ])))
+        }
+        _ => refuse(
+            "text.format",
+            "text.format.type: must be \"text\", \"json_object\" or \"json_schema\"",
+        ),
+    }
+}
+
+/// The function tools of the request, in the chat shape (`strict` kept: a strict tool's
+/// arguments are held to its parameters).
+fn convert_tools(tools: Option<&JsonValue>) -> R<Vec<JsonValue>> {
     let list = match tools {
-        None | Some(JsonValue::Null) => return Ok((Vec::new(), false)),
+        None | Some(JsonValue::Null) => return Ok(Vec::new()),
         Some(JsonValue::Array(l)) => l,
         Some(_) => return refuse("tools", "tools: must be an array"),
     };
     let mut out = Vec::new();
-    let mut strict = false;
     for (i, t) in list.iter().enumerate() {
         let p = format!("tools[{i}]");
         if t.as_object().is_none() {
@@ -769,10 +812,14 @@ fn convert_tools(tools: Option<&JsonValue>) -> R<(Vec<JsonValue>, bool)> {
                 }
             },
         ));
-        strict |= t.get("strict").and_then(JsonValue::as_bool) == Some(true);
+        match present(t, "strict") {
+            None => {}
+            Some(b @ JsonValue::Bool(_)) => f.push(("strict", b.clone())),
+            Some(_) => return refuse(&format!("{p}.strict"), format!("{p}.strict: must be a boolean")),
+        }
         out.push(obj(vec![("type", s("function")), ("function", obj(f))]));
     }
-    Ok((out, strict))
+    Ok(out)
 }
 
 /// `tool_choice` in the chat shape, and the names an `allowed_tools` choice keeps offered.
@@ -1597,7 +1644,7 @@ impl Builder {
              \"instructions\":{},\"max_output_tokens\":{},\"model\":{},\"output\":[{}],\
              \"parallel_tool_calls\":{},\"previous_response_id\":{},\
              \"reasoning\":{{\"effort\":{},\"summary\":{}}},\"store\":{stored},\
-             \"temperature\":{},\"text\":{{\"format\":{{\"type\":\"text\"}}{verbosity}}},\
+             \"temperature\":{},\"text\":{{\"format\":{}{verbosity}}},\
              \"tool_choice\":{},\"tools\":{},\"top_logprobs\":0,\"top_p\":{},\
              \"truncation\":\"disabled\",\"usage\":{usage},\"metadata\":{}{echo}{extra}}}",
             jq(&self.id),
@@ -1611,6 +1658,7 @@ impl Builder {
             opt(&h.reasoning_effort),
             opt(&h.reasoning_summary),
             num(self.temperature),
+            h.text_format,
             h.tool_choice,
             h.tools,
             num(self.top_p),
@@ -1816,10 +1864,31 @@ mod tests {
         );
         assert_eq!(
             t.chat.get("tools").unwrap().dump(),
-            r#"[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#
+            r#"[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true}}]"#
         );
-        assert_eq!(t.ignored.len(), 1, "{:?}", t.ignored);
-        assert!(t.ignored[0].starts_with("tools[].strict"));
+        // strict is applied (the chat path holds the arguments to the parameters)
+        assert!(t.ignored.is_empty(), "{:?}", t.ignored);
+    }
+
+    #[test]
+    fn text_format_becomes_the_chat_response_format() {
+        let rf = |body: &str| tr(body).unwrap().chat.get("response_format").map(JsonValue::dump);
+        assert_eq!(rf(r#"{"input":"x"}"#), None);
+        assert_eq!(rf(r#"{"input":"x","text":{"format":{"type":"text"}}}"#), None);
+        assert_eq!(
+            rf(r#"{"input":"x","text":{"format":{"type":"json_object"}}}"#).as_deref(),
+            Some(r#"{"type":"json_object"}"#)
+        );
+        let t = tr(r#"{"input":"x","text":{"format":{"type":"json_schema","name":"p","description":"d",
+            "schema":{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]},"strict":true}}}"#)
+        .unwrap();
+        assert_eq!(
+            t.chat.get("response_format").unwrap().dump(),
+            r#"{"type":"json_schema","json_schema":{"name":"p","description":"d","schema":{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]},"strict":true}}"#
+        );
+        assert!(t.ignored.is_empty(), "{:?}", t.ignored);
+        // the response echoes the format as sent
+        assert!(t.head.text_format.contains("\"json_schema\""), "{}", t.head.text_format);
     }
 
     #[test]
@@ -1845,12 +1914,20 @@ mod tests {
             (r#"{"input":"x","conversation":"conv_1"}"#, "conversation"),
             (r#"{"input":"x","top_logprobs":3}"#, "top_logprobs"),
             (
-                r#"{"input":"x","text":{"format":{"type":"json_object"}}}"#,
+                r#"{"input":"x","text":{"format":{"type":"xml"}}}"#,
                 "text.format",
             ),
             (
-                r#"{"input":"x","text":{"format":{"type":"json_schema","name":"n","schema":{}}}}"#,
-                "text.format",
+                r#"{"input":"x","text":{"format":{"type":"json_schema","name":"n"}}}"#,
+                "text.format.schema",
+            ),
+            (
+                r#"{"input":"x","text":{"format":{"type":"json_schema","name":3,"schema":{}}}}"#,
+                "text.format.name",
+            ),
+            (
+                r#"{"input":"x","tools":[{"type":"function","name":"f","strict":"yes"}]}"#,
+                "tools[0].strict",
             ),
             (
                 r#"{"input":"x","tools":[{"type":"web_search"}]}"#,

@@ -173,7 +173,22 @@ impl GenEngine for ScriptedEngine {
             host_tier,
             ..GenReport::default()
         };
+        // as the engine: a constrained request's tokens must be ones its grammar admits
+        let mut gram = params
+            .grammar
+            .clone()
+            .map(crate::grammar::constraint::Constraint::begin);
         for id in ids {
+            if let Some(g) = gram.as_mut() {
+                if !g.mask()?.has(id as u32) {
+                    return Err(format!(
+                        "scripted token {id} ({:?}) is not admitted by {}",
+                        self.tok.decode(&[id], false),
+                        g.label()
+                    ));
+                }
+                g.commit(id)?;
+            }
             // as an engine: cancellation is seen between launches
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 rep.stopped_by_cancel = true;
@@ -198,6 +213,9 @@ impl GenEngine for ScriptedEngine {
                 }
                 self.tier.lock().unwrap().paused = false;
             }
+        }
+        if let Some(g) = gram.as_ref().filter(|g| !g.complete()) {
+            return Err(format!("scripted reply ends incomplete for {}", g.label()));
         }
         rep.stopped_by_eos = true;
         Ok(rep)
@@ -3583,11 +3601,6 @@ fn chat_refuses_fields_whose_ignoring_would_go_unseen() {
         (",\"n\":2", "n"),
         (",\"logprobs\":true", "logprobs"),
         (",\"logprobs\":true,\"top_logprobs\":3", "logprobs"),
-        (",\"response_format\":{\"type\":\"json_object\"}", "response_format"),
-        (
-            ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"w\",\"schema\":{\"type\":\"object\"}}}",
-            "response_format",
-        ),
     ] {
         let (status, r) = h.chat(extra);
         assert_eq!(status, 400, "{extra}: {}", r.dump());
@@ -3924,6 +3937,113 @@ fn chat_penalties_are_applied_not_reported_as_ignored() {
     );
 }
 
+// ---- structured output (#107) ----
+
+const STRICT_TOOLS: &str = r#""tools":[{"type":"function","function":{"name":"get_weather","strict":true,"parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city","days"],"additionalProperties":false}}}]"#;
+
+const PERSON: &str = r#""response_format":{"type":"json_schema","json_schema":{"name":"person","strict":true,"schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}}}"#;
+
+#[test]
+fn a_json_schema_reply_is_held_to_its_schema() {
+    let h = harness();
+    h.script("Thinking about it.\n</think>\n\n{\"name\": \"Ada\", \"age\": 36}");
+    let (status, r) = h.chat(&format!(",{PERSON}"));
+    assert_eq!(status, 200, "{}", r.dump());
+    let msg = at(&r, &["choices", "0", "message"]);
+    assert_eq!(s(msg, &["reasoning_content"]), "Thinking about it.");
+    let content = json::parse_json(s(msg, &["content"])).unwrap();
+    assert_eq!(content.dump(), "{\"name\":\"Ada\",\"age\":36}");
+    // a reply that leaves the schema is not one the engine may emit
+    for bad in [
+        "</think>\n\n{\"name\": \"Ada\"}",
+        "</think>\n\n{\"age\": 36, \"name\": \"Ada\"}",
+        "</think>\n\nSure! {\"name\": \"Ada\", \"age\": 36}",
+    ] {
+        h.script(bad);
+        let (status, r) = h.chat(&format!(",{PERSON}"));
+        assert_ne!(status, 200, "{bad}: {}", r.dump());
+    }
+    // the reasoning itself is free
+    h.script("{[not json]} </think>\n{\"name\": \"x\", \"age\": 1}");
+    let (status, r) = h.chat(&format!(",{PERSON}"));
+    assert_eq!(status, 200, "{}", r.dump());
+}
+
+#[test]
+fn json_mode_and_unsupported_schemas() {
+    let h = harness();
+    h.script("</think>\n\n{\"any\": [1, {\"thing\": null}]}");
+    let (status, r) = h.chat(r#","response_format":{"type":"json_object"}"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert!(json::parse_json(s(&r, &["choices", "0", "message", "content"])).is_ok());
+    // text is no constraint
+    h.script("</think>\n\nplain words");
+    let (status, _) = h.chat(r#","response_format":{"type":"text"}"#);
+    assert_eq!(status, 200);
+    // a keyword outside the subset is refused by name
+    let (status, r) = h.chat(
+        r#","response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"string","pattern":"^a+$"}}}"#,
+    );
+    assert_eq!(status, 400);
+    assert!(r.dump().contains("'pattern'"), "{}", r.dump());
+    let (status, _) = h.chat(r#","response_format":{"type":"regex"}"#);
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn strict_tool_arguments_follow_their_schema() {
+    let h = harness();
+    h.script(CALL_REPLY);
+    let (status, r) = h.chat(&format!(",{STRICT_TOOLS}"));
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(
+        s(&r, &["choices", "0", "message", "tool_calls", "0", "function", "arguments"]),
+        "{\"city\":\"Oslo \\\"S\\\"\",\"days\":2}"
+    );
+    // days is an integer; a call without it is refused too
+    for bad in [
+        "</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n<parameter=days>\ntwo\n</parameter>\n</function>\n</tool_call>",
+        "</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>",
+        "</think>\n\n<tool_call>\n<function=other>\n</function>\n</tool_call>",
+    ] {
+        h.script(bad);
+        let (status, r) = h.chat(&format!(",{STRICT_TOOLS}"));
+        assert_ne!(status, 200, "{bad}: {}", r.dump());
+    }
+    // text without a call is free
+    h.script("</think>\n\nNo call needed.");
+    let (status, _) = h.chat(&format!(",{STRICT_TOOLS}"));
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn messages_output_format_and_strict_tools_are_applied() {
+    let h = harness();
+    h.script("</think>\n\n{\"name\": \"Ada\", \"age\": 36}");
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":256,"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}}},"messages":[{"role":"user","content":"Who?"}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert!(!r.dump().contains("output_config.format"), "{text}");
+    let blocks = at(&r, &["content"]).as_array().unwrap();
+    let t = blocks.iter().find(|b| s(b, &["type"]) == "text").unwrap();
+    assert!(json::parse_json(s(t, &["text"])).is_ok());
+    // a strict tool: its input follows input_schema
+    h.script("</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>");
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":256,"tools":[{"name":"get_weather","strict":true,"input_schema":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city","days"],"additionalProperties":false}}],"messages":[{"role":"user","content":"Weather?"}]}"#,
+    );
+    assert_ne!(status, 200, "{text}");
+    let (status, _) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":256,"output_config":{"format":{"type":"xml"}},"messages":[{"role":"user","content":"Who?"}]}"#,
+    );
+    assert_eq!(status, 400);
+}
+
 /// `thinking_budget_tokens`: a reply whose reasoning reaches the budget gets the family's
 /// end-of-thinking marker in place of its next token, and goes on with its answer from the prompt,
 /// the kept reasoning and the marker, with what is left of `max_tokens`.
@@ -4223,8 +4343,15 @@ fn responses_function_call_round_trip() {
         json::parse_json(s(call, &["arguments"])).unwrap().dump(),
         "{\"city\":\"Oslo \\\"S\\\"\",\"days\":2}"
     );
-    // strict schemas are reported as not enforced
-    assert!(text.contains("tools[].strict"), "{text}");
+    // a strict tool is held to its parameters, so nothing reports it as not applied
+    assert!(!text.contains("tools[].strict"), "{text}");
+    // a call outside them is not one the engine may emit
+    h.script(&CALL_REPLY.replace("\n2\n", "\ntwo\n"));
+    let (status, bad) = h.post(
+        "/v1/responses",
+        &format!(r#"{{"input":"Weather in Oslo?",{RESPONSES_TOOLS}}}"#),
+    );
+    assert_ne!(status, 200, "{bad}");
 
     // the output goes back: chained by id, with the call's output as the new input
     h.script("</think>\n\nSunny in Oslo.");
@@ -4331,7 +4458,7 @@ fn responses_refusals_name_the_field() {
     let h = harness();
     for (body, param) in [
         (r#"{"input":"x","tools":[{"type":"web_search"}]}"#, "tools[0].type"),
-        (r#"{"input":"x","text":{"format":{"type":"json_schema","name":"n","schema":{}}}}"#, "text.format"),
+        (r#"{"input":"x","text":{"format":{"type":"json_schema","name":"n"}}}"#, "text.format.schema"),
         (r#"{"input":"x","background":true}"#, "background"),
         (r#"{"input":"x","previous_response_id":"resp_missing"}"#, "previous_response_id"),
     ] {
@@ -4664,4 +4791,68 @@ fn a_panic_in_the_chat_path_releases_the_in_flight_response() {
     }));
     assert!(r.is_err());
     assert_eq!(store.live_held(), (0, 0));
+}
+
+#[test]
+fn reasoning_left_in_the_content_with_a_format_is_refused() {
+    // this template starts the reply inside the reasoning, which reasoning_format 'none' would
+    // leave in the content ahead of the JSON
+    let h = harness();
+    let before = h.prompts.lock().unwrap().len();
+    let (status, r) = h.chat(r#","reasoning_format":"none","response_format":{"type":"json_object"}"#);
+    assert_eq!(status, 400, "{}", r.dump());
+    assert!(s(&r, &["error", "message"]).contains("reasoning_format 'none'"), "{}", r.dump());
+    assert_eq!(h.prompts.lock().unwrap().len(), before);
+    // split off, the same request runs
+    h.script("Hm.\n</think>\n\n{}");
+    let (status, r) = h.chat(r#","response_format":{"type":"json_object"}"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(s(&r, &["choices", "0", "message", "content"]), "{}");
+}
+
+#[test]
+fn a_thinking_budget_beside_a_format_names_the_format() {
+    let h = harness();
+    let (status, r) = h.chat(r#","thinking_budget_tokens":32,"response_format":{"type":"json_object"}"#);
+    assert_eq!(status, 400, "{}", r.dump());
+    let msg = s(&r, &["error", "message"]);
+    assert!(msg.contains("response_format json_object") && !msg.contains("penalties"), "{msg}");
+}
+
+/// `text.format` on the Responses endpoint holds the reply to its schema (the chat path's
+/// `response_format`), is echoed in the response, and refuses a schema outside the subset.
+#[test]
+fn a_responses_text_format_is_held_to_its_schema() {
+    let h = harness();
+    let format = r#""text":{"format":{"type":"json_schema","name":"person","strict":true,"schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}}}"#;
+    h.script("Thinking.\n</think>\n\n{\"name\": \"Ada\", \"age\": 36}");
+    let (status, text) = h.post("/v1/responses", &format!(r#"{{"input":"Who?",{format}}}"#));
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert_eq!(s(&r, &["text", "format", "type"]), "json_schema");
+    assert_eq!(s(&r, &["text", "format", "name"]), "person");
+    let out = at(&r, &["output"]).as_array().unwrap();
+    let msg = out.iter().find(|o| s(o, &["type"]) == "message").unwrap();
+    let content = json::parse_json(s(msg, &["content", "0", "text"])).unwrap();
+    assert_eq!(content.dump(), "{\"name\":\"Ada\",\"age\":36}");
+    // a reply that leaves the schema is not one the engine may emit
+    h.script("</think>\n\n{\"name\": \"Ada\"}");
+    let (status, text) = h.post("/v1/responses", &format!(r#"{{"input":"Who?",{format}}}"#));
+    assert_ne!(status, 200, "{text}");
+    // JSON mode
+    h.script("</think>\n\n{\"a\": [1]}");
+    let (status, text) = h.post(
+        "/v1/responses",
+        r#"{"input":"x","text":{"format":{"type":"json_object"}}}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    // a keyword outside the subset is refused by name before anything runs
+    let before = h.prompts.lock().unwrap().len();
+    let (status, text) = h.post(
+        "/v1/responses",
+        r#"{"input":"x","text":{"format":{"type":"json_schema","name":"s","schema":{"type":"string","pattern":"^a$"}}}}"#,
+    );
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("'pattern'"), "{text}");
+    assert_eq!(h.prompts.lock().unwrap().len(), before);
 }

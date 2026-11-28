@@ -153,9 +153,9 @@ fn print_usage() {
          \x20                       reuse), the decoding lanes stepped together in one launch that\n\
          \x20                       reads the weights once. Every stream is token-identical to the\n\
          \x20                       same request run alone. Further requests wait in arrival order;\n\
-         \x20                       a request with images runs alone; one with sampling penalties\n\
-         \x20                       or logit_bias is refused (they apply one request at a time,\n\
-         \x20                       at K = 0). Each lane holds the full\n\
+         \x20                       a request with images runs alone; one with sampling penalties,\n\
+         \x20                       logit_bias or structured output is refused (they apply one\n\
+         \x20                       request at a time, at K = 0). Each lane holds the full\n\
          \x20                       context (--max-ctx / --model-ctx): a load that cannot plan N\n\
          \x20                       lanes of it is refused with the numbers. A request goes to the\n\
          \x20                       free lane where it takes over the most of its prompt for the\n\
@@ -231,7 +231,12 @@ fn print_usage() {
          \x20                       A request with presence / frequency / repetition penalties\n\
          \x20                       or logit_bias decodes at K=0 (its tokens are picked on the\n\
          \x20                       host from the read-back logits, over every generated token,\n\
-         \x20                       reasoning included)\n\
+         \x20                       reasoning included). So does structured output (chat\n\
+         \x20                       response_format json_object / json_schema, function tools\n\
+         \x20                       with \"strict\": true, Messages output_config.format and strict\n\
+         \x20                       tools, Responses text.format and strict function tools): each\n\
+         \x20                       answer token is masked to what the schema admits;\n\
+         \x20                       the reasoning stays free\n\
          \x20 --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster\n\
          \x20                       decode, more device memory, its own token stream)\n\
          \x20 --model-ctx <id=N>    Context size for model <id> instead of --max-ctx\n\
