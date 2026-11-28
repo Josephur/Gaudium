@@ -2257,6 +2257,9 @@ c2f67c24de81fae5  sv_cut_round_never_runs  law sv_cut_round_never_runs : for + s
 cda40479ac87dadc  sv_foreign_never_runs  law sv_foreign_never_runs : for + n : Nat for + p : Bool for + m : Nat { sv_admit_runs ( sv_admit ( n , p , False { } , m ) ) == False { } : Bool }
 # promise sv_foreign_never_runs: a request that names tool servers and comes from a page of another site never runs them
 # harm sv_foreign_never_runs: any web page open in a browser that can reach the server could make it call allow-listed
+e767e42e69ca25e2  sv_left_covers_unspent  law sv_left_covers_unspent : for + m : Nat for + u : Nat { Nat.is_le ( Nat.sub ( m , u ) , sv_tokens_left ( m , u ) ) == True { } : Bool }
+# promise sv_left_covers_unspent: the next round is given at least every output token left of the request's limit
+# harm sv_left_covers_unspent: a round given less is cut by its own length limit, and the reply ends with max_tokens while the client's limit is far from spent
 49a485d9c2c0caef  sv_left_goes_on  law sv_left_goes_on : for + b : Bool for + l : Nat { sv_round_goes_on ( SvRunGoOn { } , b , 1n + l ) == True { } : Bool }
 # promise sv_left_goes_on: a round the round's decision continues generates again while output tokens are left of the limit
 14be5742b0290b9b  sv_left_within_limit  law sv_left_within_limit : for + m : Nat for + u : Nat { Nat.is_le ( sv_tokens_left ( m , u ) , Nat.sub ( m , u ) ) == True { } : Bool }
