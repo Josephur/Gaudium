@@ -3819,8 +3819,9 @@ impl Qwen3Engine {
 
         let penalised = params.penalties.active();
         if budget.remaining() > 0 && !is_cancelled() {
+            // the token generation continues with (a forced one too) passes the emission check
             if penalised {
-                self.pen.commit(first_tok, self.spec.vocab)?;
+                self.pen.commit(&params.penalties, first_tok)?;
             }
             budget.record_emitted(1);
             generated.push(first_tok);
@@ -4006,7 +4007,7 @@ impl Qwen3Engine {
 
             decode_steps += 1;
             if penalised {
-                self.pen.commit(next_tok, self.spec.vocab)?;
+                self.pen.commit(&params.penalties, next_tok)?;
             }
             budget.record_emitted(1);
             generated.push(next_tok);

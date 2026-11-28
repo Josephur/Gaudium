@@ -9,10 +9,15 @@
 #   - Whether the per-token counts a position is penalised with are the counts of exactly the
 #     generated tokens before that position (none of the prompt, none of the position itself, none
 #     dropped)
+#   - How the ledger changes when a token is emitted (that token's count up by one, every other
+#     token's count unchanged, the total up by one)
+#   - How many token ids a request may emit (inside the logits row, and inside the tokenizer:
+#     a padded row's padding ids are not tokens)
 # The penalty arithmetic itself (BF16 logits, f32 math, rounding) is float work and stays in the
 # Rust shell (`gaudium/src/sampler_penalty.rs`) with Rust tests.
 
 import Base
+import nat_lemmas.bend as L
 
 # ============================================================================
 # 1. Helper lemmas (erased before Rust codegen)
@@ -99,6 +104,30 @@ def pen_emit_ok(tok: Nat, vocab: Nat, bias: PenBias) -> Bool:
 # The ledger may penalise the position only when it holds exactly the generated tokens before it.
 def pen_counts_match(total: Nat, +seq_index: Nat, +prompt_len: Nat) -> Bool:
   Bool.and(Nat.is_le(prompt_len, seq_index), Nat.is_eq(total, Nat.sub(seq_index, prompt_len)))
+
+# One token's count after an emission: raised when the emitted token is that token.
+def pen_count_bump(count: Nat, hit: Bool) -> Nat:
+  match hit:
+    case True{}:
+      1n+count
+    case False{}:
+      count
+
+# The count token `id` holds after token `tok` is emitted, where `id` held `count` before.
+# The shell's ledger stores only the tokens emitted so far; for every other id the result is its
+# old count (the laws below), which is why the shell updates only the entry of `tok`.
+def pen_count_add(count: Nat, +id: Nat, +tok: Nat) -> Nat:
+  pen_count_bump(count, Nat.is_eq(id, tok))
+
+# The ledger's total after one more emitted token.
+def pen_total_add(total: Nat) -> Nat:
+  1n+total
+
+# row:    width of the logits row the engine reads out (it may be padded)
+# tokens: token ids the tokenizer defines
+# The token ids a request may name, ban and emit.
+def pen_emit_vocab(row: Nat, tokens: Nat) -> Nat:
+  Nat.min(row, tokens)
 
 # ============================================================================
 # 5. Laws
@@ -283,3 +312,94 @@ def pen_counts_prompt_row_refused(t, p, d):
     case 0n: {==}
     case 1n+q:
       pen_counts_prompt_row_refused(t, q, d)
+
+# promise: emitting a token raises that token's count by exactly one
+# harm: a dropped or doubled count would penalise the token too little or too much
+# catches: the True{} arm of pen_count_bump returns count (the increment dropped)
+law pen_count_emitted_up_one:
+  for c: Nat
+  for +t: Nat
+  {pen_count_add(c, t, t) == 1n+c : Nat}
+
+def pen_count_emitted_up_one(c, t):
+  match t:
+    case 0n: {==}
+    case 1n+q:
+      pen_count_emitted_up_one(c, q)
+
+# promise: emitting a token leaves the count of every smaller token id unchanged
+# harm: a token that was not emitted would be penalised
+# catches: the False{} arm of pen_count_bump returns 1n+count (the wrong token incremented)
+law pen_count_lower_unchanged:
+  for c: Nat
+  for +t: Nat
+  for d: Nat
+  {pen_count_add(c, t, 1n+Nat.add(t, d)) == c : Nat}
+
+def pen_count_lower_unchanged(c, t, d):
+  match t:
+    case 0n: {==}
+    case 1n+q:
+      pen_count_lower_unchanged(c, q, d)
+
+# promise: emitting a token leaves the count of every larger token id unchanged
+# harm: a token that was not emitted would be penalised
+# catches: pen_count_add compares with Nat.is_ge in place of Nat.is_eq (larger ids incremented too)
+law pen_count_higher_unchanged:
+  for c: Nat
+  for +t: Nat
+  for d: Nat
+  {pen_count_add(c, 1n+Nat.add(t, d), t) == c : Nat}
+
+def pen_count_higher_unchanged(c, t, d):
+  match t:
+    case 0n: {==}
+    case 1n+q:
+      pen_count_higher_unchanged(c, q, d)
+
+# promise: emitting a token raises the ledger's total by exactly one
+# harm: the ledger check against the sequence position would refuse or pass the wrong ledger
+# catches: pen_total_add returns total (the increment dropped)
+law pen_total_up_one:
+  for t: Nat
+  {pen_total_add(t) == 1n+t : Nat}
+
+def pen_total_up_one(t):
+  {==}
+
+# promise: the ids a request may emit stay inside the logits row
+# harm: a token id past the row would index outside the logits
+# catches: pen_emit_vocab returns Nat.max(row, tokens) (a tokenizer larger than the row wins)
+law pen_emit_vocab_within_row:
+  for r: Nat
+  for k: Nat
+  {Nat.is_le(pen_emit_vocab(r, k), r) == True{} : Bool}
+
+def pen_emit_vocab_within_row(r, k):
+  L.nat_min_le_l(r, k)
+
+# promise: the ids a request may emit stay inside the tokenizer's tokens (never a padding row)
+# harm: banning every real token would be accepted and a padding id could be emitted
+# catches: pen_emit_vocab returns row (the padding of the logits row counted as tokens)
+law pen_emit_vocab_within_tokens:
+  for r: Nat
+  for k: Nat
+  {Nat.is_le(pen_emit_vocab(r, k), k) == True{} : Bool}
+
+def pen_emit_vocab_within_tokens(r, k):
+  L.nat_min_le_r(r, k)
+
+# promise: every id both the logits row and the tokenizer hold may be emitted
+# catches: pen_emit_vocab returns 0n (no token may ever be named or emitted)
+law pen_emit_vocab_covers_shared:
+  for +v: Nat
+  for e: Nat
+  for f: Nat
+  {Nat.is_le(v, pen_emit_vocab(Nat.add(v, e), Nat.add(v, f))) == True{} : Bool}
+
+def pen_emit_vocab_covers_shared(v, e, f):
+  match v:
+    case 0n:
+      L.nat_le_zero(Nat.min(e, f))
+    case 1n+q:
+      pen_emit_vocab_covers_shared(q, e, f)

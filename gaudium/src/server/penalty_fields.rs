@@ -2,6 +2,11 @@
 //! `repetition_penalty` and `logit_bias`, parsed and range-checked into
 //! `sampler_penalty::Penalties`. An out-of-range value is refused (the caller answers 400).
 //! Whether the model's engine may take the result is the verified `pen_path_allowed`.
+//!
+//! Accepted ranges: `presence_penalty` and `frequency_penalty` -2..2, `repetition_penalty`
+//! 0.01..100 (1 = off), `logit_bias` values -100..100 (-100 bans the token). Every one is finite,
+//! so with the card's logits (tens, not near the BF16 maximum) no adjusted logit overflows; a
+//! row that overflows anyway is refused by `sampler_penalty::pick`, never sampled.
 
 use crate::json::JsonValue;
 use crate::sampler_penalty::{Bias, Penalties, TokenMask};
@@ -11,6 +16,9 @@ use crate::verified;
 pub const PRESENCE_FREQUENCY_LIMIT: f64 = 2.0;
 /// `logit_bias` values accept `-LIMIT..=LIMIT`; `-LIMIT` bans the token.
 pub const BIAS_LIMIT: f64 = 100.0;
+/// `repetition_penalty` accepts `MIN..=MAX`: a divisor far below 1 turns a logit into +inf.
+pub const REPETITION_MIN: f64 = 0.01;
+pub const REPETITION_MAX: f64 = 100.0;
 
 /// A numeric field: absent or `null` -> `None`; any other non-number is refused.
 fn number(val: &JsonValue, key: &str) -> Result<Option<f64>, String> {
@@ -23,9 +31,10 @@ fn number(val: &JsonValue, key: &str) -> Result<Option<f64>, String> {
     }
 }
 
-/// Reads the penalty fields of a request for a model of `vocab` tokens.
+/// Reads the penalty fields of a request for a model whose requests may emit `vocab` token ids
+/// (the verified `pen_emit_vocab` of the logits row and the tokenizer).
 pub fn parse(val: &JsonValue, vocab: u64) -> Result<Penalties, String> {
-    let mut p = Penalties::default();
+    let mut p = Penalties::for_vocab(vocab);
     for (key, slot) in [
         ("presence_penalty", &mut p.presence),
         ("frequency_penalty", &mut p.frequency),
@@ -40,14 +49,12 @@ pub fn parse(val: &JsonValue, vocab: u64) -> Result<Penalties, String> {
         }
     }
     if let Some(x) = number(val, "repetition_penalty")? {
-        // (as f32 it must stay a positive, finite divisor)
-        let r = x as f32;
-        if !(x > 0.0 && r > 0.0 && r.is_finite()) {
+        if !(REPETITION_MIN..=REPETITION_MAX).contains(&x) {
             return Err(format!(
-                "'repetition_penalty' must be a number greater than 0, got {x}"
+                "'repetition_penalty' must be between {REPETITION_MIN} and {REPETITION_MAX}, got {x}"
             ));
         }
-        p.repetition = r;
+        p.repetition = x as f32;
     }
     match val.get("logit_bias") {
         None | Some(JsonValue::Null) => {}
@@ -136,6 +143,9 @@ mod tests {
             r#"{"repetition_penalty":0}"#,
             r#"{"repetition_penalty":-1}"#,
             r#"{"repetition_penalty":1e300}"#,
+            r#"{"repetition_penalty":1e-40}"#,
+            r#"{"repetition_penalty":0.009}"#,
+            r#"{"repetition_penalty":100.5}"#,
             r#"{"logit_bias":{"1000":1}}"#,
             r#"{"logit_bias":{"-1":1}}"#,
             r#"{"logit_bias":{"abc":1}}"#,
@@ -145,6 +155,31 @@ mod tests {
         ] {
             assert!(p(bad).is_err(), "{bad} was accepted");
         }
+    }
+
+    #[test]
+    fn the_repetition_range_ends_are_accepted() {
+        assert_eq!(
+            p(r#"{"repetition_penalty":0.01}"#).unwrap().repetition,
+            0.01
+        );
+        assert_eq!(
+            p(r#"{"repetition_penalty":100}"#).unwrap().repetition,
+            100.0
+        );
+        assert_eq!(p("{}").unwrap().vocab, 1000);
+    }
+
+    #[test]
+    fn banning_every_token_of_a_padded_row_is_refused() {
+        // 4 tokenizer tokens in a row padded to 8: the ids a request may emit are the 4 tokens
+        let vocab = verified::pen_emit_vocab(8, 4);
+        let all: Vec<String> = (0..4).map(|i| format!("\"{i}\":-100")).collect();
+        let v = parse_json(&format!("{{\"logit_bias\":{{{}}}}}", all.join(","))).unwrap();
+        assert!(parse(&v, vocab).is_err());
+        // and a padding id is not a token a request may name
+        let v = parse_json(r#"{"logit_bias":{"5":1}}"#).unwrap();
+        assert!(parse(&v, vocab).is_err());
     }
 
     #[test]

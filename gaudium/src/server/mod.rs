@@ -3636,7 +3636,11 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let is_greedy = temperature <= 0.0;
     // Presence / frequency / repetition penalties and logit_bias: refused out of range, and
     // refused where the model's engine would pick the tokens without them.
-    let penalties = match penalty_fields::parse(val, m.spec.vocab) {
+    // the ids a request may name and emit: the logits row's, but never a padding id past the
+    // tokenizer's tokens
+    let emit_vocab =
+        crate::verified::pen_emit_vocab(m.spec.vocab, m.tokenizer.vocab_size() as u64);
+    let penalties = match penalty_fields::parse(val, emit_vocab) {
         Ok(p) => p,
         Err(e) => {
             api.error(stream, 400, "invalid_request_error", &e);
