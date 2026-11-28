@@ -162,6 +162,14 @@ def th_sent_in_le(
     case False{} False{} False{}:
       L.nat_add_le_l(1n+r, s)
 
+# Whether a request with a thinking budget may also carry sampling penalties or a logit bias.
+# The answer resumes as a second generation from the prompt, the kept reasoning and the forced
+# end-of-thinking marker, so the penalties' counts of the reasoning and a ban on the marker would
+# not carry over: the combination is refused until they do. `budgeted`: the request's budget is
+# applied; `penalised`: it carries an active penalty or bias.
+def think_penalties_ok(budgeted: Bool, penalised: Bool) -> Bool:
+  Bool.not(Bool.and(budgeted, penalised))
+
 # ============================================================================
 # 4. Laws
 # ============================================================================
@@ -345,3 +353,24 @@ def think_sent_within_room(t, n, cap, c, r, s, f):
       L.nat_add_le_l(r, s)
     case True{}:
       th_sent_in_le(Nat.is_lt(n, cap), n, f, Nat.is_le(c, 1n+r), c, s, r, {==})
+
+
+# promise: a request whose thinking budget is applied never runs with sampling penalties or a logit bias.
+# harm: after the forced close the answer would be sampled without the reasoning's penalty counts, and a banned end-of-thinking marker would still be written.
+# catches: the penalties ignored (think_penalties_ok returns True)
+law think_budget_never_penalised:
+  {think_penalties_ok(True{}, True{}) == False{} : Bool}
+
+def think_budget_never_penalised():
+  {==}
+
+# promise: a request without a thinking budget, or without penalties, is never refused by this rule.
+# catches: the rule refuses every budgeted request (Bool.not(budgeted))
+law think_penalties_rest_ok:
+  for +b: Bool
+  {Bool.and(think_penalties_ok(False{}, b), think_penalties_ok(b, False{})) == True{} : Bool}
+
+def think_penalties_rest_ok(b):
+  match b:
+    case True{}: {==}
+    case False{}: {==}

@@ -4026,3 +4026,27 @@ fn messages_thinking_budget_is_enforced() {
     assert_eq!(status, 400, "{text}");
     assert!(text.contains("less than max_tokens"), "{text}");
 }
+
+/// A thinking budget and sampling penalties (or a logit bias) in one request are refused: the
+/// answer after a forced close is a second generation that would not carry the penalties' counts
+/// of the reasoning, nor a ban on the end-of-thinking marker.
+#[test]
+fn a_thinking_budget_with_penalties_is_refused() {
+    let h = harness();
+    for extra in [
+        r#","presence_penalty":0.5"#,
+        r#","logit_bias":{"7":-100}"#,
+        r#","repetition_penalty":1.1"#,
+    ] {
+        let (status, r) = h.chat(&format!(r#","max_tokens":64,"thinking_budget_tokens":4{extra}"#));
+        assert_eq!(status, 400, "{extra}: {}", r.dump());
+        assert!(r.dump().contains("thinking_budget_tokens"), "{}", r.dump());
+    }
+    // either one alone still runs
+    h.script("a\n</think>\n\nHi.");
+    let (status, r) = h.chat(r#","max_tokens":64,"thinking_budget_tokens":32"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    h.script("</think>\n\nHi.");
+    let (status, r) = h.chat(r#","presence_penalty":0.5"#);
+    assert_eq!(status, 200, "{}", r.dump());
+}

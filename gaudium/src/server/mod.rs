@@ -3823,6 +3823,19 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         }
         Some(b) => Some(ThinkBudget::new(b, max_new, think_close_ids.len() as u64)),
     };
+    // The answer after a forced close is a second generation: the penalties' counts of the
+    // reasoning and a ban on the end-of-thinking marker would not carry over to it.
+    if !crate::verified::think_penalties_ok(think_budget.is_some(), penalised) {
+        api.error(
+            stream,
+            400,
+            "invalid_request_error",
+            &format!(
+                "{think_field} can not be combined with sampling penalties or logit_bias yet: send one or the other"
+            ),
+        );
+        return;
+    }
     let cancel_flag = Arc::new(AtomicBool::new(false));
     // A streamed request is admitted: its stream begins now, before it waits for the card (the
     // queue, a model load, a lane) and for its prefill, and a keep-alive goes out whenever a
