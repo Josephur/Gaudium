@@ -147,9 +147,15 @@ e252eca0a4f957d4  fs_delete_conserved  law fs_delete_conserved : for + l : FsLed
 76d7734ba5a8a5ec  fs_hold_covers_ask  law fs_hold_covers_ask : for + u : Nat for + w : Nat for + x : Nat for + y : Nat for + n : Nat { Nat.is_le ( w , fs_size ( fs_hold_ticket ( fs_hold ( FsLedger { u , Nat.add ( w , x ) , n } , Nat.add ( w , y ) , w ) ) ) ) == True { } : Bool }
 # promise fs_hold_covers_ask: an upload that asks for no more than the per-file cap and the free bytes is reserved all it asked for.
 # harm fs_hold_covers_ask: uploads that fit the cap and the quota could be refused as over the quota
+781158a8e63ae590  fs_hold_free_is_ticket  law fs_hold_free_is_ticket : for + l : FsLedger for + c : Nat for + w : Nat { Nat.add ( fs_free ( fs_hold_ledger ( fs_hold ( l , c , w ) ) ) , fs_size ( fs_hold_ticket ( fs_hold ( l , c , w ) ) ) ) == fs_free ( l ) : Nat }
+# promise fs_hold_free_is_ticket: a reservation takes exactly its ticket's bytes from the free bytes of the ledger the store installs from it.
+# harm fs_hold_free_is_ticket: concurrent uploads could together stage more than the quota
 f485c85b5096b001  fs_hold_released  law fs_hold_released : for + l : FsLedger for + c : Nat for + w : Nat { fs_delete ( fs_hold_ledger ( fs_hold ( l , c , w ) ) , fs_hold_ticket ( fs_hold ( l , c , w ) ) ) == l : FsLedger }
 # promise fs_hold_released: giving a reservation's ticket back returns the ledger to what it was before the reservation.
 # harm fs_hold_released: a dropped upload could keep its reserved bytes, or free more than it held
+8413c24286b06385  fs_hold_used_is_ticket  law fs_hold_used_is_ticket : for + l : FsLedger for + c : Nat for + w : Nat { fs_used ( fs_hold_ledger ( fs_hold ( l , c , w ) ) ) == Nat.add ( fs_used ( l ) , fs_size ( fs_hold_ticket ( fs_hold ( l , c , w ) ) ) ) : Nat }
+# promise fs_hold_used_is_ticket: a reservation counts exactly its ticket's bytes as used in the ledger the store installs from it.
+# harm fs_hold_used_is_ticket: uploads in progress could stage more bytes than the ledger has taken from the quota
 a0da79d20884b173  fs_hold_within_ask  law fs_hold_within_ask : for + l : FsLedger for + c : Nat for + w : Nat { Nat.is_le ( fs_size ( fs_hold_ticket ( fs_hold ( l , c , w ) ) ) , Nat.min ( w , c ) ) == True { } : Bool }
 # promise fs_hold_within_ask: a reservation never takes more than the upload asked for, nor more than the per-file cap.
 # harm fs_hold_within_ask: one upload could hold the room other uploads need
