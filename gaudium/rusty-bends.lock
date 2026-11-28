@@ -478,6 +478,15 @@ dcfddfa5a53ff82e  g4v_whole_token_patches_within  law g4v_whole_token_patches_wi
 13a2fa8783059771  gdn_zero_k_rejected  law gdn_zero_k_rejected : for + vh : Nat for ck : Nat { gdn_dims_valid ( 0n , vh , ck ) == False { } : Bool }
 019bf212458dba00  gdn_zero_v_heads_rejected  law gdn_zero_v_heads_rejected : for + k : Nat for ck : Nat { gdn_dims_valid ( k , 0n , ck ) == False { } : Bool }
 # promise gdn_zero_v_heads_rejected: zero DeltaNet value head count is always rejected
+b80f055fe1639c04  ge_cancel_not_model_end  law ge_cancel_not_model_end : { ge_model_ended ( GeCancelled { } ) == False { } : Bool }
+# promise ge_cancel_not_model_end: a cancelled generation is never one the model ended
+681f8b0485127cc5  ge_eos_is_model_end  law ge_eos_is_model_end : { ge_model_ended ( GeEos { } ) == True { } : Bool }
+# promise ge_eos_is_model_end: a generation that ended with an end-of-sequence token is one the model ended
+d24d9517559d3cc5  ge_length_not_model_end  law ge_length_not_model_end : { ge_model_ended ( GeLength { } ) == False { } : Bool }
+# promise ge_length_not_model_end: a generation cut by the length limit is never one the model ended
+# harm ge_length_not_model_end: the half-written call at the cut would be run as a whole one
+69ab07579e592380  ge_stop_string_not_model_end  law ge_stop_string_not_model_end : { ge_model_ended ( GeStopString { } ) == False { } : Bool }
+# promise ge_stop_string_not_model_end: a generation ended by one of the request's stop strings is never one the model ended
 5e31df0d7e1ee34b  gen_end_call_limit_not_cancel  law gen_end_call_limit_not_cancel : for eos : Bool for cancelled : Bool { gen_end ( False { } , True { } , eos , cancelled ) == GeCallLimit { } : GenEnd }
 701a333557e52866  gen_end_no_flag_is_length  law gen_end_no_flag_is_length : { gen_end ( False { } , False { } , False { } , False { } ) == GeLength { } : GenEnd }
 e067e43cfe4436bc  gen_end_stop_string_wins  law gen_end_stop_string_wins : for limit : Bool for eos : Bool for cancelled : Bool { gen_end ( True { } , limit , eos , cancelled ) == GeStopString { } : GenEnd }
@@ -2228,6 +2237,59 @@ a7ddf0cb7323bd51  slot_unbound_never_quiesces  law slot_unbound_never_quiesces :
 d2f1459314d3bf87  stop_length_is_max_tokens  law stop_length_is_max_tokens : for c : Bool { stop_reason ( GeLength { } , c ) == SrMaxTokens { } : StopReason }
 e06afa1753839470  stop_sequence_needs_stop_string  law stop_sequence_needs_stop_string : for + e : GenEnd for c : Bool { Bool.or ( Bool.not ( sr_is_stop_sequence ( stop_reason ( e , c ) ) ) , ge_is_stop_string ( e ) ) == True { } : Bool }
 02fd1bd807dd2f14  stop_tool_use_needs_calls  law stop_tool_use_needs_calls : for e : GenEnd { sr_is_tool_use ( stop_reason ( e , False { } ) ) == False { } : Bool }
+22fe4a2e6ba11201  sv_both_names_clash  law sv_both_names_clash : { sv_route_clash ( sv_route ( True { } , True { } ) ) == True { } : Bool }
+# promise sv_both_names_clash: a tool name that is both a client tool and a server-side tool is a clash
+78049a43fd4f30d5  sv_client_call_stops  law sv_client_call_stops : for + e : Bool for + s : Nat for + c : Nat for + n : Nat for + m : Nat { sv_goes_on ( sv_next ( e , s , 1n + c , n , m ) ) == False { } : Bool }
+# promise sv_client_call_stops: a round in which the model called a client tool never generates another round
+a996f4fa860f42d5  sv_client_calls_wait  law sv_client_calls_wait : for + s : Nat for + c : Nat for + n : Nat for + m : Nat { sv_waits_client ( sv_next ( True { } , 1n + s , 1n + c , n , m ) ) == True { } : Bool }
+# promise sv_client_calls_wait: a round the model ended with client calls stops waiting for the client, also when it ran server-side calls
+# harm sv_client_calls_wait: the client would be told to resume a turn whose own tool calls it never answered
+121e107ba5173c3d  sv_client_tool_never_server  law sv_client_tool_never_server : for + s : Bool { sv_route_server ( sv_route ( s , True { } ) ) == False { } : Bool }
+# promise sv_client_tool_never_server: a call whose name is one of the client's tools is never run server-side
+# harm sv_client_tool_never_server: the client's call (and its arguments) would go to a remote tool server
+c2f67c24de81fae5  sv_cut_round_never_runs  law sv_cut_round_never_runs : for + s : Nat for + c : Nat for + n : Nat for + m : Nat { sv_runs ( sv_next ( False { } , s , c , n , m ) ) == False { } : Bool }
+# promise sv_cut_round_never_runs: a round cut by the length limit, a stop string or a cancel never runs its calls
+# harm sv_cut_round_never_runs: a half-written call, or one the client cancelled, would reach a remote tool server
+ad7b60e79797d231  sv_list_ends_without_cursor  law sv_list_ends_without_cursor : for + p : Nat for + m : Nat { sv_list_more ( False { } , p , m ) == False { } : Bool }
+# promise sv_list_ends_without_cursor: a tool-list page without a cursor is the last one asked for
+798d61bec2261893  sv_list_follows_cursor  law sv_list_follows_cursor : for + n : Nat for + d : Nat { sv_list_more ( True { } , n , Nat.add ( n , 1n + d ) ) == True { } : Bool }
+# promise sv_list_follows_cursor: a tool list with a cursor is read on while pages are left
+491519d44ff55632  sv_list_within_pages  law sv_list_within_pages : for + c : Bool for + m : Nat for + d : Nat { sv_list_more ( c , Nat.add ( m , d ) , m ) == False { } : Bool }
+# promise sv_list_within_pages: once `most` pages of a tool list were read, no further page is asked for
+# harm sv_list_within_pages: a server that always answers with a cursor would hold the request forever
+0b0636ad5c37a4d8  sv_never_past_rounds  law sv_never_past_rounds : for + e : Bool for + s : Nat for + c : Nat for + m : Nat for + d : Nat { sv_goes_on ( sv_next ( e , s , c , Nat.add ( m , d ) , m ) ) == False { } : Bool }
+# promise sv_never_past_rounds: once `most` rounds were generated, the loop never generates another
+# harm sv_never_past_rounds: a model that keeps calling tools would hold the request (and the card's turns) forever
+42bcad226d94b15d  sv_no_clash_without_client  law sv_no_clash_without_client : for + s : Bool { sv_route_clash ( sv_route ( s , False { } ) ) == False { } : Bool }
+# promise sv_no_clash_without_client: a name that is not one of the client's tools is never a clash
+# harm sv_no_clash_without_client: every request with tool servers would be refused as a clash
+4b208d45d28fe2d5  sv_no_client_never_waits  law sv_no_client_never_waits : for + e : Bool for + s : Nat for + n : Nat for + m : Nat { sv_waits_client ( sv_next ( e , s , 0n , n , m ) ) == False { } : Bool }
+# promise sv_no_client_never_waits: a round without client calls never stops as if client calls were waiting
+# harm sv_no_client_never_waits: the client would be asked for results of calls that are not in the reply
+e23256c94ca420e2  sv_no_server_call_never_runs  law sv_no_server_call_never_runs : for + e : Bool for + c : Nat for + n : Nat for + m : Nat { sv_runs ( sv_next ( e , 0n , c , n , m ) ) == False { } : Bool }
+# promise sv_no_server_call_never_runs: a round in which the model called no server-side tool neither runs tools nor generates again
+0cea56bb4c59517b  sv_result_fits_whole  law sv_result_fits_whole : for + l : Nat for + d : Nat { sv_result_keep ( l , Nat.add ( l , d ) ) == l : Nat }
+# promise sv_result_fits_whole: a tool result no longer than the cap is kept whole
+d9a093e3018be72a  sv_result_within_cap  law sv_result_within_cap : for + l : Nat for + c : Nat { Nat.is_le ( sv_result_keep ( l , c ) , c ) == True { } : Bool }
+# promise sv_result_within_cap: the bytes of a tool result kept for the prompt never exceed the cap
+# harm sv_result_within_cap: a large tool answer would fill the context, or the host's memory
+026463831796631e  sv_result_within_len  law sv_result_within_len : for + l : Nat for + c : Nat { Nat.is_le ( sv_result_keep ( l , c ) , l ) == True { } : Bool }
+# promise sv_result_within_len: the bytes kept of a tool result never exceed its length
+e1f117208c43e228  sv_room_goes_on  law sv_room_goes_on : for + s : Nat for + n : Nat for + d : Nat { sv_goes_on ( sv_next ( True { } , 1n + s , 0n , n , Nat.add ( n , 1n + d ) ) ) == True { } : Bool }
+# promise sv_room_goes_on: a round the model ended with server-side calls and no client call generates again while rounds are left
+29f2777aa254ad27  sv_server_calls_always_run  law sv_server_calls_always_run : for + s : Nat for + c : Nat for + n : Nat for + m : Nat { sv_runs ( sv_next ( True { } , 1n + s , c , n , m ) ) == True { } : Bool }
+# promise sv_server_calls_always_run: in a round the model ended, its server-side calls are run whether or not the loop goes on
+53d1276b0b8ecaaf  sv_server_tool_runs  law sv_server_tool_runs : { sv_route_server ( sv_route ( True { } , False { } ) ) == True { } : Bool }
+# promise sv_server_tool_runs: a call of a server-side tool that is not a client tool is run server-side
+ca25adadd6fde54c  sv_take_all_that_fit  law sv_take_all_that_fit : for + d : Nat for + a : Nat for + r : Nat { sv_calls_take ( d , a , Nat.add ( d , Nat.add ( a , r ) ) ) == a : Nat }
+# promise sv_take_all_that_fit: when the round's calls fit in what is left of the limit, every one of them runs
+56a9cee52acc00e5  sv_take_within_asked  law sv_take_within_asked : for + d : Nat for + a : Nat for + m : Nat { Nat.is_le ( sv_calls_take ( d , a , m ) , a ) == True { } : Bool }
+# promise sv_take_within_asked: the calls run in a round never exceed the calls the model made in it
+4e4bee79a47409d6  sv_take_within_room  law sv_take_within_room : for + d : Nat for + a : Nat for + m : Nat { Nat.is_le ( sv_calls_take ( d , a , m ) , Nat.sub ( m , d ) ) == True { } : Bool }
+# promise sv_take_within_room: the calls run in a round never exceed what is left of the per-request call limit
+# harm sv_take_within_room: one request could make any number of outbound calls
+ad28bec100b98ac0  sv_unknown_never_server  law sv_unknown_never_server : for + c : Bool { sv_route_server ( sv_route ( False { } , c ) ) == False { } : Bool }
+# promise sv_unknown_never_server: a call whose name is not one of the request's server-side tools is never run server-side
 46ab38ee952ff713  think_answer_kept  law think_answer_kept : for + n : Nat for + cap : Nat for + c : Nat for + room : Nat for + forced : Bool { think_act ( False { } , n , cap , c , room , forced ) == TaFeed { n } : ThinkAct }
 # promise think_answer_kept: a token of the answer is always kept by the thinking budget and leaves the reasoning count unchanged
 0d36fc68c1187832  think_below_cap_counted  law think_below_cap_counted : for + n : Nat for + d : Nat for + c : Nat for + room : Nat { think_kept ( think_act ( True { } , n , Nat.add ( n , 1n + d ) , c , Nat.add ( c , 1n + room ) , False { } ) , n ) == 1n + n : Nat }
