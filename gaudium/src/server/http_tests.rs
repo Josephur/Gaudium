@@ -8,6 +8,10 @@ use std::io::{Read, Write};
 use super::*;
 use crate::engine::{GenParams, GenReport};
 
+/// The plain text completion endpoints, on this file's harness.
+#[path = "completion_http_tests.rs"]
+mod completion_http_tests;
+
 const TOOLS: &str = r#""tools":[{"type":"function","function":{"name":"get_weather","description":"Weather.","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}},{"type":"function","function":{"name":"now","parameters":{"type":"object","properties":{}}}}]"#;
 
 /// The tower inputs of each request a scripted engine ran: `(grid rows, grid columns, values)`.
@@ -3764,5 +3768,21 @@ fn models_list_refuses_a_bad_page_query() {
         let v = json::parse_json(&body).unwrap();
         assert_eq!(s(&v, &["type"]), "error", "{body}");
         assert_eq!(s(&v, &["error", "type"]), "invalid_request_error", "{body}");
+    }
+}
+
+#[test]
+fn every_completion_route_is_behind_the_api_key() {
+    let h = configured_harness(|cfg| cfg.api_key = Some("server-key".into()));
+    for path in ["/v1/completions", "/completions", "/completion"] {
+        for auth in ["", "\r\nAuthorization: Bearer wrong"] {
+            let (status, _, body) = plain_exchange(
+                &h.state,
+                &format!("POST {path} HTTP/1.1\r\nHost: localhost{auth}"),
+                "{\"prompt\":\"hi\",\"max_tokens\":1}",
+            );
+            assert_eq!(status, 401, "{path} {auth:?}");
+            assert!(body.contains("authentication_error"), "{body}");
+        }
     }
 }

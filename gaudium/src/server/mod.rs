@@ -4,6 +4,8 @@
 //! - Gaudium Web UI static assets (`GET /`, `/sw.js`, `/css/*`, `/js/*`, `/img/*`, `/vendor/*`)
 //! - OpenAI-compatible chat & model endpoints (`/v1/models`, `/v1/chat/completions`, `/props`,
 //!   `/health`, `/tokenize`, `/detokenize`, `/slots`, `/models/load`, `/models/unload`)
+//! - Plain text completions without a chat template (`/v1/completions`, `/completions` in the
+//!   OpenAI text-completion shape, `/completion` in the native shape; see `completion.rs`)
 //! - The model list as server-sent events for a model picker (`/models/sse`)
 //! - Gaudium UI telemetry & card-lifecycle endpoints (`/gaudium/ui`, `/gaudium/engine`,
 //!   `/gaudium/live`, `/gaudium/events`, `/gaudium/count_tokens`, `/v1/chat/completions/control`)
@@ -54,6 +56,7 @@ mod a2ui;
 mod anthropic;
 mod chat;
 mod chat_fields;
+mod completion;
 mod conn;
 mod jinja;
 mod lanes;
@@ -91,7 +94,7 @@ use conn::Conn;
 pub use proxy::ProxyOptions;
 use outparse::{Delta, OutputFormat, OutputParser};
 use readout::{DrafterFacts, RunFacts, Timings};
-use stream_out::{SseSink, StreamOut};
+use stream_out::{ChunkForm, SseSink, StreamOut};
 
 /// Largest request body. Images and video frames travel inside the request as base64.
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
@@ -2076,6 +2079,7 @@ fn write_json(stream: &mut Conn, status: u16, json: &str) {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         409 => "Conflict",
         503 => "Service Unavailable",
         529 => "Overloaded",
@@ -2380,6 +2384,18 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
             handle_chat_completions(&state, &req, &mut stream);
         }
         ("POST", "/v1/messages") => handle_messages(&state, &req, &mut stream),
+        ("POST", "/completion") => handle_completions(&state, &req, &mut stream, true),
+        ("POST", "/completions") | ("POST", "/v1/completions") => {
+            handle_completions(&state, &req, &mut stream, false);
+        }
+        ("GET", "/completion") | ("GET", "/completions") | ("GET", "/v1/completions") => {
+            write_error(
+                &mut stream,
+                405,
+                "invalid_request_error",
+                &format!("{} takes POST with a JSON body holding a 'prompt'", req.path),
+            );
+        }
         ("POST", "/v1/messages/count_tokens") => handle_messages_count(&state, &req, &mut stream),
         ("POST", "/apply-template") => handle_apply_template(&state, &req, &mut stream),
         ("GET", _) => handle_static_ui(&state, &req.path, &mut stream, true),
@@ -3208,12 +3224,15 @@ enum Api {
     Chat,
     /// `/v1/messages`; thinking blocks carry their text unless `show_thinking` is off.
     Messages { show_thinking: bool },
+    /// `/v1/completions` and `/completions` (the text-completion shape), or `/completion`
+    /// (`native`: the native completion shape).
+    Completion { native: bool },
 }
 
 impl Api {
     fn error(self, stream: &mut Conn, status: u16, err_type: &str, msg: &str) {
         match self {
-            Api::Chat => write_error(stream, status, err_type, msg),
+            Api::Chat | Api::Completion { .. } => write_error(stream, status, err_type, msg),
             Api::Messages { .. } => {
                 // an engine that cannot take the request now is "overloaded" to these clients
                 let status = if status == 503 { 529 } else { status };
@@ -3226,7 +3245,7 @@ impl Api {
     /// Messages stream, a comment line on the chat-completions stream (clients skip both).
     fn keep_alive_line(self) -> String {
         match self {
-            Api::Chat => ": keep-alive\n\n".to_string(),
+            Api::Chat | Api::Completion { .. } => ": keep-alive\n\n".to_string(),
             Api::Messages { .. } => anthropic::sse("ping", "{\"type\":\"ping\"}"),
         }
     }
@@ -3234,8 +3253,13 @@ impl Api {
     /// An error after the event stream began (framed; the caller ends the stream).
     fn stream_error(self, status: u16, msg: &str) -> String {
         match self {
-            Api::Chat => format!(
+            Api::Chat | Api::Completion { native: false } => format!(
                 "data: {{\"error\":{{\"message\":{},\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n",
+                jq(msg)
+            ),
+            // a native stream has no end marker
+            Api::Completion { native: true } => format!(
+                "data: {{\"error\":{{\"message\":{},\"type\":\"server_error\"}}}}\n\n",
                 jq(msg)
             ),
             Api::Messages { .. } => anthropic::sse("error", &anthropic::error_json(status, msg)),
@@ -3430,13 +3454,127 @@ fn run_chat(
             return;
         }
     };
+    let req_max = val
+        .get("max_tokens")
+        .or_else(|| val.get("max_completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .filter(|&v| v > 0);
+    run_prompt(
+        state,
+        val,
+        stream,
+        api,
+        PreparedPrompt {
+            t_arrival,
+            idx,
+            prompt,
+            ids: prompt_ids,
+            media,
+            req_max,
+            ignored,
+        },
+    );
+}
+
+/// `POST /completion` (`native`) and `POST /completions`, `/v1/completions`: the client's own
+/// prompt text or token ids, run on the chat path without a chat template.
+fn handle_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn, native: bool) {
+    let t_arrival = Instant::now();
+    let api = Api::Completion { native };
+    let body_str = String::from_utf8_lossy(&req.body);
+    let Ok(val) = json::parse_json(&body_str) else {
+        api.error(stream, 400, "invalid_request_error", "invalid JSON body");
+        return;
+    };
+    let creq = match completion::parse(&val) {
+        Ok(c) => c,
+        Err(e) => {
+            api.error(stream, 400, "invalid_request_error", &e);
+            return;
+        }
+    };
+    let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
+    let m = &state.models[idx];
+    let (text, ids) = match &creq.prompt {
+        completion::CompletionPrompt::Text(t) => (t.clone(), Ok(m.tokenizer.encode(t, true))),
+        completion::CompletionPrompt::Ids(ids) => (
+            String::new(),
+            completion::prompt_ids(ids, m.spec.vocab, m.tokenizer.vocab_size() as u64),
+        ),
+    };
+    let ids = match ids {
+        Ok(ids) => ids,
+        Err(e) => {
+            api.error(stream, 400, "invalid_request_error", &e);
+            return;
+        }
+    };
+    // no template: no reasoning opening, no tools, no images
+    let prompt = ChatPrompt {
+        text,
+        reasoning_open: false,
+        tools: None,
+        forced_prefix: String::new(),
+        single_call: false,
+        continue_final: false,
+        ignored: Vec::new(),
+        media: Vec::new(),
+    };
+    run_prompt(
+        state,
+        &val,
+        stream,
+        api,
+        PreparedPrompt {
+            t_arrival,
+            idx,
+            prompt,
+            ids,
+            media: None,
+            req_max: creq.max_tokens,
+            ignored: creq.ignored,
+        },
+    );
+}
+
+/// A request's prompt, ready for the card: what [`run_prompt`] takes from the endpoint.
+struct PreparedPrompt {
+    /// When the request arrived (its queue time starts here).
+    t_arrival: Instant,
+    /// The model it runs on.
+    idx: usize,
+    prompt: ChatPrompt,
+    /// The prompt's token ids, and its prepared images and videos.
+    ids: Vec<i32>,
+    media: Option<RequestMedia>,
+    /// The generation limit the request names (`None`: none).
+    req_max: Option<u64>,
+    /// Request fields accepted but not applied.
+    ignored: Vec<String>,
+}
+
+/// Runs one prepared request: admission, card turn, generation, and the reply in the shape of
+/// `api`. `val`: the request body (sampling and streaming fields).
+fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Api, p: PreparedPrompt) {
+    let PreparedPrompt {
+        t_arrival,
+        idx,
+        prompt,
+        ids: prompt_ids,
+        media,
+        req_max,
+        ignored,
+    } = p;
+    let m = &state.models[idx];
     let media_counts: MediaCounts = media.as_ref().map(|md| md.counts()).unwrap_or_default();
     let media_host_ms = media.as_ref().map_or(0.0, |md| md.host_ms);
     let n_images = media_counts.images + media_counts.videos;
     let n_prompt = prompt_ids.len() as u64;
     let stream_mode = val.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    // `reasoning_format: "none"` leaves the reasoning in the content
-    let split_reasoning = val.get("reasoning_format").and_then(|v| v.as_str()) != Some("none");
+    // `reasoning_format: "none"` leaves the reasoning in the content; a completion's output is
+    // its text as generated
+    let split_reasoning = !matches!(api, Api::Completion { .. })
+        && val.get("reasoning_format").and_then(|v| v.as_str()) != Some("none");
     let temperature = val
         .get("temperature")
         .and_then(|v| v.as_f64())
@@ -3461,11 +3599,6 @@ fn run_chat(
             .duration_since(UNIX_EPOCH)
             .map_or(42, |d| d.as_nanos() as u64)
     });
-    let req_max = val
-        .get("max_tokens")
-        .or_else(|| val.get("max_completion_tokens"))
-        .and_then(|v| v.as_u64())
-        .filter(|&v| v > 0);
     // A request that names no limit may generate to the end of the model's context.
     let budget = match SequenceBudget::admit(n_prompt, req_max, m.max_ctx) {
         Ok(b) => b,
@@ -3473,6 +3606,11 @@ fn run_chat(
             let msg = match api {
                 Api::Chat => format!(
                     "prompt ({n_prompt} tokens) exceeds context budget {}: {e:?}",
+                    m.max_ctx
+                ),
+                // (a completion's prompt is the client's own, and may be empty)
+                Api::Completion { .. } => format!(
+                    "prompt ({n_prompt} tokens) is empty or exceeds context budget {}: {e:?}",
                     m.max_ctx
                 ),
                 // the words these clients match to compact their context
@@ -3525,6 +3663,7 @@ fn run_chat(
     let req_id = match api {
         Api::Chat => format!("chatcmpl-gaudium-{req_num}"),
         Api::Messages { .. } => format!("msg_gaudium_{req_num}"),
+        Api::Completion { .. } => format!("cmpl-gaudium-{req_num}"),
     };
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3580,6 +3719,8 @@ fn run_chat(
         endpoint: match api {
             Api::Chat => "chat",
             Api::Messages { .. } => "messages",
+            Api::Completion { native: false } => "completions",
+            Api::Completion { native: true } => "completion",
         },
         model: m.id.clone(),
         stream: stream_mode,
@@ -3776,12 +3917,16 @@ fn run_chat(
 
     let mut decoder = StreamDecoder::new(&m.tokenizer);
     // Generated text -> reasoning, content and tool calls (and the request's stop strings).
+    // (a completion's text passes through as generated: its parser looks for no family tags)
     let mut parser = OutputParser::new(
         prompt.reasoning_open,
         split_reasoning,
         prompt.tools.clone(),
         stop_seqs,
-        m.format.clone(),
+        match api {
+            Api::Completion { .. } => outparse::OutputFormat::default(),
+            _ => m.format.clone(),
+        },
     );
     if prompt.single_call {
         parser.set_max_calls(1);
@@ -3815,6 +3960,11 @@ fn run_chat(
         n_prompt,
         live.is_some(),
         Arc::clone(&cancel_flag),
+        match api {
+            Api::Chat | Api::Messages { .. } => ChunkForm::Chat,
+            Api::Completion { native: false } => ChunkForm::Text,
+            Api::Completion { native: true } => ChunkForm::Native,
+        },
     )));
     {
         // The chat role chunk goes out now, so a client times its request from the moment the
@@ -3830,6 +3980,11 @@ fn run_chat(
             }
             Api::Messages { show_thinking } => {
                 o.anth = Some(anthropic::Builder::new(show_thinking));
+            }
+            // an empty text chunk
+            Api::Completion { .. } => {
+                let init_chunk = o.text_chunk(None, "");
+                o.write(&init_chunk);
             }
         }
         // A forced tool call's opening is already in the prompt: the parser reads it first.
@@ -4180,6 +4335,60 @@ fn run_chat(
                         &extra,
                     );
                     write_json(stream, 200, &msg);
+                }
+            } else if let Api::Completion { native } = api {
+                // the generated text; in a stream, what the chunks before have not carried
+                let text = if stream_mode {
+                    stream_out::plain_text(&pending)
+                } else {
+                    format!("{}{}", parser.reasoning(), parser.content())
+                };
+                let body = if native {
+                    // the native shape names how the generation ended
+                    let stop_type = match finish_reason {
+                        "length" => "limit",
+                        "cancelled" => "none",
+                        _ if stop_string => "word",
+                        _ => "eos",
+                    };
+                    format!(
+                        "{{\"content\":{},\"id\":{},\"model\":{},\"stop\":true,\"stop_type\":\"{stop_type}\",\
+                         \"stopping_word\":{},\"tokens_predicted\":{n_gen},\"tokens_evaluated\":{},\
+                         \"tokens_cached\":{},\"truncated\":false,\"usage\":{usage},\"timings\":{timings_json},\
+                         \"gaudium\":{details}}}",
+                        jq(&text),
+                        jq(&req_id),
+                        jq(&model_id),
+                        jq(parser.matched_stop()),
+                        rep.prompt_tokens,
+                        timings.cache_n,
+                    )
+                } else {
+                    let head = if stream_mode {
+                        out.chunk_head().to_string()
+                    } else {
+                        format!(
+                            "\"id\":{},\"object\":\"text_completion\",\"created\":{created},\"model\":{}",
+                            jq(&req_id),
+                            jq(&model_id)
+                        )
+                    };
+                    format!(
+                        "{{{head},\"choices\":[{{\"index\":0,\"text\":{},\"logprobs\":null,\"finish_reason\":{}}}],\
+                         \"usage\":{usage},\"timings\":{timings_json},\"gaudium\":{details}}}",
+                        jq(&text),
+                        jq(finish_reason),
+                    )
+                };
+                if stream_mode {
+                    // a native stream has no end marker
+                    let end = if native { "" } else { "data: [DONE]\n\n" };
+                    out.write(&format!("data: {body}\n\n{end}"));
+                    if !out.write_failed {
+                        write_sse_end(stream);
+                    }
+                } else {
+                    write_json(stream, 200, &body);
                 }
             } else if stream_mode {
                 let final_chunk = format!(

@@ -27,10 +27,11 @@ pub(super) const RECENT_REQUESTS: usize = 64;
 pub(super) struct RequestMeta {
     /// The server's job number (`job` in the `request` events).
     pub job: u64,
-    /// The reply id the client is given (`chatcmpl-gaudium-N`, `msg_gaudium_N`): the id that
+    /// The reply id the client is given (`chatcmpl-gaudium-N`, `msg_gaudium_N`, `cmpl-gaudium-N`): the id that
     /// `/v1/chat/completions/control` cancels by and that `/v1/streams/lookup` filters on.
     pub id: String,
-    /// The API the request came in on: `chat` (chat completions) or `messages`.
+    /// The API the request came in on: `chat` (chat completions), `messages`, `completions`
+    /// (text completions) or `completion` (the native completion shape).
     pub endpoint: &'static str,
     /// The served model id.
     pub model: String,

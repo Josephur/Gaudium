@@ -89,6 +89,13 @@ pub const ROUTES: &[Route] = &[
     route("POST", "/v1/messages", Inference),
     route("POST", "/v1/messages/count_tokens", Inference),
     route("POST", "/apply-template", Inference),
+    route("POST", "/completion", Inference),
+    route("POST", "/completions", Inference),
+    route("POST", "/v1/completions", Inference),
+    // the completion paths answer GET with a 405; still behind the key like their POST
+    route("GET", "/completion", Inference),
+    route("GET", "/completions", Inference),
+    route("GET", "/v1/completions", Inference),
 ];
 
 /// Path prefixes the API owns: a request under one that the table does not list needs the key.
@@ -335,6 +342,9 @@ mod tests {
             ("POST", "/detokenize"),
             ("POST", "/gaudium/count_tokens"),
             ("POST", "/apply-template"),
+            ("POST", "/completion"),
+            ("POST", "/completions"),
+            ("POST", "/v1/completions"),
         ] {
             assert_eq!(kind(m, p), RouteKind::RouteInference, "{m} {p}");
         }
