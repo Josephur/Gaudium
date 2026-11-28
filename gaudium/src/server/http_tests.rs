@@ -3494,3 +3494,91 @@ fn messages_requests_keep_their_own_field_report() {
         .collect();
     assert_eq!(ignored, ["service_tier (ignored)"]);
 }
+
+/// With an API key configured, the Web UI's files and `/health` are served without it; every
+/// listed API route, every unlisted path the API owns and every unlisted write is refused without
+/// it and passes the key gate with it.
+#[test]
+fn the_api_key_gate_is_closed_by_default_and_leaves_the_web_ui_open() {
+    let dir = std::env::temp_dir().join(format!("gaudium-key-gate-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("js")).unwrap();
+    std::fs::write(dir.join("index.html"), "<!doctype html><title>ui</title>").unwrap();
+    std::fs::write(dir.join("js").join("app.js"), "export {};").unwrap();
+    let ui = dir.clone();
+    let h = configured_harness(move |cfg| {
+        cfg.api_key = Some("server-key".into());
+        cfg.ui_dir = Some(ui);
+    });
+    let ask = |head: &str, key: Option<&str>| {
+        let auth = key.map_or(String::new(), |k| format!("\r\nAuthorization: Bearer {k}"));
+        plain_exchange(
+            &h.state,
+            &format!("{head} HTTP/1.1\r\nHost: localhost{auth}"),
+            "",
+        )
+    };
+
+    for head in [
+        "GET /",
+        "GET /index.html",
+        "GET /ui/",
+        "GET /js/app.js",
+        "HEAD /",
+    ] {
+        let (status, _, _) = ask(head, None);
+        assert_eq!(status, 200, "{head}");
+    }
+    let (status, _, body) = ask("GET /health", None);
+    assert_eq!((status, body.as_str()), (200, "{\"status\":\"ok\"}"));
+    // a Web UI file that is not there is a 404, not a 401
+    assert_eq!(ask("GET /missing.css", None).0, 404);
+
+    for head in [
+        "POST /v1/chat/completions",
+        "POST /chat/completions",
+        "POST /v1/messages",
+        "POST /tokenize",
+        "POST /apply-template",
+        "POST /models/load",
+        "POST /gaudium/engine",
+        "GET /gaudium/live",
+        "GET /props",
+        "GET /v1/health",
+        "GET /v1/models",
+        "GET /v1/models/some-model",
+        "GET /slots",
+        // unlisted, on a path the API owns or not a read
+        "GET /v1/not-a-route",
+        "GET /gaudium/not-a-route",
+        "GET /tokenize",
+        "POST /not-a-route",
+        "PUT /index.html",
+    ] {
+        let (status, _, body) = ask(head, None);
+        assert_eq!(status, 401, "{head} answered without the key: {body}");
+        assert!(body.contains("authentication_error"), "{head}: {body}");
+        let (status, _, _) = ask(head, Some("wrong"));
+        assert_eq!(status, 401, "{head} answered with a wrong key");
+        let (status, _, body) = ask(head, Some("server-key"));
+        assert_ne!(status, 401, "{head} refused with the key: {body}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without an API key configured, nothing is refused for want of one.
+#[test]
+fn without_an_api_key_no_route_needs_one() {
+    let h = configured_harness(|cfg| cfg.api_key = None);
+    for head in [
+        "GET /props",
+        "GET /v1/models",
+        "GET /gaudium/live",
+        "GET /v1/not-a-route",
+        "POST /not-a-route",
+        "GET /health",
+    ] {
+        let (status, _, body) =
+            plain_exchange(&h.state, &format!("{head} HTTP/1.1\r\nHost: localhost"), "");
+        assert_ne!(status, 401, "{head}: {body}");
+    }
+}

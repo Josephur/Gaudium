@@ -61,6 +61,7 @@ mod outparse;
 mod proxy;
 mod readout;
 mod requests;
+mod routes;
 mod stream_out;
 
 use chat::{ChatPrompt, ChatTemplate};
@@ -2274,22 +2275,10 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
         return;
     }
 
-    let is_api = req.path.starts_with("/v1/")
-        || req.path.starts_with("/gaudium/")
-        || matches!(
-            req.path.as_str(),
-            "/props"
-                | "/models"
-                | "/models/sse"
-                | "/models/load"
-                | "/models/unload"
-                | "/chat/completions"
-                | "/apply-template"
-                | "/tokenize"
-                | "/detokenize"
-                | "/slots"
-        );
-    if is_api && !check_auth(&state.cfg, &req) {
+    // Which routes need the API key: the route table (`routes.rs`) and the verified gate
+    // (`verified/route_auth.bend`). Closed by default: a route the table does not list needs it.
+    let key_ok = check_auth(&state.cfg, &req);
+    if !routes::admits(&req.method, &req.path, state.cfg.api_key.is_some(), key_ok) {
         write_error(
             &mut stream,
             401,
@@ -2302,7 +2291,6 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
     match (req.method.as_str(), req.path.as_str()) {
         // every method: the proxy answers the ones it does not forward itself
         (_, "/cors-proxy") => {
-            let key_ok = check_auth(&state.cfg, &req);
             state.proxy.handle(&req, key_ok, &mut stream);
         }
         ("GET", "/gaudium/proxy") => {
