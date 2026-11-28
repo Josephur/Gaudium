@@ -169,7 +169,7 @@ const FIELDS: &[Field] = &[
     ignored("verbosity", "not applied", never),
     ignored(
         "sse_ping_interval",
-        "not applied: the stream sends no keep-alive pings",
+        "not applied: the stream's keep-alive interval is fixed",
         never,
     ),
 ];
