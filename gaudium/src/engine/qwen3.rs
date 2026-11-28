@@ -3356,11 +3356,18 @@ impl Qwen3Engine {
         // that is faster than prefilling them (`engine/host_tier.rs`); the plan then finds them
         // as if they had never left.
         let restored = host_tier::begin_request(self, prompt_ids, reuse_wanted, rows_zeroed)?;
+        // [lanes] then another lane's copy of the prompt's start, when it gives more (its rows
+        // were written after this request's reset: none of them was zeroed)
+        let (restored, plan_zeroed) =
+            match lanes_rt::fork_prompt(self, prompt_ids, reuse_wanted, rows_zeroed)? {
+                Some(shared) => (Some(shared), false),
+                None => (restored, rows_zeroed),
+            };
         self.prefix_plan = self.prefix.plan_from(
             prompt_ids,
             &self.prefix_images,
             reuse_wanted,
-            rows_zeroed,
+            plan_zeroed,
             restored,
         );
         let resume = self.prefix_plan.resume as usize;

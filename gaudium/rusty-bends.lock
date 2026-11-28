@@ -62,6 +62,57 @@ bf64e42c2d2741d7  cg_server_kept_without_overwrite  law cg_server_kept_without_o
 9e64dfef12e11303  cg_server_needs_signer  law cg_server_needs_signer : for + a : Bool for + b : Bool for + c : Bool for + d : Bool for + f : Bool { Bool.and ( cg_writes_server ( cg_plan ( a , b , c , d , f ) ) , Bool.not ( Bool.or ( cg_writes_ca ( cg_plan ( a , b , c , d , f ) ) , Bool.and ( a , b ) ) ) ) == False { } : Bool }
 # promise cg_server_needs_signer: a server certificate is only written when its authority is made in the same run or both of the authority's files exist
 # harm cg_server_needs_signer: a server certificate signed by an authority that is not kept, so no device can be told to trust it
+5d84a5758076b21e  ch_cancel_idempotent  law ch_cancel_idempotent : for + r : Nat for + e : Nat for + c : Bool { ch_step ( ch_step ( ChGroup { r , e , c } , ChCancelAll { } ) , ChCancelAll { } ) == ChGroup { r , e , True { } } : ChGroup }
+# promise ch_cancel_idempotent: cancelling a request twice leaves it as cancelling it once: cancelled, with the generations it started and the ends it counted unchanged.
+32d443d9cd21da4c  ch_cancel_keeps_waiting  law ch_cancel_keeps_waiting : for + g : ChGroup { ch_done ( ch_step ( g , ChCancelAll { } ) ) == ch_done ( g ) : Bool }
+# promise ch_cancel_keeps_waiting: a cancel never ends a request by itself: it still waits for the end of every generation it started.
+a60ea3c479bfc8d3  ch_cancel_marks  law ch_cancel_marks : for + g : ChGroup { ch_cancelled ( ch_step ( g , ChCancelAll { } ) ) == True { } : Bool }
+# promise ch_cancel_marks: a cancel always marks the request cancelled.
+b4dd55fc6abb9973  ch_choice_seed_first  law ch_choice_seed_first : for + s : Nat for + t : Nat { ch_choice_seed ( s , 0n , t ) == s : Nat }
+# promise ch_choice_seed_first: choice 0 runs with the request's own seed, so a request with one choice is the request it always was.
+a30e04aa54e869e6  ch_choice_seed_within  law ch_choice_seed_within : for + s : Nat for + i : Nat for + t : Nat for + hs : { Nat.is_le ( s , t ) == True { } : Bool } for hi : { Nat.is_le ( i , t ) == True { } : Bool } { Nat.is_le ( ch_choice_seed ( s , i , t ) , t ) == True { } : Bool }
+# promise ch_choice_seed_within: every choice's seed is a seed the request could have sent: never past the largest one.
+34a30fbc996c95ee  ch_choice_seeds_distinct  law ch_choice_seeds_distinct : for + s : Nat for + a : Nat for + b : Nat for + t : Nat for + hs : { Nat.is_le ( s , t ) == True { } : Bool } for ha : { Nat.is_le ( a , t ) == True { } : Bool } for hb : { Nat.is_le ( b , t ) == True { } : Bool } for e : { ch_choice_seed ( s , a , t ) == ch_choice_seed ( s , b , t ) : Nat } { a == b : Nat }
+# promise ch_choice_seeds_distinct: two choices of one request never run with the same seed, so each sampled choice is a sample of its own.
+abd012dd776c3667  ch_end_counts_each  law ch_end_counts_each : for + e : Nat for + k : Nat for + c : Bool { Nat.is_ge ( ch_ended ( ch_step ( ChGroup { Nat.add ( e , 1n + k ) , e , c } , ChRunEnded { } ) ) , 1n + e ) == True { } : Bool }
+# promise ch_end_counts_each: every end of a generation before the last one counts, so a request whose generations all ended is answered.
+9f8276915eccc755  ch_end_counts_one  law ch_end_counts_one : for + r : Nat for + e : Nat for + c : Bool { Nat.is_le ( ch_ended ( ch_step ( ChGroup { r , e , c } , ChRunEnded { } ) ) , 1n + e ) == True { } : Bool }
+# promise ch_end_counts_one: the end of one generation counts as one end, never more.
+a72636677ae51630  ch_ended_within_runs  law ch_ended_within_runs : for + r : Nat for + e : Nat for + c : Bool for + ev : ChEvent { Bool.or ( Nat.is_gt ( e , r ) , Nat.is_le ( ch_ended ( ch_step ( ChGroup { r , e , c } , ev ) ) , r ) ) == True { } : Bool }
+# promise ch_ended_within_runs: no step counts more ended generations than the request started.
+2944bda5db506c74  ch_failure_never_ok  law ch_failure_never_ok : for + f : Nat { ch_end_ok ( ch_end ( 1n + f ) ) == False { } : Bool }
+# promise ch_failure_never_ok: a request in which a generation failed is never answered as a success.
+ce285024f196985e  ch_last_end_done  law ch_last_end_done : for + e : Nat for + c : Bool { ch_done ( ch_step ( ChGroup { 1n + e , e , c } , ChRunEnded { } ) ) == True { } : Bool }
+# promise ch_last_end_done: the end of the last generation still running ends the request.
+82060ed2d74c9b9b  ch_n_never_zero  law ch_n_never_zero : for + m : Nat { ch_n_ok ( 0n , m ) == False { } : Bool }
+# promise ch_n_never_zero: a request never gets zero choices.
+7e963a64306a8133  ch_n_one_ok  law ch_n_one_ok : for + m : Nat { ch_n_ok ( 1n , 1n + m ) == True { } : Bool }
+# promise ch_n_one_ok: one choice is always allowed when the bound allows any.
+3fa8edba53073f55  ch_n_within_max  law ch_n_within_max : for + m : Nat for + k : Nat { ch_n_ok ( Nat.add ( m , 1n + k ) , m ) == False { } : Bool }
+# promise ch_n_within_max: a request never gets more choices than the server's bound.
+b949c6a324f4c000  ch_never_done_early  law ch_never_done_early : for + r : Nat for + e : Nat for + c : Bool { Bool.and ( ch_done ( ChGroup { r , e , c } ) , Nat.is_lt ( e , r ) ) == False { } : Bool }
+# promise ch_never_done_early: a request is never over while one of its generations has not delivered its end.
+76d901fd0c91fa8e  ch_new_not_cancelled  law ch_new_not_cancelled : for + r : Nat { ch_cancelled ( ch_new ( r ) ) == False { } : Bool }
+# promise ch_new_not_cancelled: a request is not cancelled before anything cancels it.
+911a2bb23d920e3a  ch_new_not_done  law ch_new_not_done : for + r : Nat { ch_done ( ch_new ( 1n + r ) ) == False { } : Bool }
+# promise ch_new_not_done: a request that started a generation is not over before that generation delivered its end.
+a48ebc35bc083fa3  ch_no_failure_ok  law ch_no_failure_ok : { ch_end_ok ( ch_end ( 0n ) ) == True { } : Bool }
+# promise ch_no_failure_ok: a request whose generations all ended without an error is answered as a success.
+4eb839c6cf8b68f1  ch_run_of_own  law ch_run_of_own : for + d : Nat for + k : Nat { ch_run_of ( d , 1n + Nat.add ( d , k ) ) == d : Nat }
+# promise ch_run_of_own: a choice that has a generation of its own reads that one, so choices with a generation each never share one.
+88def66c7615b441  ch_run_of_within  law ch_run_of_within : for + c : Nat for + rp : Nat { Nat.is_lt ( ch_run_of ( c , 1n + rp ) , 1n + rp ) == True { } : Bool }
+# promise ch_run_of_within: every choice reads a generation the request runs.
+7a89ca6547ae7e16  ch_runs_sampled_each  law ch_runs_sampled_each : for + n : Nat { ch_runs ( n , False { } ) == n : Nat }
+# promise ch_runs_sampled_each: every sampled choice is a generation of its own, never a copy of another choice.
+41a18a942c023eca  ch_runs_some  law ch_runs_some : for + n : Nat for + g : Bool { Nat.is_ge ( ch_runs ( 1n + n , g ) , 1n ) == True { } : Bool }
+# promise ch_runs_some: a request with at least one choice runs at least one generation.
+8c580df3826c640c  ch_runs_within_n  law ch_runs_within_n : for + n : Nat for + g : Bool { Nat.is_le ( ch_runs ( n , g ) , n ) == True { } : Bool }
+# promise ch_runs_within_n: the choices never take more generations than there are choices.
+8fe97b6e344f540a  ch_think_many_only_per_choice  law ch_think_many_only_per_choice : for + k : Nat for + c : Bool { Bool.and ( ch_think_ok ( 2n + k , True { } , c ) , Bool.not ( c ) ) == False { } : Bool }
+# promise ch_think_many_only_per_choice: a request with more than one choice never runs with a thinking budget unless the resume after a forced end of thinking runs for each choice.
+# harm ch_think_many_only_per_choice: the choices would share one think gate and one resumed generation, so every choice past the first would be cut at the wrong token or answered with another choice's reply.
+7c79b2cc975835af  ch_think_rest_ok  law ch_think_rest_ok : for + n : Nat for + b : Bool for + c : Bool { Bool.and ( ch_think_ok ( 1n , b , c ) , ch_think_ok ( n , False { } , c ) ) == True { } : Bool }
+# promise ch_think_rest_ok: a request with one choice, or without a thinking budget, is never refused by this rule.
 96f409b922e6e3d4  clamp_top_k_within_input  law clamp_top_k_within_input : for + k : Nat for + v : Nat { Nat.is_le ( clamp_top_k ( k , v ) , k ) == True { } : Bool }
 # promise clamp_top_k_within_input: clamp_top_k never exceeds the input top_k
 f63d6f88affafb04  ctx_for_prompt_admits  law ctx_for_prompt_admits : for + p : Nat for + extra : Nat { prompt_admitted ( 1n + p , Nat.add ( ctx_for_prompt ( 1n + p ) , extra ) ) == True { } : Bool }
@@ -1286,6 +1337,22 @@ ca6c53e6ce7c6290  ln_fail_leaves_batch  law ln_fail_leaves_batch : for s : LaneS
 # promise ln_fail_leaves_batch: a lane whose request failed takes part in no further step.
 5fef5a8c3062d3ac  ln_finish_leaves_batch  law ln_finish_leaves_batch : for s : LaneState { ln_in_batch ( ln_step ( s , EvLnFinish { } ) ) == False { } : Bool }
 # promise ln_finish_leaves_batch: a lane whose request finished takes part in no further step.
+0cae6a548c7abcde  ln_fork_needs_gain  law ln_fork_needs_gain : for + s : LaneState for + h : Nat for + o : Nat { Bool.and ( ln_fork_takes ( s , h , o ) , Nat.is_le ( o , h ) ) == False { } : Bool }
+# promise ln_fork_needs_gain: a request never copies rows from another lane unless that gives it more of its prompt than it takes over already.
+b9070933479e11cd  ln_fork_never_from_prefill  law ln_fork_never_from_prefill : for + h : Nat for + o : Nat { ln_fork_takes ( LnPrefill { } , h , o ) == False { } : Bool }
+# promise ln_fork_never_from_prefill: a lane whose prefill is running is never copied from.
+19622a5b8c3887c8  ln_fork_source_covers  law ln_fork_source_covers : for + f : Bool for + s : LaneState for + h : Nat for + o : Nat for + t : Nat for + hl : Nat for + k : Bool { Bool.and ( ln_fork_source ( f , s , h , o , t , hl , k ) , Nat.is_lt ( hl , pc_boundary ( ln_fork_tiles ( o , t ) , t ) ) ) == False { } : Bool }
+# promise ln_fork_source_covers: a source holds the tokens of every row the fork copies from it.
+235d7c65ccb32318  ln_fork_source_kept  law ln_fork_source_kept : for + f : Bool for + s : LaneState for + h : Nat for + o : Nat for + t : Nat for + hl : Nat { ln_fork_source ( f , s , h , o , t , hl , False { } ) == False { } : Bool }
+# promise ln_fork_source_kept: a source keeps the recurrent state at the position the fork resumes at.
+e1d1b8645f39996a  ln_fork_source_never_self  law ln_fork_source_never_self : for + s : LaneState for + h : Nat for + o : Nat for + t : Nat for + hl : Nat for + k : Bool { ln_fork_source ( True { } , s , h , o , t , hl , k ) == False { } : Bool }
+# promise ln_fork_source_never_self: a request never takes the start of its prompt from its own lane.
+6e2d6d45cf28985a  ln_fork_source_takes  law ln_fork_source_takes : for + f : Bool for + s : LaneState for + h : Nat for + o : Nat for + t : Nat for + hl : Nat for + k : Bool { Bool.and ( ln_fork_source ( f , s , h , o , t , hl , k ) , Bool.not ( ln_fork_takes ( s , h , o ) ) ) == False { } : Bool }
+# promise ln_fork_source_takes: a lane is chosen as the source only when the lane fork rule (ln_fork_takes) takes it.
+0e2ec3f365378cca  ln_fork_tiles_cover  law ln_fork_tiles_cover : for + k : Nat for + tp : Nat { Nat.is_ge ( ln_fork_tiles ( Nat.mul ( k , 1n + tp ) , 1n + tp ) , k ) == True { } : Bool }
+# promise ln_fork_tiles_cover: a fork of a position after whole tiles copies every one of those tiles.
+5dd6c7536c088fb2  ln_fork_tiles_within  law ln_fork_tiles_within : for + r : Nat for + tp : Nat { Nat.is_le ( Nat.mul ( ln_fork_tiles ( r , 1n + tp ) , 1n + tp ) , r ) == True { } : Bool }
+# promise ln_fork_tiles_within: a fork never copies rows past the position it resumes at.
 c4d0890ac614d952  ln_free_lane_routable  law ln_free_lane_routable : for + s : LaneState { Bool.or ( Bool.not ( ln_is_free ( s ) ) , ln_route_eligible ( s ) ) == True { } : Bool }
 # promise ln_free_lane_routable: every free lane is one routing may send a request to.
 be0740605e54f74d  ln_free_left_only_by_admit  law ln_free_left_only_by_admit : for + ev : LaneEvent { Bool.or ( ln_ev_is_admit ( ev ) , ln_is_free ( ln_step ( LnFree { } , ev ) ) ) == True { } : Bool }

@@ -314,25 +314,19 @@ impl RowLayout {
         )
     }
 
-    /// Appends the pieces of tile `t`, whose rows live at `host`: per cache, per head, the
-    /// tile's rows of that head. Where a piece starts in its cache and in the tile's segment,
-    /// and how long it is, are `hc_piece_dev_off`, `hc_piece_host_off` and `hc_piece_len`;
-    /// a piece is used only when `hc_piece_inside` says that the place is the tile's and one
-    /// the layout has (its laws then keep the piece inside the cache and inside the segment).
-    /// An error names a tile the caches have no place for; nothing was appended for it.
-    pub(crate) fn tile_pieces(
-        &self,
-        t: u64,
-        host: *mut u8,
-        out: &mut Vec<Piece>,
-    ) -> Result<(), String> {
+    /// The device ranges `(address, bytes)` of tile `t`: per cache, per head, the tile's rows of
+    /// that head. Where a range starts in its cache and how long it is are `hc_piece_dev_off` and
+    /// `hc_piece_len`; a range is used only when `hc_piece_inside` says that the place is the
+    /// tile's and one the layout has (its laws then keep the range inside the cache). An error
+    /// names a tile the caches have no place for.
+    pub(crate) fn tile_ranges(&self, t: u64) -> Result<Vec<(u64, u64)>, String> {
         let (chunk, slot) = (
             hc_tile_chunk(t, self.tiles_per_chunk),
             hc_tile_slot(t, self.tiles_per_chunk),
         );
         let caches = self.caches.len() as u64;
-        let len = hc_piece_len(self.tile, self.row_bytes) as usize;
-        let mut pieces = Vec::with_capacity(self.pieces_per_tile());
+        let len = hc_piece_len(self.tile, self.row_bytes);
+        let mut out = Vec::with_capacity(self.pieces_per_tile());
         for (cache, &addr) in self.caches.iter().enumerate() {
             for head in 0..self.heads {
                 if !hc_piece_inside(
@@ -360,14 +354,38 @@ impl RowLayout {
                     self.tile,
                     self.row_bytes,
                 );
+                out.push((addr + dev_off, len));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Appends the pieces of tile `t`, whose rows live at `host`: per cache, per head, the
+    /// tile's rows of that head ([`Self::tile_ranges`]), and where the piece lies in the tile's
+    /// segment (`hc_piece_host_off`). An error names a tile the caches have no place for;
+    /// nothing was appended for it.
+    pub(crate) fn tile_pieces(
+        &self,
+        t: u64,
+        host: *mut u8,
+        out: &mut Vec<Piece>,
+    ) -> Result<(), String> {
+        let ranges = self.tile_ranges(t)?;
+        let mut pieces = Vec::with_capacity(ranges.len());
+        let mut at = ranges.iter();
+        for cache in 0..self.caches.len() as u64 {
+            for head in 0..self.heads {
+                let Some(&(dev, len)) = at.next() else {
+                    return Err(format!("host tier: tile {t} has fewer ranges than pieces"));
+                };
                 let host_off =
-                    hc_piece_host_off(cache as u64, head, self.heads, self.tile, self.row_bytes);
+                    hc_piece_host_off(cache, head, self.heads, self.tile, self.row_bytes);
                 pieces.push(Piece {
-                    dev: addr + dev_off,
+                    dev,
                     // SAFETY: `host_off + len <= tile_bytes()`, the size of the tile's segment
                     // (`hc_piece_within_segment`).
                     host: unsafe { host.add(host_off as usize) },
-                    len,
+                    len: len as usize,
                 });
             }
         }
@@ -598,6 +616,17 @@ impl HostTier {
         self.rates.to_host = down.rate();
         self.rates.to_device = up.rate();
         Ok(())
+    }
+
+    /// [lanes] The device rows of the first `tiles` whole tiles were just replaced by a copy from
+    /// another lane (`lanes_rt::fork_prompt`): no entry is known to equal them any more.
+    pub fn rows_replaced(&mut self, tiles: u64) {
+        for iv in self.clean.values_mut() {
+            *iv = (
+                hc_clean_lo(iv.0, iv.1, 0, tiles),
+                hc_clean_hi(iv.0, iv.1, 0, tiles),
+            );
+        }
     }
 
     /// Start of a request, before its prefix plan. Copies out kept positions the request is
@@ -1406,22 +1435,20 @@ pub(super) fn attach(eng: &mut Qwen3Engine, cfg: &Qwen3Config) -> Result<(), Str
     Ok(())
 }
 
-/// The device layout the host tier copies for the active lane: the trunk K/V cache names and rows,
-/// the kept positions' state ranges and the drafter's context rings.
-#[allow(clippy::type_complexity)]
-fn layout_of_active(
+/// The rows of the trunk K/V caches `kv_addr` (one lane's: name -> (address, bytes)) as the
+/// engine lays them out: one size, chunk-major, `n_kv_heads` heads of rows in the caches' dtype.
+pub(super) fn rows_layout(
     eng: &Qwen3Engine,
-) -> Result<(Vec<String>, RowLayout, Vec<Vec<(u64, u64)>>, Vec<(u64, u64)>), String> {
-    // the trunk K/V caches: one size, chunk-major, `n_kv_heads` heads of BF16 rows
-    let cache_names: Vec<String> = eng.kv_addr.keys().cloned().collect();
-    let caches: Vec<u64> = eng.kv_addr.values().map(|&(a, _)| a).collect();
-    let cache_bytes = eng.kv_addr.values().next().map_or(0, |&(_, b)| b);
-    if eng.kv_addr.values().any(|&(_, b)| b != cache_bytes) {
+    kv_addr: &BTreeMap<String, (u64, u64)>,
+) -> Result<RowLayout, String> {
+    let caches: Vec<u64> = kv_addr.values().map(|&(a, _)| a).collect();
+    let cache_bytes = kv_addr.values().next().map_or(0, |&(_, b)| b);
+    if kv_addr.values().any(|&(_, b)| b != cache_bytes) {
         return Err("its K/V caches differ in size".into());
     }
     // [kv8] one head's row of one position in the caches' own dtype, and its V block
     let kv_dt = super::kv8::trunk_dtype(&eng.spec);
-    let rows = RowLayout::with_block(
+    RowLayout::with_block(
         caches,
         cache_bytes,
         eng.max_chunks,
@@ -1430,18 +1457,35 @@ fn layout_of_active(
         crate::core::kv_cache::row_bytes(1, eng.spec.head_dim, kv_dt),
         eng.prefill_tile,
         crate::verified::kv_vperm_rows(kv_dt),
-    )?;
+    )
+}
+
+/// The device ranges of one kept-position slot: the recurrent and conv state of every Gated
+/// DeltaNet layer, in layer order (`gdn_state` gives their sizes).
+pub(super) fn slot_ranges(
+    slot: &super::prefix_cache::SlotAddrs,
+    gdn_state: &BTreeMap<usize, GdnLayerState>,
+) -> Vec<(u64, u64)> {
+    slot.iter()
+        .flat_map(|(l, &(s, cs))| {
+            let st = &gdn_state[l];
+            [(s, st.s_bytes), (cs, st.cs_bytes)]
+        })
+        .collect()
+}
+
+/// The device layout the host tier copies for the active lane: the trunk K/V cache names and rows,
+/// the kept positions' state ranges and the drafter's context rings.
+#[allow(clippy::type_complexity)]
+fn layout_of_active(
+    eng: &Qwen3Engine,
+) -> Result<(Vec<String>, RowLayout, Vec<Vec<(u64, u64)>>, Vec<(u64, u64)>), String> {
+    let cache_names: Vec<String> = eng.kv_addr.keys().cloned().collect();
+    let rows = rows_layout(eng, &eng.kv_addr)?;
     let slots: Vec<Vec<(u64, u64)>> = eng
         .prefix_slots
         .iter()
-        .map(|m| {
-            m.iter()
-                .flat_map(|(l, &(s, cs))| {
-                    let st = &eng.gdn_state[l];
-                    [(s, st.s_bytes), (cs, st.cs_bytes)]
-                })
-                .collect()
-        })
+        .map(|m| slot_ranges(m, &eng.gdn_state))
         .collect();
     let ring: Vec<(u64, u64)> = match eng.specdec.as_ref() {
         Some(sd) if sd.context_rows() > 0 => sd.cache_regions(),

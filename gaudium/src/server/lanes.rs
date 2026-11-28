@@ -41,12 +41,15 @@ impl LaneHub {
         }
     }
 
-    /// Queues `job` for model `idx`. `true`: no session runs for the model, so the caller starts
-    /// one (`super::drive_lanes`), which will take this job.
-    pub fn submit(&self, idx: usize, job: LaneJob) -> bool {
+    /// Queues every job of `jobs` for model `idx`, one after the other with nothing between them
+    /// (the generations of one request: the first prefills the prompt, the ones that find a lane
+    /// beside it copy it from there). `true`: no session runs for the model, so the caller starts
+    /// one (`super::drive_lanes`), which will take these jobs.
+    pub fn submit_all(&self, idx: usize, jobs: Vec<LaneJob>) -> bool {
         let mut g = self.mu.lock().unwrap();
         let m = &mut g[idx];
-        m.queue.push_back((Instant::now(), job));
+        let now = Instant::now();
+        m.queue.extend(jobs.into_iter().map(|j| (now, j)));
         let start = crate::core::lanes::session_starts(m.active);
         m.active = true;
         start
@@ -209,8 +212,8 @@ mod tests {
         let hub = LaneHub::new(1);
         let (a, _ra) = job(1, false);
         let (b, _rb) = job(2, false);
-        assert!(hub.submit(0, a), "the first request starts a session");
-        assert!(!hub.submit(0, b), "the second joins it");
+        assert!(hub.submit_all(0, vec![a]), "the first request starts a session");
+        assert!(!hub.submit_all(0, vec![b]), "the second joins it");
         let mut feed = hub.feed(0);
         assert_eq!(feed.head(true), FeedHead::Job { exclusive: false });
         assert_eq!(feed.take().map(|j| j.id), Some(1));
@@ -224,7 +227,21 @@ mod tests {
         assert!(feed.take().is_none());
         assert_eq!(feed.head(true), FeedHead::End, "an ended feed stays ended");
         let (c, _rc) = job(3, false);
-        assert!(hub.submit(0, c), "after the end, a new session");
+        assert!(hub.submit_all(0, vec![c]), "after the end, a new session");
+    }
+
+    #[test]
+    fn the_jobs_of_one_request_queue_together_in_order() {
+        let hub = LaneHub::new(1);
+        let (a, _ra) = job(1, false);
+        assert!(hub.submit_all(0, vec![a]));
+        let (b0, _rb0) = job(20, false);
+        let (b1, _rb1) = job(21, false);
+        let (b2, _rb2) = job(22, false);
+        assert!(!hub.submit_all(0, vec![b0, b1, b2]), "they join the running session");
+        let mut feed = hub.feed(0);
+        let ids: Vec<u64> = std::iter::from_fn(|| feed.take().map(|j| j.id)).collect();
+        assert_eq!(ids, vec![1, 20, 21, 22]);
     }
 
     #[test]
@@ -233,7 +250,7 @@ mod tests {
         let hub = LaneHub::new(1);
         let (a, _ra) = job(1, false);
         let (b, _rb) = job(2, false);
-        assert!(hub.submit(0, a));
+        assert!(hub.submit_all(0, vec![a]));
         let due = Cell::new(false);
         let admitted = RefCell::new(Vec::new());
         let mut feed = hub.feed(0);
@@ -242,7 +259,7 @@ mod tests {
         assert_eq!(feed.head(true), FeedHead::Job { exclusive: false });
         assert_eq!(feed.take().map(|j| j.id), Some(1));
         assert_eq!(admitted.borrow().len(), 1, "an admission passes the older waiters over");
-        assert!(!hub.submit(0, b), "the second request joins the running session");
+        assert!(!hub.submit_all(0, vec![b]), "the second request joins the running session");
         due.set(true);
         assert_eq!(
             feed.head(false),
@@ -254,7 +271,7 @@ mod tests {
         assert!(feed.take().is_none());
         drop(feed);
         let (c, _rc) = job(3, false);
-        assert!(!hub.submit(0, c), "the yielded session still runs: no second one");
+        assert!(!hub.submit_all(0, vec![c]), "the yielded session still runs: no second one");
         let mut next = hub.feed(0);
         assert_eq!(next.head(true), FeedHead::Job { exclusive: false });
         assert_eq!(next.take().map(|j| j.id), Some(2), "its queue kept the arrival order");
@@ -265,7 +282,7 @@ mod tests {
         let hub = LaneHub::new(2);
         let (a, ra) = job(1, true);
         assert!(!a.exclusive());
-        assert!(hub.submit(1, a));
+        assert!(hub.submit_all(1, vec![a]));
         hub.fail_waiting(1, "no card");
         assert_eq!(hub.feed(1).head(false), FeedHead::Empty);
         match ra.recv().unwrap() {
@@ -274,7 +291,7 @@ mod tests {
         }
         let (b, _rb) = job(2, false);
         assert!(
-            hub.submit(1, b),
+            hub.submit_all(1, vec![b]),
             "a failed session lets the next arrival start one"
         );
     }

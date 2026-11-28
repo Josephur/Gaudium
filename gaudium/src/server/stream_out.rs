@@ -15,7 +15,6 @@
 //! per token and no launch counts.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,10 +44,13 @@ struct SinkState {
     failed: bool,
     /// The stream ended, or its writer is gone: the keep-alive writes nothing more.
     done: bool,
-    /// The flag a failed keep-alive sets: the request's current cancel flag (a resumed
-    /// generation gets a fresh one, `retarget_cancel`).
-    cancel: Option<Arc<AtomicBool>>,
+    /// What a failed keep-alive calls: the request's cancel.
+    cancel: Option<Cancel>,
 }
+
+/// Cancels a request: every generation it runs is told to stop (`choices::ChoiceGroup`). A
+/// stream calls it when a write to the client fails.
+pub(super) type Cancel = Arc<dyn Fn() + Send + Sync>;
 
 impl SseSink {
     /// A sink on a connection whose response head is already written.
@@ -107,13 +109,13 @@ impl SseSink {
     }
 
     /// Starts writing `line` whenever `every` passes without a write, until the stream ends or
-    /// the returned guard is dropped. A keep-alive write that fails sets `cancel` (the client
+    /// the returned guard is dropped. A keep-alive write that fails calls `cancel` (the client
     /// went away). `None`: the keep-alive thread could not start (the stream still works).
     pub fn keep_alive(
         &self,
         line: String,
         every: Duration,
-        cancel: Arc<AtomicBool>,
+        cancel: Cancel,
     ) -> Option<KeepAlive> {
         self.state().cancel = Some(cancel);
         let sink = self.clone();
@@ -122,16 +124,6 @@ impl SseSink {
             .spawn(move || sink.keep_alive_loop(line.as_bytes(), every))
             .ok()
             .map(|_| KeepAlive(self.clone()))
-    }
-
-    /// The request's cancel flag changed (a resumed generation): a keep-alive that finds the
-    /// client gone sets this one from now on. A client already gone sets it at once.
-    pub fn retarget_cancel(&self, cancel: Arc<AtomicBool>) {
-        let mut s = self.state();
-        if s.failed {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        s.cancel = Some(cancel);
     }
 
     fn keep_alive_loop(&self, line: &[u8], every: Duration) {
@@ -155,7 +147,7 @@ impl SseSink {
             if super::write_sse_chunk(&mut s.conn, line).is_err() {
                 s.failed = true;
                 if let Some(c) = &s.cancel {
-                    c.store(true, Ordering::Relaxed);
+                    c();
                 }
                 return;
             }
@@ -197,7 +189,10 @@ pub(super) struct StreamOut {
     n_prompt: u64,
     /// The engine reports its launches (else: one chunk per token).
     feed: bool,
-    cancel: Arc<AtomicBool>,
+    /// Cancels the request (a write to the client failed).
+    cancel: Cancel,
+    /// The choice this writer streams (`choices[].index` of its chunks).
+    index: u64,
     /// Parsed output not written yet.
     pending: Delta,
     /// Block-structured framing (the Messages API) instead of chat-completion chunks. It is fed
@@ -234,7 +229,7 @@ impl StreamOut {
         return_progress: bool,
         n_prompt: u64,
         feed: bool,
-        cancel: Arc<AtomicBool>,
+        cancel: Cancel,
         form: ChunkForm,
     ) -> Self {
         let object = match form {
@@ -254,6 +249,7 @@ impl StreamOut {
             n_prompt,
             feed,
             cancel,
+            index: 0,
             pending: Delta::default(),
             anth: None,
             resp: None,
@@ -268,6 +264,12 @@ impl StreamOut {
             write_failed: false,
             chunks: 0,
         }
+    }
+
+    /// The writer of choice `index` (0 unless set).
+    pub fn with_index(mut self, index: u64) -> Self {
+        self.index = index;
+        self
     }
 
     pub fn chunk_head(&self) -> &str {
@@ -439,13 +441,15 @@ impl StreamOut {
     pub fn text_chunk(&self, d: Option<&Delta>, extra: &str) -> String {
         match self.form {
             ChunkForm::Chat => format!(
-                "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{},\"finish_reason\":null}}]{extra}}}\n\n",
+                "data: {{{},\"choices\":[{{\"index\":{},\"delta\":{},\"finish_reason\":null}}]{extra}}}\n\n",
                 self.chunk_head,
+                self.index,
                 d.map_or_else(|| "{}".to_string(), delta_json),
             ),
             ChunkForm::Text => format!(
-                "data: {{{},\"choices\":[{{\"index\":0,\"text\":{},\"logprobs\":null,\"finish_reason\":null}}]{extra}}}\n\n",
+                "data: {{{},\"choices\":[{{\"index\":{},\"text\":{},\"logprobs\":null,\"finish_reason\":null}}]{extra}}}\n\n",
                 self.chunk_head,
+                self.index,
                 jq(&d.map(plain_text).unwrap_or_default()),
             ),
             ChunkForm::Native => format!(
@@ -453,20 +457,6 @@ impl StreamOut {
                 jq(&d.map(plain_text).unwrap_or_default()),
             ),
         }
-    }
-
-    /// The request's cancel flag is now `cancel` (a reply resumed after its thinking budget
-    /// runs under a fresh flag); a client already gone (a failed write of this stream or of its
-    /// keep-alive) cancels it too.
-    pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>) {
-        if self.write_failed || self.stream.as_ref().is_some_and(SseSink::failed) {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        // the keep-alive follows the request's current flag too
-        if let Some(s) = self.stream.as_ref() {
-            s.retarget_cancel(Arc::clone(&cancel));
-        }
-        self.cancel = cancel;
     }
 
     /// Writes one already-framed SSE payload; a failed write cancels the request.
@@ -477,7 +467,7 @@ impl StreamOut {
         if let Some(s) = self.stream.as_ref() {
             if s.write(payload.as_bytes()).is_err() {
                 self.write_failed = true;
-                self.cancel.store(true, Ordering::Relaxed);
+                (self.cancel)();
             }
         }
     }
@@ -532,6 +522,7 @@ pub(super) fn delta_json(d: &Delta) -> String {
 mod tests {
     use super::*;
     use crate::json::{self, JsonValue};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
 
@@ -577,6 +568,12 @@ mod tests {
         }
     }
 
+    /// A cancel that sets `f`.
+    fn on_flag(f: &Arc<AtomicBool>) -> Cancel {
+        let f = Arc::clone(f);
+        Arc::new(move || f.store(true, Ordering::Relaxed))
+    }
+
     fn writer(tx: TcpStream, feed: bool, progress: bool) -> StreamOut {
         StreamOut::new(
             Some(SseSink::new(tx.into())),
@@ -587,9 +584,25 @@ mod tests {
             progress,
             50,
             feed,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(|| {}),
             ChunkForm::Chat,
         )
+    }
+
+    /// A writer's text chunks carry its choice's index, in the chat and the text-completion
+    /// shapes alike (the native shape has no choices).
+    #[test]
+    fn text_chunks_carry_the_writers_choice_index() {
+        for (form, key) in [(ChunkForm::Chat, "delta"), (ChunkForm::Text, "text")] {
+            let w = StreamOut::new(None, "x", "m", 7, false, false, 5, false, Arc::new(|| {}), form)
+                .with_index(2);
+            let chunk = w.text_chunk(Some(&text("", "hi")), "");
+            let body = chunk.strip_prefix("data: ").unwrap().trim_end();
+            let j = json::parse_json(body).unwrap();
+            let c = &j.get("choices").and_then(JsonValue::as_array).unwrap()[0];
+            assert_eq!(c.get("index").and_then(JsonValue::as_u64), Some(2), "{chunk}");
+            assert!(c.get(key).is_some(), "{chunk}");
+        }
     }
 
     fn text(reasoning: &str, content: &str) -> Delta {
@@ -826,7 +839,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let every = Duration::from_millis(60);
         let guard = sink
-            .keep_alive(": ka\n\n".into(), every, Arc::clone(&cancel))
+            .keep_alive(": ka\n\n".into(), every, on_flag(&cancel))
             .expect("the keep-alive thread starts");
         // writes closer together than the heartbeat: no keep-alive between them
         for i in 0..10 {
@@ -854,34 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn a_keep_alive_cancels_the_flag_it_was_retargeted_to() {
-        let (tx, rx) = pair();
-        let sink = SseSink::new(tx.into());
-        let first = Arc::new(AtomicBool::new(false));
-        let _guard = sink.keep_alive(
-            ": ka\n\n".into(),
-            Duration::from_millis(10),
-            Arc::clone(&first),
-        );
-        // a resumed generation's fresh flag, before the client leaves
-        let fresh = Arc::new(AtomicBool::new(false));
-        sink.retarget_cancel(Arc::clone(&fresh));
-        drop(rx);
-        let t = Instant::now();
-        while !fresh.load(Ordering::Relaxed) && t.elapsed() < Duration::from_secs(5) {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            fresh.load(Ordering::Relaxed),
-            "the current flag is cancelled"
-        );
-        // and a flag given after the client left starts cancelled
-        let later = Arc::new(AtomicBool::new(false));
-        sink.retarget_cancel(Arc::clone(&later));
-        assert!(later.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn a_keep_alive_to_a_client_that_left_cancels_the_request() {
         let (tx, rx) = pair();
         drop(rx);
@@ -890,7 +875,7 @@ mod tests {
         let _guard = sink.keep_alive(
             ": ka\n\n".into(),
             Duration::from_millis(10),
-            Arc::clone(&cancel),
+            on_flag(&cancel),
         );
         let t = Instant::now();
         while !cancel.load(Ordering::Relaxed) && t.elapsed() < Duration::from_secs(5) {
@@ -969,7 +954,7 @@ mod tests {
             false,
             50,
             true,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(|| {}),
             ChunkForm::Chat,
         );
         w.anth = Some(Builder::new(true));

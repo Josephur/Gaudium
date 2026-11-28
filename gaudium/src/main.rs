@@ -173,6 +173,18 @@ fn print_usage() {
          \x20                       and /slots show the lanes. With --cache-ram every lane saves\n\
          \x20                       to and restores from the one host-RAM store (an entry one\n\
          \x20                       lane saved is restored into any lane)\n\
+         \x20 --max-choices <N>     Choices a chat completion may ask for with n (default: 8; at\n\
+         \x20                       most 64); a larger n is refused with a 400. A greedy request\n\
+         \x20                       runs once and returns that stream as every choice; sampled\n\
+         \x20                       choice i runs with seed + i (mod 2^64) and is token-identical\n\
+         \x20                       to the request sent alone with that seed and n = 1. With\n\
+         \x20                       --parallel the choices run in lanes beside each other, each\n\
+         \x20                       later one copying the prompt's rows up to the last whole\n\
+         \x20                       prefill tile from the lane that prefilled it; with one lane\n\
+         \x20                       they run one after another, each later one resuming from\n\
+         \x20                       the position the lane kept. usage counts the prompt once.\n\
+         \x20                       n > 1 with thinking_budget_tokens is refused (400), and the\n\
+         \x20                       completion endpoints take n = 1 only\n\
          \x20 --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a\n\
          \x20                       conversation: after another conversation, another model, or\n\
          \x20                       the idle release (--idle-park). What a request could resume\n\
@@ -2579,6 +2591,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut cache_ram_bytes: Option<u64> = None;
     let mut response_store = gaudium::server::ResponseStoreLimits::default();
     let mut parallel = 1u64;
+    let mut max_choices = gaudium::server::DEFAULT_MAX_CHOICES;
     let mut cache_max_gb: Option<f64> = None;
     let mut cache_keep_days: Option<f64> = None;
     let mut cache_trim_every: Option<u64> = None;
@@ -2801,6 +2814,19 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                         )
                     })?;
             }
+            "--max-choices" => {
+                let s = next_val(&mut i, "--max-choices")?;
+                max_choices = s
+                    .parse()
+                    .ok()
+                    .filter(|&n| gaudium::verified::ch_n_ok(n, gaudium::server::MAX_CHOICES))
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid --max-choices '{s}' (1 to {} choices)",
+                            gaudium::server::MAX_CHOICES
+                        )
+                    })?;
+            }
             "--cache-ram" => {
                 // GiB, whole or decimal ("8", "0.5"); 0 turns the host tier off
                 let s = next_val(&mut i, "--cache-ram")?;
@@ -3012,6 +3038,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         hsts_max_age,
         cache_ram_bytes,
         parallel,
+        max_choices,
         cache_trim,
         profile,
         response_store,

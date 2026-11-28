@@ -144,6 +144,18 @@ Serve options:
                         and /slots show the lanes. With --cache-ram every lane saves
                         to and restores from the one host-RAM store (an entry one
                         lane saved is restored into any lane)
+  --max-choices <N>     Choices a chat completion may ask for with n (default: 8; at
+                        most 64); a larger n is refused with a 400. A greedy request
+                        runs once and returns that stream as every choice; sampled
+                        choice i runs with seed + i (mod 2^64) and is token-identical
+                        to the request sent alone with that seed and n = 1. With
+                        --parallel the choices run in lanes beside each other, each
+                        later one copying the prompt's rows up to the last whole
+                        prefill tile from the lane that prefilled it; with one lane
+                        they run one after another, each later one resuming from
+                        the position the lane kept. usage counts the prompt once.
+                        n > 1 with thinking_budget_tokens is refused (400), and the
+                        completion endpoints take n = 1 only
   --cache-ram <GB>      Host memory for prefix reuse when the card no longer holds a
                         conversation: after another conversation, another model, or
                         the idle release (--idle-park). What a request could resume

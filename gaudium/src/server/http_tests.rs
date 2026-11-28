@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::sync::atomic::AtomicBool;
 
 use super::*;
 use crate::engine::{GenParams, GenReport};
@@ -139,6 +140,10 @@ impl GenEngine for ScriptedEngine {
             .unwrap()
             .pop_front()
             .ok_or("no scripted reply")?;
+        // (a reply may show the seed and the presence penalty its generation ran with)
+        let reply = reply
+            .replace("{seed}", &params.seed.to_string())
+            .replace("{presence}", &params.penalties.presence.to_string());
         let ids = self.tok.encode(&reply, true);
         let common = prompt_ids
             .iter()
@@ -353,6 +358,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             tls_key: None,
             tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
             hsts_max_age: super::DEFAULT_HSTS_MAX_AGE,
+            max_choices: super::choices::DEFAULT_MAX_CHOICES,
             cache_ram_bytes: Some(0),
             parallel: 1,
             cache_trim: None,
@@ -1705,6 +1711,7 @@ fn served_engine_configuration_follows_the_server_options() {
         tls_key: None,
         tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
         hsts_max_age: super::DEFAULT_HSTS_MAX_AGE,
+        max_choices: super::choices::DEFAULT_MAX_CHOICES,
         cache_ram_bytes: Some(0),
         parallel: 1,
         cache_trim: None,
@@ -1976,6 +1983,26 @@ fn chat_image_reaches_the_engine_with_its_pad_run() {
     let (status, _) = h.chat("");
     assert_eq!(status, 200);
     assert!(h.images.lock().unwrap().last().unwrap().is_empty());
+}
+
+/// Every generation of an image request with `n` choices runs with the request's tower inputs.
+#[test]
+fn every_choice_of_an_image_request_gets_its_images() {
+    let h = vision_harness(4096, 4096);
+    h.script("One {seed}.");
+    h.script("Two {seed}.");
+    let body = format!(
+        r#"{{"n":2,"temperature":0.6,"seed":9,"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{}"}}}},{{"type":"text","text":"What is this?"}}]}}]}}"#,
+        image_url(256, 256, 1)
+    );
+    let (status, text) = h.post("/v1/chat/completions", &body);
+    assert_eq!(status, 200, "{text}");
+    let v = json::parse_json(&text).unwrap();
+    assert_eq!(s(&v, &["choices", "0", "message", "content"]), "One 9.");
+    assert_eq!(s(&v, &["choices", "1", "message", "content"]), "Two 10.");
+    let seen = h.images.lock().unwrap();
+    let last_two = &seen[seen.len() - 2..];
+    assert_eq!(last_two, &[vec![(16, 16, 256 * 1536)], vec![(16, 16, 256 * 1536)]]);
 }
 
 /// Two images and a video in one request, in the order of their parts; the video is written
@@ -2265,6 +2292,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         tls_key: None,
         tls_http: crate::core::listener::PlainHttpMode::LsHttpRedirect,
         hsts_max_age: super::DEFAULT_HSTS_MAX_AGE,
+        max_choices: super::choices::DEFAULT_MAX_CHOICES,
         cache_ram_bytes: Some(0),
         parallel: 1,
         cache_trim: None,
@@ -3002,6 +3030,177 @@ fn lane_requests_run_through_the_lane_session() {
     );
 }
 
+/// `n` sampled choices: one generation each, choice `i` with seed + i, the prompt counted once.
+#[test]
+fn sampled_n_choices_run_one_generation_each_with_their_seeds() {
+    let h = harness();
+    for _ in 0..3 {
+        h.script("hm</think>\n\nPick {seed}.");
+    }
+    let before = h.prompts.lock().unwrap().len();
+    let (status, r) = h.chat(r#","n":3,"temperature":0.7,"seed":100,"gaudium_return_tokens":true"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(h.prompts.lock().unwrap().len(), before + 3, "three generations");
+    let choices = at(&r, &["choices"]).as_array().unwrap();
+    assert_eq!(choices.len(), 3);
+    for (i, c) in choices.iter().enumerate() {
+        assert_eq!(at(c, &["index"]).as_u64(), Some(i as u64));
+        assert_eq!(s(c, &["message", "content"]), format!("Pick {}.", 100 + i));
+        assert_eq!(s(c, &["finish_reason"]), "stop");
+        let d = at(&r, &["gaudium", "choices", &i.to_string()]);
+        assert_eq!(at(d, &["seed"]).as_u64(), Some(100 + i as u64));
+        assert_eq!(at(d, &["index"]).as_u64(), Some(i as u64));
+    }
+    let completions: Vec<u64> = (0..3)
+        .map(|i| at(&r, &["gaudium", "choices", &i.to_string(), "completion_tokens"]).as_u64().unwrap())
+        .collect();
+    let prompt = at(&r, &["usage", "prompt_tokens"]).as_u64().unwrap();
+    let completion = at(&r, &["usage", "completion_tokens"]).as_u64().unwrap();
+    assert_eq!(completion, completions.iter().sum::<u64>());
+    assert_eq!(at(&r, &["usage", "total_tokens"]).as_u64(), Some(prompt + completion), "the prompt once");
+    assert_eq!(at(&r, &["gaudium", "generations"]).as_u64(), Some(3));
+}
+
+/// `n` greedy choices: one generation, returned as every choice.
+#[test]
+fn greedy_n_choices_run_once_and_copy_the_stream() {
+    let h = harness();
+    h.script("hm</think>\n\nSame.");
+    let before = h.prompts.lock().unwrap().len();
+    let (status, r) = h.chat(r#","n":3,"temperature":0"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(h.prompts.lock().unwrap().len(), before + 1, "one generation");
+    let choices = at(&r, &["choices"]).as_array().unwrap();
+    assert_eq!(choices.len(), 3);
+    for (i, c) in choices.iter().enumerate() {
+        assert_eq!(at(c, &["index"]).as_u64(), Some(i as u64));
+        assert_eq!(s(c, &["message", "content"]), "Same.");
+    }
+    let per = at(&r, &["gaudium", "choices", "0", "completion_tokens"]).as_u64().unwrap();
+    assert_eq!(at(&r, &["usage", "completion_tokens"]).as_u64(), Some(3 * per));
+    assert_eq!(at(&r, &["gaudium", "generations"]).as_u64(), Some(1));
+    assert!(matches!(at(&r, &["gaudium", "choices", "1", "seed"]), JsonValue::Null), "greedy has no seed");
+}
+
+/// Each choice returns the one generation it reads, whatever number of generations the verified
+/// `ch_runs` gives the request (one, one per choice, or any count between), and usage counts what
+/// every choice returns. The expected answer is taken from `ch_runs` and `ch_run_of`, so the test
+/// holds for a body of `ch_runs` that runs a greedy request more than once.
+#[test]
+fn every_choice_returns_the_generation_it_reads() {
+    let h = harness();
+    let n = 5usize;
+    let runs = crate::verified::ch_runs(n as u64, true) as usize;
+    for _ in 0..runs {
+        h.script("hm</think>\n\nRun {seed}.");
+    }
+    let before = h.prompts.lock().unwrap().len();
+    let (status, r) = h.chat(r#","n":5,"temperature":0,"seed":30"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(h.prompts.lock().unwrap().len(), before + runs);
+    assert_eq!(at(&r, &["gaudium", "generations"]).as_u64(), Some(runs as u64));
+    let mut completion = 0;
+    for c in 0..n {
+        let g = super::choices::run_of(c, runs);
+        assert_eq!(
+            s(&r, &["choices", &c.to_string(), "message", "content"]),
+            format!("Run {}.", 30 + g),
+            "choice {c} reads generation {g} of {runs}, and only it"
+        );
+        completion += at(&r, &["gaudium", "choices", &c.to_string(), "completion_tokens"])
+            .as_u64()
+            .unwrap();
+    }
+    assert_eq!(at(&r, &["usage", "completion_tokens"]).as_u64(), Some(completion));
+}
+
+/// `n` outside 1..=--max-choices is a 400 with the numbers; one choice keeps the old shape.
+#[test]
+fn n_outside_the_bound_is_refused_and_one_choice_is_unchanged() {
+    let h = configured_harness(|c| c.max_choices = 2);
+    let (status, r) = h.chat(r#","n":3"#);
+    assert_eq!(status, 400, "{}", r.dump());
+    let msg = s(&r, &["error", "message"]);
+    assert!(msg.contains("'n' = 3") && msg.contains("1 to 2"), "{msg}");
+    let (status, _) = h.chat(r#","n":0"#);
+    assert_eq!(status, 400);
+    let (status, _) = h.chat(r#","n":"two""#);
+    assert_eq!(status, 400);
+    h.script("hm</think>\n\nOne.");
+    let (status, r) = h.chat(r#","n":1"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(at(&r, &["choices"]).as_array().map(|a| a.len()), Some(1));
+    assert!(r.get("gaudium").and_then(|g| g.get("choices")).is_none());
+}
+
+/// A streamed request with `n` choices: every chunk names its choice, each choice ends with its
+/// own finish reason, and the last chunk carries the usage of all of them.
+#[test]
+fn streamed_n_choices_are_tagged_by_index() {
+    let h = harness();
+    h.script("a</think>\n\nFirst {seed}.");
+    h.script("b</think>\n\nSecond {seed}.");
+    let (status, body) = h.post(
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"Hi"}],"stream":true,"n":2,"temperature":0.5,"seed":7}"#,
+    );
+    assert_eq!(status, 200);
+    let mut content = [String::new(), String::new()];
+    let mut finish = [String::new(), String::new()];
+    let mut usage_at = Vec::new();
+    let chunks: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|l| *l != "[DONE]")
+        .collect();
+    for (k, line) in chunks.iter().enumerate() {
+        let chunk = json::parse_json(line).unwrap();
+        let choices = at(&chunk, &["choices"]).as_array().unwrap();
+        assert_eq!(choices.len(), 1, "one choice per chunk");
+        let i = at(&choices[0], &["index"]).as_u64().unwrap() as usize;
+        if let Some(t) = choices[0].get("delta").and_then(|d| d.get("content")).and_then(JsonValue::as_str) {
+            content[i].push_str(t);
+        }
+        if let Some(f) = choices[0].get("finish_reason").and_then(JsonValue::as_str) {
+            finish[i] = f.to_string();
+        }
+        if chunk.get("usage").is_some() {
+            usage_at.push(k);
+        }
+    }
+    assert_eq!(content, ["First 7.".to_string(), "Second 8.".to_string()]);
+    assert_eq!(finish, ["stop".to_string(), "stop".to_string()]);
+    assert_eq!(usage_at, vec![chunks.len() - 1], "usage once, in the last chunk");
+    assert!(body.contains("data: [DONE]"));
+}
+
+/// A stop string ends the choice that wrote it, not the others.
+#[test]
+fn a_stop_string_ends_only_its_own_choice() {
+    let h = harness();
+    h.script("a</think>\n\nOne END and more.");
+    h.script("b</think>\n\nTwo and more.");
+    let (status, r) = h.chat(r#","n":2,"temperature":0.5,"seed":1,"stop":["END"]"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(s(&r, &["choices", "0", "message", "content"]), "One ");
+    assert_eq!(s(&r, &["choices", "1", "message", "content"]), "Two and more.");
+}
+
+/// A model served with lanes takes the choices through its lane session, in their order.
+#[test]
+fn n_choices_run_through_the_lane_session() {
+    let h = lane_harness(3);
+    for _ in 0..3 {
+        h.script("{seed}");
+    }
+    let (status, r) = h.chat(r#","n":3,"temperature":0.8,"seed":40"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    let got: Vec<String> = (0..3)
+        .map(|i| s(&r, &["choices", &i.to_string(), "message", "reasoning_content"]).to_string())
+        .collect();
+    assert_eq!(got, ["40", "41", "42"]);
+}
+
 // ------------------------------------------------------------------------------------------------
 // Plain HTTP beside HTTPS: the redirect and Strict-Transport-Security
 // ------------------------------------------------------------------------------------------------
@@ -3608,8 +3807,8 @@ fn chat_values_that_change_nothing_pass_silently() {
 fn chat_refuses_fields_whose_ignoring_would_go_unseen() {
     let h = harness();
     let before = h.prompts.lock().unwrap().len();
+    // (`n` is applied now: `n_outside_the_bound_is_refused_and_one_choice_is_unchanged`)
     for (extra, field) in [
-        (",\"n\":2", "n"),
         (",\"logprobs\":true", "logprobs"),
         (",\"logprobs\":true,\"top_logprobs\":3", "logprobs"),
     ] {
@@ -4230,6 +4429,90 @@ fn a_thinking_budget_with_penalties_is_refused() {
     assert_eq!(status, 200, "{}", r.dump());
 }
 
+/// A thinking budget with more than one choice is refused (`ch_think_ok`): the reply resumed
+/// after a forced close is one second generation, so the choices would share one think gate.
+/// One choice with a budget, and `n` choices without one, still run.
+#[test]
+fn a_thinking_budget_with_n_choices_is_refused() {
+    let h = harness();
+    for n in [2, 3] {
+        let before = h.prompts.lock().unwrap().len();
+        let (status, r) = h.chat(&format!(
+            r#","max_tokens":64,"thinking_budget_tokens":4,"n":{n},"temperature":0.5"#
+        ));
+        assert_eq!(status, 400, "n = {n}: {}", r.dump());
+        assert!(
+            r.dump().contains("thinking_budget_tokens") && r.dump().contains("n > 1"),
+            "{}",
+            r.dump()
+        );
+        assert_eq!(h.prompts.lock().unwrap().len(), before, "refused before the engine");
+    }
+    // greedy too: its choices are one generation, but each would still be cut at the budget
+    let (status, r) = h.chat(r#","thinking_budget_tokens":4,"n":2,"temperature":0"#);
+    assert_eq!(status, 400, "{}", r.dump());
+    h.script("a\n</think>\n\nHi.");
+    let (status, r) = h.chat(r#","max_tokens":64,"thinking_budget_tokens":32,"n":1"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    h.script("a</think>\n\nOne.");
+    h.script("b</think>\n\nTwo.");
+    let (status, r) = h.chat(r#","n":2,"temperature":0.5"#);
+    assert_eq!(status, 200, "{}", r.dump());
+}
+
+/// Every sampled choice of a penalised request runs with the request's penalties and its own
+/// seed, as a generation of its own (the engine starts each generation's penalty counts from
+/// none, so no choice is penalised for another choice's tokens).
+#[test]
+fn penalised_n_choices_each_run_with_the_penalties_and_their_seed() {
+    let h = harness();
+    for _ in 0..3 {
+        h.script("hm</think>\n\nP {presence} {seed}.");
+    }
+    let before = h.prompts.lock().unwrap().len();
+    let (status, r) = h.chat(r#","n":3,"temperature":0.7,"seed":40,"presence_penalty":0.5"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(h.prompts.lock().unwrap().len(), before + 3, "three generations");
+    for i in 0..3 {
+        assert_eq!(
+            s(&r, &["choices", &i.to_string(), "message", "content"]),
+            format!("P 0.5 {}.", 40 + i)
+        );
+    }
+}
+
+/// A cancel of a request with `n` choices stops every one of its generations, the one that runs
+/// and the ones that have not started, and the request still answers once each ended.
+#[test]
+fn a_cancel_stops_every_choice() {
+    let h = harness();
+    h.script("</think>\n\nabcdefghijklmnopqrstuvwxyz");
+    h.script("</think>\n\nzyxwvutsrqponmlkjihgfedcba");
+    h.hold_after(3);
+    thread::scope(|sc| {
+        let run = sc.spawn(|| h.chat(r#","n":2,"temperature":0.5,"seed":3"#));
+        let id = h.held_request();
+        let (status, ok) = h.post(
+            "/v1/chat/completions/control",
+            &format!(r#"{{"id":{}}}"#, jq(&id)),
+        );
+        assert_eq!(status, 200, "{ok}");
+        assert!(ok.contains("true"), "{ok}");
+        h.release();
+        let (status, r) = run.join().unwrap();
+        assert_eq!(status, 200, "{}", r.dump());
+        for i in 0..2 {
+            assert_eq!(
+                s(&r, &["choices", &i.to_string(), "finish_reason"]),
+                "cancelled",
+                "{}",
+                r.dump()
+            );
+        }
+        assert_eq!(s(&r, &["choices", "1", "message", "content"]), "", "the second never ran a token");
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // The Responses API (`responses.rs`)
 // ---------------------------------------------------------------------------------------------
@@ -4717,7 +5000,7 @@ fn responses_cancel_answers_with_the_response_its_generation_ends() {
         let cancel = sc.spawn(move || hr.post(&path, ""));
         // the generation goes on once the cancel has reached it
         let t0 = std::time::Instant::now();
-        while !h.state.cancels.lock().unwrap()[&id].load(Ordering::Relaxed) {
+        while !h.state.cancels.lock().unwrap()[&id].cancelled() {
             assert!(t0.elapsed() < Duration::from_secs(20));
             thread::sleep(Duration::from_millis(1));
         }
