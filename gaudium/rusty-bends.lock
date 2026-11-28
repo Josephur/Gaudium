@@ -1570,6 +1570,25 @@ d9c2a2fe466391df  media_oversized_refused  law media_oversized_refused : for + m
 25c6c5b940cf3cbe  media_remote_follows_setting  law media_remote_follows_setting : for a : Bool { media_source_allowed ( MsRemote { } , a ) == a : Bool }
 ef45a806ccc81bf8  media_zero_height_refused  law media_zero_height_refused : for + w : Nat for m : Nat { media_canvas_ok ( w , 0n , m ) == False { } : Bool }
 61de762b8557772c  media_zero_width_refused  law media_zero_width_refused : for h : Nat for m : Nat { media_canvas_ok ( 0n , h , m ) == False { } : Bool }
+1e1601cd522a8172  meter_owns_before_next  law meter_owns_before_next : for + s : Nat for + d : Nat for + e : Nat { meter_owns ( s , Nat.add ( s , d ) , True { } , Nat.add ( Nat.add ( s , d ) , 1n + e ) ) == True { } : Bool }
+# promise meter_owns_before_next: a frame with another frame on top of it owns the blocks recorded between its own start and that frame's start.
+e049c14e75e46d17  meter_owns_earlier_refused  law meter_owns_earlier_refused : for + s : Nat for + d : Nat for later : Bool for + next : Nat { meter_owns ( Nat.add ( s , 1n + d ) , s , later , next ) == False { } : Bool }
+# promise meter_owns_earlier_refused: a frame never owns a block recorded before it started, so releasing memory allocated before the meter (or by an enclosing frame) never lowers its count.
+# harm meter_owns_earlier_refused: a request could free its own body's buffers to cancel the heap its documents hold and keep more than its cap.
+a295fd1082346b8e  meter_owns_later_refused  law meter_owns_later_refused : for + start : Nat for + next : Nat for + d : Nat { meter_owns ( start , Nat.add ( next , d ) , True { } , next ) == False { } : Bool }
+# promise meter_owns_later_refused: while a frame started inside another is on, the outer frame never owns a block recorded by the inner one.
+# harm meter_owns_later_refused: a release inside a document read could credit the request's count for the read's own block and let the two counts drift apart.
+900788ee659f28a1  meter_owns_own_block  law meter_owns_own_block : for + s : Nat for + d : Nat for + next : Nat { meter_owns ( s , Nat.add ( s , d ) , False { } , next ) == True { } : Bool }
+# promise meter_owns_own_block: the top frame owns every block recorded since it started.
+a041942959670dbc  meter_regrow_charges  law meter_regrow_charges : for + c : Nat for + o : Nat for + n : Nat { Bool.and ( Nat.is_le ( c , o ) , Nat.is_lt ( Nat.add ( meter_regrow ( c , o , n ) , Nat.sub ( o , n ) ) , Nat.add ( c , Nat.sub ( n , o ) ) ) ) == False { } : Bool }
+# promise meter_regrow_charges: a reallocation charges every byte it adds and credits no more than the bytes it removes (new charge plus bytes removed is at least old charge plus bytes added).
+# harm meter_regrow_charges: growing a block under the meter without charging the growth, or shrinking it to credit more than it gave back, would let a document hold heap its count does not show.
+063c48175a2d6f02  meter_regrow_inside  law meter_regrow_inside : for + c : Nat for + o : Nat for + n : Nat { Bool.and ( Nat.is_le ( c , o ) , Nat.is_lt ( n , meter_regrow ( c , o , n ) ) ) == False { } : Bool }
+# promise meter_regrow_inside: a reallocated block is never charged for more bytes than its new size, when it was charged no more than its old size.
+# harm meter_regrow_inside: a charge above the block's size would later be credited against blocks the frame still holds.
+8bebe05ee4c99e35  meter_regrow_no_overcharge  law meter_regrow_no_overcharge : for + c : Nat for + o : Nat for + n : Nat { Nat.is_lt ( Nat.add ( c , Nat.sub ( n , o ) ) , meter_regrow ( c , o , n ) ) == False { } : Bool }
+# promise meter_regrow_no_overcharge: a reallocation never charges more than the block was charged plus the bytes it adds.
+# harm meter_regrow_no_overcharge: a block allocated before the meter would be charged its whole size when it grows, and a request refused for memory it never allocated.
 a9143821fed967ff  ml_last_page_reaches_end  law ml_last_page_reaches_end : for + n : Nat for + lo : Nat for + hi : Nat for + p : Nat for nm : { ml_more ( n , lo , hi , 1n + p ) == False { } : Bool } { Bool.or ( Nat.is_le ( Nat.min ( hi , n ) , lo ) , ml_on_page ( Nat.sub ( Nat.min ( hi , n ) , 1n ) , n , lo , hi , 1n + p , False { } ) ) == True { } : Bool }
 # promise ml_last_page_reaches_end: a forward page of at least one entry that does not say more entries follow ends at the last entry before the before_id cursor or the list's end
 # harm ml_last_page_reaches_end: a client would stop paging one entry short
