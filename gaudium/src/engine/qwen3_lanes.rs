@@ -1192,9 +1192,9 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
         return Ok(None);
     }
     // a lane step picks its tokens on the card, without penalties
-    if !crate::verified::pen_path_allowed(params.penalties.active(), false) {
+    if !crate::verified::pen_path_allowed(params.host_picked(), false) {
         out(done_event(
-            Err("sampling penalties and logit_bias are not applied in a lane: serve the model without --parallel to use them".into()),
+            Err("sampling penalties, logit_bias and structured output are not applied in a lane: serve the model without --parallel to use them".into()),
             eng,
             false,
         ));

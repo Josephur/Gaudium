@@ -124,9 +124,9 @@ Serve options:
                         reuse), the decoding lanes stepped together in one launch that
                         reads the weights once. Every stream is token-identical to the
                         same request run alone. Further requests wait in arrival order;
-                        a request with images runs alone; one with sampling penalties
-                        or logit_bias is refused (they apply one request at a time,
-                        at K = 0). Each lane holds the full
+                        a request with images runs alone; one with sampling penalties,
+                        logit_bias or structured output is refused (they apply one
+                        request at a time, at K = 0). Each lane holds the full
                         context (--max-ctx / --model-ctx): a load that cannot plan N
                         lanes of it is refused with the numbers. A request goes to the
                         free lane where it takes over the most of its prompt for the
@@ -202,7 +202,11 @@ Serve options:
                         A request with presence / frequency / repetition penalties
                         or logit_bias decodes at K=0 (its tokens are picked on the
                         host from the read-back logits, over every generated token,
-                        reasoning included)
+                        reasoning included). So does structured output (chat
+                        response_format json_object / json_schema, function tools
+                        with "strict": true, Messages output_config.format and strict
+                        tools): each answer token is masked to what the schema admits;
+                        the reasoning stays free
   --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster
                         decode, more device memory, its own token stream)
   --model-ctx <id=N>    Context size for model <id> instead of --max-ctx

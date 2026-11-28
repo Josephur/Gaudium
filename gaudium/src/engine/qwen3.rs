@@ -208,6 +208,17 @@ pub struct Qwen3GenParams {
     /// Presence / frequency / repetition penalties and the logit bias (`sampler_penalty`). An
     /// active set runs the request on the host-picked `K = 0` path (`pen_path_allowed`).
     pub penalties: crate::sampler_penalty::Penalties,
+    /// The reply's grammar (`response_format`, strict tools: `crate::grammar`). A constrained
+    /// request runs on the host-picked `K = 0` path too (`gram_host_pick`), each position masked
+    /// to the tokens the grammar admits.
+    pub grammar: Option<std::sync::Arc<crate::grammar::constraint::Plan>>,
+}
+
+impl Qwen3GenParams {
+    /// The request's tokens are picked on the host, where its penalties and its grammar apply.
+    pub fn host_picked(&self) -> bool {
+        crate::verified::gram_host_pick(self.penalties.active(), self.grammar.is_some())
+    }
 }
 
 impl Default for Qwen3GenParams {
@@ -231,6 +242,7 @@ impl Default for Qwen3GenParams {
             k0_plain: false,
             cache_prompt: true,
             penalties: crate::sampler_penalty::Penalties::default(),
+            grammar: None,
         }
     }
 }
@@ -283,10 +295,11 @@ fn k0_method_label(wprec: &str, params: &Qwen3GenParams) -> String {
     } else {
         format!("K=0 {wprec} greedy")
     };
-    if params.penalties.active() {
-        format!("{base} penalised")
-    } else {
-        base
+    match (params.penalties.active(), params.grammar.is_some()) {
+        (false, false) => base,
+        (true, false) => format!("{base} penalised"),
+        (false, true) => format!("{base} constrained"),
+        (true, true) => format!("{base} penalised constrained"),
     }
 }
 
@@ -1280,6 +1293,8 @@ pub struct Qwen3Engine {
     lanes: Option<lanes_rt::LaneRt>,
     /// Count ledger of the running request's penalties (`sampler_penalty`).
     pen: crate::sampler_penalty::PenaltyState,
+    /// The running request's grammar state (`crate::grammar`), when it has one.
+    gram: Option<crate::grammar::constraint::Constraint>,
 
     // Device handle (dropped LAST!)
     dev: HpuDevice,
@@ -2848,6 +2863,7 @@ impl Qwen3Engine {
             prof: prof.map(prof_rt::ProfRt::new),
             lanes: lane_rt,
             pen: crate::sampler_penalty::PenaltyState::default(),
+            gram: None,
             dev,
         };
         eng.warm_prefill_tiles(cfg.prefill_warm_rows, cfg.verbose)?;
@@ -3126,6 +3142,16 @@ impl Qwen3Engine {
         Ok(res.token as i32)
     }
 
+    /// Records the token a host-picked request continues with: in the penalty ledger, and in the
+    /// grammar (which refuses a token it does not admit, a forced one included).
+    fn commit_host_picked(&mut self, params: &Qwen3GenParams, tok: i32) -> Result<(), String> {
+        self.pen.commit(&params.penalties, tok)?;
+        if let Some(g) = self.gram.as_mut() {
+            g.commit(tok)?;
+        }
+        Ok(())
+    }
+
     /// The token of a penalised request at sequence index `n`: the readout row's logits read
     /// back, the request's penalties applied with its count ledger, then the sampler's host twin
     /// (greedy or sampled with the position's noise).
@@ -3147,7 +3173,15 @@ impl Qwen3Engine {
             .map(|&c| u16::from_le_bytes(c))
             .collect();
         let dev_sp = samp_rt::dev_params(params, self.spec.vocab);
-        crate::sampler_penalty::pick(&params.penalties, &self.pen, &mut bf16, &dev_sp, n)
+        let mask = self.gram.as_mut().map(|g| g.mask());
+        crate::sampler_penalty::pick_masked(
+            &params.penalties,
+            &self.pen,
+            &mut bf16,
+            &dev_sp,
+            n,
+            mask.as_deref(),
+        )
     }
 
     /// The token of a readout row: read from the card (greedy argmax, or the on-card sampler of
@@ -3160,7 +3194,7 @@ impl Qwen3Engine {
         logits_hbm: u64,
         n: u32,
     ) -> Result<i32, String> {
-        if params.penalties.active() {
+        if params.host_picked() {
             return self.pick_penalised(logits_hbm, params, n);
         }
         if params.temperature > 0.0 && self.samp.is_none() {
@@ -3209,8 +3243,12 @@ impl Qwen3Engine {
         }
         let is_eos = |tok: i32| eos_ids.contains(&tok);
         let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
-        let penalised = params.penalties.active();
+        let penalised = params.host_picked();
         self.pen = crate::sampler_penalty::PenaltyState::begin(prompt_ids.len());
+        self.gram = params
+            .grammar
+            .clone()
+            .map(crate::grammar::constraint::Constraint::begin);
 
         let wprec = if self.spec.fp8_weights { "FP8" } else { "BF16" }; // [fp8 hook]
         let method_label = if penalised {
@@ -3291,7 +3329,7 @@ impl Qwen3Engine {
         // (a penalised request picks its tokens on the host: the on-card sampler applies none)
         let samp_on = params.temperature > 0.0
             && self.samp.is_some()
-            && crate::verified::pen_path_allowed(params.penalties.active(), false);
+            && crate::verified::pen_path_allowed(params.host_picked(), false);
         if let Some(s) = self.samp.as_mut() {
             s.reset_checks();
         }
@@ -3817,11 +3855,11 @@ impl Qwen3Engine {
         let mut forks: Vec<ForkRecord> = Vec::new();
         let first_tok = self.apply_force(params, 0, first_tok, first_logits_hbm, &mut forks)?;
 
-        let penalised = params.penalties.active();
+        let penalised = params.host_picked();
         if budget.remaining() > 0 && !is_cancelled() {
             // the token generation continues with (a forced one too) passes the emission check
             if penalised {
-                self.pen.commit(&params.penalties, first_tok)?;
+                self.commit_host_picked(params, first_tok)?;
             }
             budget.record_emitted(1);
             generated.push(first_tok);
@@ -4007,7 +4045,7 @@ impl Qwen3Engine {
 
             decode_steps += 1;
             if penalised {
-                self.pen.commit(&params.penalties, next_tok)?;
+                self.commit_host_picked(params, next_tok)?;
             }
             budget.record_emitted(1);
             generated.push(next_tok);
@@ -4021,6 +4059,17 @@ impl Qwen3Engine {
         }
 
         let decode_ms = piped_ms.unwrap_or_else(|| t_decode.elapsed().as_secs_f64() * 1000.0);
+        if let Some(g) = self.gram.take() {
+            eprintln!(
+                "[grammar] {}: {} masks built in {:.1} ms, {} served from the cache, {} decode steps in {:.1} ms",
+                g.label(),
+                g.stats.masks_built,
+                g.stats.mask_ms,
+                g.stats.cache_hits,
+                decode_steps,
+                decode_ms
+            );
+        }
         if piped_ms.is_none() {
             prof_rt::end_request(self, decode_steps as u64)?;
         }

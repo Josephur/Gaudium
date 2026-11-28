@@ -14,6 +14,7 @@ pub mod core;
 pub mod engine;
 pub mod fp8;
 pub mod gguf;
+pub mod grammar;
 pub mod hostmem;
 pub mod json;
 pub mod kernels;

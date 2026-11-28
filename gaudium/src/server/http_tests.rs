@@ -173,7 +173,22 @@ impl GenEngine for ScriptedEngine {
             host_tier,
             ..GenReport::default()
         };
+        // as the engine: a constrained request's tokens must be ones its grammar admits
+        let mut gram = params
+            .grammar
+            .clone()
+            .map(crate::grammar::constraint::Constraint::begin);
         for id in ids {
+            if let Some(g) = gram.as_mut() {
+                if !g.mask().has(id as u32) {
+                    return Err(format!(
+                        "scripted token {id} ({:?}) is not admitted by {}",
+                        self.tok.decode(&[id], false),
+                        g.label()
+                    ));
+                }
+                g.commit(id)?;
+            }
             // as an engine: cancellation is seen between launches
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 rep.stopped_by_cancel = true;
@@ -198,6 +213,9 @@ impl GenEngine for ScriptedEngine {
                 }
                 self.tier.lock().unwrap().paused = false;
             }
+        }
+        if let Some(g) = gram.as_ref().filter(|g| !g.complete()) {
+            return Err(format!("scripted reply ends incomplete for {}", g.label()));
         }
         rep.stopped_by_eos = true;
         Ok(rep)
@@ -3922,6 +3940,113 @@ fn chat_penalties_are_applied_not_reported_as_ignored() {
         "{}",
         r.dump()
     );
+
+
+// ---- structured output (#107) ----
+
+const STRICT_TOOLS: &str = r#""tools":[{"type":"function","function":{"name":"get_weather","strict":true,"parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city","days"],"additionalProperties":false}}}]"#;
+
+const PERSON: &str = r#""response_format":{"type":"json_schema","json_schema":{"name":"person","strict":true,"schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}}}"#;
+
+#[test]
+fn a_json_schema_reply_is_held_to_its_schema() {
+    let h = harness();
+    h.script("Thinking about it.\n</think>\n\n{\"name\": \"Ada\", \"age\": 36}");
+    let (status, r) = h.chat(&format!(",{PERSON}"));
+    assert_eq!(status, 200, "{}", r.dump());
+    let msg = at(&r, &["choices", "0", "message"]);
+    assert_eq!(s(msg, &["reasoning_content"]), "Thinking about it.");
+    let content = json::parse_json(s(msg, &["content"])).unwrap();
+    assert_eq!(content.dump(), "{\"name\":\"Ada\",\"age\":36}");
+    // a reply that leaves the schema is not one the engine may emit
+    for bad in [
+        "</think>\n\n{\"name\": \"Ada\"}",
+        "</think>\n\n{\"age\": 36, \"name\": \"Ada\"}",
+        "</think>\n\nSure! {\"name\": \"Ada\", \"age\": 36}",
+    ] {
+        h.script(bad);
+        let (status, r) = h.chat(&format!(",{PERSON}"));
+        assert_ne!(status, 200, "{bad}: {}", r.dump());
+    }
+    // the reasoning itself is free
+    h.script("{[not json]} </think>\n{\"name\": \"x\", \"age\": 1}");
+    let (status, r) = h.chat(&format!(",{PERSON}"));
+    assert_eq!(status, 200, "{}", r.dump());
+}
+
+#[test]
+fn json_mode_and_unsupported_schemas() {
+    let h = harness();
+    h.script("</think>\n\n{\"any\": [1, {\"thing\": null}]}");
+    let (status, r) = h.chat(r#","response_format":{"type":"json_object"}"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert!(json::parse_json(s(&r, &["choices", "0", "message", "content"])).is_ok());
+    // text is no constraint
+    h.script("</think>\n\nplain words");
+    let (status, _) = h.chat(r#","response_format":{"type":"text"}"#);
+    assert_eq!(status, 200);
+    // a keyword outside the subset is refused by name
+    let (status, r) = h.chat(
+        r#","response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"string","pattern":"^a+$"}}}"#,
+    );
+    assert_eq!(status, 400);
+    assert!(r.dump().contains("'pattern'"), "{}", r.dump());
+    let (status, _) = h.chat(r#","response_format":{"type":"regex"}"#);
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn strict_tool_arguments_follow_their_schema() {
+    let h = harness();
+    h.script(CALL_REPLY);
+    let (status, r) = h.chat(&format!(",{STRICT_TOOLS}"));
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(
+        s(&r, &["choices", "0", "message", "tool_calls", "0", "function", "arguments"]),
+        "{\"city\":\"Oslo \\\"S\\\"\",\"days\":2}"
+    );
+    // days is an integer; a call without it is refused too
+    for bad in [
+        "</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n<parameter=days>\ntwo\n</parameter>\n</function>\n</tool_call>",
+        "</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>",
+        "</think>\n\n<tool_call>\n<function=other>\n</function>\n</tool_call>",
+    ] {
+        h.script(bad);
+        let (status, r) = h.chat(&format!(",{STRICT_TOOLS}"));
+        assert_ne!(status, 200, "{bad}: {}", r.dump());
+    }
+    // text without a call is free
+    h.script("</think>\n\nNo call needed.");
+    let (status, _) = h.chat(&format!(",{STRICT_TOOLS}"));
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn messages_output_format_and_strict_tools_are_applied() {
+    let h = harness();
+    h.script("</think>\n\n{\"name\": \"Ada\", \"age\": 36}");
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":256,"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}}},"messages":[{"role":"user","content":"Who?"}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert!(!r.dump().contains("output_config.format"), "{text}");
+    let blocks = at(&r, &["content"]).as_array().unwrap();
+    let t = blocks.iter().find(|b| s(b, &["type"]) == "text").unwrap();
+    assert!(json::parse_json(s(t, &["text"])).is_ok());
+    // a strict tool: its input follows input_schema
+    h.script("</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>");
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":256,"tools":[{"name":"get_weather","strict":true,"input_schema":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city","days"],"additionalProperties":false}}],"messages":[{"role":"user","content":"Weather?"}]}"#,
+    );
+    assert_ne!(status, 200, "{text}");
+    let (status, _) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":256,"output_config":{"format":{"type":"xml"}},"messages":[{"role":"user","content":"Who?"}]}"#,
+    );
+    assert_eq!(status, 400);
 }
 
 /// `thinking_budget_tokens`: a reply whose reasoning reaches the budget gets the family's
