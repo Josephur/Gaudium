@@ -94,6 +94,28 @@ def think_kept(a: ThinkAct, n: Nat) -> Nat:
     case _:
       n
 
+# The tokens the reply has written after a step, from `sent` before it: the token itself when
+# it goes on, the marker's `close` tokens in its place when the reasoning is closed, none when
+# the reply ends.
+def think_sent(a: ThinkAct, sent: Nat, close: Nat) -> Nat:
+  match a:
+    case TaFeed{m}:
+      1n+sent
+    case TaClose{}:
+      Nat.add(close, sent)
+    case TaEnd{}:
+      sent
+
+# What a step writes into the reply (the reference `think_sent` is checked against).
+def think_written(a: ThinkAct, close: Nat) -> Nat:
+  match a:
+    case TaFeed{m}:
+      1n
+    case TaClose{}:
+      close
+    case TaEnd{}:
+      0n
+
 # Helper lemmas over the step (erased before Rust codegen).
 
 def th_in_not_below_not_feed(n: Nat, forced: Bool, fits: Bool) -> {think_is_feed(think_act_in(False{}, n, forced, fits)) == False{} : Bool}:
@@ -116,6 +138,29 @@ def th_in_forced_not_close(below: Bool, n: Nat, fits: Bool) -> {think_is_close(t
     case True{} False{}: {==}
     case False{} True{}: {==}
     case False{} False{}: {==}
+
+# With room for one token or more, what a step writes stays inside the room: the token goes on
+# (one), the marker goes in only where it fits, an end writes nothing. `h` ties `fits` to the
+# room the step was given.
+def th_sent_in_le(
+  below: Bool,
+  n: Nat,
+  forced: Bool,
+  fits: Bool,
+  +c: Nat,
+  +s: Nat,
+  +r: Nat,
+  h: {Nat.is_le(c, 1n+r) == fits : Bool}
+) -> {Nat.is_le(think_sent(think_act_in(below, n, forced, fits), s, c), Nat.add(1n+r, s)) == True{} : Bool}:
+  match below forced fits:
+    case True{} _ _:
+      L.nat_add_le_l(r, s)
+    case False{} True{} _:
+      L.nat_add_le_l(1n+r, s)
+    case False{} False{} True{}:
+      L.nat_add_le_mono(c, 1n+r, s, s, h, L.nat_le_refl(s))
+    case False{} False{} False{}:
+      L.nat_add_le_l(1n+r, s)
 
 # ============================================================================
 # 4. Laws
@@ -173,18 +218,17 @@ def think_never_past_cap(cap, e, c, room, forced):
   %Equal.sym(Bool, Nat.is_lt(Nat.add(cap, e), cap), False{}, G.g_nat_lt_add_r_false(cap, e)) : {think_is_feed(think_act_in(_, Nat.add(cap, e), forced, Nat.is_le(c, room))) == False{} : Bool}
   th_in_not_below_not_feed(Nat.add(cap, e), forced, Nat.is_le(c, room))
 
-# promise: a reasoning token below the cap is kept and counted once
+# promise: a reasoning token below the cap, with room for it and the marker after it and no forced close yet, is kept and counted once
 # catches: a kept reasoning token not counted (the count stays at n, so the cap is never reached)
 law think_below_cap_counted:
   for +n: Nat
   for +d: Nat
   for +c: Nat
   for +room: Nat
-  for +forced: Bool
-  {think_kept(think_act(True{}, n, Nat.add(n, 1n+d), c, room, forced), n) == 1n+n : Nat}
+  {think_kept(think_act(True{}, n, Nat.add(n, 1n+d), c, Nat.add(c, 1n+room), False{}), n) == 1n+n : Nat}
 
-def think_below_cap_counted(n, d, c, room, forced):
-  %Equal.sym(Bool, Nat.is_lt(n, Nat.add(n, 1n+d)), True{}, G.g_nat_lt_add_succ(n, d)) : {think_kept(think_act_in(_, n, forced, Nat.is_le(c, room)), n) == 1n+n : Nat}
+def think_below_cap_counted(n, d, c, room):
+  %Equal.sym(Bool, Nat.is_lt(n, Nat.add(n, 1n+d)), True{}, G.g_nat_lt_add_succ(n, d)) : {think_kept(think_act_in(_, n, False{}, Nat.is_le(c, Nat.add(c, 1n+room))), n) == 1n+n : Nat}
   {==}
 
 # promise: a token of the answer is always kept by the thinking budget and leaves the reasoning count unchanged
@@ -249,3 +293,55 @@ def think_close_at_cap(n, c, e):
   %Equal.sym(Bool, Nat.is_lt(n, n), False{}, G.g_nat_lt_irrefl(n)) : {think_is_close(think_act_in(_, n, False{}, Nat.is_le(c, Nat.add(c, e)))) == True{} : Bool}
   %Equal.sym(Bool, Nat.is_le(c, Nat.add(c, e)), True{}, L.nat_add_le_r(c, e)) : {think_is_close(think_act_in(False{}, n, False{}, _)) == True{} : Bool}
   {==}
+
+# promise: when max_new holds the marker and k + 1 more tokens, the reply may reason for k tokens or its whole budget, whichever is less
+# harm: a max_tokens just above budget_tokens would leave the reply no reasoning at all
+# catches: the cap dropped to 0 whenever max_new is short of the budget, the marker and one answer token
+law think_cap_reserves_one:
+  for +b: Nat
+  for +c: Nat
+  for +k: Nat
+  for +e: Nat
+  {Nat.is_le(Nat.min(b, k), think_cap(b, Nat.add(c, Nat.add(k, 1n+e)), c)) == True{} : Bool}
+
+def think_cap_reserves_one(b, c, k, e):
+  %Equal.sym(Nat, Nat.sub(Nat.add(c, Nat.add(k, 1n+e)), c), Nat.add(k, 1n+e), L.nat_add_sub_cancel_l(c, Nat.add(k, 1n+e))) : {Nat.is_le(Nat.min(b, k), Nat.min(b, _)) == True{} : Bool}
+  G.g_nat_min_le_mono_r(b, k, 1n+e)
+
+# promise: the reply's written-token count after a step is the count before it plus exactly the tokens the step wrote: one for a token kept, the whole marker for a forced close, none for an end
+# harm: a miscounted marker would let the resumed answer run past max_tokens, or cut it short
+# catches: a forced close counted as one token (1n+sent on a close)
+law think_sent_counts_written:
+  for +a: ThinkAct
+  for +s: Nat
+  for +c: Nat
+  {think_sent(a, s, c) == Nat.add(think_written(a, c), s) : Nat}
+
+def think_sent_counts_written(a, s, c):
+  match a:
+    case TaFeed{m}:
+      {==}
+    case TaClose{}:
+      {==}
+    case TaEnd{}:
+      {==}
+
+# promise: a step taken while the reply may still generate a token never counts the reply past what it may generate
+# harm: the resumed answer would be given room past max_tokens and the context it was admitted with
+# catches: the marker plus the dropped token counted on a close (Nat.add(close, 1n+sent))
+law think_sent_within_room:
+  for +t: Bool
+  for +n: Nat
+  for +cap: Nat
+  for +c: Nat
+  for +r: Nat
+  for +s: Nat
+  for +f: Bool
+  {Nat.is_le(think_sent(think_act(t, n, cap, c, 1n+r, f), s, c), Nat.add(1n+r, s)) == True{} : Bool}
+
+def think_sent_within_room(t, n, cap, c, r, s, f):
+  match t:
+    case False{}:
+      L.nat_add_le_l(r, s)
+    case True{}:
+      th_sent_in_le(Nat.is_lt(n, cap), n, f, Nat.is_le(c, 1n+r), c, s, r, {==})

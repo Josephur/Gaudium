@@ -3439,24 +3439,13 @@ fn resumed_report(
     let launches = first.launches + second.launches;
     let mut generated_tokens = first.generated_tokens;
     generated_tokens.extend(second.generated_tokens);
-    let n = generated_tokens.len();
     let mut forks = first.forks;
     forks.extend(second.forks);
-    crate::engine::GenReport {
+    let mut rep = crate::engine::GenReport {
         generated_tokens,
         decode_ms,
-        decode_tok_s: if decode_ms > 0.0 {
-            n.saturating_sub(1) as f64 / decode_ms * 1e3
-        } else {
-            0.0
-        },
         ms_per_step: if launches > 0 {
             decode_ms / launches as f64
-        } else {
-            0.0
-        },
-        tokens_per_launch: if launches > 0 {
-            n.saturating_sub(1) as f64 / launches as f64
         } else {
             0.0
         },
@@ -3469,7 +3458,25 @@ fn resumed_report(
         sample_check_rows: first.sample_check_rows + second.sample_check_rows,
         sample_check_mismatches: first.sample_check_mismatches + second.sample_check_mismatches,
         ..first
-    }
+    };
+    set_token_rates(&mut rep);
+    rep
+}
+
+/// Decode tok/s and tokens per launch from the report's own token list (reported only), for a
+/// report whose tokens the server replaced or joined.
+fn set_token_rates(rep: &mut crate::engine::GenReport) {
+    let n = rep.generated_tokens.len().saturating_sub(1) as f64;
+    rep.decode_tok_s = if rep.decode_ms > 0.0 {
+        n / rep.decode_ms * 1e3
+    } else {
+        0.0
+    };
+    rep.tokens_per_launch = if rep.launches > 0 {
+        n / rep.launches as f64
+    } else {
+        0.0
+    };
 }
 
 /// Puts `job` in the model's lane session (starting the session when it is not running) and
@@ -3641,7 +3648,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         ids: prompt_ids,
         media,
         req_max,
-        ignored,
+        mut ignored,
     } = p;
     let m = &state.models[idx];
     let media_counts: MediaCounts = media.as_ref().map(|md| md.counts()).unwrap_or_default();
@@ -3790,15 +3797,32 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let max_new = budget.max_new().max(1);
     // `thinking_budget_tokens` (the Messages API's `thinking.budget_tokens`): when the reasoning
     // span reaches the budget, the family's end-of-thinking marker is written in its place and
-    // the reply goes on with its answer (`core::think_budget`). A completion has no reasoning
-    // span (its output is its text as generated): the field is reported there as unknown.
+    // the reply goes on with its answer (`core::think_budget`).
+    // A budget that can not be applied is listed in `ignored` with the reason. A completion has
+    // no reasoning span (its output is its text as generated): its parser already reported the
+    // field as unknown.
     let think_close_ids: Vec<i32> = m.tokenizer.encode(&m.format.think_close, true);
-    let think_budget = val
-        .get("thinking_budget_tokens")
-        .filter(|_| !matches!(api, Api::Completion { .. }))
-        .and_then(|v| v.as_u64())
-        .filter(|_| !think_close_ids.is_empty())
-        .map(|b| ThinkBudget::new(b, max_new, think_close_ids.len() as u64));
+    let think_field = match api {
+        Api::Chat | Api::Completion { .. } => "thinking_budget_tokens",
+        Api::Messages { .. } => "thinking.budget_tokens",
+    };
+    let think_budget = match val.get("thinking_budget_tokens").and_then(|v| v.as_u64()) {
+        None => None,
+        Some(_) if matches!(api, Api::Completion { .. }) => None,
+        Some(_) if think_close_ids.is_empty() => {
+            ignored.push(format!(
+                "{think_field} (this model family has no end-of-thinking marker to close the reasoning with)"
+            ));
+            None
+        }
+        Some(_) if !split_reasoning => {
+            ignored.push(format!(
+                "{think_field} (not applied with reasoning_format \"none\": the reasoning is not tracked apart from the content)"
+            ));
+            None
+        }
+        Some(b) => Some(ThinkBudget::new(b, max_new, think_close_ids.len() as u64)),
+    };
     let cancel_flag = Arc::new(AtomicBool::new(false));
     // A streamed request is admitted: its stream begins now, before it waits for the card (the
     // queue, a model load, a lane) and for its prefill, and a keep-alive goes out whenever a
@@ -3941,7 +3965,11 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     // a lane of the model's lane session.
     let mut images = media.map(|md| md.into_tower_inputs());
     // a reply resumed after its thinking budget gives the engine the same images again
-    let images_again = images.clone().filter(|_| think_budget.is_some());
+    let images_again = if think_budget.is_some() {
+        images.clone()
+    } else {
+        None
+    };
     let mut lane_rx: Option<std::sync::mpsc::Receiver<LaneOut>> = None;
     let mut _op = None;
     let (mut engine, hbm_bytes) = if lane_mode {
@@ -4310,7 +4338,9 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         // a reply the thinking budget cut reports the tokens it kept, and ends at its length
         joined.map(|mut rep| {
             if think_cut.get().is_some() || resume.is_some() {
+                // the rest of a launch past the cut was dropped: the rates count the kept tokens
                 rep.generated_tokens = kept.borrow().clone();
+                set_token_rates(&mut rep);
             }
             if think_cut.get().is_some() {
                 rep.stopped_by_eos = false;

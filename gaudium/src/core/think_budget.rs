@@ -3,10 +3,11 @@
 //! A request with a thinking budget (`thinking.budget_tokens` of the Messages API) holds one
 //! [`ThinkBudget`]: each generated token is shown to [`ThinkBudget::step`] before it reaches the
 //! reply, and the step says whether it goes on, whether the end-of-thinking marker takes its
-//! place, or whether the reply ends. The cap, the step and the budget left after the marker all
-//! come from the verified core; this type only holds the counts between steps.
+//! place, or whether the reply ends. The cap, the step, the tokens the reply has written after it
+//! and the budget left after the marker all come from the verified core; this type only holds
+//! the counts between steps.
 
-use crate::verified::{remaining_budget, think_act, think_cap, ThinkAct};
+use crate::verified::{remaining_budget, think_act, think_cap, think_sent, ThinkAct};
 
 /// What to do with one generated token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,22 +52,22 @@ impl ThinkBudget {
     /// span before this token.
     pub fn step(&mut self, in_thought: bool) -> ThinkStep {
         let room = remaining_budget(self.sent, self.max_new);
-        match think_act(
+        let act = think_act(
             in_thought,
             self.kept,
             self.cap,
             self.close_len,
             room,
             self.forced,
-        ) {
+        );
+        self.sent = think_sent(act.clone(), self.sent, self.close_len);
+        match act {
             ThinkAct::TaFeed(n) => {
                 self.kept = n;
-                self.sent = self.sent.saturating_add(1);
                 ThinkStep::Keep
             }
             ThinkAct::TaClose => {
                 self.forced = true;
-                self.sent = self.sent.saturating_add(self.close_len);
                 ThinkStep::Close
             }
             ThinkAct::TaEnd => ThinkStep::End,

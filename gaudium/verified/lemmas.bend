@@ -184,3 +184,13 @@ def g_nat_lt_irrefl(+n: Nat) -> {Nat.is_lt(n, n) == False{} : Bool}:
     case 0n: {==}
     case 1n+np:
       g_nat_lt_irrefl(np)
+
+# `min(b, k) <= min(b, k + j)`: the smaller of b and k grows with k.
+def g_nat_min_le_mono_r(+b: Nat, +k: Nat, j: Nat) -> {Nat.is_le(Nat.min(b, k), Nat.min(b, Nat.add(k, j))) == True{} : Bool}:
+  match b k:
+    case 0n _:
+      L.nat_le_zero(0n)
+    case 1n+bp 0n:
+      L.nat_le_zero(Nat.min(1n+bp, j))
+    case 1n+bp 1n+kp:
+      g_nat_min_le_mono_r(bp, kp, j)

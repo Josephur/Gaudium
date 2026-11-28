@@ -3936,6 +3936,36 @@ fn a_thinking_budget_closes_the_reasoning_and_the_answer_follows() {
     assert_eq!(status, 200, "{}", r.dump());
     assert_eq!(s(&r, &["choices", "0", "finish_reason"]), "length");
     assert_eq!(h.prompts.lock().unwrap().len(), 4);
+
+    // with `reasoning_format: "none"` the budget is not applied, and `ignored` says so
+    h.script(&format!("{thought}\n</think>\n\nshown"));
+    let (status, r) = h.chat(
+        r#","max_tokens":64,"thinking_budget_tokens":4,"reasoning_format":"none""#,
+    );
+    assert_eq!(status, 200, "{}", r.dump());
+    let ignored = at(&r, &["gaudium", "ignored"]).dump();
+    assert!(
+        ignored.contains("thinking_budget_tokens") && ignored.contains("reasoning_format"),
+        "{ignored}"
+    );
+    assert!(s(&r, &["choices", "0", "message", "content"]).contains("shown"));
+    assert_eq!(h.prompts.lock().unwrap().len(), 5);
+}
+
+/// A report whose tokens the server replaced (a thinking-budget cut) or joined gives its rates
+/// from its own token list, not from the engine's count.
+#[test]
+fn replaced_tokens_set_the_reported_rates() {
+    let mut rep = GenReport {
+        generated_tokens: vec![1; 11],
+        decode_ms: 100.0,
+        launches: 2,
+        decode_tok_s: 999.0,
+        tokens_per_launch: 9.0,
+        ..GenReport::default()
+    };
+    super::set_token_rates(&mut rep);
+    assert_eq!((rep.decode_tok_s, rep.tokens_per_launch), (100.0, 5.0));
 }
 
 /// `/v1/messages`: `thinking.budget_tokens` closes the thinking block at the budget; the text
