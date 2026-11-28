@@ -1798,13 +1798,31 @@ d34f2537e2e6aec8  pc_zeroed_rows_never_reused  law pc_zeroed_rows_never_reused :
 d697aad72e376926  pdf_below_within  law pdf_below_within : for + x : Nat for + m : Nat { Bool.and ( pdf_below ( x , m ) , Nat.is_le ( m , x ) ) == False { } : Bool }
 # promise pdf_below_within: a depth or count the limit check lets grow is always below the limit.
 # harm pdf_below_within: hostile nesting could recurse past the stack, or a page tree could yield more pages than configured.
+28724d9a130c7b38  pdf_budget_charge_counts_accepted  law pdf_budget_charge_counts_accepted : for + u : Nat for + n : Nat for + r : Nat { pdf_budget_charge ( u , n , Nat.add ( Nat.add ( u , n ) , r ) ) == pdf_budget_take ( u , n ) : Nat }
+# promise pdf_budget_charge_counts_accepted: a charge that fits is counted in full.
+# harm pdf_budget_charge_counts_accepted: a charge that fits but is not counted would let many small steps run past the cap.
+4361f8a6d0cb020b  pdf_budget_charge_refused_keeps  law pdf_budget_charge_refused_keeps : for + u : Nat for + n : Nat for + m : Nat { Bool.pick ( Nat , pdf_budget_fits ( u , n , m ) , u , pdf_budget_charge ( u , n , m ) ) == u : Nat }
+# promise pdf_budget_charge_refused_keeps: a charge the budget refuses leaves its spend as it was.
+# harm pdf_budget_charge_refused_keeps: a refused charge that filled or reset the budget would refuse the rest of a good document, or let a later charge past the cap.
+124dea063532290f  pdf_budget_charge_within  law pdf_budget_charge_within : for + u : Nat for + d : Nat for + n : Nat { Nat.is_le ( pdf_budget_charge ( u , n , Nat.add ( u , d ) ) , Nat.add ( u , d ) ) == True { } : Bool }
+# promise pdf_budget_charge_within: while a budget is not overspent, no charge, counted or refused, takes its spend past the budget.
+# harm pdf_budget_charge_within: hostile input could make the reader take more steps, or hold more memory, than configured.
 3b94f5a6c2b91292  pdf_budget_inside_accepted  law pdf_budget_inside_accepted : for + u : Nat for + n : Nat for + r : Nat { pdf_budget_fits ( u , n , Nat.add ( Nat.add ( u , n ) , r ) ) == True { } : Bool }
 # promise pdf_budget_inside_accepted: every charge that fits in the bytes the budget has left is accepted.
+572fc7558c1c3f2f  pdf_budget_room_covers  law pdf_budget_room_covers : for + u : Nat for + d : Nat { Nat.is_le ( d , pdf_budget_room ( u , Nat.add ( u , d ) ) ) == True { } : Bool }
+# promise pdf_budget_room_covers: the room a budget leaves covers everything it has left.
+# harm pdf_budget_room_covers: a room smaller than what is left would refuse decodes the budget still holds (every compressed PDF, with a room of one byte).
 e1c1ab8c97071c81  pdf_budget_room_fits  law pdf_budget_room_fits : for + u : Nat for + d : Nat for + r : Nat { pdf_budget_fits ( u , Nat.sub ( pdf_budget_room ( u , Nat.add ( u , d ) ) , r ) , Nat.add ( u , d ) ) == True { } : Bool }
 # promise pdf_budget_room_fits: while the budget is not overspent, every decode no larger than the room it leaves is accepted.
+7dd59611a763685d  pdf_budget_spent_counts  law pdf_budget_spent_counts : for + f : Nat for + d : Nat { pdf_budget_spent ( f , Nat.add ( f , d ) ) == d : Nat }
+# promise pdf_budget_spent_counts: what a lexer charged since it started is exactly what its budget spent since then.
+# harm pdf_budget_spent_counts: an undercount would let the objects of a parse go uncharged; an overcount would charge the earlier spend again and refuse good files.
 7928f2e7f0dd417f  pdf_budget_take_counts_all  law pdf_budget_take_counts_all : for + u : Nat for + n : Nat { Nat.sub ( pdf_budget_take ( u , n ) , u ) == n : Nat }
 # promise pdf_budget_take_counts_all: a decode adds exactly its bytes to the bytes spent, no fewer.
 # harm pdf_budget_take_counts_all: an undercounted spend would let many streams together decode past the budget (a zip bomb split over streams).
+336cd157e19ca00f  pdf_budget_take_keeps_spent  law pdf_budget_take_keeps_spent : for + u : Nat for + n : Nat { Nat.is_le ( u , pdf_budget_take ( u , n ) ) == True { } : Bool }
+# promise pdf_budget_take_keeps_spent: a charge never lowers what a budget has spent, a charge of nothing included.
+# harm pdf_budget_take_keeps_spent: a zero charge (an empty stream, an empty stage) that reset the spend would reopen a bomb split over streams.
 eb66daee20514a73  pdf_budget_within  law pdf_budget_within : for + u : Nat for + n : Nat for + m : Nat { Bool.and ( pdf_budget_fits ( u , n , m ) , Nat.is_lt ( m , pdf_budget_take ( u , n ) ) ) == False { } : Bool }
 # promise pdf_budget_within: a decode the budget accepts never takes the bytes spent past the budget.
 # harm pdf_budget_within: a zip bomb could make the reader hold more decompressed bytes than configured.
