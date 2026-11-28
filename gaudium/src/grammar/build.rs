@@ -8,17 +8,29 @@
 //! annotations (`title`, `description`, `default`, `examples`, ...). Any other keyword is refused
 //! with its name and place. The reply follows the schema's property order; optional properties
 //! may be left out.
+//!
+//! A schema is a client's input: everything it makes the compiler build is charged to one
+//! budget of [`MAX_GRAMMAR_BYTES`] (the verified `gram_budget_ok`), and a schema past it, or one
+//! whose alternatives could not all be followed (`gram_alive_ok`), is refused before any token.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
-use super::{Grammar, Node, NodeId, ObjDef, Pat, PropDef, TrieNode, FINISH, NO_LEAF};
+use super::{Grammar, Node, NodeId, ObjDef, Pat, PropDef, TrieNode, FINISH, MAX_ALIVE, NO_LEAF};
 use crate::json::{quote_json, JsonValue};
 use crate::verified;
 
 /// Schema nesting levels (objects and arrays inside each other) a request may declare.
 pub const MAX_SCHEMA_DEPTH: u64 = 32;
-/// Grammar nodes a request may compile to.
-pub const MAX_NODES: usize = 200_000;
+/// Schemas the compiler may be inside at once (`anyOf`, `allOf`, `$ref`, containers): bounds
+/// its recursion, so a chain of references can not exhaust the thread's stack.
+pub const MAX_SCHEMA_LEVELS: u64 = 128;
+/// Bytes of grammar a request may compile to: nodes, trie nodes, literal bytes and the key
+/// tables of objects.
+pub const MAX_GRAMMAR_BYTES: u64 = 32 << 20;
+/// The parameter-block form's tags: a value ends at the first of them.
+pub const PARAM_CLOSE: &str = "</parameter>";
+pub const FUNCTION_CLOSE: &str = "</function>";
 
 /// Keywords that annotate and constrain nothing.
 const ANNOTATIONS: &[&str] = &[
@@ -83,7 +95,15 @@ pub fn reply(answer: Option<&Answer>, tools: &[ToolDef], tags: &CallTags) -> Res
         .transpose()?;
     let root = match (answer, calls) {
         (Some(a), calls) => {
+            // beside tools, the reply parser splits the answer at the tool tag's opening, even
+            // inside a JSON string: the answer's strings may not hold it
+            b.forbid = if calls.is_some() {
+                forbid_list(&[tags.open.as_str()])?
+            } else {
+                Vec::new()
+            };
             let doc = b.answer_doc(a)?;
+            b.forbid.clear();
             match calls {
                 Some(body) => {
                     // the answer, or one or more calls
@@ -123,19 +143,82 @@ pub fn reply(answer: Option<&Answer>, tools: &[ToolDef], tags: &CallTags) -> Res
 
 /// The grammar of one JSON document of `schema` (tests and tools).
 pub fn schema_doc(schema: &JsonValue) -> Result<Grammar, String> {
+    schema_doc_within(schema, MAX_GRAMMAR_BYTES)
+}
+
+/// [`schema_doc`] with a compile budget of `cap` bytes.
+pub fn schema_doc_within(schema: &JsonValue, cap: u64) -> Result<Grammar, String> {
     let mut b = Builder::new();
+    b.cap = cap.min(u64::MAX - 1);
     let root = b.answer_doc(&Answer::Schema(schema.clone()))?;
     b.finish(root)
+}
+
+/// The bytes a grammar was charged to the compile budget.
+pub fn grammar_bytes(schema: &JsonValue) -> Result<u64, String> {
+    let mut b = Builder::new();
+    let root = b.answer_doc(&Answer::Schema(schema.clone()))?;
+    let used = b.used;
+    b.finish(root)?;
+    Ok(used)
+}
+
+/// Patterns a JSON string may not hold. Each must be non-empty, shorter than 256 bytes, and
+/// hold no quote or backslash and some byte that JSON never writes outside a string: then every
+/// occurrence in a JSON text lies inside one string's raw bytes, where `Node::Str` looks for it.
+fn forbid_list(tags: &[&str]) -> Result<Vec<Pat>, String> {
+    let outside = |c: u8| b"{}[],: \t\n\r0123456789-+.eEtrufalsn".contains(&c);
+    let mut out: Vec<Pat> = Vec::new();
+    for t in tags {
+        let b = t.as_bytes();
+        let ok = !b.is_empty()
+            && b.len() < 256
+            && !b.iter().any(|&c| c == b'"' || c == b'\\')
+            && b.iter().any(|&c| !outside(c));
+        if !ok {
+            return Err(format!(
+                "this model's tag '{t}' can not be kept out of the JSON strings of its replies"
+            ));
+        }
+        if !out.iter().any(|p| p.bytes == b) {
+            out.push(Pat::new(b));
+        }
+    }
+    debug_assert!(out.len() <= 3);
+    Ok(out)
+}
+
+/// The heap and inline bytes of a node, for the compile budget.
+fn node_bytes(n: &Node) -> u64 {
+    let heap = match n {
+        Node::Lit(b) => b.len(),
+        Node::Seq(c) | Node::Alt(c) => 4 * c.len(),
+        Node::Raw { term, forbid } => 5 * (term.bytes.len() + forbid.iter().map(|p| p.bytes.len()).sum::<usize>()),
+        Node::Str { forbid } => 5 * forbid.iter().map(|p| p.bytes.len()).sum::<usize>(),
+        Node::Text { open, .. } => 5 * open.bytes.len(),
+        _ => 0,
+    };
+    (std::mem::size_of::<Node>() + heap) as u64
 }
 
 struct Builder {
     nodes: Vec<Node>,
     tries: Vec<TrieNode>,
     objs: Vec<ObjDef>,
-    any: Option<NodeId>,
-    str_node: NodeId,
+    /// Bytes charged to the compile budget (below `u64::MAX`). A refused charge leaves `used`
+    /// past `cap`, where every further charge is refused (`gram_budget_over_refused`): the
+    /// builder then adds nothing more, returns node 0, and `finish` refuses the grammar.
+    used: u64,
+    cap: u64,
+    /// Schemas the compiler is inside now.
+    levels: u64,
+    /// What the strings compiled now may not hold, and the string and any-value nodes compiled
+    /// for each such list.
+    forbid: Vec<Pat>,
+    strs: HashMap<Vec<Vec<u8>>, NodeId>,
+    anys: HashMap<Vec<Vec<u8>>, NodeId>,
     /// The schema `$ref`s resolve in, and the node of every pointer compiled so far.
-    root_schema: Option<JsonValue>,
+    root_schema: Option<Rc<JsonValue>>,
     refs: HashMap<String, NodeId>,
 }
 
@@ -143,80 +226,169 @@ fn kw_err(path: &str, kw: &str, why: &str) -> String {
     format!("response schema: '{kw}' at {path} {why}")
 }
 
+fn budget_err() -> String {
+    format!(
+        "response schema: compiles to more than the {} MiB of grammar a request may use",
+        MAX_GRAMMAR_BYTES >> 20
+    )
+}
+// (a test's smaller cap reports the same message)
+
 impl Builder {
     fn new() -> Self {
-        let mut b = Self {
+        Self {
             nodes: Vec::new(),
             tries: Vec::new(),
             objs: Vec::new(),
-            any: None,
-            str_node: 0,
+            used: 0,
+            cap: MAX_GRAMMAR_BYTES,
+            levels: 0,
+            forbid: Vec::new(),
+            strs: HashMap::new(),
+            anys: HashMap::new(),
             root_schema: None,
             refs: HashMap::new(),
-        };
-        b.str_node = b.push(Node::Str);
-        b
+        }
+    }
+
+    /// Charges `bytes` to the compile budget; `false` (and over from then on) past it.
+    fn charge(&mut self, bytes: u64) -> bool {
+        if verified::gram_budget_ok(self.used, bytes, self.cap) {
+            self.used += bytes;
+            return true;
+        }
+        self.used = self.cap + 1;
+        false
+    }
+
+    /// A charge was refused.
+    fn over(&self) -> bool {
+        !verified::gram_budget_ok(self.used, 0, self.cap)
     }
 
     fn push(&mut self, n: Node) -> NodeId {
+        if !self.charge(node_bytes(&n)) {
+            return 0;
+        }
         self.nodes.push(n);
         (self.nodes.len() - 1) as NodeId
     }
 
-    fn finish(self, root: NodeId) -> Result<Grammar, String> {
-        if self.nodes.len() > MAX_NODES {
-            return Err(format!(
-                "response schema: compiles to {} grammar nodes, more than the {MAX_NODES} a request may use",
-                self.nodes.len()
-            ));
+    fn finish(mut self, root: NodeId) -> Result<Grammar, String> {
+        if self.over() || self.nodes.is_empty() {
+            return Err(budget_err());
         }
+        self.check_alternatives()?;
+        self.nodes.shrink_to_fit();
+        self.tries.shrink_to_fit();
         Ok(Grammar {
             nodes: self.nodes,
             tries: self.tries,
             objs: self.objs,
             root,
-            str_node: self.str_node,
         })
     }
 
     fn check_size(&self) -> Result<(), String> {
-        if self.nodes.len() > MAX_NODES {
-            return Err(format!(
-                "response schema: compiles to more than the {MAX_NODES} grammar nodes a request may use"
-            ));
+        if self.over() {
+            return Err(budget_err());
         }
         Ok(())
     }
 
-    /// A trie over `lits`, each ending with its leaf value.
-    fn trie(&mut self, lits: &[(Vec<u8>, u32)]) -> u32 {
-        let root = self.tries.len() as u32;
+    /// Every set of alternatives one step enters at once (an `anyOf`, with the `anyOf`s and
+    /// references its branches lead to without a byte in between) is one the automaton can
+    /// follow (`gram_alive_ok` with `MAX_ALIVE`), and no reference leads back to itself without
+    /// a byte in between (that loop would be entered without end).
+    fn check_alternatives(&self) -> Result<(), String> {
+        let n = self.nodes.len();
+        // 0: not seen, 1: on the path, 2: done; width saturates past the cap
+        let mut state = vec![0u8; n];
+        let mut width = vec![0u64; n];
+        let cap = MAX_ALIVE + 1;
+        for start in 0..n {
+            if state[start] != 0 || !matches!(self.nodes[start], Node::Alt(_)) {
+                continue;
+            }
+            let mut path: Vec<(usize, usize)> = vec![(start, 0)];
+            state[start] = 1;
+            while let Some(&mut (id, ref mut next)) = path.last_mut() {
+                let Node::Alt(bs) = &self.nodes[id] else {
+                    unreachable!("only alternatives are walked")
+                };
+                if let Some(&b) = bs.get(*next) {
+                    *next += 1;
+                    let b = b as usize;
+                    if matches!(self.nodes[b], Node::Alt(_)) {
+                        match state[b] {
+                            0 => {
+                                state[b] = 1;
+                                path.push((b, 0));
+                            }
+                            1 => {
+                                return Err("response schema: a reference leads back to itself without a JSON value in between".into())
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                let wd = bs
+                    .iter()
+                    .map(|&b| match self.nodes[b as usize] {
+                        Node::Alt(_) => width[b as usize],
+                        _ => 1,
+                    })
+                    .fold(0u64, |a, x| a.saturating_add(x).min(cap));
+                if !verified::gram_alive_ok(wd, MAX_ALIVE) {
+                    return Err(format!(
+                        "response schema: an anyOf (with the anyOfs and references its branches lead to) offers more than the {MAX_ALIVE} alternatives a reply can follow at once"
+                    ));
+                }
+                width[id] = wd;
+                state[id] = 2;
+                path.pop();
+            }
+        }
+        Ok(())
+    }
+
+    /// A new trie node, charged to the budget (`None` past it).
+    fn trie_node(&mut self) -> Option<u32> {
+        if !self.charge(std::mem::size_of::<TrieNode>() as u64 + 8) {
+            return None;
+        }
         self.tries.push(TrieNode {
             children: Vec::new(),
             leaf: NO_LEAF,
         });
+        Some((self.tries.len() - 1) as u32)
+    }
+
+    /// The trie node under `cur` for byte `c`, made when missing.
+    fn trie_child(&mut self, cur: u32, c: u8) -> Option<u32> {
+        if let Some(n) = self.tries[cur as usize].child(c) {
+            return Some(n);
+        }
+        let n = self.trie_node()?;
+        let kids = &mut self.tries[cur as usize].children;
+        let at = kids.partition_point(|e| e.0 < c);
+        kids.insert(at, (c, n));
+        Some(n)
+    }
+
+    /// A trie over `lits`, each ending with its leaf value.
+    fn trie(&mut self, lits: &[(Vec<u8>, u32)]) -> u32 {
+        let Some(root) = self.trie_node() else {
+            return 0;
+        };
         for (bytes, leaf) in lits {
             let mut cur = root;
             for &c in bytes {
-                let found = self.tries[cur as usize]
-                    .children
-                    .iter()
-                    .find(|e| e.0 == c)
-                    .map(|e| e.1);
-                cur = match found {
-                    Some(n) => n,
-                    None => {
-                        let n = self.tries.len() as u32;
-                        self.tries.push(TrieNode {
-                            children: Vec::new(),
-                            leaf: NO_LEAF,
-                        });
-                        let kids = &mut self.tries[cur as usize].children;
-                        let at = kids.partition_point(|e| e.0 < c);
-                        kids.insert(at, (c, n));
-                        n
-                    }
+                let Some(n) = self.trie_child(cur, c) else {
+                    return root;
                 };
+                cur = n;
             }
             // a literal listed twice keeps its first leaf
             if self.tries[cur as usize].leaf == NO_LEAF {
@@ -224,6 +396,31 @@ impl Builder {
             }
         }
         root
+    }
+
+    /// `bytes` hold none of the strings' forbidden patterns.
+    fn clean(&self, bytes: &[u8]) -> bool {
+        !self
+            .forbid
+            .iter()
+            .any(|p| bytes.windows(p.bytes.len()).any(|w| w == p.bytes.as_slice()))
+    }
+
+    fn forbid_key(&self) -> Vec<Vec<u8>> {
+        self.forbid.iter().map(|p| p.bytes.clone()).collect()
+    }
+
+    /// A JSON string (holding none of the forbidden patterns).
+    fn str_node(&mut self) -> NodeId {
+        let key = self.forbid_key();
+        if let Some(&n) = self.strs.get(&key) {
+            return n;
+        }
+        let n = self.push(Node::Str {
+            forbid: self.forbid.clone(),
+        });
+        self.strs.insert(key, n);
+        n
     }
 
     fn lit(&mut self, s: &str) -> NodeId {
@@ -243,14 +440,21 @@ impl Builder {
         self.push(Node::Switch(t))
     }
 
+    /// An object with free keys, every value of node `value`.
+    fn map(&mut self, value: NodeId) -> NodeId {
+        let key = self.str_node();
+        self.push(Node::Map { key, value })
+    }
+
     /// Any JSON value (JSON mode).
     fn any(&mut self) -> NodeId {
-        if let Some(a) = self.any {
+        let key = self.forbid_key();
+        if let Some(&a) = self.anys.get(&key) {
             return a;
         }
         let a = self.push(Node::Alt(Vec::new()));
-        self.any = Some(a);
-        let map = self.push(Node::Map { value: a });
+        self.anys.insert(key, a);
+        let map = self.map(a);
         let arr = self.push(Node::Array {
             items: a,
             min: 0,
@@ -258,20 +462,27 @@ impl Builder {
         });
         let num = self.push(Node::Num { integer: false });
         let words = self.literals(&["true".into(), "false".into(), "null".into()]);
-        let s = self.str_node;
-        self.nodes[a as usize] = Node::Alt(vec![map, arr, s, num, words]);
+        let s = self.str_node();
+        if !self.over() {
+            self.nodes[a as usize] = Node::Alt(vec![map, arr, s, num, words]);
+        }
         a
+    }
+
+    /// Starts compiling the schema `s`, the root its `$ref`s resolve in.
+    fn set_root(&mut self, s: &JsonValue) {
+        self.root_schema = Some(Rc::new(s.clone()));
+        self.refs.clear();
     }
 
     fn answer_doc(&mut self, a: &Answer) -> Result<NodeId, String> {
         let value = match a {
             Answer::JsonObject => {
                 let any = self.any();
-                self.push(Node::Map { value: any })
+                self.map(any)
             }
             Answer::Schema(s) => {
-                self.root_schema = Some(s.clone());
-                self.refs.clear();
+                self.set_root(s);
                 self.value(s, "#", 0)?
             }
         };
@@ -283,6 +494,20 @@ impl Builder {
     /// The node of a JSON value of `schema` at `path`, `depth` containers deep.
     fn value(&mut self, schema: &JsonValue, path: &str, depth: u64) -> Result<NodeId, String> {
         self.check_size()?;
+        if !verified::gram_push_ok(self.levels, MAX_SCHEMA_LEVELS) {
+            return Err(format!(
+                "response schema: passes through more than {MAX_SCHEMA_LEVELS} schemas (anyOf, allOf, $ref, objects and arrays) at {path}"
+            ));
+        }
+        self.levels += 1;
+        let r = self.value_in(schema, path, depth);
+        self.levels -= 1;
+        let n = r?;
+        self.check_size()?;
+        Ok(n)
+    }
+
+    fn value_in(&mut self, schema: &JsonValue, path: &str, depth: u64) -> Result<NodeId, String> {
         let obj = match schema {
             JsonValue::Bool(true) => return Ok(self.any()),
             JsonValue::Bool(false) => {
@@ -335,6 +560,13 @@ impl Builder {
             let Some(list) = any_of.as_array().filter(|l| !l.is_empty()) else {
                 return Err(kw_err(path, "anyOf", "must be a non-empty array"));
             };
+            if !verified::gram_alive_ok(list.len() as u64, MAX_ALIVE) {
+                return Err(kw_err(
+                    path,
+                    "anyOf",
+                    &format!("lists more than the {MAX_ALIVE} alternatives a reply can follow at once"),
+                ));
+            }
             let mut alts = Vec::with_capacity(list.len());
             for (i, s) in list.iter().enumerate() {
                 alts.push(self.value(s, &format!("{path}/anyOf/{i}"), depth)?);
@@ -367,6 +599,12 @@ impl Builder {
             }
         }
         if has("enum") || has("const") {
+            // a literal is checked against its type only: any other constraint beside it is
+            // refused rather than left unchecked
+            let lit = if has("enum") { "enum" } else { "const" };
+            if let Some(k) = others(&["enum", "const", "type"]) {
+                return Err(kw_err(path, k, &format!("can not stand beside '{lit}'")));
+            }
             let values: Vec<JsonValue> = if let Some(c) = get("const") {
                 if has("enum") {
                     return Err(kw_err(path, "const", "can not stand beside 'enum'"));
@@ -378,13 +616,22 @@ impl Builder {
                     _ => return Err(kw_err(path, "enum", "must be a non-empty array")),
                 }
             };
-            let kept: Vec<String> = values
+            let typed: Vec<String> = values
                 .iter()
                 .filter(|v| types.is_empty() || types.iter().any(|t| type_of_value(t, v)))
                 .map(JsonValue::dump)
                 .collect();
+            if typed.is_empty() {
+                return Err(kw_err(path, lit, "has no value of the schema's type"));
+            }
+            let kept: Vec<String> = typed.into_iter().filter(|v| self.clean(v.as_bytes())).collect();
             if kept.is_empty() {
-                return Err(kw_err(path, "enum", "has no value of the schema's type"));
+                return Err(kw_err(path, lit, "has only values that hold this model's tool tags"));
+            }
+            for v in &kept {
+                if !self.charge(v.len() as u64) {
+                    return Err(budget_err());
+                }
             }
             return Ok(self.literals(&kept));
         }
@@ -406,7 +653,7 @@ impl Builder {
             let n = match t.as_str() {
                 "object" => self.object(schema, path, depth)?,
                 "array" => self.array(schema, path, depth)?,
-                "string" => self.str_node,
+                "string" => self.str_node(),
                 // `number` admits every integer, so the pair is one number
                 "number" | "integer" if numeric => continue,
                 "number" | "integer" => {
@@ -467,7 +714,7 @@ impl Builder {
                     ));
                 }
                 let value = self.value(extra, &format!("{path}/additionalProperties"), depth)?;
-                return Ok(self.push(Node::Map { value }));
+                return Ok(self.map(value));
             }
             Some(_) => {
                 return Err(kw_err(path, "additionalProperties", "must be a boolean or a schema"))
@@ -477,7 +724,7 @@ impl Builder {
         if props.is_empty() && !closed {
             // an object of free properties
             let any = self.any();
-            return Ok(self.push(Node::Map { value: any }));
+            return Ok(self.map(any));
         }
         let mut defs = Vec::with_capacity(props.len());
         for (k, s) in props {
@@ -488,23 +735,68 @@ impl Builder {
             });
         }
         let n = defs.len();
-        let mut keys = Vec::with_capacity(n + 1);
-        let mut close_ok = Vec::with_capacity(n + 1);
-        for p in 0..=n {
-            close_ok.push(defs[p..].iter().all(|d| !d.required));
-            if p == n {
-                keys.push(None);
-                continue;
+        // per position: no required property from it on, and the last property that may come
+        // next (the next required one, else the last)
+        let mut close_ok = vec![true; n + 1];
+        let mut last = vec![0u32; n];
+        let mut next_req = None;
+        for p in (0..n).rev() {
+            if defs[p].required {
+                next_req = Some(p as u32);
             }
-            let last = (p..n).find(|&i| defs[i].required).unwrap_or(n - 1);
-            let lits: Vec<(Vec<u8>, u32)> = (p..=last)
-                .map(|i| (quote_json(&props[i].0).into_bytes(), i as u32))
-                .collect();
-            keys.push(Some(self.trie(&lits)));
+            close_ok[p] = close_ok[p + 1] && !defs[p].required;
+            last[p] = next_req.unwrap_or(n as u32 - 1);
+        }
+        let table = 4 * n as u64 + 4 * n as u64 + (n as u64 + 1) + (std::mem::size_of::<PropDef>() * n) as u64;
+        if !self.charge(table) {
+            return Err(budget_err());
+        }
+        // one trie of every quoted key, its leaves the property indices; each node lists the
+        // indices below it, in increasing order (each key adds its index once per byte)
+        let Some(root) = self.trie_node() else {
+            return Err(budget_err());
+        };
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new()];
+        for (i, (k, _)) in props.iter().enumerate() {
+            let q = quote_json(k);
+            if !self.clean(q.as_bytes()) {
+                return Err(kw_err(path, "properties", &format!("names '{k}', which holds this model's tool tags")));
+            }
+            if !self.charge(4 * (q.len() as u64 + 1)) {
+                return Err(budget_err());
+            }
+            let mut cur = root;
+            lists[0].push(i as u32);
+            for &c in q.as_bytes() {
+                let Some(next) = self.trie_child(cur, c) else {
+                    return Err(budget_err());
+                };
+                cur = next;
+                let at = (cur - root) as usize;
+                if at >= lists.len() {
+                    lists.resize(at + 1, Vec::new());
+                }
+                lists[at].push(i as u32);
+            }
+            if self.tries[cur as usize].leaf == NO_LEAF {
+                self.tries[cur as usize].leaf = i as u32;
+            }
+        }
+        let count = self.tries.len() - root as usize;
+        lists.resize(count, Vec::new());
+        let mut spans = Vec::with_capacity(count);
+        let mut idx = Vec::new();
+        for l in lists {
+            let a = idx.len() as u32;
+            idx.extend(l);
+            spans.push((a, idx.len() as u32));
         }
         self.objs.push(ObjDef {
             props: defs,
-            keys,
+            keys: root,
+            spans,
+            idx,
+            last,
             close_ok,
         });
         Ok(self.push(Node::Object((self.objs.len() - 1) as u32)))
@@ -541,26 +833,23 @@ impl Builder {
         let Some(root) = self.root_schema.clone() else {
             return Err(kw_err(path, "$ref", "has no schema to resolve in"));
         };
-        let target = if r == "#" {
-            root.clone()
-        } else {
+        let mut target: &JsonValue = &root;
+        if r != "#" {
             let Some(rest) = r.strip_prefix("#/") else {
                 return Err(kw_err(path, "$ref", &format!("'{r}' is not a local reference ('#/$defs/...')")));
             };
-            let mut cur = &root;
             for part in rest.split('/') {
                 let key = part.replace("~1", "/").replace("~0", "~");
-                cur = match cur.get(&key) {
+                target = match target.get(&key) {
                     Some(c) => c,
                     None => return Err(kw_err(path, "$ref", &format!("'{r}' points at nothing"))),
                 };
             }
-            cur.clone()
-        };
+        }
         // a placeholder first, so a recursive reference finds itself
         let slot = self.push(Node::Alt(Vec::new()));
         self.refs.insert(r.to_string(), slot);
-        let n = self.value(&target, r, depth)?;
+        let n = self.value(target, r, depth)?;
         self.nodes[slot as usize] = Node::Alt(vec![n]);
         Ok(slot)
     }
@@ -570,15 +859,32 @@ impl Builder {
     fn call_body(&mut self, tools: &[ToolDef], tags: &CallTags) -> Result<NodeId, String> {
         let mut lits = Vec::with_capacity(tools.len());
         for t in tools {
-            let cont = match tags.form {
-                CallForm::Params => self.params_call(t, tags)?,
-                CallForm::Json => self.json_call(t, tags)?,
+            // what the reply parser ends a call's name, and the strings of its arguments, at
+            self.forbid = match tags.form {
+                CallForm::Params => forbid_list(&[PARAM_CLOSE, FUNCTION_CLOSE, tags.close.as_str()])?,
+                CallForm::Json => forbid_list(&[tags.close.as_str()])?,
             };
             let name = match tags.form {
                 CallForm::Params => format!("{}>\n", t.name),
                 CallForm::Json => quote_json(&t.name),
             };
-            lits.push((name.into_bytes(), cont));
+            let bad_name = match tags.form {
+                CallForm::Params => t.name.contains(['>', '\n']),
+                CallForm::Json => false,
+            };
+            if bad_name || !self.clean(name.as_bytes()) || !self.charge(name.len() as u64) {
+                self.forbid.clear();
+                return Err(format!(
+                    "tool '{}': its name can not be written in this model's call form",
+                    t.name
+                ));
+            }
+            let cont = match tags.form {
+                CallForm::Params => self.params_call(t, tags),
+                CallForm::Json => self.json_call(t, tags),
+            };
+            self.forbid.clear();
+            lits.push((name.into_bytes(), cont?));
         }
         let sw = self.trie(&lits);
         let names = self.push(Node::Switch(sw));
@@ -613,11 +919,22 @@ impl Builder {
         };
         let path = format!("tool '{}' parameters", t.name);
         let props = tool_props(schema, &path)?;
-        self.root_schema = Some(schema.clone());
-        self.refs.clear();
+        // the optional parameters before the next required one (or the end) are all open at
+        // once after a parameter, each one stack of the automaton, with the end beside them
+        let mut run = 0u64;
+        for (_, _, required) in &props {
+            run = if *required { 0 } else { run + 1 };
+            if !verified::gram_alive_ok(run + 1, MAX_ALIVE) {
+                return Err(format!(
+                    "{path}: more than {} optional parameters in a row can not be held in this model's call form (make some required, or group them in an object parameter)",
+                    MAX_ALIVE - 1
+                ));
+            }
+        }
+        self.set_root(schema);
         let mut parts = Vec::with_capacity(props.len() + 1);
         for (k, s, required) in props {
-            if k.contains('>') || k.contains('\n') {
+            if k.contains('>') || k.contains('\n') || !self.clean(k.as_bytes()) {
                 return Err(format!(
                     "{path}: the property name '{k}' can not be written in this model's call form"
                 ));
@@ -657,6 +974,9 @@ impl Builder {
                 .filter(|v| !v.contains("</"))
                 .map(|v| format!("{v}{close}"))
                 .collect();
+            if !self.charge(texts.iter().map(|t| t.len() as u64).sum()) {
+                return Err(budget_err());
+            }
             if texts.is_empty() {
                 return Err(format!("{path}: the enum has no string value this call form can write"));
             }
@@ -665,8 +985,8 @@ impl Builder {
         // the string schema itself admits every string: only its keywords are checked
         self.value(s, path, 1)?;
         let raw = self.push(Node::Raw {
-            term: Pat::new(b"</parameter>"),
-            forbid: vec![Pat::new(b"</function>"), Pat::new(tags.close.as_bytes())],
+            term: Pat::new(PARAM_CLOSE.as_bytes()),
+            forbid: vec![Pat::new(FUNCTION_CLOSE.as_bytes()), Pat::new(tags.close.as_bytes())],
         });
         let nl = self.lit("\n");
         Ok(self.seq(vec![raw, nl]))
@@ -678,13 +998,12 @@ impl Builder {
             Some(schema) => {
                 let path = format!("tool '{}' parameters", t.name);
                 tool_props(schema, &path)?;
-                self.root_schema = Some(schema.clone());
-                self.refs.clear();
+                self.set_root(schema);
                 self.value(schema, &path, 0)?
             }
             None => {
                 let any = self.any();
-                self.push(Node::Map { value: any })
+                self.map(any)
             }
         };
         let mut parts = Vec::new();

@@ -18,7 +18,7 @@ use super::outparse::{CallStyle, OutputFormat};
 use crate::grammar::build::{self, Answer, CallForm, CallTags, ToolDef};
 use crate::grammar::constraint::Plan;
 use crate::grammar::vocab::TokenTable;
-use crate::grammar::Pat;
+use crate::grammar::{Pat, Work, MAX_WORK};
 use crate::json::JsonValue;
 use crate::tokenizer::Tokenizer;
 
@@ -147,24 +147,28 @@ pub fn plan(
             .then(|| (format.think_open.clone(), format.think_close.clone())),
     };
     let grammar = build::reply(req.answer.as_ref(), &req.tools, &tags)?;
+    let mut w = Work::new(MAX_WORK);
     let start = grammar
-        .start()
-        .and_then(|c| grammar.step_bytes(&c, prompt.forced_prefix.as_bytes()))
-        .ok_or_else(|| {
-            format!(
-                "{}: the forced tool call's opening does not fit the reply's format",
-                req.label
-            )
-        })?;
-    Ok(Arc::new(Plan {
+        .start_in(&mut w)
+        .and_then(|c| grammar.step_bytes_in(&c, prompt.forced_prefix.as_bytes(), &mut w));
+    if w.exhausted() {
+        return Err(format!("{}: the reply's format takes too many automaton steps to start", req.label));
+    }
+    let start = start.ok_or_else(|| {
+        format!(
+            "{}: the forced tool call's opening does not fit the reply's format",
+            req.label
+        )
+    })?;
+    Ok(Arc::new(Plan::new(
         grammar,
         vocab,
-        think_close: prompt
+        prompt
             .reasoning_open
             .then(|| Pat::new(format.think_close.as_bytes())),
         start,
-        label: req.label.clone(),
-    }))
+        req.label.clone(),
+    )))
 }
 
 /// The reply may open the model's reasoning itself: the prompt neither opened it (the reply
@@ -282,7 +286,7 @@ mod tests {
         let plan = plan(&r, &p, &f, Arc::new(TokenTable::new(bytes, kinds))).unwrap();
         let mut c = Constraint::begin(plan);
         for b in "<parameter=n>\n7\n</parameter>\n</function>\n</tool_call>".bytes() {
-            assert!(c.mask().has(b as u32), "{}", b as char);
+            assert!(c.mask().unwrap().has(b as u32), "{}", b as char);
             c.commit(b as i32).unwrap();
         }
         assert!(c.complete());
@@ -328,5 +332,122 @@ mod tests {
         };
         let t = Arc::new(TokenTable::new(vec![b"a".to_vec()], vec![crate::grammar::vocab::Kind::Text]));
         assert!(plan(&r, &p, &f, t).unwrap_err().contains("can not be held"));
+    }
+
+    /// For replies the grammar accepts (random walks over adversarial pieces: tags inside
+    /// strings, escapes, numbers at the exponent limit), what the reply parser extracts is valid:
+    /// every call's arguments against its tool's schema, and an answer without calls against the
+    /// answer's schema. Text is fed in random splits, as a stream would be.
+    #[test]
+    fn what_the_parser_extracts_from_an_accepted_reply_is_valid() {
+        use super::super::outparse::OutputParser;
+        use crate::grammar::tests::validates;
+        let answer = r#"{"type":"object","properties":{"a":{"type":"string"},"k":{"type":"array","items":{"type":"number"},"maxItems":3},
+            "m":{"type":"object","additionalProperties":{"type":"string"}}},"required":["a"],"additionalProperties":false}"#;
+        let get = r#"{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"],"additionalProperties":false}"#;
+        let put = r#"{"type":"object","properties":{"o":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":false},
+            "s":{"type":"string"},"x":{"type":"number"}},"required":["o"],"additionalProperties":false}"#;
+        let tools = format!(
+            r#"[{{"type":"function","function":{{"name":"get","strict":true,"parameters":{get}}}}},
+                {{"type":"function","function":{{"name":"put","strict":true,"parameters":{put}}}}}]"#
+        );
+        let p = prompt(Some(&tools));
+        let body = parse_json(&format!(
+            r#"{{"response_format":{{"type":"json_schema","json_schema":{{"name":"r","schema":{answer}}}}}}}"#
+        ))
+        .unwrap();
+        let r = request(&body, &p).unwrap().unwrap();
+        let f = OutputFormat::default();
+        let plan = c_plan(&r, &p, &f);
+        let g = &plan.grammar;
+        let answer = parse_json(answer).unwrap();
+        let schemas = [("get", parse_json(get).unwrap()), ("put", parse_json(put).unwrap())];
+        let pieces: &[&str] = &[
+            "{", "}", "[", "]", "\"", ",", ":", " ", "\n", "\\", "\\n", "\\u003c", "a", "b", "k", "m",
+            "o", "n", "s", "x", "body", "0", "1", "7", "-", ".", "e", "9", "<", ">", "/", "_",
+            "<tool_call>", "</tool_call>", "<tool_call>\n<function=get>\n", "<tool_call>\n<function=put>\n",
+            "<function=get>", "<parameter=n>\n", "<parameter=o>\n", "<parameter=s>\n", "<parameter=x>\n",
+            "\n</parameter>\n", "</parameter>", "</function>", "</function>\n</tool_call>", "<think>\n",
+            "</think>\n\n", "tool_call", "parameter", "function", "\"a\"", "\"k\"", "\"m\"", "\"body\"",
+            "true", "null", "1e99", "99",
+        ];
+        let closing: &[&str] = &[
+            "\"", "}", "]", "\n</parameter>\n", "</function>\n</tool_call>", "</think>\n\n", "0", "\n",
+        ];
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let (mut docs, mut with_calls) = (0, 0);
+        for _ in 0..1500 {
+            let mut cur = g.start().unwrap();
+            let mut text = String::new();
+            let done = loop {
+                let late = text.len() > 60 + rnd(200) as usize;
+                let pool = if late { closing } else { pieces };
+                let ok: Vec<&str> = pool
+                    .iter()
+                    .copied()
+                    .filter(|x| g.step_bytes(&cur, x.as_bytes()).is_some())
+                    .collect();
+                if g.complete(&cur) && (ok.is_empty() || rnd(6) == 0) {
+                    break true;
+                }
+                if text.len() > 600 {
+                    break false;
+                }
+                let pick = if ok.is_empty() {
+                    // past the closing set: any admitted piece
+                    match pieces.iter().find(|x| g.step_bytes(&cur, x.as_bytes()).is_some()) {
+                        Some(x) => *x,
+                        None => break false,
+                    }
+                } else {
+                    ok[rnd(ok.len() as u64) as usize]
+                };
+                cur = g.step_bytes(&cur, pick.as_bytes()).unwrap();
+                text.push_str(pick);
+            };
+            if !done {
+                continue;
+            }
+            let mut parser = OutputParser::new(false, true, p.tools.clone(), Vec::new(), f.clone());
+            let mut at = 0;
+            while at < text.len() {
+                let mut end = (at + 1 + rnd(12) as usize).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                parser.feed(&text[at..end]);
+                at = end;
+            }
+            parser.finish();
+            let calls = parser.tool_calls();
+            if calls.is_empty() {
+                let v = parse_json(parser.content().trim())
+                    .unwrap_or_else(|e| panic!("accepted answer does not parse ({e}): {text:?}"));
+                assert!(validates(&answer, &v, &answer), "answer off its schema: {text:?}");
+                docs += 1;
+            } else {
+                assert!(parser.content().trim().is_empty(), "content beside calls: {text:?}");
+                for c in calls {
+                    let (_, s) = schemas
+                        .iter()
+                        .find(|(n, _)| *n == c.name)
+                        .unwrap_or_else(|| panic!("call to '{}' extracted from {text:?}", c.name));
+                    let args = parse_json(&c.arguments)
+                        .unwrap_or_else(|e| panic!("arguments {:?} do not parse ({e}): {text:?}", c.arguments));
+                    assert!(validates(s, &args, s), "arguments {} off the schema of '{}': {text:?}", c.arguments, c.name);
+                }
+                with_calls += 1;
+            }
+        }
+        assert!(docs >= 30 && with_calls >= 30, "walks reached {docs} answers and {with_calls} call replies");
+        // the review's reply, accepted before the fix
+        let smuggled = r#"{"a":"<tool_call><function=get><parameter=n>not a number</parameter></function></tool_call>"}"#;
+        assert!(g.start().and_then(|c| g.step_bytes(&c, smuggled.as_bytes())).is_none());
     }
 }

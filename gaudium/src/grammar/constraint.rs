@@ -1,12 +1,20 @@
 //! One constrained request's run: the reply phase, the token mask of every automaton state it
-//! reaches (computed once, cached), and the commit of each emitted token.
+//! reaches (computed once, cached up to a byte cap), and the commit of each emitted token.
+//!
+//! What a request can make the host spend is bounded: the cache holds at most
+//! [`MASK_CACHE_BYTES`] (verified `gram_cache_act` / `gram_cache_held`), one mask or one commit
+//! does at most [`MAX_WORK`] frame operations and the whole request at most
+//! [`MAX_REQUEST_WORK`] (verified `gram_budget_ok`); past either the request ends with an error.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::vocab::{Kind, TokenTable, Trie};
-use super::{Cursor, Grammar, Pat};
-use crate::verified::{self, GramPhase};
+use super::{Cursor, Grammar, Pat, Work, MAX_REQUEST_WORK, MAX_WORK};
+use crate::verified::{self, GramCacheAct, GramPhase};
+
+/// Bytes the masks one request keeps (and their keys) may hold.
+pub const MASK_CACHE_BYTES: u64 = 64 << 20;
 
 /// What a request's reply is held to: compiled once when the request is parsed.
 pub struct Plan {
@@ -18,6 +26,27 @@ pub struct Plan {
     pub start: Cursor,
     /// What the request asked for, for messages (`json_schema 'name'`, `strict tools`).
     pub label: String,
+    /// Bytes the mask cache may hold ([`MASK_CACHE_BYTES`]), the frame operations one mask or
+    /// one commit may take ([`MAX_WORK`]) and those the request may take in all
+    /// ([`MAX_REQUEST_WORK`]).
+    pub cache_cap: u64,
+    pub work_cap: u64,
+    pub request_work_cap: u64,
+}
+
+impl Plan {
+    pub fn new(grammar: Grammar, vocab: Arc<TokenTable>, think_close: Option<Pat>, start: Cursor, label: String) -> Self {
+        Self {
+            grammar,
+            vocab,
+            think_close,
+            start,
+            label,
+            cache_cap: MASK_CACHE_BYTES,
+            work_cap: MAX_WORK,
+            request_work_cap: MAX_REQUEST_WORK,
+        }
+    }
 }
 
 impl std::fmt::Debug for Plan {
@@ -73,12 +102,31 @@ enum Key {
     Answer(Cursor),
 }
 
+impl Key {
+    /// Bytes a cache entry of this key and a mask of `mask_words` words holds.
+    fn entry_bytes(&self, mask_words: usize) -> u64 {
+        let key = match self {
+            Key::Think(_) => 0,
+            Key::Answer(c) => c
+                .stacks
+                .iter()
+                .map(|s| std::mem::size_of::<super::Stack>() + s.len() * std::mem::size_of::<super::Frame>())
+                .sum::<usize>(),
+        };
+        (key + 8 * mask_words + 2 * std::mem::size_of::<(Key, Arc<Mask>)>()) as u64
+    }
+}
+
 /// Counters of a run, for the request's report.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Stats {
     pub masks_built: u64,
     pub mask_ms: f64,
     pub cache_hits: u64,
+    /// Times the cache was full and was emptied.
+    pub cache_clears: u64,
+    /// The most frame operations one mask took.
+    pub mask_work_max: u64,
 }
 
 /// A request's constraint while it decodes.
@@ -89,6 +137,11 @@ pub struct Constraint {
     kmp: u32,
     cursor: Cursor,
     cache: HashMap<Key, Arc<Mask>>,
+    /// Bytes the cache's entries hold (`gram_cache_held`).
+    cache_bytes: u64,
+    /// The request's work so far, against `request_work_cap` (`gram_budget_ok`; past the cap
+    /// once a charge was refused).
+    spent: u64,
     pub stats: Stats,
 }
 
@@ -105,18 +158,52 @@ impl Constraint {
             phase,
             kmp: 0,
             cache: HashMap::new(),
+            cache_bytes: 0,
+            spent: 0,
             stats: Stats::default(),
         }
+    }
+
+    /// Charges a call's work to the request; `Err` once the request's cap is passed.
+    fn charge(&mut self, w: &Work) -> Result<(), String> {
+        let cap = self.plan.request_work_cap.min(u64::MAX - 1);
+        if verified::gram_budget_ok(self.spent, w.used(), cap) {
+            self.spent += w.used();
+            return Ok(());
+        }
+        self.spent = cap + 1;
+        Err(format!(
+            "{}: the reply's format took more than {} automaton steps in all",
+            self.plan.label, self.plan.request_work_cap
+        ))
+    }
+
+    fn work(&self) -> Work {
+        Work::new(self.plan.work_cap)
+    }
+
+    fn out_of_work(&self) -> String {
+        format!(
+            "{}: the reply's format took more than {} automaton steps for one token",
+            self.plan.label, self.plan.work_cap
+        )
+    }
+
+    /// Bytes the mask cache holds now.
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_bytes
     }
 
     pub fn phase(&self) -> GramPhase {
         self.phase
     }
 
-    fn accepting(&self) -> bool {
-        let complete =
-            self.phase == GramPhase::GpAnswer && self.plan.grammar.complete(&self.cursor);
-        verified::gram_accepting(self.phase, complete)
+    fn accepting(&self, w: &mut Work) -> Result<bool, String> {
+        let complete = self.plan.grammar.complete_in(&self.cursor, w);
+        if w.exhausted() {
+            return Err(self.out_of_work());
+        }
+        Ok(verified::gram_accepting(self.phase, complete))
     }
 
     fn key(&self) -> Key {
@@ -126,46 +213,68 @@ impl Constraint {
         }
     }
 
-    /// The ids the next position admits.
-    pub fn mask(&mut self) -> Arc<Mask> {
+    /// The ids the next position admits (`Err`: the mask took more than the work cap).
+    pub fn mask(&mut self) -> Result<Arc<Mask>, String> {
         let key = self.key();
         if let Some(m) = self.cache.get(&key) {
             self.stats.cache_hits += 1;
-            return Arc::clone(m);
+            return Ok(Arc::clone(m));
         }
         let t0 = std::time::Instant::now();
-        let m = Arc::new(match self.phase {
-            GramPhase::GpThink => self.think_mask(),
-            GramPhase::GpAnswer => self.answer_mask(),
-        });
+        let mut w = self.work();
+        let m = match self.phase {
+            GramPhase::GpThink => self.think_mask(&mut w),
+            GramPhase::GpAnswer => self.answer_mask(&mut w),
+        };
+        if w.exhausted() {
+            return Err(self.out_of_work());
+        }
+        let m = Arc::new(m?);
+        self.charge(&w)?;
         self.stats.masks_built += 1;
         self.stats.mask_ms += t0.elapsed().as_secs_f64() * 1e3;
-        self.cache.insert(key, Arc::clone(&m));
-        m
+        self.stats.mask_work_max = self.stats.mask_work_max.max(w.used());
+        let add = key.entry_bytes(m.bits.len());
+        let act = verified::gram_cache_act(self.cache_bytes, add, self.plan.cache_cap);
+        match act {
+            GramCacheAct::GcKeep => {
+                self.cache.insert(key, Arc::clone(&m));
+            }
+            GramCacheAct::GcClear => {
+                self.cache.clear();
+                self.stats.cache_clears += 1;
+            }
+        }
+        self.cache_bytes = verified::gram_cache_held(act, self.cache_bytes, add);
+        Ok(m)
     }
 
     /// In the reasoning every text and control token is free, except one whose bytes close the
     /// reasoning and continue with bytes the answer refuses; an end token waits for the answer.
-    fn think_mask(&self) -> Mask {
+    fn think_mask(&self, w: &mut Work) -> Result<Mask, String> {
         let v = &*self.plan.vocab;
         let close = self.plan.think_close.as_ref().expect("a reasoning phase");
-        let accepting = self.accepting();
+        let accepting = self.accepting(w)?;
+        let control = verified::gram_control_free(self.phase);
         let mut m = Mask::new(v.len());
         for id in 0..v.len() as u32 {
             let ok = match v.kind(id) {
                 Kind::End => verified::gram_admit(true, accepting, false),
-                Kind::Control => verified::gram_admit(false, accepting, true),
-                Kind::Text => verified::gram_admit(false, accepting, self.think_steps(close, id)),
+                Kind::Control => verified::gram_admit(false, accepting, control),
+                Kind::Text => verified::gram_admit(false, accepting, self.think_steps(close, id, w)),
             };
             if ok {
                 m.set(id);
             }
+            if w.exhausted() {
+                break;
+            }
         }
-        m
+        Ok(m)
     }
 
     /// Whether text token `id` keeps the reply alive from the reasoning phase.
-    fn think_steps(&self, close: &Pat, id: u32) -> bool {
+    fn think_steps(&self, close: &Pat, id: u32, w: &mut Work) -> bool {
         let bytes = self.plan.vocab.bytes(id);
         let mut k = self.kmp;
         for (i, &b) in bytes.iter().enumerate() {
@@ -174,24 +283,30 @@ impl Constraint {
                 return self
                     .plan
                     .grammar
-                    .step_bytes(&self.cursor, &bytes[i + 1..])
+                    .step_bytes_in(&self.cursor, &bytes[i + 1..], w)
                     .is_some();
             }
         }
         true
     }
 
-    fn answer_mask(&self) -> Mask {
+    fn answer_mask(&self, w: &mut Work) -> Result<Mask, String> {
         let v = &*self.plan.vocab;
         let g = &self.plan.grammar;
-        let accepting = self.accepting();
+        let accepting = self.accepting(w)?;
         let mut m = Mask::new(v.len());
         for id in v.ids_of(Kind::End) {
             if verified::gram_admit(true, accepting, false) {
                 m.set(id);
             }
         }
-        // (control tokens add no text: `gram_admit(false, _, false)`, never admitted)
+        // a control token adds no text: free only where `gram_control_free` says so
+        let control = verified::gram_control_free(self.phase);
+        for id in v.ids_of(Kind::Control) {
+            if verified::gram_admit(false, accepting, control) {
+                m.set(id);
+            }
+        }
         let loop_set = self
             .cursor
             .stacks
@@ -209,16 +324,19 @@ impl Constraint {
                         m.set(id);
                     }
                 }
-                Self::walk(g, &split.rest, 0, &self.cursor, accepting, &mut m);
+                Self::walk(g, &split.rest, 0, &self.cursor, accepting, &mut m, w);
             }
-            None => Self::walk(g, v.trie(), 0, &self.cursor, accepting, &mut m),
+            None => Self::walk(g, v.trie(), 0, &self.cursor, accepting, &mut m, w),
         }
-        m
+        Ok(m)
     }
 
-    fn walk(g: &Grammar, t: &Trie, n: u32, c: &Cursor, accepting: bool, m: &mut Mask) {
+    fn walk(g: &Grammar, t: &Trie, n: u32, c: &Cursor, accepting: bool, m: &mut Mask, w: &mut Work) {
         for &(b, child) in t.children(n) {
-            let Some(next) = g.step(c, b) else {
+            let Some(next) = g.step_in(c, b, w) else {
+                if w.exhausted() {
+                    return;
+                }
                 continue;
             };
             for &id in t.tokens(child) {
@@ -226,7 +344,7 @@ impl Constraint {
                     m.set(id);
                 }
             }
-            Self::walk(g, t, child, &next, accepting, m);
+            Self::walk(g, t, child, &next, accepting, m, w);
         }
     }
 
@@ -237,7 +355,8 @@ impl Constraint {
             return Err(format!("{}: token {tok} is not a token id", self.plan.label));
         };
         let v = Arc::clone(&self.plan.vocab);
-        let accepting = self.accepting();
+        let mut w = self.work();
+        let accepting = self.accepting(&mut w)?;
         let refused = || {
             format!(
                 "{}: token {tok} does not continue the reply in its format",
@@ -251,8 +370,7 @@ impl Constraint {
                 }
             }
             Kind::Control => {
-                let free = self.phase == GramPhase::GpThink;
-                if !verified::gram_admit(false, accepting, free) {
+                if !verified::gram_admit(false, accepting, verified::gram_control_free(self.phase)) {
                     return Err(refused());
                 }
             }
@@ -271,7 +389,10 @@ impl Constraint {
                     self.phase = verified::gram_phase_step(self.phase, closed_at.is_some());
                     if let Some(i) = closed_at {
                         self.kmp = 0;
-                        let next = self.plan.grammar.step_bytes(&self.cursor, &bytes[i..]);
+                        let next = self.plan.grammar.step_bytes_in(&self.cursor, &bytes[i..], &mut w);
+                        if w.exhausted() {
+                            return Err(self.out_of_work());
+                        }
                         if !verified::gram_admit(false, accepting, next.is_some()) {
                             return Err(refused());
                         }
@@ -279,7 +400,10 @@ impl Constraint {
                     }
                 }
                 GramPhase::GpAnswer => {
-                    let next = self.plan.grammar.step_bytes(&self.cursor, v.bytes(id));
+                    let next = self.plan.grammar.step_bytes_in(&self.cursor, v.bytes(id), &mut w);
+                    if w.exhausted() {
+                        return Err(self.out_of_work());
+                    }
                     if !verified::gram_admit(false, accepting, next.is_some()) {
                         return Err(refused());
                     }
@@ -287,12 +411,12 @@ impl Constraint {
                 }
             },
         }
-        Ok(())
+        self.charge(&w)
     }
 
-    /// The reply as it stands could end here.
+    /// The reply as it stands could end here (`false` also when the check ran out of work).
     pub fn complete(&self) -> bool {
-        self.accepting()
+        self.accepting(&mut self.work()).unwrap_or(false)
     }
 
     pub fn label(&self) -> &str {

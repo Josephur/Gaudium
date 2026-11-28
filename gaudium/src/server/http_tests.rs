@@ -180,7 +180,7 @@ impl GenEngine for ScriptedEngine {
             .map(crate::grammar::constraint::Constraint::begin);
         for id in ids {
             if let Some(g) = gram.as_mut() {
-                if !g.mask().has(id as u32) {
+                if !g.mask()?.has(id as u32) {
                     return Err(format!(
                         "scripted token {id} ({:?}) is not admitted by {}",
                         self.tok.decode(&[id], false),

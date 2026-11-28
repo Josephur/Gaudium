@@ -14,7 +14,9 @@
 //!   and the commit of every emitted token.
 //!
 //! The decisions around the automaton are verified (`verified/grammar.bend`): how deep a stack
-//! may grow (`gram_push_ok`), how many alternatives it may follow (`gram_alive_ok`), which
+//! may grow (`gram_push_ok`), how many alternatives it may follow (`gram_alive_ok`), how much
+//! work one call into it may do and how much memory a compiled grammar may take
+//! (`gram_budget_ok`), which
 //! tokens are admitted (`gram_admit`), when the reply may end (`gram_accepting`), the reply's
 //! phase (`gram_phase_step`), that a refused token is never emitted (`gram_token_class` with
 //! `pen_emit_ok`) and that an empty mask never picks (`gram_can_pick`). The JSON grammar itself
@@ -26,7 +28,7 @@ pub mod constraint;
 pub mod vocab;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::verified;
 
@@ -41,7 +43,19 @@ pub const WS_MAX: u32 = 96;
 /// 18 digits fits an i64).
 pub const INT_DIGITS: u32 = 18;
 pub const FRAC_DIGITS: u32 = 18;
-pub const EXP_DIGITS: u32 = 3;
+/// Two exponent digits keep every admitted number finite as an `f64` (at most about 1e117), so a
+/// tool argument read back through the JSON parser never turns into an infinity (written `null`).
+pub const EXP_DIGITS: u32 = 2;
+/// Frame operations (entering, feeding, completing a frame) one call into the automaton may do:
+/// a byte step, the start, a completion check, one token's commit, or the whole of one mask.
+/// Past it the call stops with [`Work::exhausted`] set and the request ends with an error.
+/// Measured on a 248K-token vocabulary: a mask of an ordinary schema takes 1-10 thousand, one
+/// that follows 256 alternatives about 240 thousand (7 ms on the dev host); the cap is about
+/// 30 times that.
+pub const MAX_WORK: u64 = 8_000_000;
+/// Frame operations every mask and commit of one request may take together (a few minutes of
+/// one host core at most).
+pub const MAX_REQUEST_WORK: u64 = 4_000_000_000;
 
 pub type NodeId = u32;
 
@@ -121,14 +135,38 @@ pub struct PropDef {
     pub required: bool,
 }
 
+/// An object with known properties. One trie holds every quoted key (its leaves are property
+/// indices); at position `p` the keys that may come next are the properties `p ..= last[p]` (up
+/// to and including the next required one), so a trie node may be entered only while its
+/// subtree holds such an index.
 #[derive(Debug, Clone)]
 pub struct ObjDef {
     pub props: Vec<PropDef>,
-    /// Per position `p` (0 ..= props.len()): the trie of the keys that may come next (the
-    /// properties from `p` up to and including the next required one), `None` past the end.
-    pub keys: Vec<Option<u32>>,
-    /// Per position `p`: no required property remains, so the object may close.
+    /// The key trie's root; its nodes are `keys .. keys + spans.len()`.
+    pub keys: u32,
+    /// Per trie node: the range of `idx` that lists, in increasing order, the property indices
+    /// of its subtree.
+    pub spans: Vec<(u32, u32)>,
+    pub idx: Vec<u32>,
+    /// Per position `p < props.len()`: the last property that may come next.
+    pub last: Vec<u32>,
+    /// Per position `p` (0 ..= props.len()): no required property remains, so the object may close.
     pub close_ok: Vec<bool>,
+}
+
+impl ObjDef {
+    /// Trie node `t` leads to a key that may come at position `p`.
+    fn key_alive(&self, t: u32, p: u32) -> bool {
+        let (Some(&last), Some(&(a, b))) = (
+            self.last.get(p as usize),
+            self.spans.get(t.wrapping_sub(self.keys) as usize),
+        ) else {
+            return false;
+        };
+        let list = &self.idx[a as usize..b as usize];
+        let i = list.partition_point(|&x| x < p);
+        list.get(i).is_some_and(|&x| x <= last)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -141,16 +179,17 @@ pub enum Node {
     Rep(NodeId),
     /// Up to [`WS_MAX`] JSON whitespace bytes.
     Ws,
-    /// A JSON string.
-    Str,
+    /// A JSON string whose raw bytes hold none of `forbid` (at most 3 patterns, each shorter
+    /// than 256 bytes and without a quote): the tags a reply parser splits the text at.
+    Str { forbid: Vec<Pat> },
     /// A JSON number (`integer`: no fraction, no exponent).
     Num { integer: bool },
     /// Literal alternatives (a trie root): enum values, a const, a tool name.
     Switch(u32),
     /// An object with known properties, in the schema's order (index into `objs`).
     Object(u32),
-    /// An object with free keys, every value matching `value`.
-    Map { value: NodeId },
+    /// An object with free keys (each a `key` string node), every value matching `value`.
+    Map { key: NodeId, value: NodeId },
     Array {
         items: NodeId,
         min: u32,
@@ -171,11 +210,52 @@ pub struct Frame {
     /// Whitespace bytes in the current run (JSON containers).
     pub w: u8,
     pub x: u32,
+    /// An object's position while its key is read; a string's matched lengths of its forbidden
+    /// patterns (one byte each).
+    pub y: u32,
 }
 
 impl Frame {
     fn new(node: NodeId, ph: u8, x: u32) -> Self {
-        Self { node, ph, w: 0, x }
+        Self { node, ph, w: 0, x, y: 0 }
+    }
+}
+
+/// The work one call into the automaton has done, against its cap (verified `gram_budget_ok`).
+/// A refused charge leaves the ledger past its cap, where `gram_budget_ok` refuses every
+/// further charge (law `gram_budget_over_refused`): the call stays cut short.
+#[derive(Debug, Clone)]
+pub struct Work {
+    used: u64,
+    cap: u64,
+}
+
+impl Work {
+    /// `cap` below `u64::MAX`.
+    pub fn new(cap: u64) -> Self {
+        Self {
+            used: 0,
+            cap: cap.min(u64::MAX - 1),
+        }
+    }
+
+    /// One frame operation; `false` (and exhausted from then on) once the cap is reached.
+    fn spend(&mut self) -> bool {
+        if verified::gram_budget_ok(self.used, 1, self.cap) {
+            self.used += 1;
+            return true;
+        }
+        self.used = self.cap + 1;
+        false
+    }
+
+    /// The cap was reached: what the call returned is incomplete and must not be used.
+    pub fn exhausted(&self) -> bool {
+        !verified::gram_budget_ok(self.used, 0, self.cap)
+    }
+
+    pub fn used(&self) -> u64 {
+        self.used.min(self.cap)
     }
 }
 
@@ -254,19 +334,25 @@ pub struct Grammar {
     pub tries: Vec<TrieNode>,
     pub objs: Vec<ObjDef>,
     pub root: NodeId,
-    /// The node of a free JSON string (object keys of a [`Node::Map`]).
-    pub str_node: NodeId,
 }
 
 impl Grammar {
-    /// The cursor before the reply's first byte (`None`: the grammar matches nothing).
+    /// The cursor before the reply's first byte (`None`: the grammar matches nothing, or the
+    /// work ran out).
     pub fn start(&self) -> Option<Cursor> {
-        let mut out = Vec::new();
-        self.enter(Vec::new(), self.root, &mut out, FUEL);
-        Self::cursor(out)
+        self.start_in(&mut Work::new(MAX_WORK))
     }
 
-    fn cursor(mut stacks: Vec<Stack>) -> Option<Cursor> {
+    pub fn start_in(&self, w: &mut Work) -> Option<Cursor> {
+        let mut out = Vec::new();
+        self.enter(Vec::new(), self.root, &mut out, FUEL, w);
+        Self::cursor(out, w)
+    }
+
+    fn cursor(mut stacks: Vec<Stack>, w: &Work) -> Option<Cursor> {
+        if w.exhausted() {
+            return None;
+        }
         stacks.sort_unstable();
         stacks.dedup();
         if stacks.is_empty() || !verified::gram_alive_ok(stacks.len() as u64, MAX_ALIVE) {
@@ -277,31 +363,45 @@ impl Grammar {
 
     /// The cursor after byte `b` (`None`: the byte is refused).
     pub fn step(&self, c: &Cursor, b: u8) -> Option<Cursor> {
+        self.step_in(c, b, &mut Work::new(MAX_WORK))
+    }
+
+    /// The cursor after byte `b`, charged to `w` (`None` with `w` exhausted: not decided).
+    pub fn step_in(&self, c: &Cursor, b: u8, w: &mut Work) -> Option<Cursor> {
         let mut out = Vec::new();
         for st in &c.stacks {
-            self.feed(st.clone(), b, &mut out, FUEL);
+            self.feed(st.clone(), b, &mut out, FUEL, w);
         }
-        Self::cursor(out)
+        Self::cursor(out, w)
     }
 
     pub fn step_bytes(&self, c: &Cursor, bytes: &[u8]) -> Option<Cursor> {
+        self.step_bytes_in(c, bytes, &mut Work::new(MAX_WORK))
+    }
+
+    pub fn step_bytes_in(&self, c: &Cursor, bytes: &[u8], w: &mut Work) -> Option<Cursor> {
         let mut cur = c.clone();
         for &b in bytes {
-            cur = self.step(&cur, b)?;
+            cur = self.step_in(&cur, b, w)?;
         }
         Some(cur)
     }
 
     /// The reply may end here: some stack completes without another byte.
     pub fn complete(&self, c: &Cursor) -> bool {
-        c.stacks.iter().any(|s| self.completes(s.clone(), FUEL))
+        self.complete_in(c, &mut Work::new(MAX_WORK))
     }
 
-    fn completes(&self, mut st: Stack, fuel: u32) -> bool {
+    pub fn complete_in(&self, c: &Cursor, w: &mut Work) -> bool {
+        let done = c.stacks.iter().any(|s| self.completes(s.clone(), FUEL, w));
+        done && !w.exhausted()
+    }
+
+    fn completes(&self, mut st: Stack, fuel: u32, w: &mut Work) -> bool {
         let Some(&f) = st.last() else {
             return true;
         };
-        if fuel == 0 || !self.can_finish(f) {
+        if fuel == 0 || !w.spend() || !self.can_finish(f) {
             return false;
         }
         st.pop();
@@ -309,19 +409,20 @@ impl Grammar {
             return true;
         }
         let mut parents = Vec::new();
-        self.child_done(st, &mut parents, fuel - 1);
-        parents.into_iter().any(|p| self.completes(p, fuel - 1))
+        self.child_done(st, &mut parents, fuel - 1, w);
+        parents.into_iter().any(|p| self.completes(p, fuel - 1, w))
     }
 
     /// Pushes `id` (alternatives: one stack per branch) onto `st`.
-    fn enter(&self, mut st: Stack, id: NodeId, out: &mut Vec<Stack>, fuel: u32) {
-        if fuel == 0 {
+    fn enter(&self, mut st: Stack, id: NodeId, out: &mut Vec<Stack>, fuel: u32, w: &mut Work) {
+        // `fuel` bounds the recursion's depth, `w` its total work across every branch
+        if fuel == 0 || !w.spend() {
             return;
         }
         let node = &self.nodes[id as usize];
         if let Node::Alt(bs) = node {
             for &b in bs {
-                self.enter(st.clone(), b, out, fuel - 1);
+                self.enter(st.clone(), b, out, fuel - 1, w);
             }
             return;
         }
@@ -335,7 +436,7 @@ impl Grammar {
             }
             Node::Seq(cs) => {
                 st.push(Frame::new(id, SEQ_RUN, 0));
-                self.enter(st, cs[0], out, fuel - 1);
+                self.enter(st, cs[0], out, fuel - 1, w);
             }
             Node::Switch(root) => {
                 st.push(Frame::new(id, 0, *root));
@@ -361,7 +462,7 @@ impl Grammar {
     }
 
     /// The parent on top of `st` resumes after its child completed.
-    fn child_done(&self, mut st: Stack, out: &mut Vec<Stack>, fuel: u32) {
+    fn child_done(&self, mut st: Stack, out: &mut Vec<Stack>, fuel: u32, w: &mut Work) {
         let Some(top) = st.last_mut() else {
             return;
         };
@@ -375,7 +476,7 @@ impl Grammar {
                 } else {
                     top.x = next;
                     let child = cs[next as usize];
-                    self.enter(st, child, out, fuel);
+                    self.enter(st, child, out, fuel, w);
                 }
             }
             Node::Rep(_) => {
@@ -415,8 +516,8 @@ impl Grammar {
         }
     }
 
-    fn feed(&self, st: Stack, b: u8, out: &mut Vec<Stack>, fuel: u32) {
-        if fuel == 0 {
+    fn feed(&self, st: Stack, b: u8, out: &mut Vec<Stack>, fuel: u32, w: &mut Work) {
+        if fuel == 0 || !w.spend() {
             return;
         }
         let Some(&f) = st.last() else {
@@ -427,13 +528,13 @@ impl Grammar {
             p.pop();
             if !p.is_empty() {
                 let mut parents = Vec::new();
-                self.child_done(p, &mut parents, fuel - 1);
+                self.child_done(p, &mut parents, fuel - 1, w);
                 for q in parents {
-                    self.feed(q, b, out, fuel - 1);
+                    self.feed(q, b, out, fuel - 1, w);
                 }
             }
         }
-        self.consume(st, f, b, out, fuel);
+        self.consume(st, f, b, out, fuel, w);
     }
 
     /// Sets the top frame to `f` and enters `child` above it, then feeds `b` to the child.
@@ -445,12 +546,13 @@ impl Grammar {
         b: u8,
         out: &mut Vec<Stack>,
         fuel: u32,
+        w: &mut Work,
     ) {
         *st.last_mut().expect("a frame") = f;
         let mut entered = Vec::new();
-        self.enter(st, child, &mut entered, fuel - 1);
+        self.enter(st, child, &mut entered, fuel - 1, w);
         for s in entered {
-            self.feed(s, b, out, fuel - 1);
+            self.feed(s, b, out, fuel - 1, w);
         }
     }
 
@@ -467,7 +569,21 @@ impl Grammar {
         }
     }
 
-    fn consume(&self, st: Stack, f: Frame, b: u8, out: &mut Vec<Stack>, fuel: u32) {
+    /// The matched lengths of `forbid` (packed one byte each) after byte `b`; `None`: a
+    /// forbidden pattern is complete.
+    fn forbid_next(forbid: &[Pat], packed: u32, b: u8) -> Option<u32> {
+        let mut next = 0u32;
+        for (i, p) in forbid.iter().enumerate() {
+            let k = p.next((packed >> (8 * i)) & 0xFF, b);
+            if k == p.len() {
+                return None;
+            }
+            next |= k << (8 * i);
+        }
+        Some(next)
+    }
+
+    fn consume(&self, st: Stack, f: Frame, b: u8, out: &mut Vec<Stack>, fuel: u32, w: &mut Work) {
         let mut g = f;
         match &self.nodes[f.node as usize] {
             Node::Lit(bytes) => {
@@ -485,46 +601,55 @@ impl Grammar {
             Node::Rep(child) => {
                 if f.ph == REP_READY {
                     g.ph = REP_CHILD;
-                    self.enter_feed(st, g, *child, b, out, fuel);
+                    self.enter_feed(st, g, *child, b, out, fuel, w);
                 }
             }
-            Node::Str => match f.ph {
-                S_START if b == b'"' => {
-                    g.ph = S_NORMAL;
-                    Self::set_top(st, g, out);
-                }
-                S_NORMAL => {
-                    if b == b'"' {
-                        g.ph = DONE;
-                    } else if b == b'\\' {
-                        g.ph = S_ESC;
-                    } else if b < 0x20 {
-                        return;
+            Node::Str { forbid } => {
+                if f.ph != S_START {
+                    // every raw byte of the body, escapes included, is what a parser searches
+                    match Self::forbid_next(forbid, f.y, b) {
+                        Some(y) => g.y = y,
+                        None => return,
                     }
-                    Self::set_top(st, g, out);
                 }
-                S_ESC => {
-                    if b"\"\\/bfnrt".contains(&b) {
+                match f.ph {
+                    S_START if b == b'"' => {
                         g.ph = S_NORMAL;
-                    } else if b == b'u' {
-                        g.ph = S_HEX;
-                        g.x = 0;
-                    } else {
-                        return;
+                        Self::set_top(st, g, out);
                     }
-                    Self::set_top(st, g, out);
-                }
-                S_HEX if b.is_ascii_hexdigit() => {
-                    if f.x == 3 {
-                        g.ph = S_NORMAL;
-                        g.x = 0;
-                    } else {
-                        g.x += 1;
+                    S_NORMAL => {
+                        if b == b'"' {
+                            g.ph = DONE;
+                        } else if b == b'\\' {
+                            g.ph = S_ESC;
+                        } else if b < 0x20 {
+                            return;
+                        }
+                        Self::set_top(st, g, out);
                     }
-                    Self::set_top(st, g, out);
+                    S_ESC => {
+                        if b"\"\\/bfnrt".contains(&b) {
+                            g.ph = S_NORMAL;
+                        } else if b == b'u' {
+                            g.ph = S_HEX;
+                            g.x = 0;
+                        } else {
+                            return;
+                        }
+                        Self::set_top(st, g, out);
+                    }
+                    S_HEX if b.is_ascii_hexdigit() => {
+                        if f.x == 3 {
+                            g.ph = S_NORMAL;
+                            g.x = 0;
+                        } else {
+                            g.x += 1;
+                        }
+                        Self::set_top(st, g, out);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Node::Num { integer } => {
                 let digit = b.is_ascii_digit();
                 let (ph, x) = match (f.ph, b) {
@@ -558,17 +683,18 @@ impl Grammar {
                     // the literal is complete: its continuation takes the frame's place
                     let mut p = st;
                     p.pop();
-                    self.enter(p, t.leaf, out, fuel - 1);
+                    self.enter(p, t.leaf, out, fuel - 1, w);
                 }
             }
             Node::Object(oi) => {
                 let o = &self.objs[*oi as usize];
-                let key_from = |pos: usize| -> Option<u32> {
-                    o.keys
-                        .get(pos)
-                        .copied()
-                        .flatten()
-                        .and_then(|r| self.tries[r as usize].child(b'"'))
+                // the key's opening quote, at position `pos`
+                let key_from = |pos: u32| -> Option<Frame> {
+                    let n = self.tries[o.keys as usize].child(b'"')?;
+                    o.key_alive(n, pos).then(|| Frame {
+                        y: pos,
+                        ..Frame::new(f.node, O_KEY, n)
+                    })
                 };
                 match f.ph {
                     O_OPEN if b == b'{' => {
@@ -583,14 +709,12 @@ impl Grammar {
                         Self::set_top(st, g, out);
                     }
                     O_FIRST if b == b'"' => {
-                        if let Some(n) = key_from(0) {
-                            g = Frame::new(f.node, O_KEY, n);
+                        if let Some(g) = key_from(0) {
                             Self::set_top(st, g, out);
                         }
                     }
                     O_COMMA if b == b'"' => {
-                        if let Some(n) = key_from(f.x as usize) {
-                            g = Frame::new(f.node, O_KEY, n);
+                        if let Some(g) = key_from(f.x) {
                             Self::set_top(st, g, out);
                         }
                     }
@@ -598,11 +722,15 @@ impl Grammar {
                         let Some(n) = self.tries[f.x as usize].child(b) else {
                             return;
                         };
+                        if !o.key_alive(n, f.y) {
+                            return;
+                        }
+                        // quoted keys are prefix-free: a leaf ends its key
                         let leaf = self.tries[n as usize].leaf;
                         g = if leaf != NO_LEAF && leaf != FINISH {
                             Frame::new(f.node, O_COLON, leaf)
                         } else {
-                            Frame::new(f.node, O_KEY, n)
+                            Frame { y: f.y, ..Frame::new(f.node, O_KEY, n) }
                         };
                         Self::set_top(st, g, out);
                     }
@@ -615,12 +743,12 @@ impl Grammar {
                         let child = o.props[f.x as usize].value;
                         g.ph = O_VALUE;
                         g.w = 0;
-                        self.enter_feed(st, g, child, b, out, fuel);
+                        self.enter_feed(st, g, child, b, out, fuel, w);
                     }
                     O_AFTER if b == b',' => {
-                        let next = f.x as usize + 1;
-                        if o.keys.get(next).copied().flatten().is_some() {
-                            g = Frame::new(f.node, O_COMMA, next as u32);
+                        let next = f.x + 1;
+                        if (next as usize) < o.props.len() {
+                            g = Frame::new(f.node, O_COMMA, next);
                             Self::set_top(st, g, out);
                         }
                     }
@@ -633,7 +761,7 @@ impl Grammar {
                     _ => {}
                 }
             }
-            Node::Map { value } => match f.ph {
+            Node::Map { key, value } => match f.ph {
                 M_OPEN if b == b'{' => {
                     g.ph = M_FIRST;
                     Self::set_top(st, g, out);
@@ -646,7 +774,7 @@ impl Grammar {
                 M_FIRST | M_COMMA if b == b'"' => {
                     g.ph = M_KEY;
                     g.w = 0;
-                    self.enter_feed(st, g, self.str_node, b, out, fuel);
+                    self.enter_feed(st, g, *key, b, out, fuel, w);
                 }
                 M_COLON if b == b':' => {
                     g.ph = M_PRE;
@@ -656,7 +784,7 @@ impl Grammar {
                 M_PRE => {
                     g.ph = M_VALUE;
                     g.w = 0;
-                    self.enter_feed(st, g, *value, b, out, fuel);
+                    self.enter_feed(st, g, *value, b, out, fuel, w);
                 }
                 M_AFTER if b == b',' => {
                     g.ph = M_COMMA;
@@ -685,7 +813,7 @@ impl Grammar {
                     }
                     g.ph = A_ITEM;
                     g.w = 0;
-                    self.enter_feed(st, g, *items, b, out, fuel);
+                    self.enter_feed(st, g, *items, b, out, fuel, w);
                 }
                 A_AFTER if b == b',' && f.x < *max => {
                     g.ph = A_COMMA;
@@ -729,7 +857,7 @@ impl Grammar {
                     g.x = 0;
                     let mut st = st;
                     *st.last_mut().expect("a frame") = g;
-                    self.enter(st, *call, out, fuel - 1);
+                    self.enter(st, *call, out, fuel - 1, w);
                 } else {
                     g.x = k;
                     Self::set_top(st, g, out);
@@ -747,11 +875,14 @@ impl Grammar {
         let mut set = [0u64; 4];
         let mut add = |b: u8| set[(b >> 6) as usize] |= 1 << (b & 63);
         match &self.nodes[f.node as usize] {
-            Node::Str if f.ph == S_NORMAL => {
+            Node::Str { forbid } if f.ph == S_NORMAL && f.y == 0 => {
                 add(b'"');
                 add(b'\\');
                 for b in 0..0x20u8 {
                     add(b);
+                }
+                for p in forbid {
+                    add(p.bytes[0]);
                 }
             }
             Node::Raw { term, forbid } if f.ph == R_RUN && f.x == 0 => {

@@ -33,7 +33,7 @@ fn json_mode() -> Grammar {
 }
 
 /// A tiny JSON Schema validator for the subset (the reference the grammar is tested against).
-fn validates(s: &JsonValue, v: &JsonValue, root: &JsonValue) -> bool {
+pub(crate) fn validates(s: &JsonValue, v: &JsonValue, root: &JsonValue) -> bool {
     if let Some(r) = s.get("$ref").and_then(JsonValue::as_str) {
         let mut cur = root;
         if r != "#" {
@@ -379,13 +379,7 @@ const CTL: u32 = 138;
 
 fn plan(g: Grammar, think: bool) -> Arc<Plan> {
     let start = g.start().unwrap();
-    Arc::new(Plan {
-        grammar: g,
-        vocab: toy_table(),
-        think_close: think.then(|| Pat::new(b"</think>")),
-        start,
-        label: "test".into(),
-    })
+    Arc::new(Plan::new(g, toy_table(), think.then(|| Pat::new(b"</think>")), start, "test".into()))
 }
 
 /// Every admitted token, decoded one at a time, agrees with the grammar on the whole text.
@@ -396,7 +390,7 @@ fn the_mask_admits_exactly_the_tokens_that_step() {
     let mut c = Constraint::begin(plan(g.clone(), false));
     let mut text = Vec::new();
     for piece in ["{\"", "name", "\":", " ", "true", "}"] {
-        let m = c.mask();
+        let m = c.mask().unwrap();
         for id in 0..v.len() as u32 {
             let want = match v.kind(id) {
                 Kind::End => {
@@ -419,14 +413,14 @@ fn the_mask_admits_exactly_the_tokens_that_step() {
         text.extend_from_slice(piece.as_bytes());
     }
     assert!(c.complete());
-    assert!(c.mask().has(END));
+    assert!(c.mask().unwrap().has(END));
     assert!(c.commit(b'x' as i32).is_err());
 }
 
 #[test]
 fn reasoning_is_free_and_the_answer_follows_it() {
     let mut c = Constraint::begin(plan(json_mode(), true));
-    let m = c.mask();
+    let m = c.mask().unwrap();
     // free text and control tokens, but no end before the answer
     assert!(m.has(b'x' as u32) && m.has(b'[' as u32) && m.has(CTL));
     assert!(!m.has(END));
@@ -437,11 +431,11 @@ fn reasoning_is_free_and_the_answer_follows_it() {
     let close = (0..200).find(|&i| toy_table().bytes(i) == b"</think>").unwrap();
     c.commit(close as i32).unwrap();
     assert_eq!(c.phase(), crate::verified::GramPhase::GpAnswer);
-    let m = c.mask();
+    let m = c.mask().unwrap();
     assert!(!m.has(b'x' as u32) && !m.has(CTL) && m.has(b'{' as u32) && m.has(b'\n' as u32));
     let obj = (0..200).find(|&i| toy_table().bytes(i) == b" {\"a\": 1}").unwrap();
     c.commit(obj as i32).unwrap();
-    assert!(c.mask().has(END));
+    assert!(c.mask().unwrap().has(END));
     c.commit(END as i32).unwrap();
 }
 
@@ -453,15 +447,9 @@ fn a_closing_tag_followed_by_refused_bytes_is_not_admitted() {
     let v = Arc::new(TokenTable::new(bytes, kinds));
     let g = json_mode();
     let start = g.start().unwrap();
-    let p = Arc::new(Plan {
-        grammar: g,
-        vocab: v,
-        think_close: Some(Pat::new(b"</think>")),
-        start,
-        label: "t".into(),
-    });
+    let p = Arc::new(Plan::new(g, v, Some(Pat::new(b"</think>")), start, "t".into()));
     let mut c = Constraint::begin(p);
-    assert!(!c.mask().has(128));
+    assert!(!c.mask().unwrap().has(128));
     assert!(c.commit(128).is_err());
 }
 
@@ -469,12 +457,12 @@ fn a_closing_tag_followed_by_refused_bytes_is_not_admitted() {
 fn the_cache_serves_a_repeated_state() {
     let mut c = Constraint::begin(plan(json_mode(), false));
     for b in b"{\"k\": \"abc" {
-        c.mask();
+        c.mask().unwrap();
         c.commit(*b as i32).unwrap();
     }
     let built = c.stats.masks_built;
     for b in b"defgh" {
-        c.mask();
+        c.mask().unwrap();
         c.commit(*b as i32).unwrap();
     }
     // the string body is one state, built once before its first byte
@@ -494,4 +482,270 @@ fn a_reply_may_open_its_own_reasoning() {
     // never ends inside the reasoning, and the answer after it is held
     assert!(refuses(&g, "<think>\nstill thinking"));
     assert!(refuses(&g, "<think>x</think> no json"));
+}
+
+// ------------------------------------------------------------------ a schema is hostile input
+
+fn optional_props(n: usize) -> JsonValue {
+    let props: Vec<String> = (0..n).map(|i| format!("\"p{i}\":{{}}")).collect();
+    schema(&format!(
+        r#"{{"type":"object","properties":{{{}}},"additionalProperties":false}}"#,
+        props.join(",")
+    ))
+}
+
+/// One key trie per object, not one per position: 6,000 optional properties (the review's
+/// 38 M trie nodes, 6.4 s and 2.3 GB) now compile to a grammar linear in the schema.
+#[test]
+fn many_optional_properties_compile_linearly() {
+    let s = optional_props(6000);
+    let body = s.dump().len() as u64;
+    let t0 = std::time::Instant::now();
+    let g = build::schema_doc(&s).unwrap();
+    let ms = t0.elapsed().as_millis();
+    assert!(g.tries.len() < 10 * 6000, "{} trie nodes", g.tries.len());
+    let bytes = build::grammar_bytes(&s).unwrap();
+    assert!(bytes < 200 * body, "{bytes} bytes charged for a {body}-byte schema");
+    assert!(ms < 5000, "{ms} ms");
+    // order and closure still hold
+    assert!(accepts(&g, r#"{"p3":1,"p17":"x","p5999":null}"#));
+    assert!(accepts(&g, "{}"));
+    assert!(refuses(&g, r#"{"p17":1,"p3":2}"#));
+    assert!(refuses(&g, r#"{"p3":1,"p3":2}"#));
+    assert!(refuses(&g, r#"{"p6000":1}"#));
+}
+
+#[test]
+fn keys_admit_only_the_properties_that_may_come_next() {
+    let s = schema(
+        r#"{"type":"object","properties":{"ab":{},"a":{},"abc":{"type":"integer"},"b":{}},
+            "required":["abc"],"additionalProperties":false}"#,
+    );
+    let g = build::schema_doc(&s).unwrap();
+    for ok in [r#"{"abc":1}"#, r#"{"ab":0,"a":0,"abc":1,"b":0}"#, r#"{"a":0,"abc":1}"#] {
+        assert!(accepts(&g, ok), "{ok}");
+    }
+    // "b" may not come before the required "abc"; "ab" not after "a"
+    for bad in [r#"{"b":0,"abc":1}"#, r#"{"a":0,"ab":0,"abc":1}"#, r#"{"a":0}"#] {
+        assert!(refuses(&g, bad), "{bad}");
+    }
+    // the prefix `{"b` is refused at once (no key of the position starts so), not later
+    let c = g.start().unwrap();
+    assert!(g.step_bytes(&c, br#"{"b"#).is_none());
+    assert!(g.step_bytes(&c, br#"{"ab"#).is_some());
+}
+
+#[test]
+fn the_compile_budget_refuses_a_schema_past_it() {
+    let s = optional_props(200);
+    let need = build::grammar_bytes(&s).unwrap();
+    assert!(build::schema_doc_within(&s, need).is_ok());
+    let e = build::schema_doc_within(&s, need - 1).unwrap_err();
+    assert!(e.contains("MiB of grammar"), "{e}");
+    // an enum is charged by its literal bytes
+    let big: Vec<String> = (0..2000).map(|i| format!("\"{}{i}\"", "v".repeat(40))).collect();
+    let s = schema(&format!(r#"{{"enum":[{}]}}"#, big.join(",")));
+    assert!(build::schema_doc_within(&s, 50_000).unwrap_err().contains("MiB of grammar"));
+}
+
+#[test]
+fn wide_and_looping_alternatives_are_refused_at_compile_time() {
+    let wide = |n: usize| {
+        let b: Vec<&str> = vec![r#"{"type":"integer"}"#; n];
+        schema(&format!(r#"{{"type":"array","items":{{"anyOf":[{}]}}}}"#, b.join(",")))
+    };
+    assert!(build::schema_doc(&wide(MAX_ALIVE as usize)).is_ok());
+    let e = build::schema_doc(&wide(MAX_ALIVE as usize + 1)).unwrap_err();
+    assert!(e.contains("'anyOf'") && e.contains("alternatives"), "{e}");
+    // nested through references: 20 x 20 alternatives at once
+    let mut defs = Vec::new();
+    for i in 0..20 {
+        let b: Vec<String> = (0..20).map(|j| format!(r#"{{"const":{}}}"#, i * 20 + j)).collect();
+        defs.push(format!(r#""d{i}":{{"anyOf":[{}]}}"#, b.join(",")));
+    }
+    let refs: Vec<String> = (0..20).map(|i| format!(r##"{{"$ref":"#/$defs/d{i}"}}"##)).collect();
+    let s = schema(&format!(r#"{{"$defs":{{{}}},"anyOf":[{}]}}"#, defs.join(","), refs.join(",")));
+    assert!(build::schema_doc(&s).unwrap_err().contains("alternatives"));
+    // a diamond of references: 2^12 paths into one value
+    let mut defs = vec![r#""d12":{"type":"integer"}"#.to_string()];
+    for i in 0..12 {
+        defs.push(format!(r##""d{i}":{{"anyOf":[{{"$ref":"#/$defs/d{0}"}},{{"$ref":"#/$defs/d{0}"}}]}}"##, i + 1));
+    }
+    let s = schema(&format!(r##"{{"$defs":{{{}}},"$ref":"#/$defs/d0"}}"##, defs.join(",")));
+    assert!(build::schema_doc(&s).unwrap_err().contains("alternatives"));
+    // Codex: a reference to itself with no JSON in between (exponential before the fix)
+    for s in [
+        r##"{"anyOf":[{"$ref":"#"},{"$ref":"#"}]}"##,
+        r##"{"$defs":{"a":{"$ref":"#/$defs/b"},"b":{"anyOf":[{"$ref":"#/$defs/a"},{"type":"null"}]}},"$ref":"#/$defs/a"}"##,
+    ] {
+        let e = build::schema_doc(&schema(s)).unwrap_err();
+        assert!(e.contains("leads back to itself"), "{s}: {e}");
+    }
+    // recursion through a value is fine
+    assert!(build::schema_doc(&schema(r##"{"anyOf":[{"type":"array","items":{"$ref":"#"}},{"type":"null"}]}"##)).is_ok());
+}
+
+#[test]
+fn a_long_reference_chain_is_refused_not_overflowed() {
+    let n = 5000;
+    let mut defs: Vec<String> = (0..n).map(|i| format!(r##""d{i}":{{"$ref":"#/$defs/d{}"}}"##, i + 1)).collect();
+    defs.push(format!(r#""d{n}":{{"type":"integer"}}"#));
+    let s = schema(&format!(r##"{{"$defs":{{{}}},"$ref":"#/$defs/d0"}}"##, defs.join(",")));
+    let e = build::schema_doc(&s).unwrap_err();
+    assert!(e.contains("passes through more than"), "{e}");
+}
+
+#[test]
+fn a_literal_is_never_checked_against_its_type_alone() {
+    // Codex: the enum's value violates the object's `required`
+    for s in [
+        r#"{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"],"enum":[{}]}"#,
+        r#"{"type":"array","minItems":2,"const":[1]}"#,
+    ] {
+        let e = build::schema_doc(&schema(s)).unwrap_err();
+        assert!(e.contains("can not stand beside"), "{s}: {e}");
+    }
+    assert!(build::schema_doc(&schema(r#"{"type":"string","enum":["a"],"description":"d"}"#)).is_ok());
+}
+
+#[test]
+fn every_admitted_number_is_finite() {
+    let g = build::schema_doc(&schema(r#"{"type":"number"}"#)).unwrap();
+    assert!(accepts(&g, "-1.5e99"));
+    assert!(refuses(&g, "1e999"));
+    let biggest = format!("{}.{}e99", "9".repeat(INT_DIGITS as usize), "9".repeat(FRAC_DIGITS as usize));
+    assert!(accepts(&g, &biggest));
+    let v = parse_json(&biggest).unwrap();
+    assert!(matches!(v, JsonValue::Float(f) if f.is_finite()), "{v:?}");
+}
+
+/// A counted array makes every step a new automaton state: the cache stays within its byte cap.
+#[test]
+fn a_counted_array_keeps_the_mask_cache_within_its_cap() {
+    let g = build::schema_doc(&schema(r#"{"type":"array","items":{"type":"integer"},"maxItems":1000000}"#)).unwrap();
+    let start = g.start().unwrap();
+    let mut p = Plan::new(g, toy_table(), None, start, "t".into());
+    p.cache_cap = 4096;
+    let p = Arc::new(p);
+    let mut c = Constraint::begin(Arc::clone(&p));
+    c.commit(b'[' as i32).unwrap();
+    let mut peak = 0;
+    for _ in 0..300 {
+        for b in *b"1," {
+            assert!(c.mask().unwrap().has(b as u32));
+            c.commit(b as i32).unwrap();
+            peak = peak.max(c.cache_bytes());
+        }
+    }
+    assert!(peak <= p.cache_cap, "{peak}");
+    assert!(c.stats.cache_clears > 0);
+    // with the default cap the same run is cached whole
+    let g = build::schema_doc(&schema(r#"{"type":"array","items":{"type":"integer"},"maxItems":1000000}"#)).unwrap();
+    let start = g.start().unwrap();
+    let mut c = Constraint::begin(Arc::new(Plan::new(g, toy_table(), None, start, "t".into())));
+    c.commit(b'[' as i32).unwrap();
+    for _ in 0..50 {
+        for b in *b"1," {
+            c.mask().unwrap();
+            c.commit(b as i32).unwrap();
+        }
+    }
+    assert_eq!(c.stats.cache_clears, 0);
+}
+
+/// A mask (and a commit) past the work cap ends the request with an error, never with a
+/// partial mask.
+#[test]
+fn a_mask_past_its_work_cap_is_an_error() {
+    let b: Vec<&str> = vec![r#"{"type":"array","items":{"type":"integer"}}"#; 200];
+    let s = schema(&format!(r#"{{"type":"array","items":{{"anyOf":[{}]}}}}"#, b.join(",")));
+    let g = build::schema_doc(&s).unwrap();
+    let start = g.start().unwrap();
+    let mut p = Plan::new(g, toy_table(), None, start, "t".into());
+    p.work_cap = 2_000;
+    let mut c = Constraint::begin(Arc::new(p));
+    let e = c.commit(b'[' as i32).and_then(|_| c.mask().map(|_| ())).unwrap_err();
+    assert!(e.contains("automaton steps"), "{e}");
+    // a request's masks and commits together are held to the request's cap
+    let g = build::schema_doc(&s).unwrap();
+    let start = g.start().unwrap();
+    let mut p = Plan::new(g, toy_table(), None, start, "t".into());
+    p.request_work_cap = 50_000;
+    let mut c = Constraint::begin(Arc::new(p));
+    let mut err = None;
+    for b in b"[[1],[2],[3],[4],[5],[6],[7],[8],[9],[1],[2],[3]]".repeat(4) {
+        if let Err(e) = c.mask().and_then(|_| c.commit(b as i32)) {
+            err = Some(e);
+            break;
+        }
+    }
+    assert!(err.as_deref().is_some_and(|e| e.contains("in all")), "{err:?}");
+    // the default cap leaves room for it
+    let g = build::schema_doc(&s).unwrap();
+    let start = g.start().unwrap();
+    let mut c = Constraint::begin(Arc::new(Plan::new(g, toy_table(), None, start, "t".into())));
+    c.commit(b'[' as i32).unwrap();
+    assert!(c.mask().unwrap().has(b'[' as u32));
+    assert!(c.stats.mask_work_max < MAX_WORK);
+}
+
+#[test]
+fn many_optional_parameters_are_a_clear_refusal() {
+    let tool = |n: usize| {
+        let props: Vec<String> = (0..n).map(|i| format!(r#""p{i}":{{"type":"integer"}}"#)).collect();
+        ToolDef {
+            name: "t".into(),
+            strict: Some(schema(&format!(r#"{{"type":"object","properties":{{{}}}}}"#, props.join(",")))),
+        }
+    };
+    let n = MAX_ALIVE as usize - 1;
+    let g = build::reply(None, &[tool(n)], &params_tags()).unwrap();
+    let last = format!("<tool_call>\n<function=t>\n<parameter=p{}>\n7\n</parameter>\n</function>\n</tool_call>", n - 1);
+    assert!(accepts(&g, &last));
+    let e = build::reply(None, &[tool(n + 1)], &params_tags()).unwrap_err();
+    assert!(e.contains("optional parameters in a row"), "{e}");
+}
+
+#[test]
+fn constrained_strings_never_hold_the_parsers_tags() {
+    // Codex / review: an answer beside tools may not smuggle a call in a string
+    let g = build::reply(
+        Some(&Answer::Schema(schema(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#))),
+        &[ToolDef {
+            name: "get".into(),
+            strict: Some(schema(r#"{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}"#)),
+        }],
+        &params_tags(),
+    )
+    .unwrap();
+    assert!(refuses(&g, r#"{"a":"<tool_call><function=get><parameter=n>not a number</parameter></function></tool_call>"}"#));
+    assert!(refuses(&g, r#"{"a":"x<tool_call>"}"#));
+    // the bytes of the tag split by an escape are no tag to a parser
+    assert!(accepts(&g, r#"{"a":"<tool\u005fcall> and </tool_call> and <tool_cal"}"#));
+    // a const or enum holding the tag is left out
+    let e = build::reply(
+        Some(&Answer::Schema(schema(r#"{"const":"<tool_call>"}"#))),
+        &[weather_tool()],
+        &params_tags(),
+    )
+    .unwrap_err();
+    assert!(e.contains("tool tags"), "{e}");
+    // without tools the parser splits nothing: the tag is plain text
+    let g = build::reply(Some(&Answer::Schema(schema(r#"{"type":"string"}"#))), &[], &params_tags()).unwrap();
+    assert!(accepts(&g, r#""<tool_call>""#));
+    // Codex: a JSON-valued parameter may not hold the block's closing tags
+    let obj = ToolDef {
+        name: "put".into(),
+        strict: Some(schema(r#"{"type":"object","properties":{"o":{"type":"object","properties":{"body":{"type":"string"}}}},"required":["o"]}"#)),
+    };
+    let g = build::reply(None, &[obj], &params_tags()).unwrap();
+    let call = |v: &str| format!("<tool_call>\n<function=put>\n<parameter=o>\n{v}\n</parameter>\n</function>\n</tool_call>");
+    assert!(accepts(&g, &call(r#"{"body":"a < b"}"#)));
+    for v in [r#"{"body":"</parameter>"}"#, r#"{"body":"x</function>"}"#, r#"{"body":"</tool_call>"}"#] {
+        assert!(refuses(&g, &call(v)), "{v}");
+    }
+    // the JSON call form ends at the tag's closing
+    let tags = CallTags { form: CallForm::Json, ..params_tags() };
+    let g = build::reply(None, &[weather_tool()], &tags).unwrap();
+    assert!(refuses(&g, "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"</tool_call>\", \"days\": 2}}\n</tool_call>"));
 }

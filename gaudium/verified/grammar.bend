@@ -12,11 +12,16 @@
 #   - Whether the reply may end: only in the constrained phase, with the grammar complete
 #   - The automaton's capacity bounds: how deep a stack may grow, and how many alternatives the
 #     automaton follows at once
+#   - The budgets a client's schema is held to: a charge to a budget (the bytes a grammar may
+#     compile to, the work of one mask or one commit) never takes it past its cap
+#   - The mask cache's byte ledger: what it holds never passes its cap
+#   - Where a control token (one that adds no text) is free: in the reasoning only
 # The grammar itself (JSON lexing, the schema subset, the token byte strings) is a format defined
 # by an outside reference and stays in the Rust shell (`gaudium/src/grammar/`) with Rust tests,
 # among them a differential test against the crate's JSON parser.
 
 import Base
+import nat_lemmas.bend as L
 import sampler_penalty.bend as P
 
 # ============================================================================
@@ -96,7 +101,83 @@ def gram_alive_ok(alive: Nat, cap: Nat) -> Bool:
   Nat.is_le(alive, cap)
 
 # ============================================================================
-# 4. Laws
+# 4. Budgets and the Mask Cache
+# ============================================================================
+
+# used: what a budget has been charged so far; add: the next charge; cap: the budget
+# A charge is accepted only when the ledger is within its cap and the charge fits in what is
+# left (written without the sum, so no client-sized charge can overflow it).
+def gram_budget_ok(+used: Nat, add: Nat, +cap: Nat) -> Bool:
+  Bool.and(Nat.is_le(used, cap), Nat.is_le(add, Nat.sub(cap, used)))
+
+# What the mask cache does with a new entry: keep it beside what it holds, or empty itself
+# (the entry is then not kept).
+type GramCacheAct is Data:
+  GcKeep{}
+  GcClear{}
+
+def gram_cache_pick(fits: Bool) -> GramCacheAct:
+  match fits:
+    case True{}:
+      GcKeep{}
+    case False{}:
+      GcClear{}
+
+# held: bytes the cache holds; add: bytes of the new entry; cap: the most it may hold
+def gram_cache_act(+held: Nat, +add: Nat, +cap: Nat) -> GramCacheAct:
+  gram_cache_pick(gram_budget_ok(held, add, cap))
+
+# The bytes the cache holds after the action.
+def gram_cache_held(act: GramCacheAct, held: Nat, add: Nat) -> Nat:
+  match act:
+    case GcKeep{}:
+      Nat.add(held, add)
+    case GcClear{}:
+      0n
+
+# A control token adds no text: it is free while the model reasons, never in the answer.
+def gram_control_free(ph: GramPhase) -> Bool:
+  match ph:
+    case GpThink{}:
+      True{}
+    case GpAnswer{}:
+      False{}
+
+# 1 + (r + e) <= r never holds
+def gram_le_succ_add_false(+r: Nat, +e: Nat) -> {Nat.is_le(1n+Nat.add(r, e), r) == False{} : Bool}:
+  match r:
+    case 0n: {==}
+    case 1n+p:
+      gram_le_succ_add_false(p, e)
+
+# a charge against a budget of h + r after h is a <= r
+def gram_budget_shift(+h: Nat, +a: Nat, +r: Nat) -> {gram_budget_ok(h, a, Nat.add(h, r)) == Nat.is_le(a, r) : Bool}:
+  match h:
+    case 0n:
+      match r:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+p:
+      gram_budget_shift(p, a, r)
+
+# h + a <= h + r is a <= r
+def gram_le_add_shift(+h: Nat, +a: Nat, +r: Nat) -> {Nat.is_le(a, r) == Nat.is_le(Nat.add(h, a), Nat.add(h, r)) : Bool}:
+  match h:
+    case 0n: {==}
+    case 1n+p:
+      gram_le_add_shift(p, a, r)
+
+def gram_cache_bound_go(+h: Nat, +a: Nat, +r: Nat, f: Bool, ef: {gram_budget_ok(h, a, Nat.add(h, r)) == f : Bool}) -> {Nat.is_le(gram_cache_held(gram_cache_pick(f), h, a), Nat.add(h, r)) == True{} : Bool}:
+  match f:
+    case True{}:
+      %gram_le_add_shift(h, a, r) : {_ == True{} : Bool}
+      %gram_budget_shift(h, a, r) : {_ == True{} : Bool}
+      ef
+    case False{}:
+      L.nat_le_zero(Nat.add(h, r))
+
+# ============================================================================
+# 5. Laws
 # ============================================================================
 
 # promise: a constrained request always has its tokens picked on the host, where the mask applies
@@ -302,3 +383,102 @@ def gram_alive_within_cap_ok(n, e):
         case 1n+_: {==}
     case 1n+q:
       gram_alive_within_cap_ok(q, e)
+
+# promise: a charge that does not fit in what is left of a budget is refused
+# harm: a hostile schema would make the compiler, or one mask, take memory or time without bound
+# catches: gram_budget_ok uses Nat.is_le(add, cap) (what is already spent ignored)
+law gram_budget_past_cap_refused:
+  for +u: Nat
+  for +r: Nat
+  for +e: Nat
+  {gram_budget_ok(u, 1n+Nat.add(r, e), Nat.add(u, r)) == False{} : Bool}
+
+def gram_budget_past_cap_refused(u, r, e):
+  %Equal.sym(Bool, gram_budget_ok(u, 1n+Nat.add(r, e), Nat.add(u, r)), Nat.is_le(1n+Nat.add(r, e), r), gram_budget_shift(u, 1n+Nat.add(r, e), r)) : {_ == False{} : Bool}
+  gram_le_succ_add_false(r, e)
+
+# promise: a charge that fits in what is left of a budget is accepted
+# catches: gram_budget_ok uses Nat.is_lt(add, Nat.sub(cap, used)) (a charge that fills the budget exactly refused)
+law gram_budget_within_cap_ok:
+  for +u: Nat
+  for +a: Nat
+  for +e: Nat
+  {gram_budget_ok(u, a, Nat.add(u, Nat.add(a, e))) == True{} : Bool}
+
+def gram_budget_within_cap_ok(u, a, e):
+  %Equal.sym(Bool, gram_budget_ok(u, a, Nat.add(u, Nat.add(a, e))), Nat.is_le(a, Nat.add(a, e)), gram_budget_shift(u, a, Nat.add(a, e))) : {_ == True{} : Bool}
+  L.nat_add_le_r(a, e)
+
+# promise: a ledger already past its budget accepts no charge, not even an empty one
+# catches: gram_budget_ok drops the Nat.is_le(used, cap) term (a saturated Nat.sub leaves room 0, and a zero charge passes)
+law gram_budget_over_refused:
+  for +c: Nat
+  for +e: Nat
+  for +a: Nat
+  {gram_budget_ok(1n+Nat.add(c, e), a, c) == False{} : Bool}
+
+def gram_budget_over_refused(c, e, a):
+  %Equal.sym(Bool, Nat.is_le(1n+Nat.add(c, e), c), False{}, gram_le_succ_add_false(c, e)) : {Bool.and(_, Nat.is_le(a, Nat.sub(c, 1n+Nat.add(c, e)))) == False{} : Bool}
+  {==}
+
+# promise: a mask cache within its cap stays within it after any new entry
+# harm: a schema whose every step is a new state (a counted array) would fill the host's memory with masks
+# catches: gram_cache_act returns GcKeep{} whatever the cap (every mask kept)
+law gram_cache_within_cap:
+  for +h: Nat
+  for +r: Nat
+  for +a: Nat
+  {Nat.is_le(gram_cache_held(gram_cache_act(h, a, Nat.add(h, r)), h, a), Nat.add(h, r)) == True{} : Bool}
+
+def gram_cache_within_cap(h, r, a):
+  gram_cache_bound_go(h, a, r, gram_budget_ok(h, a, Nat.add(h, r)), {==})
+
+# promise: an entry that fits beside what the cache holds is kept
+# catches: gram_cache_act returns GcClear{} (nothing ever cached)
+law gram_cache_keeps_what_fits:
+  for +h: Nat
+  for +a: Nat
+  for +e: Nat
+  {gram_cache_act(h, a, Nat.add(h, Nat.add(a, e))) == GcKeep{} : GramCacheAct}
+
+def gram_cache_keeps_what_fits(h, a, e):
+  %Equal.sym(Bool, gram_budget_ok(h, a, Nat.add(h, Nat.add(a, e))), True{}, gram_budget_within_cap_ok(h, a, e)) : {gram_cache_pick(_) == GcKeep{} : GramCacheAct}
+  {==}
+
+# promise: a kept entry's bytes are counted beside what the cache held
+# harm: an undercounted ledger would let the cache grow past its cap
+# catches: the GcKeep arm of gram_cache_held returns held (the new entry not counted)
+law gram_cache_keep_counts:
+  for h: Nat
+  for a: Nat
+  {gram_cache_held(GcKeep{}, h, a) == Nat.add(h, a) : Nat}
+
+def gram_cache_keep_counts(h, a):
+  {==}
+
+# promise: an emptied cache counts no bytes
+# catches: the GcClear arm of gram_cache_held returns held (the ledger keeps what was freed, and the cache stops caching)
+law gram_cache_clear_empties:
+  for h: Nat
+  for a: Nat
+  {gram_cache_held(GcClear{}, h, a) == 0n : Nat}
+
+def gram_cache_clear_empties(h, a):
+  {==}
+
+# promise: a control token is never admitted in the constrained answer
+# harm: a token that adds no text would pass the mask, and the model could end or switch modes outside the format
+# catches: gram_control_free returns True{} in the GpAnswer arm
+law gram_control_refused_in_answer:
+  {gram_control_free(GpAnswer{}) == False{} : Bool}
+
+def gram_control_refused_in_answer():
+  {==}
+
+# promise: while the model reasons, a control token stays free
+# catches: gram_control_free returns False{} in the GpThink arm (the reasoning loses its control tokens)
+law gram_control_free_in_think:
+  {gram_control_free(GpThink{}) == True{} : Bool}
+
+def gram_control_free_in_think():
+  {==}

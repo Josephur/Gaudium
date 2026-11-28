@@ -3173,7 +3173,7 @@ impl Qwen3Engine {
             .map(|&c| u16::from_le_bytes(c))
             .collect();
         let dev_sp = samp_rt::dev_params(params, self.spec.vocab);
-        let mask = self.gram.as_mut().map(|g| g.mask());
+        let mask = self.gram.as_mut().map(|g| g.mask()).transpose()?;
         crate::sampler_penalty::pick_masked(
             &params.penalties,
             &self.pen,
@@ -4061,11 +4061,14 @@ impl Qwen3Engine {
         let decode_ms = piped_ms.unwrap_or_else(|| t_decode.elapsed().as_secs_f64() * 1000.0);
         if let Some(g) = self.gram.take() {
             eprintln!(
-                "[grammar] {}: {} masks built in {:.1} ms, {} served from the cache, {} decode steps in {:.1} ms",
+                "[grammar] {}: {} masks built in {:.1} ms (at most {} steps each), {} served from the cache ({} KiB held, emptied {} times), {} decode steps in {:.1} ms",
                 g.label(),
                 g.stats.masks_built,
                 g.stats.mask_ms,
+                g.stats.mask_work_max,
                 g.stats.cache_hits,
+                g.cache_bytes() >> 10,
+                g.stats.cache_clears,
                 decode_steps,
                 decode_ms
             );
