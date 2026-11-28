@@ -499,6 +499,33 @@ mod tests {
     }
 
     #[test]
+    fn releasing_the_request_body_does_not_hide_the_text_kept() {
+        // Codex repro (#136): each file part's base64 string was allocated before the
+        // expansion started counting; freeing it as the part became text took its size from
+        // the count, so twenty 128 KiB text files kept 2,621,440 bytes under a 1 MiB cap
+        let c = Ctx {
+            limits: pdf::Limits {
+                max_heap: 1 << 20,
+                ..pdf::Limits::default()
+            },
+            fetch: None,
+        };
+        let text = "x".repeat(128 << 10);
+        let one = format!("data:text/plain;base64,{}", b64(text.as_bytes()));
+        let mut body = chat_files(20, &one);
+        let e = expand_chat(&mut body, &c).unwrap_err();
+        assert!(
+            e.contains("they hold more than 1048576 bytes of memory (--pdf-max-heap-mb)"),
+            "{e}"
+        );
+        // under the cap they are read
+        let mut body = chat_files(4, &one);
+        expand_chat(&mut body, &c).unwrap();
+        assert!(body.dump().len() > 4 * (128 << 10));
+        assert_eq!(crate::heap_meter::reading(), None);
+    }
+
+    #[test]
     fn chat_file_parts_become_text() {
         let body = |data: &str| {
             parse_json(&format!(
