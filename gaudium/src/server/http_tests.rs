@@ -8,6 +8,10 @@ use std::io::{Read, Write};
 use super::*;
 use crate::engine::{GenParams, GenReport};
 
+/// The plain text completion endpoints, on this file's harness.
+#[path = "completion_http_tests.rs"]
+mod completion_http_tests;
+
 const TOOLS: &str = r#""tools":[{"type":"function","function":{"name":"get_weather","description":"Weather.","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}},{"type":"function","function":{"name":"now","parameters":{"type":"object","properties":{}}}}]"#;
 
 /// The tower inputs of each request a scripted engine ran: `(grid rows, grid columns, values)`.

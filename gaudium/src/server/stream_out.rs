@@ -158,11 +158,23 @@ impl Drop for KeepAlive {
     }
 }
 
+/// The shape of the text chunks a stream carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChunkForm {
+    /// Chat-completion chunks (`choices[].delta`).
+    Chat,
+    /// Text-completion chunks (`choices[].text`).
+    Text,
+    /// The native completion shape (`content`, `stop`).
+    Native,
+}
+
 pub(super) struct StreamOut {
     /// `None`: a non-streaming request (nothing is written; counters still run).
     stream: Option<SseSink>,
-    /// `"id":..,"object":"chat.completion.chunk","created":..,"model":..` of every chunk.
+    /// `"id":..,"object":..,"created":..,"model":..` of every chunk (not of native chunks).
     chunk_head: String,
+    form: ChunkForm,
     timings_per_token: bool,
     return_progress: bool,
     n_prompt: u64,
@@ -199,14 +211,20 @@ impl StreamOut {
         n_prompt: u64,
         feed: bool,
         cancel: Arc<AtomicBool>,
+        form: ChunkForm,
     ) -> Self {
+        let object = match form {
+            ChunkForm::Chat => "chat.completion.chunk",
+            ChunkForm::Text | ChunkForm::Native => "text_completion",
+        };
         Self {
             stream,
             chunk_head: format!(
-                "\"id\":{},\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":{}",
+                "\"id\":{},\"object\":\"{object}\",\"created\":{created},\"model\":{}",
                 jq(req_id),
                 jq(model_id)
             ),
+            form,
             timings_per_token,
             return_progress,
             n_prompt,
@@ -320,15 +338,14 @@ impl StreamOut {
             return;
         }
         self.last_progress = Some(now);
-        let chunk = format!(
-            "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":null}}],\
-             \"prompt_progress\":{{\"total\":{},\"cache\":{},\"processed\":{},\"time_ms\":{:.1}}}}}\n\n",
-            self.chunk_head,
+        let progress = format!(
+            "\"prompt_progress\":{{\"total\":{},\"cache\":{},\"processed\":{},\"time_ms\":{:.1}}}",
             self.n_prompt,
             ev.prompt_cached.min(self.n_prompt),
             ev.prefill_pos.min(self.n_prompt),
             ev.request_ms,
         );
+        let chunk = self.text_chunk(None, &format!(",{progress}"));
         self.write(&chunk);
     }
 
@@ -355,18 +372,36 @@ impl StreamOut {
         if !has_text && !self.timings_per_token {
             return;
         }
-        let delta = delta_json(&std::mem::take(&mut self.pending));
+        let pending = std::mem::take(&mut self.pending);
         let timings = if self.timings_per_token {
             format!(",\"timings\":{}", self.timings().json())
         } else {
             String::new()
         };
-        let chunk = format!(
-            "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{delta},\"finish_reason\":null}}]{timings}}}\n\n",
-            self.chunk_head
-        );
+        let chunk = self.text_chunk(Some(&pending), &timings);
         self.chunks += 1;
         self.write(&chunk);
+    }
+
+    /// One framed chunk of this stream's form that has not ended: `d` its text (`None`: no
+    /// text), `extra` further top-level members (each led by a comma).
+    pub fn text_chunk(&self, d: Option<&Delta>, extra: &str) -> String {
+        match self.form {
+            ChunkForm::Chat => format!(
+                "data: {{{},\"choices\":[{{\"index\":0,\"delta\":{},\"finish_reason\":null}}]{extra}}}\n\n",
+                self.chunk_head,
+                d.map_or_else(|| "{}".to_string(), delta_json),
+            ),
+            ChunkForm::Text => format!(
+                "data: {{{},\"choices\":[{{\"index\":0,\"text\":{},\"logprobs\":null,\"finish_reason\":null}}]{extra}}}\n\n",
+                self.chunk_head,
+                jq(&d.map(plain_text).unwrap_or_default()),
+            ),
+            ChunkForm::Native => format!(
+                "data: {{\"content\":{},\"stop\":false{extra}}}\n\n",
+                jq(&d.map(plain_text).unwrap_or_default()),
+            ),
+        }
     }
 
     /// Writes one already-framed SSE payload; a failed write cancels the request.
@@ -381,6 +416,14 @@ impl StreamOut {
             }
         }
     }
+}
+
+/// The text of a completion's output: a completion splits off no reasoning and parses no tool
+/// calls, so this is its content (with any reasoning first).
+pub(super) fn plain_text(d: &Delta) -> String {
+    let mut s = d.reasoning.clone();
+    s.push_str(&d.content);
+    s
 }
 
 /// The `delta` object of a chat-completion chunk: reasoning, content and tool-call fragments
@@ -480,6 +523,7 @@ mod tests {
             50,
             feed,
             Arc::new(AtomicBool::new(false)),
+            ChunkForm::Chat,
         )
     }
 
