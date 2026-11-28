@@ -16,13 +16,11 @@ use crate::verified as v;
 /// Decodes `data` through the filters named in `dict`. The raw bytes are charged first; each
 /// stage may produce the bytes the budget still has room for, and its output is charged.
 pub(crate) fn decode(dict: &Dict, data: &[u8], budget: &mut Budget) -> Result<Vec<u8>, Fail> {
-    let filters: Vec<Vec<u8>> = match dict.get(b"Filter").or_else(|| dict.get(b"F")) {
+    // the names are borrowed: an array may list one shared name many times
+    let filters: Vec<&[u8]> = match dict.get(b"Filter").or_else(|| dict.get(b"F")) {
         None | Some(Obj::Null) => Vec::new(),
-        Some(Obj::Name(n)) => vec![n.to_vec()],
-        Some(Obj::Array(a)) => a
-            .iter()
-            .filter_map(|o| o.as_name().map(<[u8]>::to_vec))
-            .collect(),
+        Some(Obj::Name(n)) => vec![&n[..]],
+        Some(Obj::Array(a)) => a.iter().filter_map(Obj::as_name).collect(),
         Some(_) => return Err(Fail::damaged("a stream's /Filter is not a name")),
     };
     let parms: Vec<Option<&Dict>> = match dict.get(b"DecodeParms").or_else(|| dict.get(b"DP")) {
@@ -38,7 +36,7 @@ pub(crate) fn decode(dict: &Dict, data: &[u8], budget: &mut Budget) -> Result<Ve
         let input: &[u8] = cur.as_deref().unwrap_or(data);
         let room = budget.room();
         let cap = usize::try_from(room).unwrap_or(usize::MAX);
-        let (stage, predicted) = match f.as_slice() {
+        let (stage, predicted) = match *f {
             b"FlateDecode" | b"Fl" => (
                 crate::vision::decode::inflate::zlib_decompress(input, cap)
                     .map_err(|e| inflate_fail(&e, room)),

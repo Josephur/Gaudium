@@ -1853,3 +1853,33 @@ fn the_default_heap_cap_is_pinned() {
     let l = Limits::default();
     assert!(l.max_heap >= 3 * l.max_decoded);
 }
+
+#[test]
+fn a_shared_filter_name_is_not_copied_per_use() {
+    // Codex repro: a 64 KiB name, one indirect object, listed 1,000 times in /Filter
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let f1 = p.add(HELVETICA);
+    let name = p.add(format!("/{}", "N".repeat(65_536)));
+    let filters = vec![format!("{name} 0 R"); 1_000].join(" ");
+    let content = p.add(stream(&format!("/Filter [{filters}]"), b"x"));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    let file = p.table(catalog, "");
+    assert!(file.len() < 80_000, "{}", file.len());
+    let lim = Limits {
+        max_decoded: 1 << 20,
+        ..Limits::default()
+    };
+    let (got, peak) = peak_heap(|| extract_text(&file, &lim));
+    // the unknown filter leaves the page without text; the names are never copied
+    assert!(matches!(got, Err(Fail::NoText { pages: 1 })), "{got:?}");
+    assert!(peak < 8 << 20, "{peak}");
+}
