@@ -6,6 +6,9 @@
 //!   `/health`, `/tokenize`, `/detokenize`, `/slots`, `/models/load`, `/models/unload`)
 //! - Plain text completions without a chat template (`/v1/completions`, `/completions` in the
 //!   OpenAI text-completion shape, `/completion` in the native shape; see `completion.rs`)
+//! - The OpenAI Responses API (`POST /v1/responses`; stored responses at `GET` / `DELETE
+//!   /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel`;
+//!   see `responses.rs`, `response_store.rs`)
 //! - The model list as server-sent events for a model picker (`/models/sse`)
 //! - Gaudium UI telemetry & card-lifecycle endpoints (`/gaudium/ui`, `/gaudium/engine`,
 //!   `/gaudium/live`, `/gaudium/events`, `/gaudium/count_tokens`, `/v1/chat/completions/control`)
@@ -68,6 +71,8 @@ mod proxy;
 mod readout;
 mod requests;
 mod routes;
+mod response_store;
+mod responses;
 mod stream_out;
 
 use chat::{ChatPrompt, ChatTemplate};
@@ -95,12 +100,15 @@ pub fn hsts_max_age_for(tls: bool, port: u16, requested: Option<u64>) -> Result<
 }
 use conn::Conn;
 pub use proxy::ProxyOptions;
+pub use response_store::{StoreLimits as ResponseStoreLimits, DEFAULT_ENTRIES as DEFAULT_RESPONSE_STORE_ENTRIES, DEFAULT_MIB as DEFAULT_RESPONSE_STORE_MIB};
 use outparse::{Delta, OutputFormat, OutputParser};
 use readout::{DrafterFacts, RunFacts, Timings};
 use stream_out::{ChunkForm, SseSink, StreamOut};
 
 /// Largest request body. Images and video frames travel inside the request as base64.
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// How long `POST /v1/responses/{id}/cancel` waits for the cancelled response's own reply.
+const CANCEL_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Server defaults of the vision tower (`--vision-max-patches`, `--vision-max-tokens`): images
 /// of up to 4096 patches (1024 x 1024 pixels; larger ones are resized down to it) and 16384
@@ -175,6 +183,9 @@ pub struct ServerConfig {
     /// Device-trace windows (`--profile-steps`) of the batched launches of a model served with
     /// lanes; empty = none.
     pub profile: Vec<crate::synapse::profiler::ProfileWindow>,
+    /// Bounds of the in-memory store of past responses (`--response-store`,
+    /// `--response-store-mb`; 0 entries = off).
+    pub response_store: ResponseStoreLimits,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -424,6 +435,9 @@ struct AppState {
     /// How long a streamed chat reply goes without a write before a keep-alive goes out (ms):
     /// [`SSE_HEARTBEAT`] in service, shorter in tests.
     stream_heartbeat_ms: AtomicU64,
+    /// Past responses of `POST /v1/responses` (bounded; `response_store.rs`), and the request
+    /// context of those still being generated.
+    responses: response_store::ResponseStore,
 }
 
 impl AppState {
@@ -1821,6 +1835,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
         lanes: lanes::LaneHub::new(n_models),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
+        responses: response_store::ResponseStore::new(cfg.response_store),
     });
 
     // The recipe-cache trim starts once the first load has taken (and marked) its recipes, so it
@@ -2400,6 +2415,16 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
             );
         }
         ("POST", "/v1/messages/count_tokens") => handle_messages_count(&state, &req, &mut stream),
+        ("POST", "/v1/responses") => handle_responses(&state, &req, &mut stream),
+        ("GET", p) if p.starts_with("/v1/responses/") => {
+            handle_stored_response(&state, "GET", &p["/v1/responses/".len()..], &req, &mut stream);
+        }
+        ("DELETE", p) if p.starts_with("/v1/responses/") => {
+            handle_stored_response(&state, "DELETE", &p["/v1/responses/".len()..], &req, &mut stream);
+        }
+        ("POST", p) if p.starts_with("/v1/responses/") => {
+            handle_stored_response(&state, "POST", &p["/v1/responses/".len()..], &req, &mut stream);
+        }
         ("POST", "/apply-template") => handle_apply_template(&state, &req, &mut stream),
         ("GET", _) => handle_static_ui(&state, &req.path, &mut stream, true),
         ("HEAD", _) => handle_static_ui(&state, &req.path, &mut stream, false),
@@ -2966,6 +2991,7 @@ impl Drop for Turn<'_> {
 impl TurnQueue {
     /// Waits for this request's turn on the card. `ready` reads the model loaded now (it takes the slot
     /// lock; this queue's lock is always taken first).
+    #[cfg(test)]
     fn acquire(
         &self,
         model: usize,
@@ -2973,6 +2999,19 @@ impl TurnQueue {
         limits: impl Fn() -> TurnLimits,
     ) -> Turn<'_> {
         self.acquire_from(model, Instant::now(), ready, limits)
+    }
+
+    /// [`Self::acquire`] for a request that may be cancelled while it waits: `gone` turns true
+    /// when it is (polled at least once a second, and on [`Self::wake`]). `None`: it left the
+    /// queue without the card.
+    fn acquire_unless(
+        &self,
+        model: usize,
+        ready: impl Fn() -> Option<usize>,
+        limits: impl Fn() -> TurnLimits,
+        gone: impl Fn() -> bool,
+    ) -> Option<Turn<'_>> {
+        self.wait_turn(model, Instant::now(), ready, limits, gone)
     }
 
     /// [`Self::acquire`] for a waiter that has waited since `since` (a lane session queues at its
@@ -2984,6 +3023,23 @@ impl TurnQueue {
         ready: impl Fn() -> Option<usize>,
         limits: impl Fn() -> TurnLimits,
     ) -> Turn<'_> {
+        self.wait_turn(model, since, ready, limits, || false)
+            .expect("a waiter that never gives up gets its turn")
+    }
+
+    /// Wakes every waiter, so one whose request was cancelled leaves the queue now.
+    fn wake(&self) {
+        self.cv.notify_all();
+    }
+
+    fn wait_turn(
+        &self,
+        model: usize,
+        since: Instant,
+        ready: impl Fn() -> Option<usize>,
+        limits: impl Fn() -> TurnLimits,
+        gone: impl Fn() -> bool,
+    ) -> Option<Turn<'_>> {
         let mut st = self.mu.lock().unwrap();
         let id = st.next_id;
         st.next_id += 1;
@@ -2998,6 +3054,13 @@ impl TurnQueue {
             },
         );
         loop {
+            if gone() {
+                // it leaves its place; the waiters behind it may now be next
+                st.waiting.retain(|w| w.id != id);
+                drop(st);
+                self.cv.notify_all();
+                return None;
+            }
             if !st.busy {
                 if let Some(pos) = next_turn(&st.waiting, ready(), Instant::now(), limits()) {
                     if st.waiting[pos].id == id {
@@ -3013,7 +3076,7 @@ impl TurnQueue {
                         }
                         st.waiting.remove(pos);
                         st.busy = true;
-                        return Turn(self);
+                        return Some(Turn(self));
                     }
                 }
             }
@@ -3212,8 +3275,11 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
         return;
     };
     let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if let Some(flag) = state.cancels.lock().unwrap().get(id) {
+    let flag = state.cancels.lock().unwrap().get(id).cloned();
+    if let Some(flag) = flag {
         flag.store(true, Ordering::Relaxed);
+        // a request that waits for the card leaves the queue now
+        state.turns.wake();
         write_json(stream, 200, "{\"ok\":true}");
     } else {
         write_json(stream, 200, "{\"ok\":false}");
@@ -3235,6 +3301,8 @@ enum Api {
     /// `/v1/completions` and `/completions` (the text-completion shape), or `/completion`
     /// (`native`: the native completion shape).
     Completion { native: bool },
+    /// `/v1/responses`: output items and semantic events (`responses.rs`).
+    Responses,
 }
 
 impl Api {
@@ -3246,14 +3314,16 @@ impl Api {
                 let status = if status == 503 { 529 } else { status };
                 write_json(stream, status, &anthropic::error_json(status, msg));
             }
+            Api::Responses => write_json(stream, status, &responses::error_json(msg, err_type, None)),
         }
     }
 
     /// What keeps a streamed reply open while nothing else is written: a `ping` event on the
-    /// Messages stream, a comment line on the chat-completions stream (clients skip both).
+    /// Messages stream, a comment line on the chat-completions, completions and Responses
+    /// streams (clients skip both).
     fn keep_alive_line(self) -> String {
         match self {
-            Api::Chat | Api::Completion { .. } => ": keep-alive\n\n".to_string(),
+            Api::Chat | Api::Completion { .. } | Api::Responses => ": keep-alive\n\n".to_string(),
             Api::Messages { .. } => anthropic::sse("ping", "{\"type\":\"ping\"}"),
         }
     }
@@ -3271,7 +3341,73 @@ impl Api {
                 jq(msg)
             ),
             Api::Messages { .. } => anthropic::sse("error", &anthropic::error_json(status, msg)),
+            Api::Responses => responses::stream_error(msg),
         }
+    }
+}
+
+/// A request's entry in the cancel table (`AppState::cancels`); dropping it removes the entry,
+/// so a request leaves no entry behind on any way out.
+struct CancelEntry<'a> {
+    cancels: &'a Mutex<HashMap<String, Arc<AtomicBool>>>,
+    id: &'a str,
+}
+
+impl Drop for CancelEntry<'_> {
+    fn drop(&mut self) {
+        self.cancels.lock().unwrap().remove(self.id);
+    }
+}
+
+/// Ends a response: closes its open item, keeps it in the store unless the request said
+/// `store: false`, a DELETE reached it, or the store can not take it, and hands the response
+/// object to a cancel waiting for it. Returns the events still to write (the terminal one last)
+/// and the response object.
+fn end_response(
+    state: &AppState,
+    b: &mut responses::Builder,
+    req_id: &str,
+    ending: responses::Ending,
+    usage: &str,
+    extra: &str,
+) -> (String, String) {
+    let mut events = b.close(ending);
+    let stored = match state.responses.put(req_id, b.head().store, || {
+        response_store::StoredResponse {
+            id: req_id.to_string(),
+            response: b.response(ending, None, usage, true, extra, false),
+            input: b.head().input.clone(),
+            own_from: b.head().own_from,
+        }
+    }) {
+        Ok(kept) => kept,
+        Err(e) => {
+            eprintln!("[server] response {req_id} not stored: {e}");
+            false
+        }
+    };
+    let resp = b.response(ending, None, usage, stored, extra, false);
+    state.responses.settle(req_id, &resp);
+    events.push_str(&b.finish(ending, &resp));
+    (events, resp)
+}
+
+/// The events that end a stream that failed: a response that began ends as `response.failed`
+/// in its own sequence (`resp`: its builder); every other stream gets its API's error event.
+fn stream_fail_events(
+    api: Api,
+    resp: Option<&mut responses::Builder>,
+    status: u16,
+    msg: &str,
+) -> String {
+    match resp {
+        Some(b) => {
+            let mut events = b.close(responses::Ending::Failed);
+            let r = b.response(responses::Ending::Failed, Some(msg), "null", false, "", false);
+            events.push_str(&b.finish(responses::Ending::Failed, &r));
+            events
+        }
+        None => api.stream_error(status, msg),
     }
 }
 
@@ -3416,6 +3552,179 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut Conn)
     match rendered {
         Ok(n) => write_json(stream, 200, &format!("{{\"input_tokens\":{n}}}")),
         Err(e) => api.error(stream, 400, "invalid_request_error", &e),
+    }
+}
+
+/// `POST /v1/responses`: the request is translated into a chat request and runs on the chat
+/// path; the response is kept in the response store unless it asks for `store: false`.
+fn handle_responses(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
+    let api = Api::Responses;
+    let body_str = String::from_utf8_lossy(&req.body);
+    let Ok(val) = json::parse_json(&body_str) else {
+        api.error(stream, 400, "invalid_request_error", "invalid JSON body");
+        return;
+    };
+    let id = match responses::new_response_id() {
+        Ok(id) => id,
+        Err(e) => {
+            write_json(stream, 500, &responses::error_json(&e, "server_error", None));
+            return;
+        }
+    };
+    let store_on = state.responses.limits().entries > 0;
+    let t = match responses::translate(&val, &id, &|pid| state.responses.get(pid), store_on) {
+        Ok(t) => t,
+        Err(r) => {
+            write_json(
+                stream,
+                r.status,
+                &responses::error_json(&r.message, "invalid_request_error", r.param.as_deref()),
+            );
+            return;
+        }
+    };
+    if let Err(e) = state.responses.begin(&id, t.head) {
+        write_json(stream, 503, &responses::error_json(&e, "server_error", None));
+        return;
+    }
+    // released on every way out, a panic in the chat path included
+    let _in_flight = InFlight {
+        store: &state.responses,
+        id: &id,
+    };
+    run_chat(state, &t.chat, stream, api, t.ignored);
+}
+
+/// A response's in-flight entry; dropping it ends the entry (`ResponseStore::end`), so its
+/// bytes never stay counted after the request is gone.
+struct InFlight<'a> {
+    store: &'a response_store::ResponseStore,
+    id: &'a str,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.store.end(self.id);
+    }
+}
+
+/// `GET` / `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items` and
+/// `POST /v1/responses/{id}/cancel` (`rest`: the path after `/v1/responses/`).
+fn handle_stored_response(
+    state: &AppState,
+    method: &str,
+    rest: &str,
+    req: &HttpRequest,
+    stream: &mut Conn,
+) {
+    let not_found = |stream: &mut Conn, id: &str| {
+        write_json(
+            stream,
+            404,
+            &responses::error_json(
+                &format!("No response found with id '{id}'."),
+                "invalid_request_error",
+                None,
+            ),
+        );
+    };
+    let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    match (method, tail) {
+        ("GET", "") => match state.responses.get(id) {
+            Some(_) if req.query.get("stream").map(String::as_str) == Some("true") => write_json(
+                stream,
+                400,
+                &responses::error_json(
+                    "stream: replaying a stored response as events is not supported; read it without stream",
+                    "invalid_request_error",
+                    Some("stream"),
+                ),
+            ),
+            Some(r) => write_json(stream, 200, &r.response),
+            None => not_found(stream, id),
+        },
+        ("DELETE", "") => match state.responses.delete(id) {
+            response_store::Deleted::None => not_found(stream, id),
+            found => {
+                // a response still being generated stops at its next step, or leaves the card's
+                // queue if it waits there, and is not kept
+                if found == response_store::Deleted::Running {
+                    if let Some(flag) = state.cancels.lock().unwrap().get(id) {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    state.turns.wake();
+                }
+                write_json(
+                    stream,
+                    200,
+                    &format!("{{\"id\":{},\"object\":\"response.deleted\",\"deleted\":true}}", jq(id)),
+                );
+            }
+        },
+        ("GET", "input_items") => match state.responses.get(id) {
+            Some(r) => match responses::input_items_page(
+                &r,
+                req.query.get("after").map(String::as_str),
+                req.query.get("limit").map(String::as_str),
+                req.query.get("order").map(String::as_str),
+            ) {
+                Ok(page) => write_json(stream, 200, &page),
+                Err(e) => write_json(
+                    stream,
+                    400,
+                    &responses::error_json(&e, "invalid_request_error", e.split(':').next()),
+                ),
+            },
+            None => not_found(stream, id),
+        },
+        ("POST", "cancel") => {
+            // a response still being generated stops at its next step; a finished one is final
+            // the watch is taken first, so a reply that comes as soon as the flag is set is seen
+            let watch = state.responses.watch(id);
+            let flag = state.cancels.lock().unwrap().get(id).cloned();
+            match (flag, watch) {
+                (Some(flag), Some(watch)) => {
+                    flag.store(true, Ordering::Relaxed);
+                    // (one that waits for the card leaves the queue now)
+                    state.turns.wake();
+                    // the reply is the response as its generation ends it (the same object its
+                    // own request and a later GET see), once the generation has it
+                    match watch.wait(CANCEL_REPLY_WAIT) {
+                        Some(r) => write_json(stream, 200, &r),
+                        None => {
+                            // it ended without a response object (its request failed), or it
+                            // did not reach its end in time
+                            let head = state.responses.head(id).unwrap_or_default();
+                            let created = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |d| d.as_secs());
+                            let b = responses::Builder::new(head, id, "", created, 0.0, 0.0);
+                            write_json(
+                                stream,
+                                200,
+                                &b.response(responses::Ending::Cancelled, None, "null", false, "", false),
+                            );
+                        }
+                    }
+                }
+                _ if state.responses.get(id).is_some() => write_json(
+                    stream,
+                    400,
+                    &responses::error_json(
+                        &format!("Response '{id}' has already finished; only a response still being generated can be cancelled."),
+                        "invalid_request_error",
+                        None,
+                    ),
+                ),
+                _ => not_found(stream, id),
+            }
+        }
+        _ => write_error(
+            stream,
+            404,
+            "not_found_error",
+            &format!("unknown endpoint {} {}", req.method, req.path),
+        ),
     }
 }
 
@@ -3708,6 +4017,10 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                     "prompt is too long: {n_prompt} tokens > {} maximum",
                     crate::core::budget::advertised_served_ctx(m.max_ctx).saturating_sub(1)
                 ),
+                Api::Responses => format!(
+                    "Your input ({n_prompt} tokens) exceeds the context window of this model ({} tokens).",
+                    crate::core::budget::advertised_served_ctx(m.max_ctx)
+                ),
             };
             api.error(stream, 400, "invalid_request_error", &msg);
             return;
@@ -3795,6 +4108,11 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         Api::Chat => format!("chatcmpl-gaudium-{req_num}"),
         Api::Messages { .. } => format!("msg_gaudium_{req_num}"),
         Api::Completion { .. } => format!("cmpl-gaudium-{req_num}"),
+        // the id the translation gave the response
+        Api::Responses => val
+            .get("gaudium_response_id")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| format!("resp_gaudium_{req_num}"), str::to_string),
     };
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3807,8 +4125,9 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     // no reasoning span (its output is its text as generated): its parser already reported the
     // field as unknown.
     let think_close_ids: Vec<i32> = m.tokenizer.encode(&m.format.think_close, true);
+    // (the Responses translation sets no budget: its reasoning control is `reasoning.effort`)
     let think_field = match api {
-        Api::Chat | Api::Completion { .. } => "thinking_budget_tokens",
+        Api::Chat | Api::Completion { .. } | Api::Responses => "thinking_budget_tokens",
         Api::Messages { .. } => "thinking.budget_tokens",
     };
     let think_budget = match val.get("thinking_budget_tokens").and_then(|v| v.as_u64()) {
@@ -3846,6 +4165,26 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         return;
     }
     let cancel_flag = Arc::new(AtomicBool::new(false));
+    // The request can be cancelled from now on (`/v1/chat/completions/control`, a DELETE or a
+    // cancel of a response), while it waits for the card too: a cancelled request leaves the
+    // queue and never reaches the engine. The entry goes when this function returns.
+    state
+        .cancels
+        .lock()
+        .unwrap()
+        .insert(req_id.clone(), Arc::clone(&cancel_flag));
+    let _cancel_entry = CancelEntry {
+        cancels: &state.cancels,
+        id: &req_id,
+    };
+    // Verified RequestGuard tracks request lifecycle transitions!
+    let mut rguard = RequestGuard::new();
+    fn step_request_guard(rguard: &mut RequestGuard, ev: ReqEvent, req_id: &str) {
+        if let Err(e) = rguard.apply(ev) {
+            eprintln!("[server] request {req_id} invalid lifecycle transition: {e:?}");
+            debug_assert!(false, "request {req_id} invalid lifecycle transition: {e:?}");
+        }
+    }
     // A streamed request is admitted: its stream begins now, before it waits for the card (the
     // queue, a model load, a lane) and for its prefill, and a keep-alive goes out whenever a
     // heartbeat passes without a write, so no idle timeout cuts a reply that has not begun. A
@@ -3863,6 +4202,16 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         // the message as it begins; the client gets its blocks once the engine generates
         let _ = s.write(anthropic::Builder::message_start(&req_id, &m.id, n_prompt).as_bytes());
     }
+    // A response's output items are built from admission on: its stream begins with
+    // `response.created` and `response.in_progress`, so the client has the response's id (to
+    // cancel or delete it) while it waits for the card.
+    let mut resp_start = (api == Api::Responses).then(|| {
+        let head = state.responses.head(&req_id).unwrap_or_default();
+        responses::Builder::new(head, &req_id, &m.id, created, temperature, top_p)
+    });
+    if let (Some(s), Some(b)) = (&sink, resp_start.as_mut()) {
+        let _ = s.write(b.start().as_bytes());
+    }
     let _keep_alive = sink.as_ref().and_then(|s| {
         s.keep_alive(
             api.keep_alive_line(),
@@ -3871,9 +4220,9 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         )
     });
     // An error after the stream began: an error event, then the end of the stream.
-    let stream_fail = |status: u16, msg: &str| {
+    let stream_fail = |resp: &mut Option<responses::Builder>, status: u16, msg: &str| {
         if let Some(s) = &sink {
-            let _ = s.write(api.stream_error(status, msg).as_bytes());
+            let _ = s.write(stream_fail_events(api, resp.as_mut(), status, msg).as_bytes());
             s.end();
         }
     };
@@ -3897,6 +4246,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             Api::Messages { .. } => "messages",
             Api::Completion { native: false } => "completions",
             Api::Completion { native: true } => "completion",
+            Api::Responses => "responses",
         },
         model: m.id.clone(),
         stream: stream_mode,
@@ -3910,19 +4260,66 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let lane_mode = m.lanes > 1;
     // One turn covers the model load and the generation, so no request for another model can swap the card
     // between them; a request for the model already on the card may go ahead of older ones (TurnQueue).
-    let turn = (!lane_mode).then(|| {
-        state.turns.acquire(
-            idx,
-            || state.ready_model(),
-            || TurnLimits::read(state.cfg.queue_config.as_deref()),
-        )
-    });
+    // A request cancelled while it waits leaves the queue (`None`).
+    let turn = (!lane_mode)
+        .then(|| {
+            state.turns.acquire_unless(
+                idx,
+                || state.ready_model(),
+                || TurnLimits::read(state.cfg.queue_config.as_deref()),
+                || cancel_flag.load(Ordering::Relaxed),
+            )
+        })
+        .flatten();
+
+    // Cancelled while it waited (a cancel, a DELETE of its response, or the client gone): the
+    // request ends here, without the engine.
+    let end_cancelled = |resp: &mut Option<responses::Builder>, stream: &mut Conn| {
+        state.publish_request(
+            req_num,
+            format!(
+                "{{{}}}",
+                req_base("cancelled", t_arrival.elapsed().as_secs_f64() * 1e3)
+            ),
+        );
+        let client_gone = sink.as_ref().is_some_and(SseSink::failed);
+        if let Some(mut b) = resp.take() {
+            // the response ends as cancelled, with no output; kept unless it was deleted
+            let (events, r) =
+                end_response(state, &mut b, &req_id, responses::Ending::Cancelled, "null", "");
+            match &sink {
+                Some(s) => {
+                    let _ = s.write(events.as_bytes());
+                    s.end();
+                }
+                None => write_json(stream, 200, &r),
+            }
+        } else if !client_gone {
+            let msg = "the request was cancelled before it started";
+            match &sink {
+                Some(s) => {
+                    let _ = s.write(api.stream_error(409, msg).as_bytes());
+                    s.end();
+                }
+                None => api.error(stream, 409, "cancelled", msg),
+            }
+        }
+    };
+    // (before any model load: a deleted request never swaps the card's model)
+    if cancel_flag.load(Ordering::Relaxed) {
+        drop(turn);
+        rguard.cancel();
+        debug_assert!(rguard.is_terminal());
+        end_cancelled(&mut resp_start, stream);
+        return;
+    }
 
     // Ensure target model is loaded on Gaudi 2 before starting generation.
     if let Err(e) = (!lane_mode)
         .then(|| state.ensure_loaded(idx, false))
         .unwrap_or(Ok(()))
     {
+        step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
         state.publish_request(
             req_num,
             format!(
@@ -3932,34 +4329,20 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             ),
         );
         if stream_mode {
-            stream_fail(503, &e);
+            stream_fail(&mut resp_start, 503, &e);
         } else {
             api.error(stream, 503, "unavailable_error", &e);
         }
         return;
     }
 
-    state
-        .cancels
-        .lock()
-        .unwrap()
-        .insert(req_id.clone(), Arc::clone(&cancel_flag));
-
-    // Verified RequestGuard tracks request lifecycle transitions!
-    let mut rguard = RequestGuard::new();
-    fn step_request_guard(rguard: &mut RequestGuard, ev: ReqEvent, req_id: &str) {
-        if let Err(e) = rguard.apply(ev) {
-            eprintln!("[server] request {req_id} invalid lifecycle transition: {e:?}");
-            debug_assert!(false, "request {req_id} invalid lifecycle transition: {e:?}");
-        }
-    }
-
-    // The client went away while the request waited (a keep-alive found it gone): the engine
-    // does not take the request.
-    if sink.as_ref().is_some_and(SseSink::failed) {
-        state.cancels.lock().unwrap().remove(&req_id);
+    // Cancelled while the model loaded (the client gone included: its keep-alive sets the flag):
+    // the engine does not take the request.
+    if cancel_flag.load(Ordering::Relaxed) || sink.as_ref().is_some_and(SseSink::failed) {
+        drop(turn);
         rguard.cancel();
         debug_assert!(rguard.is_terminal());
+        end_cancelled(&mut resp_start, stream);
         return;
     }
 
@@ -4024,7 +4407,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 ),
             );
             if stream_mode {
-                stream_fail(503, &e);
+                stream_fail(&mut resp_start, 503, &e);
             } else {
                 api.error(stream, 503, "unavailable_error", &e);
             }
@@ -4073,7 +4456,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                     ),
                 );
                 if stream_mode {
-                    stream_fail(503, msg);
+                    stream_fail(&mut resp_start, 503, msg);
                 } else {
                     api.error(stream, 503, "unavailable_error", msg);
                 }
@@ -4132,7 +4515,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         live.is_some(),
         Arc::clone(&cancel_flag),
         match api {
-            Api::Chat | Api::Messages { .. } => ChunkForm::Chat,
+            Api::Chat | Api::Messages { .. } | Api::Responses => ChunkForm::Chat,
             Api::Completion { native: false } => ChunkForm::Text,
             Api::Completion { native: true } => ChunkForm::Native,
         },
@@ -4157,6 +4540,8 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 let init_chunk = o.text_chunk(None, "");
                 o.write(&init_chunk);
             }
+            // (the Responses stream began with `response.created` at admission)
+            Api::Responses => o.resp = resp_start.take(),
         }
         // A forced tool call's opening is already in the prompt: the parser reads it first.
         if !prompt.forced_prefix.is_empty() {
@@ -4417,6 +4802,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     out.add(tail_delta);
     let pending = out.take_pending();
     let builder = out.anth.take();
+    let mut resp_builder = out.resp.take();
     let first_token_ms = out.first_token_ms();
 
     match report {
@@ -4597,7 +4983,50 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 ),
             );
 
-            if let Api::Messages { show_thinking } = api {
+            if api == Api::Responses {
+                let mut b = resp_builder.unwrap_or_else(|| {
+                    responses::Builder::new(
+                        state.responses.head(&req_id).unwrap_or_default(),
+                        &req_id,
+                        &model_id,
+                        created,
+                        temperature,
+                        top_p,
+                    )
+                });
+                let ending = match end {
+                    GenEnd::GeCancelled => responses::Ending::Cancelled,
+                    GenEnd::GeLength => responses::Ending::Incomplete,
+                    GenEnd::GeEos | GenEnd::GeStopString | GenEnd::GeCallLimit => {
+                        responses::Ending::Completed
+                    }
+                };
+                // reasoning tokens: the reasoning text as the tokenizer counts it
+                let reasoning_tokens = if parser.reasoning().is_empty() {
+                    0
+                } else {
+                    tok_ref.encode(parser.reasoning(), false).len() as u64
+                };
+                let usage = responses::usage_json(
+                    rep.prompt_tokens as u64,
+                    rep.reused_tokens,
+                    n_gen,
+                    reasoning_tokens,
+                );
+                let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
+                let mut events = out.take_held() + &b.feed(&pending);
+                let (end_events, resp) =
+                    end_response(state, &mut b, &req_id, ending, &usage, &extra);
+                events.push_str(&end_events);
+                if stream_mode {
+                    out.write(&events);
+                    if let Some(s) = &sink {
+                        s.end();
+                    }
+                } else {
+                    write_json(stream, 200, &resp);
+                }
+            } else if let Api::Messages { show_thinking } = api {
                 let mut b = builder.unwrap_or_else(|| anthropic::Builder::new(show_thinking));
                 let stop = stop_reason_name(end, has_calls);
                 let usage = anthropic::usage_json_cached(
@@ -4735,7 +5164,14 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 ),
             );
             if stream_mode {
-                out.write(&api.stream_error(500, &e));
+                // a response that began ends as failed, in its own sequence (after the events
+                // its output already built)
+                let mut events = String::new();
+                if resp_builder.is_some() {
+                    events.push_str(&out.take_held());
+                }
+                events.push_str(&stream_fail_events(api, resp_builder.as_mut(), 500, &e));
+                out.write(&events);
                 if let Some(s) = &sink {
                     s.end();
                 }

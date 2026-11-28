@@ -167,6 +167,22 @@ Serve options:
                         cache. Needs
                         --prefix-cache > 0; about 64 KiB per token and 0.15 GiB per
                         kept position for a 16-attention-layer, 48-DeltaNet-layer model
+  --response-store <N>  Responses POST /v1/responses keeps in host memory for GET
+                        /v1/responses/{id}, its input_items and previous_response_id
+                        (default 1024; 0 = off: a request with
+                        previous_response_id is refused). A request with store: false
+                        is never kept, nor one deleted while it is generated (the
+                        DELETE cancels it). When the store is full the oldest responses
+                        leave first; a response larger than the whole store is not kept.
+                        Response ids carry 128 random bits
+  --response-store-mb <MiB>
+                        Bytes the response store may hold, in MiB (default
+                        256). Each response is held as serialised JSON (its
+                        response object and its conversation's input items) and
+                        counts those bytes, its id three times and 256 bytes of
+                        overhead. The request contexts of the responses being
+                        generated are counted apart and bounded to this size plus the
+                        256 MiB request limit; a request past that bound gets a 503
   --queue-config <file> Card-queue settings, re-read on every turn (or GAUDIUM_QUEUE_CONFIG;
                         default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock
                         state dir). Keys: group_max_wait_min (default 45), group_max_skips

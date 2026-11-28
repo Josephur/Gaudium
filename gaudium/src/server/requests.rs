@@ -31,7 +31,7 @@ pub(super) struct RequestMeta {
     /// `/v1/chat/completions/control` cancels by and that `/v1/streams/lookup` filters on.
     pub id: String,
     /// The API the request came in on: `chat` (chat completions), `messages`, `completions`
-    /// (text completions) or `completion` (the native completion shape).
+    /// (text completions), `completion` (the native completion shape) or `responses`.
     pub endpoint: &'static str,
     /// The served model id.
     pub model: String,

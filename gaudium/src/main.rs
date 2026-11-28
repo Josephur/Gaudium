@@ -48,6 +48,8 @@ fn version_line() -> String {
 }
 
 fn print_usage() {
+    let store_n = gaudium::server::DEFAULT_RESPONSE_STORE_ENTRIES;
+    let store_mb = gaudium::server::DEFAULT_RESPONSE_STORE_MIB;
     println!(
         "Gaudium — Intel Gaudi 2 Inference Engine (RustyBends v1)\n\
          \n\
@@ -194,6 +196,22 @@ fn print_usage() {
          \x20                       cache. Needs\n\
          \x20                       --prefix-cache > 0; about 64 KiB per token and 0.15 GiB per\n\
          \x20                       kept position for a 16-attention-layer, 48-DeltaNet-layer model\n\
+         \x20 --response-store <N>  Responses POST /v1/responses keeps in host memory for GET\n\
+         \x20                       /v1/responses/{{id}}, its input_items and previous_response_id\n\
+         \x20                       (default {store_n}; 0 = off: a request with\n\
+         \x20                       previous_response_id is refused). A request with store: false\n\
+         \x20                       is never kept, nor one deleted while it is generated (the\n\
+         \x20                       DELETE cancels it). When the store is full the oldest responses\n\
+         \x20                       leave first; a response larger than the whole store is not kept.\n\
+         \x20                       Response ids carry 128 random bits\n\
+         \x20 --response-store-mb <MiB>\n\
+         \x20                       Bytes the response store may hold, in MiB (default\n\
+         \x20                       {store_mb}). Each response is held as serialised JSON (its\n\
+         \x20                       response object and its conversation's input items) and\n\
+         \x20                       counts those bytes, its id three times and 256 bytes of\n\
+         \x20                       overhead. The request contexts of the responses being\n\
+         \x20                       generated are counted apart and bounded to this size plus the\n\
+         \x20                       256 MiB request limit; a request past that bound gets a 503\n\
          \x20 --queue-config <file> Card-queue settings, re-read on every turn (or GAUDIUM_QUEUE_CONFIG;\n\
          \x20                       default: queue.conf in the parent of GAUDI_LIVE_DIR, the card-lock\n\
          \x20                       state dir). Keys: group_max_wait_min (default 45), group_max_skips\n\
@@ -2526,6 +2544,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut vision_max_tokens = gaudium::server::DEFAULT_VISION_MAX_TOKENS;
     let mut prefix_slots = gaudium::engine::qwen3::prefix_cache::DEFAULT_SLOTS;
     let mut cache_ram_bytes: Option<u64> = None;
+    let mut response_store = gaudium::server::ResponseStoreLimits::default();
     let mut parallel = 1u64;
     let mut cache_max_gb: Option<f64> = None;
     let mut cache_keep_days: Option<f64> = None;
@@ -2759,6 +2778,20 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| format!("invalid --cache-ram '{s}' (GiB, 0 = off)"))?;
                 cache_ram_bytes = Some((gib * (1u64 << 30) as f64) as u64);
             }
+            "--response-store" => {
+                let s = next_val(&mut i, "--response-store")?;
+                response_store.entries = s
+                    .parse()
+                    .map_err(|_| format!("invalid --response-store '{s}' (responses, 0 = off)"))?;
+            }
+            "--response-store-mb" => {
+                let s = next_val(&mut i, "--response-store-mb")?;
+                response_store.bytes = s
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|mb| mb.checked_mul(1 << 20))
+                    .ok_or_else(|| format!("invalid --response-store-mb '{s}' (MiB)"))?;
+            }
             "--queue-config" => {
                 queue_config = Some(PathBuf::from(next_val(&mut i, "--queue-config")?))
             }
@@ -2907,6 +2940,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         parallel,
         cache_trim,
         profile,
+        response_store,
     };
     // `--serve ... --build-cache`: compile the served models' recipes without the card, then exit
     if build_cache {

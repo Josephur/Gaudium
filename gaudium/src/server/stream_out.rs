@@ -203,7 +203,11 @@ pub(super) struct StreamOut {
     /// Block-structured framing (the Messages API) instead of chat-completion chunks. It is fed
     /// every delta as it arrives, streamed or not, so its blocks keep the order of the output.
     pub anth: Option<Builder>,
-    /// Block events built but not written yet (they go out when their launch is complete).
+    /// Output-item framing (the Responses API) instead of chat-completion chunks; like `anth`,
+    /// it is fed every delta as it arrives.
+    pub resp: Option<super::responses::Builder>,
+    /// Block or item events built but not written yet (they go out when their launch is
+    /// complete).
     held: String,
     /// Tokens handed over by the token callback.
     seen: u64,
@@ -252,6 +256,7 @@ impl StreamOut {
             cancel,
             pending: Delta::default(),
             anth: None,
+            resp: None,
             held: String::new(),
             seen: 0,
             covered: 0,
@@ -320,17 +325,20 @@ impl StreamOut {
         self.take_in(d);
     }
 
-    /// One delta in: the block builder takes it at once (merged deltas would lose the order of
-    /// text and calls within a launch, #139); chat-completion chunks merge it into `pending`.
+    /// One delta in: the block or item builder takes it at once (merged deltas would lose the
+    /// order of text and calls within a launch, #139); chat-completion chunks merge it into
+    /// `pending`.
     fn take_in(&mut self, d: Delta) {
-        match self.anth.as_mut() {
-            Some(b) => {
-                let events = b.feed(&d);
-                if self.stream.is_some() {
-                    self.held.push_str(&events);
-                }
-            }
-            None => self.pending.append(d),
+        let events = if let Some(b) = self.anth.as_mut() {
+            b.feed(&d)
+        } else if let Some(b) = self.resp.as_mut() {
+            b.feed(&d)
+        } else {
+            self.pending.append(d);
+            return;
+        };
+        if self.stream.is_some() {
+            self.held.push_str(&events);
         }
     }
 
@@ -361,7 +369,8 @@ impl StreamOut {
     }
 
     fn progress(&mut self, ev: &LaunchEvent) {
-        if !self.return_progress || self.stream.is_none() {
+        // (prefill progress is a chat-completion chunk; a Responses stream carries none)
+        if !self.return_progress || self.stream.is_none() || self.resp.is_some() {
             return;
         }
         let now = Instant::now();
@@ -389,7 +398,8 @@ impl StreamOut {
         std::mem::take(&mut self.pending)
     }
 
-    /// Takes the block events not written yet (the caller writes them before the final ones).
+    /// Takes the block or item events not written yet (the caller writes them before the final
+    /// ones).
     pub fn take_held(&mut self) -> String {
         std::mem::take(&mut self.held)
     }
@@ -398,8 +408,8 @@ impl StreamOut {
         // whole calls are for the final message; the stream carries their fragments
         self.pending.tool_calls.clear();
         let has_text = !self.pending.is_empty();
-        // content blocks were built as the output came (`take_in`): a launch's events go out
-        if self.anth.is_some() {
+        // blocks and items were built as the output came (`take_in`): a launch's events go out
+        if self.anth.is_some() || self.resp.is_some() {
             let events = std::mem::take(&mut self.held);
             if !events.is_empty() {
                 self.chunks += 1;
