@@ -4360,7 +4360,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                     n_gen,
                 );
                 let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
-                let events = b.feed(&pending);
+                let events = out.take_held() + &b.feed(&pending);
                 if stream_mode {
                     out.write(&events);
                     out.write(&b.finish(stop, parser.matched_stop(), &usage, &extra));

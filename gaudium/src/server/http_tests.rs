@@ -1357,6 +1357,85 @@ fn messages_endpoint_streams_blocks_that_rebuild_the_message() {
     assert!(at(delta, &["usage", "output_tokens"]).as_u64().unwrap() > 0);
 }
 
+/// The content blocks a streamed Messages reply rebuilds to, as `(type, text or input)`.
+fn streamed_message_blocks(body: &str) -> Vec<(String, String)> {
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    for e in body.split("\n\n").filter(|e| !e.is_empty()) {
+        let (name, data) = e.split_once('\n').unwrap();
+        let d = json::parse_json(data.strip_prefix("data: ").unwrap()).unwrap();
+        match name.strip_prefix("event: ").unwrap() {
+            "content_block_start" => {
+                blocks.push((s(&d, &["content_block", "type"]).to_string(), String::new()))
+            }
+            "content_block_delta" => {
+                let i = at(&d, &["index"]).as_u64().unwrap() as usize;
+                let delta = at(&d, &["delta"]);
+                let field = match s(delta, &["type"]) {
+                    "thinking_delta" => "thinking",
+                    "text_delta" => "text",
+                    "input_json_delta" => "partial_json",
+                    _ => continue,
+                };
+                blocks[i].1.push_str(s(delta, &[field]));
+            }
+            _ => {}
+        }
+    }
+    for b in blocks.iter_mut().filter(|b| b.0 == "tool_use") {
+        b.1 = json::parse_json(&b.1).unwrap().dump();
+    }
+    blocks
+}
+
+/// A reply that goes back and forth between text and calls keeps its order in both forms of
+/// `/v1/messages` (#139).
+#[test]
+fn messages_reply_keeps_text_and_calls_in_model_order() {
+    let h = harness();
+    let reply = "Two places.\n</think>\n\nFirst Oslo.\n\n<tool_call>\n<function=get_weather>\n\
+                 <parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>\n\
+                 Then Bergen.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBergen\n\
+                 </parameter>\n</function>\n</tool_call>";
+    let req = |stream: bool| {
+        format!("{{\"stream\":{stream},\"max_tokens\":512,{MESSAGES_TOOLS},\"messages\":[{{\"role\":\"user\",\"content\":\"Weather?\"}}]}}")
+    };
+    h.script(reply);
+    let (status, text) = h.post("/v1/messages", &req(false));
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    let whole: Vec<(String, String)> = at(&r, &["content"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            let kind = s(b, &["type"]);
+            let body = match kind {
+                "thinking" => s(b, &["thinking"]).to_string(),
+                "text" => s(b, &["text"]).to_string(),
+                _ => at(b, &["input"]).dump(),
+            };
+            (kind.to_string(), body)
+        })
+        .collect();
+    let kinds: Vec<&str> = whole.iter().map(|b| b.0.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["thinking", "text", "tool_use", "text", "tool_use"],
+        "{text}"
+    );
+    assert_eq!(whole[2].1, "{\"city\":\"Oslo\"}");
+    assert_eq!(whole[4].1, "{\"city\":\"Bergen\"}");
+    assert!(
+        whole[1].1.contains("Oslo") && whole[3].1.contains("Bergen"),
+        "{text}"
+    );
+
+    h.script(reply);
+    let (status, body) = h.post("/v1/messages", &req(true));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(streamed_message_blocks(&body), whole);
+}
+
 #[test]
 fn template_and_token_count_endpoints_and_props() {
     let h = harness();
