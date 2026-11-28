@@ -487,8 +487,18 @@ b80f055fe1639c04  ge_cancel_not_model_end  law ge_cancel_not_model_end : { ge_mo
 d24d9517559d3cc5  ge_length_not_model_end  law ge_length_not_model_end : { ge_model_ended ( GeLength { } ) == False { } : Bool }
 # promise ge_length_not_model_end: a generation cut by the length limit is never one the model ended
 # harm ge_length_not_model_end: the half-written call at the cut would be run as a whole one
+95d1b0c1a056e85b  ge_repaired_cut_not_model_end  law ge_repaired_cut_not_model_end : for + ss : Bool for + st : Bool for + c : Bool { ge_model_ended ( gen_end_closed ( ss , st , True { } , False { } , c ) ) == False { } : Bool }
+# promise ge_repaired_cut_not_model_end: a generation cut by the length limit or a cancel inside a call the parser then closed is never one the model ended
+# harm ge_repaired_cut_not_model_end: the half-written call would be run as a whole one, on a remote tool server with arguments the model never finished
+0f6a720226cb7f9f  ge_stop_string_closed_wins  law ge_stop_string_closed_wins : for + st : Bool for + r : Bool for + eos : Bool for + c : Bool { gen_end_closed ( True { } , st , r , eos , c ) == GeStopString { } : GenEnd }
+# promise ge_stop_string_closed_wins: a generation one of the request's stop strings ended ends as the stop string, whatever the parser stopped or closed
 69ab07579e592380  ge_stop_string_not_model_end  law ge_stop_string_not_model_end : { ge_model_ended ( GeStopString { } ) == False { } : Bool }
 # promise ge_stop_string_not_model_end: a generation ended by one of the request's stop strings is never one the model ended
+2d28ce12fe40f3bd  ge_unstopped_ends_as_engine  law ge_unstopped_ends_as_engine : for + r : Bool for + eos : Bool for + c : Bool { gen_end_closed ( False { } , False { } , r , eos , c ) == gen_end ( False { } , False { } , eos , c ) : GenEnd }
+# promise ge_unstopped_ends_as_engine: a generation the parser did not stop (no stop string, no call limit) ends as the engine ended it, whatever the parser closed at the end
+# harm ge_unstopped_ends_as_engine: a plain length cut or cancel would count as the call limit, and its calls would run
+64d6ee93c1158261  ge_whole_call_limit_stays  law ge_whole_call_limit_stays : for + eos : Bool for + c : Bool { gen_end_closed ( False { } , True { } , False { } , eos , c ) == GeCallLimit { } : GenEnd }
+# promise ge_whole_call_limit_stays: a generation the call limit stopped after a call the model finished still ends as the call limit
 5e31df0d7e1ee34b  gen_end_call_limit_not_cancel  law gen_end_call_limit_not_cancel : for eos : Bool for cancelled : Bool { gen_end ( False { } , True { } , eos , cancelled ) == GeCallLimit { } : GenEnd }
 701a333557e52866  gen_end_no_flag_is_length  law gen_end_no_flag_is_length : { gen_end ( False { } , False { } , False { } , False { } ) == GeLength { } : GenEnd }
 e067e43cfe4436bc  gen_end_stop_string_wins  law gen_end_stop_string_wins : for limit : Bool for eos : Bool for cancelled : Bool { gen_end ( True { } , limit , eos , cancelled ) == GeStopString { } : GenEnd }
@@ -2243,6 +2253,15 @@ e06afa1753839470  stop_sequence_needs_stop_string  law stop_sequence_needs_stop_
 # promise sv_asked_never_dropped: a request that names at least one tool server is never treated as naming none
 22fe4a2e6ba11201  sv_both_names_clash  law sv_both_names_clash : { sv_route_clash ( sv_route ( True { } , True { } ) ) == True { } : Bool }
 # promise sv_both_names_clash: a tool name that is both a client tool and a server-side tool is a clash
+8d1056c6e2afaf70  sv_call_past_take_never_runs  law sv_call_past_take_never_runs : for + w : Bool for + c : Bool for + t : Nat for + d : Nat { sv_call_runs ( w , c , Nat.add ( t , d ) , t ) == False { } : Bool }
+# promise sv_call_past_take_never_runs: a call at or past the number of calls the round may run is never sent
+# harm sv_call_past_take_never_runs: a round could exceed the per-request call limit by one call
+1f242a8f682b9030  sv_cancelled_call_never_runs  law sv_cancelled_call_never_runs : for + w : Bool for + i : Nat for + t : Nat { sv_call_runs ( w , True { } , i , t ) == False { } : Bool }
+# promise sv_cancelled_call_never_runs: once the reply is cancelled (or its client is gone), no further call is sent to any server
+# harm sv_cancelled_call_never_runs: a cancelled request would go on causing side effects on remote tool servers
+5a6240c9af5853ec  sv_cancelled_never_goes_on  law sv_cancelled_never_goes_on : for + n : SvNext for + b : Bool for + l : Nat { sv_goes_on_live ( True { } , n , b , l ) == False { } : Bool }
+# promise sv_cancelled_never_goes_on: once the reply is cancelled (or its client is gone), the loop never generates another round
+# harm sv_cancelled_never_goes_on: a cancel sent with the reply's id would be ignored after the first round, and the card would keep generating for nobody
 78049a43fd4f30d5  sv_client_call_stops  law sv_client_call_stops : for + e : Bool for + s : Nat for + c : Nat for + n : Nat for + m : Nat { sv_goes_on ( sv_next ( e , s , 1n + c , n , m ) ) == False { } : Bool }
 # promise sv_client_call_stops: a round in which the model called a client tool never generates another round
 a996f4fa860f42d5  sv_client_calls_wait  law sv_client_calls_wait : for + s : Nat for + c : Nat for + n : Nat for + m : Nat { sv_waits_client ( sv_next ( True { } , 1n + s , 1n + c , n , m ) ) == True { } : Bool }
@@ -2272,6 +2291,9 @@ ad7b60e79797d231  sv_list_ends_without_cursor  law sv_list_ends_without_cursor :
 491519d44ff55632  sv_list_within_pages  law sv_list_within_pages : for + c : Bool for + m : Nat for + d : Nat { sv_list_more ( c , Nat.add ( m , d ) , m ) == False { } : Bool }
 # promise sv_list_within_pages: once `most` pages of a tool list were read, no further page is asked for
 # harm sv_list_within_pages: a server that always answers with a cursor would hold the request forever
+e72d1bedb1489661  sv_live_within_rules  law sv_live_within_rules : for + c : Bool for + n : SvNext for + b : Bool for + l : Nat { Bool.and ( sv_goes_on_live ( c , n , b , l ) , Bool.not ( sv_round_goes_on ( n , b , l ) ) ) == False { } : Bool }
+# promise sv_live_within_rules: the loop never generates a round that the round's own decision or the output limit refuses, cancelled or not
+# harm sv_live_within_rules: a reply would run past its round bound or its max_tokens while nobody cancelled it
 0b0636ad5c37a4d8  sv_never_past_rounds  law sv_never_past_rounds : for + e : Bool for + s : Nat for + c : Nat for + m : Nat for + d : Nat { sv_goes_on ( sv_next ( e , s , c , Nat.add ( m , d ) , m ) ) == False { } : Bool }
 # promise sv_never_past_rounds: once `most` rounds were generated, the loop never generates another
 # harm sv_never_past_rounds: a model that keeps calling tools would hold the request (and the card's turns) forever
@@ -2289,6 +2311,9 @@ e23256c94ca420e2  sv_no_server_call_never_runs  law sv_no_server_call_never_runs
 0b46f28fd6c7abde  sv_proxy_off_never_runs  law sv_proxy_off_never_runs : for + n : Nat for + s : Bool for + m : Nat { sv_admit_runs ( sv_admit ( n , False { } , s , m ) ) == False { } : Bool }
 # promise sv_proxy_off_never_runs: a request that names tool servers on a server without the MCP proxy never runs them
 # harm sv_proxy_off_never_runs: the server would connect to client-named addresses with none of the proxy's allow rules
+6c22de97892e2716  sv_repaired_call_never_runs  law sv_repaired_call_never_runs : for + c : Bool for + i : Nat for + t : Nat { sv_call_runs ( False { } , c , i , t ) == False { } : Bool }
+# promise sv_repaired_call_never_runs: a call the parser closed at the end of generation (not finished by the model) is never sent to its server
+# harm sv_repaired_call_never_runs: a call whose arguments were cut mid-value would run remotely with the partial value
 0cea56bb4c59517b  sv_result_fits_whole  law sv_result_fits_whole : for + l : Nat for + d : Nat { sv_result_keep ( l , Nat.add ( l , d ) ) == l : Nat }
 # promise sv_result_fits_whole: a tool result no longer than the cap is kept whole
 d9a093e3018be72a  sv_result_within_cap  law sv_result_within_cap : for + l : Nat for + c : Nat { Nat.is_le ( sv_result_keep ( l , c ) , c ) == True { } : Bool }
@@ -2327,6 +2352,8 @@ ad28bec100b98ac0  sv_unknown_never_server  law sv_unknown_never_server : for + c
 # promise sv_unknown_never_server: a call whose name is not one of the request's server-side tools is never run server-side
 f8b122d170b0a30a  sv_unlimited_goes_on  law sv_unlimited_goes_on : for + l : Nat { sv_round_goes_on ( SvRunGoOn { } , False { } , l ) == True { } : Bool }
 # promise sv_unlimited_goes_on: a request without an output limit generates its rounds as the round decision says, without a token bound
+425291a5e0a9400e  sv_whole_live_call_runs  law sv_whole_live_call_runs : for + i : Nat for + d : Nat { sv_call_runs ( True { } , False { } , i , Nat.add ( i , 1n + d ) ) == True { } : Bool }
+# promise sv_whole_live_call_runs: a call the model finished, inside the round's take, of a reply not cancelled, is run
 a378964733894e9d  sv_within_limit_runs  law sv_within_limit_runs : for + n : Nat for + d : Nat { sv_admit_runs ( sv_admit ( 1n + n , True { } , True { } , Nat.add ( 1n + n , d ) ) ) == True { } : Bool }
 # promise sv_within_limit_runs: with the MCP proxy on, a request that passes the site rule and names between one and `most` servers runs them
 46ab38ee952ff713  think_answer_kept  law think_answer_kept : for + n : Nat for + cap : Nat for + c : Nat for + room : Nat for + forced : Bool { think_act ( False { } , n , cap , c , room , forced ) == TaFeed { n } : ThinkAct }
