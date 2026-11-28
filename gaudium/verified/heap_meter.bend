@@ -15,8 +15,17 @@
 #     the bytes it removes, and never leaves the block charged for more than its size. A block
 #     allocated before any frame started is charged only the bytes added under the meter.
 #
-# The record itself (the table of blocks, its growth, the thread-local frames) is allocator code
-# in Rust; the decisions it makes on each release and reallocation are these functions.
+# The count itself moves only through these functions too: a charge adds a block's bytes, a
+# credit takes a released block's charge off (never below zero), a reallocation rebills the block
+# from its old charge to its new one, and a frame that ends folds its count into the enclosing
+# one. The PDF reader admits or refuses work on that count (`pdf_within`, `pdf_budget_fits`), so
+# the count must hold every byte the frame's blocks were charged. The functions that grow it are
+# total: on a count past 64 bits the shell keeps the largest count (`u64::MAX`), which every cap
+# refuses, so a hostile document can never panic the allocator.
+#
+# The record itself (the table of blocks, its growth, the thread-local frames) and the peak (only
+# reported) are allocator code in Rust; the decisions it makes on each release and reallocation
+# are these functions.
 
 import Base
 import lemmas.bend as G
@@ -35,6 +44,28 @@ def meter_owns(+start: Nat, +serial: Nat, later: Bool, +next: Nat) -> Bool:
 # what it was charged that the new size still holds, and every byte added.
 def meter_regrow(+charge: Nat, +old: Nat, +new: Nat) -> Nat:
   Nat.add(Nat.min(charge, new), Nat.sub(new, old))
+
+# A frame's count `live` once `n` more bytes are charged to it. `None` past 64 bits.
+# rusty-bends: total
+def meter_charge(+live: Nat, +n: Nat) -> Nat:
+  Nat.add(live, n)
+
+# A frame's count `live` once a released block it was charged `n` for is credited: never below
+# zero.
+def meter_credit(+live: Nat, +n: Nat) -> Nat:
+  Nat.sub(live, n)
+
+# A frame's count `live` once one of its blocks, charged `was`, is charged `now` instead (a
+# reallocation, `meter_regrow`): the growth charged, the shrinkage credited. `None` past 64 bits.
+# rusty-bends: total
+def meter_rebill(+live: Nat, +was: Nat, +now: Nat) -> Nat:
+  meter_credit(meter_charge(live, now), was)
+
+# The enclosing frame's count `outer` once the frame inside it ends with the count `inner`: the
+# blocks the inner frame kept pass to it. `None` past 64 bits.
+# rusty-bends: total
+def meter_fold(+outer: Nat, +inner: Nat) -> Nat:
+  meter_charge(outer, inner)
 
 # ============================================================================
 # 2. Helper lemmas (erased before Rust codegen)
@@ -80,6 +111,26 @@ def meter_min_add_not_over(+c: Nat, +n: Nat, +y: Nat) -> {Nat.is_lt(Nat.add(c, y
       meter_succ_add_not_lt(y, cp)
     case 1n+cp 1n+np:
       meter_min_add_not_over(cp, np, y)
+
+# `n + (l - n)` is never less than `l`.
+def meter_credit_floor(+l: Nat, +n: Nat) -> {Nat.is_lt(Nat.add(n, Nat.sub(l, n)), l) == False{} : Bool}:
+  match l n:
+    case 0n 0n:
+      {==}
+    case 0n 1n+np:
+      {==}
+    case 1n+lp 0n:
+      G.g_nat_lt_irrefl(lp)
+    case 1n+lp 1n+np:
+      meter_credit_floor(lp, np)
+
+# `(w + l + n) - w` is `l + n`.
+def meter_rebill_cancel(+w: Nat, +l: Nat, +n: Nat) -> {Nat.sub(Nat.add(Nat.add(w, l), n), w) == Nat.add(l, n) : Nat}:
+  match w:
+    case 0n:
+      L.nat_sub_zero_r(Nat.add(l, n))
+    case 1n+wp:
+      meter_rebill_cancel(wp, l, n)
 
 # ============================================================================
 # 3. Laws
@@ -184,3 +235,69 @@ law meter_regrow_no_overcharge:
 
 def meter_regrow_no_overcharge(c, o, n):
   meter_min_add_not_over(c, n, Nat.sub(n, o))
+
+# promise: a charge followed by the credit of the same bytes leaves a frame's count as it was.
+# harm: a count that drifts on every allocate-and-release pair would refuse a document for heap it gave back, or admit one past its cap.
+# catches: the credit subtracts twice (meter_credit returning Nat.sub(Nat.sub(live, n), n))
+law meter_charge_credit_conserved:
+  for +l: Nat
+  for +n: Nat
+  {meter_credit(meter_charge(l, n), n) == l : Nat}
+
+def meter_charge_credit_conserved(l, n):
+  L.nat_add_sub_cancel_r(l, n)
+
+# promise: a charge never leaves a frame's count below what it held plus the bytes charged.
+# harm: an undercounted allocation lets a document hold heap past its cap without being refused.
+# catches: add replaced by max (meter_charge returning Nat.max(live, n))
+law meter_charge_counts_all:
+  for +l: Nat
+  for +n: Nat
+  {Nat.is_lt(meter_charge(l, n), Nat.add(l, n)) == False{} : Bool}
+
+def meter_charge_counts_all(l, n):
+  G.g_nat_lt_irrefl(Nat.add(l, n))
+
+# promise: a credit never raises a frame's count.
+# catches: the credit adds (Nat.sub(live, n) replaced by Nat.add(live, n))
+law meter_credit_never_raises:
+  for +l: Nat
+  for +n: Nat
+  {Nat.is_lt(l, meter_credit(l, n)) == False{} : Bool}
+
+def meter_credit_never_raises(l, n):
+  L.nat_le_lt_false(l, Nat.sub(l, n), G.g_nat_sub_le_self(l, n))
+
+# promise: a credit takes no more than the released block's charge off a frame's count.
+# harm: a release that credits more than the block was charged would cancel heap the frame still holds and admit work past its cap.
+# catches: the credit subtracts twice (meter_credit returning Nat.sub(Nat.sub(live, n), n))
+law meter_credit_at_most_charge:
+  for +l: Nat
+  for +n: Nat
+  {Nat.is_lt(Nat.add(n, meter_credit(l, n)), l) == False{} : Bool}
+
+def meter_credit_at_most_charge(l, n):
+  meter_credit_floor(l, n)
+
+# promise: a frame holding a block charged w plus l other bytes holds l plus the block's new charge once the block is rebilled.
+# harm: a reallocation that does not charge its growth, or credits more than it shrank, lets a document hold heap its count does not show.
+# catches: the shrinkage not credited (meter_rebill returning meter_charge(live, Nat.sub(now, was)))
+law meter_rebill_conserved:
+  for +w: Nat
+  for +l: Nat
+  for +n: Nat
+  {meter_rebill(Nat.add(w, l), w, n) == Nat.add(l, n) : Nat}
+
+def meter_rebill_conserved(w, l, n):
+  meter_rebill_cancel(w, l, n)
+
+# promise: when a frame ends, the enclosing frame's count gains the whole count of the frame that ended.
+# harm: the blocks a document read kept would leave the request's count, and the request could hold heap past its cap.
+# catches: the fold drops the inner count (meter_fold returning outer)
+law meter_fold_keeps_sum:
+  for +o: Nat
+  for +i: Nat
+  {meter_fold(o, i) == Nat.add(o, i) : Nat}
+
+def meter_fold_keeps_sum(o, i):
+  {==}

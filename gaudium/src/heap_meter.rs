@@ -12,7 +12,10 @@
 //! the start (the request body a task rewrites, say) never cancels the task's own allocations.
 //! A reallocation keeps the block's owner and changes its charge as `meter_regrow` decides:
 //! every byte it adds is charged, no more than the bytes it removes is credited, and a block
-//! allocated before the start is charged only for what it grows by. The task reads the count at
+//! allocated before the start is charged only for what it grows by. The count itself changes only
+//! through the verified core too (`meter_charge`, `meter_credit`, `meter_rebill`, `meter_fold`):
+//! a count past 64 bits stays at the largest one, which every cap refuses, rather than panic the
+//! allocator. The task reads the count at
 //! its own checkpoints and decides there what to do with it; the allocator never refuses or
 //! fails an allocation.
 //!
@@ -233,15 +236,24 @@ impl Local {
         })
     }
 
+    /// Charges `n` bytes to `frame` (`meter_charge`).
     fn charge(&mut self, frame: usize, n: u64) {
         let f = &mut self.frames[frame];
-        f.live = f.live.saturating_add(n);
+        f.live = settle(v::meter_charge(f.live, n));
         f.peak = f.peak.max(f.live);
     }
 
+    /// Credits `frame` with a released block's charge `n` (`meter_credit`).
     fn credit(&mut self, frame: usize, n: u64) {
         let f = &mut self.frames[frame];
-        f.live = f.live.saturating_sub(n);
+        f.live = v::meter_credit(f.live, n);
+    }
+
+    /// Rebills one of `frame`'s blocks from its charge `was` to `now` (`meter_rebill`).
+    fn rebill(&mut self, frame: usize, was: u64, now: u64) {
+        let f = &mut self.frames[frame];
+        f.live = settle(v::meter_rebill(f.live, was, now));
+        f.peak = f.peak.max(f.live);
     }
 
     /// A block of `size` bytes allocated at `ptr`.
@@ -277,11 +289,7 @@ impl Local {
             None => (self.depth - 1, 0, self.top().serial),
         };
         let charged = v::meter_regrow(charge, old, new);
-        if charged >= charge {
-            self.charge(frame, charged - charge);
-        } else {
-            self.credit(frame, charge - charged);
-        }
+        self.rebill(frame, charge, charged);
         if charged > 0 {
             if let Some(grown) = self.table.insert(q, charged, serial) {
                 let top = self.depth - 1;
@@ -289,6 +297,13 @@ impl Local {
             }
         }
     }
+}
+
+/// A count the verified core grew: past 64 bits (`None`) the largest count, which every cap
+/// refuses. The allocator never panics on a count.
+#[inline]
+fn settle(count: Option<u64>) -> u64 {
+    count.unwrap_or(u64::MAX)
 }
 
 /// Runs `f` on the thread's meter when it is on.
@@ -401,7 +416,7 @@ impl Drop for Metered {
                 p.peak = p
                     .peak
                     .max(p.live.max(inner.held_at_start).saturating_add(inner.peak));
-                p.live = p.live.saturating_add(inner.live);
+                p.live = settle(v::meter_fold(p.live, inner.live));
                 p.peak = p.peak.max(p.live);
             } else {
                 let t = std::mem::replace(
@@ -606,6 +621,22 @@ mod tests {
         drop(again);
         assert!(live() < 1 << 10, "{}", live());
         assert!(reading().unwrap().outer.unwrap().held < 1 << 20);
+    }
+
+    #[test]
+    fn a_count_past_64_bits_stays_at_the_largest() {
+        // a hostile document can never panic the allocator: the growth that overflows is `None`
+        // from the verified core, and the count stays at the largest one, which every cap refuses
+        assert_eq!(v::meter_charge(u64::MAX, 1), None);
+        assert_eq!(v::meter_fold(u64::MAX - 1, 2), None);
+        assert_eq!(v::meter_rebill(u64::MAX, 0, 1), None);
+        assert_eq!(settle(v::meter_charge(u64::MAX, 1)), u64::MAX);
+        assert!(!v::pdf_within(settle(None), u64::MAX - 1));
+        // today's rebill: the growth charged, the shrinkage credited, never below zero
+        assert_eq!(v::meter_rebill(100, 10, 30), Some(120));
+        assert_eq!(v::meter_rebill(100, 30, 10), Some(80));
+        assert_eq!(v::meter_rebill(5, 30, 10), Some(0));
+        assert_eq!(v::meter_credit(5, 30), 0);
     }
 
     #[test]
