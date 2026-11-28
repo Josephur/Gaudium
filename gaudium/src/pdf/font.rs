@@ -2,8 +2,8 @@
 //! bytes split into character codes, the Unicode text of each code, and its advance width.
 //!
 //! The text of a code comes from the font's ToUnicode CMap when it maps the code, else from the
-//! font's encoding: the base encoding (StandardEncoding, WinAnsiEncoding, MacRomanEncoding)
-//! with its /Differences, whose glyph names are looked up in a table of common names and the
+//! font's encoding: the base encoding (StandardEncoding, WinAnsiEncoding, MacRomanEncoding, or
+//! the built-in encoding of the Symbol font) with its /Differences, whose glyph names are looked up in a table of common names and the
 //! `uniXXXX` / `uXXXX` forms. Composite (Type0) fonts take their code lengths from the
 //! codespace ranges of their CMap (two bytes for Identity-H / Identity-V); their text needs a
 //! ToUnicode CMap, except for the predefined Unicode (UCS2 / UTF16) CMaps.
@@ -94,6 +94,39 @@ fn win_ansi(code: u8) -> Option<char> {
 }
 
 /// MacRomanEncoding, codes 0x80..=0xFF.
+/// The Unicode text of the codes of the Symbol font's built-in encoding (Annex D.5).
+fn symbol(code: u8) -> Option<char> {
+    // 0x20..=0x7E (0: no character; 0x60 is the radical's extender, not text)
+    const LOW: [u16; 95] = [
+        0x20, 0x21, 0x2200, 0x23, 0x2203, 0x25, 0x26, 0x220B, 0x28, 0x29, 0x2217, 0x2B, 0x2C,
+        0x2212, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B,
+        0x3C, 0x3D, 0x3E, 0x3F, 0x2245, 0x391, 0x392, 0x3A7, 0x394, 0x395, 0x3A6, 0x393, 0x397,
+        0x399, 0x3D1, 0x39A, 0x39B, 0x39C, 0x39D, 0x39F, 0x3A0, 0x398, 0x3A1, 0x3A3, 0x3A4, 0x3A5,
+        0x3C2, 0x3A9, 0x39E, 0x3A8, 0x396, 0x5B, 0x2234, 0x5D, 0x22A5, 0x5F, 0, 0x3B1, 0x3B2,
+        0x3C7, 0x3B4, 0x3B5, 0x3C6, 0x3B3, 0x3B7, 0x3B9, 0x3D5, 0x3BA, 0x3BB, 0x3BC, 0x3BD, 0x3BF,
+        0x3C0, 0x3B8, 0x3C1, 0x3C3, 0x3C4, 0x3C5, 0x3D6, 0x3C9, 0x3BE, 0x3C8, 0x3B6, 0x7B, 0x7C,
+        0x7D, 0x223C,
+    ];
+    // 0xA0..=0xFE (0: no character)
+    const HIGH: [u16; 95] = [
+        0x20AC, 0x3D2, 0x2032, 0x2264, 0x2044, 0x221E, 0x192, 0x2663, 0x2666, 0x2665, 0x2660,
+        0x2194, 0x2190, 0x2191, 0x2192, 0x2193, 0xB0, 0xB1, 0x2033, 0x2265, 0xD7, 0x221D, 0x2202,
+        0x2022, 0xF7, 0x2260, 0x2261, 0x2248, 0x2026, 0x23D0, 0x23AF, 0x21B5, 0x2135, 0x2111,
+        0x211C, 0x2118, 0x2297, 0x2295, 0x2205, 0x2229, 0x222A, 0x2283, 0x2287, 0x2284, 0x2282,
+        0x2286, 0x2208, 0x2209, 0x2220, 0x2207, 0xAE, 0xA9, 0x2122, 0x220F, 0x221A, 0x22C5, 0xAC,
+        0x2227, 0x2228, 0x21D4, 0x21D0, 0x21D1, 0x21D2, 0x21D3, 0x25CA, 0x2329, 0xAE, 0xA9, 0x2122,
+        0x2211, 0x239B, 0x239C, 0x239D, 0x23A1, 0x23A2, 0x23A3, 0x23A7, 0x23A8, 0x23A9, 0x23AA, 0,
+        0x232A, 0x222B, 0x2320, 0x23AE, 0x2321, 0x239E, 0x239F, 0x23A0, 0x23A4, 0x23A5, 0x23A6,
+        0x23AB, 0x23AC, 0x23AD,
+    ];
+    let u = match code {
+        0x20..=0x7E => LOW[usize::from(code - 0x20)],
+        0xA0..=0xFE => HIGH[usize::from(code - 0xA0)],
+        _ => 0,
+    };
+    (u != 0).then(|| char::from_u32(u32::from(u))).flatten()
+}
+
 fn mac_roman(code: u8) -> Option<char> {
     const HIGH: [u16; 128] = [
         0xC4, 0xC5, 0xC7, 0xC9, 0xD1, 0xD6, 0xDC, 0xE1, 0xE0, 0xE2, 0xE4, 0xE3, 0xE5, 0xE7, 0xE9,
@@ -456,10 +489,11 @@ fn code_of(b: &[u8]) -> Option<(usize, u32)> {
 }
 
 impl CMap {
-    /// Parses a CMap stream's decoded bytes. Unknown parts are skipped.
-    pub fn parse(data: &[u8]) -> CMap {
+    /// Parses a CMap stream's decoded bytes; the operands held at a time may take the room
+    /// `mem` leaves. Unknown parts are skipped.
+    pub fn parse(data: &[u8], mem: super::Budget) -> CMap {
         let mut m = CMap::default();
-        let mut lx = Lexer::new(data, 0);
+        let mut lx = Lexer::new(data, 0, mem);
         let mut args: Vec<Obj> = Vec::new();
         #[derive(PartialEq)]
         enum Mode {
@@ -483,6 +517,7 @@ impl CMap {
                                 }
                             }
                             args.clear();
+                            lx.restart();
                         }
                         Mode::Char if args.len() == 2 => {
                             if let (Obj::Str(src), dst) = (&args[0], &args[1]) {
@@ -500,10 +535,12 @@ impl CMap {
                                 }
                             }
                             args.clear();
+                            lx.restart();
                         }
                         Mode::Range if args.len() == 3 => {
                             m.add_range(&args[0], &args[1], &args[2]);
                             args.clear();
+                            lx.restart();
                         }
                         _ => {
                             if mode == Mode::None && args.len() > 16 {
@@ -514,6 +551,7 @@ impl CMap {
                 }
                 Token::Op(op) => {
                     args.clear();
+                    lx.restart();
                     mode = match op.as_slice() {
                         b"begincodespacerange" => Mode::Space,
                         b"beginbfchar" => Mode::Char,
@@ -645,16 +683,19 @@ pub(crate) struct FontParts<'a> {
     pub encoding: Option<Obj>,
     pub encoding_cmap: Option<Vec<u8>>,
     /// The resolved /Widths array (simple) or the descendant font's /W array (composite).
-    pub widths: Option<Vec<Obj>>,
+    pub widths: Option<std::rc::Rc<[Obj]>>,
     /// The descendant font's /DW, or the /MissingWidth of a simple font's descriptor.
     pub default_width: Option<f64>,
+    /// The object budget the objects of its CMaps are charged to while they are read (they
+    /// take the room it leaves; the CMaps themselves are small).
+    pub mem: super::Budget,
 }
 
 impl Font {
     pub fn new(p: FontParts) -> Font {
         let subtype = p.dict.get(b"Subtype").and_then(Obj::as_name).unwrap_or(b"");
         let composite = subtype == b"Type0";
-        let to_unicode = p.to_unicode.as_deref().map(CMap::parse);
+        let to_unicode = p.to_unicode.as_deref().map(|d| CMap::parse(d, p.mem));
         let scale = if subtype == b"Type3" {
             p.dict
                 .get(b"FontMatrix")
@@ -685,14 +726,19 @@ impl Font {
                     f.cid_text = CidText::Unicode;
                 }
             }
-            f.encoding_cmap = p.encoding_cmap.as_deref().map(CMap::parse);
+            f.encoding_cmap = p.encoding_cmap.as_deref().map(|d| CMap::parse(d, p.mem));
             f.default_width = p.default_width.unwrap_or(1000.0);
             if let Some(w) = &p.widths {
                 f.cid_widths = cid_widths(w);
                 f.cid_widths.sort_by_key(|r| r.0);
             }
         } else {
-            f.simple = simple_encoding(subtype, p.encoding.as_ref());
+            let base_font = p
+                .dict
+                .get(b"BaseFont")
+                .and_then(Obj::as_name)
+                .unwrap_or(b"");
+            f.simple = simple_encoding(subtype, base_font, p.encoding.as_ref());
             f.first_char = p
                 .dict
                 .get(b"FirstChar")
@@ -764,8 +810,22 @@ impl Font {
     }
 }
 
-/// The text of each code of a simple font: its base encoding with its /Differences.
-fn simple_encoding(subtype: &[u8], enc: Option<&Obj>) -> Vec<Option<String>> {
+/// Whether a /BaseFont names the Symbol font (with a subset tag or a style suffix).
+fn is_symbol_font(base_font: &[u8]) -> bool {
+    let name = match base_font.iter().position(|&b| b == b'+') {
+        Some(i) if i == 6 => &base_font[7..],
+        _ => base_font,
+    };
+    let stem = name
+        .split(|&b| b == b',' || b == b'-')
+        .next()
+        .unwrap_or(b"");
+    stem == b"Symbol" || stem == b"SymbolMT"
+}
+
+/// The text of each code of a simple font: its base encoding with its /Differences. A font
+/// that names no base encoding uses its built-in one: the Symbol font's for the Symbol font.
+fn simple_encoding(subtype: &[u8], base_font: &[u8], enc: Option<&Obj>) -> Vec<Option<String>> {
     let base_name: &[u8] = match enc {
         Some(Obj::Name(n)) => n,
         Some(Obj::Dict(d)) => d.get(b"BaseEncoding").and_then(Obj::as_name).unwrap_or(b""),
@@ -775,6 +835,7 @@ fn simple_encoding(subtype: &[u8], enc: Option<&Obj>) -> Vec<Option<String>> {
         b"WinAnsiEncoding" => win_ansi,
         b"MacRomanEncoding" => mac_roman,
         b"StandardEncoding" => standard,
+        _ if is_symbol_font(base_font) => symbol,
         // a TrueType font without an encoding is most often written in the Windows code page
         _ if subtype == b"TrueType" => win_ansi,
         _ => standard,
@@ -783,7 +844,7 @@ fn simple_encoding(subtype: &[u8], enc: Option<&Obj>) -> Vec<Option<String>> {
     if let Some(Obj::Dict(d)) = enc {
         if let Some(Obj::Array(diff)) = d.get(b"Differences") {
             let mut code: Option<usize> = None;
-            for item in diff {
+            for item in diff.iter() {
                 match item {
                     Obj::Int(c) => code = usize::try_from(*c).ok().filter(|c| *c < 256),
                     Obj::Name(n) => {

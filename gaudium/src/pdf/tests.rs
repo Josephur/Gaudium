@@ -698,13 +698,9 @@ fn truncated_and_corrupted_files_never_panic() {
 
 #[test]
 fn filters_decode() {
-    let mut b = Budget::new(1 << 20, "test");
-    let d = |f: &str| {
-        lex::Dict(vec![(
-            b"Filter".to_vec(),
-            lex::Obj::Name(f.as_bytes().to_vec()),
-        )])
-    };
+    let mut b = Budget::new(1 << 20, "test", "bytes", "--test");
+    let d =
+        |f: &str| lex::Dict::from_iter([(b"Filter".to_vec(), lex::Obj::Name(f.as_bytes().into()))]);
     assert_eq!(
         filter::decode(&d("ASCIIHexDecode"), b"48 65 6c6C 6>", &mut b).unwrap(),
         b"Hell`"
@@ -736,4 +732,295 @@ fn filters_decode() {
         filter::decode(&d("DCTDecode"), b"", &mut b),
         Err(Fail::Unsupported(_))
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The law review's hostile inputs (PR #136): each must now be refused, or finish quickly and
+// within its budgets. The files are small and built here.
+// ---------------------------------------------------------------------------------------------
+
+/// One page whose content lists the same stream `times` times.
+fn repeated_contents(stream_dict: &str, data: &[u8], times: usize) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let f1 = p.add(HELVETICA);
+    let content = p.add(stream(stream_dict, data));
+    let parts = vec![format!("{content} 0 R"); times].join(" ");
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents [{parts}] /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+/// A page drawing form X, which draws itself `fan` times (unfiltered).
+fn self_drawing_form(fan: usize) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let form = p.reserve();
+    let body = format!("{}BT /F1 1 Tf (x) Tj ET", "/X Do ".repeat(fan));
+    let f1 = p.add(HELVETICA);
+    p.set(
+        form,
+        stream(
+            &format!(
+                "/Type /XObject /Subtype /Form /Resources << /XObject << /X {form} 0 R >> /Font << /F1 {f1} 0 R >> >>"
+            ),
+            body.as_bytes(),
+        ),
+    );
+    let content = p.add(stream("", b"/X Do"));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /XObject << /X {form} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+/// `n` objects that overlap: each object's header lies inside the one before it, as a stream
+/// (all ending at one `endstream`, their /Length wrong) or as a string (nested parentheses), all
+/// listed as page-tree kids, and no xref table (the file is rebuilt by a scan).
+fn overlapping_objects(n: usize, as_strings: bool) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n".to_vec();
+    let kids: Vec<String> = (0..n).map(|k| format!("{} 0 R", k + 3)).collect();
+    out.extend_from_slice(
+        format!(
+            "2 0 obj << /Type /Pages /Kids [{}] /Count {n} >> endobj\n",
+            kids.join(" ")
+        )
+        .as_bytes(),
+    );
+    let filler = vec![b'x'; 900];
+    for k in 0..n {
+        if as_strings {
+            out.extend_from_slice(format!("{} 0 obj (", k + 3).as_bytes());
+        } else {
+            out.extend_from_slice(
+                format!("{} 0 obj << /Length 999999999 >> stream\n", k + 3).as_bytes(),
+            );
+        }
+        out.extend_from_slice(&filler);
+        out.push(b'\n');
+    }
+    if as_strings {
+        out.extend_from_slice(&vec![b')'; n]);
+        out.extend_from_slice(b"\nendobj\n");
+    } else {
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+    out.extend_from_slice(b"trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+    out
+}
+
+/// A page whose font dictionary has `n` keys, each used once by `Tf`.
+fn many_keys(n: usize) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let f1 = p.add(HELVETICA);
+    let fonts: String = (0..n).map(|i| format!("/F{i} {f1} 0 R ")).collect();
+    let fonts = p.add(format!("<< {fonts}>>"));
+    let ops: String = (0..n).map(|i| format!("/F{i} 1 Tf ")).collect();
+    let content = p.add(stream("", format!("BT {ops}(x) Tj ET").as_bytes()));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font {fonts} 0 R >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+/// A two-byte compressed stream whose PNG predictor declares rows of 64 MiB, listed `times`
+/// times.
+fn wide_predictor(times: usize) -> Vec<u8> {
+    repeated_contents(
+        "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 1048576 /Colors 32 /BitsPerComponent 16 >>",
+        &zlib_stored(&[2, 0]),
+        times,
+    )
+}
+
+fn quick(what: &str, start: std::time::Instant) {
+    let took = start.elapsed();
+    assert!(took.as_secs() < 30, "{what} took {took:?}");
+}
+
+#[test]
+fn unfiltered_streams_are_charged() {
+    // review repro 1: the same unfiltered 64 KiB stream listed 200 times, 1 MiB budget
+    let lim = Limits {
+        max_decoded: 1 << 20,
+        ..Limits::default()
+    };
+    let body = [b"BT /F1 12 Tf (a) Tj ET ".as_slice(), &[b' '; 65_536 - 23]].concat();
+    let e = extract_text(&repeated_contents("", &body, 200), &lim).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("its streams decode to more than 1048576 bytes (--pdf-max-inflate-mb)"),
+        "{e}"
+    );
+    // an empty filter array copies too, and is charged the same way
+    let e = extract_text(&repeated_contents("/Filter []", &body, 200), &lim).unwrap_err();
+    assert!(matches!(e, Fail::TooLarge(_)), "{e}");
+    // a single unfiltered stream larger than the budget (Codex's repro: 20 KB, budget 10 bytes)
+    let lim = Limits {
+        max_decoded: 10,
+        ..Limits::default()
+    };
+    let e = extract_text(&repeated_contents("", &[b' '; 20_000], 1), &lim).unwrap_err();
+    assert!(matches!(e, Fail::TooLarge(_)), "{e}");
+    // within the budget, the same page is read
+    let lim = Limits {
+        max_decoded: 1 << 24,
+        ..Limits::default()
+    };
+    let got = extract_text(&repeated_contents("", &body, 2), &lim).unwrap();
+    assert_eq!(got.pages[0].split_whitespace().collect::<Vec<_>>(), ["aa"]);
+}
+
+#[test]
+fn a_form_drawing_itself_stops_at_the_form_cap() {
+    // review repro 1b: a form that draws itself 8 times, nested 12 deep (8^11 draws)
+    let start = std::time::Instant::now();
+    let e = extract_text(&self_drawing_form(8), &Limits::default()).unwrap_err();
+    quick("the self-drawing form", start);
+    assert!(
+        e.to_string()
+            .contains("it draws more than 100000 form XObjects (--pdf-max-forms)"),
+        "{e}"
+    );
+    // a lower cap stops it sooner; forms within the cap are read
+    let lim = Limits {
+        max_forms: 3,
+        ..Limits::default()
+    };
+    assert!(matches!(
+        extract_text(&self_drawing_form(8), &lim),
+        Err(Fail::TooLarge(_))
+    ));
+    let lim = Limits {
+        max_forms: 11,
+        ..Limits::default()
+    };
+    let got = extract_text(&self_drawing_form(0), &lim).unwrap();
+    assert_eq!(got.pages[0].trim(), "x");
+}
+
+#[test]
+fn overlapping_objects_are_charged_not_copied() {
+    // review repro 2: 300 overlapping streams (about 276 KiB) rebuilt by a scan; stream data
+    // is a span of the file, so the objects take little memory and the file is read
+    let file = overlapping_objects(300, false);
+    assert!(file.len() < 300 << 10, "{}", file.len());
+    let lim = Limits {
+        max_decoded: 1 << 20,
+        ..Limits::default()
+    };
+    let start = std::time::Instant::now();
+    let e = extract_text(&file, &lim).unwrap_err();
+    quick("overlapping streams", start);
+    assert!(matches!(e, Fail::NoText { .. }), "{e}");
+    // the same with nested strings: each spans the rest of the file, so the parses are
+    // charged to the object budget and stop at it
+    let file = overlapping_objects(300, true);
+    let start = std::time::Instant::now();
+    let e = extract_text(&file, &lim).unwrap_err();
+    quick("overlapping strings", start);
+    assert!(
+        e.to_string()
+            .contains("its objects take more than 1048576 bytes (--pdf-max-inflate-mb)"),
+        "{e}"
+    );
+}
+
+#[test]
+fn large_dictionaries_stay_linear() {
+    // review repro 3: 80,000 keys in one dictionary, each looked up once by `Tf`
+    let file = many_keys(80_000);
+    let start = std::time::Instant::now();
+    let got = extract_text(&file, &Limits::default()).unwrap();
+    quick("80,000 keys", start);
+    assert_eq!(got.pages[0].trim(), "x");
+    // the last of a repeated key wins, in a small and in a large dictionary
+    for n in [3usize, 50] {
+        let keys: String = (0..n).map(|i| format!("/K{i} {i} ")).collect();
+        let src = format!("<< {keys}/K1 /Last >>");
+        let mut lx = lex::Lexer::new(
+            src.as_bytes(),
+            0,
+            Budget::new(u64::MAX, "test", "bytes", "--test"),
+        );
+        let o = lx.object(0).unwrap();
+        let d = o.as_dict().unwrap();
+        assert_eq!(d.get(b"K1").and_then(lex::Obj::as_name), Some(&b"Last"[..]));
+        assert_eq!(d.get(b"K2").and_then(lex::Obj::as_int), Some(2));
+        assert_eq!(d.iter().count(), n);
+    }
+}
+
+#[test]
+fn predictor_work_is_charged_before_it_starts() {
+    // review repro 4: a two-byte stream declaring 64 MiB rows, listed 20 times
+    let start = std::time::Instant::now();
+    let lim = Limits {
+        max_decoded: 8 << 20,
+        ..Limits::default()
+    };
+    let e = extract_text(&wide_predictor(20), &lim).unwrap_err();
+    quick("the wide predictor", start);
+    assert!(
+        e.to_string()
+            .contains("its streams decode to more than 8388608 bytes"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_page_split_over_streams_keeps_its_state() {
+    // Codex repro: the font is selected in the first stream and used in the second
+    let (p, root) = doc(&[b"BT /F1 12 Tf 72 700 Td (First) Tj"], HELVETICA, false);
+    let mut p = p;
+    let second = p.add(stream("", b"0 -14 Td (Second) Tj ET"));
+    // the page is the last object written by `doc`: give it both streams
+    let page = p.objs.len() as u32 - 1;
+    let first = page - 1;
+    let body = String::from_utf8(p.objs[page as usize - 1].clone()).unwrap();
+    let body = body.replace(
+        &format!("/Contents {first} 0 R"),
+        &format!("/Contents [{first} 0 R {second} 0 R]"),
+    );
+    p.set(page, body);
+    let got = extract_text(&p.table(root, ""), &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "First\nSecond");
+}
+
+#[test]
+fn the_symbol_font_uses_its_built_in_encoding() {
+    // Codex repro: /BaseFont /Symbol without /Encoding or /ToUnicode
+    let symbol = "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>";
+    let (p, root) = doc(&[b"BT /F1 12 Tf (abg) Tj ET"], symbol, false);
+    let got = extract_text(&p.table(root, ""), &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "\u{3b1}\u{3b2}\u{3b3}");
+    // a subset tag and a style suffix name the same font; /Differences still apply over it
+    let tagged = "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+Symbol,Bold /Encoding << /Differences [98 /x] >> >>";
+    let (p, root) = doc(&[b"BT /F1 12 Tf (ab\\245) Tj ET"], tagged, false);
+    let got = extract_text(&p.table(root, ""), &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "\u{3b1}x\u{221e}");
+    // other fonts keep StandardEncoding
+    let (p, root) = doc(&[b"BT /F1 12 Tf (abg) Tj ET"], HELVETICA, false);
+    let got = extract_text(&p.table(root, ""), &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "abg");
 }

@@ -331,9 +331,13 @@ Serve options:
                         page by page. A PDF without one (scanned pages), an encrypted
                         one, or one over a limit is refused with a 400 that says why
   --pdf-max-pages <N>   Most pages read from one PDF (default: 500)
-  --pdf-max-inflate-mb <N>  Most bytes one PDF's compressed streams may expand to, in
-                        MiB (default: 256; also the most text it may yield). Host
-                        memory a request may hold for it, on the request's own thread
+  --pdf-max-inflate-mb <N>  Most bytes one PDF's streams may decode to, in MiB, every
+                        read of a stream counted, filtered or not (default: 256).
+                        Also, each on its own: the most bytes its object parses may
+                        read and their objects take, and the most text it may yield.
+                        Host memory a request may hold for it, on its own thread
+  --pdf-max-forms <N>   Most form XObjects one PDF may draw, all pages together, a
+                        form drawn again counted again (default: 100000)
   --verbose             Print server, HBM, and recipe diagnostics
   --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the
                         last 64 chat requests (job, reply id, endpoint, model,

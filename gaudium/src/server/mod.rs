@@ -171,7 +171,7 @@ pub struct ServerConfig {
     /// The MCP proxy (`--mcp-proxy` and its options).
     pub mcp_proxy: ProxyOptions,
     /// What one PDF in a request may cost (`--pdf-max-mb`, `--pdf-max-pages`,
-    /// `--pdf-max-inflate-mb`).
+    /// `--pdf-max-inflate-mb`, `--pdf-max-forms`).
     pub pdf: crate::pdf::Limits,
     /// PEM certificate chain of the HTTPS listener (`--tls-cert`).
     pub tls_cert: Option<PathBuf>,

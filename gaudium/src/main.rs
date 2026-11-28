@@ -360,9 +360,13 @@ fn print_usage() {
          \x20                       page by page. A PDF without one (scanned pages), an encrypted\n\
          \x20                       one, or one over a limit is refused with a 400 that says why\n\
          \x20 --pdf-max-pages <N>   Most pages read from one PDF (default: 500)\n\
-         \x20 --pdf-max-inflate-mb <N>  Most bytes one PDF's compressed streams may expand to, in\n\
-         \x20                       MiB (default: 256; also the most text it may yield). Host\n\
-         \x20                       memory a request may hold for it, on the request's own thread\n\
+         \x20 --pdf-max-inflate-mb <N>  Most bytes one PDF's streams may decode to, in MiB, every\n\
+         \x20                       read of a stream counted, filtered or not (default: 256).\n\
+         \x20                       Also, each on its own: the most bytes its object parses may\n\
+         \x20                       read and their objects take, and the most text it may yield.\n\
+         \x20                       Host memory a request may hold for it, on its own thread\n\
+         \x20 --pdf-max-forms <N>   Most form XObjects one PDF may draw, all pages together, a\n\
+         \x20                       form drawn again counted again (default: 100000)\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \x20 --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the\n\
          \x20                       last 64 chat requests (job, reply id, endpoint, model,\n\
@@ -2923,6 +2927,14 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                         format!("invalid --pdf-max-inflate-mb '{s}' (MiB, 1 to 65536)")
                     })?
                     << 20;
+            }
+            "--pdf-max-forms" => {
+                let s = next_val(&mut i, "--pdf-max-forms")?;
+                pdf.max_forms = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=100_000_000).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-forms '{s}' (1 to 100000000)"))?;
             }
             "--verbose" => verbose = true,
             "--debug-endpoints" => debug_endpoints = true,

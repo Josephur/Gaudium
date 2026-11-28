@@ -5,6 +5,13 @@
 //! the same baseline wider than a fraction of the font size becomes a space (words placed by
 //! `Td`, `TJ` adjustments or separate strings). Form XObjects are followed; inline images are
 //! skipped; graphics other than text are ignored.
+//!
+//! What one document may make the interpreter do is bounded: every content stream it reads is a
+//! fresh decode charged to the decode budget, so the bytes interpreted never exceed it; every
+//! form XObject drawn is charged to the form budget (`--pdf-max-forms`), so a form drawing
+//! itself many times stops at the cap; the operands held at any time are charged to the room
+//! the object budget leaves. Resources and objects are shared (`Rc`), and looking up a font or
+//! a form by name does not copy the resource dictionary.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -105,8 +112,13 @@ impl GState {
     }
 }
 
-/// Fonts already read, by object number (shared by the pages of a document).
-pub(crate) type FontCache = HashMap<u32, Rc<Font>>;
+/// Fonts already read (shared by the pages of a document): by object number, and direct font
+/// dictionaries by their shared allocation (kept alive here, so the address is not reused).
+#[derive(Default)]
+pub(crate) struct FontCache {
+    by_ref: HashMap<u32, Rc<Font>>,
+    direct: HashMap<*const Dict, (Rc<Dict>, Rc<Font>)>,
+}
 
 /// The text of one page under construction.
 pub(crate) struct Page<'d, 'a> {
@@ -114,6 +126,8 @@ pub(crate) struct Page<'d, 'a> {
     pub fonts: &'d mut FontCache,
     /// Bytes of text the document may yield.
     pub text_budget: &'d mut Budget,
+    /// Form XObjects the document may still draw.
+    pub forms: &'d mut Budget,
     pub out: String,
     /// Where the last text shown ended: x, y and the height of its font, in page space.
     last: Option<(f64, f64, f64)>,
@@ -124,11 +138,13 @@ impl<'d, 'a> Page<'d, 'a> {
         doc: &'d mut Doc<'a>,
         fonts: &'d mut FontCache,
         text_budget: &'d mut Budget,
+        forms: &'d mut Budget,
     ) -> Self {
         Page {
             doc,
             fonts,
             text_budget,
+            forms,
             out: String::new(),
             last: None,
         }
@@ -139,7 +155,7 @@ impl<'d, 'a> Page<'d, 'a> {
     pub fn run(
         &mut self,
         content: &[u8],
-        resources: &Dict,
+        resources: &Rc<Dict>,
         ctm: M0,
         depth: u64,
     ) -> Result<(), Fail> {
@@ -148,11 +164,13 @@ impl<'d, 'a> Page<'d, 'a> {
         let mut tm = M::ID;
         let mut tlm = M::ID;
         let mut args: Vec<Obj> = Vec::new();
-        let mut lx = Lexer::new(content, 0);
+        // the operands held between two operators may take the room the object budget leaves
+        let mut lx = Lexer::new(content, 0, self.doc.objects);
         loop {
             let tok = match lx.token(0, true) {
                 Ok(Some(t)) => t,
                 Ok(None) => break,
+                Err(e @ Fail::TooLarge(_)) => return Err(e),
                 Err(_) => break,
             };
             let op = match tok {
@@ -165,6 +183,19 @@ impl<'d, 'a> Page<'d, 'a> {
                 }
                 Token::Op(op) => op,
             };
+            // the operands are dropped at each operator
+            lx.restart();
+            if op == b"Do" {
+                let name = match args.first() {
+                    Some(Obj::Name(n)) => Some(n.clone()),
+                    _ => None,
+                };
+                args.clear();
+                if let Some(name) = name {
+                    self.form(resources, &name, gs.ctm, depth)?;
+                }
+                continue;
+            }
             let num = |i: usize| args.get(i).and_then(Obj::as_f64);
             match op.as_slice() {
                 b"q" => {
@@ -237,7 +268,7 @@ impl<'d, 'a> Page<'d, 'a> {
                 b"TJ" => {
                     if let Some(Obj::Array(items)) = args.first() {
                         let items = items.clone();
-                        for it in &items {
+                        for it in items.iter() {
                             match it {
                                 Obj::Str(s) => self.show(s, &gs, &mut tm)?,
                                 o => {
@@ -248,12 +279,6 @@ impl<'d, 'a> Page<'d, 'a> {
                                 }
                             }
                         }
-                    }
-                }
-                b"Do" => {
-                    if let Some(Obj::Name(name)) = args.first() {
-                        let name = name.clone();
-                        self.form(resources, &name, gs.ctm, depth)?;
                     }
                 }
                 b"BI" => skip_inline_image(&mut lx),
@@ -336,16 +361,29 @@ impl<'d, 'a> Page<'d, 'a> {
             Obj::Ref(n, _) => Some(n),
             _ => None,
         };
-        if let Some(f) = key.and_then(|k| self.fonts.get(&k)) {
+        if let Some(f) = key.and_then(|k| self.fonts.by_ref.get(&k)) {
             return Ok(Some(f.clone()));
         }
+        if let Obj::Dict(d) = &entry {
+            if let Some((_, f)) = self.fonts.direct.get(&Rc::as_ptr(d)) {
+                return Ok(Some(f.clone()));
+            }
+        }
         let obj = soft(self.doc.get(&entry))?;
-        let Some(dict) = obj.as_dict().cloned() else {
+        let Some(dict) = obj.as_dict() else {
             return Ok(None);
         };
-        let font = Rc::new(self.read_font(&dict)?);
-        if let Some(k) = key {
-            self.fonts.insert(k, font.clone());
+        let font = Rc::new(self.read_font(dict)?);
+        match (key, &entry) {
+            (Some(k), _) => {
+                self.fonts.by_ref.insert(k, font.clone());
+            }
+            (None, Obj::Dict(d)) => {
+                self.fonts
+                    .direct
+                    .insert(Rc::as_ptr(d), (d.clone(), font.clone()));
+            }
+            _ => {}
         }
         Ok(Some(font))
     }
@@ -366,11 +404,11 @@ impl<'d, 'a> Page<'d, 'a> {
             Obj::Dict(d) => {
                 let mut e = Dict::default();
                 if let Some(b) = d.get(b"BaseEncoding") {
-                    e.0.push((b"BaseEncoding".to_vec(), soft(self.doc.get(b))?));
+                    e.set(b"BaseEncoding".to_vec(), soft(self.doc.get(b))?);
                 }
                 let diff = soft(self.doc.entry(&d, b"Differences"))?;
-                e.0.push((b"Differences".to_vec(), diff));
-                encoding = Some(Obj::Dict(e));
+                e.set(b"Differences".to_vec(), diff);
+                encoding = Some(Obj::Dict(Rc::new(e)));
             }
             _ => {}
         }
@@ -380,26 +418,25 @@ impl<'d, 'a> Page<'d, 'a> {
             let desc = soft(self.doc.entry(dict, b"DescendantFonts"))?;
             let first = desc.as_array().and_then(|a| a.first()).cloned();
             if let Some(first) = first {
-                if let Some(df) = soft(self.doc.get(&first))?.as_dict().cloned() {
-                    if let Obj::Array(w) = soft(self.doc.entry(&df, b"W"))? {
+                let df = soft(self.doc.get(&first))?;
+                if let Some(df) = df.as_dict() {
+                    if let Obj::Array(w) = soft(self.doc.entry(df, b"W"))? {
                         let mut out = Vec::with_capacity(w.len());
-                        for x in w {
-                            out.push(soft(self.doc.get(&x))?);
+                        for x in w.iter() {
+                            out.push(soft(self.doc.get(x))?);
                         }
-                        widths = Some(out);
+                        widths = Some(Rc::from(out));
                     }
-                    default_width = soft(self.doc.entry(&df, b"DW"))?.as_f64();
+                    default_width = soft(self.doc.entry(df, b"DW"))?.as_f64();
                 }
             }
         } else {
             if let Obj::Array(w) = soft(self.doc.entry(dict, b"Widths"))? {
                 widths = Some(w);
             }
-            if let Some(fd) = soft(self.doc.entry(dict, b"FontDescriptor"))?
-                .as_dict()
-                .cloned()
-            {
-                default_width = soft(self.doc.entry(&fd, b"MissingWidth"))?
+            let fd = soft(self.doc.entry(dict, b"FontDescriptor"))?;
+            if let Some(fd) = fd.as_dict() {
+                default_width = soft(self.doc.entry(fd, b"MissingWidth"))?
                     .as_f64()
                     .filter(|w| *w > 0.0);
             }
@@ -411,11 +448,13 @@ impl<'d, 'a> Page<'d, 'a> {
             encoding_cmap,
             widths,
             default_width,
+            mem: self.doc.objects,
         }))
     }
 
-    /// Follows `Do` into a form XObject.
-    fn form(&mut self, resources: &Dict, name: &[u8], ctm: M, depth: u64) -> Result<(), Fail> {
+    /// Follows `Do` into a form XObject. Each form drawn is charged to the form budget, and
+    /// each draw decodes the form again, charged to the decode budget.
+    fn form(&mut self, resources: &Rc<Dict>, name: &[u8], ctm: M, depth: u64) -> Result<(), Fail> {
         if !v::pdf_below(depth + 1, MAX_FORM_DEPTH) {
             return Ok(());
         }
@@ -429,7 +468,7 @@ impl<'d, 'a> Page<'d, 'a> {
         if s.dict.get(b"Subtype").and_then(Obj::as_name) != Some(b"Form") {
             return Ok(());
         }
-        // each use decodes the form again, so repeated forms are charged to the budget
+        self.forms.take(1)?;
         let Some(data) = soft(self.doc.decode(&s, 0).map(Some))? else {
             return Ok(());
         };

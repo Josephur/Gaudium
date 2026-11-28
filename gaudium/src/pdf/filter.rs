@@ -1,20 +1,24 @@
 //! Stream filters (ISO 32000-1, section 7.4): FlateDecode (with PNG predictors), LZWDecode,
 //! ASCIIHexDecode, ASCII85Decode and RunLengthDecode.
 //!
-//! Every decoder gets the room the document's decompressed-byte budget still leaves
+//! Every read of a stream is charged to the document's decode budget, filtered or not: the
+//! raw bytes read, then each stage's output. Every decoder gets the room the budget still leaves
 //! (`pdf_budget_room`) and stops with an error as soon as its output would grow past it, so a
-//! small stream that expands without end (a zip bomb) stops at the cap. Image filters (DCT,
-//! JPX, CCITT, JBIG2) hold no text and are refused.
+//! small stream that expands without end (a zip bomb) stops at the cap, and a stream read again
+//! (a page listing it many times, a form drawn again) costs again. A PNG predictor's work is
+//! checked against the room and charged before it starts (`pdf_predict_fits`). Image filters
+//! (DCT, JPX, CCITT, JBIG2) hold no text and are refused.
 
 use super::lex::{Dict, Obj};
 use super::{Budget, Fail};
+use crate::verified as v;
 
-/// Decodes `data` through the filters named in `dict`. Each stage may produce the bytes the
-/// budget still has room for, and its output is charged to the budget.
+/// Decodes `data` through the filters named in `dict`. The raw bytes are charged first; each
+/// stage may produce the bytes the budget still has room for, and its output is charged.
 pub(crate) fn decode(dict: &Dict, data: &[u8], budget: &mut Budget) -> Result<Vec<u8>, Fail> {
     let filters: Vec<Vec<u8>> = match dict.get(b"Filter").or_else(|| dict.get(b"F")) {
-        None | Some(Obj::Null) => return Ok(data.to_vec()),
-        Some(Obj::Name(n)) => vec![n.clone()],
+        None | Some(Obj::Null) => Vec::new(),
+        Some(Obj::Name(n)) => vec![n.to_vec()],
         Some(Obj::Array(a)) => a
             .iter()
             .filter_map(|o| o.as_name().map(<[u8]>::to_vec))
@@ -26,25 +30,30 @@ pub(crate) fn decode(dict: &Dict, data: &[u8], budget: &mut Budget) -> Result<Ve
         Some(Obj::Array(a)) => a.iter().map(Obj::as_dict).collect(),
         _ => Vec::new(),
     };
-    let mut cur = data.to_vec();
+    // the bytes read are charged before they are copied or decoded
+    budget.take(data.len() as u64)?;
+    let mut cur: Option<Vec<u8>> = None;
     for (i, f) in filters.iter().enumerate() {
         let parm = parms.get(i).copied().flatten();
+        let input: &[u8] = cur.as_deref().unwrap_or(data);
         let room = budget.room();
         let cap = usize::try_from(room).unwrap_or(usize::MAX);
-        let stage = match f.as_slice() {
-            b"FlateDecode" | b"Fl" => crate::vision::decode::inflate::zlib_decompress(&cur, cap)
-                .map_err(|e| inflate_fail(&e, room))
-                .and_then(|raw| predict(raw, parm)),
+        let (stage, predicted) = match f.as_slice() {
+            b"FlateDecode" | b"Fl" => (
+                crate::vision::decode::inflate::zlib_decompress(input, cap)
+                    .map_err(|e| inflate_fail(&e, room)),
+                true,
+            ),
             b"LZWDecode" | b"LZW" => {
                 let early = parm
                     .and_then(|p| p.get(b"EarlyChange"))
                     .and_then(Obj::as_int)
                     .unwrap_or(1);
-                lzw(&cur, cap, early != 0, room).and_then(|raw| predict(raw, parm))
+                (lzw(input, cap, early != 0, room), true)
             }
-            b"ASCIIHexDecode" | b"AHx" => ascii_hex(&cur, cap, room),
-            b"ASCII85Decode" | b"A85" => ascii85(&cur, cap, room),
-            b"RunLengthDecode" | b"RL" => run_length(&cur, cap, room),
+            b"ASCIIHexDecode" | b"AHx" => (ascii_hex(input, cap, room), false),
+            b"ASCII85Decode" | b"A85" => (ascii85(input, cap, room), false),
+            b"RunLengthDecode" | b"RL" => (run_length(input, cap, room), false),
             other => {
                 return Err(Fail::Unsupported(format!(
                     "stream filter {}",
@@ -52,13 +61,17 @@ pub(crate) fn decode(dict: &Dict, data: &[u8], budget: &mut Budget) -> Result<Ve
                 )))
             }
         };
-        cur = stage.map_err(|e| match e {
+        let mut out = stage.map_err(|e| match e {
             Fail::TooLarge(_) => budget.over(),
             e => e,
         })?;
-        budget.take(cur.len() as u64)?;
+        budget.take(out.len() as u64)?;
+        if predicted {
+            out = predict(out, parm, budget)?;
+        }
+        cur = Some(out);
     }
-    Ok(cur)
+    Ok(cur.unwrap_or_else(|| data.to_vec()))
 }
 
 fn over(room: u64) -> Fail {
@@ -75,8 +88,10 @@ fn inflate_fail(e: &str, room: u64) -> Fail {
     }
 }
 
-/// Undoes a PNG predictor (`/Predictor` 10..=15) or passes the data through (1 or absent).
-fn predict(data: Vec<u8>, parm: Option<&Dict>) -> Result<Vec<u8>, Fail> {
+/// Undoes a PNG predictor (`/Predictor` 10..=15) or passes the data through (1 or absent). The
+/// rows it walks are counted from the data (`pdf_predict_rows`), and their work (rows times the
+/// row width) must fit in the budget's room and is charged before any of it is done.
+fn predict(data: Vec<u8>, parm: Option<&Dict>, budget: &mut Budget) -> Result<Vec<u8>, Fail> {
     let Some(p) = parm else {
         return Ok(data);
     };
@@ -104,11 +119,27 @@ fn predict(data: Vec<u8>, parm: Option<&Dict>) -> Result<Vec<u8>, Fail> {
     let bits_per_pixel = (colors * bpc) as usize;
     let bpp = bits_per_pixel.div_ceil(8).max(1);
     let row = (columns as usize * bits_per_pixel).div_ceil(8);
+    let (len, width) = (data.len() as u64, row as u64);
+    if !v::pdf_predict_fits(len, width, budget.room()) {
+        return Err(budget.over());
+    }
+    let rows = v::pdf_predict_rows(len, width);
+    // the work fits in the room, so the product does not overflow
+    budget.take(v::pdf_row_offset(rows, width))?;
     let mut out = Vec::with_capacity(data.len());
+    if rows == 0 {
+        return Ok(out);
+    }
     let mut prev = vec![0u8; row];
     let mut cur = vec![0u8; row];
-    for chunk in data.chunks(row + 1) {
-        let (kind, body) = (chunk[0], &chunk[1..]);
+    for k in 0..rows {
+        let at = v::pdf_row_offset(k, width + 1) as usize;
+        let Some(chunk) = data.get(at..data.len().min(at + row + 1)) else {
+            break;
+        };
+        let Some((&kind, body)) = chunk.split_first() else {
+            break;
+        };
         cur[..body.len()].copy_from_slice(body);
         for b in cur[body.len()..].iter_mut() {
             *b = 0;

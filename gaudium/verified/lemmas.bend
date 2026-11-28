@@ -234,3 +234,16 @@ def g_nat_lt_succ_le(+k: Nat, +n: Nat, h: {Nat.is_lt(k, n) == True{} : Bool}) ->
       L.bool_absurd({Nat.is_le(1n+1n+kp, 0n) == True{} : Bool}, h)
     case 1n+kp 1n+np:
       g_nat_lt_succ_le(kp, np, h)
+
+def g_div_mul_add_ge.dec(+n: Nat, +bp: Nat, +r: Nat, b: Bool, eb: {b == Nat.is_lt(Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp), n) : Bool}) -> {Nat.is_le(n, Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp)) == True{} : Bool}:
+  match b:
+    case False{}:
+      L.nat_not_lt_imp_le(Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp), n, Equal.sym(Bool, False{}, Nat.is_lt(Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp), n), eb))
+    case True{}:
+      +lt = L.nat_split_lt(Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp), Nat.mod(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp), n, bp, Equal.sym(Bool, True{}, Nat.is_lt(Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp), n), eb), L.nat_mod_lt(Nat.add(Nat.mul(n, 1n+bp), r), bp))
+      +lt2 = L.nat_lt_subst_l(Nat.add(Nat.mul(Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp), 1n+bp), Nat.mod(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp)), Nat.add(Nat.mul(n, 1n+bp), r), Nat.mul(n, 1n+bp), L.nat_div_mod_r(Nat.add(Nat.mul(n, 1n+bp), r), bp), lt)
+      Empty.absurd({Nat.is_le(n, Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp)) == True{} : Bool}, L.nat_lt_not_le(Nat.add(Nat.mul(n, 1n+bp), r), Nat.mul(n, 1n+bp), lt2, L.nat_add_le_r(Nat.mul(n, 1n+bp), r)))
+
+# `n * (1 + bp) + r` divided by `1 + bp` is at least `n`: a quotient keeps every whole count.
+def g_div_mul_add_ge(+n: Nat, +bp: Nat, +r: Nat) -> {Nat.is_le(n, Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp)) == True{} : Bool}:
+  g_div_mul_add_ge.dec(n, bp, r, Nat.is_lt(Nat.div(Nat.add(Nat.mul(n, 1n+bp), r), 1n+bp), n), {==})

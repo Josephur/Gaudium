@@ -13,8 +13,11 @@
 #   - the byte offset of row k of an xref stream;
 #   - the place of an object inside an object stream (/First plus its offset);
 #   - the field widths of an xref stream (/W);
-#   - the decompressed-byte budget of a document (the room one more inflate may use, whether
-#     a result fits, and the running total), so that a zip bomb stops at the cap;
+#   - the byte budgets of a document (the room one more decode may use, whether a charge fits,
+#     and the running total): the bytes its streams decode to (filtered or not), the memory its
+#     parsed objects take, the text it yields, and the form XObjects it draws, so that a zip
+#     bomb, overlapping objects or a form drawing itself stop at a cap;
+#   - the rows a PNG predictor walks, and whether that work fits the budget;
 #   - depth and count limits (nesting of arrays and dictionaries, chains of references, the
 #     page tree, form XObjects, pages) and the document size limit.
 # The limits themselves (bytes, pages, decompressed bytes, depths) are configuration and Rust
@@ -54,6 +57,17 @@ def pdf_objstm_pos(first: Nat, off: Nat) -> Nat:
 # The three field widths of an xref stream (/W) are each at most `max` bytes.
 def pdf_widths_ok(+a: Nat, +b: Nat, +c: Nat, +max: Nat) -> Bool:
   Bool.and(Bool.and(Nat.is_le(a, max), Nat.is_le(b, max)), Nat.is_le(c, max))
+
+# The rows a PNG predictor walks over `len` bytes of data, in rows of a tag byte and `row`
+# bytes (the last row may be short).
+def pdf_predict_rows(+len: Nat, +row: Nat) -> Nat:
+  Nat.div(Nat.add(len, row), 1n+row)
+
+# The predictor's work over `len` bytes (its rows times `row` bytes each) fits in `room`.
+# Checked before any work, so the work a stream asks for is tied to the budget, not to the
+# row width it declares.
+def pdf_predict_fits(+len: Nat, +row: Nat, +room: Nat) -> Bool:
+  pdf_count_fits(pdf_predict_rows(len, row), row, room)
 
 # ============================================================================
 # 2. Decompressed-byte budget
@@ -175,15 +189,16 @@ def pdf_count_within(n, e, a):
     case 1n+ep:
       G.g_fit_within(n, ep, a, Nat.is_le(n, Nat.div(a, 1n+ep)), {==})
 
-# promise: no entries at all always fit, whatever their size.
-# catches: a constant refusal (pdf_count_fits returning False)
-law pdf_count_none_fits:
+# promise: n entries of a nonzero size are accepted whenever the available bytes hold them all.
+# catches: only an empty count accepted (Nat.is_le(n, Nat.div(avail, elem)) replaced by Nat.is_eq(n, 0n))
+law pdf_count_inside_accepted:
+  for +n: Nat
   for +ep: Nat
-  for +a: Nat
-  {pdf_count_fits(0n, 1n+ep, a) == True{} : Bool}
+  for +r: Nat
+  {pdf_count_fits(n, 1n+ep, Nat.add(Nat.mul(n, 1n+ep), r)) == True{} : Bool}
 
-def pdf_count_none_fits(ep, a):
-  L.nat_le_zero(Nat.div(a, 1n+ep))
+def pdf_count_inside_accepted(n, ep, r):
+  G.g_div_mul_add_ge(n, ep, r)
 
 # promise: every row below the accepted row count ends inside the available bytes.
 # harm: an xref stream row could be read past the end of the decoded stream.
@@ -214,14 +229,19 @@ law pdf_objstm_within:
 def pdf_objstm_within(f, o, d):
   pdf_objstm_fit(f, o, d, Nat.is_le(f, d), {==}, Nat.is_lt(o, Nat.sub(d, f)), {==})
 
-# promise: the first object right after an empty header of a nonempty object stream is accepted.
-# catches: a constant refusal (pdf_objstm_ok returning False)
-law pdf_objstm_first_accepted:
-  for +d: Nat
-  {pdf_objstm_ok(0n, 0n, 1n+d) == True{} : Bool}
+# promise: every object that starts inside the decoded data after the header is accepted.
+# catches: only the first object accepted (Nat.is_lt(off, ...) replaced by Nat.is_eq(off, 0n))
+law pdf_objstm_inside_accepted:
+  for +f: Nat
+  for +o: Nat
+  for +r: Nat
+  {pdf_objstm_ok(f, o, Nat.add(Nat.add(f, o), 1n+r)) == True{} : Bool}
 
-def pdf_objstm_first_accepted(d):
-  {==}
+def pdf_objstm_inside_accepted(f, o, r):
+  %Equal.sym(Nat, Nat.add(Nat.add(f, o), 1n+r), Nat.add(f, Nat.add(o, 1n+r)), L.nat_add_assoc(f, o, 1n+r)) : {pdf_objstm_ok(f, o, _) == True{} : Bool}
+  %Equal.sym(Nat, Nat.sub(Nat.add(f, Nat.add(o, 1n+r)), f), Nat.add(o, 1n+r), L.nat_add_sub_cancel_l(f, Nat.add(o, 1n+r))) : {Bool.and(Nat.is_le(f, Nat.add(f, Nat.add(o, 1n+r))), Nat.is_lt(o, _)) == True{} : Bool}
+  %Equal.sym(Nat, Nat.add(o, 1n+r), 1n+Nat.add(o, r), L.nat_add_succ_r(o, r)) : {Bool.and(Nat.is_le(f, Nat.add(f, Nat.add(o, 1n+r))), Nat.is_lt(o, _)) == True{} : Bool}
+  G.g_bool_and_tt(Nat.is_le(f, Nat.add(f, Nat.add(o, 1n+r))), Nat.is_lt(o, 1n+Nat.add(o, r)), L.nat_add_le_r(f, Nat.add(o, 1n+r)), Equal.trans(Bool, Nat.is_lt(o, 1n+Nat.add(o, r)), Nat.is_le(o, Nat.add(o, r)), True{}, L.nat_lt_succ_eq_le(o, Nat.add(o, r)), L.nat_add_le_r(o, r)))
 
 # promise: xref field widths the reader accepts are never wider than the limit they were checked against.
 # harm: a wider field would overflow the integer the reader assembles it into.
@@ -236,15 +256,23 @@ law pdf_widths_within:
 def pdf_widths_within(a, b, c, m):
   pdf_widths_fit(a, b, c, m, Nat.is_le(a, m), {==}, Nat.is_le(b, m), {==}, Nat.is_le(c, m), {==})
 
-# promise: fields of zero width (absent fields, which take their defaults) are always accepted.
-# catches: a width of zero refused (Nat.is_le(a, max) replaced by Nat.is_lt(0n, a))
-law pdf_widths_zero_accepted:
-  for +m: Nat
-  {pdf_widths_ok(0n, 0n, 0n, m) == True{} : Bool}
+# promise: field widths that are each within the limit are always accepted.
+# catches: only zero widths accepted (Nat.is_le(a, max) replaced by Nat.is_eq(a, 0n))
+law pdf_widths_inside_accepted:
+  for +a: Nat
+  for +b: Nat
+  for +c: Nat
+  for +r: Nat
+  {pdf_widths_ok(a, b, c, Nat.add(Nat.max(a, Nat.max(b, c)), r)) == True{} : Bool}
 
-def pdf_widths_zero_accepted(m):
-  %Equal.sym(Bool, Nat.is_le(0n, m), True{}, L.nat_le_zero(m)) : {Bool.and(Bool.and(_, _), _) == True{} : Bool}
-  {==}
+def pdf_widths_inside_accepted(a, b, c, r):
+  +m = Nat.add(Nat.max(a, Nat.max(b, c)), r)
+  +top = L.nat_add_le_r(Nat.max(a, Nat.max(b, c)), r)
+  +bc = L.nat_max_ge_r(a, Nat.max(b, c))
+  +ha = L.nat_le_trans(a, Nat.max(a, Nat.max(b, c)), m, L.nat_max_ge_l(a, Nat.max(b, c)), top)
+  +hb = L.nat_le_trans(b, Nat.max(b, c), m, L.nat_max_ge_l(b, c), L.nat_le_trans(Nat.max(b, c), Nat.max(a, Nat.max(b, c)), m, bc, top))
+  +hc = L.nat_le_trans(c, Nat.max(b, c), m, L.nat_max_ge_r(b, c), L.nat_le_trans(Nat.max(b, c), Nat.max(a, Nat.max(b, c)), m, bc, top))
+  G.g_bool_and_tt(Bool.and(Nat.is_le(a, m), Nat.is_le(b, m)), Nat.is_le(c, m), G.g_bool_and_tt(Nat.is_le(a, m), Nat.is_le(b, m), ha, hb), hc)
 
 # promise: a decode the budget accepts never takes the bytes spent past the budget.
 # harm: a zip bomb could make the reader hold more decompressed bytes than configured.
@@ -258,15 +286,29 @@ law pdf_budget_within:
 def pdf_budget_within(u, n, m):
   pdf_span_within(u, n, m)
 
-# promise: a decode that fills exactly the room the budget leaves is accepted.
+# promise: while the budget is not overspent, every decode no larger than the room it leaves is accepted.
 # catches: the room computed one byte too large (Nat.sub(max, used) replaced by Nat.sub(1n+max, used))
 law pdf_budget_room_fits:
   for +u: Nat
   for +d: Nat
-  {pdf_budget_fits(u, pdf_budget_room(u, Nat.add(u, d)), Nat.add(u, d)) == True{} : Bool}
+  for +r: Nat
+  {pdf_budget_fits(u, Nat.sub(pdf_budget_room(u, Nat.add(u, d)), r), Nat.add(u, d)) == True{} : Bool}
 
-def pdf_budget_room_fits(u, d):
-  G.g_bool_and_tt(Nat.is_le(u, Nat.add(u, d)), Nat.is_le(Nat.sub(Nat.add(u, d), u), Nat.sub(Nat.add(u, d), u)), L.nat_add_le_r(u, d), L.nat_le_refl(Nat.sub(Nat.add(u, d), u)))
+def pdf_budget_room_fits(u, d, r):
+  %Equal.sym(Nat, Nat.sub(Nat.add(u, d), u), d, L.nat_add_sub_cancel_l(u, d)) : {pdf_budget_fits(u, Nat.sub(_, r), Nat.add(u, d)) == True{} : Bool}
+  %Equal.sym(Nat, Nat.sub(Nat.add(u, d), u), d, L.nat_add_sub_cancel_l(u, d)) : {Bool.and(Nat.is_le(u, Nat.add(u, d)), Nat.is_le(Nat.sub(d, r), _)) == True{} : Bool}
+  G.g_bool_and_tt(Nat.is_le(u, Nat.add(u, d)), Nat.is_le(Nat.sub(d, r), d), L.nat_add_le_r(u, d), G.g_nat_sub_le_self(d, r))
+
+# promise: every charge that fits in the bytes the budget has left is accepted.
+# catches: only a charge that fills the budget accepted (pdf_budget_fits replaced by Nat.is_eq(n, Nat.sub(max, used)))
+law pdf_budget_inside_accepted:
+  for +u: Nat
+  for +n: Nat
+  for +r: Nat
+  {pdf_budget_fits(u, n, Nat.add(Nat.add(u, n), r)) == True{} : Bool}
+
+def pdf_budget_inside_accepted(u, n, r):
+  pdf_span_inside_accepted(u, n, r)
 
 # promise: while the budget is not spent, the next decode gets some room.
 # catches: a constant zero room (pdf_budget_room returning 0n)
@@ -298,14 +340,16 @@ def pdf_below_within(x, m):
     case 1n+xp 1n+mp:
       pdf_below_within(xp, mp)
 
-# promise: the first level or entry is allowed under any positive limit.
-# catches: a constant refusal (pdf_below returning False)
-law pdf_below_zero_accepted:
-  for +m: Nat
-  {pdf_below(0n, 1n+m) == True{} : Bool}
+# promise: a depth or count below the limit may always grow by one more.
+# catches: only the first level allowed (pdf_below replaced by Bool.and(Nat.is_eq(x, 0n), Nat.is_lt(x, max)))
+law pdf_below_inside_accepted:
+  for +x: Nat
+  for +r: Nat
+  {pdf_below(x, Nat.add(x, 1n+r)) == True{} : Bool}
 
-def pdf_below_zero_accepted(m):
-  {==}
+def pdf_below_inside_accepted(x, r):
+  %Equal.sym(Nat, Nat.add(x, 1n+r), 1n+Nat.add(x, r), L.nat_add_succ_r(x, r)) : {pdf_below(x, _) == True{} : Bool}
+  Equal.trans(Bool, Nat.is_lt(x, 1n+Nat.add(x, r)), Nat.is_le(x, Nat.add(x, r)), True{}, L.nat_lt_succ_eq_le(x, Nat.add(x, r)), L.nat_add_le_r(x, r))
 
 # promise: a size the limit check accepts never exceeds the limit.
 # harm: a document larger than configured could be read into memory.
@@ -326,14 +370,15 @@ def pdf_within_limit(x, m):
     case 1n+xp 1n+mp:
       pdf_within_limit(xp, mp)
 
-# promise: a size equal to the limit is accepted.
-# catches: the limit itself refused (Nat.is_le replaced by Nat.is_lt)
-law pdf_within_at_limit:
-  for +m: Nat
-  {pdf_within(m, m) == True{} : Bool}
+# promise: every size up to the limit is accepted.
+# catches: only the limit itself accepted (Nat.is_le(x, max) replaced by Nat.is_eq(x, max))
+law pdf_within_inside_accepted:
+  for +x: Nat
+  for +r: Nat
+  {pdf_within(x, Nat.add(x, r)) == True{} : Bool}
 
-def pdf_within_at_limit(m):
-  L.nat_le_refl(m)
+def pdf_within_inside_accepted(x, r):
+  L.nat_add_le_r(x, r)
 
 # promise: a decode adds exactly its bytes to the bytes spent, no fewer.
 # harm: an undercounted spend would let many streams together decode past the budget (a zip bomb split over streams).
@@ -383,3 +428,48 @@ law pdf_objstm_pos_step:
 
 def pdf_objstm_pos_step(f, o):
   L.nat_add_succ_r(f, o)
+
+# promise: the rows a PNG predictor walks cover every byte of its data.
+# harm: bytes past the last row would be dropped from a decoded xref stream or content stream.
+# catches: the rows rounded down (Nat.div(Nat.add(len, row), 1n+row) replaced by Nat.div(len, 1n+row))
+law pdf_predict_rows_cover:
+  for +l: Nat
+  for +r: Nat
+  {Nat.is_le(l, Nat.mul(pdf_predict_rows(l, r), 1n+r)) == True{} : Bool}
+
+def pdf_predict_rows_cover(l, r):
+  G.g_nat_ceil_div_covers(l, r)
+
+# promise: a PNG predictor walks no row that starts past the end of its data.
+# harm: an extra row would be walked (and charged) for bytes the stream does not have.
+# catches: one row too many (pdf_predict_rows returning one more)
+law pdf_predict_rows_tight:
+  for +l: Nat
+  for +r: Nat
+  {Nat.is_le(Nat.mul(pdf_predict_rows(l, r), 1n+r), Nat.add(l, r)) == True{} : Bool}
+
+def pdf_predict_rows_tight(l, r):
+  L.nat_align_down_le(Nat.add(l, r), r)
+
+# promise: the work a PNG predictor is allowed (its rows times the row width) never exceeds the room it was checked against.
+# harm: a tiny stream declaring huge rows could make the reader walk megabytes per decode.
+# catches: the row width ignored (pdf_count_fits(rows, row, room) replaced by pdf_count_fits(rows, 1n, room))
+law pdf_predict_within:
+  for +l: Nat
+  for +r: Nat
+  for +m: Nat
+  {Bool.and(pdf_predict_fits(l, r, m), Nat.is_lt(m, Nat.mul(pdf_predict_rows(l, r), r))) == False{} : Bool}
+
+def pdf_predict_within(l, r, m):
+  pdf_count_within(pdf_predict_rows(l, r), r, m)
+
+# promise: a predictor over rows of a nonzero width is accepted whenever the room holds its work.
+# catches: the tag byte charged as row work (pdf_count_fits(rows, row, room) replaced by pdf_count_fits(rows, 1n+row, room))
+law pdf_predict_inside_accepted:
+  for +l: Nat
+  for +rp: Nat
+  for +x: Nat
+  {pdf_predict_fits(l, 1n+rp, Nat.add(Nat.mul(pdf_predict_rows(l, 1n+rp), 1n+rp), x)) == True{} : Bool}
+
+def pdf_predict_inside_accepted(l, rp, x):
+  G.g_div_mul_add_ge(pdf_predict_rows(l, 1n+rp), rp, x)

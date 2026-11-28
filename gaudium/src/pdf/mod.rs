@@ -11,9 +11,13 @@
 //! instead of (or beside) their text.
 //!
 //! A PDF is client data. Every offset, length, count, depth and byte budget taken from the file
-//! is checked through the verified core (`verified/pdf_bounds.bend`) before it is used, the
-//! decompressed bytes of a document are capped (so a zip bomb stops at the cap), and every
-//! limit is refused with its numbers. Encrypted PDFs are refused.
+//! is checked through the verified core (`verified/pdf_bounds.bend`) before it is used, and
+//! every limit is refused with its numbers. What one document may make the server spend is
+//! capped by budgets charged through the verified core: the bytes its streams decode to (every
+//! read of a stream, filtered or not, and the work of a PNG predictor), the bytes its object
+//! parses read and the memory their objects take (objects may overlap), the text it yields, and
+//! the form XObjects it draws. So a zip bomb, a stream listed many times, overlapping objects
+//! and a form drawing itself all stop at a cap. Encrypted PDFs are refused.
 
 mod content;
 mod doc;
@@ -24,6 +28,7 @@ mod lex;
 mod tests;
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use crate::verified as v;
 use doc::Doc;
@@ -35,6 +40,8 @@ pub const DEFAULT_MAX_MB: u64 = 32;
 pub const DEFAULT_MAX_PAGES: u64 = 500;
 /// `--pdf-max-inflate-mb` default: most bytes one PDF's streams may decode to, in MiB.
 pub const DEFAULT_MAX_INFLATE_MB: u64 = 256;
+/// `--pdf-max-forms` default: most form XObjects one PDF may draw, all pages together.
+pub const DEFAULT_MAX_FORMS: u64 = 100_000;
 
 /// Deepest nesting of arrays and dictionaries.
 pub(crate) const MAX_NEST: u64 = 64;
@@ -56,8 +63,12 @@ pub struct Limits {
     pub max_bytes: u64,
     /// Pages.
     pub max_pages: u64,
-    /// Bytes all its streams decode to together (and bytes of text it yields).
+    /// Bytes all its streams decode to together, counting every read of a stream (and,
+    /// separately, the bytes its object parses read and their objects take, and the bytes of
+    /// text it yields).
     pub max_decoded: u64,
+    /// Form XObjects drawn, all pages together (a form drawn again counts again).
+    pub max_forms: u64,
 }
 
 impl Default for Limits {
@@ -66,6 +77,7 @@ impl Default for Limits {
             max_bytes: DEFAULT_MAX_MB << 20,
             max_pages: DEFAULT_MAX_PAGES,
             max_decoded: DEFAULT_MAX_INFLATE_MB << 20,
+            max_forms: DEFAULT_MAX_FORMS,
         }
     }
 }
@@ -112,25 +124,51 @@ impl std::fmt::Display for Fail {
     }
 }
 
-/// A byte budget: what a document may still decode, or the text it may still yield.
+/// The flag that sets the byte budgets of a document.
+pub(crate) const INFLATE_FLAG: &str = "--pdf-max-inflate-mb";
+
+/// A budget of one document: the bytes its streams may still decode to, the memory its parsed
+/// objects may still take, the text it may still yield, or the form XObjects it may still draw.
+/// Every charge goes through the verified core (`pdf_budget_fits`, `pdf_budget_take`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Budget {
     used: u64,
     max: u64,
     what: &'static str,
+    unit: &'static str,
+    flag: &'static str,
 }
 
 impl Budget {
-    fn new(max: u64, what: &'static str) -> Self {
-        Budget { used: 0, max, what }
+    pub fn new(max: u64, what: &'static str, unit: &'static str, flag: &'static str) -> Self {
+        Budget {
+            used: 0,
+            max,
+            what,
+            unit,
+            flag,
+        }
     }
 
-    /// The bytes the next decode may produce.
+    /// The same budget with `used` spent (no more than it has spent now).
+    pub fn restarted_at(&self, used: u64) -> Self {
+        Budget {
+            used: used.min(self.used),
+            ..*self
+        }
+    }
+
+    /// What one more charge may take.
     pub fn room(&self) -> u64 {
         v::pdf_budget_room(self.used, self.max)
     }
 
-    /// Charges `n` bytes; refused past the budget.
+    /// What is spent.
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    /// Charges `n`; refused past the budget.
     pub fn take(&mut self, n: u64) -> Result<(), Fail> {
         if !v::pdf_budget_fits(self.used, n, self.max) {
             return Err(self.over());
@@ -141,8 +179,8 @@ impl Budget {
 
     pub fn over(&self) -> Fail {
         Fail::TooLarge(format!(
-            "{} more than {} bytes (--pdf-max-inflate-mb)",
-            self.what, self.max
+            "{} more than {} {} ({})",
+            self.what, self.max, self.unit, self.flag
         ))
     }
 }
@@ -189,19 +227,34 @@ pub fn extract_text(bytes: &[u8], limits: &Limits) -> Result<Extracted, Fail> {
     }
     let mut doc = Doc::open(
         bytes,
-        Budget::new(limits.max_decoded, "its streams decode to"),
+        Budget::new(
+            limits.max_decoded,
+            "its streams decode to",
+            "bytes",
+            INFLATE_FLAG,
+        ),
+        Budget::new(
+            limits.max_decoded,
+            "its objects take",
+            "bytes",
+            INFLATE_FLAG,
+        ),
     )?;
     let pages = page_list(&mut doc, limits.max_pages)?;
-    let mut fonts = content::FontCache::new();
-    let mut text_budget = Budget::new(limits.max_decoded, "its text is");
+    let mut fonts = content::FontCache::default();
+    let mut text_budget = Budget::new(limits.max_decoded, "its text is", "bytes", INFLATE_FLAG);
+    let mut forms = Budget::new(
+        limits.max_forms,
+        "it draws",
+        "form XObjects",
+        "--pdf-max-forms",
+    );
     let mut out = Vec::with_capacity(pages.len());
     for p in &pages {
-        let mut page = content::Page::new(&mut doc, &mut fonts, &mut text_budget);
-        for data in contents(page.doc, &p.contents)? {
-            page.run(&data, &p.resources, content::M0::ID, 0)?;
-            // content streams of a page are one stream split at token boundaries
-            page.out.push('\n');
-        }
+        // the content streams of a page are one stream split at token boundaries
+        let data = contents(&mut doc, &p.contents)?;
+        let mut page = content::Page::new(&mut doc, &mut fonts, &mut text_budget, &mut forms);
+        page.run(&data, &p.resources, content::M0::ID, 0)?;
         out.push(page.out);
     }
     if out.iter().all(|t| t.trim().is_empty()) {
@@ -212,7 +265,7 @@ pub fn extract_text(bytes: &[u8], limits: &Limits) -> Result<Extracted, Fail> {
 
 struct PageRef {
     contents: Obj,
-    resources: Dict,
+    resources: Rc<Dict>,
 }
 
 /// The pages in order, with their inherited resources.
@@ -232,7 +285,7 @@ fn page_list(doc: &mut Doc, max_pages: u64) -> Result<Vec<PageRef>, Fail> {
 fn walk(
     doc: &mut Doc,
     node: &Obj,
-    inherited: Option<&Dict>,
+    inherited: Option<&Rc<Dict>>,
     depth: u64,
     seen: &mut HashSet<u32>,
     out: &mut Vec<PageRef>,
@@ -258,7 +311,7 @@ fn walk(
     };
     match doc.entry(d, b"Kids")? {
         Obj::Array(kids) => {
-            for k in &kids {
+            for k in kids.iter() {
                 walk(doc, k, resources.as_ref(), depth + 1, seen, out, max_pages)?;
             }
         }
@@ -281,18 +334,22 @@ fn walk(
     Ok(())
 }
 
-/// The decoded content streams of a page. A stream the reader cannot decode is left out; a
-/// broken limit is an error.
-fn contents(doc: &mut Doc, c: &Obj) -> Result<Vec<Vec<u8>>, Fail> {
-    let parts = match doc.get(c)? {
+/// The content of a page: its content streams decoded (each read charged to the decode budget)
+/// and joined into one, with a white-space byte between parts. A stream the reader cannot
+/// decode is left out; a broken limit is an error.
+fn contents(doc: &mut Doc, c: &Obj) -> Result<Vec<u8>, Fail> {
+    let parts: Rc<[Obj]> = match doc.get(c)? {
         Obj::Array(a) => a,
-        o => vec![o],
+        o => Rc::from(vec![o]),
     };
     let mut out = Vec::new();
-    for p in &parts {
+    for p in parts.iter() {
         if let Obj::Stream(s) = doc.get(p)? {
             match doc.decode(&s, 0) {
-                Ok(d) => out.push(d),
+                Ok(d) => {
+                    out.extend_from_slice(&d);
+                    out.push(b'\n');
+                }
                 Err(e @ Fail::TooLarge(_)) => return Err(e),
                 Err(_) => {}
             }

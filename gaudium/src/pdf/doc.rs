@@ -4,6 +4,11 @@
 //! A file whose cross-reference data is missing or damaged is read by scanning it for
 //! `N G obj` headers instead. Every offset, length, count and depth taken from the file goes
 //! through the verified core before it is used.
+//!
+//! Objects may overlap (an offset may point anywhere, and a stream or a string may hold other
+//! object headers), so every parse is charged to the document's object budget: the bytes it
+//! reads and the memory its objects take. A stream's data is not copied: it stays a span of the
+//! file, and each decode of it is charged to the decode budget.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -44,7 +49,10 @@ pub(crate) struct Doc<'a> {
     objstm: HashMap<u32, Rc<ObjStm>>,
     /// Offsets of every `endstream` keyword (found once, for streams whose /Length is wrong).
     endstreams: Option<Vec<usize>>,
+    /// The bytes the document's streams may still decode to.
     pub budget: Budget,
+    /// The bytes object parses may still read, and the memory their objects may still take.
+    pub objects: Budget,
 }
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -66,7 +74,7 @@ fn non_negative(o: Option<&Obj>) -> Option<u64> {
 }
 
 impl<'a> Doc<'a> {
-    pub fn open(data: &'a [u8], budget: Budget) -> Result<Doc<'a>, Fail> {
+    pub fn open(data: &'a [u8], budget: Budget, objects: Budget) -> Result<Doc<'a>, Fail> {
         let head = &data[..data.len().min(1024)];
         if find(head, b"%PDF-", 0).is_none() {
             return Err(Fail::NotPdf);
@@ -79,6 +87,7 @@ impl<'a> Doc<'a> {
             objstm: HashMap::new(),
             endstreams: None,
             budget,
+            objects,
         };
         let read = doc.read_xref();
         if read.is_err() || doc.trailer.get(b"Root").is_none() {
@@ -105,7 +114,7 @@ impl<'a> Doc<'a> {
         let at = rfind(&self.data[tail_from..], b"startxref")
             .map(|p| p + tail_from)
             .ok_or_else(|| Fail::damaged("no startxref"))?;
-        let mut lx = Lexer::new(self.data, at + b"startxref".len());
+        let mut lx = Lexer::words(self.data, at + b"startxref".len());
         let mut next = lx.read_uint();
         let mut seen: HashSet<u64> = HashSet::new();
         let mut sections = 0u64;
@@ -124,23 +133,30 @@ impl<'a> Doc<'a> {
                     "a cross-reference offset ({off}) lies past the end of the file ({len} bytes)"
                 )));
             }
-            let mut lx = Lexer::new(self.data, off as usize);
-            let trailer = if lx.eat_keyword(b"xref") {
-                let t = self.xref_table(&mut lx)?;
+            let mut lx = Lexer::new(self.data, off as usize, self.objects);
+            let trailer: Obj = if lx.eat_keyword(b"xref") {
+                let t = self.xref_table(&mut lx);
+                self.charge(&lx, off as usize, 0)?;
+                let t = t?;
                 if let Some(stm) = non_negative(t.get(b"XRefStm")) {
                     if v::pdf_below(stm, len as u64) {
                         // a hybrid file: the stream's entries count before the older sections
-                        let _ = self.xref_stream_at(stm);
+                        if let Err(e @ Fail::TooLarge(_)) = self.xref_stream_at(stm) {
+                            return Err(e);
+                        }
                     }
                 }
-                t
+                Obj::Dict(t)
             } else {
-                self.xref_stream_at(off)?
+                Obj::Stream(self.xref_stream_at(off)?)
+            };
+            let Some(trailer) = trailer.as_dict() else {
+                break;
             };
             next = non_negative(trailer.get(b"Prev"));
-            for (k, val) in trailer.0 {
-                if self.trailer.get(&k).is_none() && k != b"Prev" {
-                    self.trailer.0.push((k, val));
+            for (k, val) in trailer.iter() {
+                if self.trailer.get(k).is_none() && k != b"Prev" {
+                    self.trailer.set(k.to_vec(), val.clone());
                 }
             }
         }
@@ -152,8 +168,17 @@ impl<'a> Doc<'a> {
         self.xref.entry(num).or_insert(loc);
     }
 
+    /// Charges a parse to the object budget: the memory its objects take, the bytes it read
+    /// from `from` to the cursor, and `extra` bytes read beside it.
+    fn charge(&mut self, lx: &Lexer, from: usize, extra: u64) -> Result<(), Fail> {
+        let read = lx.pos.saturating_sub(from) as u64;
+        self.objects.take(lx.spent())?;
+        self.objects.take(read)?;
+        self.objects.take(extra)
+    }
+
     /// A classic xref table at the cursor (after `xref`), and the trailer that follows it.
-    fn xref_table(&mut self, lx: &mut Lexer) -> Result<Dict, Fail> {
+    fn xref_table(&mut self, lx: &mut Lexer) -> Result<Rc<Dict>, Fail> {
         loop {
             let save = lx.pos;
             let (Some(start), Some(count)) = (lx.read_uint(), lx.read_uint()) else {
@@ -192,8 +217,8 @@ impl<'a> Doc<'a> {
         }
     }
 
-    /// The xref stream at file offset `off`; returns its dictionary (the trailer).
-    fn xref_stream_at(&mut self, off: u64) -> Result<Dict, Fail> {
+    /// The xref stream at file offset `off`; returns it (its dictionary is the trailer).
+    fn xref_stream_at(&mut self, off: u64) -> Result<Rc<Stream>, Fail> {
         let Some((_, obj)) = self.parse_at(off, 0)? else {
             return Err(Fail::damaged("no cross-reference data at startxref"));
         };
@@ -204,7 +229,7 @@ impl<'a> Doc<'a> {
             return Err(Fail::damaged("no cross-reference data at startxref"));
         }
         self.xref_stream(&s)?;
-        Ok(s.dict.clone())
+        Ok(s)
     }
 
     fn xref_stream(&mut self, s: &Stream) -> Result<(), Fail> {
@@ -300,7 +325,7 @@ impl<'a> Doc<'a> {
             if !(ws(&mut j) && digits(&mut j) && ws(&mut j) && digits(&mut j)) {
                 continue;
             }
-            let mut lx = Lexer::new(data, j);
+            let mut lx = Lexer::words(data, j);
             let (Some(num), Some(_)) = (lx.read_uint(), lx.read_uint()) else {
                 continue;
             };
@@ -311,17 +336,24 @@ impl<'a> Doc<'a> {
         }
         // the trailer: the last `trailer` dictionary, else an xref stream's dictionary
         if let Some(t) = rfind(data, b"trailer") {
-            let mut lx = Lexer::new(data, t + b"trailer".len());
-            if let Ok(Obj::Dict(d)) = lx.object(0) {
-                trailer = Some(d);
+            let from = t + b"trailer".len();
+            let mut lx = Lexer::new(data, from, self.objects);
+            let got = lx.object(0);
+            self.charge(&lx, from, 0)?;
+            match got {
+                Ok(Obj::Dict(d)) => trailer = Some((*d).clone()),
+                Err(e @ Fail::TooLarge(_)) => return Err(e),
+                _ => {}
             }
         }
         if trailer.as_ref().is_none_or(|t| t.get(b"Root").is_none()) {
             let mut nums: Vec<u32> = self.xref.keys().copied().collect();
             nums.sort_unstable();
             for num in nums {
-                let Ok(o) = self.resolve(num, 0) else {
-                    continue;
+                let o = match self.resolve(num, 0) {
+                    Ok(o) => o,
+                    Err(e @ Fail::TooLarge(_)) => return Err(e),
+                    Err(_) => continue,
                 };
                 if let Obj::Stream(s) = &o {
                     if s.dict.get(b"Type").and_then(Obj::as_name) == Some(b"XRef") {
@@ -342,7 +374,7 @@ impl<'a> Doc<'a> {
                     if ty == Some(b"Catalog")
                         && trailer.as_ref().is_none_or(|t| t.get(b"Root").is_none())
                     {
-                        trailer = Some(Dict(vec![(b"Root".to_vec(), Obj::Ref(num, 0))]));
+                        trailer = Some(Dict::from_iter([(b"Root".to_vec(), Obj::Ref(num, 0))]));
                     }
                 }
             }
@@ -361,13 +393,26 @@ impl<'a> Doc<'a> {
     // ---------------------------------------------------------------------------------------
 
     /// The indirect object at file offset `off`: its number and the object (`None` when no
-    /// object header is there).
+    /// object header is there). The parse is charged to the object budget.
     fn parse_at(&mut self, off: u64, depth: u64) -> Result<Option<(u32, Obj)>, Fail> {
         let len = self.data.len() as u64;
         if !v::pdf_below(off, len) {
             return Ok(None);
         }
-        let mut lx = Lexer::new(self.data, off as usize);
+        let mut lx = Lexer::new(self.data, off as usize, self.objects);
+        let mut extra = 0u64;
+        let got = self.parse_obj(&mut lx, depth, &mut extra);
+        self.charge(&lx, off as usize, extra)?;
+        got
+    }
+
+    fn parse_obj(
+        &mut self,
+        lx: &mut Lexer<'a>,
+        depth: u64,
+        extra: &mut u64,
+    ) -> Result<Option<(u32, Obj)>, Fail> {
+        let len = self.data.len() as u64;
         let (Some(num), Some(_gen)) = (lx.read_uint(), lx.read_uint()) else {
             return Ok(None);
         };
@@ -384,6 +429,7 @@ impl<'a> Doc<'a> {
         if !lx.eat_keyword(b"stream") {
             return Ok(Some((num, Obj::Dict(dict))));
         }
+        let dict = Rc::try_unwrap(dict).unwrap_or_else(|d| (*d).clone());
         // the data starts after the end of line that follows the keyword
         let mut start = lx.pos;
         if self.data.get(start) == Some(&b'\r') {
@@ -402,8 +448,10 @@ impl<'a> Doc<'a> {
         let span = declared.filter(|&l| {
             v::pdf_span_ok(start as u64, l, len) && {
                 // the length is right when `endstream` follows it
-                let mut after = Lexer::new(self.data, start + l as usize);
-                after.eat_keyword(b"endstream")
+                let mut after = Lexer::words(self.data, start + l as usize);
+                let found = after.eat_keyword(b"endstream");
+                *extra += (after.pos - (start + l as usize)) as u64;
+                found
             }
         });
         let end = match span {
@@ -430,8 +478,12 @@ impl<'a> Doc<'a> {
                 e
             }
         };
-        let data: Rc<[u8]> = Rc::from(self.data.get(start..end).unwrap_or(&[]));
-        Ok(Some((num, Obj::Stream(Rc::new(Stream { dict, data })))))
+        let end = end.max(start).min(self.data.len());
+        let start = start.min(end);
+        Ok(Some((
+            num,
+            Obj::Stream(Rc::new(Stream { dict, start, end })),
+        )))
     }
 
     /// Object `num` (null when the file has no such object).
@@ -505,7 +557,7 @@ impl<'a> Doc<'a> {
                         "an object stream claims {n} objects in a header of {first} bytes"
                     )));
                 }
-                let mut lx = Lexer::new(&data[..first as usize], 0);
+                let mut lx = Lexer::words(&data[..first as usize], 0);
                 let mut offsets = Vec::with_capacity(n as usize);
                 for _ in 0..n {
                     let (Some(_num), Some(off)) = (lx.read_uint(), lx.read_uint()) else {
@@ -531,8 +583,12 @@ impl<'a> Doc<'a> {
             )));
         }
         let pos = v::pdf_objstm_pos(os.first, off) as usize;
-        let mut lx = Lexer::new(&os.data, pos);
-        lx.object(0)
+        let mut lx = Lexer::new(&os.data, pos, self.objects);
+        let got = lx.object(0);
+        let (spent, read) = (lx.spent(), (lx.pos - pos) as u64);
+        self.objects.take(spent)?;
+        self.objects.take(read)?;
+        got
     }
 
     /// The decoded data of a stream, charged to the decompression budget.
@@ -542,17 +598,20 @@ impl<'a> Doc<'a> {
         for key in [&b"Filter"[..], b"DecodeParms", b"F", b"DP"] {
             if let Some(o) = s.dict.get(key) {
                 let mut val = self.get_depth(o, depth)?;
-                if let Obj::Array(items) = &mut val {
-                    for it in items.iter_mut() {
-                        if let Obj::Ref(..) = it {
-                            *it = self.get_depth(it, depth)?;
+                if let Obj::Array(items) = &val {
+                    if items.iter().any(|it| matches!(it, Obj::Ref(..))) {
+                        let mut out = Vec::with_capacity(items.len());
+                        for it in items.iter() {
+                            out.push(self.get_depth(it, depth)?);
                         }
+                        val = Obj::Array(out.into());
                     }
                 }
-                dict.0.push((key.to_vec(), val));
+                dict.set(key.to_vec(), val);
             }
         }
-        super::filter::decode(&dict, &s.data, &mut self.budget)
+        let data = self.data.get(s.start..s.end).unwrap_or(&[]);
+        super::filter::decode(&dict, data, &mut self.budget)
     }
 
     fn get_depth(&mut self, o: &Obj, depth: u64) -> Result<Obj, Fail> {
