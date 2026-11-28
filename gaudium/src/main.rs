@@ -320,7 +320,8 @@ fn print_usage() {
          \x20                       reaches, and plain-http servers used from an https page). Off\n\
          \x20                       by default. It needs the targets it may reach (the two options\n\
          \x20                       below); requests need the API key when one is set; a page of\n\
-         \x20                       another site cannot drive it. GET /gaudium/proxy shows its\n\
+         \x20                       another site cannot drive it, and a request must name this\n\
+         \x20                       server (see --server-name). GET /gaudium/proxy shows its\n\
          \x20                       settings and last decisions\n\
          \x20 --mcp-proxy-allow <list>  Targets the proxy may reach, comma separated (repeatable):\n\
          \x20                       host, host:port, *.domain, an address, an address range\n\
@@ -332,6 +333,14 @@ fn print_usage() {
          \x20                       (localhost:8931, 127.0.0.1, 192.168.0.0/16). An entry here\n\
          \x20                       also allows the target, so an MCP server on this machine\n\
          \x20                       needs this option only\n\
+         \x20 --server-name <list>  Names this server is opened by, comma separated (repeatable),\n\
+         \x20                       for the MCP proxy: its requests must name the server (Host and\n\
+         \x20                       any X-Forwarded-Host or Forwarded host) by an address,\n\
+         \x20                       localhost, a name given here, or a DNS name of the HTTPS\n\
+         \x20                       certificate; any other name is refused, so a page of another\n\
+         \x20                       site cannot point its own name at this server (DNS rebinding).\n\
+         \x20                       Give the name the Web UI is opened by, and a front end's\n\
+         \x20                       public name\n\
          \x20 --mcp-proxy-max-mb <N>  Largest response the proxy passes on, in MiB (default: 64)\n\
          \x20 --mcp-proxy-timeout <secs>  Longest silence of a target, or wait on a page that\n\
          \x20                       stopped reading, before the proxy gives up (default: 600).\n\
@@ -2834,6 +2843,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             "--mcp-proxy-allow-private" => mcp_proxy
                 .allow_private
                 .push(next_val(&mut i, "--mcp-proxy-allow-private")?),
+            "--server-name" => mcp_proxy
+                .server_names
+                .push(next_val(&mut i, "--server-name")?),
             "--mcp-proxy-max-mb" => {
                 let s = next_val(&mut i, "--mcp-proxy-max-mb")?;
                 mcp_proxy.max_response_mb = s

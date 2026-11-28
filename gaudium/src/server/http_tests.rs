@@ -2554,12 +2554,21 @@ fn the_proxy_route_is_behind_the_api_key_and_never_forwards_it() {
 }
 
 /// Behind a front end that ends TLS and forwards plain HTTP (a tunnel, a reverse proxy, a
-/// forwarded router port), the server gets a `Host` it has never heard of and a page whose
-/// origin is https. Nothing is configured with that name, and every answer is the one a direct
-/// request gets.
+/// forwarded router port), the server gets the front end's public name as `Host` and a page whose
+/// origin is https. With that name given (`--server-name`), every answer is the one a direct
+/// request gets; the MCP proxy alone needs the name, every other route answers without it.
 #[test]
 fn a_request_through_a_tls_front_end_gets_the_answers_of_a_direct_one() {
-    let h = net_harness(loopback_proxy(false), None, None);
+    let named = |names: &[&str]| {
+        let opts = ProxyOptions {
+            enabled: true,
+            allow_private: vec!["127.0.0.1".into()],
+            server_names: names.iter().map(|n| n.to_string()).collect(),
+            ..ProxyOptions::default()
+        };
+        proxy::McpProxy::new(&opts, false).unwrap()
+    };
+    let h = net_harness(named(&["chat.example.com"]), None, None);
     let (port, seen) = json_target("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
     let direct = "Host: 127.0.0.1:8090";
     let fronted = "Host: chat.example.com\r\nX-Forwarded-Proto: https\r\n\
@@ -2612,6 +2621,25 @@ fn a_request_through_a_tls_front_end_gets_the_answers_of_a_direct_one() {
         assert!(head.contains(&format!("host: 127.0.0.1:{port}")), "{head}");
         assert!(!head.contains("x-forwarded") && !head.contains("chat.example.com"), "{head}");
     }
+    drop(seen);
+
+    // without the name, the proxy refuses the fronted requests (the public name may be a page
+    // of another site that points its own name at this server) and the other routes still answer
+    let h = net_harness(named(&[]), None, None);
+    let initialize = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
+    for headers in [fronted, bare] {
+        let (status, _, body) =
+            plain_exchange(&h.state, &format!("{proxied}\r\n{headers}"), initialize);
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("--server-name"), "{body}");
+        let (status, _, _) =
+            plain_exchange(&h.state, &format!("GET /health HTTP/1.1\r\n{headers}"), "");
+        assert_eq!(status, 200);
+    }
+    // a front end that rewrites Host to an address passes, its page's statement decides
+    let (status, _, _) =
+        plain_exchange(&h.state, &format!("{proxied}\r\n{rewritten}"), initialize);
+    assert_eq!(status, 200);
 }
 
 /// One exchange over TLS with the engine's own client: `(status, head, body)`.
