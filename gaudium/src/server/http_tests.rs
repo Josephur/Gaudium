@@ -3388,7 +3388,7 @@ fn chat_reports_the_request_fields_it_does_not_apply() {
     // accepted but not applied: the reply names each one, in body order, with a reason
     h.script("</think>\n\nHi.");
     let (status, r) = h.chat(
-        ",\"presence_penalty\":0.6,\"frequency_penalty\":0.2,\"logit_bias\":{\"7\":5},\
+        ",\"service_tier\":\"auto\",\"metadata\":{\"k\":\"v\"},\
          \"user\":\"someone\",\"stream_options\":{\"include_usage\":false}",
     );
     assert_eq!(status, 200, "{}", r.dump());
@@ -3400,13 +3400,7 @@ fn chat_reports_the_request_fields_it_does_not_apply() {
         .collect();
     assert_eq!(
         names,
-        [
-            "presence_penalty",
-            "frequency_penalty",
-            "logit_bias",
-            "user",
-            "stream_options"
-        ],
+        ["service_tier", "metadata", "user", "stream_options"],
         "{ignored:?}"
     );
     assert!(
@@ -3424,7 +3418,7 @@ fn chat_reports_the_request_fields_it_does_not_apply() {
     h.script("</think>\n\nHi.");
     let (status, body) = h.post(
         "/v1/chat/completions",
-        "{\"stream\":true,\"presence_penalty\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
+        "{\"stream\":true,\"user\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
     );
     assert_eq!(status, 200, "{body}");
     let last = body
@@ -3436,7 +3430,7 @@ fn chat_reports_the_request_fields_it_does_not_apply() {
         .unwrap();
     let ignored = ignored_of(&last);
     assert_eq!(ignored.len(), 1, "{ignored:?}");
-    assert!(ignored[0].starts_with("presence_penalty ("), "{ignored:?}");
+    assert!(ignored[0].starts_with("user ("), "{ignored:?}");
 }
 
 #[test]
@@ -3785,4 +3779,20 @@ fn every_completion_route_is_behind_the_api_key() {
             assert!(body.contains("authentication_error"), "{body}");
         }
     }
+}
+
+#[test]
+fn chat_penalties_are_applied_not_reported_as_ignored() {
+    let h = harness();
+    h.script("</think>\n\nHi.");
+    let (status, r) = h.chat(",\"presence_penalty\":0.5,\"logit_bias\":{\"7\":5}");
+    assert_eq!(status, 200, "{}", r.dump());
+    let ignored = ignored_of(&r);
+    assert!(
+        !ignored
+            .iter()
+            .any(|i| i.starts_with("presence_penalty") || i.starts_with("logit_bias")),
+        "{}",
+        r.dump()
+    );
 }
