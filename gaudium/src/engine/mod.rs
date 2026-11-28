@@ -475,6 +475,17 @@ pub fn lane_verify(opts: &step_opts::StepOpts, lanes: u64) -> step_opts::GdnVeri
     }
 }
 
+/// Whether the engine of `family`, served with `lanes` lanes, applies a request's sampling
+/// penalties and logit bias (`sampler_penalty`): the Qwen-family engine on its host-picked
+/// `K = 0` path, one request at a time. The server gates requests with
+/// `verified::pen_path_allowed` on this.
+pub fn applies_penalties(family: ModelFamily, lanes: usize) -> bool {
+    matches!(
+        family,
+        ModelFamily::Qwen3 | ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
+    ) && lanes <= 1
+}
+
 /// Loads the engine matching the model family declared in `<model_dir>/config.json`.
 pub fn load_engine(cfg: &EngineConfig) -> Result<Box<dyn GenEngine>, String> {
     use crate::core::kv_cache::check_setting_taken;

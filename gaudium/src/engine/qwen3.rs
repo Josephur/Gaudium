@@ -205,6 +205,9 @@ pub struct Qwen3GenParams {
     /// The request may resume its prefill from state the engine holds for a prefix of its prompt
     /// (`false`: a cold prefill from position 0, the reference a resumed one is identical to).
     pub cache_prompt: bool,
+    /// Presence / frequency / repetition penalties and the logit bias (`sampler_penalty`). An
+    /// active set runs the request on the host-picked `K = 0` path (`pen_path_allowed`).
+    pub penalties: crate::sampler_penalty::Penalties,
 }
 
 impl Default for Qwen3GenParams {
@@ -227,6 +230,7 @@ impl Default for Qwen3GenParams {
             force_draft_k: None,
             k0_plain: false,
             cache_prompt: true,
+            penalties: crate::sampler_penalty::Penalties::default(),
         }
     }
 }
@@ -269,6 +273,21 @@ pub struct Qwen3GenReport {
     /// Where the reused rows came from, and what the host-RAM tier copied for this request
     /// (`None`: the engine has no host tier).
     pub host_tier: Option<host_tier::TierReport>,
+}
+
+/// Method label of a request decoded on the `K = 0` path, e.g. `K=0 FP8 T=0.70` or
+/// `K=0 BF16 greedy penalised`.
+fn k0_method_label(wprec: &str, params: &Qwen3GenParams) -> String {
+    let base = if params.temperature > 0.0 {
+        format!("K=0 {wprec} T={:.2}", params.temperature)
+    } else {
+        format!("K=0 {wprec} greedy")
+    };
+    if params.penalties.active() {
+        format!("{base} penalised")
+    } else {
+        base
+    }
 }
 
 /// One greedy-vs-reference disagreement observed under teacher forcing.
@@ -1259,6 +1278,8 @@ pub struct Qwen3Engine {
     /// [lanes] the lanes of an engine loaded with `--parallel N > 1` (owns recipes: must drop
     /// before `dev`); `None`: one request at a time.
     lanes: Option<lanes_rt::LaneRt>,
+    /// Count ledger of the running request's penalties (`sampler_penalty`).
+    pen: crate::sampler_penalty::PenaltyState,
 
     // Device handle (dropped LAST!)
     dev: HpuDevice,
@@ -2826,6 +2847,7 @@ impl Qwen3Engine {
                 .map_or_else(|| "none".to_string(), |(c, _)| c.id()),
             prof: prof.map(prof_rt::ProfRt::new),
             lanes: lane_rt,
+            pen: crate::sampler_penalty::PenaltyState::default(),
             dev,
         };
         eng.warm_prefill_tiles(cfg.prefill_warm_rows, cfg.verbose)?;
@@ -3104,6 +3126,30 @@ impl Qwen3Engine {
         Ok(res.token as i32)
     }
 
+    /// The token of a penalised request at sequence index `n`: the readout row's logits read
+    /// back, the request's penalties applied with its count ledger, then the sampler's host twin
+    /// (greedy or sampled with the position's noise).
+    fn pick_penalised(
+        &mut self,
+        logits_hbm: u64,
+        params: &Qwen3GenParams,
+        n: u32,
+    ) -> Result<i32, String> {
+        let vocab = self.spec.vocab as usize;
+        let bytes = vocab * 2;
+        self.dev
+            .copy_d2h_pinned_sync(logits_hbm, &mut self.stage_io, bytes)
+            .map_err(|e| format!("read logits D2H: {e}"))?;
+        let mut bf16: Vec<u16> = self.stage_io.as_slice()[..bytes]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        let dev_sp = samp_rt::dev_params(params, self.spec.vocab);
+        crate::sampler_penalty::pick(&params.penalties, &self.pen, &mut bf16, &dev_sp, n)
+    }
+
     /// The token of a readout row: read from the card (greedy argmax, or the on-card sampler of
     /// a sampled request, which `sample_check` compares with the host twin), or sampled on the
     /// host when the engine has no on-card sampler. `n` = sequence index of the token.
@@ -3114,6 +3160,9 @@ impl Qwen3Engine {
         logits_hbm: u64,
         n: u32,
     ) -> Result<i32, String> {
+        if params.penalties.active() {
+            return self.pick_penalised(logits_hbm, params, n);
+        }
         if params.temperature > 0.0 && self.samp.is_none() {
             return self.sample_from_logits(logits_hbm, params, n);
         }
@@ -3160,9 +3209,13 @@ impl Qwen3Engine {
         }
         let is_eos = |tok: i32| eos_ids.contains(&tok);
         let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+        let penalised = params.penalties.active();
+        self.pen = crate::sampler_penalty::PenaltyState::begin(prompt_ids.len());
 
         let wprec = if self.spec.fp8_weights { "FP8" } else { "BF16" }; // [fp8 hook]
-        let method_label = if let Some(sd) = &self.specdec {
+        let method_label = if penalised {
+            k0_method_label(wprec, params)
+        } else if let Some(sd) = &self.specdec {
             sd.method_label(params.temperature).replace(
                 " BF16 ",
                 if self.spec.fp8_weights {
@@ -3235,7 +3288,10 @@ impl Qwen3Engine {
         prof_rt::begin_request(self);
         let mut gdn_parity: usize = 0;
         // A sampled request runs the sampled recipe families; its parameters go to the card now.
-        let samp_on = params.temperature > 0.0 && self.samp.is_some();
+        // (a penalised request picks its tokens on the host: the on-card sampler applies none)
+        let samp_on = params.temperature > 0.0
+            && self.samp.is_some()
+            && crate::verified::pen_path_allowed(params.penalties.active(), false);
         if let Some(s) = self.samp.as_mut() {
             s.reset_checks();
         }
@@ -3761,7 +3817,11 @@ impl Qwen3Engine {
         let mut forks: Vec<ForkRecord> = Vec::new();
         let first_tok = self.apply_force(params, 0, first_tok, first_logits_hbm, &mut forks)?;
 
+        let penalised = params.penalties.active();
         if budget.remaining() > 0 && !is_cancelled() {
+            if penalised {
+                self.pen.commit(first_tok, self.spec.vocab)?;
+            }
             budget.record_emitted(1);
             generated.push(first_tok);
             self.live.first_token(Some(ttft_ms), 1);
@@ -3779,6 +3839,8 @@ impl Qwen3Engine {
             .as_ref()
             .is_some_and(|sd| params.temperature <= 0.0 || sd.handles_sampled())
             && !params.non_speculative
+            // the verify picks its tokens on the card, without the penalties
+            && crate::verified::pen_path_allowed(penalised, false)
             && !stopped_by_eos
             && !stopped_by_cancel
             && !generated.is_empty()
@@ -3866,6 +3928,8 @@ impl Qwen3Engine {
         let mut piped_ms: Option<f64> = None;
         if !samp_on
             && k0pipe::usable(self, params)
+            // (the token is fed back on the card, without the penalties)
+            && crate::verified::pen_path_allowed(penalised, false)
             && !stopped_by_eos
             && !stopped_by_cancel
             && budget.remaining() > 0
@@ -3941,6 +4005,9 @@ impl Qwen3Engine {
             )?;
 
             decode_steps += 1;
+            if penalised {
+                self.pen.commit(next_tok, self.spec.vocab)?;
+            }
             budget.record_emitted(1);
             generated.push(next_tok);
             self.live.step(1, 0, 0);
@@ -3980,14 +4047,10 @@ impl Qwen3Engine {
             forks,
             launches: decode_steps as u64,
             tokens_per_launch: if decode_steps > 0 { 1.0 } else { 0.0 },
-            method: {
-                let wprec = if self.spec.fp8_weights { "FP8" } else { "BF16" };
-                if params.temperature > 0.0 {
-                    format!("K=0 {wprec} T={:.2}", params.temperature)
-                } else {
-                    format!("K=0 {wprec} greedy")
-                }
-            },
+            method: k0_method_label(
+                if self.spec.fp8_weights { "FP8" } else { "BF16" },
+                params,
+            ),
             accept_per_pos: Vec::new(),
             sample_check_rows: self.samp.as_ref().map_or(0, |s| s.check_rows),
             sample_check_mismatches: self.samp.as_ref().map_or(0, |s| s.check_bad),

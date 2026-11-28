@@ -25,6 +25,7 @@ pub mod moe_cache;
 pub mod proto;
 pub mod safetensors;
 pub mod sampler;
+pub mod sampler_penalty;
 pub mod server;
 pub mod signals;
 pub mod synapse;

@@ -1191,6 +1191,15 @@ fn start_lane(eng: &mut Qwen3Engine, lane: usize, job: LaneJob) -> Result<Option
         ));
         return Ok(None);
     }
+    // a lane step picks its tokens on the card, without penalties
+    if !crate::verified::pen_path_allowed(params.penalties.active(), false) {
+        out(done_event(
+            Err("sampling penalties and logit_bias are not applied in a lane: serve the model without --parallel to use them".into()),
+            eng,
+            false,
+        ));
+        return Ok(None);
+    }
     let mut eos = eng.spec.eos_token_ids.clone();
     for &tok in &params.extra_eos_ids {
         if !eos.contains(&tok) {

@@ -124,7 +124,9 @@ Serve options:
                         reuse), the decoding lanes stepped together in one launch that
                         reads the weights once. Every stream is token-identical to the
                         same request run alone. Further requests wait in arrival order;
-                        a request with images runs alone. Each lane holds the full
+                        a request with images runs alone; one with sampling penalties
+                        or logit_bias is refused (they apply one request at a time,
+                        at K = 0). Each lane holds the full
                         context (--max-ctx / --model-ctx): a load that cannot plan N
                         lanes of it is refused with the numbers. A request goes to the
                         free lane where it takes over the most of its prompt for the
@@ -180,7 +182,11 @@ Serve options:
                         ends in -assistant (4 drafts), otherwise DSpine. <id>=mtp
                         drafts with the model's own MTP head (no checkpoint; 4 drafts,
                         3 in the routed mixture-of-experts form; an Inkling 2 model:
-                        its block drafter, 7 drafts, as --spec mtp finds it)
+                        its block drafter, 7 drafts, as --spec mtp finds it).
+                        A request with presence / frequency / repetition penalties
+                        or logit_bias decodes at K=0 (its tokens are picked on the
+                        host from the read-back logits, over every generated token,
+                        reasoning included)
   --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster
                         decode, more device memory, its own token stream)
   --model-ctx <id=N>    Context size for model <id> instead of --max-ctx
