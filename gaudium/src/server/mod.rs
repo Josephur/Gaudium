@@ -3220,6 +3220,11 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     }
 }
 
+/// Whether a resumed answer (after a thinking budget's forced close) carries the penalties' state
+/// over: their counts of the reasoning and a ban on the end-of-thinking marker. Not yet (#150):
+/// a budgeted request with penalties is refused (`think_penalties_ok`).
+const THINK_RESUME_CARRIES_PENALTIES: bool = false;
+
 /// Which API a chat request came in on: the shape of its reply and of its errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Api {
@@ -3825,7 +3830,11 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     };
     // The answer after a forced close is a second generation: the penalties' counts of the
     // reasoning and a ban on the end-of-thinking marker would not carry over to it.
-    if !crate::verified::think_penalties_ok(think_budget.is_some(), penalised) {
+    if !crate::verified::think_penalties_ok(
+        think_budget.is_some(),
+        penalised,
+        THINK_RESUME_CARRIES_PENALTIES,
+    ) {
         api.error(
             stream,
             400,
