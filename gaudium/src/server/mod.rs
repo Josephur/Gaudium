@@ -61,6 +61,7 @@ mod conn;
 mod jinja;
 mod lanes;
 mod outparse;
+mod penalty_fields;
 mod proxy;
 mod readout;
 mod requests;
@@ -3633,12 +3634,53 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         _ => Vec::new(),
     };
     let is_greedy = temperature <= 0.0;
+    // Presence / frequency / repetition penalties and logit_bias: refused out of range, and
+    // refused where the model's engine would pick the tokens without them.
+    // the ids a request may name and emit: the logits row's, but never a padding id past the
+    // tokenizer's tokens
+    let emit_vocab =
+        crate::verified::pen_emit_vocab(m.spec.vocab, m.tokenizer.vocab_size() as u64);
+    let penalties = match penalty_fields::parse(val, emit_vocab) {
+        Ok(p) => p,
+        Err(e) => {
+            api.error(stream, 400, "invalid_request_error", &e);
+            return;
+        }
+    };
+    let penalised = penalties.active();
+    if !crate::verified::pen_path_allowed(
+        penalised,
+        crate::engine::applies_penalties(m.spec.family, m.lanes),
+    ) {
+        api.error(
+            stream,
+            400,
+            "invalid_request_error",
+            &format!(
+                "model '{}' does not apply sampling penalties or logit_bias{}",
+                m.id,
+                if m.lanes > 1 {
+                    " while it is served with lanes (--parallel)"
+                } else {
+                    " (only the Qwen-family engine applies them so far)"
+                }
+            ),
+        );
+        return;
+    }
 
     // The method this request takes follows from the model's drafter and from greedy / sampled;
-    // a request may name it (`gaudium_method`) but can not pick another one.
+    // a request may name it (`gaudium_method`) but can not pick another one. A penalised request
+    // decodes at K = 0 (its tokens are picked on the host).
     let (m_greedy, m_sampled, m_loaded, _) =
         readout::method_set(state.run_facts(idx).drafter.as_ref());
-    let method = if is_greedy { m_greedy } else { m_sampled };
+    let method = if penalised {
+        readout::method_label(None, !is_greedy)
+    } else if is_greedy {
+        m_greedy
+    } else {
+        m_sampled
+    };
     if let Some(want) = val
         .get("gaudium_method")
         .and_then(|v| v.as_str())
@@ -3803,6 +3845,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             .get("cache_prompt")
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
+        penalties,
         ..Qwen3GenParams::default()
     };
 

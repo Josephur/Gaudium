@@ -60,9 +60,6 @@ const fn refused(name: &'static str, why: &'static str, noop: fn(&JsonValue) -> 
     }
 }
 
-const SAMPLING_PENALTY: &str =
-    "not applied: sampling penalties and logit bias are not supported yet";
-
 /// The table. Keep one entry per field; a later change moves a field between classes.
 const FIELDS: &[Field] = &[
     // the API's own fields the chat path applies
@@ -95,6 +92,11 @@ const FIELDS: &[Field] = &[
     applied("gaudium_a2ui"),
     applied("gaudium_hidden_tools"),
     applied("gaudium_return_tokens"),
+    // sampler penalties and the logit bias (`server/penalty_fields.rs` parses them)
+    applied("presence_penalty"),
+    applied("frequency_penalty"),
+    applied("repetition_penalty"),
+    applied("logit_bias"),
     // refused: ignoring them changes the reply without a sign
     refused(
         "n",
@@ -117,10 +119,6 @@ const FIELDS: &[Field] = &[
         is_text_format,
     ),
     // ignored and reported
-    ignored("presence_penalty", SAMPLING_PENALTY, is_zero),
-    ignored("frequency_penalty", SAMPLING_PENALTY, is_zero),
-    ignored("repetition_penalty", SAMPLING_PENALTY, is_one),
-    ignored("logit_bias", SAMPLING_PENALTY, is_empty_object),
     ignored(
         "stream_options",
         "not applied: the last chunk of a stream always carries usage",
@@ -239,10 +237,6 @@ fn is_one(v: &JsonValue) -> bool {
     v.as_f64() == Some(1.0)
 }
 
-fn is_empty_object(v: &JsonValue) -> bool {
-    v.as_object().is_some_and(|o| o.is_empty())
-}
-
 fn is_empty_array(v: &JsonValue) -> bool {
     v.as_array().is_some_and(|a| a.is_empty())
 }
@@ -300,13 +294,14 @@ mod tests {
 
     #[test]
     fn ignored_fields_are_reported_with_a_reason() {
-        let r =
-            run(r#"{"messages":[],"presence_penalty":0.5,"logit_bias":{"12":-100},"user":"u1"}"#)
-                .unwrap();
-        assert_eq!(r.len(), 3, "{r:?}");
-        assert!(r[0].starts_with("presence_penalty (not applied"), "{r:?}");
-        assert!(r[1].starts_with("logit_bias (not applied"), "{r:?}");
-        assert!(r[2].starts_with("user (not applied"), "{r:?}");
+        let r = run(
+            r#"{"messages":[],"presence_penalty":0.5,"logit_bias":{"12":-100},"user":"u1","service_tier":"auto"}"#,
+        )
+        .unwrap();
+        // the penalties and the bias are applied now: only the other two are reported
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[0].starts_with("user (not applied"), "{r:?}");
+        assert!(r[1].starts_with("service_tier (not applied"), "{r:?}");
     }
 
     #[test]

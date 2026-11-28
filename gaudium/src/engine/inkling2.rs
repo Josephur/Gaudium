@@ -2514,6 +2514,10 @@ impl Inkling2Engine {
         if prompt_ids.is_empty() {
             return Err("prompt must contain at least 1 token".into());
         }
+        // this engine picks its tokens without the penalties (`sampler_penalty`)
+        if !crate::verified::pen_path_allowed(params.penalties.active(), false) {
+            return Err("sampling penalties and logit_bias are not applied by the Inkling 2 engine yet".into());
+        }
         if let Some(&bad) = prompt_ids
             .iter()
             .find(|&&id| id < 0 || (id as u64) >= self.dims.vocab_in)

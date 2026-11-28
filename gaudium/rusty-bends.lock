@@ -1491,6 +1491,60 @@ a4f605578c25a7c8  pc_writing_not_readable  law pc_writing_not_readable : for + s
 1fe2bf0db086bfba  pc_writing_slot_not_usable  law pc_writing_slot_not_usable : for + t : Nat for + r : Bool for + m : Bool { pc_class_usable ( pc_victim_class ( PcWriting { t } , r , m ) ) == False { } : Bool }
 d34f2537e2e6aec8  pc_zeroed_rows_never_reused  law pc_zeroed_rows_never_reused : for + w : Bool for + s : Bool { pc_request_may_reuse ( w , True { } , s ) == False { } : Bool }
 1bca3abfb4f4fd87  pc_zeroed_table_is_void  law pc_zeroed_table_is_void : for + s : Bool { pc_table_void ( True { } , s ) == True { } : Bool }
+4b28276029305698  pen_applied_path_allowed  law pen_applied_path_allowed : { pen_path_allowed ( True { } , True { } ) == True { } : Bool }
+# promise pen_applied_path_allowed: a penalised request may take a decode path that applies its penalties
+4c77590153cf6984  pen_banned_never_emitted  law pen_banned_never_emitted : for t : Nat for v : Nat { pen_emit_ok ( t , v , PbBan { } ) == False { } : Bool }
+# promise pen_banned_never_emitted: a token the request bans is never emitted, whatever its id
+# harm pen_banned_never_emitted: a logit_bias of -100 would not ban the token
+9c5388e1d1495068  pen_bans_covering_vocab_refused  law pen_bans_covering_vocab_refused : for v : Nat for e : Nat { pen_bans_leave_tokens ( Nat.add ( v , e ) , v ) == False { } : Bool }
+# promise pen_bans_covering_vocab_refused: bans that cover the whole vocabulary are refused
+# harm pen_bans_covering_vocab_refused: the request could only ever emit a banned token
+0b4ea4674a51b49b  pen_bans_leaving_tokens_accepted  law pen_bans_leaving_tokens_accepted : for + b : Nat for e : Nat { pen_bans_leave_tokens ( b , 1n + Nat.add ( b , e ) ) == True { } : Bool }
+# promise pen_bans_leaving_tokens_accepted: a request that bans fewer tokens than the vocabulary holds is accepted
+d93e61da6c603bdb  pen_count_emitted_up_one  law pen_count_emitted_up_one : for c : Nat for + t : Nat { pen_count_add ( c , t , t ) == 1n + c : Nat }
+# promise pen_count_emitted_up_one: emitting a token raises that token's count by exactly one
+# harm pen_count_emitted_up_one: a dropped or doubled count would penalise the token too little or too much
+cb0d1e697cf9bafa  pen_count_higher_unchanged  law pen_count_higher_unchanged : for c : Nat for + t : Nat for d : Nat { pen_count_add ( c , 1n + Nat.add ( t , d ) , t ) == c : Nat }
+# promise pen_count_higher_unchanged: emitting a token leaves the count of every larger token id unchanged
+# harm pen_count_higher_unchanged: a token that was not emitted would be penalised
+63a396170e38e956  pen_count_lower_unchanged  law pen_count_lower_unchanged : for c : Nat for + t : Nat for d : Nat { pen_count_add ( c , t , 1n + Nat.add ( t , d ) ) == c : Nat }
+# promise pen_count_lower_unchanged: emitting a token leaves the count of every smaller token id unchanged
+# harm pen_count_lower_unchanged: a token that was not emitted would be penalised
+e680407ec8b49178  pen_counts_extra_refused  law pen_counts_extra_refused : for + t : Nat for + d : Nat for + p : Nat { pen_counts_match ( 1n + Nat.add ( t , d ) , Nat.add ( p , t ) , p ) == False { } : Bool }
+# promise pen_counts_extra_refused: a ledger holding more tokens than were generated before a position never penalises it
+# harm pen_counts_extra_refused: the position would be penalised for a token it has not seen (its own, or a rejected one)
+54f5a3ba41e7a95d  pen_counts_match_exact  law pen_counts_match_exact : for + t : Nat for + p : Nat { pen_counts_match ( t , Nat.add ( p , t ) , p ) == True { } : Bool }
+# promise pen_counts_match_exact: a ledger holding exactly the generated tokens before a position may penalise it
+9fb1ff5d52ad791e  pen_counts_prompt_row_refused  law pen_counts_prompt_row_refused : for t : Nat for + p : Nat for d : Nat { pen_counts_match ( t , p , 1n + Nat.add ( p , d ) ) == False { } : Bool }
+# promise pen_counts_prompt_row_refused: a position inside the prompt is never penalised as a generated one
+ff03c1188990a47c  pen_counts_short_refused  law pen_counts_short_refused : for + t : Nat for + d : Nat for + p : Nat { pen_counts_match ( t , 1n + Nat.add ( Nat.add ( p , t ) , d ) , p ) == False { } : Bool }
+# promise pen_counts_short_refused: a ledger holding fewer tokens than were generated before a position never penalises it
+# harm pen_counts_short_refused: a generated token would escape its penalty
+2d7ab8c10884687e  pen_emit_past_vocab_refused  law pen_emit_past_vocab_refused : for v : Nat for e : Nat for b : PenBias { pen_emit_ok ( Nat.add ( v , e ) , v , b ) == False { } : Bool }
+# promise pen_emit_past_vocab_refused: a token id at or past the vocabulary size is never emitted, biased or not
+60c12f9450f88cd0  pen_emit_vocab_covers_shared  law pen_emit_vocab_covers_shared : for + v : Nat for e : Nat for f : Nat { Nat.is_le ( v , pen_emit_vocab ( Nat.add ( v , e ) , Nat.add ( v , f ) ) ) == True { } : Bool }
+# promise pen_emit_vocab_covers_shared: every id both the logits row and the tokenizer hold may be emitted
+1242280c467040f3  pen_emit_vocab_within_row  law pen_emit_vocab_within_row : for r : Nat for k : Nat { Nat.is_le ( pen_emit_vocab ( r , k ) , r ) == True { } : Bool }
+# promise pen_emit_vocab_within_row: the ids a request may emit stay inside the logits row
+# harm pen_emit_vocab_within_row: a token id past the row would index outside the logits
+fdf8da391d7df38e  pen_emit_vocab_within_tokens  law pen_emit_vocab_within_tokens : for r : Nat for k : Nat { Nat.is_le ( pen_emit_vocab ( r , k ) , k ) == True { } : Bool }
+# promise pen_emit_vocab_within_tokens: the ids a request may emit stay inside the tokenizer's tokens (never a padding row)
+# harm pen_emit_vocab_within_tokens: banning every real token would be accepted and a padding id could be emitted
+a3f305756235e39d  pen_token_in_vocab_accepted  law pen_token_in_vocab_accepted : for + i : Nat for e : Nat { pen_token_in_vocab ( i , 1n + Nat.add ( i , e ) ) == True { } : Bool }
+# promise pen_token_in_vocab_accepted: every token id below the vocabulary size is accepted
+42a98a963f322c6a  pen_token_past_vocab_refused  law pen_token_past_vocab_refused : for v : Nat for e : Nat { pen_token_in_vocab ( Nat.add ( v , e ) , v ) == False { } : Bool }
+# promise pen_token_past_vocab_refused: a token id at or past the vocabulary size is never accepted as a token id
+# harm pen_token_past_vocab_refused: a logit_bias key or a count past the vocabulary would index outside the logits row
+c06ca620ed737dd2  pen_total_up_one  law pen_total_up_one : for t : Nat { pen_total_add ( t ) == 1n + t : Nat }
+# promise pen_total_up_one: emitting a token raises the ledger's total by exactly one
+# harm pen_total_up_one: the ledger check against the sequence position would refuse or pass the wrong ledger
+cc8caf58f9ab1c93  pen_unapplied_path_refused  law pen_unapplied_path_refused : { pen_path_allowed ( True { } , False { } ) == False { } : Bool }
+# promise pen_unapplied_path_refused: a penalised request never takes a decode path that picks tokens without its penalties
+# harm pen_unapplied_path_refused: the request's tokens would leave its own reference stream (AGENTS.md section 7)
+e9af2a88e37c02bf  pen_unbanned_token_emitted  law pen_unbanned_token_emitted : for + t : Nat for + e : Nat { Bool.and ( pen_emit_ok ( t , 1n + Nat.add ( t , e ) , PbNone { } ) , pen_emit_ok ( t , 1n + Nat.add ( t , e ) , PbAdd { } ) ) == True { } : Bool }
+# promise pen_unbanned_token_emitted: an unbanned token inside the vocabulary is emitted, with or without a bias
+dc96ff08b9992ca5  pen_unpenalised_path_allowed  law pen_unpenalised_path_allowed : for a : Bool { pen_path_allowed ( False { } , a ) == True { } : Bool }
+# promise pen_unpenalised_path_allowed: a request without penalties may take every decode path
 84e37afe4c2e2159  pfx_reuse_at_prompt_end_false  law pfx_reuse_at_prompt_end_false : for + p : Nat for lcp : Nat for + tile : Nat for nm : Bool for mu : Nat for nd : Bool for du : Nat { pfx_reuse_valid ( p , lcp , p , tile , nm , mu , nd , du ) == False { } : Bool }
 04510828d65fcb37  pfx_reuse_before_prompt_end  law pfx_reuse_before_prompt_end : for + pos : Nat for + lcp : Nat for + p : Nat for + tile : Nat for + nm : Bool for + mu : Nat for + nd : Bool for + du : Nat { Bool.and ( pfx_reuse_valid ( pos , lcp , p , tile , nm , mu , nd , du ) , Nat.is_le ( p , pos ) ) == False { } : Bool }
 3033d0beb3c8c14f  pfx_reuse_on_tile_boundary  law pfx_reuse_on_tile_boundary : for + pos : Nat for + lcp : Nat for + p : Nat for + tile : Nat for + nm : Bool for + mu : Nat for + nd : Bool for + du : Nat { Bool.and ( pfx_reuse_valid ( pos , lcp , p , tile , nm , mu , nd , du ) , Bool.not ( Nat.is_eq ( Nat.mod ( pos , tile ) , 0n ) ) ) == False { } : Bool }
