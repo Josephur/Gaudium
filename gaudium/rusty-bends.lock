@@ -110,6 +110,160 @@ f6771bf6b09c4e0c  force_none_when_not_forced  law force_none_when_not_forced : f
 75fd49693051a595  force_placed_only_when_possible  law force_placed_only_when_possible : for + f : Bool for + r : Bool for + c : Bool { Bool.or ( Bool.not ( force_is_placed ( tool_force_place ( f , r , c ) ) ) , Bool.and ( f , Bool.and ( Bool.not ( r ) , c ) ) ) == True { } : Bool }
 # promise force_placed_only_when_possible: a call's opening is put into the prompt only when the call is forced, the prompt is not inside reasoning, and the format can write it
 # harm force_placed_only_when_possible: an opening placed inside reasoning or in a form the model cannot continue would garble the reply
+1774a712933515a9  fs_commit_fits_stored  law fs_commit_fits_stored : for + g : Nat for + x : Nat for + y : Nat for + n : Nat for + z : Nat { fs_is_stored ( fs_commit ( fs_open ( Nat.add ( g , x ) , n ) , Nat.add ( g , y ) , Nat.add ( n , 1n + z ) , FsEntry { g , True { } } , g ) ) == True { } : Bool }
+# promise fs_commit_fits_stored: an upload that fills its reservation exactly, within the cap and the free bytes, with ids left, is stored.
+# harm fs_commit_fits_stored: the store could refuse every upload
+65e6cb435b77447b  fs_commit_ids_rightly  law fs_commit_ids_rightly : for + l : FsLedger for + c : Nat for + m : Nat for + t : FsEntry for + s : Nat { fs_ids_rightly ( fs_next ( l ) , m , fs_commit ( l , c , m , t , s ) ) == True { } : Bool }
+# promise fs_commit_ids_rightly: a commit never hands out an id at or past the id limit, and refuses for want of ids only once the counter has reached it.
+# harm fs_commit_ids_rightly: ids past the limit would not fit their 12 hex digits and could repeat
+3e1516f653c0cf49  fs_commit_is_upload  law fs_commit_is_upload : for + l : FsLedger for + c : Nat for + m : Nat for + t : FsEntry for + s : Nat { fs_when_stored ( fs_commit ( l , c , m , t , s ) , fs_upload ( l , c , s ) ) == fs_commit ( l , c , m , t , s ) : FsUpload }
+# promise fs_commit_is_upload: a commit that stores an upload stores exactly what fs_upload decides for it, so the cap, quota, id and byte laws of fs_upload hold for every stored commit.
+# harm fs_commit_is_upload: a commit could store a file the ledger never admitted, or count other bytes than the file's
+fe5aa25154da3f0c  fs_commit_refused_keeps  law fs_commit_refused_keeps : for + l : FsLedger for + c : Nat for + m : Nat for + t : FsEntry for + s : Nat { fs_kept_if_refused ( fs_commit ( l , c , m , t , s ) , fs_upload_ledger ( l , fs_commit ( l , c , m , t , s ) ) , l ) == fs_upload_ledger ( l , fs_commit ( l , c , m , t , s ) ) : FsLedger }
+# promise fs_commit_refused_keeps: a refused commit, whatever the refusal, leaves the ledger the store keeps after it equal to the ledger it was decided against.
+# harm fs_commit_refused_keeps: a refusal could zero the used bytes and the id counter: the quota would be lost and ids handed out again
+990979b17904da0b  fs_commit_refused_rightly  law fs_commit_refused_rightly : for + l : FsLedger for + c : Nat for + m : Nat for + t : FsEntry for + s : Nat { fs_refused_rightly ( s , c , Nat.min ( fs_free ( l ) , fs_size ( t ) ) , fs_commit ( l , c , m , t , s ) ) == True { } : Bool }
+# promise fs_commit_refused_rightly: a commit is refused as too large only when the upload is larger than the per-file cap, and as over the quota only when it is larger than its reservation or the free bytes.
+# harm fs_commit_refused_rightly: the store could refuse uploads it has room for, or give the client the wrong reason
+45769b0e720185ab  fs_commit_within_hold  law fs_commit_within_hold : for + l : FsLedger for + c : Nat for + m : Nat for + t : FsEntry for + x : Nat { fs_is_stored ( fs_commit ( l , c , m , t , Nat.add ( fs_size ( t ) , 1n + x ) ) ) == False { } : Bool }
+# promise fs_commit_within_hold: an upload larger than its reservation is never stored: its bytes past the reservation were not read.
+# harm fs_commit_within_hold: a truncated file could be stored as if complete
+32baefd9057d2c35  fs_count_fits_within  law fs_count_fits_within : for + n : Nat for + z : Nat { fs_count_fits ( FsCount { n , Nat.add ( n , z ) } ) == True { } : Bool }
+# promise fs_count_fits_within: a store whose files found on disk are within its bound starts.
+# harm fs_count_fits_within: a store holding as many files as its bound would refuse to start
+f15e740f4e1246a0  fs_count_open_empty  law fs_count_open_empty : for + m : Nat { fs_count_open ( m ) == FsCount { 0n , m } : FsCount }
+# promise fs_count_open_empty: an opened count holds no files and keeps the bound it was given.
+# harm fs_count_open_empty: a new store could start full and refuse every upload, or with another bound than configured
+7c5e2130afc5c4a2  fs_count_refuses_overfull  law fs_count_refuses_overfull : for + m : Nat for + x : Nat { fs_count_fits ( FsCount { Nat.add ( m , 1n + x ) , m } ) == False { } : Bool }
+# promise fs_count_refuses_overfull: a store whose files found on disk are more than its bound never starts.
+# harm fs_count_refuses_overfull: a bound lowered below the files kept would not be enforced
+e252eca0a4f957d4  fs_delete_conserved  law fs_delete_conserved : for + l : FsLedger for + e : FsEntry { fs_quota ( fs_delete ( l , e ) ) == fs_quota ( l ) : Nat }
+# promise fs_delete_conserved: a delete leaves used + free equal to the quota.
+41ccad1ef6daece3  fs_delete_frees  law fs_delete_frees : for + u : Nat for + s : Nat for + f : Nat for + n : Nat { fs_used ( fs_delete ( FsLedger { Nat.add ( u , s ) , f , n } , FsEntry { s , True { } } ) ) == u : Nat }
+# promise fs_delete_frees: deleting a live file the ledger counts frees exactly its bytes.
+# harm fs_delete_frees: deleted files would keep holding the quota until the store refuses every upload
+868fa8632a49a34f  fs_delete_keeps_next  law fs_delete_keeps_next : for + l : FsLedger for + e : FsEntry { fs_next ( fs_delete ( l , e ) ) == fs_next ( l ) : Nat }
+# promise fs_delete_keeps_next: a delete never moves the id counter, so a deleted file's id is not handed out again.
+0dfd5dfac43e6f66  fs_delete_killed  law fs_delete_killed : for + l : FsLedger for + e : FsEntry { fs_delete ( l , fs_kill ( e ) ) == l : FsLedger }
+# promise fs_delete_killed: giving back an entry already given back changes nothing, whatever the ledger is by then, so a reservation or a file is released once.
+# harm fs_delete_killed: a ticket given back at commit and again when the upload is dropped would free bytes twice
+5ec607da2b64792c  fs_delete_once  law fs_delete_once : for + l : FsLedger for + e : FsEntry { fs_delete ( fs_delete ( l , e ) , fs_kill ( e ) ) == fs_delete ( l , e ) : FsLedger }
+# promise fs_delete_once: deleting a file a second time changes nothing: its bytes are freed once.
+# harm fs_delete_once: a repeated delete could free bytes another file still uses and let the store pass its quota
+b41f249fe73b82a4  fs_give_once  law fs_give_once : for + c : FsCount { fs_count_give ( c , False { } ) == c : FsCount }
+# promise fs_give_once: giving back a slot that is no longer held changes nothing, so a slot is freed at most once.
+# harm fs_give_once: an upload refused and then dropped could free its slot twice, and the store would take files past its bound
+d11b77117a41d040  fs_give_undoes_restore  law fs_give_undoes_restore : for + c : FsCount { fs_count_give ( fs_count_restore ( c ) , True { } ) == c : FsCount }
+# promise fs_give_undoes_restore: deleting a file found at start frees the slot it was counted with.
+# harm fs_give_undoes_restore: files deleted after a restart would keep their slots, and the store would fill for good
+8661139d46a9725d  fs_give_undoes_take  law fs_give_undoes_take : for + c : FsCount { fs_count_give ( fs_take_count ( c , fs_count_take ( c ) ) , fs_take_ok ( fs_count_take ( c ) ) ) == c : FsCount }
+# promise fs_give_undoes_take: giving back the slot a take gave leaves the count, and the bound, as they were before the take.
+# harm fs_give_undoes_take: deleted files and refused uploads would keep their slots, and the store would fill for good
+6974045981f4249f  fs_hold_conserved  law fs_hold_conserved : for + l : FsLedger for + c : Nat for + w : Nat { fs_quota ( fs_hold_ledger ( fs_hold ( l , c , w ) ) ) == fs_quota ( l ) : Nat }
+# promise fs_hold_conserved: a reservation leaves used + free equal to the quota: its bytes move from free to used.
+# harm fs_hold_conserved: uploads in progress could stage more bytes on disk than the quota has room for
+76d7734ba5a8a5ec  fs_hold_covers_ask  law fs_hold_covers_ask : for + u : Nat for + w : Nat for + x : Nat for + y : Nat for + n : Nat { Nat.is_le ( w , fs_size ( fs_hold_ticket ( fs_hold ( FsLedger { u , Nat.add ( w , x ) , n } , Nat.add ( w , y ) , w ) ) ) ) == True { } : Bool }
+# promise fs_hold_covers_ask: an upload that asks for no more than the per-file cap and the free bytes is reserved all it asked for.
+# harm fs_hold_covers_ask: uploads that fit the cap and the quota could be refused as over the quota
+781158a8e63ae590  fs_hold_free_is_ticket  law fs_hold_free_is_ticket : for + l : FsLedger for + c : Nat for + w : Nat { Nat.add ( fs_free ( fs_hold_ledger ( fs_hold ( l , c , w ) ) ) , fs_size ( fs_hold_ticket ( fs_hold ( l , c , w ) ) ) ) == fs_free ( l ) : Nat }
+# promise fs_hold_free_is_ticket: a reservation takes exactly its ticket's bytes from the free bytes of the ledger the store installs from it.
+# harm fs_hold_free_is_ticket: concurrent uploads could together stage more than the quota
+f485c85b5096b001  fs_hold_released  law fs_hold_released : for + l : FsLedger for + c : Nat for + w : Nat { fs_delete ( fs_hold_ledger ( fs_hold ( l , c , w ) ) , fs_hold_ticket ( fs_hold ( l , c , w ) ) ) == l : FsLedger }
+# promise fs_hold_released: giving a reservation's ticket back returns the ledger to what it was before the reservation.
+# harm fs_hold_released: a dropped upload could keep its reserved bytes, or free more than it held
+8413c24286b06385  fs_hold_used_is_ticket  law fs_hold_used_is_ticket : for + l : FsLedger for + c : Nat for + w : Nat { fs_used ( fs_hold_ledger ( fs_hold ( l , c , w ) ) ) == Nat.add ( fs_used ( l ) , fs_size ( fs_hold_ticket ( fs_hold ( l , c , w ) ) ) ) : Nat }
+# promise fs_hold_used_is_ticket: a reservation counts exactly its ticket's bytes as used in the ledger the store installs from it.
+# harm fs_hold_used_is_ticket: uploads in progress could stage more bytes than the ledger has taken from the quota
+a0da79d20884b173  fs_hold_within_ask  law fs_hold_within_ask : for + l : FsLedger for + c : Nat for + w : Nat { Nat.is_le ( fs_size ( fs_hold_ticket ( fs_hold ( l , c , w ) ) ) , Nat.min ( w , c ) ) == True { } : Bool }
+# promise fs_hold_within_ask: a reservation never takes more than the upload asked for, nor more than the per-file cap.
+# harm fs_hold_within_ask: one upload could hold the room other uploads need
+ba4e59b3d5e41115  fs_hold_within_free  law fs_hold_within_free : for + l : FsLedger for + c : Nat for + w : Nat { Nat.is_le ( fs_size ( fs_hold_ticket ( fs_hold ( l , c , w ) ) ) , fs_free ( l ) ) == True { } : Bool }
+# promise fs_hold_within_free: a reservation never takes more than the free bytes.
+# harm fs_hold_within_free: concurrent uploads could together stage more than the quota
+9d865586b25858fc  fs_kill_retires  law fs_kill_retires : for + e : FsEntry { fs_live ( fs_kill ( e ) ) == False { } : Bool }
+# promise fs_kill_retires: a deleted entry is no longer live, so the file is not served and not freed again.
+0c4c3849646ec0da  fs_open_all_free  law fs_open_all_free : for + q : Nat for + n : Nat { fs_free ( fs_open ( q , n ) ) == q : Nat }
+# promise fs_open_all_free: an open store has every byte of its quota free and none used.
+88b8cb257087725f  fs_open_keeps_next  law fs_open_keeps_next : for + q : Nat for + n : Nat { Nat.is_le ( n , fs_next ( fs_open ( q , n ) ) ) == True { } : Bool }
+# promise fs_open_keeps_next: an open store keeps the id counter it was given, so ids handed out before a restart stay retired.
+# harm fs_open_keeps_next: after a restart a new upload could get the id of a deleted file a client still refers to
+2d4e8aaf68e79c16  fs_open_none_used  law fs_open_none_used : for + q : Nat for + n : Nat { fs_used ( fs_open ( q , n ) ) == 0n : Nat }
+# promise fs_open_none_used: an open store counts no bytes as used.
+394039943a13e3a6  fs_restore_conserved  law fs_restore_conserved : for + l : FsLedger for + i : Nat for + x : Nat { fs_quota ( fs_restore ( l , i , Nat.sub ( fs_free ( l ) , x ) ) ) == fs_quota ( l ) : Nat }
+# promise fs_restore_conserved: counting a file found on disk that fits the free bytes takes its bytes from them: used + free stays the quota.
+# harm fs_restore_conserved: the files kept across a restart would leave the whole quota free for new uploads
+ea9477786b1d0366  fs_restore_counts  law fs_restore_counts : for + u : Nat for + f : Nat for + n : Nat for + i : Nat for + s : Nat { fs_used ( fs_restore ( FsLedger { u , f , n } , i , s ) ) == Nat.add ( u , s ) : Nat }
+# promise fs_restore_counts: a file found on disk at start counts its bytes as used.
+# harm fs_restore_counts: after a restart the store could take uploads past its quota
+e55b58c6137163ce  fs_restore_counts_file  law fs_restore_counts_file : for + c : FsCount { Bool.and ( Nat.is_lt ( fs_count_live ( c ) , fs_count_live ( fs_count_restore ( c ) ) ) , Nat.is_eq ( fs_count_max ( fs_count_restore ( c ) ) , fs_count_max ( c ) ) ) == True { } : Bool }
+# promise fs_restore_counts_file: every file found at start is counted, and the bound is kept.
+# harm fs_restore_counts_file: files kept across a restart would not count against the bound
+c520399852af620c  fs_restore_keeps_next  law fs_restore_keeps_next : for + u : Nat for + f : Nat for + n : Nat for + i : Nat for + s : Nat { Nat.is_le ( n , fs_next ( fs_restore ( FsLedger { u , f , n } , i , s ) ) ) == True { } : Bool }
+# promise fs_restore_keeps_next: counting a file found on disk never moves the id counter back, so the ids of deleted files stay retired.
+# harm fs_restore_keeps_next: after a restart a new upload could get the id of a deleted file a client still refers to
+71ed9481ffc123b9  fs_restore_no_free_gain  law fs_restore_no_free_gain : for + l : FsLedger for + i : Nat for + s : Nat { Nat.is_le ( fs_free ( fs_restore ( l , i , s ) ) , fs_free ( l ) ) == True { } : Bool }
+# promise fs_restore_no_free_gain: counting a file found on disk never adds free bytes.
+# harm fs_restore_no_free_gain: after a restart the store could take uploads past its quota
+cdfec960816c37b4  fs_restore_passes_id  law fs_restore_passes_id : for + l : FsLedger for + i : Nat for + s : Nat { Nat.is_lt ( i , fs_next ( fs_restore ( l , i , s ) ) ) == True { } : Bool }
+# promise fs_restore_passes_id: after counting a file found on disk, the id counter is past that file's id.
+# harm fs_restore_passes_id: a new upload after a restart could get the id of a file still on disk
+d2a798c0d3804e32  fs_start_keeps_next  law fs_start_keeps_next : for + l : FsLedger for + x : Nat { Nat.is_le ( fs_next ( l ) , fs_next ( fs_start_ledger ( fs_start ( l , Nat.add ( fs_used ( l ) , x ) ) ) ) ) == True { } : Bool }
+# promise fs_start_keeps_next: a started store never moves the id counter back.
+# harm fs_start_keeps_next: after a restart a new upload could get the id of a file deleted before it
+7c7635442e42364d  fs_start_keeps_used  law fs_start_keeps_used : for + l : FsLedger for + x : Nat { fs_used ( fs_start_ledger ( fs_start ( l , Nat.add ( fs_used ( l ) , x ) ) ) ) == fs_used ( l ) : Nat }
+# promise fs_start_keeps_used: a started store counts every byte of the files found on disk as used.
+# harm fs_start_keeps_used: files kept across a restart would not count against the quota
+9155e70d38707ecb  fs_start_quota  law fs_start_quota : for + l : FsLedger for + x : Nat { fs_quota ( fs_start_ledger ( fs_start ( l , Nat.add ( fs_used ( l ) , x ) ) ) ) == Nat.add ( fs_used ( l ) , x ) : Nat }
+# promise fs_start_quota: a store whose files fit its quota starts, with used + free equal to the configured quota.
+# harm fs_start_quota: a store started from an over-full ledger keeps a quota larger than configured
+c4fc37515bfd2073  fs_start_refuses_overfull  law fs_start_refuses_overfull : for + l : FsLedger for + q : Nat { Bool.and ( fs_is_ready ( fs_start ( l , q ) ) , Nat.is_lt ( q , fs_used ( l ) ) ) == False { } : Bool }
+# promise fs_start_refuses_overfull: a store whose files on disk hold more than its quota never starts.
+# harm fs_start_refuses_overfull: a quota lowered below the files kept would not be enforced: deletes would free bytes past it
+19872f3a3df46c83  fs_take_below_bound  law fs_take_below_bound : for + n : Nat for + z : Nat { fs_take_ok ( fs_count_take ( FsCount { n , Nat.add ( n , 1n + z ) } ) ) == True { } : Bool }
+# promise fs_take_below_bound: an upload is given its slot whenever the store holds fewer files than its bound.
+# harm fs_take_below_bound: the store could refuse every upload, or the last one its bound allows
+c86dd65765e3fc41  fs_take_count_counts  law fs_take_count_counts : for + c : FsCount { fs_take_counted ( c , fs_count_take ( c ) , fs_take_count ( c , fs_count_take ( c ) ) ) == True { } : Bool }
+# promise fs_take_count_counts: when a take gives an upload its slot, the count the store keeps after it holds more files than before, no more than the bound, and the same bound.
+# harm fs_take_count_counts: an upload could take a slot the count never records, and uploads of no bytes would then pass the bound without end
+df80ae00d54a2f1c  fs_take_raises_count  law fs_take_raises_count : for + c : FsCount { fs_take_raises ( fs_count_live ( c ) , fs_count_take ( c ) ) == True { } : Bool }
+# promise fs_take_raises_count: a take that gives an upload its slot counts it: the store holds more files after it.
+# harm fs_take_raises_count: uploads in progress and stored files would not count against the bound
+a7f217ce7d9d9da2  fs_take_refused_keeps  law fs_take_refused_keeps : for + c : FsCount { fs_take_kept ( fs_count_take ( c ) , fs_take_count ( c , fs_count_take ( c ) ) , c ) == fs_take_count ( c , fs_count_take ( c ) ) : FsCount }
+# promise fs_take_refused_keeps: a refused take leaves the count the store keeps after it equal to the count it was decided against.
+# harm fs_take_refused_keeps: a refusal could zero the count, and the store would then take files past its bound
+cb76d7fd7f1e3683  fs_take_within_bound  law fs_take_within_bound : for + c : FsCount { fs_take_within ( fs_count_max ( c ) , fs_count_take ( c ) ) == True { } : Bool }
+# promise fs_take_within_bound: a slot is given only while one more file stays within the bound, so a take never leaves the store with more files than its bound, and keeps the bound.
+# harm fs_take_within_bound: uploads of no bytes could grow the index and the directory without end
+fdc2051809c02b62  fs_upload_conserved  law fs_upload_conserved : for + u : Nat for + f : Nat for + n : Nat for + c : Nat for + s : Nat { fs_quota ( fs_upload_ledger ( FsLedger { u , f , n } , fs_upload ( FsLedger { u , f , n } , c , s ) ) ) == Nat.add ( u , f ) : Nat }
+# promise fs_upload_conserved: an upload, stored or refused, leaves used + free equal to the quota it started from.
+# harm fs_upload_conserved: the store could hold more than its quota, or lose free bytes it never handed out
+aac3e557865816d7  fs_upload_fits_stored  law fs_upload_fits_stored : for + l : FsLedger for + c : Nat for + s : Nat { fs_refused_rightly ( s , c , fs_free ( l ) , fs_upload ( l , c , s ) ) == True { } : Bool }
+# promise fs_upload_fits_stored: an upload is refused as too large only when it is larger than the per-file cap, and as over the quota only when it is larger than the free bytes.
+# harm fs_upload_fits_stored: the store could refuse files it has room for, or give the client the wrong reason
+5b61c36a320672e0  fs_upload_fresh_id  law fs_upload_fresh_id : for + l : FsLedger for + c : Nat for + s : Nat { fs_id_fresh ( fs_next ( l ) , fs_upload ( l , c , s ) , fs_next ( fs_upload_ledger ( l , fs_upload ( l , c , s ) ) ) ) == True { } : Bool }
+# promise fs_upload_fresh_id: a stored upload's id is at or above the ledger's counter and below the counter of the ledger the store keeps after it, so no id is handed out twice.
+# harm fs_upload_fresh_id: two files could share an id, and a client could read or delete another client's file
+aead311ff1476888  fs_upload_takes_bytes  law fs_upload_takes_bytes : for + l : FsLedger for + c : Nat for + s : Nat { fs_used ( fs_upload_ledger ( l , fs_upload ( l , c , s ) ) ) == Nat.add ( fs_used ( l ) , fs_taken ( fs_upload ( l , c , s ) , s ) ) : Nat }
+# promise fs_upload_takes_bytes: a stored upload counts exactly its bytes as used in the ledger the store keeps after it, and a refused one counts none.
+# harm fs_upload_takes_bytes: the store could hold files past its quota, or lose room it never handed out
+22ddeb68247abf37  fs_upload_within_cap  law fs_upload_within_cap : for + l : FsLedger for + c : Nat for + x : Nat { fs_is_stored ( fs_upload ( l , c , Nat.add ( c , 1n + x ) ) ) == False { } : Bool }
+# promise fs_upload_within_cap: an upload larger than the per-file cap is never stored.
+# harm fs_upload_within_cap: one client could fill the disk with a single file past the configured limit
+4ebcff3ead52712b  fs_upload_within_free  law fs_upload_within_free : for + u : Nat for + f : Nat for + n : Nat for + c : Nat for + x : Nat { fs_is_stored ( fs_upload ( FsLedger { u , f , n } , c , Nat.add ( f , 1n + x ) ) ) == False { } : Bool }
+# promise fs_upload_within_free: an upload larger than the free bytes of the quota is never stored, whatever the cap.
+# harm fs_upload_within_free: uploads could pass the quota and fill the disk the store was given a share of
+48b6aa10625d1544  fs_visible_id_only  law fs_visible_id_only : for + e : FsEntry for + o : Bool { fs_visible ( e , o , False { } ) == False { } : Bool }
+# promise fs_visible_id_only: a request for one file never gets another one.
+# harm fs_visible_id_only: a caller naming one id could be given another file of the same owner
+988aead23e1f893b  fs_visible_live_only  law fs_visible_live_only : for + e : FsEntry for + o : Bool for + i : Bool { fs_visible ( fs_kill ( e ) , o , i ) == False { } : Bool }
+# promise fs_visible_live_only: a deleted file is never shown.
+# harm fs_visible_live_only: a deleted file could still be listed or read
+096d87e021b43802  fs_visible_own_file  law fs_visible_own_file : for + s : Nat { fs_visible ( FsEntry { s , True { } } , True { } , True { } ) == True { } : Bool }
+# promise fs_visible_own_file: the owner who names a live file sees it.
+# harm fs_visible_own_file: owners could lose access to their own files
+0c8ad5dedd1f75e2  fs_visible_owner_only  law fs_visible_owner_only : for + e : FsEntry for + i : Bool { fs_visible ( e , False { } , i ) == False { } : Bool }
+# promise fs_visible_owner_only: a file is never shown to a caller who is not its owner.
+# harm fs_visible_owner_only: one API key could read or delete another key's files
 c74c47153e6fb0be  g4_audio_zero_left_rejected  law g4_audio_zero_left_rejected : for ar : Nat { g4_audio_ctx_valid ( 0n , ar ) == False { } : Bool }
 6bc6fbd345acaeea  g4_heads_zero_dh_rejected  law g4_heads_zero_dh_rejected : for + nh : Nat for + nkv : Nat for + p : Nat { g4_heads_valid ( nh , nkv , 0n , p ) == False { } : Bool }
 d556bde2ff41c207  g4_heads_zero_kv_rejected  law g4_heads_zero_kv_rejected : for + nh : Nat for + dh : Nat for + p : Nat { g4_heads_valid ( nh , 0n , dh , p ) == False { } : Bool }

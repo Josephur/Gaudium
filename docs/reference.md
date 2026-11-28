@@ -331,6 +331,21 @@ Serve options:
                         event: phase, timings, token counts; never prompt or reply
                         text). Off by default: the path answers 404. Needs the API key
                         when one is set
+  --files-dir <dir>     Serve the Files API (/v1/files: upload, list, get, content,
+                        delete) with its files kept in <dir>, also across restarts, and
+                        take file_id sources in chat and Messages requests. A request
+                        with an anthropic-version or anthropic-beta header gets the
+                        Messages-API shape, any other the OpenAI shape. With --api-key a
+                        file belongs to the key that uploaded it. Off by default: the
+                        paths answer 404
+  --files-quota-gb <N>  With --files-dir: GiB all files may hold together (decimals
+                        allowed; default: 16), uploads in progress included. An upload
+                        that does not fit is refused; a start whose files already hold
+                        more is refused (docs/files-api.md)
+  --files-max-mb <N>    With --files-dir: largest single file in MiB (default: 512)
+  --files-max-count <N> With --files-dir: most files the store holds, whatever their
+                        size (default: 10000), uploads in progress included. An upload
+                        past it is refused; a start with more files is refused
 
 Live status environment variables:
   GAUDI_LIVE_DIR        Directory for live dashboard JSON records (GAUDI_LIVE=0 disables).
