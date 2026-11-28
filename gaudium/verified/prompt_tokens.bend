@@ -20,6 +20,15 @@ def pt_rows_refute(+id: Nat, +rows: Nat, a: Bool, e: {Nat.is_lt(id, rows) == a :
         case False{}: {==}
         case True{}: L.nat_lt_le_false(id, rows, e)
 
+# id < names refutes names <= id, whatever is checked before it.
+def pt_names_refute(+id: Nat, +names: Nat, a: Bool, c: Bool, e: {Nat.is_lt(id, names) == c : Bool}) -> {Bool.and(Bool.and(a, c), Nat.is_le(names, id)) == False{} : Bool}:
+  match a:
+    case False{}: {==}
+    case True{}:
+      match c:
+        case False{}: {==}
+        case True{}: L.nat_lt_le_false(id, names, e)
+
 # ============================================================================
 # 2. Decision
 # ============================================================================
@@ -54,3 +63,16 @@ law prompt_token_first_ok:
 
 def prompt_token_first_ok(r, n):
   {==}
+
+# promise: a prompt token id at or past the tokenizer's last entry is never accepted.
+# harm: the engine would run an embedding row the tokenizer cannot name (a padding row), and the
+# reply could not be read back as text.
+# catches: the tokenizer bound dropped (only the embedding's rows checked)
+law prompt_token_within_names:
+  for +id: Nat
+  for +rows: Nat
+  for +names: Nat
+  {Bool.and(prompt_token_ok(id, rows, names), Nat.is_le(names, id)) == False{} : Bool}
+
+def prompt_token_within_names(id, rows, names):
+  pt_names_refute(id, names, Nat.is_lt(id, rows), Nat.is_lt(id, names), {==})
