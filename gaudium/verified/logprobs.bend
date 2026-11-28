@@ -267,6 +267,46 @@ def lp_ring_rows_cover(b):
   +b2 = {b : Nat}
   lp_and_intro(Nat.is_le(1n, Nat.max(1n, b2)), Nat.is_le(b2, Nat.max(1n, b2)), L.nat_max_ge_l(1n, b2), L.nat_max_ge_r(1n, b2))
 
+def lp_ring_rows_tight_go(+b: Nat) -> {Nat.is_le(Nat.sub(lp_ring_rows(b), 1n), b) == True{} : Bool}:
+  match b:
+    case 0n:
+      {==}
+    case 1n+bp:
+      %G.g_nat_max_one_succ(bp) : {Nat.is_le(Nat.sub(_, 1n), 1n+bp) == True{} : Bool}
+      %Equal.sym(Nat, Nat.sub(bp, 0n), bp, L.nat_sub_zero_r(bp)) : {Nat.is_le(_, 1n+bp) == True{} : Bool}
+      L.nat_le_succ_r(bp, bp, L.nat_le_refl(bp))
+
+# promise: each slot of the ring holds at most one row more than the widest launch it was sized for
+# harm: every model load pins host memory that no launch ever writes
+# catches: a large constant added to the rows (`Nat.add(Nat.max(1n, blk), 64n)`)
+law lp_ring_rows_tight:
+  for b: Nat
+  {Nat.is_le(Nat.sub(lp_ring_rows(b), 1n), b) == True{} : Bool}
+
+def lp_ring_rows_tight(b):
+  +b2 = {b : Nat}
+  lp_ring_rows_tight_go(b2)
+
+def lp_ring_bytes_tight_go(+c: Nat, +rb: Nat) -> {Nat.is_le(Nat.sub(Nat.sub(Nat.sub(Nat.add(c, c), c), c), rb), rb) == True{} : Bool}:
+  %Equal.sym(Nat, Nat.sub(Nat.add(c, c), c), c, L.nat_add_sub_cancel_l(c, c)) : {Nat.is_le(Nat.sub(Nat.sub(_, c), rb), rb) == True{} : Bool}
+  %Equal.sym(Nat, Nat.sub(c, c), 0n, L.nat_sub_self(c)) : {Nat.is_le(Nat.sub(_, rb), rb) == True{} : Bool}
+  L.nat_le_trans(Nat.sub(0n, rb), 0n, rb, G.g_nat_sub_le_self(0n, rb), L.nat_le_zero(rb))
+
+# The ring's bytes beyond two slots of `cap` rows, read with saturating subtraction so the law
+# builds no sum or product the ring's own size does not: at most one row of padding per slot.
+# promise: the host ring pins at most two slots of the rows it was sized for, plus one row of padding per slot
+# harm: every model load pins host memory that no copy ever writes, and a hostile size pins far more
+# catches: a large constant added to the bytes (`Nat.add(Nat.add(lp_slot_bytes(cap, rb), lp_slot_bytes(cap, rb)), 4096n)`)
+law lp_ring_bytes_tight:
+  for cap: Nat
+  for rb: Nat
+  {Nat.is_le(Nat.sub(Nat.sub(Nat.sub(lp_ring_bytes(cap, rb), Nat.mul(cap, rb)), Nat.mul(cap, rb)), rb), rb) == True{} : Bool}
+
+def lp_ring_bytes_tight(cap, rb):
+  +cap2 = {cap : Nat}
+  +rb2 = {rb : Nat}
+  lp_ring_bytes_tight_go(Nat.mul(cap2, rb2), rb2)
+
 def lp_ring_at(
   +p: Nat,
   +t: Nat,
