@@ -4802,3 +4802,12 @@ fn reasoning_left_in_the_content_with_a_format_is_refused() {
     assert_eq!(status, 200, "{}", r.dump());
     assert_eq!(s(&r, &["choices", "0", "message", "content"]), "{}");
 }
+
+#[test]
+fn a_thinking_budget_beside_a_format_names_the_format() {
+    let h = harness();
+    let (status, r) = h.chat(r#","thinking_budget_tokens":32,"response_format":{"type":"json_object"}"#);
+    assert_eq!(status, 400, "{}", r.dump());
+    let msg = s(&r, &["error", "message"]);
+    assert!(msg.contains("response_format json_object") && !msg.contains("penalties"), "{msg}");
+}

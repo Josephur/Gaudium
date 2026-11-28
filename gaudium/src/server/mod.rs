@@ -4215,18 +4215,23 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     };
     // The answer after a forced close is a second generation: the penalties' counts of the
     // reasoning and a ban on the end-of-thinking marker would not carry over to it.
+    // (a constrained reply is picked on the host as a penalised one is, and its grammar's
+    // reasoning phase would not carry over either)
     if !crate::verified::think_penalties_ok(
         think_budget.is_some(),
         penalised,
         THINK_RESUME_CARRIES_PENALTIES,
     ) {
+        let what = match &structured_req {
+            Some(r) if !penalties.active() => r.label.clone(),
+            Some(r) => format!("sampling penalties, logit_bias or {}", r.label),
+            None => "sampling penalties or logit_bias".to_string(),
+        };
         api.error(
             stream,
             400,
             "invalid_request_error",
-            &format!(
-                "{think_field} can not be combined with sampling penalties or logit_bias yet: send one or the other"
-            ),
+            &format!("{think_field} can not be combined with {what} yet: send one or the other"),
         );
         return;
     }
