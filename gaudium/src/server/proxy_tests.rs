@@ -2174,6 +2174,7 @@ fn api_request(headers: &[(&str, &str)]) -> HttpRequest {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         body: Vec::new(),
+        streamed: None,
     }
 }
 
