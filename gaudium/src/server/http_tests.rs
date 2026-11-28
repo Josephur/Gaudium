@@ -3215,3 +3215,134 @@ fn models_sse_is_behind_the_api_key() {
     assert_eq!(status, 401);
     assert!(body.contains("authentication_error"), "{body}");
 }
+
+/// `gaudium.ignored` of a chat reply (empty when the reply has none).
+fn ignored_of(r: &JsonValue) -> Vec<String> {
+    at(r, &["gaudium"])
+        .get("ignored")
+        .and_then(JsonValue::as_array)
+        .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn chat_reports_the_request_fields_it_does_not_apply() {
+    let h = harness();
+    // accepted but not applied: the reply names each one, in body order, with a reason
+    h.script("</think>\n\nHi.");
+    let (status, r) = h.chat(
+        ",\"presence_penalty\":0.6,\"frequency_penalty\":0.2,\"logit_bias\":{\"7\":5},\
+         \"user\":\"someone\",\"stream_options\":{\"include_usage\":false}",
+    );
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(s(&r, &["choices", "0", "message", "content"]), "Hi.");
+    let ignored = ignored_of(&r);
+    let names: Vec<&str> = ignored
+        .iter()
+        .map(|i| i.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "presence_penalty",
+            "frequency_penalty",
+            "logit_bias",
+            "user",
+            "stream_options"
+        ],
+        "{ignored:?}"
+    );
+    assert!(
+        ignored.iter().all(|i| i.contains("(not applied")),
+        "{ignored:?}"
+    );
+
+    // a field this server does not know is reported, never refused
+    h.script("</think>\n\nHi.");
+    let (status, r) = h.chat(",\"a_field_from_a_newer_api\":{\"x\":1}");
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(ignored_of(&r), ["a_field_from_a_newer_api (unknown field)"]);
+
+    // the stream reports them in its last chunk
+    h.script("</think>\n\nHi.");
+    let (status, body) = h.post(
+        "/v1/chat/completions",
+        "{\"stream\":true,\"presence_penalty\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
+    );
+    assert_eq!(status, 200, "{body}");
+    let last = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|l| *l != "[DONE]")
+        .last()
+        .map(|l| json::parse_json(l).unwrap())
+        .unwrap();
+    let ignored = ignored_of(&last);
+    assert_eq!(ignored.len(), 1, "{ignored:?}");
+    assert!(ignored[0].starts_with("presence_penalty ("), "{ignored:?}");
+}
+
+#[test]
+fn chat_values_that_change_nothing_pass_silently() {
+    let h = harness();
+    h.script("</think>\n\nHi.");
+    let (status, r) = h.chat(
+        ",\"n\":1,\"logprobs\":false,\"top_logprobs\":0,\"response_format\":{\"type\":\"text\"},\
+         \"presence_penalty\":0,\"frequency_penalty\":0,\"logit_bias\":{},\"store\":false,\
+         \"stream_options\":{\"include_usage\":true},\"modalities\":[\"text\"],\"user\":null,\
+         \"temperature\":0,\"top_k\":1,\"seed\":5,\"max_tokens\":50",
+    );
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(s(&r, &["choices", "0", "message", "content"]), "Hi.");
+    assert!(ignored_of(&r).is_empty(), "{}", r.dump());
+}
+
+#[test]
+fn chat_refuses_fields_whose_ignoring_would_go_unseen() {
+    let h = harness();
+    let before = h.prompts.lock().unwrap().len();
+    for (extra, field) in [
+        (",\"n\":2", "n"),
+        (",\"logprobs\":true", "logprobs"),
+        (",\"logprobs\":true,\"top_logprobs\":3", "logprobs"),
+        (",\"response_format\":{\"type\":\"json_object\"}", "response_format"),
+        (
+            ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"w\",\"schema\":{\"type\":\"object\"}}}",
+            "response_format",
+        ),
+    ] {
+        let (status, r) = h.chat(extra);
+        assert_eq!(status, 400, "{extra}: {}", r.dump());
+        assert_eq!(s(&r, &["error", "type"]), "invalid_request_error");
+        assert_eq!(s(&r, &["error", "param"]), field, "{extra}");
+        assert!(
+            s(&r, &["error", "message"]).starts_with(&format!("{field}=")),
+            "{}",
+            r.dump()
+        );
+    }
+    // refused before the prompt reached the model
+    assert_eq!(h.prompts.lock().unwrap().len(), before);
+}
+
+#[test]
+fn messages_requests_keep_their_own_field_report() {
+    // the chat table is for chat-completions bodies; a Messages request is translated first
+    // and reports what its own translation dropped
+    let h = harness();
+    h.script("</think>\n\nHi.");
+    let (status, text) = h.post(
+        "/v1/messages",
+        "{\"model\":\"m\",\"max_tokens\":64,\"service_tier\":\"auto\",\
+         \"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    let ignored: Vec<&str> = at(&r, &["gaudium", "ignored"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert_eq!(ignored, ["service_tier (ignored)"]);
+}

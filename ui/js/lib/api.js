@@ -35,7 +35,7 @@ export const skipReasoning = (id) => getJson('/v1/chat/completions/control', { m
 // Build the request body from the UI settings, including Gaudium's optional gaudium_method selector.
 export function buildBody(messages, s, tools) {
   const b = {
-    messages, stream: true, timings_per_token: true, return_progress: true, sse_ping_interval: 1,
+    messages, stream: true, timings_per_token: true, return_progress: true,
     reasoning_format: 'auto', cache_prompt: true,
   };
   if (s.thinking === 'off') b.chat_template_kwargs = { enable_thinking: false };
