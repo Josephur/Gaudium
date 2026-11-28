@@ -1316,6 +1316,15 @@ def fs_take_raises(+n: Nat, t: FsTake) -> Bool:
     case FsTooMany{_, _}:
       True{}
 
+# Whether `a`, the count the store keeps after a take decided against `c`, counts a given slot:
+# more files than `c`, at most `c`'s bound, and that bound unchanged.
+def fs_take_counted(+c: FsCount, t: FsTake, +a: FsCount) -> Bool:
+  match t:
+    case FsTaken{_}:
+      Bool.and(Nat.is_lt(fs_count_live(c), fs_count_live(a)), Bool.and(Nat.is_le(fs_count_live(a), fs_count_max(c)), Nat.is_eq(fs_count_max(a), fs_count_max(c))))
+    case FsTooMany{_, _}:
+      True{}
+
 # `a` when the take gave the slot, `c` when it refused it.
 def fs_take_kept(t: FsTake, +a: FsCount, +c: FsCount) -> FsCount:
   match t:
@@ -1375,6 +1384,15 @@ def fs_take_go_raises(+n: Nat, +m: Nat, k: Bool) -> {fs_take_raises(n, fs_take_g
   match k:
     case True{}:
       L.nat_lt_succ_self(n)
+    case False{}:
+      {==}
+
+def fs_take_go_counted(+n: Nat, +m: Nat, k: Bool, ek: {k == Nat.is_lt(n, m) : Bool}) -> {fs_take_counted(FsCount{n, m}, fs_take_go(n, m, k), fs_take_count(FsCount{n, m}, fs_take_go(n, m, k))) == True{} : Bool}:
+  match k:
+    case True{}:
+      %Equal.sym(Bool, Nat.is_lt(n, 1n+n), True{}, L.nat_lt_succ_self(n)) : {Bool.and(_, Bool.and(Nat.is_le(1n+n, m), Nat.is_eq(m, m))) == True{} : Bool}
+      %Equal.sym(Bool, Nat.is_le(1n+n, m), True{}, fs_succ_le_of_lt(n, m, Equal.sym(Bool, True{}, Nat.is_lt(n, m), ek))) : {Bool.and(True{}, Bool.and(_, Nat.is_eq(m, m))) == True{} : Bool}
+      G.g_nat_eq_refl(m)
     case False{}:
       {==}
 
@@ -1438,6 +1456,18 @@ def fs_take_raises_count(c):
   match c:
     case FsCount{+n, +m}:
       fs_take_go_raises(n, m, Nat.is_lt(n, m))
+
+# promise: when a take gives an upload its slot, the count the store keeps after it holds more files than before, no more than the bound, and the same bound.
+# harm: an upload could take a slot the count never records, and uploads of no bytes would then pass the bound without end
+# catches: fs_take_count returning `c` for a given slot when `c` holds no files
+law fs_take_count_counts:
+  for +c: FsCount
+  {fs_take_counted(c, fs_count_take(c), fs_take_count(c, fs_count_take(c))) == True{} : Bool}
+
+def fs_take_count_counts(c):
+  match c:
+    case FsCount{+n, +m}:
+      fs_take_go_counted(n, m, Nat.is_lt(n, m), {==})
 
 # promise: an upload is given its slot whenever the store holds fewer files than its bound.
 # harm: the store could refuse every upload, or the last one its bound allows

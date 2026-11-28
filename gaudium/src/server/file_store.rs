@@ -20,7 +20,8 @@
 //! - `fs_delete` gives a deleted file's bytes back, and the file leaves the index;
 //! - `fs_visible` decides who sees a file;
 //! - the file count bounds the files whatever their size (`--files-max-count`): `fs_count_take`
-//!   gives an upload its slot before its room is reserved, or refuses it when the store is full;
+//!   gives an upload its slot before its room is reserved, or refuses it when the store is full,
+//!   and `fs_take_count` is the count kept after it (one that counts the slot within the bound);
 //!   the slot passes to the stored file and is given back once (`fs_count_give`) when the upload
 //!   is refused or dropped, or the file is deleted; `fs_count_restore` counts every file found at
 //!   start and `fs_count_fits` refuses a start with more files than the bound.
@@ -635,7 +636,8 @@ impl FileStore {
     pub fn stage(&self, want: Option<u64>, src: &mut dyn Read) -> Result<Staged<'_>, FileError> {
         let ticket = {
             let mut g = self.lock();
-            // the slot first: a refusal leaves the count (fs_take_refused_keeps) and the ledger
+            // the slot first: a given slot is counted within the bound (fs_take_count_counts); a
+            // refusal leaves the count (fs_take_refused_keeps) and the ledger
             let t = fs_count_take(g.count);
             g.count = fs_take_count(g.count, t);
             if let FsTake::FsTooMany(live, max) = t {
