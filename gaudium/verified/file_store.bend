@@ -174,6 +174,18 @@ def fs_when_stored(r: FsUpload, +u: FsUpload) -> FsUpload:
     case FsNoIds{}:
       FsNoIds{}
 
+# `a` when `r` stores the upload, `l` when it refuses it (whatever the refusal).
+def fs_kept_if_refused(r: FsUpload, +a: FsLedger, +l: FsLedger) -> FsLedger:
+  match r:
+    case FsStored{_, _}:
+      a
+    case FsTooLarge{}:
+      l
+    case FsOverQuota{_}:
+      l
+    case FsNoIds{}:
+      l
+
 def fs_release_if(+u: Nat, +f: Nat, +n: Nat, +size: Nat, counted: Bool) -> FsLedger:
   match counted:
     case True{}:
@@ -629,6 +641,25 @@ def fs_lt_of_succ_le(+i: Nat, +m: Nat, h: {Nat.is_le(1n+i, m) == True{} : Bool})
     case 1n+ip 1n+mp:
       fs_lt_of_succ_le(ip, mp, h)
 
+def fs_ledger_kept(+l: FsLedger, r: FsUpload) -> {fs_kept_if_refused(r, fs_upload_ledger(l, r), l) == fs_upload_ledger(l, r) : FsLedger}:
+  match r:
+    case FsStored{+i, +a}:
+      {==}
+    case FsTooLarge{}:
+      {==}
+    case FsOverQuota{+x}:
+      {==}
+    case FsNoIds{}:
+      {==}
+
+def fs_min_add_self(+a: Nat, +b: Nat) -> {Nat.min(a, Nat.add(a, b)) == a : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %Equal.sym(Nat, Nat.min(ap, Nat.add(ap, b)), ap, fs_min_add_self(ap, b)) : {1n+_ == 1n+ap : Nat}
+      {==}
+
 # ============================================================================
 # 3. Laws
 # ============================================================================
@@ -966,6 +997,23 @@ def fs_hold_within_free(l, c, w):
     case FsLedger{+u, +f, +n}:
       L.nat_min_le_r(Nat.min(w, c), f)
 
+# promise: an upload that asks for no more than the per-file cap and the free bytes is reserved all it asked for.
+# harm: uploads that fit the cap and the quota could be refused as over the quota
+# catches: fs_hold reserving 0 bytes
+# catches: fs_hold reserving half of what it may
+law fs_hold_covers_ask:
+  for +u: Nat
+  for +w: Nat
+  for +x: Nat
+  for +y: Nat
+  for +n: Nat
+  {Nat.is_le(w, fs_size(fs_hold_ticket(fs_hold(FsLedger{u, Nat.add(w, x), n}, Nat.add(w, y), w)))) == True{} : Bool}
+
+def fs_hold_covers_ask(u, w, x, y, n):
+  %Equal.sym(Nat, Nat.min(w, Nat.add(w, y)), w, fs_min_add_self(w, y)) : {Nat.is_le(w, Nat.min(_, Nat.add(w, x))) == True{} : Bool}
+  %Equal.sym(Nat, Nat.min(w, Nat.add(w, x)), w, fs_min_add_self(w, x)) : {Nat.is_le(w, _) == True{} : Bool}
+  L.nat_le_refl(w)
+
 # promise: a reservation never takes more than the upload asked for, nor more than the per-file cap.
 # harm: one upload could hold the room other uploads need
 # catches: the reservation taking every free byte whatever the upload asked for
@@ -1022,6 +1070,20 @@ def fs_commit_is_upload(l, c, m, t, s):
   match t:
     case FsEntry{+h, +v}:
       fs_commit_go_is(l, c, m, h, s, Nat.is_le(s, h))
+
+# promise: a refused commit, whatever the refusal, leaves the ledger the store keeps after it equal to the ledger it was decided against.
+# harm: a refusal could zero the used bytes and the id counter: the quota would be lost and ids handed out again
+# catches: fs_upload_ledger returning a zeroed ledger for FsNoIds
+law fs_commit_refused_keeps:
+  for +l: FsLedger
+  for +c: Nat
+  for +m: Nat
+  for +t: FsEntry
+  for +s: Nat
+  {fs_kept_if_refused(fs_commit(l, c, m, t, s), fs_upload_ledger(l, fs_commit(l, c, m, t, s)), l) == fs_upload_ledger(l, fs_commit(l, c, m, t, s)) : FsLedger}
+
+def fs_commit_refused_keeps(l, c, m, t, s):
+  fs_ledger_kept(l, fs_commit(l, c, m, t, s))
 
 # promise: an upload larger than its reservation is never stored: its bytes past the reservation were not read.
 # harm: a truncated file could be stored as if complete
