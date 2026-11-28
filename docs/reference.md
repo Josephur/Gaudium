@@ -205,7 +205,8 @@ Serve options:
                         reasoning included). So does structured output (chat
                         response_format json_object / json_schema, function tools
                         with "strict": true, Messages output_config.format and strict
-                        tools): each answer token is masked to what the schema admits;
+                        tools, Responses text.format and strict function tools): each
+                        answer token is masked to what the schema admits;
                         the reasoning stays free
   --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster
                         decode, more device memory, its own token stream)

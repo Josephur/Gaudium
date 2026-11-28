@@ -234,7 +234,8 @@ fn print_usage() {
          \x20                       reasoning included). So does structured output (chat\n\
          \x20                       response_format json_object / json_schema, function tools\n\
          \x20                       with \"strict\": true, Messages output_config.format and strict\n\
-         \x20                       tools): each answer token is masked to what the schema admits;\n\
+         \x20                       tools, Responses text.format and strict function tools): each\n\
+         \x20                       answer token is masked to what the schema admits;\n\
          \x20                       the reasoning stays free\n\
          \x20 --moe-form <id=f>     Mixture-of-experts model <id>: dense (default) or routed (faster\n\
          \x20                       decode, more device memory, its own token stream)\n\
