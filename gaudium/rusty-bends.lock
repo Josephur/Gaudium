@@ -409,6 +409,21 @@ affa30b5d1f8bee0  gram_alive_within_cap_ok  law gram_alive_within_cap_ok : for +
 # harm gram_answer_absorbing: tokens after a second closing tag would escape the constraint
 a8e24d7dc4cd86dc  gram_answer_accepts_when_complete  law gram_answer_accepts_when_complete : for c : Bool { gram_accepting ( GpAnswer { } , c ) == c : Bool }
 # promise gram_answer_accepts_when_complete: in the answer, the reply may end exactly when the grammar accepts it
+a6b44e3308558588  gram_budget_charge_adds  law gram_budget_charge_adds : for + u : Nat for + a : Nat for + e : Nat { gram_budget_charge ( u , a , Nat.add ( u , Nat.add ( a , e ) ) ) == Nat.add ( u , a ) : Nat }
+# promise gram_budget_charge_adds: a charge the budget accepts adds exactly what was charged to the ledger
+# harm gram_budget_charge_adds: an undercounted ledger would let a client's schema spend past its cap
+af4690129887f52f  gram_budget_over_refused  law gram_budget_over_refused : for + c : Nat for + e : Nat for + a : Nat { gram_budget_ok ( 1n + Nat.add ( c , e ) , a , c ) == False { } : Bool }
+# promise gram_budget_over_refused: a ledger already past its budget accepts no charge, not even an empty one
+c2344af25f07a9df  gram_budget_over_stays_over  law gram_budget_over_stays_over : for + c : Nat for + e : Nat for a : Nat for b : Nat { gram_budget_ok ( gram_budget_charge ( 1n + Nat.add ( c , e ) , a , c ) , b , c ) == False { } : Bool }
+# promise gram_budget_over_stays_over: a ledger already past its cap stays past it after any charge
+bce12ad615727581  gram_budget_past_cap_refused  law gram_budget_past_cap_refused : for + u : Nat for + r : Nat for + e : Nat { gram_budget_ok ( u , 1n + Nat.add ( r , e ) , Nat.add ( u , r ) ) == False { } : Bool }
+# promise gram_budget_past_cap_refused: a charge that does not fit in what is left of a budget is refused
+# harm gram_budget_past_cap_refused: a hostile schema would make the compiler, or one mask, take memory or time without bound
+02cf5d14df8914d9  gram_budget_refused_latches  law gram_budget_refused_latches : for + u : Nat for + r : Nat for + e : Nat for b : Nat { gram_budget_ok ( gram_budget_charge ( u , 1n + Nat.add ( r , e ) , Nat.add ( u , r ) ) , b , Nat.add ( u , r ) ) == False { } : Bool }
+# promise gram_budget_refused_latches: after a charge that does not fit, every later charge to the ledger is refused, an empty one included
+# harm gram_budget_refused_latches: a mask cut short by its work cap would pass as complete, and the reply could leave its format
+b1310618752ed7a4  gram_budget_within_cap_ok  law gram_budget_within_cap_ok : for + u : Nat for + a : Nat for + e : Nat { gram_budget_ok ( u , a , Nat.add ( u , Nat.add ( a , e ) ) ) == True { } : Bool }
+# promise gram_budget_within_cap_ok: a charge that fits in what is left of a budget is accepted
 2f710bb17fffd754  gram_cache_clear_empties  law gram_cache_clear_empties : for h : Nat for a : Nat { gram_cache_held ( GcClear { } , h , a ) == 0n : Nat }
 # promise gram_cache_clear_empties: an emptied cache counts no bytes
 c9f61d003d68d297  gram_cache_keep_counts  law gram_cache_keep_counts : for h : Nat for a : Nat { gram_cache_held ( GcKeep { } , h , a ) == Nat.add ( h , a ) : Nat }
