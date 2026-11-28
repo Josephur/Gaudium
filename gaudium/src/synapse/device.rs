@@ -657,6 +657,41 @@ impl HpuDevice {
         unsafe { self.sync_stream(self.d2h) }
     }
 
+    /// Enqueues a device-to-host copy of `bytes` from `src_hbm` into `dst[dst_off..]` on the
+    /// compute stream, ordered with the recipe launches of that stream: it reads what the launch
+    /// enqueued before it wrote, and a launch enqueued after it writes only once it is done. NOT
+    /// synchronised: the bytes are in `dst` once the compute stream (or an event recorded on it
+    /// after this call) is synchronised, and `dst` must not be read or dropped before then.
+    pub fn enqueue_d2h_compute(
+        &self,
+        src_hbm: u64,
+        bytes: usize,
+        dst: &mut PinnedBuf,
+        dst_off: usize,
+    ) -> Result<(), SynapseError> {
+        self.guard
+            .check_dma()
+            .map_err(|e| SynapseError::Guard(format!("d2h refused: {e:?}")))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        if dst_off.checked_add(bytes).is_none_or(|end| end > dst.len) {
+            return Err(SynapseError::InvalidArg(format!(
+                "enqueue_d2h_compute: {bytes} bytes at {dst_off} > pinned capacity {}",
+                dst.len
+            )));
+        }
+        syn_check("synMemCopyAsync(D2H, compute)", unsafe {
+            (self.api.syn_mem_copy_async)(
+                self.compute,
+                src_hbm,
+                bytes as u64,
+                dst.ptr.add(dst_off) as u64,
+                SynDmaDir::DramToHost as u32,
+            )
+        })
+    }
+
     /// Enqueues an HBM -> HBM copy on the compute stream, ordered with the recipe launches of
     /// that stream. NOT synchronized: the caller syncs the compute stream like after a launch.
     pub fn copy_d2d_compute(

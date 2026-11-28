@@ -469,14 +469,32 @@ fn search_round(
     s
 }
 
-/// Samples one vocab row of BF16 logits (`role = 0` target/verify, `role = 1` draft).
-pub fn sample_row(
+/// The support of one row's draw: every token whose logit is at least `thr` (and not NaN) is in
+/// the distribution the Gumbel-max draw runs over, with weight `exp((l - max_logit) * inv_t)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowSupport {
+    /// Largest logit of the row.
+    pub max_logit: f32,
+    /// BF16 order key of the support threshold.
+    pub tau_key: i32,
+    /// Support threshold (a BF16 value).
+    pub thr: f32,
+    /// The draw adds noise (a sampled row; `false`: the row's argmax).
+    pub noise: bool,
+    /// Final search state.
+    pub state: SearchState,
+    /// Every 1024-token block's maximum.
+    pub block_max: Vec<f32>,
+}
+
+/// The support threshold of one row exactly as the sampler kernels derive it: the block maxima,
+/// the 8 search rounds (when `searched`) and the min-p floor. `role` as in [`sample_row`].
+pub fn row_support(
     logits_bf16: &[u16],
     dev: &DevSampleParams,
     role: i32,
-    seq_pos: u32,
     searched: bool,
-) -> SampleResult {
+) -> RowSupport {
     assert!(!logits_bf16.is_empty());
     let coupled = (dev.i[3] & F_COUPLED) != 0;
     let dtrunc = (dev.i[3] & F_DTRUNC) != 0;
@@ -501,7 +519,6 @@ pub fn sample_row(
             st = search_round(logits_bf16, round, st, dev, trunc_active, &bm);
         }
     }
-    let inv_t = dev.f[0];
     let tau = if !noise {
         key_of(m)
     } else {
@@ -518,6 +535,33 @@ pub fn sample_row(
         }
         t
     };
+    RowSupport {
+        max_logit: m,
+        tau_key: tau,
+        thr: val_of_key(tau),
+        noise,
+        state: st,
+        block_max: bm,
+    }
+}
+
+/// Samples one vocab row of BF16 logits (`role = 0` target/verify, `role = 1` draft).
+pub fn sample_row(
+    logits_bf16: &[u16],
+    dev: &DevSampleParams,
+    role: i32,
+    seq_pos: u32,
+    searched: bool,
+) -> SampleResult {
+    let sup = row_support(logits_bf16, dev, role, searched);
+    let (m, tau, noise, st, bm) = (
+        sup.max_logit,
+        sup.tau_key,
+        sup.noise,
+        sup.state,
+        sup.block_max,
+    );
+    let inv_t = dev.f[0];
     let thr = val_of_key(tau);
     let rk = row_key(dev.i[1] as u32, dev.i[2] as u32, seq_pos);
     let mut best = NEG;

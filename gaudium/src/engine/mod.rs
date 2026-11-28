@@ -531,6 +531,16 @@ pub struct BuildRequest<'a> {
     pub images: &'a [crate::vision::PreparedImage],
 }
 
+/// Engines that read every emitted token's logits row out for per-token log-probabilities
+/// (`GenParams::logprobs`): the Qwen3 / Qwen3.5 / Qwen3.8 engine, served one request at a time.
+/// (The Gemma 4 and Inkling 2 engines and lane sessions have no readout yet.)
+pub fn has_logprob_readout(family: ModelFamily, lanes: usize) -> bool {
+    matches!(
+        family,
+        ModelFamily::Qwen3 | ModelFamily::Qwen35Dense | ModelFamily::Qwen35Moe
+    ) && lanes <= 1
+}
+
 /// Whether `family` has an off-card build (`build_cache`).
 pub fn has_offcard_build(family: ModelFamily) -> bool {
     matches!(

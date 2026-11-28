@@ -994,3 +994,56 @@ fn long_keys_nested_deep_keep_a_short_message() {
     let e = build::schema_doc(&schema(&format!(r#"{{"type":"object","properties":{{}},"required":["{long}"]}}"#))).unwrap_err();
     assert!(e.len() <= build::MESSAGE_MAX + 3 && e.contains("names 'qqq"), "{e}");
 }
+
+/// A constrained request that asks for log-probabilities: the readout of each token comes from
+/// the row the host pick drew it from (`pick_masked` leaves it penalised and masked), so the
+/// chosen token is the one picked and every alternative is a token the grammar admits there.
+#[test]
+fn logprobs_of_a_constrained_pick_report_only_admitted_tokens() {
+    use crate::fp8::f32_to_bf16_rne;
+    use crate::sampler::SampleParams;
+    use crate::sampler_penalty::{pick_masked, PenaltyState, Penalties};
+    let v = toy_table();
+    let vocab = v.len();
+    let top = 8u64;
+    let greedy = SampleParams::default().to_dev(vocab as u64);
+    let sampled = SampleParams {
+        temperature: 1.0,
+        seed: 7,
+        ..SampleParams::default()
+    }
+    .to_dev(vocab as u64);
+    for (dev, is_greedy) in [(greedy, true), (sampled, false)] {
+        let p = Penalties::for_vocab(vocab as u64);
+        let mut st = PenaltyState::begin(0);
+        let mut c = Constraint::begin(plan(json_mode(), false));
+        for n in 0..24u32 {
+            if c.complete() {
+                break;
+            }
+            let m = c.mask().unwrap();
+            // a row whose highest logits are mostly tokens the grammar refuses
+            let mut row: Vec<u16> = (0..vocab)
+                .map(|i| f32_to_bf16_rne(((i * 37 + n as usize * 11) % 101) as f32 / 10.0 - 5.0))
+                .collect();
+            let tok = pick_masked(&p, &st, &mut row, &dev, n, Some(&m)).unwrap();
+            assert!(m.has(tok as u32), "step {n}: token {tok} is refused by the grammar");
+            let e = crate::logprobs::row_logprobs_u16(&row, &dev, tok, top);
+            assert_eq!(e.token, tok);
+            assert!(e.logprob.is_finite(), "step {n}: the picked token is in the support");
+            assert!(!e.top.is_empty());
+            for &(id, lp) in &e.top {
+                assert!(m.has(id as u32), "step {n}: alternative {id} is refused by the grammar");
+                assert!(lp.is_finite(), "step {n}: alternative {id} at -inf");
+            }
+            if is_greedy {
+                // the greedy pick is the most likely admitted token, and every admitted token
+                // up to `top` is listed
+                assert_eq!(e.top[0].0, tok, "step {n}");
+                assert_eq!(e.top.len() as u64, top.min(m.count()), "step {n}");
+            }
+            st.commit(&p, tok).unwrap();
+            c.commit(tok).unwrap();
+        }
+    }
+}

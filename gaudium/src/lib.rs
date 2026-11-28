@@ -20,6 +20,7 @@ pub mod json;
 pub mod kernels;
 pub mod live_profile;
 pub mod live_report;
+pub mod logprobs;
 pub mod model_spec;
 pub mod model_text;
 pub mod moe_cache;

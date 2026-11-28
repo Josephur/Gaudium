@@ -943,6 +943,16 @@ pub struct SpecLane {
 }
 
 impl SpecRuntime {
+    /// Rows of the widest verify launch (`sp_ids0` holds one `i32` id per row; 0: none).
+    pub(super) fn verify_rows(&self) -> u64 {
+        self.act_specs.get("sp_ids0").map_or(0, |b| b / 4)
+    }
+
+    /// Bytes of the verify launches' device logits buffer (0: none).
+    pub(super) fn verify_logits_bytes(&self) -> u64 {
+        self.act_specs.get("logits").copied().unwrap_or(0)
+    }
+
     /// [lanes] Verify rows of a lane at its narrow and its wide width: the narrowest and the
     /// widest of this runtime's widths (a lanes load gives it the wide one only when the lanes'
     /// rings hold its rows).
@@ -1288,6 +1298,12 @@ impl SpecRuntime {
     /// draft tree they keep the non-speculative loop.
     pub fn handles_sampled(&self) -> bool {
         self.sampled_steps
+    }
+
+    /// Its decode loop reads each emitted token's logits row out for log-probabilities (the
+    /// chain verify loop; draft trees do not, so their requests that ask take the `K = 0` loop).
+    pub fn has_logprob_readout(&self) -> bool {
+        self.tree.is_none()
     }
 
     /// `(address, bytes)` of every drafter context cache (valid after [`Self::allocate`]).
@@ -2497,6 +2513,12 @@ pub(super) fn decode(
             oracle,
         )
     };
+    if lp_rt::wanted(params) {
+        // every launch of this loop has at most `blk` rows
+        lp_rt::loop_fits(eng, blk as u64)?;
+    }
+    let addr_logits = eng.specdec.as_ref().unwrap().addr["logits"];
+    let logits_bytes = eng.specdec.as_ref().unwrap().verify_logits_bytes();
     let mut ks: Vec<u64> = widths.iter().filter(|&&t| t > 1).map(|t| t - 1).collect();
     // [step] a request may pin one of the engine's widths (width-policy measurements)
     if let Some(k) = params.force_draft_k.filter(|k| ks.contains(k)) {
@@ -2710,6 +2732,10 @@ pub(super) fn decode(
                     .launch_prepared(&eng.dev, &step.launches[p])
                     .map_err(|e| format!("launch spec step (cursor<={cur_hi}, T={t}): {e}")));
             }
+            if lp_rt::wanted(params) {
+                // the launch's verify rows, before the next launch overwrites them
+                tryd!(lp_rt::enqueue_rows(eng, addr_logits, logits_bytes, t, p));
+            }
             if let Some(ev) = &events {
                 tryd!(ev[p]
                     .record_compute(&eng.dev)
@@ -2769,7 +2795,6 @@ pub(super) fn decode(
             // (row `i` at `cursor` samples sequence index `cursor + i + 1`), then the next
             // block's coupled walk (anchored on the bonus token at `cursor + n_emit`)
             let tokens = tryd!(read_i32s(eng, addr_tokens, t as usize));
-            let addr_logits = eng.specdec.as_ref().unwrap().addr["logits"];
             let row_bytes = eng.spec.vocab * 2;
             for (i, &tok) in tokens.iter().enumerate() {
                 tryd!(samp_rt::check_row(
@@ -2806,6 +2831,9 @@ pub(super) fn decode(
             e.1 += 1;
         }
 
+        // row `i` of the verify gave emitted token `i` (the accepted drafts, then the bonus)
+        let mut lps =
+            tryd!(lp_rt::slot_entries(eng, f.p, t, &emitted[..n_emit], params)).into_iter();
         let mut step_emitted = 0u64;
         for &tok in &emitted[..n_emit] {
             if budget.remaining() == 0 {
@@ -2814,6 +2842,7 @@ pub(super) fn decode(
             budget.record_emitted(1);
             generated.push(tok);
             step_emitted += 1;
+            lp_rt::push(params, lps.next());
             on_token(tok);
             if params.stop_on_eos && is_eos(tok) {
                 stopped_by_eos = true;

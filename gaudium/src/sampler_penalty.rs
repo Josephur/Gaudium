@@ -575,4 +575,47 @@ mod tests {
         assert_eq!(dense.iter().sum::<u64>(), total);
         assert_eq!((dense[3], dense[15], dense[2]), (3, 2, 0));
     }
+
+    /// The log-probability readout of a penalised token reads the row `pick` left behind: the
+    /// penalised distribution the token was drawn from, not the raw logits.
+    #[test]
+    fn the_readout_of_a_penalised_pick_is_the_penalised_distribution() {
+        use crate::logprobs::row_logprobs_u16;
+        let p = Penalties {
+            presence: 1.5,
+            bias: TokenMask::new(vec![(5, Bias::Ban), (7, Bias::Add(0.75))]),
+            ..Penalties::for_vocab(256)
+        };
+        let mut vals: Vec<f32> = (0..256).map(|i| -2.0 + (i % 13) as f32 * 0.125).collect();
+        vals[5] = 10.0;
+        vals[9] = 3.0;
+        vals[7] = 2.75;
+        let raw = row(&vals);
+        let sampled = SampleParams {
+            temperature: 0.8,
+            top_p: 0.9,
+            seed: 11,
+            ..SampleParams::default()
+        }
+        .to_dev(256);
+        for dev in [greedy(), sampled] {
+            let mut st = PenaltyState::begin(4);
+            for n in 4..24u32 {
+                let mut l = raw.clone();
+                let tok = pick(&p, &st, &mut l, &dev, n).unwrap();
+                let pen = row_logprobs_u16(&l, &dev, tok, 5);
+                assert!(pen.logprob.is_finite(), "n={n} tok={tok}");
+                // the banned token is never an alternative with a finite logprob
+                assert!(pen.top.iter().all(|&(id, lp)| id != 5 || !lp.is_finite()));
+                if dev.i[3] & crate::sampler::F_GREEDY != 0 {
+                    // greedy: the picked token is the penalised row's top-1
+                    assert_eq!(pen.top[0].0, tok, "n={n}");
+                }
+                // the raw row would report another distribution (its top-1 is the banned 5)
+                let rawlp = row_logprobs_u16(&raw, &dev, tok, 5);
+                assert_ne!(rawlp.top[0].0, pen.top[0].0, "n={n}");
+                st.commit(&p, tok).unwrap();
+            }
+        }
+    }
 }

@@ -1503,6 +1503,69 @@ ee4d7d07db0e432e  ln_wide_unknown_chunk_narrow  law ln_wide_unknown_chunk_narrow
 # promise ln_wide_unknown_chunk_narrow: a lane never goes wide into K/V chunks whose cost the model has not measured.
 f8533147dc62d652  ln_younger_waiter_never_blocks  law ln_younger_waiter_never_blocks : for + d : Bool for + r : Nat for + e : Nat { ln_admission_blocked ( d , Nat.add ( r , e ) , r ) == False { } : Bool }
 # promise ln_younger_waiter_never_blocks: a waiter that arrived after a session's next request never blocks its admission.
+98e7966f5fd1649a  lp_copy_fits_narrower  law lp_copy_fits_narrower : for t : Nat for d : Nat { lp_copy_fits ( t , Nat.add ( t , d ) ) == True { } : Bool }
+# promise lp_copy_fits_narrower: a slot takes every copy no wider than the rows it was sized for
+# harm lp_copy_fits_narrower: logprob requests on narrower verify widths are refused
+2cf79df877248ca4  lp_copy_in_ring  law lp_copy_in_ring : for p : Nat for t : Nat for cap : Nat for rb : Nat { Bool.or ( Bool.not ( lp_slot_ok ( p , t , cap ) ) , Nat.is_le ( Nat.add ( lp_slot_start ( p , cap , rb ) , lp_copy_bytes ( t , rb ) ) , lp_ring_bytes ( cap , rb ) ) ) == True { } : Bool }
+# promise lp_copy_in_ring: a copy the readout accepts for a slot never writes past the end of the host ring
+# harm lp_copy_in_ring: the device writes logits rows over host memory that is not the ring
+c25dae80e3af1eb3  lp_copy_in_slot  law lp_copy_in_slot : for t : Nat for cap : Nat for rb : Nat { Bool.or ( Bool.not ( lp_copy_fits ( t , cap ) ) , Nat.is_le ( lp_copy_bytes ( t , rb ) , lp_slot_bytes ( cap , rb ) ) ) == True { } : Bool }
+# promise lp_copy_in_slot: a copy the readout accepts never writes past the host slot it goes into
+# harm lp_copy_in_slot: the device writes logits rows over host memory that is not the slot
+de612aa8edaa376c  lp_path_needs_readout  law lp_path_needs_readout : for w : Bool { lp_path_keeps ( True { } , False { } ) == False { } : Bool }
+# promise lp_path_needs_readout: a request that asks for log-probabilities never runs a path that cannot read them out
+# harm lp_path_needs_readout: tokens are emitted with no log-probabilities although the client asked for them
+8b0cd7f90a30a037  lp_path_readout_keeps  law lp_path_readout_keeps : for w : Bool { lp_path_keeps ( True { } , True { } ) == True { } : Bool }
+# promise lp_path_readout_keeps: a request that asks for log-probabilities keeps a path that reads them out
+# harm lp_path_readout_keeps: every logprob request falls back to the slow path
+05208bf44588dbac  lp_path_unasked_keeps  law lp_path_unasked_keeps : for r : Bool { lp_path_keeps ( False { } , r ) == True { } : Bool }
+# promise lp_path_unasked_keeps: a request that does not ask for log-probabilities keeps its decode path, so it pays nothing for the readout
+# harm lp_path_unasked_keeps: requests without logprobs are moved off the speculative path and slow down
+245c976e3cc77a97  lp_ring_bytes_tight  law lp_ring_bytes_tight : for cap : Nat for rb : Nat { Nat.is_le ( Nat.sub ( Nat.sub ( Nat.sub ( lp_ring_bytes ( cap , rb ) , Nat.mul ( cap , rb ) ) , Nat.mul ( cap , rb ) ) , rb ) , rb ) == True { } : Bool }
+# promise lp_ring_bytes_tight: the host ring pins at most two slots of the rows it was sized for, plus one row of padding per slot
+# harm lp_ring_bytes_tight: every model load pins host memory that no copy ever writes, and a hostile size pins far more
+57f3ebc8aa48191d  lp_ring_rows_cover  law lp_ring_rows_cover : for b : Nat { Bool.and ( lp_copy_fits ( 1n , lp_ring_rows ( b ) ) , lp_copy_fits ( b , lp_ring_rows ( b ) ) ) == True { } : Bool }
+# promise lp_ring_rows_cover: every slot of the ring takes a one-row step and the widest verify launch it was sized for
+# harm lp_ring_rows_cover: a logprob request on a loaded engine is refused, or its copy overruns the slot
+c275fb163ff25306  lp_ring_rows_tight  law lp_ring_rows_tight : for b : Nat { Nat.is_le ( Nat.sub ( lp_ring_rows ( b ) , 1n ) , b ) == True { } : Bool }
+# promise lp_ring_rows_tight: each slot of the ring holds at most one row more than the widest launch it was sized for
+# harm lp_ring_rows_tight: every model load pins host memory that no launch ever writes
+f7eb2df0add925b5  lp_row_in_copy  law lp_row_in_copy : for i : Nat for d : Nat for rb : Nat { Nat.is_le ( Nat.add ( lp_row_start ( i , rb ) , rb ) , lp_copy_bytes ( Nat.add ( 1n + i , d ) , rb ) ) == True { } : Bool }
+# promise lp_row_in_copy: every row of a t-row readout copy, i < t, ends inside the copy
+# harm lp_row_in_copy: a token's log-probabilities are read from the next row or past the copied bytes
+b0750fcc85066c8a  lp_rows_disjoint  law lp_rows_disjoint : for i : Nat for rb : Nat { Nat.is_le ( Nat.add ( lp_row_start ( i , rb ) , rb ) , lp_row_start ( 1n + i , rb ) ) == True { } : Bool }
+# promise lp_rows_disjoint: row i+1 of a readout copy starts where row i ends or later, so no two rows share a byte
+# harm lp_rows_disjoint: every token reads its log-probabilities from the same row
+4eaf0092600f460a  lp_slot_ok_parities  law lp_slot_ok_parities : for t : Nat for d : Nat { Bool.and ( lp_slot_ok ( 0n , t , Nat.add ( t , d ) ) , lp_slot_ok ( 1n , t , Nat.add ( t , d ) ) ) == True { } : Bool }
+# promise lp_slot_ok_parities: both launch parities take every copy no wider than the slots
+# harm lp_slot_ok_parities: logprob requests are refused on one parity, so every other step fails
+dca8f8022395f9ae  lp_slots_disjoint  law lp_slots_disjoint : for t : Nat for cap : Nat for rb : Nat { Bool.or ( Bool.not ( lp_slot_ok ( 0n , t , cap ) ) , Nat.is_le ( Nat.add ( lp_slot_start ( 0n , cap , rb ) , lp_copy_bytes ( t , rb ) ) , lp_slot_start ( 1n , cap , rb ) ) ) == True { } : Bool }
+# promise lp_slots_disjoint: a copy the readout accepts for slot 0 ends before slot 1 starts, so the two launches in flight never share a host byte
+# harm lp_slots_disjoint: the launch queued behind overwrites the rows the host is still reading
+f57615995194301b  lp_src_fits_narrower  law lp_src_fits_narrower : for t : Nat for rb : Nat for d : Nat { lp_src_fits ( t , rb , Nat.add ( lp_copy_bytes ( t , rb ) , d ) ) == True { } : Bool }
+# promise lp_src_fits_narrower: a buffer takes every copy no larger than it
+# harm lp_src_fits_narrower: logprob requests are refused although the launch's rows are all in the buffer
+cf4c7c25da6bbee4  lp_src_in_buffer  law lp_src_in_buffer : for t : Nat for rb : Nat for s : Nat { Bool.or ( Bool.not ( lp_src_fits ( t , rb , s ) ) , Nat.is_le ( lp_copy_bytes ( t , rb ) , s ) ) == True { } : Bool }
+# promise lp_src_in_buffer: a copy the readout accepts never reads past the end of the device logits buffer it copies from
+# harm lp_src_in_buffer: rows of another tensor, or past the buffer, are read back as a token's logits
+dbd2d67a3183ab93  lp_step_rows_cover  law lp_step_rows_cover : for u : Nat for t : Nat { Bool.or ( Bool.not ( Nat.is_le ( u , t ) ) , Nat.is_eq ( lp_step_rows ( u , t ) , u ) ) == True { } : Bool }
+# promise lp_step_rows_cover: every emitted token of a step gets its own row read when the step computed it
+# harm lp_step_rows_cover: a token is reported without its log-probability
+6be6ae8bb4d4909e  lp_step_rows_le_rows  law lp_step_rows_le_rows : for u : Nat for t : Nat { Nat.is_le ( lp_step_rows ( u , t ) , t ) == True { } : Bool }
+# promise lp_step_rows_le_rows: a step never has more of its rows read than it computed
+# harm lp_step_rows_le_rows: tokens get log-probabilities from rows the step never wrote
+cdbd91d97c1ad4c2  lp_top_count_covers  law lp_top_count_covers : for r : Nat for s : Nat { Bool.or ( Bool.not ( lp_top_ok ( r ) ) , Nat.is_le ( Nat.min ( r , s ) , lp_top_count ( r , s ) ) ) == True { } : Bool }
+# promise lp_top_count_covers: an accepted request gets every alternative it asked for, or every token of the draw when the draw holds fewer
+# harm lp_top_count_covers: a client asking for alternatives silently gets fewer than the distribution holds
+810c15acbae81dbb  lp_top_count_le_cap  law lp_top_count_le_cap : for r : Nat for s : Nat { Nat.is_le ( lp_top_count ( r , s ) , lp_top_cap ( ) ) == True { } : Bool }
+# promise lp_top_count_le_cap: a token never reports more alternatives than the readout's cap, whatever was asked
+# harm lp_top_count_le_cap: the readout's fixed-size top list is indexed past its end
+e5e59f0c1fc8a4c7  lp_top_count_le_req  law lp_top_count_le_req : for r : Nat for s : Nat { Nat.is_le ( lp_top_count ( r , s ) , r ) == True { } : Bool }
+# promise lp_top_count_le_req: a token never reports more alternatives than the request asked for
+# harm lp_top_count_le_req: a client reads entries it never asked for
+f0a3f600b5f7e441  lp_top_count_le_support  law lp_top_count_le_support : for r : Nat for s : Nat { Nat.is_le ( lp_top_count ( r , s ) , s ) == True { } : Bool }
+# promise lp_top_count_le_support: a token never reports more alternatives than the distribution it was drawn from holds
+# harm lp_top_count_le_support: tokens outside the sampled support are reported as alternatives of the draw
 1d7a0b64d1763db8  ls_hello_byte_recognised  law ls_hello_byte_recognised : { ls_is_hello ( 22n ) == True { } : Bool }
 e0bc2b3a6b6233d4  ls_hello_never_plain  law ls_hello_never_plain : for + t : Bool { ls_proto_is_plain ( ls_proto ( True { } , t ) ) == False { } : Bool }
 bf93288fe2d92a34  ls_hsts_on_tls  law ls_hsts_on_tls : { ls_sends_hsts ( LsTls { } ) == True { } : Bool }
