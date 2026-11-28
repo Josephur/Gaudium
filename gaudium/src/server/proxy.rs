@@ -1607,7 +1607,7 @@ impl McpProxy {
             );
         }
         let tls_state = self.tls.as_ref().map(|_| ()).map_err(String::as_str);
-        let mut target = match parse_target(url, tls_state) {
+        let target = match parse_target(url, tls_state) {
             Ok(t) => t,
             Err(why) => return refuse(stream, 400, "invalid_request_error", why),
         };
@@ -1624,13 +1624,51 @@ impl McpProxy {
             );
         }
 
+        let body: Option<&[u8]> = (!req.body.is_empty()).then_some(req.body.as_slice());
+        let headers = |same_origin: bool| forwarded_headers(req, same_origin);
+        let opened = match self.open_exchange(target, method, body, &headers, Instant::now()) {
+            Ok(o) => o,
+            Err(Stopped::Refused(status, why)) => {
+                return refuse(stream, status, "permission_error", why);
+            }
+            Err(Stopped::Unreachable(why)) => {
+                write_proxy_error(
+                    stream,
+                    502,
+                    "upstream_error",
+                    &format!("proxy error: {why}"),
+                );
+                return;
+            }
+        };
+        let Opened {
+            up,
+            buf,
+            head,
+            target,
+            started,
+        } = opened;
+        self.relay(stream, up, buf, &head, &target, started);
+    }
+
+    /// Opens an exchange with a target: every address it resolves to checked, the request sent,
+    /// and redirects followed as far as the rules allow. `headers(same_origin)` gives the
+    /// headers of a hop (once a redirect left the origin first named, `same_origin` is false and
+    /// the headers bound to that origin stay behind). An answer is counted as proxied, a target
+    /// that could not be reached as failed; a refusal is left to the caller to count.
+    fn open_exchange(
+        &self,
+        mut target: Target,
+        mut method: Method,
+        mut body: Option<&[u8]>,
+        headers: &dyn Fn(bool) -> Vec<(String, String)>,
+        started: Instant,
+    ) -> Result<Opened, Stopped> {
+        let tls_state = self.tls.as_ref().map(|_| ()).map_err(String::as_str);
         let named_origin = target.origin();
         let mut same_origin = true;
-        let mut method = method;
-        let mut body: Option<&[u8]> = (!req.body.is_empty()).then_some(req.body.as_slice());
         let mut redirects_left = self.limits.redirects;
         let mut hop = 0u32;
-        let started = Instant::now();
         loop {
             let prefix = if hop == 0 {
                 String::new()
@@ -1640,15 +1678,21 @@ impl McpProxy {
             let step = self.checked_addresses(&target).and_then(|addrs| {
                 let mut up = self.connect(&target, &addrs)?;
                 let mut buf = Vec::new();
-                let headers = forwarded_headers(req, same_origin);
-                let head =
-                    self.exchange(&mut up, &target, method, &headers, body, &mut buf, started)?;
+                let head = self.exchange(
+                    &mut up,
+                    &target,
+                    method,
+                    &headers(same_origin),
+                    body,
+                    &mut buf,
+                    started,
+                )?;
                 Ok((up, buf, head))
             });
             let (up, buf, head) = match step {
                 Ok(x) => x,
                 Err(Failure::Refused(status, why)) => {
-                    return refuse(stream, status, "permission_error", format!("{prefix}{why}"));
+                    return Err(Stopped::Refused(status, format!("{prefix}{why}")));
                 }
                 Err(Failure::Unreachable(why)) => {
                     self.note(
@@ -1661,13 +1705,7 @@ impl McpProxy {
                             jq(&why)
                         ),
                     );
-                    write_proxy_error(
-                        stream,
-                        502,
-                        "upstream_error",
-                        &format!("proxy error: {why}"),
-                    );
-                    return;
+                    return Err(Stopped::Unreachable(why));
                 }
             };
 
@@ -1676,23 +1714,19 @@ impl McpProxy {
             if let (true, Some(location)) = (rule::redirect_follows(kind), location) {
                 drop(up);
                 if !rule::redirect_may(redirects_left) {
-                    return refuse(
-                        stream,
+                    return Err(Stopped::Refused(
                         403,
-                        "permission_error",
                         format!("too many redirects (more than {})", self.limits.redirects),
-                    );
+                    ));
                 }
                 redirects_left = rule::redirect_left(redirects_left);
                 let next = match parse_target(&resolve_location(&target, location), tls_state) {
                     Ok(t) => t,
                     Err(why) => {
-                        return refuse(
-                            stream,
+                        return Err(Stopped::Refused(
                             403,
-                            "permission_error",
                             format!("redirect from {}: {why}", target.shown()),
-                        )
+                        ))
                     }
                 };
                 eprintln!(
@@ -1727,8 +1761,192 @@ impl McpProxy {
                     head.status
                 ),
             );
-            self.relay(stream, up, buf, &head, &target, started);
-            return;
+            return Ok(Opened {
+                up,
+                buf,
+                head,
+                target,
+                started,
+            });
+        }
+    }
+
+    /// A request of the server's own (the Messages MCP connector). It is made under every rule a
+    /// page's request through the route is made under: the proxy must be on, the target URL and
+    /// each address it resolves to must pass the allow-lists, a header goes to the target only
+    /// as the header rules say (one bound to the origin, such as `authorization` or
+    /// `mcp-session-id`, never follows a redirect to another origin), redirects are followed
+    /// alike, and the answer is read within the same size and time caps. The decisions are
+    /// counted and listed with the route's (`GET /gaudium/proxy`).
+    ///
+    /// The body goes to `sink` as it arrives; `sink` answers `false` to stop reading (what it
+    /// needed is complete). The error is the reason: `mcp proxy: ...` for a refusal, `proxy
+    /// error: ...` for a target that could not be reached or did not answer properly.
+    pub fn fetch(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+        sink: &mut dyn FnMut(&Fetched, &[u8]) -> bool,
+    ) -> Result<Fetched, String> {
+        let refuse = |why: String| {
+            self.note(
+                &self.refused,
+                format!("refused {} {} (server): {why}", method_name(method), shown_url(url)),
+                format!(
+                    "\"result\":\"refused\",\"method\":{},\"url\":{},\"by\":\"server\",\"reason\":{}",
+                    jq(method_name(method)),
+                    jq(&shown_url(url)),
+                    jq(&why)
+                ),
+            );
+            Err(format!("mcp proxy: {why}"))
+        };
+        if !self.enabled() {
+            return refuse("this server was started without --mcp-proxy".into());
+        }
+        let tls_state = self.tls.as_ref().map(|_| ()).map_err(String::as_str);
+        let target = match parse_target(url, tls_state) {
+            Ok(t) => t,
+            Err(why) => return refuse(why),
+        };
+        let len = body.map_or(0, <[u8]>::len) as u64;
+        if !rule::body_fits(len, self.limits.max_request) {
+            return refuse(format!(
+                "the request body of {len} bytes exceeds the limit of {} bytes",
+                self.limits.max_request
+            ));
+        }
+        let hop_headers = |same_origin: bool| {
+            let mut out: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                .filter(|(k, v)| {
+                    rule::req_header_goes(
+                        header_name_ok(k) && header_value_ok(v),
+                        req_header_kind(k),
+                        same_origin,
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let Opened {
+            up,
+            buf,
+            head,
+            target,
+            started,
+        } = match self.open_exchange(target, method, body, &hop_headers, Instant::now()) {
+            Ok(o) => o,
+            Err(Stopped::Refused(_, why)) => return refuse(why),
+            Err(Stopped::Unreachable(why)) => return Err(format!("proxy error: {why}")),
+        };
+        let fetched = Fetched {
+            status: head.status,
+            headers: head
+                .headers
+                .iter()
+                .map(|(lower, _, v)| (lower.clone(), v.clone()))
+                .collect(),
+        };
+        self.read_body(up, buf, &head, started, &fetched, sink)
+            .map_err(|why| {
+                eprintln!("[mcp-proxy] {} (server): answer cut: {why}", target.shown());
+                format!("proxy error: {}: {why}", target.authority())
+            })?;
+        Ok(fetched)
+    }
+
+    /// Reads an answer's body for the server itself (see [`McpProxy::fetch`]), within the
+    /// response cap and the idle and total limits.
+    fn read_body(
+        &self,
+        mut up: Upstream,
+        mut buf: Vec<u8>,
+        head: &Head,
+        started: Instant,
+        fetched: &Fetched,
+        sink: &mut dyn FnMut(&Fetched, &[u8]) -> bool,
+    ) -> Result<(), String> {
+        let chunked = head
+            .get("transfer-encoding")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+        let mut framing = if matches!(head.status, 100..=199 | 204 | 304) {
+            Framing::Empty
+        } else if chunked {
+            Framing::Chunked(ChunkState::Size)
+        } else {
+            match head.get("content-length").map(|v| v.parse::<u64>()) {
+                Some(Ok(n)) => Framing::Length(n),
+                Some(Err(_)) => return Err("the target sent an invalid Content-Length".into()),
+                None => Framing::ToClose,
+            }
+        };
+        let too_large = || {
+            format!(
+                "the response exceeds the limit of {} bytes (--mcp-proxy-max-mb)",
+                self.limits.max_response
+            )
+        };
+        if let Framing::Length(n) = framing {
+            if rule::resp_cut(0, n, self.limits.max_response) {
+                return Err(too_large());
+            }
+        }
+        let mut sent: u64 = 0;
+        let mut last_from_target = Instant::now();
+        loop {
+            match body_step(&mut framing, &mut buf) {
+                Step::End => return Ok(()),
+                Step::Bad(why) => return Err(why.to_string()),
+                Step::Data(n) => {
+                    let take = rule::resp_take(sent, n as u64, self.limits.max_response) as usize;
+                    let go_on = take == 0 || sink(fetched, &buf[..take]);
+                    if rule::resp_cut(sent, n as u64, self.limits.max_response) {
+                        return Err(too_large());
+                    }
+                    if !go_on {
+                        return Ok(());
+                    }
+                    sent += take as u64;
+                    buf.drain(..n);
+                    last_from_target = Instant::now();
+                }
+                Step::More => {
+                    let idle = ms_since(last_from_target);
+                    let total = ms_since(started);
+                    if rule::expired(idle, self.limits.idle_ms) {
+                        return Err(format!("the target was silent for {} s", idle / 1000));
+                    }
+                    if rule::expired(total, self.limits.total_ms) {
+                        return Err(format!("the exchange lasted {} s", total / 1000));
+                    }
+                    up.set_read_timeout(rule::read_wait(
+                        rule::time_left(idle, self.limits.idle_ms),
+                        rule::time_left(total, self.limits.total_ms),
+                        self.limits.idle_ms,
+                    ));
+                    let mut chunk = [0u8; 16 * 1024];
+                    match up.read(&mut chunk) {
+                        Ok(0) if framing == Framing::ToClose => return Ok(()),
+                        Ok(0) => {
+                            return Err(
+                                "the target closed the connection in the middle of its answer"
+                                    .into(),
+                            )
+                        }
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            last_from_target = Instant::now();
+                        }
+                        Err(e) if timed_out(&e) || e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(format!("reading from the target failed: {e}")),
+                    }
+                }
+            }
         }
     }
 
@@ -1976,6 +2194,42 @@ impl McpProxy {
             ),
         );
     }
+}
+
+/// The answer to a request of the server's own ([`McpProxy::fetch`]): its status and headers
+/// (names in lower case).
+#[derive(Debug, Clone)]
+pub(super) struct Fetched {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Fetched {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|h| h.0 == name)
+            .map(|h| h.1.as_str())
+    }
+}
+
+/// An exchange with a target that has its answer's head.
+struct Opened {
+    up: Upstream,
+    /// What was read past the head.
+    buf: Vec<u8>,
+    head: Head,
+    /// The target that answered (after any redirects).
+    target: Target,
+    started: Instant,
+}
+
+/// Why an exchange got no answer.
+enum Stopped {
+    /// The rules refused it (status, reason).
+    Refused(u16, String),
+    /// The target could not be reached or did not answer properly.
+    Unreachable(String),
 }
 
 /// How a write to the page ended without completing.

@@ -74,6 +74,40 @@ Streamable HTTP, DELETE ends a session).
   and shown without their query and fragment, which may hold a credential, and without a user
   part (`user:password@`), also when the URL is refused or malformed.
 
+## The Messages MCP connector (`mcp_servers`)
+
+A `POST /v1/messages` request may name MCP servers (`mcp_servers`) whose tools the server runs
+itself: it lists their tools to the model, runs the calls the model makes, and answers with
+`mcp_tool_use` / `mcp_tool_result` content blocks before it goes on generating. Its requests to
+those servers are made under the proxy's rules, exactly as a page's request through
+`/cors-proxy`: the same allow-lists and address checks, the same redirect and header rules (the
+server's `authorization_token` goes as a bearer header and never follows a redirect to another
+origin), and the same size and time limits. They are counted and listed with the page's
+(`GET /gaudium/proxy`, `"by":"server"` on a refusal). A server started without `--mcp-proxy`
+refuses a request with `mcp_servers`, and a server whose address the lists do not allow refuses
+the request before generation starts.
+
+- Accepted: `mcp_servers` entries `{"type": "url", "url", "name", "authorization_token"}`, with
+  either `tool_configuration` (`enabled`, `allowed_tools`) or an `mcp_toolset` entry in `tools`
+  (`mcp_server_name`, `default_config` and per-tool `configs` with `enabled` and
+  `defer_loading`). Tools reach the model as `mcp__<server>__<tool>`; a client tool of the same
+  name refuses the request.
+- Transport: Streamable HTTP (`initialize`, `tools/list` with its pages, `tools/call`; answers as
+  JSON or as an event stream; the session id the server assigns). Tool results are passed on as
+  text (an image or audio part becomes a note).
+- The loop: after each generation round the server runs the round's calls of MCP tools and
+  generates again, until the model ends its turn (`end_turn`), calls a client tool (the calls of
+  MCP tools in that round are still run; the reply stops with `tool_use`), or the round limit is
+  reached (`pause_turn`: send the reply back as the assistant turn to go on). A round cut by
+  `max_tokens`, a stop sequence or a cancel runs none of its calls. A forced `tool_choice`
+  applies to the first round.
+- Limits per request: 8 servers, 10 generation rounds, 64 calls of MCP tools (later calls get an
+  error result), 128 KiB of each result in the prompt (the rest is cut, with a note), 16 pages of
+  a server's tool list. Usage sums every round; `gaudium_tool_loop` gives the rounds and calls.
+- The decisions (admission, where a call goes, whether a round's calls run and whether another
+  round follows, and the bounds) are in `gaudium/verified/server_tools.bend`; the loop is
+  `gaudium/src/server/tool_loop.rs`, the client `gaudium/src/server/mcp_client.rs`.
+
 ## Threat model and guards
 
 A route that fetches a URL named by the request is a forwarder inside the operator's network.

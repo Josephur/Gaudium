@@ -4867,3 +4867,6 @@ fn a_responses_text_format_is_held_to_its_schema() {
     assert!(text.contains("'pattern'"), "{text}");
     assert_eq!(h.prompts.lock().unwrap().len(), before);
 }
+
+#[path = "tool_loop_tests.rs"]
+mod tool_loop_tests;

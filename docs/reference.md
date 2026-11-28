@@ -298,7 +298,10 @@ Serve options:
                         below); requests need the API key when one is set; a page of
                         another site cannot drive it, and a request must name this
                         server (see --server-name). GET /gaudium/proxy shows its
-                        settings and last decisions
+                        settings and last decisions. The Messages API's mcp_servers
+                        (the MCP connector: the server runs those tools itself) go
+                        through it too, under the same lists and limits; without
+                        --mcp-proxy a request with mcp_servers is refused
   --mcp-proxy-allow <list>  Targets the proxy may reach, comma separated (repeatable):
                         host, host:port, *.domain, an address, an address range
                         (192.0.2.0/24), or * for any target (* needs --api-key). Each

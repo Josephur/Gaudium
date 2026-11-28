@@ -1,0 +1,395 @@
+//! The server-side tool loop: a Messages request whose tools the server runs itself (the MCP
+//! connector, `mcp_servers`) is answered over several generation rounds. After each round the
+//! server runs the round's calls of its own tools, puts their results into the conversation and
+//! generates again, until the model ends its turn, calls a client tool, or the rounds run out.
+//!
+//! The reply is one message: its content blocks go on across the rounds (`mcp_tool_use` where
+//! the model called a server-side tool, then its `mcp_tool_result`), streamed in that order, and
+//! its usage sums every round.
+//!
+//! Every decision of the loop is verified (`verified/server_tools.bend`): whether a request with
+//! tool servers runs, where a call goes, whether a round's calls run and whether another round
+//! follows, and the bounds on calls and result sizes. The runner of the tools is a trait
+//! ([`ServerTools`]), so other tools the server runs itself use the same loop.
+
+use std::sync::Arc;
+
+use super::anthropic::{self, Translated};
+use super::conn::Conn;
+use super::mcp_client::{Connector, BOUNDS};
+use super::outparse::ToolCall;
+use super::{run_chat, write_json, write_sse_chunk, write_sse_end, Api, AppState};
+use crate::core::tool_calls::{stop_reason_name, GenEnd};
+use crate::json::{parse_json, JsonValue};
+use crate::verified::{
+    ge_model_ended, pc_prefill_rows, pc_reused_rows, sv_admit, sv_admit_is_none, sv_admit_runs,
+    sv_calls_take, sv_goes_on, sv_next, sv_route, sv_route_clash, sv_route_server, sv_runs,
+    sv_waits_client, SvAdmit,
+};
+
+/// Tools the server runs itself while it answers a request.
+pub(super) trait ServerTools {
+    /// `name` (as the model sees it) is one of these tools.
+    fn owns(&self, name: &str) -> bool;
+    /// Runs one call. A call that fails is an error result for the model, not an error of the
+    /// request.
+    fn run(&mut self, name: &str, arguments: &JsonValue) -> ToolOutput;
+    /// The request is over (sessions are closed).
+    fn finish(&mut self);
+}
+
+/// The result of one call: text parts, and whether the tool reported an error.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ToolOutput {
+    pub is_error: bool,
+    pub texts: Vec<String>,
+}
+
+impl ToolOutput {
+    /// The result as the next round's prompt has it.
+    fn prompt_text(&self) -> String {
+        let text = self.texts.join("\n");
+        if self.is_error {
+            format!("Error: {text}")
+        } else {
+            text
+        }
+    }
+}
+
+/// What the rounds of one reply share (`run_chat` takes it for each round).
+pub(super) struct Rounds {
+    /// The reply's content blocks so far.
+    pub builder: Option<anthropic::Builder>,
+    /// How the last round ended; `None` after a round that answered the request itself (an
+    /// error).
+    pub end: Option<RoundEnd>,
+}
+
+/// One generation round's outcome.
+pub(super) struct RoundEnd {
+    /// The round's request id and model.
+    pub id: String,
+    pub model: String,
+    pub end: GenEnd,
+    /// Every whole call the model made in the round.
+    pub calls: Vec<ToolCall>,
+    pub content: String,
+    pub reasoning: String,
+    pub stop_sequence: String,
+    pub prompt_tokens: u64,
+    pub reused: u64,
+    pub output_tokens: u64,
+    /// The round's `timings` and `gaudium` fields (`,"key":value` text).
+    pub extra: String,
+    /// Writing the stream to the client failed.
+    pub write_failed: bool,
+}
+
+/// The tool names of a chat body (offered and held back).
+fn chat_tool_names(chat: &JsonValue) -> Vec<String> {
+    ["tools", "gaudium_hidden_tools"]
+        .iter()
+        .filter_map(|k| chat.get(k).and_then(JsonValue::as_array))
+        .flatten()
+        .filter_map(|t| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Appends `items` to the array `key` of a chat body (made when absent).
+fn extend_list(chat: &mut JsonValue, key: &str, items: Vec<JsonValue>) {
+    if items.is_empty() {
+        return;
+    }
+    let JsonValue::Object(fields) = chat else {
+        return;
+    };
+    match fields.iter_mut().find(|(k, _)| k == key) {
+        Some((_, JsonValue::Array(a))) => a.extend(items),
+        Some((_, v)) => *v = JsonValue::Array(items),
+        None => fields.push((key.to_string(), JsonValue::Array(items))),
+    }
+}
+
+fn set_field(chat: &mut JsonValue, key: &str, value: Option<JsonValue>) {
+    let JsonValue::Object(fields) = chat else {
+        return;
+    };
+    fields.retain(|(k, _)| k != key);
+    if let Some(v) = value {
+        fields.push((key.to_string(), v));
+    }
+}
+
+/// Opens the request's MCP servers and adds their tools to its chat body (`None`: it names
+/// none). The error is the reason the request is refused.
+pub(super) fn open_server_tools<'a>(
+    state: &'a AppState,
+    t: &mut Translated,
+) -> Result<Option<Connector<'a>>, String> {
+    let asked = t.mcp.len() as u64;
+    let admit = sv_admit(asked, state.proxy.enabled(), BOUNDS.servers);
+    if sv_admit_is_none(admit) {
+        return Ok(None);
+    }
+    if !sv_admit_runs(admit) {
+        return match admit {
+            SvAdmit::SvProxyOff => Err(
+                "mcp_servers: this server was started without --mcp-proxy. The MCP connector's \
+                 requests go out through the MCP proxy and its allow-list (--mcp-proxy, \
+                 --mcp-proxy-allow, --mcp-proxy-allow-private); or run the MCP tools in the client"
+                    .into(),
+            ),
+            SvAdmit::SvTooMany | SvAdmit::SvRun | SvAdmit::SvNone => Err(format!(
+                "mcp_servers: {asked} servers named; this server takes at most {} per request",
+                BOUNDS.servers
+            )),
+        };
+    }
+    let client = chat_tool_names(&t.chat);
+    let c = Connector::open(&state.proxy, &t.mcp)?;
+    if let Some(name) = c
+        .names()
+        .find(|n| sv_route_clash(sv_route(true, client.iter().any(|x| x == n))))
+    {
+        return Err(format!(
+            "tools: '{name}' is the name of a client tool and of a tool of the request's MCP servers"
+        ));
+    }
+    extend_list(&mut t.chat, "tools", c.offered.clone());
+    extend_list(&mut t.chat, "gaudium_hidden_tools", c.deferred.clone());
+    t.ignored.extend(c.notes.iter().cloned());
+    Ok(Some(c))
+}
+
+/// `POST /v1/messages` once translated: a request without tool servers runs as one round, as
+/// any chat request; one with them runs the tool loop.
+pub(super) fn run_messages(state: &Arc<AppState>, mut t: Translated, stream: &mut Conn) {
+    let api = Api::Messages {
+        show_thinking: t.show_thinking,
+        begun: false,
+    };
+    let client = chat_tool_names(&t.chat);
+    let mut tools = match open_server_tools(state, &mut t) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            run_chat(state, &t.chat, stream, api, t.ignored, None);
+            return;
+        }
+        Err(e) => {
+            api.error(stream, 400, "invalid_request_error", &e);
+            return;
+        }
+    };
+    let labels = tools.labels();
+    run_loop(state, t, stream, &mut tools, &client, labels);
+    tools.finish();
+}
+
+/// The next round's conversation: the round's assistant turn with its server-side calls, and a
+/// tool message with each call's result.
+fn next_round_chat(
+    chat: &mut JsonValue,
+    end: &RoundEnd,
+    calls: Vec<JsonValue>,
+    results: Vec<JsonValue>,
+) {
+    let mut content = end.content.clone();
+    let mut reasoning = end.reasoning.clone();
+    let JsonValue::Object(fields) = chat else {
+        return;
+    };
+    let prefilled = fields
+        .iter()
+        .any(|(k, v)| k == "continue_final_message" && v.as_bool() == Some(true));
+    let Some((_, JsonValue::Array(msgs))) = fields.iter_mut().find(|(k, _)| k == "messages") else {
+        return;
+    };
+    // a prefilled reply goes on from the prefill's text
+    if prefilled {
+        if let Some(last) = msgs.pop() {
+            let text = |k: &str| {
+                last.get(k)
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            content = text("content") + &content;
+            reasoning = text("reasoning_content") + &reasoning;
+        }
+    }
+    let mut m = vec![
+        ("role".to_string(), JsonValue::Str("assistant".into())),
+        ("content".to_string(), JsonValue::Str(content)),
+    ];
+    if !reasoning.is_empty() {
+        m.push(("reasoning_content".to_string(), JsonValue::Str(reasoning)));
+    }
+    m.push(("tool_calls".to_string(), JsonValue::Array(calls)));
+    msgs.push(JsonValue::Object(m));
+    msgs.extend(results);
+    // the next round is a new assistant turn after the results; a forced tool choice was the
+    // first round's
+    for k in [
+        "continue_final_message",
+        "add_generation_prompt",
+        "tool_choice",
+    ] {
+        set_field(chat, k, None);
+    }
+}
+
+/// The rounds of one reply.
+fn run_loop(
+    state: &Arc<AppState>,
+    t: Translated,
+    stream: &mut Conn,
+    tools: &mut dyn ServerTools,
+    client: &[String],
+    labels: Vec<(String, String, String)>,
+) {
+    let Translated {
+        mut chat,
+        show_thinking,
+        ignored,
+        ..
+    } = t;
+    let stream_mode = chat.get("stream").and_then(JsonValue::as_bool) == Some(true);
+    let mut rounds = Rounds {
+        builder: Some(anthropic::Builder::new(show_thinking).with_server_tools(labels)),
+        end: None,
+    };
+    let (mut done, mut calls_run) = (0u64, 0u64);
+    let (mut input, mut cached, mut output) = (0u64, 0u64, 0u64);
+    let mut first: Option<(String, String)> = None;
+    loop {
+        let api = Api::Messages {
+            show_thinking,
+            // a stream that began takes a later round's error as an event
+            begun: stream_mode && done > 0,
+        };
+        run_chat(
+            state,
+            &chat,
+            stream,
+            api,
+            ignored.clone(),
+            Some(&mut rounds),
+        );
+        let Some(end) = rounds.end.take() else {
+            return; // the round answered the request itself (an error)
+        };
+        done += 1;
+        input += pc_prefill_rows(end.prompt_tokens, end.reused);
+        cached += pc_reused_rows(end.prompt_tokens, end.reused);
+        output += end.output_tokens;
+        let (id, model) = first
+            .get_or_insert_with(|| (end.id.clone(), end.model.clone()))
+            .clone();
+        let (server, client_calls): (Vec<&ToolCall>, Vec<&ToolCall>) =
+            end.calls.iter().partition(|c| {
+                sv_route_server(sv_route(
+                    tools.owns(&c.name),
+                    client.iter().any(|n| *n == c.name),
+                ))
+            });
+        let next = sv_next(
+            ge_model_ended(end.end),
+            server.len() as u64,
+            client_calls.len() as u64,
+            done,
+            BOUNDS.rounds,
+        );
+        let Some(b) = rounds.builder.as_mut() else {
+            return;
+        };
+        let mut write_failed = end.write_failed;
+        let mut stop_sequence = String::new();
+        let stop = if !sv_runs(next) {
+            stop_sequence = end.stop_sequence.clone();
+            stop_reason_name(end.end, !end.calls.is_empty())
+        } else {
+            let take = sv_calls_take(calls_run, server.len() as u64, BOUNDS.calls) as usize;
+            calls_run += take as u64;
+            let (mut calls, mut results) = (Vec::new(), Vec::new());
+            for (i, c) in server.iter().enumerate() {
+                let block_id = b.call_block_id(&c.id, &c.name);
+                let args = parse_json(&c.arguments)
+                    .ok()
+                    .filter(|v| v.as_object().is_some());
+                let out = match (&args, i < take) {
+                    (Some(a), true) => tools.run(&c.name, a),
+                    (None, true) => ToolOutput::error("the call's arguments are not a JSON object"),
+                    (_, false) => ToolOutput::error(format!(
+                        "not run: this request reached its limit of {} server-side tool calls",
+                        BOUNDS.calls
+                    )),
+                };
+                let events = b.push_result(&block_id, out.is_error, &out.texts);
+                if stream_mode
+                    && !write_failed
+                    && write_sse_chunk(stream, events.as_bytes()).is_err()
+                {
+                    write_failed = true;
+                }
+                calls.push(JsonValue::Object(vec![
+                    ("id".to_string(), JsonValue::Str(block_id.clone())),
+                    ("type".to_string(), JsonValue::Str("function".into())),
+                    (
+                        "function".to_string(),
+                        JsonValue::Object(vec![
+                            ("name".to_string(), JsonValue::Str(c.name.clone())),
+                            (
+                                "arguments".to_string(),
+                                args.unwrap_or(JsonValue::Object(Vec::new())),
+                            ),
+                        ]),
+                    ),
+                ]));
+                results.push(JsonValue::Object(vec![
+                    ("role".to_string(), JsonValue::Str("tool".into())),
+                    ("tool_call_id".to_string(), JsonValue::Str(block_id)),
+                    ("content".to_string(), JsonValue::Str(out.prompt_text())),
+                ]));
+            }
+            if write_failed {
+                return; // the client is gone
+            }
+            if sv_goes_on(next) {
+                next_round_chat(&mut chat, &end, calls, results);
+                continue;
+            }
+            if sv_waits_client(next) {
+                "tool_use" // the client's own calls wait for it
+            } else {
+                "pause_turn" // no round is left: the client may send the reply back to go on
+            }
+        };
+        let usage = anthropic::usage_json_parts(input, cached, output);
+        let extra = format!(
+            "{},\"gaudium_tool_loop\":{{\"rounds\":{done},\"server_calls\":{calls_run}}}",
+            end.extra
+        );
+        if stream_mode {
+            if !write_failed {
+                let events = b.finish(stop, &stop_sequence, &usage, &extra);
+                if write_sse_chunk(stream, events.as_bytes()).is_ok() {
+                    write_sse_end(stream);
+                }
+            }
+        } else {
+            b.close();
+            write_json(
+                stream,
+                200,
+                &b.message(&id, &model, stop, &stop_sequence, &usage, &extra),
+            );
+        }
+        return;
+    }
+}

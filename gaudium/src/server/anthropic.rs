@@ -10,6 +10,7 @@
 //! Which block is open, when a new one starts and when a stop event is owed follow the verified
 //! block lifecycle (`core::tool_calls::BlockTrack`).
 
+use super::mcp_client::{model_name, ServerSpec, ToolFilter};
 use super::outparse::Delta;
 use super::readout::jq;
 use crate::core::tool_calls::{BlockKind, BlockTrack};
@@ -119,6 +120,14 @@ pub fn tool_use_id(call_id: &str) -> String {
     format!("toolu_{}", call_id.strip_prefix("call_").unwrap_or(call_id))
 }
 
+/// `call_X` -> `mcptoolu_X`: the id of a call the server runs itself (an MCP tool).
+pub fn server_tool_use_id(call_id: &str) -> String {
+    format!(
+        "mcptoolu_{}",
+        call_id.strip_prefix("call_").unwrap_or(call_id)
+    )
+}
+
 /// The error type of an HTTP status.
 pub fn error_type(status: u16) -> &'static str {
     match status {
@@ -157,10 +166,18 @@ pub fn usage_json(input_tokens: u64, output_tokens: u64) -> String {
 /// request before it (prefix reuse): those are reported as read from the cache, the rest as
 /// input.
 pub fn usage_json_cached(prompt_tokens: u64, reused: u64, output_tokens: u64) -> String {
-    format!(
-        "{{\"input_tokens\":{},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{},\"output_tokens\":{output_tokens}}}",
+    usage_json_parts(
         crate::verified::pc_prefill_rows(prompt_tokens, reused),
         crate::verified::pc_reused_rows(prompt_tokens, reused),
+        output_tokens,
+    )
+}
+
+/// The usage of the given input (prefilled), cache-read (reused) and output token counts (a
+/// reply over several generation rounds reports the sums of its rounds).
+pub fn usage_json_parts(input_tokens: u64, cache_read: u64, output_tokens: u64) -> String {
+    format!(
+        "{{\"input_tokens\":{input_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cache_read},\"output_tokens\":{output_tokens}}}"
     )
 }
 
@@ -418,26 +435,74 @@ fn convert_user(
     Ok(())
 }
 
-/// Adds the assistant message; returns its text (for the prefill check).
+/// The `input` of a `tool_use` / `mcp_tool_use` block as a JSON object.
+fn call_input(b: &JsonValue, p: &str) -> R<JsonValue> {
+    let input = match b.get("input") {
+        None | Some(JsonValue::Null) => JsonValue::Object(Vec::new()),
+        Some(JsonValue::Str(t)) => match parse_json(t) {
+            Ok(v) => v,
+            Err(_) => return bad(format!("{p}.input: not valid JSON")),
+        },
+        Some(v) => v.clone(),
+    };
+    if input.as_object().is_none() {
+        return bad(format!("{p}.input: must be an object"));
+    }
+    Ok(input)
+}
+
+/// One assistant message under construction.
+#[derive(Default)]
+struct Turn {
+    text: String,
+    reasoning: String,
+    calls: Vec<JsonValue>,
+}
+
+impl Turn {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.reasoning.is_empty() && self.calls.is_empty()
+    }
+
+    fn push_to(self, msgs: &mut Vec<JsonValue>) {
+        let mut m = vec![
+            ("role", s("assistant")),
+            ("content", JsonValue::Str(self.text)),
+        ];
+        if !self.reasoning.is_empty() {
+            m.push(("reasoning_content", JsonValue::Str(self.reasoning)));
+        }
+        if !self.calls.is_empty() {
+            m.push(("tool_calls", JsonValue::Array(self.calls)));
+        }
+        msgs.push(obj(m));
+    }
+}
+
+/// Adds the assistant message; returns the text of its last part (for the prefill check). An
+/// `mcp_tool_result` block (a call the server ran itself) ends the assistant message it follows:
+/// the result becomes a tool message, and the blocks after it a new assistant message.
 fn convert_assistant(
     content: &JsonValue,
     path: &str,
     msgs: &mut Vec<JsonValue>,
     ignored: &mut Vec<String>,
+    all_tools: &[JsonValue],
 ) -> R<String> {
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut calls = Vec::new();
+    let mut turn = Turn::default();
+    // the message ends with a tool result: no assistant part follows it
+    let mut after_result = false;
     match content {
-        JsonValue::Str(t) => text.push_str(t),
+        JsonValue::Str(t) => turn.text.push_str(t),
         JsonValue::Array(blocks) => {
             for (i, b) in blocks.iter().enumerate() {
                 let p = at(&format!("{path}.content"), i);
                 if b.as_object().is_none() {
                     return bad(format!("{p}: must be an object"));
                 }
+                after_result = false;
                 match kind(b) {
-                    "text" => text.push_str(text_of(b, "text", &p)?),
+                    "text" => turn.text.push_str(text_of(b, "text", &p)?),
                     "thinking" => {
                         let mut r = b.get("thinking").and_then(JsonValue::as_str).unwrap_or("").to_string();
                         if r.is_empty() {
@@ -448,30 +513,40 @@ fn convert_assistant(
                                 .unwrap_or_default();
                         }
                         if !r.is_empty() {
-                            if !reasoning.is_empty() {
-                                reasoning.push_str("\n\n");
+                            if !turn.reasoning.is_empty() {
+                                turn.reasoning.push_str("\n\n");
                             }
-                            reasoning.push_str(&r);
+                            turn.reasoning.push_str(&r);
                         }
                     }
                     "redacted_thinking" => ignored.push(format!("{p} redacted_thinking (dropped)")),
                     "tool_use" => {
-                        let input = match b.get("input") {
-                            None | Some(JsonValue::Null) => JsonValue::Object(Vec::new()),
-                            Some(JsonValue::Str(t)) => match parse_json(t) {
-                                Ok(v) => v,
-                                Err(_) => return bad(format!("{p}.input: not valid JSON")),
-                            },
-                            Some(v) => v.clone(),
-                        };
-                        if input.as_object().is_none() {
-                            return bad(format!("{p}.input: must be an object"));
-                        }
-                        calls.push(obj(vec![
+                        let input = call_input(b, &p)?;
+                        turn.calls.push(obj(vec![
                             ("id", s(text_of(b, "id", &p)?)),
                             ("type", s("function")),
                             ("function", obj(vec![("name", s(text_of(b, "name", &p)?)), ("arguments", input)])),
                         ]));
+                    }
+                    // a call the server ran itself, under the name the model saw
+                    "mcp_tool_use" => {
+                        let input = call_input(b, &p)?;
+                        let name = model_name(text_of(b, "server_name", &p)?, text_of(b, "name", &p)?);
+                        turn.calls.push(obj(vec![
+                            ("id", s(text_of(b, "id", &p)?)),
+                            ("type", s("function")),
+                            ("function", obj(vec![("name", s(&name)), ("arguments", input)])),
+                        ]));
+                    }
+                    "mcp_tool_result" => {
+                        let id = text_of(b, "tool_use_id", &p)?.to_string();
+                        std::mem::take(&mut turn).push_to(msgs);
+                        msgs.push(obj(vec![
+                            ("role", s("tool")),
+                            ("tool_call_id", s(&id)),
+                            ("content", tool_result_content(b, &p, all_tools)?),
+                        ]));
+                        after_result = true;
                     }
                     k => return bad(format!("{p}.type: '{k}' blocks are not supported in assistant messages by this server")),
                 }
@@ -483,18 +558,123 @@ fn convert_assistant(
             ))
         }
     }
-    let mut m = vec![
-        ("role", s("assistant")),
-        ("content", JsonValue::Str(text.clone())),
-    ];
-    if !reasoning.is_empty() {
-        m.push(("reasoning_content", JsonValue::Str(reasoning)));
+    let text = turn.text.clone();
+    if !(after_result && turn.is_empty()) {
+        turn.push_to(msgs);
     }
-    if !calls.is_empty() {
-        m.push(("tool_calls", JsonValue::Array(calls)));
-    }
-    msgs.push(obj(m));
     Ok(text)
+}
+
+/// A request's `mcp_servers` (the MCP connector): the servers and, from the older form, which of
+/// their tools are offered (`tool_configuration`).
+fn mcp_servers(body: &JsonValue) -> R<Vec<ServerSpec>> {
+    let list = match body.get("mcp_servers") {
+        None | Some(JsonValue::Null) => return Ok(Vec::new()),
+        Some(JsonValue::Array(a)) => a,
+        Some(_) => return bad("mcp_servers: must be an array"),
+    };
+    let mut out: Vec<ServerSpec> = Vec::new();
+    for (i, x) in list.iter().enumerate() {
+        let p = at("mcp_servers", i);
+        if x.as_object().is_none() {
+            return bad(format!("{p}: must be an object"));
+        }
+        match x.get("type").and_then(JsonValue::as_str) {
+            Some("url") => {}
+            Some(t) => return bad(format!("{p}.type: '{t}' is not supported (only \"url\" is)")),
+            None => return bad(format!("{p}.type: Field required (\"url\")")),
+        }
+        let url = text_of(x, "url", &p)?.to_string();
+        let name = text_of(x, "name", &p)?.to_string();
+        if name.is_empty() {
+            return bad(format!("{p}.name: must not be empty"));
+        }
+        if out.iter().any(|o| o.name == name) {
+            return bad(format!("{p}.name: '{name}' names another server too (names must be unique)"));
+        }
+        let token = match present(x, "authorization_token") {
+            None => None,
+            Some(JsonValue::Str(t)) => Some(t),
+            Some(_) => return bad(format!("{p}.authorization_token: must be a string")),
+        };
+        let mut filter = ToolFilter::default();
+        if let Some(tc) = present(x, "tool_configuration") {
+            let tp = format!("{p}.tool_configuration");
+            if tc.as_object().is_none() {
+                return bad(format!("{tp}: must be an object"));
+            }
+            if let Some(e) = present(&tc, "enabled") {
+                filter.enabled = e
+                    .as_bool()
+                    .ok_or_else(|| format!("{tp}.enabled: must be a boolean"))?;
+            }
+            if let Some(list) = present(&tc, "allowed_tools") {
+                let Some(names) = list.as_array().filter(|a| a.iter().all(|n| n.as_str().is_some())) else {
+                    return bad(format!("{tp}.allowed_tools: must be an array of tool names"));
+                };
+                // an allow-list offers the tools it names only
+                let on = filter.enabled;
+                filter.enabled = false;
+                filter.configs = names
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(|n| (n.to_string(), Some(on), None))
+                    .collect();
+            }
+        }
+        out.push(ServerSpec {
+            name,
+            url,
+            token,
+            filter,
+        });
+    }
+    Ok(out)
+}
+
+/// One per-tool setting object of an `mcp_toolset` (`enabled`, `defer_loading`).
+fn tool_setting(v: &JsonValue, p: &str) -> R<(Option<bool>, Option<bool>)> {
+    if v.as_object().is_none() {
+        return bad(format!("{p}: must be an object"));
+    }
+    let flag = |k: &str| -> R<Option<bool>> {
+        match present(v, k) {
+            None => Ok(None),
+            Some(JsonValue::Bool(b)) => Ok(Some(b)),
+            Some(_) => bad(format!("{p}.{k}: must be a boolean")),
+        }
+    };
+    Ok((flag("enabled")?, flag("defer_loading")?))
+}
+
+/// An `mcp_toolset` tool: which tools of the server it names are offered, and which are held
+/// back for a tool search. It replaces the server's `tool_configuration`.
+fn apply_toolset(x: &JsonValue, p: &str, servers: &mut [ServerSpec], seen: &mut Vec<String>) -> R<()> {
+    let name = text_of(x, "mcp_server_name", p)?;
+    let Some(server) = servers.iter_mut().find(|s| s.name == name) else {
+        return bad(format!("{p}.mcp_server_name: '{name}' is not in mcp_servers"));
+    };
+    if seen.iter().any(|n| n == name) {
+        return bad(format!("{p}: the server '{name}' has another mcp_toolset too (one per server)"));
+    }
+    seen.push(name.to_string());
+    let mut filter = ToolFilter::default();
+    if let Some(d) = present(x, "default_config") {
+        let (e, l) = tool_setting(&d, &format!("{p}.default_config"))?;
+        filter.enabled = e.unwrap_or(true);
+        filter.defer = l.unwrap_or(false);
+    }
+    if let Some(c) = present(x, "configs") {
+        let Some(entries) = c.as_object() else {
+            return bad(format!("{p}.configs: must be an object of tool names"));
+        };
+        for (tool, v) in entries {
+            let (e, l) = tool_setting(v, &format!("{p}.configs.{tool}"))?;
+            filter.configs.push((tool.clone(), e, l));
+        }
+    }
+    server.filter = filter;
+    Ok(())
 }
 
 /// A Messages request as the chat pipeline takes it.
@@ -506,6 +686,9 @@ pub struct Translated {
     pub show_thinking: bool,
     /// Accepted, not applied.
     pub ignored: Vec<String>,
+    /// The MCP servers whose tools the server runs itself (`mcp_servers`); their tools join the
+    /// chat body once they are listed.
+    pub mcp: Vec<ServerSpec>,
 }
 
 /// Messages request -> chat body. `Err`: what this server cannot serve (unknown block types,
@@ -551,6 +734,8 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
     }
 
     // tools first: tool_reference blocks in the history look their definitions up
+    let mut mcp = mcp_servers(body)?;
+    let mut toolsets: Vec<String> = Vec::new();
     let (mut tools, mut hidden, mut all) = (Vec::new(), Vec::new(), Vec::new());
     match body.get("tools") {
         None | Some(JsonValue::Null) => {}
@@ -564,6 +749,10 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
                     .get("type")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("custom");
+                if ty == "mcp_toolset" {
+                    apply_toolset(x, &p, &mut mcp, &mut toolsets)?;
+                    continue;
+                }
                 if ty != "custom" {
                     let name = x
                         .get("name")
@@ -649,7 +838,9 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
         last_role = role_of(m);
         match last_role.as_str() {
             "user" => convert_user(content, &p, &mut msgs, &all)?,
-            "assistant" => last_text = convert_assistant(content, &p, &mut msgs, &mut ignored)?,
+            "assistant" => {
+                last_text = convert_assistant(content, &p, &mut msgs, &mut ignored, &all)?
+            }
             "system" => {
                 let t = system_text(content, &format!("{p}.content"), &mut ignored)?;
                 msgs.push(obj(vec![
@@ -668,10 +859,11 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
     if last_role == "assistant" {
         if !last_text.is_empty() {
             prefill = true;
-        } else if msgs
-            .last()
-            .is_some_and(|m| m.get("tool_calls").is_none() && m.get("reasoning_content").is_none())
-        {
+        } else if msgs.last().is_some_and(|m| {
+            m.get("role").and_then(JsonValue::as_str) == Some("assistant")
+                && m.get("tool_calls").is_none()
+                && m.get("reasoning_content").is_none()
+        }) {
             msgs.pop(); // empty: nothing to continue
         }
     }
@@ -706,7 +898,8 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
             "auto" => chat.push(("tool_choice", s("auto"))),
             "none" => chat.push(("tool_choice", s("none"))),
             ty @ ("any" | "tool") => {
-                if !have_tools {
+                // the MCP servers' tools are listed later: they count for "any"
+                if !have_tools && (ty == "tool" || mcp.is_empty()) {
                     return bad(format!(
                         "tool_choice: type '{ty}' needs a non-empty 'tools' list"
                     ));
@@ -852,13 +1045,6 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
         }
         chat.push(("stream", st.clone()));
     }
-    if body
-        .get("mcp_servers")
-        .and_then(JsonValue::as_array)
-        .is_some_and(|a| !a.is_empty())
-    {
-        return bad("mcp_servers: server-side MCP is not supported by this server; run MCP tools in the client");
-    }
     for k in [
         "service_tier",
         "context_management",
@@ -894,6 +1080,7 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
         chat: obj(chat),
         show_thinking,
         ignored,
+        mcp,
     })
 }
 
@@ -907,6 +1094,15 @@ enum Block {
         id: String,
         name: String,
         input: String,
+        /// The MCP server of a call the server runs itself (`mcp_tool_use`).
+        server: Option<String>,
+    },
+    /// The result of a call the server ran itself (`mcp_tool_result`); `content`: its text
+    /// blocks as JSON.
+    ToolResult {
+        id: String,
+        is_error: bool,
+        content: String,
     },
 }
 
@@ -919,10 +1115,34 @@ impl Block {
                 jq(signature)
             ),
             Block::Text(t) => format!("{{\"type\":\"text\",\"text\":{}}}", jq(t)),
-            Block::Tool { id, name, input } => format!(
+            Block::Tool {
+                id,
+                name,
+                input,
+                server: None,
+            } => format!(
                 "{{\"type\":\"tool_use\",\"id\":{},\"name\":{},\"input\":{input}}}",
                 jq(id),
                 jq(name)
+            ),
+            Block::Tool {
+                id,
+                name,
+                input,
+                server: Some(server),
+            } => format!(
+                "{{\"type\":\"mcp_tool_use\",\"id\":{},\"name\":{},\"server_name\":{},\"input\":{input}}}",
+                jq(id),
+                jq(name),
+                jq(server)
+            ),
+            Block::ToolResult {
+                id,
+                is_error,
+                content,
+            } => format!(
+                "{{\"type\":\"mcp_tool_result\",\"tool_use_id\":{},\"is_error\":{is_error},\"content\":{content}}}",
+                jq(id)
             ),
         }
     }
@@ -937,6 +1157,8 @@ pub struct Builder {
     track: BlockTrack,
     /// The open thinking or text block's text; the open tool block's input JSON text.
     buf: String,
+    /// The tools the server runs itself: `(name the model sees, server name, tool name)`.
+    server_tools: Vec<(String, String, String)>,
 }
 
 impl Builder {
@@ -946,7 +1168,46 @@ impl Builder {
             blocks: Vec::new(),
             track: BlockTrack::new(),
             buf: String::new(),
+            server_tools: Vec::new(),
         }
+    }
+
+    /// A builder whose calls of these tools (`(name the model sees, server name, tool name)`)
+    /// are `mcp_tool_use` blocks.
+    pub fn with_server_tools(mut self, labels: Vec<(String, String, String)>) -> Self {
+        self.server_tools = labels;
+        self
+    }
+
+    /// The block id of a call (what a later request sends back as its `tool_use_id`).
+    pub fn call_block_id(&self, call_id: &str, name: &str) -> String {
+        if self.server_tools.iter().any(|l| l.0 == name) {
+            server_tool_use_id(call_id)
+        } else {
+            tool_use_id(call_id)
+        }
+    }
+
+    /// Adds the result of a call the server ran (`mcp_tool_result`, after its use block);
+    /// returns its events.
+    pub fn push_result(&mut self, tool_use_id: &str, is_error: bool, texts: &[String]) -> String {
+        let content = JsonValue::Array(
+            texts
+                .iter()
+                .map(|t| obj(vec![("type", s("text")), ("text", s(t))]))
+                .collect(),
+        )
+        .dump();
+        let mut out = self.open(
+            BlockKind::BkTool,
+            Block::ToolResult {
+                id: tool_use_id.to_string(),
+                is_error,
+                content,
+            },
+        );
+        out.push_str(&self.close());
+        out
     }
 
     pub fn message_start(id: &str, model: &str, input_tokens: u64) -> String {
@@ -1018,6 +1279,7 @@ impl Builder {
                 ));
             }
             Some(Block::Text(text)) => *text = buf,
+            Some(Block::ToolResult { .. }) => {}
             Some(Block::Tool { input, .. }) => {
                 // the streamed text is the call's arguments: a JSON object, or nothing
                 *input = match parse_json(&buf) {
@@ -1067,14 +1329,14 @@ impl Builder {
         for td in &d.tool_deltas {
             // a header starts the call's own block
             if td.header && self.track.must_open(BlockKind::BkTool) {
-                out.push_str(&self.open(
-                    BlockKind::BkTool,
-                    Block::Tool {
-                        id: tool_use_id(&td.id),
-                        name: td.name.clone(),
-                        input: "{}".into(),
-                    },
-                ));
+                let label = self.server_tools.iter().find(|l| l.0 == td.name);
+                let block = Block::Tool {
+                    id: self.call_block_id(&td.id, &td.name),
+                    name: label.map_or_else(|| td.name.clone(), |l| l.2.clone()),
+                    input: "{}".into(),
+                    server: label.map(|l| l.1.clone()),
+                };
+                out.push_str(&self.open(BlockKind::BkTool, block));
             }
             if self.track.open() != BlockKind::BkTool || td.arguments.is_empty() {
                 continue;
@@ -1296,7 +1558,19 @@ mod tests {
             ),
             (
                 r#"{"mcp_servers":[{"url":"u"}],"messages":[{"role":"user","content":"x"}]}"#,
-                "MCP",
+                "mcp_servers.0.type",
+            ),
+            (
+                r#"{"mcp_servers":[{"type":"url","url":"u","name":"a"},{"type":"url","url":"v","name":"a"}],"messages":[{"role":"user","content":"x"}]}"#,
+                "unique",
+            ),
+            (
+                r#"{"mcp_servers":[{"type":"url","url":"u","name":"a"}],"tools":[{"type":"mcp_toolset","mcp_server_name":"b"}],"messages":[{"role":"user","content":"x"}]}"#,
+                "not in mcp_servers",
+            ),
+            (
+                r#"{"mcp_servers":[{"type":"url","url":"u","name":"a"}],"tools":[{"type":"mcp_toolset","mcp_server_name":"a"},{"type":"mcp_toolset","mcp_server_name":"a"}],"messages":[{"role":"user","content":"x"}]}"#,
+                "one per server",
             ),
             (
                 r#"{"max_tokens":4096,"thinking":{"type":"enabled","budget_tokens":1023},"messages":[{"role":"user","content":"x"}]}"#,
@@ -1339,6 +1613,101 @@ mod tests {
             Some(1024)
         );
         assert!(t.ignored.is_empty(), "{:?}", t.ignored);
+    }
+
+    #[test]
+    fn mcp_servers_and_their_blocks_in_the_history() {
+        let t = translate_str(
+            r#"{"mcp_servers":[{"type":"url","url":"https://mcp.example.com/mcp","name":"docs","authorization_token":"T",
+                                "tool_configuration":{"allowed_tools":["search"]}},
+                               {"type":"url","url":"https://b.example.com/mcp","name":"b"}],
+                "tools":[{"type":"mcp_toolset","mcp_server_name":"b","default_config":{"defer_loading":true},"configs":{"x":{"enabled":false}}}],
+                "tool_choice":{"type":"any"},
+                "messages":[{"role":"user","content":"Find it"},
+                  {"role":"assistant","content":[{"type":"text","text":"Searching."},
+                     {"type":"mcp_tool_use","id":"mcptoolu_1","name":"search","server_name":"docs","input":{"q":"it"}},
+                     {"type":"mcp_tool_result","tool_use_id":"mcptoolu_1","is_error":false,"content":[{"type":"text","text":"found"}]},
+                     {"type":"text","text":"Here it is."}]},
+                  {"role":"user","content":"Again"},
+                  {"role":"assistant","content":[{"type":"mcp_tool_use","id":"mcptoolu_2","name":"search","server_name":"docs","input":{}},
+                     {"type":"mcp_tool_result","tool_use_id":"mcptoolu_2","is_error":true,"content":"down"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(t.mcp.len(), 2);
+        let docs = &t.mcp[0];
+        assert_eq!((docs.name.as_str(), docs.token.as_deref()), ("docs", Some("T")));
+        assert!(docs.filter.offers("search") && !docs.filter.offers("other"));
+        let b = &t.mcp[1];
+        assert!(b.filter.offers("y") && b.filter.defers("y") && !b.filter.offers("x"));
+        // the toolsets are not client tools; "any" counts the servers' tools
+        assert!(t.chat.get("tools").is_none());
+        assert_eq!(t.chat.get("tool_choice").and_then(JsonValue::as_str), Some("required"));
+        let msgs = t.chat.get("messages").and_then(JsonValue::as_array).unwrap();
+        let roles: Vec<&str> = msgs
+            .iter()
+            .map(|m| m.get("role").and_then(JsonValue::as_str).unwrap())
+            .collect();
+        // a result splits the assistant turn; a turn that ends with a result is generated on
+        assert_eq!(
+            roles,
+            ["user", "assistant", "tool", "assistant", "user", "assistant", "tool"]
+        );
+        assert_eq!(
+            msgs[1].get("tool_calls").unwrap().dump(),
+            r#"[{"id":"mcptoolu_1","type":"function","function":{"name":"mcp__docs__search","arguments":{"q":"it"}}}]"#
+        );
+        assert_eq!(msgs[2].get("content").and_then(JsonValue::as_str), Some("found"));
+        assert_eq!(msgs[3].get("content").and_then(JsonValue::as_str), Some("Here it is."));
+        assert_eq!(msgs[6].get("content").and_then(JsonValue::as_str), Some("Error: down"));
+        assert!(t.chat.get("continue_final_message").is_none());
+        // the token is kept for the server, never in the chat body
+        assert!(!t.chat.dump().contains("\"T\""));
+    }
+
+    #[test]
+    fn mcp_blocks_of_the_builder() {
+        let header = ToolDelta {
+            index: 0,
+            header: true,
+            id: "call_A".into(),
+            name: "mcp__docs__search".into(),
+            arguments: "{\"q\":1}".into(),
+        };
+        let mut b = Builder::new(true).with_server_tools(vec![(
+            "mcp__docs__search".into(),
+            "docs".into(),
+            "search".into(),
+        )]);
+        let mut ev = b.feed(&Delta {
+            tool_deltas: vec![header],
+            ..Delta::default()
+        });
+        assert_eq!(b.call_block_id("call_A", "mcp__docs__search"), "mcptoolu_A");
+        assert_eq!(b.call_block_id("call_B", "client_tool"), "toolu_B");
+        ev.push_str(&b.push_result("mcptoolu_A", false, &["hit".to_string()]));
+        ev.push_str(&b.finish("end_turn", "", &usage_json(1, 2), ""));
+        let names: Vec<String> = events(&ev).into_iter().map(|e| e.0).collect();
+        assert_eq!(
+            names,
+            [
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        let msg = parse_json(&b.message("m", "m", "end_turn", "", &usage_json(1, 2), "")).unwrap();
+        assert_eq!(
+            msg.get("content").unwrap().dump(),
+            r#"[{"type":"mcp_tool_use","id":"mcptoolu_A","name":"search","server_name":"docs","input":{"q":1}},{"type":"mcp_tool_result","tool_use_id":"mcptoolu_A","is_error":false,"content":[{"type":"text","text":"hit"}]}]"#
+        );
+        assert_eq!(
+            usage_json_parts(3, 4, 5),
+            r#"{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":4,"output_tokens":5}"#
+        );
     }
 
     #[test]

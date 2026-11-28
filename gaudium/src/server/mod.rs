@@ -17,7 +17,8 @@
 //! - A2UI interfaces as a per-request option (`--a2ui`, the request field `gaudium_a2ui`,
 //!   `/gaudium/a2ui`, instructions hot-reloaded from `--a2ui-prompt <file>`; see `a2ui.rs`)
 //! - The MCP proxy for the Web UI's MCP servers (`--mcp-proxy`, `/cors-proxy`, `/gaudium/proxy`;
-//!   see `proxy.rs`)
+//!   see `proxy.rs`), which also carries the Messages MCP connector (`mcp_servers`: the server
+//!   runs those tools itself over several generation rounds; see `tool_loop.rs`, `mcp_client.rs`)
 //! - The Files API in the OpenAI and the Messages-API shapes (`/v1/files`, `--files-dir`), and
 //!   `file_id` sources in chat and Messages requests; see `files.rs` and `file_store.rs`
 //!
@@ -69,6 +70,7 @@ pub mod file_store;
 mod files;
 mod jinja;
 mod lanes;
+mod mcp_client;
 mod multipart;
 mod outparse;
 mod penalty_fields;
@@ -80,6 +82,7 @@ mod response_store;
 mod responses;
 mod structured;
 mod stream_out;
+mod tool_loop;
 
 use chat::{ChatPrompt, ChatTemplate};
 
@@ -2599,6 +2602,7 @@ fn api_of(req: &HttpRequest) -> Api {
     if req.headers.contains_key("anthropic-version") {
         Api::Messages {
             show_thinking: true,
+            begun: false,
         }
     } else {
         Api::Chat
@@ -3410,7 +3414,9 @@ enum Api {
     /// `/v1/chat/completions`.
     Chat,
     /// `/v1/messages`; thinking blocks carry their text unless `show_thinking` is off.
-    Messages { show_thinking: bool },
+    /// `begun`: the reply's event stream already began (a later round of a reply with
+    /// server-side tools), so an error goes out as an event.
+    Messages { show_thinking: bool, begun: bool },
     /// `/v1/completions` and `/completions` (the text-completion shape), or `/completion`
     /// (`native`: the native completion shape).
     Completion { native: bool },
@@ -3422,6 +3428,10 @@ impl Api {
     fn error(self, stream: &mut Conn, status: u16, err_type: &str, msg: &str) {
         match self {
             Api::Chat | Api::Completion { .. } => write_error(stream, status, err_type, msg),
+            Api::Messages { begun: true, .. } => {
+                let _ = write_sse_chunk(stream, self.stream_error(status, msg).as_bytes());
+                write_sse_end(stream);
+            }
             Api::Messages { .. } => {
                 // an engine that cannot take the request now is "overloaded" to these clients
                 let status = if status == 503 { 529 } else { status };
@@ -3624,13 +3634,15 @@ fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mu
         write_error(stream, 400, "invalid_request_error", &e);
         return;
     }
-    run_chat(state, &val, stream, Api::Chat, ignored);
+    run_chat(state, &val, stream, Api::Chat, ignored, None);
 }
 
-/// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path.
+/// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path
+/// (a request with `mcp_servers` over the server-side tool loop, `tool_loop.rs`).
 fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let api = Api::Messages {
         show_thinking: true,
+        begun: false,
     };
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(mut val) = json::parse_json(&body_str) else {
@@ -3642,15 +3654,7 @@ fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) 
         return;
     }
     match anthropic::translate(&val) {
-        Ok(t) => run_chat(
-            state,
-            &t.chat,
-            stream,
-            Api::Messages {
-                show_thinking: t.show_thinking,
-            },
-            t.ignored,
-        ),
+        Ok(t) => tool_loop::run_messages(state, t, stream),
         Err(e) => api.error(stream, 400, "invalid_request_error", &e),
     }
 }
@@ -3659,6 +3663,7 @@ fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) 
 fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
     let api = Api::Messages {
         show_thinking: true,
+        begun: false,
     };
     let body_str = String::from_utf8_lossy(&req.body);
     let Ok(mut val) = json::parse_json(&body_str) else {
@@ -3669,7 +3674,9 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut Conn)
         api.error(stream, 400, "invalid_request_error", &e);
         return;
     }
-    let rendered = anthropic::translate(&val).and_then(|t| {
+    let rendered = anthropic::translate(&val).and_then(|mut t| {
+        // the MCP servers' tools are part of the prompt: they are listed for the count too
+        let _tools = tool_loop::open_server_tools(state, &mut t)?;
         let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
         let p = prepare_prompt(state.cfg.a2ui, m, &t.chat)?;
         tokenize_prompt(m, &p, false).map(|(ids, _)| ids.len())
@@ -3950,13 +3957,17 @@ fn join_lanes(
 }
 
 /// Runs one chat request: prompt, card turn, generation, and the reply in the shape of `api`.
-/// `ignored`: request fields the caller already found accepted but not applied.
+/// `ignored`: request fields the caller already found accepted but not applied. `rounds`: the
+/// request is one generation round of a Messages reply with server-side tools; its blocks go on
+/// from the ones before, and at its end it hands the round's outcome over instead of finishing
+/// the reply (`tool_loop.rs`).
 fn run_chat(
     state: &Arc<AppState>,
     val: &JsonValue,
     stream: &mut Conn,
     api: Api,
     mut ignored: Vec<String>,
+    rounds: Option<&mut tool_loop::Rounds>,
 ) {
     let t_arrival = Instant::now();
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
@@ -3997,6 +4008,7 @@ fn run_chat(
             req_max,
             ignored,
         },
+        rounds,
     );
 }
 
@@ -4058,6 +4070,7 @@ fn handle_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Con
             req_max: creq.max_tokens,
             ignored: creq.ignored,
         },
+        None,
     );
 }
 
@@ -4078,8 +4091,15 @@ struct PreparedPrompt {
 }
 
 /// Runs one prepared request: admission, card turn, generation, and the reply in the shape of
-/// `api`. `val`: the request body (sampling and streaming fields).
-fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Api, p: PreparedPrompt) {
+/// `api`. `val`: the request body (sampling and streaming fields). `rounds`: as [`run_chat`].
+fn run_prompt(
+    state: &Arc<AppState>,
+    val: &JsonValue,
+    stream: &mut Conn,
+    api: Api,
+    p: PreparedPrompt,
+    mut rounds: Option<&mut tool_loop::Rounds>,
+) {
     let PreparedPrompt {
         t_arrival,
         idx,
@@ -4696,8 +4716,13 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 );
                 o.write(&init_chunk);
             }
-            Api::Messages { show_thinking } => {
-                o.anth = Some(anthropic::Builder::new(show_thinking));
+            Api::Messages { show_thinking, .. } => {
+                o.anth = Some(
+                    rounds
+                        .as_mut()
+                        .and_then(|r| r.builder.take())
+                        .unwrap_or_else(|| anthropic::Builder::new(show_thinking)),
+                );
             }
             // an empty text chunk
             Api::Completion { .. } => {
@@ -5190,8 +5215,31 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 } else {
                     write_json(stream, 200, &resp);
                 }
-            } else if let Api::Messages { show_thinking } = api {
+            } else if let Api::Messages { show_thinking, .. } = api {
                 let mut b = builder.unwrap_or_else(|| anthropic::Builder::new(show_thinking));
+                if let Some(r) = rounds {
+                    // one round of several: its blocks so far go out, the loop decides the rest
+                    let events = b.feed(&pending);
+                    if stream_mode {
+                        out.write(&events);
+                    }
+                    r.builder = Some(b);
+                    r.end = Some(tool_loop::RoundEnd {
+                        id: req_id.clone(),
+                        model: model_id.clone(),
+                        end,
+                        calls: parser.tool_calls().to_vec(),
+                        content: parser.content().to_string(),
+                        reasoning: parser.reasoning().to_string(),
+                        stop_sequence: parser.matched_stop().to_string(),
+                        prompt_tokens: rep.prompt_tokens as u64,
+                        reused: rep.reused_tokens,
+                        output_tokens: n_gen,
+                        extra: format!(",\"timings\":{timings_json},\"gaudium\":{details}"),
+                        write_failed: out.write_failed,
+                    });
+                    return;
+                }
                 let stop = stop_reason_name(end, has_calls);
                 let usage = anthropic::usage_json_cached(
                     rep.prompt_tokens as u64,
@@ -5990,6 +6038,7 @@ mod tests {
             .ends_with("data: [DONE]\n\n"));
         let e = Api::Messages {
             show_thinking: true,
+            begun: false,
         }
         .stream_error(503, "busy");
         assert!(e.starts_with("event: error\ndata: {\"type\":\"error\""));

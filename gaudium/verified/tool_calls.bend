@@ -454,6 +454,51 @@ def ge_is_stop_string(e: GenEnd) -> Bool:
     case _:
       False{}
 
+# The generation ended where the model ended it: an end-of-sequence token, or the call limit
+# after a whole call. A generation cut by the length limit, a stop string or a cancel did not.
+# (The server-side tool loop runs a round's calls only after such an end.)
+def ge_model_ended(e: GenEnd) -> Bool:
+  match e:
+    case GeEos{}:
+      True{}
+    case GeCallLimit{}:
+      True{}
+    case _:
+      False{}
+
+# promise: a generation cut by the length limit is never one the model ended
+# harm: the half-written call at the cut would be run as a whole one
+# catches: ge_model_ended answers True{} for every end
+law ge_length_not_model_end:
+  {ge_model_ended(GeLength{}) == False{} : Bool}
+
+def ge_length_not_model_end():
+  {==}
+
+# promise: a cancelled generation is never one the model ended
+# catches: ge_model_ended answers True{} for GeCancelled (a cancelled request runs its calls)
+law ge_cancel_not_model_end:
+  {ge_model_ended(GeCancelled{}) == False{} : Bool}
+
+def ge_cancel_not_model_end():
+  {==}
+
+# promise: a generation ended by one of the request's stop strings is never one the model ended
+# catches: ge_model_ended answers True{} for GeStopString (the client's stop sequence overridden)
+law ge_stop_string_not_model_end:
+  {ge_model_ended(GeStopString{}) == False{} : Bool}
+
+def ge_stop_string_not_model_end():
+  {==}
+
+# promise: a generation that ended with an end-of-sequence token is one the model ended
+# catches: ge_model_ended answers False{} always (no server-side call ever runs)
+law ge_eos_is_model_end:
+  {ge_model_ended(GeEos{}) == True{} : Bool}
+
+def ge_eos_is_model_end():
+  {==}
+
 type FinishReason is Data:
   FrStop{}
   FrLength{}
