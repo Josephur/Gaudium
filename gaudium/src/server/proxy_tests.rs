@@ -2213,6 +2213,7 @@ fn the_caller_verdict_is_the_routes_site_rule() {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         body: Vec::new(),
+        streamed: None,
     };
     let p = proxy(&[], &["127.0.0.1"]);
     let caller = |headers: &[(&str, &str)], key_ok: bool| p.caller(&req(headers), key_ok);
