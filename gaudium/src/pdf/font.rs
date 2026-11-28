@@ -485,8 +485,8 @@ const SINGLE_COST: u64 = (2 * size_of::<((usize, u32), String)>() + 4 * size_of:
 /// up to twice its entries, and the units are an allocation of their own).
 const RANGE_COST: u64 =
     (2 * size_of::<((usize, u32), (u32, Vec<u16>))>() + 4 * size_of::<usize>()) as u64;
-/// The memory a codespace range is charged for.
-const SPACE_COST: u64 = size_of::<(usize, u32, u32)>() as u64;
+/// The memory a codespace range is charged for (kept while the CMap is read, then indexed).
+const SPACE_COST: u64 = 2 * size_of::<(u32, u32)>() as u64;
 /// The memory one entry of a composite font's width table is charged for.
 const WIDTH_COST: u64 = size_of::<(u32, u32, f64)>() as u64;
 /// The memory a font is charged for besides its tables: the font itself, its shared
@@ -501,11 +501,42 @@ const TEXT_COST: u64 = 2 * size_of::<usize>() as u64;
 /// The memory one entry of a simple font's width table is charged for.
 const SIMPLE_WIDTH_COST: u64 = size_of::<f64>() as u64;
 
+/// The codespace ranges of one code length, sorted by their low code, each with the highest
+/// code any range up to it reaches: whether a code lies in a range is one binary search.
+#[derive(Default, Debug)]
+struct Space {
+    /// (low, highest code reached by this range or any before it)
+    reach: Vec<(u32, u32)>,
+}
+
+impl Space {
+    fn new(mut ranges: Vec<(u32, u32)>) -> Space {
+        ranges.sort_unstable();
+        let mut top = 0u32;
+        let reach = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, &(lo, hi))| {
+                top = if i == 0 { hi } else { top.max(hi) };
+                (lo, top)
+            })
+            .collect();
+        Space { reach }
+    }
+
+    fn contains(&self, code: u32) -> bool {
+        let k = self.reach.partition_point(|r| r.0 <= code);
+        k > 0 && self.reach[k - 1].1 >= code
+    }
+}
+
 /// A CMap: code lengths (codespace ranges) and, for a ToUnicode CMap, the text of codes.
 #[derive(Default, Debug)]
 pub(crate) struct CMap {
-    /// (bytes, low, high)
-    space: Vec<(usize, u32, u32)>,
+    /// The codespace ranges of codes of 1 to 4 bytes.
+    space: [Space; 4],
+    /// The shortest code length a range has (0: no ranges).
+    shortest: usize,
     single: HashMap<(usize, u32), String>,
     /// keyed by (bytes, low): (high, destination UTF-16 units)
     ranges: BTreeMap<(usize, u32), (u32, Vec<u16>)>,
@@ -524,6 +555,9 @@ impl CMap {
     /// Unknown parts are skipped; only a broken limit is an error.
     pub fn parse(data: &[u8], mem: &mut Budget, work: &mut Budget) -> Result<CMap, Fail> {
         let mut m = CMap::default();
+        // codespace ranges by code length, indexed once the CMap is read
+        let mut space: [Vec<(u32, u32)>; 4] = Default::default();
+        let mut spaces = 0usize;
         let mut lx = Lexer::new(data, 0, *mem);
         let mut args: Vec<Obj> = Vec::new();
         #[derive(PartialEq)]
@@ -548,10 +582,11 @@ impl CMap {
                         Mode::Space if args.len() == 2 => {
                             if let (Obj::Str(lo), Obj::Str(hi)) = (&args[0], &args[1]) {
                                 if let (Some((n, l)), Some((n2, h))) = (code_of(lo), code_of(hi)) {
-                                    if n == n2 && l <= h && m.space.len() < MAX_SPACE_RANGES {
+                                    if n == n2 && l <= h && spaces < MAX_SPACE_RANGES {
                                         work.take(1)?;
                                         mem.take(SPACE_COST)?;
-                                        m.space.push((n, l, h));
+                                        space[n - 1].push((l, h));
+                                        spaces += 1;
                                     }
                                 }
                             }
@@ -600,6 +635,11 @@ impl CMap {
                 }
             }
         }
+        m.shortest = space
+            .iter()
+            .position(|r| !r.is_empty())
+            .map_or(0, |i| i + 1);
+        m.space = space.map(Space::new);
         Ok(m)
     }
 
@@ -681,21 +721,17 @@ impl CMap {
     /// The length of the code at the start of `b` from the codespace ranges; `None` when the
     /// CMap has none.
     pub fn code_len(&self, b: &[u8]) -> Option<usize> {
-        if self.space.is_empty() {
+        if self.shortest == 0 {
             return None;
         }
         for n in 1..=4usize.min(b.len()) {
             let (_, c) = code_of(&b[..n])?;
-            if self
-                .space
-                .iter()
-                .any(|&(sn, lo, hi)| sn == n && (lo..=hi).contains(&c))
-            {
+            if self.space[n - 1].contains(c) {
                 return Some(n);
             }
         }
         // a code in no range: as long as the shortest range, per the specification
-        self.space.iter().map(|s| s.0).min()
+        Some(self.shortest)
     }
 }
 
@@ -836,12 +872,16 @@ impl Font {
         Ok(f)
     }
 
-    /// Splits `s` into codes and calls `out` for each (stopping at its first error).
+    /// Splits `s` into codes and calls `out` for each (stopping at its first error). Each code
+    /// costs a step of `work`: the string's bytes are charged before its codes are found (a code
+    /// is at least one byte, so they cover every code).
     pub fn glyphs(
         &self,
         s: &[u8],
+        work: &mut Budget,
         mut out: impl FnMut(Glyph) -> Result<(), Fail>,
     ) -> Result<(), Fail> {
+        work.take(s.len() as u64)?;
         let mut i = 0usize;
         while i < s.len() {
             let rest = &s[i..];

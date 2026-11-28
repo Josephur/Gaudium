@@ -187,10 +187,10 @@ impl<'d, 'a> Page<'d, 'a> {
                 }
                 Token::Op(op) => op,
             };
-            // every operator is a step; its operands are dropped, and what the document has
-            // charged since (a font read) takes their room
+            // every operator is a step; its operands are dropped once it has run, and the next
+            // operands may take only the room the document leaves after it (an operator that
+            // reads from the document, a font or a form, drops them before it reads)
             self.doc.work.take(1)?;
-            lx.restart(self.doc.objects);
             if op == b"Do" {
                 let name = match args.first() {
                     Some(Obj::Name(n)) => Some(n.clone()),
@@ -200,6 +200,7 @@ impl<'d, 'a> Page<'d, 'a> {
                 if let Some(name) = name {
                     self.form(resources, &name, &gs, depth)?;
                 }
+                lx.restart(self.doc.objects);
                 continue;
             }
             let num = |i: usize| args.get(i).and_then(Obj::as_f64);
@@ -226,6 +227,9 @@ impl<'d, 'a> Page<'d, 'a> {
                 b"Tf" => {
                     if let (Some(Obj::Name(name)), Some(size)) = (args.first(), num(1)) {
                         let name = name.clone();
+                        // the operands are dropped before the font is read: what the font
+                        // keeps takes the room they took
+                        args.clear();
                         gs.font = self.font(resources, &name)?;
                         gs.size = size;
                     }
@@ -233,6 +237,7 @@ impl<'d, 'a> Page<'d, 'a> {
                 b"gs" => {
                     if let Some(Obj::Name(name)) = args.first() {
                         let name = name.clone();
+                        args.clear();
                         if let Some((font, size)) = self.state_font(resources, &name)? {
                             gs.font = font;
                             gs.size = size;
@@ -300,6 +305,7 @@ impl<'d, 'a> Page<'d, 'a> {
                 _ => {}
             }
             args.clear();
+            lx.restart(self.doc.objects);
         }
         Ok(())
     }
@@ -314,7 +320,7 @@ impl<'d, 'a> Page<'d, 'a> {
         let em = gs.size.abs() * trm.a.hypot(trm.b);
         let mut text = String::new();
         let budget = &mut *self.text_budget;
-        font.glyphs(s, |g| {
+        font.glyphs(s, &mut self.doc.work, |g| {
             if let Some(t) = g.text {
                 // charged before it is kept: one code may map to a long text
                 budget.take(t.len() as u64)?;

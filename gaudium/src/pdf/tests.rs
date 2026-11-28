@@ -46,6 +46,13 @@ fn zlib_stored(d: &[u8]) -> Vec<u8> {
 
 /// A zlib stream that expands to `258 * repeats + 1` bytes of `a` (fixed Huffman codes).
 fn zlib_bomb(repeats: usize) -> Vec<u8> {
+    zlib_run(b'a', repeats)
+}
+
+/// A zlib stream that expands to `258 * repeats + 1` bytes of `byte` (below 144: fixed
+/// Huffman codes).
+fn zlib_run(byte: u8, repeats: usize) -> Vec<u8> {
+    assert!(byte < 144);
     struct Bits {
         out: Vec<u8>,
         acc: u64,
@@ -76,14 +83,20 @@ fn zlib_bomb(repeats: usize) -> Vec<u8> {
     };
     b.put(1, 1); // final block
     b.put(1, 2); // fixed Huffman codes
-    b.code(0x30 + 97, 8); // literal 'a'
+    b.code(0x30 + u64::from(byte), 8); // the literal
     for _ in 0..repeats {
         b.code(0xC0 + 5, 8); // length 258
         b.put(0, 5); // distance 1
     }
     b.code(0, 7); // end of block
     b.put(0, 7);
-    b.out.extend_from_slice(&[0, 0, 0, 0]);
+    // the checksum of what it expands to
+    let (mut a, mut c) = (1u32, 0u32);
+    for _ in 0..258 * repeats + 1 {
+        a = (a + u32::from(byte)) % 65521;
+        c = (c + a) % 65521;
+    }
+    b.out.extend_from_slice(&(c << 16 | a).to_be_bytes());
     b.out
 }
 
@@ -1507,4 +1520,336 @@ fn a_hybrid_tables_free_entries_yield_to_its_stream() {
         .as_bytes(),
     );
     assert_eq!(text_of(&file).unwrap(), vec!["Packed objects"]);
+}
+
+/// The heap `f` holds at its peak, as the allocator counts it on this thread.
+fn peak_heap<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let meter = crate::heap_meter::Metered::start(u64::MAX);
+    let got = f();
+    let peak = crate::heap_meter::reading().expect("the meter is on").peak;
+    drop(meter);
+    (got, peak)
+}
+
+/// A one-page document (read through a classic table) whose newer cross-reference section is
+/// a compressed xref stream of `258 * repeats + 1` one-byte rows of `byte`, for objects
+/// numbered from 1000. With `/W [0 1 0]` each row is an object at an offset, with `/W [1 0 0]`
+/// each row is its type (0: a free entry; any other byte: an entry kept nowhere).
+fn xref_rows(w: &str, byte: u8, repeats: usize) -> Vec<u8> {
+    let rows = 258 * repeats + 1;
+    let (p, root) = doc(&[b"BT /F1 12 Tf (x) Tj ET"], HELVETICA, false);
+    let mut file = p.table(root, "");
+    let prev = last_startxref(&file);
+    let at = file.len();
+    file.extend_from_slice(format!("{} 0 obj\n", p.objs.len() + 1).as_bytes());
+    file.extend_from_slice(&stream(
+        &format!(
+            "/Type /XRef /Size {} /W {w} /Index [1000 {rows}] /Root {root} 0 R /Prev {prev} /Filter /FlateDecode",
+            1000 + rows
+        ),
+        &zlib_run(byte, repeats),
+    ));
+    file.extend_from_slice(format!("\nendobj\nstartxref\n{at}\n%%EOF\n").as_bytes());
+    file
+}
+
+#[test]
+fn xref_stream_rows_are_charged() {
+    // third review, repro 1: about 10.3M one-byte rows in a 63 KB file; every entry the
+    // cross-reference map keeps is charged to the object budget (here 16 MiB)
+    let lim = Limits {
+        max_decoded: 16 << 20,
+        ..Limits::default()
+    };
+    for (w, byte) in [("[0 1 0]", b'a'), ("[1 0 0]", 0u8)] {
+        let file = xref_rows(w, byte, 40_000);
+        assert!(file.len() < 70_000, "{}", file.len());
+        let start = std::time::Instant::now();
+        let (got, peak) = peak_heap(|| extract_text(&file, &lim));
+        quick("the xref rows", start);
+        let e = got.unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("its objects take more than 16777216 bytes"),
+            "{w}: {e}"
+        );
+        assert!(peak < 64 << 20, "{w}: {peak}");
+    }
+    // rows that keep no entry still cost a step each
+    let file = xref_rows("[1 0 0]", b'a', 40_000);
+    let e = extract_text(
+        &file,
+        &Limits {
+            max_work: 1_000_000,
+            ..Limits::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("it costs more than 1000000 steps of work (--pdf-max-work)"),
+        "{e}"
+    );
+    // a few rows: the document is read through its older section
+    for (w, byte) in [("[0 1 0]", b'a'), ("[1 0 0]", 0u8), ("[1 0 0]", b'a')] {
+        let got = extract_text(&xref_rows(w, byte, 4), &Limits::default()).unwrap();
+        assert_eq!(got.pages[0].trim(), "x", "{w}");
+    }
+}
+
+/// A page whose content is the first of `levels` streams, each holding an array of `items`
+/// numbers in its dictionary and naming the next one as its /Length (a stream, so its data is
+/// found by its `endstream`); reading the first stream reads every other one.
+fn length_chain(levels: usize, items: usize) -> Vec<u8> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let f1 = p.add(HELVETICA);
+    let first = p.objs.len() as u32 + 1;
+    let array = vec!["0"; items].join(" ");
+    for k in 0..levels as u32 {
+        let length = if k + 1 < levels as u32 {
+            format!("{} 0 R", first + k + 1)
+        } else {
+            "22".to_string()
+        };
+        let mut body = format!("<< /A [{array}] /Length {length} >>\nstream\n").into_bytes();
+        body.extend_from_slice(b"BT /F1 12 Tf (x) Tj ET\nendstream");
+        p.add(body);
+    }
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {first} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+#[test]
+fn a_length_chain_is_charged_level_by_level() {
+    // third review, repro 2: 31 streams, each holding 20,000 numbers (about 0.8 MB of objects,
+    // under the 1 MiB budget alone), each one's /Length the next one; the objects a parse holds
+    // are charged before it reads its /Length, so the next level has only the room left
+    let file = length_chain(31, 20_000);
+    let lim = Limits {
+        max_decoded: 1 << 20,
+        ..Limits::default()
+    };
+    let (got, peak) = peak_heap(|| extract_text(&file, &lim));
+    let e = got.unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("its objects take more than 1048576 bytes (--pdf-max-inflate-mb)"),
+        "{e}"
+    );
+    assert!(peak < 6 << 20, "{peak}");
+    // a short chain within the budget is read
+    let got = extract_text(&length_chain(3, 10), &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "x");
+}
+
+/// A page that selects F1 (with `select`: `Tf`, or an ExtGState's /Font), a simple font whose
+/// ToUnicode CMap keeps `entries` entries, then shows a string in an array of `items` numbers
+/// that follows the selection right away.
+fn font_then_operands(select: &str, entries: usize, items: usize) -> Vec<u8> {
+    let mut cmap = b"1 begincodespacerange <00> <FF> endcodespacerange\n".to_vec();
+    for chunk in (0..entries).collect::<Vec<_>>().chunks(100) {
+        cmap.extend_from_slice(format!("{} beginbfchar\n", chunk.len()).as_bytes());
+        for &k in chunk {
+            cmap.extend_from_slice(format!("<{k:06X}> <0041>\n").as_bytes());
+        }
+        cmap.extend_from_slice(b"endbfchar\n");
+    }
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let to_unicode = p.add(stream("", &cmap));
+    let f1 = p.add(format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode {to_unicode} 0 R >>"
+    ));
+    let content = format!("BT {select} [(x) {}] TJ ET", vec!["0"; items].join(" "));
+    let content = p.add(stream("", content.as_bytes()));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> /ExtGState << /G << /Font [{f1} 0 R 12] >> >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+#[test]
+fn operands_after_a_font_have_the_room_it_leaves() {
+    // third review, the content-stream case of repro 2: a font whose CMap keeps about 2.9 MB,
+    // then an array of about 1.6 MB, each under the 4 MiB budget alone; the operands that
+    // follow a font read have only the room the font leaves
+    let lim = Limits {
+        max_decoded: 4 << 20,
+        ..Limits::default()
+    };
+    for select in ["/F1 12 Tf", "/G gs"] {
+        let e = extract_text(&font_then_operands(select, 25_000, 40_000), &lim).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("its objects take more than 4194304 bytes"),
+            "{select}: {e}"
+        );
+        // each alone is read
+        let got = extract_text(&font_then_operands(select, 25_000, 10), &lim).unwrap();
+        assert_eq!(got.pages[0].trim(), "x", "{select}");
+        let got = extract_text(&font_then_operands(select, 10, 40_000), &lim).unwrap();
+        assert_eq!(got.pages[0].trim(), "x", "{select}");
+    }
+}
+
+/// A page showing `258 * repeats + 1` one-byte codes in a composite font whose embedded CMap
+/// has one one-byte codespace range and 255 four-byte ranges none of the codes is in. The
+/// string is split over three content streams, the codes compressed.
+fn composite_glyphs(repeats: usize) -> Vec<u8> {
+    let mut space = String::from("256 begincodespacerange\n<00> <00>\n");
+    for k in 0..255u32 {
+        space.push_str(&format!("<{:08X}> <{:08X}>\n", 2 * k, 2 * k + 1));
+    }
+    space.push_str("endcodespacerange\n");
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let enc = p.add(stream("/Type /CMap", space.as_bytes()));
+    let cid = p.add("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X >>");
+    let f1 = p.add(format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding {enc} 0 R /DescendantFonts [{cid} 0 R] >>"
+    ));
+    let a = p.add(stream("", b"BT /F1 12 Tf ("));
+    let b = p.add(stream("/Filter /FlateDecode", &zlib_run(b'a', repeats)));
+    let c = p.add(stream("", b") Tj ET"));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents [{a} 0 R {b} 0 R {c} 0 R] /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    p.table(catalog, "")
+}
+
+#[test]
+fn composite_glyphs_cost_a_step_each() {
+    // third review, repro 3: 5.2M codes in a 39 KB file, each tried against 256 codespace
+    // ranges; the ranges are indexed, and each code is a step of work
+    let file = composite_glyphs(20_000);
+    assert!(file.len() < 45_000, "{}", file.len());
+    let start = std::time::Instant::now();
+    let e = extract_text(&file, &Limits::default()).unwrap_err();
+    quick("the composite glyphs", start);
+    assert!(matches!(e, Fail::NoText { pages: 1 }), "{e}");
+    let e = extract_text(
+        &file,
+        &Limits {
+            max_work: 1_000_000,
+            ..Limits::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("it costs more than 1000000 steps of work (--pdf-max-work)"),
+        "{e}"
+    );
+}
+
+#[test]
+fn indexed_codespace_ranges_give_the_lengths_a_scan_gives() {
+    // overlapping and nested ranges of each length, against a scan of every range
+    let ranges: Vec<(usize, u32, u32)> = vec![
+        (1, 0x00, 0x1F),
+        (1, 0x10, 0x18),
+        (1, 0x80, 0x9F),
+        (2, 0x8140, 0x9FFC),
+        (2, 0x8000, 0x8150),
+        (2, 0xE040, 0xFCFC),
+        (3, 0x00A0_0000, 0x00A0_FFFF),
+        (4, 0x2000_0000, 0x2FFF_FFFF),
+        (4, 0x2100_0000, 0x2100_00FF),
+    ];
+    let mut src = format!("{} begincodespacerange\n", ranges.len());
+    for &(n, lo, hi) in &ranges {
+        let w = 2 * n;
+        src.push_str(&format!("<{lo:0w$X}> <{hi:0w$X}>\n"));
+    }
+    src.push_str("endcodespacerange\n");
+    let mut mem = Budget::new(u64::MAX, "test", "bytes", "--test");
+    let mut work = Budget::new(u64::MAX, "test", "steps", "--test");
+    let m = font::CMap::parse(src.as_bytes(), &mut mem, &mut work).unwrap();
+    let scan = |b: &[u8]| -> Option<usize> {
+        for n in 1..=4usize.min(b.len()) {
+            let c = b[..n].iter().fold(0u32, |a, &x| a << 8 | u32::from(x));
+            if ranges
+                .iter()
+                .any(|&(sn, lo, hi)| sn == n && (lo..=hi).contains(&c))
+            {
+                return Some(n);
+            }
+        }
+        Some(1)
+    };
+    let mut x = 0x2545_F491u32;
+    for _ in 0..20_000 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let b = x.to_be_bytes();
+        for len in 1..=4 {
+            assert_eq!(m.code_len(&b[..len]), scan(&b[..len]), "{:02X?}", &b[..len]);
+        }
+    }
+    for b in [
+        &[0x81u8, 0x40][..],
+        &[0x20, 0, 0, 0],
+        &[0x9F],
+        &[0xA0, 0x00, 0x05],
+    ] {
+        assert_eq!(m.code_len(b), scan(b), "{b:02X?}");
+    }
+    let none = font::CMap::parse(b"", &mut mem, &mut work).unwrap();
+    assert_eq!(none.code_len(b"ab"), None);
+}
+
+#[test]
+fn the_heap_a_read_holds_is_capped() {
+    // the backstop: a read that holds more heap than --pdf-max-heap-mb is refused at the next
+    // charge, whatever path holds it (here a 1M-entry CMap, about 115 MB, within its budgets)
+    let file = large_cmap(1_000_000);
+    let lim = Limits {
+        max_heap: 32 << 20,
+        ..Limits::default()
+    };
+    let (got, peak) = peak_heap(|| extract_text(&file, &lim));
+    let e = got.unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("reading it holds more than 33554432 bytes of memory (--pdf-max-heap-mb)"),
+        "{e}"
+    );
+    // it may pass the cap by what is allocated between two charges (here a hash table that
+    // doubles); unchecked, this read holds about 200 MB
+    assert!(peak < 64 << 20, "{peak}");
+    // the meter is on only while a PDF is read
+    assert_eq!(crate::heap_meter::reading(), None);
+    let got = extract_text(&file, &Limits::default()).unwrap();
+    assert_eq!(got.pages[0].trim(), "x");
+    assert_eq!(crate::heap_meter::reading(), None);
+}
+
+#[test]
+fn the_default_heap_cap_is_pinned() {
+    assert_eq!(Limits::default().max_heap, 1024 << 20);
+    // above what the byte budgets may hold together
+    let l = Limits::default();
+    assert!(l.max_heap >= 3 * l.max_decoded);
 }

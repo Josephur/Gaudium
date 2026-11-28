@@ -26,6 +26,12 @@
 //! CMap expands to, a content-stream operator). Structure the file shares many times over (one
 //! array listed by many nodes, one stream read many times, one width list repeated) is charged
 //! for every use, so a path that misses a specific budget is still bounded by this one.
+//!
+//! Behind every budget, the heap the reader actually holds is counted by the process allocator
+//! ([`crate::heap_meter`], on only on the reading thread and only while a PDF is read) and
+//! checked at every charge of every budget (`--pdf-max-heap-mb`): memory a path keeps without
+//! charging it to a budget is still refused at the next charge.
+//!
 //! Encrypted PDFs are refused.
 
 mod content;
@@ -53,6 +59,8 @@ pub const DEFAULT_MAX_INFLATE_MB: u64 = 256;
 pub const DEFAULT_MAX_FORMS: u64 = 100_000;
 /// `--pdf-max-work` default: most steps of work the reader may take over one PDF's structure.
 pub const DEFAULT_MAX_WORK: u64 = 20_000_000;
+/// `--pdf-max-heap-mb` default: most heap the reader may hold while it reads one PDF, in MiB.
+pub const DEFAULT_MAX_HEAP_MB: u64 = 1024;
 
 /// Deepest nesting of arrays and dictionaries.
 pub(crate) const MAX_NEST: u64 = 64;
@@ -82,6 +90,8 @@ pub struct Limits {
     pub max_forms: u64,
     /// Steps of work over the file's structure (see the module documentation).
     pub max_work: u64,
+    /// Bytes of heap the reader may hold while it reads the PDF, as the allocator counts them.
+    pub max_heap: u64,
 }
 
 impl Default for Limits {
@@ -92,6 +102,7 @@ impl Default for Limits {
             max_decoded: DEFAULT_MAX_INFLATE_MB << 20,
             max_forms: DEFAULT_MAX_FORMS,
             max_work: DEFAULT_MAX_WORK,
+            max_heap: DEFAULT_MAX_HEAP_MB << 20,
         }
     }
 }
@@ -142,6 +153,29 @@ impl std::fmt::Display for Fail {
 pub(crate) const INFLATE_FLAG: &str = "--pdf-max-inflate-mb";
 /// The flag that sets the work budget of a document.
 pub(crate) const WORK_FLAG: &str = "--pdf-max-work";
+/// The flag that sets the heap the reader may hold.
+pub(crate) const HEAP_FLAG: &str = "--pdf-max-heap-mb";
+
+/// Whether the heap this read holds (as the allocator counts it) is within its cap. Every
+/// charge of every budget checks it first and is refused when it is not, so memory a path keeps
+/// without charging it is refused at the next charge. Outside a read (the meter off) it holds.
+#[inline]
+pub(crate) fn heap_fits() -> bool {
+    match crate::heap_meter::reading() {
+        Some(r) => v::pdf_within(r.live, r.cap),
+        None => true,
+    }
+}
+
+/// The refusal of a read that holds more heap than it may.
+#[cold]
+#[inline(never)]
+fn heap_over() -> Fail {
+    let cap = crate::heap_meter::reading().map_or(0, |r| r.cap);
+    Fail::TooLarge(format!(
+        "reading it holds more than {cap} bytes of memory ({HEAP_FLAG})"
+    ))
+}
 
 /// A budget of one document: the bytes its streams may still decode to, the memory its parsed
 /// objects may still take, the text it may still yield, the form XObjects it may still draw, or
@@ -177,8 +211,12 @@ impl Budget {
         self.used
     }
 
-    /// Charges `n`; refused past the budget (the spend then stays as it was).
+    /// Charges `n`; refused past the budget (the spend then stays as it was), and refused,
+    /// whatever `n`, once the read holds more heap than it may ([`heap_fits`]).
     pub fn take(&mut self, n: u64) -> Result<(), Fail> {
+        if !heap_fits() {
+            return Err(heap_over());
+        }
         let fits = v::pdf_budget_fits(self.used, n, self.max);
         self.used = v::pdf_budget_charge(self.used, n, self.max);
         if fits {
@@ -188,6 +226,8 @@ impl Budget {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn over(&self) -> Fail {
         Fail::TooLarge(format!(
             "{} more than {} {} ({})",
@@ -236,6 +276,8 @@ pub fn extract_text(bytes: &[u8], limits: &Limits) -> Result<Extracted, Fail> {
             limits.max_bytes
         )));
     }
+    // the heap this read holds is counted from here, and checked at every charge
+    let _heap = crate::heap_meter::Metered::start(limits.max_heap);
     let mut doc = Doc::open(
         bytes,
         Budget::new(

@@ -11,10 +11,13 @@
 //! file, and each decode of it is charged to the decode budget.
 //!
 //! Every object resolved (a cached one too) and every stream read (an empty one too) costs a
-//! step of the work budget, as does each element of a stream's filter and parameter arrays and
-//! each key of a trailer merged.
+//! step of the work budget, as does each element of a stream's filter and parameter arrays,
+//! each key of a trailer merged and each entry or row of the cross-reference data. The memory
+//! the cross-reference map and the object cache keep is charged to the object budget, entry by
+//! entry, as they grow.
 
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::rc::Rc;
 
 use super::lex::{Dict, Lexer, Obj, Stream};
@@ -29,6 +32,13 @@ const MIN_XREF_ENTRY: u64 = 5;
 const MIN_OBJSTM_PAIR: u64 = 2;
 /// Bytes from the end of the file searched for `startxref`.
 const TAIL: usize = 4096;
+/// The memory one entry of the cross-reference map is charged for: a hash table holds up to
+/// twice its entries with a control byte each, and holds the old table beside the new one
+/// while it grows.
+const XREF_ENTRY_COST: u64 = 4 * (size_of::<(u32, Loc)>() as u64 + 1);
+/// The memory one entry of the object cache is charged for besides the object (charged by its
+/// parse), on the same terms.
+const CACHE_ENTRY_COST: u64 = 4 * (size_of::<(u32, Obj)>() as u64 + 1);
 
 #[derive(Clone, Copy, Debug)]
 enum Loc {
@@ -166,7 +176,7 @@ impl<'a> Doc<'a> {
                 // file they yield to the section's own stream (which lists the objects the
                 // table leaves free because they sit in object streams)
                 for num in free {
-                    self.insert(num, Loc::Free);
+                    self.insert(num, Loc::Free)?;
                 }
                 Obj::Dict(t)
             } else {
@@ -186,9 +196,14 @@ impl<'a> Doc<'a> {
         Ok(())
     }
 
-    fn insert(&mut self, num: u32, loc: Loc) {
-        // newer sections are read first, and their entries win
-        self.xref.entry(num).or_insert(loc);
+    /// Records where object `num` is, unless a newer section did (newer sections are read
+    /// first, and their entries win). An entry kept is charged to the object budget first.
+    fn insert(&mut self, num: u32, loc: Loc) -> Result<(), Fail> {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.xref.entry(num) {
+            self.objects.take(XREF_ENTRY_COST)?;
+            e.insert(loc);
+        }
+        Ok(())
     }
 
     /// Charges a parse to the object budget: the memory its objects take, the bytes it read
@@ -216,6 +231,8 @@ impl<'a> Doc<'a> {
                 )));
             }
             for k in 0..count {
+                // every entry is a step
+                self.work.take(1)?;
                 let (Some(off), Some(_gen)) = (lx.read_uint(), lx.read_uint()) else {
                     return Err(Fail::damaged("a damaged xref entry"));
                 };
@@ -228,7 +245,7 @@ impl<'a> Doc<'a> {
                 };
                 let num = start.checked_add(k).and_then(|n| u32::try_from(n).ok());
                 match (in_use, num) {
-                    (true, Some(num)) if off > 0 => self.insert(num, Loc::At(off)),
+                    (true, Some(num)) if off > 0 => self.insert(num, Loc::At(off))?,
                     (false, Some(num)) => free.push(num),
                     _ => {}
                 }
@@ -287,6 +304,8 @@ impl<'a> Doc<'a> {
                 )));
             }
             for k in 0..*count {
+                // every row is a step, a row of no use too
+                self.work.take(1)?;
                 let at = v::pdf_row_offset(k, width) as usize;
                 let row = rest
                     .get(at..at + width as usize)
@@ -304,11 +323,11 @@ impl<'a> Doc<'a> {
                     continue;
                 };
                 match kind {
-                    0 => self.insert(num, Loc::Free),
-                    1 if f2 > 0 => self.insert(num, Loc::At(f2)),
+                    0 => self.insert(num, Loc::Free)?,
+                    1 if f2 > 0 => self.insert(num, Loc::At(f2))?,
                     2 => {
                         if let Ok(stm) = u32::try_from(f2) {
-                            self.insert(num, Loc::InStream(stm, f3));
+                            self.insert(num, Loc::InStream(stm, f3))?;
                         }
                     }
                     _ => {}
@@ -357,8 +376,12 @@ impl<'a> Doc<'a> {
                 continue;
             };
             if let Ok(num) = u32::try_from(num) {
-                // a later definition of an object replaces an earlier one
-                self.xref.insert(num, Loc::At(j as u64));
+                // every header found is a step; a later definition of an object replaces an
+                // earlier one, and a new entry is charged
+                self.work.take(1)?;
+                if self.xref.insert(num, Loc::At(j as u64)).is_none() {
+                    self.objects.take(XREF_ENTRY_COST)?;
+                }
             }
         }
         // the trailer: the last `trailer` dictionary, else an xref stream's dictionary
@@ -428,15 +451,21 @@ impl<'a> Doc<'a> {
         }
         let mut lx = Lexer::new(self.data, off as usize, self.objects);
         let mut extra = 0u64;
-        let got = self.parse_obj(&mut lx, depth, &mut extra);
-        self.charge(&lx, off as usize, extra)?;
+        let mut from = off as usize;
+        let got = self.parse_obj(&mut lx, depth, &mut from, &mut extra);
+        self.charge(&lx, from, extra)?;
         got
     }
 
+    /// Parses the object at the cursor. What the parse read and took from `from` on is charged
+    /// by the caller; a parse that reads another object first (an indirect `/Length`) charges
+    /// what it holds up to there and moves `from` past it, so the nested parse has only the room
+    /// the document has left.
     fn parse_obj(
         &mut self,
         lx: &mut Lexer<'a>,
         depth: u64,
+        from: &mut usize,
         extra: &mut u64,
     ) -> Result<Option<(u32, Obj)>, Fail> {
         let len = self.data.len() as u64;
@@ -468,6 +497,10 @@ impl<'a> Doc<'a> {
         let declared = match dict.get(b"Length") {
             Some(Obj::Ref(n, _)) if *n != num => {
                 let n = *n;
+                // the dictionary is held while the length is read: it is charged first
+                self.charge(lx, *from, 0)?;
+                *from = lx.pos;
+                lx.restart(self.objects);
                 non_negative(Some(&self.resolve(n, depth + 1)?))
             }
             other => non_negative(other),
@@ -525,6 +558,8 @@ impl<'a> Doc<'a> {
         if let Some(o) = self.cache.get(&num) {
             return Ok(o.clone());
         }
+        // the cache keeps an entry for every object resolved, one the file lacks too
+        self.objects.take(CACHE_ENTRY_COST)?;
         // a cycle back to this object sees null
         self.cache.insert(num, Obj::Null);
         let obj = match self.xref.get(&num).copied() {

@@ -177,7 +177,7 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
 }
 
 fn push_capped(out: &mut Vec<u8>, b: u8, cap: usize, room: u64) -> Result<(), Fail> {
-    if out.len() >= cap {
+    if !v::pdf_below(out.len() as u64, cap as u64) {
         return Err(over(room));
     }
     out.push(b);

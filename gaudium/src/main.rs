@@ -363,8 +363,7 @@ fn print_usage() {
          \x20 --pdf-max-inflate-mb <N>  Most bytes one PDF's streams may decode to, in MiB, every\n\
          \x20                       read of a stream counted, filtered or not (default: 256).\n\
          \x20                       Also, each on its own: the most bytes its object parses may\n\
-         \x20                       read and their objects take, and the most text it may yield.\n\
-         \x20                       Host memory a request may hold for it, on its own thread\n\
+         \x20                       read and their objects take, and the most text it may yield\n\
          \x20 --pdf-max-forms <N>   Most form XObjects one PDF may draw, all pages together, a\n\
          \x20                       form drawn again counted again (default: 100000)\n\
          \x20 --pdf-max-work <N>    Most steps of work the reader may take over one PDF's\n\
@@ -372,6 +371,10 @@ fn print_usage() {
          \x20                       page-tree node visited, object resolved, stream read, filter\n\
          \x20                       stage, array element, width or CMap entry and content-stream\n\
          \x20                       operator is a step, counted again each time it is reached\n\
+         \x20 --pdf-max-heap-mb <N>  Most heap the reader may hold while it reads one PDF, in\n\
+         \x20                       MiB, as the allocator counts it on the reading thread\n\
+         \x20                       (default: 1024): checked at every charge of the budgets above,\n\
+         \x20                       so memory no budget covers is still refused\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \x20 --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the\n\
          \x20                       last 64 chat requests (job, reply id, endpoint, model,\n\
@@ -2930,6 +2933,17 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                     .filter(|&n| (1..=65_536).contains(&n))
                     .ok_or_else(|| {
                         format!("invalid --pdf-max-inflate-mb '{s}' (MiB, 1 to 65536)")
+                    })?
+                    << 20;
+            }
+            "--pdf-max-heap-mb" => {
+                let s = next_val(&mut i, "--pdf-max-heap-mb")?;
+                pdf.max_heap = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=1_048_576).contains(&n))
+                    .ok_or_else(|| {
+                        format!("invalid --pdf-max-heap-mb '{s}' (MiB, 1 to 1048576)")
                     })?
                     << 20;
             }

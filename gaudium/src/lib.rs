@@ -4,6 +4,11 @@
 //! in `verified/*.bend` at build time (Bend 2 `--check-only` + Lean `--verdict`) and
 //! emitted as zero-overhead pure Rust into `OUT_DIR/verified.rs`.
 
+/// The process allocator: the system allocator, with a per-thread heap count that only a
+/// metered task (the PDF reader) turns on ([`heap_meter`]).
+#[global_allocator]
+static ALLOCATOR: heap_meter::Meter = heap_meter::Meter;
+
 pub mod verified {
     #![allow(dead_code, clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/verified.rs"));
@@ -15,6 +20,7 @@ pub mod engine;
 pub mod fp8;
 pub mod gguf;
 pub mod grammar;
+pub mod heap_meter;
 pub mod hostmem;
 pub mod json;
 pub mod kernels;

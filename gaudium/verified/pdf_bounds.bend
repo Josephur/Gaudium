@@ -114,7 +114,7 @@ def pdf_budget_spent(+from: Nat, +used: Nat) -> Nat:
 def pdf_below(+x: Nat, +max: Nat) -> Bool:
   Nat.is_lt(x, max)
 
-# A size `x` is within the limit `max` (the document's bytes).
+# A size `x` is within the limit `max` (the document's bytes, the heap its read holds).
 def pdf_within(+x: Nat, +max: Nat) -> Bool:
   Nat.is_le(x, max)
 
