@@ -45,6 +45,10 @@ struct ScriptedTier {
     /// `idle_work` calls, with the number of waiting requests each saw.
     idle_waiting: Vec<u64>,
     releases: u64,
+    /// The generation stops after this many tokens until the test clears it (`paused` is set
+    /// while it waits).
+    hold_after: Option<usize>,
+    paused: bool,
 }
 
 impl GenEngine for ScriptedEngine {
@@ -185,6 +189,15 @@ impl GenEngine for ScriptedEngine {
             }
             rep.generated_tokens.push(id);
             on_token(id);
+            // a test holds the generation here, as a long one would be held
+            let n = rep.generated_tokens.len();
+            if self.tier.lock().unwrap().hold_after == Some(n) {
+                self.tier.lock().unwrap().paused = true;
+                while self.tier.lock().unwrap().hold_after == Some(n) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                self.tier.lock().unwrap().paused = false;
+            }
         }
         rep.stopped_by_eos = true;
         Ok(rep)
@@ -326,6 +339,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             parallel: 1,
             cache_trim: None,
             profile: Vec::new(),
+        response_store: ResponseStoreLimits::default(),
         },
         models: vec![model("tags", chat::TEST_TEMPLATE, None)],
         slot: Mutex::new(EngineSlot {
@@ -361,6 +375,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
         host_cache,
         lanes: lanes::LaneHub::new(1),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
+        responses: response_store::ResponseStore::new(ResponseStoreLimits::default()),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
     });
     let _ = model; // (one resident model per harness)
@@ -436,6 +451,7 @@ fn model_harness(id: &str, template: &str, config: Option<&str>, spec: Option<&s
         tls: None,
         host_cache: None,
         lanes: lanes::LaneHub::new(1),
+        responses: response_store::ResponseStore::new(ResponseStoreLimits::default()),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
     });
@@ -555,6 +571,7 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
         proxy: proxy::McpProxy::disabled(),
         tls: None,
         host_cache: None,
+        responses: response_store::ResponseStore::new(ResponseStoreLimits::default()),
         lanes: lanes::LaneHub::new(1),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
@@ -1666,6 +1683,7 @@ fn served_engine_configuration_follows_the_server_options() {
         parallel: 1,
         cache_trim: None,
         profile: Vec::new(),
+        response_store: ResponseStoreLimits::default(),
     };
     // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
     let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
@@ -2224,6 +2242,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         parallel: 1,
         cache_trim: None,
         profile: Vec::new(),
+        response_store: ResponseStoreLimits::default(),
     };
     // plain decode and the drafters that passed the vision suite on this (dense) family: the
     // server-wide tower
@@ -2864,6 +2883,7 @@ fn lane_harness(n: usize) -> Harness {
         host_cache: None,
         lanes: lanes::LaneHub::new(1),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
+        responses: response_store::ResponseStore::new(ResponseStoreLimits::default()),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
     });
     Harness { state, ..h }
@@ -4049,4 +4069,443 @@ fn a_thinking_budget_with_penalties_is_refused() {
     h.script("</think>\n\nHi.");
     let (status, r) = h.chat(r#","presence_penalty":0.5"#);
     assert_eq!(status, 200, "{}", r.dump());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Responses API (`responses.rs`)
+// ---------------------------------------------------------------------------------------------
+
+const RESPONSES_TOOLS: &str = r#""tools":[{"type":"function","name":"get_weather","description":"Weather.","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}},"strict":true}]"#;
+
+/// The JSON payloads of a Responses stream, each checked against its `event:` line.
+fn responses_events(body: &str) -> Vec<JsonValue> {
+    let mut out = Vec::new();
+    let mut event = None;
+    for line in body.lines() {
+        if let Some(e) = line.strip_prefix("event: ") {
+            event = Some(e.to_string());
+        } else if let Some(d) = line.strip_prefix("data: ") {
+            assert_ne!(d, "[DONE]", "a Responses stream has no [DONE]");
+            let v = json::parse_json(d).unwrap_or_else(|e| panic!("{e}: {d}"));
+            assert_eq!(event.take().as_deref(), Some(s(&v, &["type"])), "{d}");
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn types(evs: &[JsonValue]) -> Vec<&str> {
+    evs.iter().map(|e| s(e, &["type"])).collect()
+}
+
+#[test]
+fn responses_text_reply_is_stored_listed_and_deleted() {
+    let h = harness();
+    h.script("I should greet.\n</think>\n\nHello there.");
+    let (status, text) = h.post(
+        "/v1/responses",
+        r#"{"model":"any","instructions":"Be brief.","input":"Hi","max_output_tokens":64,"metadata":{"k":"v"}}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    let id = s(&r, &["id"]).to_string();
+    assert!(id.starts_with("resp_"), "{id}");
+    assert_eq!(
+        (s(&r, &["object"]), s(&r, &["status"])),
+        ("response", "completed")
+    );
+    assert_eq!(s(&r, &["instructions"]), "Be brief.");
+    assert_eq!(at(&r, &["max_output_tokens"]).as_u64(), Some(64));
+    assert_eq!(at(&r, &["store"]).as_bool(), Some(true));
+    assert_eq!(s(&r, &["metadata", "k"]), "v");
+    let out = at(&r, &["output"]).as_array().unwrap();
+    assert_eq!(types(out), ["reasoning", "message"]);
+    assert_eq!(s(&out[0], &["content", "0", "text"]), "I should greet.");
+    assert!(s(&out[0], &["id"]).starts_with("rs_"));
+    assert_eq!(s(&out[1], &["role"]), "assistant");
+    assert_eq!(s(&out[1], &["content", "0", "type"]), "output_text");
+    assert_eq!(s(&out[1], &["content", "0", "text"]), "Hello there.");
+    assert!(s(&out[1], &["id"]).starts_with("msg_"));
+    let usage = at(&r, &["usage"]);
+    let (inp, outp) = (
+        at(usage, &["input_tokens"]).as_u64().unwrap(),
+        at(usage, &["output_tokens"]).as_u64().unwrap(),
+    );
+    assert!(inp > 0 && outp > 0);
+    assert_eq!(at(usage, &["total_tokens"]).as_u64(), Some(inp + outp));
+    let rt = at(usage, &["output_tokens_details", "reasoning_tokens"]).as_u64().unwrap();
+    assert!(rt > 0 && rt < outp, "{rt} of {outp}");
+    // the instructions are the system turn
+    assert!(h.last_prompt().contains("<|im_start|>system\nBe brief.<|im_end|>"), "{}", h.last_prompt());
+
+    // stored: read back whole, its input items listed
+    let (status, got) = h.get(&format!("/v1/responses/{id}"));
+    assert_eq!(status, 200, "{got}");
+    assert_eq!(json::parse_json(&got).unwrap(), r);
+    let (status, items) = h.get(&format!("/v1/responses/{id}/input_items"));
+    assert_eq!(status, 200, "{items}");
+    let items = json::parse_json(&items).unwrap();
+    assert_eq!(s(&items, &["object"]), "list");
+    assert_eq!(s(&items, &["data", "0", "role"]), "user");
+    assert_eq!(s(&items, &["data", "0", "content", "0", "text"]), "Hi");
+    assert_eq!(at(&items, &["has_more"]).as_bool(), Some(false));
+
+    // deleted: gone, and a second delete is a 404
+    let (status, del) = h.exchange("DELETE", &format!("/v1/responses/{id}"), "");
+    assert_eq!(status, 200, "{del}");
+    let del = json::parse_json(&del).unwrap();
+    assert_eq!(s(&del, &["object"]), "response.deleted");
+    assert_eq!(at(&del, &["deleted"]).as_bool(), Some(true));
+    assert_eq!(h.get(&format!("/v1/responses/{id}")).0, 404);
+    assert_eq!(h.exchange("DELETE", &format!("/v1/responses/{id}"), "").0, 404);
+
+    // store: false keeps nothing
+    h.script("</think>\n\nOk.");
+    let (_, text) = h.post("/v1/responses", r#"{"input":"Hi","store":false}"#);
+    let r = json::parse_json(&text).unwrap();
+    assert_eq!(at(&r, &["store"]).as_bool(), Some(false));
+    // stateless: the reasoning item carries the opaque content that brings it back
+    assert!(at(&r, &["output", "0"]).get("encrypted_content").is_none() || s(&r, &["output", "0", "type"]) == "reasoning");
+    assert_eq!(h.get(&format!("/v1/responses/{}", s(&r, &["id"]))).0, 404);
+}
+
+#[test]
+fn responses_function_call_round_trip() {
+    let h = harness();
+    h.script(CALL_REPLY);
+    let (status, text) = h.post(
+        "/v1/responses",
+        &format!(r#"{{"input":"Weather in Oslo?",{RESPONSES_TOOLS}}}"#),
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    // the tools reached the model through its template
+    assert!(h
+        .last_prompt()
+        .contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""));
+    let out = at(&r, &["output"]).as_array().unwrap();
+    assert_eq!(types(out), ["reasoning", "message", "function_call"]);
+    let call = &out[2];
+    assert_eq!(s(call, &["name"]), "get_weather");
+    assert_eq!(s(call, &["status"]), "completed");
+    assert!(s(call, &["id"]).starts_with("fc_"));
+    let call_id = s(call, &["call_id"]).to_string();
+    assert!(call_id.starts_with("call_"), "{call_id}");
+    assert_eq!(
+        json::parse_json(s(call, &["arguments"])).unwrap().dump(),
+        "{\"city\":\"Oslo \\\"S\\\"\",\"days\":2}"
+    );
+    // strict schemas are reported as not enforced
+    assert!(text.contains("tools[].strict"), "{text}");
+
+    // the output goes back: chained by id, with the call's output as the new input
+    h.script("</think>\n\nSunny in Oslo.");
+    let (status, text) = h.post(
+        "/v1/responses",
+        &format!(
+            r#"{{"previous_response_id":"{}","input":[{{"type":"function_call_output","call_id":"{call_id}","output":"sunny"}}],{RESPONSES_TOOLS}}}"#,
+            s(&r, &["id"])
+        ),
+    );
+    assert_eq!(status, 200, "{text}");
+    let r2 = json::parse_json(&text).unwrap();
+    assert_eq!(s(&r2, &["previous_response_id"]), s(&r, &["id"]));
+    assert_eq!(s(&r2, &["output", "0", "content", "0", "text"]), "Sunny in Oslo.");
+    let prompt = h.last_prompt();
+    assert!(prompt.contains("Weather in Oslo?"), "{prompt}");
+    assert!(prompt.contains("<function=get_weather>"), "{prompt}");
+    assert!(prompt.contains("<tool_response>\nsunny\n</tool_response>"), "{prompt}");
+    let chained = prompt.clone();
+
+    // the same conversation sent whole (stateless) renders the same prompt
+    h.script("</think>\n\nSunny in Oslo.");
+    let mut items: Vec<String> = vec![r#"{"role":"user","content":"Weather in Oslo?"}"#.into()];
+    items.extend(out.iter().map(JsonValue::dump));
+    items.push(format!(
+        r#"{{"type":"function_call_output","call_id":"{call_id}","output":"sunny"}}"#
+    ));
+    let (status, text) = h.post(
+        "/v1/responses",
+        &format!(r#"{{"store":false,"input":[{}],{RESPONSES_TOOLS}}}"#, items.join(",")),
+    );
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(h.last_prompt(), chained);
+}
+
+#[test]
+fn responses_stream_events_accumulate_to_the_stored_response() {
+    let h = harness();
+    h.script(CALL_REPLY);
+    let (status, body) = h.post(
+        "/v1/responses",
+        &format!(r#"{{"input":"Weather in Oslo?","stream":true,{RESPONSES_TOOLS}}}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    let evs = responses_events(&body);
+    for (i, e) in evs.iter().enumerate() {
+        assert_eq!(at(e, &["sequence_number"]).as_u64(), Some(i as u64), "{}", e.dump());
+    }
+    let ty = types(&evs);
+    assert_eq!(&ty[..3], ["response.created", "response.in_progress", "response.output_item.added"]);
+    assert_eq!(*ty.last().unwrap(), "response.completed");
+    assert_eq!(s(&evs[0], &["response", "status"]), "in_progress");
+    assert!(at(&evs[0], &["response", "usage"]) == &JsonValue::Null);
+    // the deltas add up to the items of the final response
+    let (mut reasoning, mut text, mut args) = (String::new(), String::new(), String::new());
+    for e in &evs {
+        let d = || s(e, &["delta"]).to_string();
+        match s(e, &["type"]) {
+            "response.reasoning_text.delta" => reasoning.push_str(&d()),
+            "response.output_text.delta" => text.push_str(&d()),
+            "response.function_call_arguments.delta" => args.push_str(&d()),
+            _ => {}
+        }
+    }
+    let done = at(evs.last().unwrap(), &["response"]);
+    let out = at(done, &["output"]).as_array().unwrap();
+    assert_eq!(types(out), ["reasoning", "message", "function_call"]);
+    assert_eq!(s(&out[0], &["content", "0", "text"]), reasoning);
+    assert_eq!(s(&out[1], &["content", "0", "text"]), text);
+    assert_eq!(text, "Let me check.");
+    assert_eq!(s(&out[2], &["arguments"]), args);
+    // each item opened and closed once, in order
+    let added: Vec<u64> = evs
+        .iter()
+        .filter(|e| s(e, &["type"]) == "response.output_item.added")
+        .map(|e| at(e, &["output_index"]).as_u64().unwrap())
+        .collect();
+    assert_eq!(added, [0, 1, 2]);
+    // the stored response is the one the stream ended with
+    let (status, got) = h.get(&format!("/v1/responses/{}", s(done, &["id"])));
+    assert_eq!(status, 200);
+    assert_eq!(&json::parse_json(&got).unwrap(), done);
+}
+
+#[test]
+fn responses_output_limit_is_incomplete() {
+    let h = harness();
+    h.script("</think>\n\nabcdefghijklmnopqrstuvwxyz");
+    let (status, text) = h.post("/v1/responses", r#"{"input":"Hi","max_output_tokens":16}"#);
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert_eq!(s(&r, &["status"]), "incomplete");
+    assert_eq!(s(&r, &["incomplete_details", "reason"]), "max_output_tokens");
+    assert_eq!(s(&r, &["output", "0", "status"]), "incomplete");
+    // streamed, the terminal event says so
+    h.script("</think>\n\nabcdefghijklmnopqrstuvwxyz");
+    let (_, body) = h.post("/v1/responses", r#"{"input":"Hi","max_output_tokens":16,"stream":true}"#);
+    let evs = responses_events(&body);
+    assert_eq!(*types(&evs).last().unwrap(), "response.incomplete");
+}
+
+#[test]
+fn responses_refusals_name_the_field() {
+    let h = harness();
+    for (body, param) in [
+        (r#"{"input":"x","tools":[{"type":"web_search"}]}"#, "tools[0].type"),
+        (r#"{"input":"x","text":{"format":{"type":"json_schema","name":"n","schema":{}}}}"#, "text.format"),
+        (r#"{"input":"x","background":true}"#, "background"),
+        (r#"{"input":"x","previous_response_id":"resp_missing"}"#, "previous_response_id"),
+    ] {
+        let (status, text) = h.post("/v1/responses", body);
+        assert_eq!(status, 400, "{body}: {text}");
+        let e = json::parse_json(&text).unwrap();
+        assert_eq!(s(&e, &["error", "param"]), param, "{text}");
+        assert_eq!(s(&e, &["error", "type"]), "invalid_request_error");
+    }
+    // nothing was generated for them
+    assert!(h.prompts.lock().unwrap().is_empty());
+    let (status, text) = h.get("/v1/responses/resp_missing");
+    assert_eq!(status, 404, "{text}");
+    let (status, _) = h.post("/v1/responses/resp_missing/cancel", "");
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn responses_store_off_keeps_nothing_and_refuses_chaining() {
+    let Harness {
+        state,
+        replies,
+        prompts,
+        images,
+        tier,
+    } = harness();
+    let mut st = Arc::try_unwrap(state).ok().expect("the harness owns its state");
+    st.responses = response_store::ResponseStore::new(ResponseStoreLimits {
+        entries: 0,
+        bytes: 1 << 20,
+    });
+    let h = Harness {
+        state: Arc::new(st),
+        replies,
+        prompts,
+        images,
+        tier,
+    };
+    h.script("</think>\n\nOk.");
+    let (status, text) = h.post("/v1/responses", r#"{"input":"Hi"}"#);
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert_eq!(at(&r, &["store"]).as_bool(), Some(false));
+    let (status, text) = h.post(
+        "/v1/responses",
+        &format!(r#"{{"input":"And?","previous_response_id":"{}"}}"#, s(&r, &["id"])),
+    );
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("--response-store 0"), "{text}");
+}
+
+impl Harness {
+    /// Holds the next generation after `n` tokens.
+    fn hold_after(&self, n: usize) {
+        self.tier.lock().unwrap().hold_after = Some(n);
+    }
+
+    /// Waits until the generation is held, and returns the id of the request it serves.
+    fn held_request(&self) -> String {
+        let t0 = std::time::Instant::now();
+        while !self.tier.lock().unwrap().paused {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the generation was never held");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let ids: Vec<String> = self.state.cancels.lock().unwrap().keys().cloned().collect();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        ids[0].clone()
+    }
+
+    fn release(&self) {
+        self.tier.lock().unwrap().hold_after = None;
+    }
+}
+
+#[test]
+fn responses_delete_while_running_cancels_it_and_keeps_nothing() {
+    let h = harness();
+    h.script("</think>\n\nabcdefghijklmnopqrstuvwxyz");
+    h.hold_after(3);
+    thread::scope(|sc| {
+        let run = sc.spawn(|| h.post("/v1/responses", r#"{"input":"Hi"}"#));
+        let id = h.held_request();
+        assert!(id.starts_with("resp_"), "{id}");
+        // not readable while it runs, but it can be deleted
+        assert_eq!(h.get(&format!("/v1/responses/{id}")).0, 404);
+        let (status, del) = h.exchange("DELETE", &format!("/v1/responses/{id}"), "");
+        assert_eq!(status, 200, "{del}");
+        let del = json::parse_json(&del).unwrap();
+        assert_eq!(at(&del, &["deleted"]).as_bool(), Some(true));
+        assert_eq!(s(&del, &["id"]), id);
+        // a second DELETE finds nothing, and neither does a cancel
+        assert_eq!(h.exchange("DELETE", &format!("/v1/responses/{id}"), "").0, 404);
+        assert_eq!(h.post(&format!("/v1/responses/{id}/cancel"), "").0, 404);
+        h.release();
+        let (status, text) = run.join().unwrap();
+        assert_eq!(status, 200, "{text}");
+        let r = json::parse_json(&text).unwrap();
+        // the DELETE cancelled it, and it was not kept
+        assert_eq!(s(&r, &["status"]), "cancelled");
+        assert_eq!(at(&r, &["store"]).as_bool(), Some(false));
+        assert_eq!(h.get(&format!("/v1/responses/{id}")).0, 404);
+    });
+    assert_eq!(h.state.responses.held(), (0, 0));
+    assert_eq!(h.state.responses.live_held(), (0, 0));
+}
+
+#[test]
+fn responses_cancel_answers_with_the_response_its_generation_ends() {
+    let h = harness();
+    h.script("</think>\n\nabcdefghijklmnopqrstuvwxyz");
+    h.hold_after(6);
+    thread::scope(|sc| {
+        let run = sc.spawn(|| h.post("/v1/responses", r#"{"input":"Hi","metadata":{"k":"v"}}"#));
+        let id = h.held_request();
+        let path = format!("/v1/responses/{id}/cancel");
+        let hr = &h;
+        let cancel = sc.spawn(move || hr.post(&path, ""));
+        // the generation goes on once the cancel has reached it
+        let t0 = std::time::Instant::now();
+        while !h.state.cancels.lock().unwrap()[&id].load(Ordering::Relaxed) {
+            assert!(t0.elapsed() < Duration::from_secs(20));
+            thread::sleep(Duration::from_millis(1));
+        }
+        h.release();
+        let (status, own) = run.join().unwrap();
+        assert_eq!(status, 200, "{own}");
+        let (status, cancelled) = cancel.join().unwrap();
+        assert_eq!(status, 200, "{cancelled}");
+        let own = json::parse_json(&own).unwrap();
+        // the cancel's reply is the response itself: its partial output, its model and time
+        assert_eq!(json::parse_json(&cancelled).unwrap(), own);
+        assert_eq!(s(&own, &["status"]), "cancelled");
+        assert_eq!(at(&own, &["store"]).as_bool(), Some(true));
+        assert_eq!(s(&own, &["metadata", "k"]), "v");
+        assert!(!s(&own, &["model"]).is_empty());
+        let out = at(&own, &["output"]).as_array().unwrap();
+        assert!(!s(out.last().unwrap(), &["content", "0", "text"]).is_empty(), "{}", own.dump());
+        let (status, got) = h.get(&format!("/v1/responses/{id}"));
+        assert_eq!(status, 200);
+        assert_eq!(json::parse_json(&got).unwrap(), own);
+    });
+}
+
+#[test]
+fn responses_items_keep_their_order_with_or_without_a_stream() {
+    let call = |city: &str| {
+        format!("<tool_call>\n<function=get_weather>\n<parameter=city>\n{city}\n</parameter>\n</function>\n</tool_call>")
+    };
+    let reply = format!(
+        "</think>\n\nFirst.\n\n{}\nBetween.\n\n{}",
+        call("Oslo"),
+        call("Bergen")
+    );
+    let h = harness();
+    h.script(&reply);
+    let (status, body) = h.post(
+        "/v1/responses",
+        &format!(r#"{{"input":"Weather?","stream":true,{RESPONSES_TOOLS}}}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    let evs = responses_events(&body);
+    let streamed = at(at(evs.last().unwrap(), &["response"]), &["output"])
+        .as_array()
+        .unwrap()
+        .to_vec();
+    h.script(&reply);
+    let (status, text) = h.post(
+        "/v1/responses",
+        &format!(r#"{{"input":"Weather?",{RESPONSES_TOOLS}}}"#),
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    let whole = at(&r, &["output"]).as_array().unwrap();
+    let shape = |items: &[JsonValue]| -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match s(i, &["type"]) {
+                "message" => format!("message:{}", s(i, &["content", "0", "text"])),
+                "function_call" => format!("call:{}", s(i, &["arguments"])),
+                t => t.to_string(),
+            })
+            .collect()
+    };
+    assert_eq!(shape(whole), shape(&streamed));
+    // the text after the first call stays after it
+    assert!(shape(whole).len() >= 4, "{:?}", shape(whole));
+}
+
+#[test]
+fn a_panic_in_the_chat_path_releases_the_in_flight_response() {
+    let store = response_store::ResponseStore::new(response_store::StoreLimits::default());
+    store
+        .begin("resp_panics", responses::Head::default())
+        .unwrap();
+    assert_eq!(store.live_held().0, 1);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _in_flight = InFlight {
+            store: &store,
+            id: "resp_panics",
+        };
+        panic!("the chat path panics");
+    }));
+    assert!(r.is_err());
+    assert_eq!(store.live_held(), (0, 0));
 }

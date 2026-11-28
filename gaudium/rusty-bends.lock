@@ -1743,6 +1743,57 @@ f9641cbf76dadef6  rr_hw_le_max_ctx  law rr_hw_le_max_ctx : for + prompt : Nat fo
 # promise rr_state_mode_preserved: rr_begin preserves the reset mode read back by rr_state_mode
 91e8dd285b1b7bfe  rr_zero_dirty_clears_nothing  law rr_zero_dirty_clears_nothing : for + cb : Nat for + chunks : Nat for + rows : Nat for + cr : Nat for + rb : Nat { Bool.and ( Nat.is_eq ( rr_chunk_dirty_bytes ( cb , chunks , 0n , cr ) , 0n ) , Nat.is_eq ( rr_head_dirty_rows ( rows , 0n , rb ) , 0n ) ) == True { } : Bool }
 # promise rr_zero_dirty_clears_nothing: zero dirty rows requires zero KV bytes to clear
+3ebeb3f0a2532ebf  rs_admit_fitting  law rs_admit_fitting : for + n : Nat for + b : Nat for + s : Nat for + x : Nat { rs_admit ( RsAcct { n , b } , Nat.add ( b , Nat.add ( s , x ) ) , s ) == True { } : Bool }
+# promise rs_admit_fitting: a request context that fits beside what the in-flight account holds is admitted.
+# harm rs_admit_fitting: an account that admits nothing would pass the bound law and refuse every Responses request
+ef45c1cf735f9be9  rs_admit_within_bytes  law rs_admit_within_bytes : for + a : RsAcct for + mb : Nat for + s : Nat { Bool.or ( Bool.not ( rs_admit ( a , mb , s ) ) , Nat.is_le ( rs_bytes ( rs_add ( a , s ) ) , mb ) ) == True { } : Bool }
+# promise rs_admit_within_bytes: a request context the in-flight account admits leaves it holding no more bytes than its bound.
+# harm rs_admit_within_bytes: concurrent requests chaining a large stored conversation would each hold a copy of it with no bound on their sum
+4d9de29f9d4b5e4f  rs_bytes_reads  law rs_bytes_reads : for + n : Nat for + b : Nat { rs_bytes ( RsAcct { n , b } ) == b : Nat }
+# promise rs_bytes_reads: rs_bytes reads the number of bytes the account holds.
+# harm rs_bytes_reads: the byte bound law would be stated about a number that is not what the store holds
+315665fc53922ea3  rs_count_reads  law rs_count_reads : for + n : Nat for + b : Nat { rs_count ( RsAcct { n , b } ) == n : Nat }
+# promise rs_count_reads: rs_count reads the number of entries the account holds.
+# harm rs_count_reads: rs_put would decide on a wrong count: never evict from a full store, or evict from an empty one
+434fe931bc345d08  rs_keep_deleted_dropped  law rs_keep_deleted_dropped : for + w : Bool { rs_keep ( w , True { } ) == False { } : Bool }
+# promise rs_keep_deleted_dropped: a response deleted while it was being generated is never offered to the store.
+# harm rs_keep_deleted_dropped: a DELETE answered with deleted: true would be undone when the response finished, and the conversation kept
+f348ec5241dd6e82  rs_keep_needs_want  law rs_keep_needs_want : for d : Bool { rs_keep ( False { } , d ) == False { } : Bool }
+# promise rs_keep_needs_want: a response whose request asked for it not to be kept (store: false) is never offered to the store.
+# harm rs_keep_needs_want: a client that sent store: false would find its conversation readable by its id afterwards
+dc1a9765341fd961  rs_keep_undeleted_as_asked  law rs_keep_undeleted_as_asked : for + w : Bool { rs_keep ( w , False { } ) == w : Bool }
+# promise rs_keep_undeleted_as_asked: a response that was not deleted while it ran is offered to the store exactly when its request asked for it.
+# harm rs_keep_undeleted_as_asked: a store that is never offered anything would pass the other keep laws and make previous_response_id useless
+dd91bacf930859c1  rs_put_empty_takes  law rs_put_empty_takes : for + k : Nat for + s : Nat for + x : Nat { rs_put ( rs_empty ( ) , 1n + k , Nat.add ( s , x ) , s ) == RsPutStore { } : RsPut }
+# promise rs_put_empty_takes: an empty store with room for one entry takes an entry within its byte bound.
+# harm rs_put_empty_takes: a store that refuses everything would pass every other law and make previous_response_id useless
+8daf50c0d8697f60  rs_put_evict_has_entry  law rs_put_evict_has_entry : for + a : RsAcct for + mn : Nat for + mb : Nat for + s : Nat { Bool.or ( Bool.not ( rs_put_evicts ( rs_put ( a , mn , mb , s ) ) ) , Nat.is_lt ( 0n , rs_count ( a ) ) ) == True { } : Bool }
+# promise rs_put_evict_has_entry: an eviction is asked for only while the store holds an entry, so a put ends after at most as many evictions as there are entries.
+# harm rs_put_evict_has_entry: the shell would be told to evict from an empty store and loop or give up on an entry that fits
+60275593dbca7702  rs_put_fitting_taken  law rs_put_fitting_taken : for + n : Nat for + b : Nat for + k : Nat for + s : Nat for + x : Nat { rs_put ( RsAcct { n , b } , Nat.add ( n , 1n + k ) , Nat.add ( b , Nat.add ( s , x ) ) , s ) == RsPutStore { } : RsPut }
+# promise rs_put_fitting_taken: an entry that fits beside what the store holds is taken now, so no entry is evicted that need not leave.
+# harm rs_put_fitting_taken: the store would forget older responses on every put and previous_response_id would work only for the latest one
+e7659d051526b950  rs_put_off_refuses  law rs_put_off_refuses : for + a : RsAcct for + mb : Nat for + s : Nat { rs_put ( a , 0n , mb , s ) == RsPutRefuse { } : RsPut }
+# promise rs_put_off_refuses: a store whose entry bound is zero (the store is off) keeps nothing.
+# harm rs_put_off_refuses: `--response-store 0` would still keep responses
+6648fae2123414bc  rs_put_oversize_refused  law rs_put_oversize_refused : for + a : RsAcct for + mn : Nat for + mb : Nat for + x : Nat { rs_put ( a , mn , mb , Nat.add ( mb , 1n + x ) ) == RsPutRefuse { } : RsPut }
+# promise rs_put_oversize_refused: an entry larger than the byte bound is refused whatever the store holds, so nothing is evicted for it.
+# harm rs_put_oversize_refused: one oversized response would empty the store of every other response and still not be kept
+2ab7dda000e4a16b  rs_put_store_within_bytes  law rs_put_store_within_bytes : for + a : RsAcct for + mn : Nat for + mb : Nat for + s : Nat { Bool.or ( Bool.not ( rs_put_stores ( rs_put ( a , mn , mb , s ) ) ) , Nat.is_le ( rs_bytes ( rs_add ( a , s ) ) , mb ) ) == True { } : Bool }
+# promise rs_put_store_within_bytes: an entry the store takes leaves it holding no more bytes than its bound.
+# harm rs_put_store_within_bytes: large responses could pile up past the byte bound and exhaust host memory
+b3c11e609f4bba73  rs_put_store_within_count  law rs_put_store_within_count : for + a : RsAcct for + mn : Nat for + mb : Nat for + s : Nat { Bool.or ( Bool.not ( rs_put_stores ( rs_put ( a , mn , mb , s ) ) ) , Nat.is_le ( rs_count ( rs_add ( a , s ) ) , mn ) ) == True { } : Bool }
+# promise rs_put_store_within_count: an entry the store takes leaves it holding no more entries than its bound.
+# harm rs_put_store_within_count: the store would grow one entry past its bound on every full put and its memory with it
+db05c4cfd0479606  rs_remove_add_inverse  law rs_remove_add_inverse : for + a : RsAcct for + s : Nat { rs_remove ( rs_add ( a , s ) , s ) == a : RsAcct }
+# promise rs_remove_add_inverse: taking an entry and then removing it leaves the account exactly as it was: entries and bytes are conserved.
+# harm rs_remove_add_inverse: the account would drift from what the store holds and the bounds would stop meaning anything
+64668677848ab4ea  rs_remove_empty_unchanged  law rs_remove_empty_unchanged : for + b : Nat for + s : Nat { rs_remove ( RsAcct { 0n , b } , s ) == RsAcct { 0n , b } : RsAcct }
+# promise rs_remove_empty_unchanged: removing from a store that holds no entry changes nothing, so its bytes never go below what entries hold.
+# harm rs_remove_empty_unchanged: a stray removal would lower the byte count and let the store take more than its bound
+0ce185c0433d8a2e  rs_remove_oversize_unchanged  law rs_remove_oversize_unchanged : for + n : Nat for + b : Nat for + x : Nat { rs_remove ( RsAcct { 1n + n , b } , Nat.add ( b , 1n + x ) ) == RsAcct { 1n + n , b } : RsAcct }
+# promise rs_remove_oversize_unchanged: removing more bytes than the store holds changes nothing, so the byte count never drops below what the remaining entries hold.
+# harm rs_remove_oversize_unchanged: a removal with a wrong size would zero the byte count and let the store take far more than its bound
 4d991163fc1faf9c  rt_after_never_grows  law rt_after_never_grows : for + h : Nat for + b : Nat { Nat.is_le ( rt_after ( h , b ) , h ) == True { } : Bool }
 # promise rt_after_never_grows: the count of held bytes never grows during a trim.
 a42b6a942341612b  rt_ahead_within_window_protected  law rt_ahead_within_window_protected : for + n : Nat for + e : Nat for + k : Nat for + f : Bool { rt_protected ( Nat.add ( n , e ) , n , 1n + Nat.add ( e , k ) , f ) == True { } : Bool }
