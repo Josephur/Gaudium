@@ -5,7 +5,7 @@
 //! greedy request (the engine's greedy stream does not depend on what runs beside it, so every
 //! choice is a copy of that one generation). With lanes (`--parallel`) the generations are queued
 //! together and the ones that find a free lane run beside each other; a lane that takes one copies
-//! the start of the prompt from the lane that prefilled it (`ln_fork_source`), so the prompt is
+//! the start of the prompt from the lane that prefilled it (`ln_fork_pick`), so the prompt is
 //! prefilled once and each later generation prefills only the rows after the last whole tile.
 //! Without lanes they run one after another in the one lane, which resumes each later one from the
 //! position its prefix table kept.

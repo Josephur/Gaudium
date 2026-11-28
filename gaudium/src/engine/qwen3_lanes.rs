@@ -1007,16 +1007,27 @@ pub(super) struct ForkChoice {
     pub rows: u64,
 }
 
+/// The fewest whole tiles a fork copies from another lane (`min_tiles` of the verified
+/// `ln_fork_pick`); an offer of fewer is left to the prefill, which gives the same stream. Today
+/// every offer of a whole tile is taken; a measured profitability threshold may raise it.
+pub(super) const FORK_MIN_TILES: u64 = 1;
+
 /// Which lane, of `lanes`, the request on lane `me` takes the start of its prompt from, when it
-/// takes over `own` rows by itself and the tiles are `tile` rows: the verified `ln_fork_source`,
-/// lane by lane, each later lane asked against the most the request has so far. `None`: no lane
-/// gives more than the request has.
-pub(super) fn fork_source(me: usize, own: u64, tile: u64, lanes: &[ForkOffer]) -> Option<ForkChoice> {
+/// takes over `own` rows by itself, the tiles are `tile` rows and a copy is at least `min_tiles`
+/// whole tiles: the verified `ln_fork_pick`, lane by lane, each later lane asked against the most
+/// the request has so far. `None`: no lane gives more than the request has.
+pub(super) fn fork_source(
+    me: usize,
+    own: u64,
+    tile: u64,
+    min_tiles: u64,
+    lanes: &[ForkOffer],
+) -> Option<ForkChoice> {
     let mut best = own;
     let mut src = None;
     for (j, l) in lanes.iter().enumerate() {
         let kept = l.kept.contains(&crate::verified::ln_fork_tiles(l.offer, tile));
-        if crate::verified::ln_fork_source(j == me, l.state, best, l.offer, tile, l.held, kept) {
+        if crate::verified::ln_fork_pick(j == me, l.state, best, l.offer, tile, l.held, kept, min_tiles) {
             best = l.offer;
             src = Some(j);
         }
@@ -1032,7 +1043,8 @@ pub(super) fn fork_source(me: usize, own: u64, tile: u64, lanes: &[ForkOffer]) -
 /// [lanes] The start of `prompt` from another lane, for the request about to prefill on the active
 /// lane (the choices of one chat request share their prompt). Another lane whose prefix table would
 /// resume this prompt further than the active lane's own, and that holds the tokens and the kept
-/// state of the rows (`ln_fork_source`, through [`fork_source`]), is copied from on the card: the K/V rows of the whole tiles up to the position it kept (`ln_fork_tiles`) and the
+/// state of the rows and gives at least [`FORK_MIN_TILES`] whole tiles (`ln_fork_pick`, through
+/// [`fork_source`]), is copied from on the card: the K/V rows of the whole tiles up to the position it kept (`ln_fork_tiles`) and the
 /// recurrent state it kept there go into the active lane's caches and a slot of its table, which
 /// then describes those rows (`PrefixCache::adopt_restored`). The prefill resumes at that
 /// position, which is the prefix-reuse rule: the tiles left are the ones a cold prefill runs on
@@ -1075,13 +1087,13 @@ pub(super) fn fork_prompt(
             kept: b.prefix.held_slots().iter().map(|&(t, _)| t).collect(),
         })
         .collect();
-    let Some(choice) = fork_source(me, own, eng.prefix.tile(), &offers) else {
+    let Some(choice) = fork_source(me, own, eng.prefix.tile(), FORK_MIN_TILES, &offers) else {
         return Ok(None);
     };
     let ForkChoice { lane: j, tiles, rows } = choice;
     let b = &rt.bufs[j];
     // the state at that position, which the other lane kept, and the tokens of the rows
-    // (`ln_fork_source` chose a lane that has both)
+    // (`ln_fork_pick` chose a lane that has both)
     let src_slot = b
         .prefix
         .held_slots()
@@ -2551,7 +2563,7 @@ mod tests {
     #[test]
     fn a_fork_takes_the_lane_that_gives_most_and_never_its_own() {
         use LaneState::*;
-        let pick = |me, own, lanes: &[ForkOffer]| fork_source(me, own, 128, lanes);
+        let pick = |me, own, lanes: &[ForkOffer]| fork_source(me, own, 128, FORK_MIN_TILES, lanes);
         // lane 0 asks; its own entry offers most (a table whose rows its reset just zeroed) and is
         // never the source
         let lanes = [
@@ -2587,6 +2599,54 @@ mod tests {
         let c = pick(0, 0, &lanes).unwrap();
         assert_eq!((c.lane, c.tiles, c.rows), (1, 2, 256));
         assert!(c.rows <= 300);
+    }
+
+    #[test]
+    fn today_every_whole_tile_offer_from_a_decoding_lane_is_taken() {
+        use crate::verified::{ln_fork_pick, ln_fork_takes};
+        use LaneState::*;
+        // today's threshold: one whole tile
+        assert_eq!(FORK_MIN_TILES, 1);
+        // a request that holds nothing takes any offer from a decoding lane
+        for o in [1u64, 2, 127, 128, 4096] {
+            assert!(ln_fork_takes(LnDecode, 0, o), "offer {o}");
+        }
+        // and any offer of whole tiles that lane holds with the state kept, from one tile up
+        for tile in [1u64, 64, 128] {
+            for tiles in [1u64, 2, 3, 32] {
+                let rows = tiles * tile;
+                assert!(
+                    ln_fork_pick(false, LnDecode, 0, rows, tile, rows, true, FORK_MIN_TILES),
+                    "{tiles} tile(s) of {tile}"
+                );
+                let lanes = [lane(LnPrefill, 0, 0, &[]), lane(LnDecode, rows, rows, &[tiles])];
+                assert_eq!(
+                    fork_source(0, 0, tile, FORK_MIN_TILES, &lanes),
+                    Some(ForkChoice { lane: 1, tiles, rows })
+                );
+            }
+        }
+        // an offer of no whole tile copies nothing
+        let lanes = [lane(LnPrefill, 0, 0, &[]), lane(LnDecode, 100, 100, &[0])];
+        assert_eq!(fork_source(0, 0, 128, FORK_MIN_TILES, &lanes), None);
+    }
+
+    #[test]
+    fn a_higher_threshold_leaves_small_copies_to_the_prefill() {
+        use LaneState::*;
+        let lanes = [
+            lane(LnPrefill, 0, 0, &[]),
+            lane(LnDecode, 256, 256, &[2]),
+            lane(LnDecode, 384, 384, &[3]),
+        ];
+        assert_eq!(
+            fork_source(0, 0, 128, 3, &lanes),
+            Some(ForkChoice { lane: 2, tiles: 3, rows: 384 })
+        );
+        assert_eq!(fork_source(0, 0, 128, 4, &lanes), None);
+        // the two-tile lane alone is below a threshold of three
+        assert_eq!(fork_source(0, 0, 128, 3, &lanes[..2]), None);
+        assert_eq!(fork_source(0, 0, 128, 2, &lanes[..2]).map(|c| c.lane), Some(1));
     }
 
 
