@@ -160,3 +160,37 @@ def g_nat_eq_of_is_eq(+a: Nat, +b: Nat, +h: {Nat.is_eq(a, b) == True{} : Bool}) 
     case 1n+ap 1n+bp:
       %g_nat_eq_of_is_eq(ap, bp, h) : {1n+ap == 1n+_ : Nat}
       {==}
+
+# `a + e < a` never holds.
+def g_nat_lt_add_r_false(+a: Nat, e: Nat) -> {Nat.is_lt(Nat.add(a, e), a) == False{} : Bool}:
+  match a:
+    case 0n:
+      match e:
+        case 0n: {==}
+        case 1n+_: {==}
+    case 1n+ap:
+      g_nat_lt_add_r_false(ap, e)
+
+# `n < n + 1 + d` always holds.
+def g_nat_lt_add_succ(+n: Nat, d: Nat) -> {Nat.is_lt(n, Nat.add(n, 1n+d)) == True{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+np:
+      g_nat_lt_add_succ(np, d)
+
+# `n < n` never holds.
+def g_nat_lt_irrefl(+n: Nat) -> {Nat.is_lt(n, n) == False{} : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+np:
+      g_nat_lt_irrefl(np)
+
+# `min(b, k) <= min(b, k + j)`: the smaller of b and k grows with k.
+def g_nat_min_le_mono_r(+b: Nat, +k: Nat, j: Nat) -> {Nat.is_le(Nat.min(b, k), Nat.min(b, Nat.add(k, j))) == True{} : Bool}:
+  match b k:
+    case 0n _:
+      L.nat_le_zero(0n)
+    case 1n+bp 0n:
+      L.nat_le_zero(Nat.min(1n+bp, j))
+    case 1n+bp 1n+kp:
+      g_nat_min_le_mono_r(bp, kp, j)

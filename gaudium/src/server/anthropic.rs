@@ -49,6 +49,9 @@ fn kind(o: &JsonValue) -> &str {
     o.get("type").and_then(JsonValue::as_str).unwrap_or("")
 }
 
+/// The smallest `thinking.budget_tokens` the Messages API accepts.
+const MIN_THINKING_BUDGET: u64 = 1024;
+
 fn present(o: &JsonValue, key: &str) -> Option<JsonValue> {
     o.get(key)
         .filter(|v| !matches!(v, JsonValue::Null))
@@ -719,11 +722,32 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
             "disabled" => kwargs.push(("enable_thinking".into(), JsonValue::Bool(false))),
             _ => return bad("thinking.type: must be \"enabled\", \"adaptive\" or \"disabled\""),
         }
-        if let Some(b) = th.get("budget_tokens").filter(|b| b.as_f64().is_some()) {
-            ignored.push(format!(
-                "thinking.budget_tokens={} (not enforced)",
-                b.dump()
-            ));
+        // `enabled` takes a budget of at least 1024 tokens, below `max_tokens`; the reasoning
+        // is closed when it reaches the budget (`run_chat`). `adaptive` has no budget.
+        if let Some(b) = present(&th, "budget_tokens") {
+            if kind(&th) == "enabled" {
+                let Some(n) = b.as_u64().filter(|_| !matches!(b, JsonValue::Float(_))) else {
+                    return bad("thinking.budget_tokens: must be an integer");
+                };
+                if n < MIN_THINKING_BUDGET {
+                    return bad(format!(
+                        "thinking.budget_tokens: must be at least {MIN_THINKING_BUDGET}"
+                    ));
+                }
+                if let Some(mt) = body.get("max_tokens").and_then(JsonValue::as_u64) {
+                    if n >= mt {
+                        return bad(format!(
+                            "thinking.budget_tokens: must be less than max_tokens ({n} >= {mt})"
+                        ));
+                    }
+                }
+                chat.push(("thinking_budget_tokens", JsonValue::Int(n as i64)));
+            } else {
+                ignored.push(format!(
+                    "thinking.budget_tokens (only thinking.type \"enabled\" takes a budget, not \"{}\")",
+                    kind(&th)
+                ));
+            }
         }
         if th.get("display").and_then(JsonValue::as_str) == Some("omitted") {
             show_thinking = false;
@@ -817,6 +841,8 @@ pub fn translate(body: &JsonValue) -> R<Translated> {
         "min_p",
         "gaudium_method",
         "gaudium_a2ui",
+        // the generated token ids in the reply's details (exactness checks between runs)
+        "gaudium_return_tokens",
         "reasoning_effort",
         "coupled",
         "draft_trunc",
@@ -1092,7 +1118,7 @@ mod tests {
     #[test]
     fn a_messages_request_becomes_a_chat_request() {
         let t = translate_str(
-            r#"{"model":"m","max_tokens":64,"system":[{"type":"text","text":"x-anthropic-billing-header: abc"},{"type":"text","text":"Be brief."}],
+            r#"{"model":"m","max_tokens":4096,"system":[{"type":"text","text":"x-anthropic-billing-header: abc"},{"type":"text","text":"Be brief."}],
                 "tools":[{"name":"get_weather","description":"Weather.","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}},
                          {"name":"later","defer_loading":true}],
                 "tool_choice":{"type":"tool","name":"get_weather","disable_parallel_tool_use":true},
@@ -1107,7 +1133,7 @@ mod tests {
         )
         .unwrap();
         assert!(!t.show_thinking);
-        assert_eq!(t.ignored.len(), 2, "{:?}", t.ignored);
+        assert_eq!(t.ignored.len(), 1, "{:?}", t.ignored);
         let c = &t.chat;
         let msgs = c.get("messages").and_then(JsonValue::as_array).unwrap();
         let roles: Vec<&str> = msgs
@@ -1163,7 +1189,11 @@ mod tests {
             r#"{"enable_thinking":true}"#
         );
         assert_eq!(c.get("stop").unwrap().dump(), r#"["END"]"#);
-        assert_eq!(c.get("max_tokens").and_then(JsonValue::as_u64), Some(64));
+        assert_eq!(c.get("max_tokens").and_then(JsonValue::as_u64), Some(4096));
+        assert_eq!(
+            c.get("thinking_budget_tokens").and_then(JsonValue::as_u64),
+            Some(2000)
+        );
         assert_eq!(c.get("stream").and_then(JsonValue::as_bool), Some(true));
         assert_eq!(c.get("model").and_then(JsonValue::as_str), Some("m"));
     }
@@ -1233,10 +1263,47 @@ mod tests {
                 r#"{"mcp_servers":[{"url":"u"}],"messages":[{"role":"user","content":"x"}]}"#,
                 "MCP",
             ),
+            (
+                r#"{"max_tokens":4096,"thinking":{"type":"enabled","budget_tokens":1023},"messages":[{"role":"user","content":"x"}]}"#,
+                "at least 1024",
+            ),
+            (
+                r#"{"max_tokens":2048,"thinking":{"type":"enabled","budget_tokens":2048},"messages":[{"role":"user","content":"x"}]}"#,
+                "less than max_tokens",
+            ),
+            (
+                r#"{"max_tokens":4096,"thinking":{"type":"enabled","budget_tokens":1500.5},"messages":[{"role":"user","content":"x"}]}"#,
+                "must be an integer",
+            ),
         ] {
             let err = translate_str(body).unwrap_err();
             assert!(err.contains(want), "{body}: {err}");
         }
+    }
+
+    #[test]
+    fn only_enabled_thinking_takes_a_budget() {
+        let t = translate_str(
+            r#"{"model":"m","max_tokens":4096,"thinking":{"type":"adaptive","budget_tokens":2000},
+                "messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert!(t.chat.get("thinking_budget_tokens").is_none());
+        assert!(
+            t.ignored.iter().any(|i| i.contains("budget_tokens")),
+            "{:?}",
+            t.ignored
+        );
+        let t = translate_str(
+            r#"{"model":"m","max_tokens":1025,"thinking":{"type":"enabled","budget_tokens":1024},
+                "messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            t.chat.get("thinking_budget_tokens").and_then(JsonValue::as_u64),
+            Some(1024)
+        );
+        assert!(t.ignored.is_empty(), "{:?}", t.ignored);
     }
 
     #[test]

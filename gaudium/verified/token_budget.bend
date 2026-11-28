@@ -288,3 +288,14 @@ def sampling_admitted_when_allowed(wants):
   match wants:
     case True{}: {==}
     case False{}: {==}
+
+# promise: after sent tokens of a max_new of sent + e, the remaining budget is exactly e (all that is left, never more)
+# harm: an answer that resumes after a forced end of thinking would run past max_tokens, or lose tokens it was owed
+# catches: an off-by-one in the remaining budget (max_new minus sent minus one)
+law remaining_budget_exact:
+  for +s: Nat
+  for +e: Nat
+  {remaining_budget(s, Nat.add(s, e)) == e : Nat}
+
+def remaining_budget_exact(s, e):
+  tb_sub_add_cancel(s, e)

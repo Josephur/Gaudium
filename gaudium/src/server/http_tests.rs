@@ -3875,3 +3875,178 @@ fn chat_penalties_are_applied_not_reported_as_ignored() {
         r.dump()
     );
 }
+
+/// `thinking_budget_tokens`: a reply whose reasoning reaches the budget gets the family's
+/// end-of-thinking marker in place of its next token, and goes on with its answer from the prompt,
+/// the kept reasoning and the marker, with what is left of `max_tokens`.
+#[test]
+fn a_thinking_budget_closes_the_reasoning_and_the_answer_follows() {
+    let h = harness();
+    let tok = Arc::clone(&h.state.models[0].tokenizer);
+    let thought = "one two three four five six seven eight nine ten";
+    h.script(&format!("{thought}\n</think>\n\nnever shown"));
+    h.script("\n\nThe answer.");
+    let (status, r) = h.chat(r#","max_tokens":64,"thinking_budget_tokens":4,"gaudium_return_tokens":true"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    let kept: Vec<i32> = tok.encode(thought, true)[..4].to_vec();
+    let close = tok.encode("</think>", true);
+    let answer = tok.encode("\n\nThe answer.", true);
+    let msg = at(&r, &["choices", "0", "message"]);
+    assert_eq!(s(msg, &["reasoning_content"]), tok.decode(&kept, false).trim());
+    assert_eq!(s(msg, &["content"]), "The answer.");
+    assert_eq!(s(&r, &["choices", "0", "finish_reason"]), "stop");
+    // the reply's tokens: the kept reasoning, the marker, the answer
+    let want: Vec<i32> = kept.iter().chain(&close).chain(&answer).copied().collect();
+    assert_eq!(
+        at(&r, &["usage", "completion_tokens"]).as_u64(),
+        Some(want.len() as u64)
+    );
+    assert_eq!(at(&r, &["gaudium", "tokens"]).dump(), ids_json(&want));
+    assert_eq!(at(&r, &["gaudium", "thinking", "reasoning_tokens"]).as_u64(), Some(4));
+    assert_eq!(
+        at(&r, &["gaudium", "thinking", "forced_close"]),
+        &JsonValue::Bool(true)
+    );
+    // the answer was prompted with the first prompt, the kept reasoning and the marker
+    let prompts = h.prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(
+        prompts[1],
+        format!("{}{}</think>", prompts[0], tok.decode(&kept, false))
+    );
+
+    // a reply that closes its reasoning inside the budget runs once, as without a budget
+    h.script("short\n</think>\n\nDone.");
+    let (status, r) = h.chat(r#","max_tokens":64,"thinking_budget_tokens":40"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    let msg = at(&r, &["choices", "0", "message"]);
+    assert_eq!(
+        (s(msg, &["reasoning_content"]), s(msg, &["content"])),
+        ("short", "Done.")
+    );
+    assert_eq!(h.prompts.lock().unwrap().len(), 3);
+    assert_eq!(
+        at(&r, &["gaudium", "thinking", "forced_close"]),
+        &JsonValue::Bool(false)
+    );
+
+    // the marker no longer fits after the reasoning: the reply ends at its length
+    h.script(&format!("{thought}\n</think>\n\nnever shown"));
+    let (status, r) = h.chat(r#","max_tokens":5,"thinking_budget_tokens":100"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    assert_eq!(s(&r, &["choices", "0", "finish_reason"]), "length");
+    assert_eq!(h.prompts.lock().unwrap().len(), 4);
+
+    // with `reasoning_format: "none"` the budget is not applied, and `ignored` says so
+    h.script(&format!("{thought}\n</think>\n\nshown"));
+    let (status, r) = h.chat(
+        r#","max_tokens":64,"thinking_budget_tokens":4,"reasoning_format":"none""#,
+    );
+    assert_eq!(status, 200, "{}", r.dump());
+    let ignored = at(&r, &["gaudium", "ignored"]).dump();
+    assert!(
+        ignored.contains("thinking_budget_tokens") && ignored.contains("reasoning_format"),
+        "{ignored}"
+    );
+    assert!(s(&r, &["choices", "0", "message", "content"]).contains("shown"));
+    assert_eq!(h.prompts.lock().unwrap().len(), 5);
+
+    // a completion has no reasoning span: the budget is not applied (one generation, the text
+    // as generated) and the field is reported as unknown
+    h.script(&format!("{thought}\n</think>\n\nall of it"));
+    let (status, text) = h.post(
+        "/v1/completions",
+        r#"{"model":"any","prompt":"Go.","max_tokens":256,"thinking_budget_tokens":4}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    assert_eq!(
+        s(&r, &["choices", "0", "text"]),
+        format!("{thought}\n</think>\n\nall of it"),
+        "{text}"
+    );
+    assert!(
+        at(&r, &["gaudium", "ignored"])
+            .dump()
+            .contains("thinking_budget_tokens"),
+        "{text}"
+    );
+    assert!(r.get("gaudium").and_then(|g| g.get("thinking")).is_none(), "{text}");
+    assert_eq!(h.prompts.lock().unwrap().len(), 6);
+}
+
+/// A report whose tokens the server replaced (a thinking-budget cut) or joined gives its rates
+/// from its own token list, not from the engine's count.
+#[test]
+fn replaced_tokens_set_the_reported_rates() {
+    let mut rep = GenReport {
+        generated_tokens: vec![1; 11],
+        decode_ms: 100.0,
+        launches: 2,
+        decode_tok_s: 999.0,
+        tokens_per_launch: 9.0,
+        ..GenReport::default()
+    };
+    super::set_token_rates(&mut rep);
+    assert_eq!((rep.decode_tok_s, rep.tokens_per_launch), (100.0, 5.0));
+}
+
+/// `/v1/messages`: `thinking.budget_tokens` closes the thinking block at the budget; the text
+/// block follows.
+#[test]
+fn messages_thinking_budget_is_enforced() {
+    let h = harness();
+    let tok = Arc::clone(&h.state.models[0].tokenizer);
+    let thought = "step ".repeat(1500);
+    assert!(tok.encode(&thought, true).len() > 1024);
+    h.script(&format!("{thought}\n</think>\n\nnever shown"));
+    h.script("\n\nThe answer.");
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":4096,"thinking":{"type":"enabled","budget_tokens":1024},
+            "messages":[{"role":"user","content":"Think."}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    let blocks = at(&r, &["content"]).as_array().unwrap();
+    let kinds: Vec<&str> = blocks.iter().map(|b| s(b, &["type"])).collect();
+    assert_eq!(kinds, ["thinking", "text"]);
+    assert_eq!(s(&blocks[1], &["text"]), "The answer.");
+    assert_eq!(s(&r, &["stop_reason"]), "end_turn");
+    assert!(h.last_prompt().ends_with("</think>"));
+    let kept = tok.encode(&thought, true)[..1024].to_vec();
+    assert_eq!(s(&blocks[0], &["thinking"]), tok.decode(&kept, false).trim());
+
+    // a budget at max_tokens is refused in this API's shape
+    let (status, text) = h.post(
+        "/v1/messages",
+        r#"{"model":"any","max_tokens":1024,"thinking":{"type":"enabled","budget_tokens":1024},
+            "messages":[{"role":"user","content":"Think."}]}"#,
+    );
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("less than max_tokens"), "{text}");
+}
+
+/// A thinking budget and sampling penalties (or a logit bias) in one request are refused: the
+/// answer after a forced close is a second generation that would not carry the penalties' counts
+/// of the reasoning, nor a ban on the end-of-thinking marker.
+#[test]
+fn a_thinking_budget_with_penalties_is_refused() {
+    let h = harness();
+    for extra in [
+        r#","presence_penalty":0.5"#,
+        r#","logit_bias":{"7":-100}"#,
+        r#","repetition_penalty":1.1"#,
+    ] {
+        let (status, r) = h.chat(&format!(r#","max_tokens":64,"thinking_budget_tokens":4{extra}"#));
+        assert_eq!(status, 400, "{extra}: {}", r.dump());
+        assert!(r.dump().contains("thinking_budget_tokens"), "{}", r.dump());
+    }
+    // either one alone still runs
+    h.script("a\n</think>\n\nHi.");
+    let (status, r) = h.chat(r#","max_tokens":64,"thinking_budget_tokens":32"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    h.script("</think>\n\nHi.");
+    let (status, r) = h.chat(r#","presence_penalty":0.5"#);
+    assert_eq!(status, 200, "{}", r.dump());
+}

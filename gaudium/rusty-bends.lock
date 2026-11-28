@@ -1655,6 +1655,9 @@ ccedb8b0ed563ee0  recipe_shared_ws_oversize_fails  law recipe_shared_ws_oversize
 bcdbb0965633fbf5  recipe_shared_ws_uncompiled_cannot_launch  law recipe_shared_ws_uncompiled_cannot_launch : for + ws_need : Nat for + pool_size : Nat { Bool.and ( Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecBuilding { } , ws_need , pool_size ) ) ) , Bool.and ( Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecWsFailed { } , ws_need , pool_size ) ) ) , Bool.not ( recipe_can_launch ( recipe_bind_shared_ws ( RecDestroyed { } , ws_need , pool_size ) ) ) ) ) == True { } : Bool }
 # promise recipe_shared_ws_uncompiled_cannot_launch: binding shared workspace on RecBuilding, RecWsFailed, or RecDestroyed never enables launch
 a1e1d13137bf7fec  recipe_ws_fail_never_launches  law recipe_ws_fail_never_launches : { recipe_can_launch ( RecWsFailed { } ) == False { } : Bool }
+306e82b6aaa853d8  remaining_budget_exact  law remaining_budget_exact : for + s : Nat for + e : Nat { remaining_budget ( s , Nat.add ( s , e ) ) == e : Nat }
+# promise remaining_budget_exact: after sent tokens of a max_new of sent + e, the remaining budget is exactly e (all that is left, never more)
+# harm remaining_budget_exact: an answer that resumes after a forced end of thinking would run past max_tokens, or lose tokens it was owed
 4e29b494852f35ad  remaining_monotone_step  law remaining_monotone_step : for + sent : Nat for + m : Nat { Nat.is_le ( remaining_budget ( 1n + sent , m ) , remaining_budget ( sent , m ) ) == True { } : Bool }
 1f4af7eeefaac3d0  remaining_zero_at_limit  law remaining_zero_at_limit : for + m : Nat for + over : Nat { remaining_budget ( Nat.add ( m , over ) , m ) == 0n : Nat }
 50e5c88a1ed73b76  req_cancel_idempotent  law req_cancel_idempotent : for s : ReqState { req_cancel ( req_cancel ( s ) ) == req_cancel ( s ) : ReqState }
@@ -1872,6 +1875,42 @@ a7ddf0cb7323bd51  slot_unbound_never_quiesces  law slot_unbound_never_quiesces :
 d2f1459314d3bf87  stop_length_is_max_tokens  law stop_length_is_max_tokens : for c : Bool { stop_reason ( GeLength { } , c ) == SrMaxTokens { } : StopReason }
 e06afa1753839470  stop_sequence_needs_stop_string  law stop_sequence_needs_stop_string : for + e : GenEnd for c : Bool { Bool.or ( Bool.not ( sr_is_stop_sequence ( stop_reason ( e , c ) ) ) , ge_is_stop_string ( e ) ) == True { } : Bool }
 02fd1bd807dd2f14  stop_tool_use_needs_calls  law stop_tool_use_needs_calls : for e : GenEnd { sr_is_tool_use ( stop_reason ( e , False { } ) ) == False { } : Bool }
+46ab38ee952ff713  think_answer_kept  law think_answer_kept : for + n : Nat for + cap : Nat for + c : Nat for + room : Nat for + forced : Bool { think_act ( False { } , n , cap , c , room , forced ) == TaFeed { n } : ThinkAct }
+# promise think_answer_kept: a token of the answer is always kept by the thinking budget and leaves the reasoning count unchanged
+0d36fc68c1187832  think_below_cap_counted  law think_below_cap_counted : for + n : Nat for + d : Nat for + c : Nat for + room : Nat { think_kept ( think_act ( True { } , n , Nat.add ( n , 1n + d ) , c , Nat.add ( c , 1n + room ) , False { } ) , n ) == 1n + n : Nat }
+# promise think_below_cap_counted: a reasoning token below the cap, with room for it and the marker after it and no forced close yet, is kept and counted once
+1cabbffc63617615  think_budget_penalised_only_carried  law think_budget_penalised_only_carried : for + c : Bool { Bool.and ( think_penalties_ok ( True { } , True { } , c ) , Bool.not ( c ) ) == False { } : Bool }
+# promise think_budget_penalised_only_carried: a request whose thinking budget is applied never runs with sampling penalties or a logit bias unless their state carries over to the resumed answer.
+# harm think_budget_penalised_only_carried: after the forced close the answer would be sampled without the reasoning's penalty counts, and a banned end-of-thinking marker would still be written.
+3306d4cdb18a3f15  think_cap_full_budget  law think_cap_full_budget : for + b : Nat for + c : Nat for + e : Nat { think_cap ( b , Nat.add ( c , Nat.add ( b , 1n + e ) ) , c ) == b : Nat }
+# promise think_cap_full_budget: when the budget, the marker and at least one answer token fit in max_new, the reply may reason for its whole budget
+95cf652ef263c27a  think_cap_leaves_close  law think_cap_leaves_close : for + b : Nat for + c : Nat for + e : Nat { Nat.is_le ( Nat.add ( c , think_cap ( b , Nat.add ( c , e ) , c ) ) , Nat.add ( c , e ) ) == True { } : Bool }
+# promise think_cap_leaves_close: the reasoning cap leaves room for the whole end-of-thinking marker inside max_new whenever the marker fits at all
+# harm think_cap_leaves_close: a reply would reason up to a cap where the marker no longer fits and end without its answer
+08655338a10f28b3  think_cap_reserves_one  law think_cap_reserves_one : for + b : Nat for + c : Nat for + k : Nat for + e : Nat { Nat.is_le ( Nat.min ( b , k ) , think_cap ( b , Nat.add ( c , Nat.add ( k , 1n + e ) ) , c ) ) == True { } : Bool }
+# promise think_cap_reserves_one: when max_new holds the marker and k + 1 more tokens, the reply may reason for k tokens or its whole budget, whichever is less
+# harm think_cap_reserves_one: a max_tokens just above budget_tokens would leave the reply no reasoning at all
+4b3f1edc36a09961  think_cap_within_budget  law think_cap_within_budget : for + b : Nat for + m : Nat for + c : Nat { Nat.is_le ( think_cap ( b , m , c ) , b ) == True { } : Bool }
+# promise think_cap_within_budget: the reasoning cap never exceeds the budget the request gave
+# harm think_cap_within_budget: a reply would reason past the client's budget_tokens and spend its answer tokens on it
+f800bf772db39ae6  think_close_at_cap  law think_close_at_cap : for + n : Nat for + c : Nat for + e : Nat { think_is_close ( think_act ( True { } , n , n , c , Nat.add ( c , e ) , False { } ) ) == True { } : Bool }
+# promise think_close_at_cap: a reply that reaches the cap inside its reasoning, with room for the marker and not yet forced, gets the marker
+76a58b050de2d329  think_close_fits  law think_close_fits : for + t : Bool for + n : Nat for + cap : Nat for + room : Nat for + d : Nat for + forced : Bool { think_is_close ( think_act ( t , n , cap , Nat.add ( room , 1n + d ) , room , forced ) ) == False { } : Bool }
+# promise think_close_fits: the end-of-thinking marker is forced only where all of it fits in what the reply may still generate
+# harm think_close_fits: the forced marker would push the reply past its max_new and the context it was admitted with
+7e3760e002e23fa8  think_close_once  law think_close_once : for + t : Bool for + n : Nat for + cap : Nat for + c : Nat for + room : Nat { think_is_close ( think_act ( t , n , cap , c , room , True { } ) ) == False { } : Bool }
+# promise think_close_once: the end-of-thinking marker is forced at most once in a reply
+39e7f02320ebb493  think_never_past_cap  law think_never_past_cap : for + cap : Nat for + e : Nat for + c : Nat for + room : Nat for + forced : Bool { think_is_feed ( think_act ( True { } , Nat.add ( cap , e ) , cap , c , room , forced ) ) == False { } : Bool }
+# promise think_never_past_cap: a reasoning token at or past the cap is never kept
+# harm think_never_past_cap: the reasoning span would outgrow the budget
+8f87e6a5e636f3c8  think_penalties_rest_ok  law think_penalties_rest_ok : for + b : Bool for + c : Bool { Bool.and ( think_penalties_ok ( False { } , b , c ) , think_penalties_ok ( b , False { } , c ) ) == True { } : Bool }
+# promise think_penalties_rest_ok: a request without a thinking budget, or without penalties, is never refused by this rule.
+bbfe8a0c9fa2eaeb  think_sent_counts_written  law think_sent_counts_written : for + a : ThinkAct for + s : Nat for + c : Nat { think_sent ( a , s , c ) == Nat.add ( think_written ( a , c ) , s ) : Nat }
+# promise think_sent_counts_written: the reply's written-token count after a step is the count before it plus exactly the tokens the step wrote: one for a token kept, the whole marker for a forced close, none for an end
+# harm think_sent_counts_written: a miscounted marker would let the resumed answer run past max_tokens, or cut it short
+7cb96959a8b9c326  think_sent_within_room  law think_sent_within_room : for + t : Bool for + n : Nat for + cap : Nat for + c : Nat for + r : Nat for + s : Nat for + f : Bool { Nat.is_le ( think_sent ( think_act ( t , n , cap , c , 1n + r , f ) , s , c ) , Nat.add ( 1n + r , s ) ) == True { } : Bool }
+# promise think_sent_within_room: a step taken while the reply may still generate a token never counts the reply past what it may generate
+# harm think_sent_within_room: the resumed answer would be given room past max_tokens and the context it was admitted with
 4fe24103e68cc08f  tool_auto_never_forces  law tool_auto_never_forces : for g : Bool { tool_choice_forces ( TcAuto { } , g ) == False { } : Bool }
 9a9a069d38d51c47  tool_choice_named_needs_tools  law tool_choice_named_needs_tools : { tool_choice_valid ( TcNamed { } , False { } ) == False { } : Bool }
 # promise tool_choice_named_needs_tools: forcing a named tool when no tools are provided is always refused
