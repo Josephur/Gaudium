@@ -1,0 +1,828 @@
+//! The server's file store: the files of the Files API (`/v1/files`, `files.rs`), kept in one
+//! directory with a total quota and a per-file cap (`--files-dir`, `--files-quota-gb`,
+//! `--files-max-mb`).
+//!
+//! Each file is two entries of the directory: `<id>.data` (its bytes) and `<id>.json` (its
+//! metadata: name, size, time, purpose, media type, owner). A file exists once its metadata is
+//! written; a restart reads the metadata back. `next` holds the id counter, so the id of a
+//! deleted file is never handed out again, also across restarts.
+//!
+//! Which upload is stored, what the quota holds and which id a file gets are decided by the
+//! verified ledger (`verified/file_store.bend`): `fs_upload` decides an upload against the
+//! per-file cap and the free bytes and hands out the id, `fs_delete` / `fs_kill` give a deleted
+//! file's bytes back once, `fs_restore` counts the files found at start. This module streams the
+//! bytes, writes and reads the directory, and keeps the ledger in memory behind a lock.
+//!
+//! Ownership: with API keys configured, a file belongs to the key that stored it ([`Owner`]);
+//! another key (or none) finds no such file. Without keys every client shares the store.
+//!
+//! The internal API other parts of the server use (the batch APIs read their input here):
+//! [`FileStore::create`] stores bytes, [`FileStore::open_content`] opens a file for reading.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::json::{parse_json, JsonValue};
+use crate::verified::{
+    fs_delete, fs_free, fs_kill, fs_live, fs_next, fs_open, fs_quota, fs_restore, fs_upload,
+    fs_upload_ledger, fs_used, FsEntry, FsLedger, FsUpload,
+};
+
+use super::readout::jq;
+
+/// The default total quota of the store (`--files-quota-gb`), in bytes.
+pub const DEFAULT_QUOTA_BYTES: u64 = 16 << 30;
+/// The default largest file (`--files-max-mb`), in bytes.
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 512 << 20;
+/// Ids are 12 hexadecimal digits of the counter; a counter at this value is refused.
+const ID_LIMIT: u64 = 1 << 48;
+/// The longest file name kept, in characters.
+const MAX_FILENAME_CHARS: usize = 255;
+/// Bytes of a file's start kept to recognise its media type.
+const SNIFF_BYTES: usize = 512;
+/// The name of the id-counter file in the store's directory.
+const NEXT_FILE: &str = "next";
+
+/// The store's settings (`--files-dir` and its limits).
+#[derive(Debug, Clone)]
+pub struct FileStoreOptions {
+    /// The store's directory; `None`: the Files API is off.
+    pub dir: Option<PathBuf>,
+    /// The total bytes the store may hold.
+    pub quota_bytes: u64,
+    /// The largest single file, in bytes.
+    pub max_file_bytes: u64,
+}
+
+impl Default for FileStoreOptions {
+    fn default() -> Self {
+        FileStoreOptions {
+            dir: None,
+            quota_bytes: DEFAULT_QUOTA_BYTES,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+        }
+    }
+}
+
+/// Who a file belongs to: the API key that stored it (as a digest, never the key itself), or
+/// everyone on a server without keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner(String);
+
+impl Owner {
+    /// Every client of a server without API keys.
+    pub fn everyone() -> Owner {
+        Owner(String::new())
+    }
+
+    /// The holder of `key`.
+    pub fn of_key(key: &str) -> Owner {
+        let digest = crate::synapse::recipe_cache::sha256_hex(key.as_bytes());
+        Owner(format!("key:{}", &digest[..32]))
+    }
+
+    fn may_use(&self, file_owner: &str) -> bool {
+        self.0 == file_owner
+    }
+}
+
+/// A stored file's metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMeta {
+    pub id: String,
+    pub filename: String,
+    pub bytes: u64,
+    /// Unix seconds.
+    pub created_at: u64,
+    /// The OpenAI purpose (`user_data` for files stored through the Messages API shape).
+    pub purpose: String,
+    pub mime_type: String,
+    /// Whether the Messages API shape lets clients download the content (files the server
+    /// wrote itself; uploads are not, as that API has it).
+    pub downloadable: bool,
+    owner: String,
+    num: u64,
+}
+
+/// Why a store operation failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileError {
+    /// No such file for this owner.
+    NotFound(String),
+    /// The file is larger than the per-file cap (`size` is at least `cap + 1`: the upload stops
+    /// reading there).
+    TooLarge { cap: u64 },
+    /// The file does not fit the free bytes of the quota.
+    OverQuota {
+        size: u64,
+        used: u64,
+        free: u64,
+        quota: u64,
+    },
+    /// Every id has been handed out.
+    IdsExhausted,
+    /// The upload could not be read from the client.
+    BadUpload(String),
+    /// The disk refused: what failed.
+    Io(String),
+}
+
+impl FileError {
+    /// The HTTP status of the failure.
+    pub fn status(&self) -> u16 {
+        match self {
+            FileError::NotFound(_) => 404,
+            FileError::TooLarge { .. } => 413,
+            FileError::OverQuota { .. } | FileError::BadUpload(_) => 400,
+            FileError::IdsExhausted | FileError::Io(_) => 500,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            FileError::NotFound(id) => format!("file '{id}' not found"),
+            FileError::TooLarge { cap } => format!(
+                "the file is larger than this server's limit of {cap} bytes per file \
+                 (--files-max-mb)"
+            ),
+            FileError::OverQuota {
+                size,
+                used,
+                free,
+                quota,
+            } => format!(
+                "the file of {size} bytes does not fit the file store: {used} of {quota} bytes \
+                 are in use and {free} are free (delete files or raise --files-quota-gb)"
+            ),
+            FileError::IdsExhausted => "the file store has handed out every file id".into(),
+            FileError::BadUpload(e) => format!("the upload could not be read: {e}"),
+            FileError::Io(e) => format!("the file store could not write to its directory: {e}"),
+        }
+    }
+}
+
+fn io_err(what: &str, e: io::Error) -> FileError {
+    FileError::Io(format!("{what}: {e}"))
+}
+
+/// An upload streamed to a staging file, not yet a file of the store. Dropped uncommitted, it
+/// removes its staging file.
+pub struct Staged {
+    path: PathBuf,
+    size: u64,
+    head: Vec<u8>,
+}
+
+impl Staged {
+    /// Bytes staged (at most the per-file cap + 1).
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct Held {
+    meta: FileMeta,
+    /// The ledger's view of the file: a deleted file stays here, no longer live
+    /// (`fs_kill`), until the next start, so a repeated delete finds it already freed.
+    entry: FsEntry,
+}
+
+impl Held {
+    fn visible_to(&self, owner: &Owner, id: &str) -> bool {
+        fs_live(self.entry) && self.meta.id == id && owner.may_use(&self.meta.owner)
+    }
+}
+
+struct Inner {
+    ledger: FsLedger,
+    /// The files by their counter value (upload order).
+    files: BTreeMap<u64, Held>,
+}
+
+pub struct FileStore {
+    dir: PathBuf,
+    quota: u64,
+    cap: u64,
+    inner: Mutex<Inner>,
+    staging: AtomicU64,
+}
+
+/// The counter value of an id `file-<12 hex digits><12 hex digits>`.
+fn id_num(id: &str) -> Option<u64> {
+    let rest = id.strip_prefix("file-")?;
+    if rest.len() != 24 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&rest[..12], 16).ok()
+}
+
+/// Random bits for the second half of an id (so ids are not guessed from the counter).
+fn id_tail() -> u64 {
+    let mut b = [0u8; 8];
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_err()
+    {
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        b = (t ^ u64::from(std::process::id()).rotate_left(32)).to_le_bytes();
+    }
+    u64::from_le_bytes(b) & ((1 << 48) - 1)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The name a file is kept under: the last path component, without control characters, at
+/// most 255 characters; `unnamed` when nothing is left.
+pub fn clean_filename(raw: &str) -> String {
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let name: String = last
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_FILENAME_CHARS)
+        .collect();
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        "unnamed".into()
+    } else {
+        name.to_string()
+    }
+}
+
+/// A file's media type: what its first bytes show (images, PDF), else the type the client gave,
+/// else what its name's extension says, else `text/plain` for UTF-8 text, else
+/// `application/octet-stream`.
+pub fn detect_mime(hint: Option<&str>, filename: &str, head: &[u8]) -> String {
+    let magic: &[(&[u8], &str)] = &[
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+        (b"%PDF-", "application/pdf"),
+    ];
+    for (m, t) in magic {
+        if head.starts_with(m) {
+            return (*t).into();
+        }
+    }
+    if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return "image/webp".into();
+    }
+    if let Some(h) = hint {
+        let t = h
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if t.contains('/') && t != "application/octet-stream" && t.len() <= 255 {
+            return t;
+        }
+    }
+    let ext = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let by_ext = match ext.as_str() {
+        "txt" | "text" | "log" => Some("text/plain"),
+        "md" | "markdown" => Some("text/markdown"),
+        "csv" => Some("text/csv"),
+        "html" | "htm" => Some("text/html"),
+        "xml" => Some("application/xml"),
+        "json" => Some("application/json"),
+        "jsonl" | "ndjson" => Some("application/jsonl"),
+        "pdf" => Some("application/pdf"),
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    };
+    if let Some(t) = by_ext {
+        return t.into();
+    }
+    let text = match std::str::from_utf8(head) {
+        Ok(_) => true,
+        // a character cut at the end of the sniffed bytes
+        Err(e) => e.error_len().is_none() && head.len() - e.valid_up_to() < 4,
+    };
+    if text && !head.contains(&0) {
+        "text/plain".into()
+    } else {
+        "application/octet-stream".into()
+    }
+}
+
+/// Writes `bytes` to `path` through a temporary file and a rename.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
+}
+
+fn meta_json(m: &FileMeta) -> String {
+    format!(
+        "{{\"id\":{},\"filename\":{},\"bytes\":{},\"created_at\":{},\"purpose\":{},\"mime_type\":{},\"downloadable\":{},\"owner\":{}}}\n",
+        jq(&m.id),
+        jq(&m.filename),
+        m.bytes,
+        m.created_at,
+        jq(&m.purpose),
+        jq(&m.mime_type),
+        m.downloadable,
+        jq(&m.owner)
+    )
+}
+
+fn meta_from_json(text: &str, num: u64) -> Option<FileMeta> {
+    let v: JsonValue = parse_json(text).ok()?;
+    let s = |k: &str| v.get(k).and_then(JsonValue::as_str).map(str::to_string);
+    Some(FileMeta {
+        id: s("id")?,
+        filename: s("filename")?,
+        bytes: v.get("bytes")?.as_u64()?,
+        created_at: v.get("created_at")?.as_u64()?,
+        purpose: s("purpose")?,
+        mime_type: s("mime_type")?,
+        downloadable: v.get("downloadable")?.as_bool()?,
+        owner: s("owner")?,
+        num,
+    })
+}
+
+impl FileStore {
+    /// Opens (or creates) the store in `dir` and counts the files it holds.
+    pub fn open(dir: &Path, quota: u64, cap: u64) -> Result<FileStore, String> {
+        fs::create_dir_all(dir)
+            .map_err(|e| format!("--files-dir {}: cannot create it: {e}", dir.display()))?;
+        let saved_next = match fs::read_to_string(dir.join(NEXT_FILE)) {
+            Ok(t) => t
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|&n| n < ID_LIMIT)
+                .ok_or_else(|| {
+                    format!(
+                        "--files-dir {}: the id counter file '{NEXT_FILE}' is damaged",
+                        dir.display()
+                    )
+                })?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(format!("--files-dir {}: {e}", dir.display())),
+        };
+        let mut ledger = fs_open(quota, saved_next);
+        let mut files = BTreeMap::new();
+        let entries =
+            fs::read_dir(dir).map_err(|e| format!("--files-dir {}: {e}", dir.display()))?;
+        let mut data_ids = Vec::new();
+        for ent in entries.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".staging-") || name.ends_with(".tmp") {
+                // an upload or a write that a stop cut short
+                let _ = fs::remove_file(ent.path());
+                continue;
+            }
+            if let Some(id) = name.strip_suffix(".data") {
+                if id_num(id).is_some() {
+                    data_ids.push(id.to_string());
+                }
+                continue;
+            }
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let Some(num) = id_num(id).filter(|&n| n < ID_LIMIT - 1) else {
+                continue;
+            };
+            let data = dir.join(format!("{id}.data"));
+            let Ok(size) = fs::metadata(&data).map(|m| m.len()) else {
+                eprintln!("[files] {id}: metadata without data; the file is not served");
+                continue;
+            };
+            // the bytes on disk are counted whether or not the file can be served
+            ledger = fs_restore(ledger, num, size);
+            let meta = fs::read_to_string(ent.path())
+                .ok()
+                .and_then(|t| meta_from_json(&t, num))
+                .filter(|m| m.id == id);
+            match meta {
+                Some(mut m) => {
+                    if m.bytes != size {
+                        eprintln!(
+                            "[files] {id}: metadata says {} bytes, the data holds {size}; serving the data",
+                            m.bytes
+                        );
+                        m.bytes = size;
+                    }
+                    files.insert(
+                        num,
+                        Held {
+                            meta: m,
+                            entry: FsEntry::FsEntry(size, true),
+                        },
+                    );
+                }
+                None => eprintln!(
+                    "[files] {id}: unreadable metadata; its {size} bytes stay counted, the file is not served"
+                ),
+            }
+        }
+        // data whose metadata was never written: an upload a stop cut short (its id is retired
+        // by the saved counter)
+        for id in data_ids {
+            if !dir.join(format!("{id}.json")).exists() {
+                let _ = fs::remove_file(dir.join(format!("{id}.data")));
+            }
+        }
+        Ok(FileStore {
+            dir: dir.to_path_buf(),
+            quota,
+            cap,
+            inner: Mutex::new(Inner { ledger, files }),
+            staging: AtomicU64::new(0),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The largest file, in bytes.
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
+
+    /// `(used, free, quota)` bytes. `quota` is the configured one; files found at start may hold
+    /// more than a quota lowered since.
+    pub fn usage(&self) -> (u64, u64, u64) {
+        let l = self.lock().ledger;
+        (fs_used(l), fs_free(l), self.quota)
+    }
+
+    /// Streams `src` to a staging file: up to the per-file cap + 1 bytes (one byte past the cap
+    /// is enough for the ledger to refuse the file).
+    pub fn stage(&self, src: &mut dyn Read) -> Result<Staged, FileError> {
+        let k = self.staging.fetch_add(1, Ordering::Relaxed);
+        let path = self
+            .dir
+            .join(format!(".staging-{}-{k}", std::process::id()));
+        let mut f = fs::File::create(&path).map_err(|e| io_err("staging file", e))?;
+        let mut staged = Staged {
+            path,
+            size: 0,
+            head: Vec::new(),
+        };
+        let mut limited = src.take(self.cap.saturating_add(1));
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match limited.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(FileError::BadUpload(e.to_string())),
+            };
+            if staged.head.len() < SNIFF_BYTES {
+                let take = (SNIFF_BYTES - staged.head.len()).min(n);
+                staged.head.extend_from_slice(&buf[..take]);
+            }
+            f.write_all(&buf[..n])
+                .map_err(|e| io_err("staging file", e))?;
+            staged.size += n as u64;
+        }
+        f.sync_all().map_err(|e| io_err("staging file", e))?;
+        Ok(staged)
+    }
+
+    /// Whether the ledger would store a file of `size` bytes now (the decision of
+    /// [`commit`](Self::commit), taken early so a refused upload is not read to its end).
+    pub fn precheck(&self, size: u64) -> Result<(), FileError> {
+        let l = self.lock().ledger;
+        match fs_upload(l, self.cap, size) {
+            FsUpload::FsTooLarge => Err(FileError::TooLarge { cap: self.cap }),
+            FsUpload::FsOverQuota(free) => Err(FileError::OverQuota {
+                size,
+                used: fs_used(l),
+                free,
+                quota: fs_quota(l),
+            }),
+            FsUpload::FsStored(..) => Ok(()),
+        }
+    }
+
+    /// Makes a staged upload a file of the store, if the ledger stores it.
+    pub fn commit(
+        &self,
+        staged: Staged,
+        owner: &Owner,
+        filename: &str,
+        mime_hint: Option<&str>,
+        purpose: &str,
+        downloadable: bool,
+    ) -> Result<FileMeta, FileError> {
+        let filename = clean_filename(filename);
+        let mime_type = detect_mime(mime_hint, &filename, &staged.head);
+        let size = staged.size;
+        let mut g = self.lock();
+        let before = g.ledger;
+        let decided = fs_upload(before, self.cap, size);
+        let num = match decided {
+            FsUpload::FsTooLarge => return Err(FileError::TooLarge { cap: self.cap }),
+            FsUpload::FsOverQuota(free) => {
+                return Err(FileError::OverQuota {
+                    size,
+                    used: fs_used(before),
+                    free,
+                    quota: fs_quota(before),
+                })
+            }
+            FsUpload::FsStored(num, _) => num,
+        };
+        if num >= ID_LIMIT - 1 {
+            return Err(FileError::IdsExhausted);
+        }
+        let after = fs_upload_ledger(before, decided);
+        let entry = FsEntry::FsEntry(size, true);
+        // From here the id is taken: the ledger keeps the counter even if the disk refuses
+        // (the bytes are then given back through the verified delete).
+        g.ledger = after;
+        let id = format!("file-{num:012x}{:012x}", id_tail());
+        let meta = FileMeta {
+            id: id.clone(),
+            filename,
+            bytes: size,
+            created_at: now_secs(),
+            purpose: purpose.to_string(),
+            mime_type,
+            downloadable,
+            owner: owner.0.clone(),
+            num,
+        };
+        let written = (|| {
+            write_atomic(
+                &self.dir.join(NEXT_FILE),
+                format!("{}\n", fs_next(after)).as_bytes(),
+            )
+            .map_err(|e| io_err("id counter", e))?;
+            let data = self.dir.join(format!("{id}.data"));
+            fs::rename(&staged.path, &data).map_err(|e| io_err("file data", e))?;
+            if let Err(e) = write_atomic(
+                &self.dir.join(format!("{id}.json")),
+                meta_json(&meta).as_bytes(),
+            ) {
+                let _ = fs::remove_file(&data);
+                return Err(io_err("file metadata", e));
+            }
+            Ok(())
+        })();
+        if let Err(e) = written {
+            g.ledger = fs_delete(g.ledger, entry);
+            return Err(e);
+        }
+        g.files.insert(
+            num,
+            Held {
+                meta: meta.clone(),
+                entry,
+            },
+        );
+        Ok(meta)
+    }
+
+    /// Stores `bytes` as a file (the server's own files, such as batch results).
+    pub fn create(
+        &self,
+        owner: &Owner,
+        filename: &str,
+        mime_type: Option<&str>,
+        purpose: &str,
+        downloadable: bool,
+        bytes: &[u8],
+    ) -> Result<FileMeta, FileError> {
+        let staged = self.stage(&mut &bytes[..])?;
+        self.commit(staged, owner, filename, mime_type, purpose, downloadable)
+    }
+
+    /// The metadata of `id`, if `owner` may use it.
+    pub fn get(&self, owner: &Owner, id: &str) -> Result<FileMeta, FileError> {
+        let g = self.lock();
+        id_num(id)
+            .and_then(|n| g.files.get(&n))
+            .filter(|h| h.visible_to(owner, id))
+            .map(|h| h.meta.clone())
+            .ok_or_else(|| FileError::NotFound(id.to_string()))
+    }
+
+    /// The files `owner` may use, oldest first.
+    pub fn list(&self, owner: &Owner) -> Vec<FileMeta> {
+        self.lock()
+            .files
+            .values()
+            .filter(|h| fs_live(h.entry) && owner.may_use(&h.meta.owner))
+            .map(|h| h.meta.clone())
+            .collect()
+    }
+
+    /// Opens `id`'s content for reading.
+    pub fn open_content(&self, owner: &Owner, id: &str) -> Result<(FileMeta, fs::File), FileError> {
+        let meta = self.get(owner, id)?;
+        let f = fs::File::open(self.dir.join(format!("{}.data", meta.id)))
+            .map_err(|_| FileError::NotFound(id.to_string()))?;
+        Ok((meta, f))
+    }
+
+    /// `id`'s content in memory: `Ok(Err(size))` when it is larger than `limit` bytes.
+    pub fn read_limited(
+        &self,
+        owner: &Owner,
+        id: &str,
+        limit: u64,
+    ) -> Result<Result<(FileMeta, Vec<u8>), u64>, FileError> {
+        let (meta, f) = self.open_content(owner, id)?;
+        if meta.bytes > limit {
+            return Ok(Err(meta.bytes));
+        }
+        let mut out = Vec::with_capacity(meta.bytes as usize);
+        f.take(limit.saturating_add(1))
+            .read_to_end(&mut out)
+            .map_err(|e| FileError::Io(format!("reading {id}: {e}")))?;
+        if out.len() as u64 > limit {
+            return Ok(Err(out.len() as u64));
+        }
+        Ok(Ok((meta, out)))
+    }
+
+    /// Deletes `id`: its metadata first (the file is gone from then on), then its data; the
+    /// ledger gives its bytes back once.
+    pub fn delete(&self, owner: &Owner, id: &str) -> Result<FileMeta, FileError> {
+        let mut g = self.lock();
+        let num = id_num(id)
+            .filter(|n| g.files.get(n).is_some_and(|h| h.visible_to(owner, id)))
+            .ok_or_else(|| FileError::NotFound(id.to_string()))?;
+        let meta_path = self.dir.join(format!("{id}.json"));
+        match fs::remove_file(&meta_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err("file metadata", e)),
+        }
+        let _ = fs::remove_file(self.dir.join(format!("{id}.data")));
+        let entry = g.files[&num].entry;
+        g.ledger = fs_delete(g.ledger, entry);
+        let held = g.files.get_mut(&num).expect("checked above");
+        held.entry = fs_kill(entry);
+        Ok(held.meta.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gaudium-files-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn files_are_stored_counted_and_kept_across_a_restart() {
+        let d = tmp("store");
+        let s = FileStore::open(&d, 100, 60).unwrap();
+        let me = Owner::of_key("k1");
+        let a = s
+            .create(&me, "dir/a.txt", None, "user_data", false, b"hello")
+            .unwrap();
+        assert!(a.id.starts_with("file-") && a.id.len() == 29, "{}", a.id);
+        assert_eq!(
+            (a.filename.as_str(), a.bytes, a.mime_type.as_str()),
+            ("a.txt", 5, "text/plain")
+        );
+        let b = s
+            .create(
+                &me,
+                "b.png",
+                None,
+                "vision",
+                false,
+                b"\x89PNG\r\n\x1a\nrest",
+            )
+            .unwrap();
+        assert_eq!(b.mime_type, "image/png");
+        assert_eq!(s.usage(), (5 + 12, 100 - 17, 100));
+        // ownership: another key finds nothing
+        let other = Owner::of_key("k2");
+        assert!(matches!(s.get(&other, &a.id), Err(FileError::NotFound(_))));
+        assert!(s.list(&other).is_empty());
+        assert!(matches!(
+            s.delete(&other, &a.id),
+            Err(FileError::NotFound(_))
+        ));
+        // per-file cap and quota, refused with their numbers
+        assert_eq!(
+            s.create(&me, "big", None, "batch", false, &[b'x'; 61]),
+            Err(FileError::TooLarge { cap: 60 })
+        );
+        s.create(&me, "c", None, "batch", false, &[b'x'; 60])
+            .unwrap();
+        match s.create(&me, "d", None, "batch", false, &[b'x'; 30]) {
+            Err(FileError::OverQuota {
+                size,
+                used,
+                free,
+                quota,
+            }) => {
+                assert_eq!((size, used, free, quota), (30, 77, 23, 100))
+            }
+            r => panic!("{r:?}"),
+        }
+        // a delete gives the bytes back once
+        s.delete(&me, &a.id).unwrap();
+        assert_eq!(s.usage().0, 72);
+        assert!(matches!(s.delete(&me, &a.id), Err(FileError::NotFound(_))));
+        assert_eq!(s.usage().0, 72);
+        drop(s);
+        // a restart reads the files back, and never hands out a deleted id again
+        let s = FileStore::open(&d, 100, 60).unwrap();
+        assert_eq!(s.usage().0, 72);
+        assert_eq!(s.list(&me).len(), 2);
+        assert_eq!(s.get(&me, &b.id).unwrap(), b);
+        let e = s.create(&me, "e", None, "batch", false, b"e").unwrap();
+        assert!(id_num(&e.id).unwrap() > id_num(&a.id).unwrap().max(id_num(&b.id).unwrap()) + 1);
+        let mut content = String::new();
+        s.open_content(&me, &b.id)
+            .unwrap()
+            .1
+            .read_to_string(&mut content)
+            .ok();
+        let (_, bytes) = s.read_limited(&me, &b.id, 100).unwrap().unwrap();
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\nrest");
+        assert_eq!(s.read_limited(&me, &b.id, 4).unwrap(), Err(12));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_counter_saved_past_the_last_file_is_kept() {
+        let d = tmp("counter");
+        let s = FileStore::open(&d, 100, 100).unwrap();
+        let me = Owner::everyone();
+        let a = s.create(&me, "a", None, "batch", false, b"a").unwrap();
+        let b = s.create(&me, "b", None, "batch", false, b"b").unwrap();
+        s.delete(&me, &b.id).unwrap();
+        drop(s);
+        let s = FileStore::open(&d, 100, 100).unwrap();
+        let c = s.create(&me, "c", None, "batch", false, b"c").unwrap();
+        assert!(id_num(&c.id).unwrap() > id_num(&b.id).unwrap());
+        assert_eq!(
+            s.list(&me).iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            [a.id, c.id]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn names_and_media_types() {
+        assert_eq!(clean_filename("C:\\x\\y.pdf"), "y.pdf");
+        assert_eq!(clean_filename("../"), "unnamed");
+        assert_eq!(clean_filename("a\u{0}b"), "ab");
+        assert_eq!(
+            detect_mime(Some("image/x-portable-pixmap"), "a", b"P6\n"),
+            "image/x-portable-pixmap"
+        );
+        assert_eq!(
+            detect_mime(Some("text/plain"), "a", b"%PDF-1.7"),
+            "application/pdf"
+        );
+        assert_eq!(detect_mime(None, "in.jsonl", b"{}"), "application/jsonl");
+        assert_eq!(
+            detect_mime(Some("application/octet-stream"), "x", b"plain words"),
+            "text/plain"
+        );
+        assert_eq!(
+            detect_mime(None, "x", b"\x00\x01\x02"),
+            "application/octet-stream"
+        );
+        assert_eq!(detect_mime(None, "x", "caf\u{e9}".as_bytes()), "text/plain");
+        assert_eq!(id_num("file-00000000002a0123456789ab"), Some(42));
+        assert_eq!(id_num("file-xyz"), None);
+        assert_eq!(id_num("file_00000000002a0123456789ab"), None);
+    }
+}

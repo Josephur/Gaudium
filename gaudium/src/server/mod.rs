@@ -18,6 +18,8 @@
 //!   `/gaudium/a2ui`, instructions hot-reloaded from `--a2ui-prompt <file>`; see `a2ui.rs`)
 //! - The MCP proxy for the Web UI's MCP servers (`--mcp-proxy`, `/cors-proxy`, `/gaudium/proxy`;
 //!   see `proxy.rs`)
+//! - The Files API in the OpenAI and the Messages-API shapes (`/v1/files`, `--files-dir`), and
+//!   `file_id` sources in chat and Messages requests; see `files.rs` and `file_store.rs`
 //!
 //! HTTP and HTTPS share the port (`--tls-cert`, `--tls-key`; see `conn.rs`): the first byte of a
 //! connection says which of the two the client speaks. With HTTPS served, a plain-HTTP request is
@@ -63,8 +65,11 @@ mod chat;
 mod chat_fields;
 mod completion;
 mod conn;
+pub mod file_store;
+mod files;
 mod jinja;
 mod lanes;
+mod multipart;
 mod outparse;
 mod penalty_fields;
 mod proxy;
@@ -187,6 +192,8 @@ pub struct ServerConfig {
     /// Bounds of the in-memory store of past responses (`--response-store`,
     /// `--response-store-mb`; 0 entries = off).
     pub response_store: ResponseStoreLimits,
+    /// The file store of the Files API (`--files-dir`, `--files-quota-gb`, `--files-max-mb`).
+    pub files: file_store::FileStoreOptions,
 }
 
 /// Token ids an own-MTP drafter reads out per draft (the old engine's measured default: the same
@@ -439,6 +446,8 @@ struct AppState {
     /// Past responses of `POST /v1/responses` (bounded; `response_store.rs`), and the request
     /// context of those still being generated.
     responses: response_store::ResponseStore,
+    /// The file store of the Files API; `None`: off (no `--files-dir`).
+    files: Option<Arc<file_store::FileStore>>,
 }
 
 impl AppState {
@@ -1798,6 +1807,19 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
     }
 
     let host_cache = host_cache_of(&cfg)?;
+    let files = match &cfg.files.dir {
+        Some(dir) => {
+            let st =
+                file_store::FileStore::open(dir, cfg.files.quota_bytes, cfg.files.max_file_bytes)?;
+            let (used, free, quota) = st.usage();
+            eprintln!(
+                "[server] Files API on: {used} of {quota} bytes in use, {free} free, files up to {} bytes",
+                st.cap()
+            );
+            Some(Arc::new(st))
+        }
+        None => None,
+    };
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
@@ -1842,6 +1864,7 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
         proxy,
         tls,
         host_cache,
+        files,
         lanes: lanes::LaneHub::new(n_models),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
@@ -1982,6 +2005,10 @@ struct HttpRequest {
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    /// For a request whose handler streams its body (an upload, `files::streams_body`): the body
+    /// bytes already read past the head; `body` is then empty and the rest is still on the
+    /// connection.
+    streamed: Option<Vec<u8>>,
 }
 
 fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
@@ -2034,6 +2061,19 @@ fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
         }
     }
 
+    if files::streams_body(&method, &path) {
+        let prefix = reader.buffer().to_vec();
+        return Ok(Some(HttpRequest {
+            method,
+            target: raw_target.to_string(),
+            path,
+            query,
+            headers,
+            body: Vec::new(),
+            streamed: Some(prefix),
+        }));
+    }
+
     let mut body = Vec::new();
     let is_chunked = headers
         .get("transfer-encoding")
@@ -2082,6 +2122,7 @@ fn read_http_request(stream: &mut Conn) -> Result<Option<HttpRequest>, String> {
         query,
         headers,
         body,
+        streamed: None,
     }))
 }
 
@@ -2132,6 +2173,7 @@ fn write_json(stream: &mut Conn, status: u16, json: &str) {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Payload Too Large",
         503 => "Service Unavailable",
         529 => "Overloaded",
         _ => "Internal Server Error",
@@ -2446,6 +2488,12 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
                 "invalid_request_error",
                 &format!("{} takes POST with a JSON body holding a 'prompt'", req.path),
             );
+        }
+        ("POST", "/v1/files") => files::handle_upload(&state, &req, &mut stream),
+        ("GET", "/v1/files") => files::handle_list(&state, &req, &mut stream),
+        ("GET", p) if p.starts_with("/v1/files/") => files::handle_file(&state, &req, &mut stream),
+        ("DELETE", p) if p.starts_with("/v1/files/") => {
+            files::handle_file(&state, &req, &mut stream)
         }
         ("POST", "/v1/messages/count_tokens") => handle_messages_count(&state, &req, &mut stream),
         ("POST", "/v1/responses") => handle_responses(&state, &req, &mut stream),
@@ -3527,7 +3575,7 @@ fn tokenize_prompt(
 
 fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let body_str = String::from_utf8_lossy(&req.body);
-    let Ok(val) = json::parse_json(&body_str) else {
+    let Ok(mut val) = json::parse_json(&body_str) else {
         write_error(stream, 400, "invalid_request_error", "invalid JSON body");
         return;
     };
@@ -3540,6 +3588,10 @@ fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mu
             return;
         }
     };
+    if let Err(e) = files::resolve_chat(state, req, &mut val) {
+        write_error(stream, 400, "invalid_request_error", &e);
+        return;
+    }
     run_chat(state, &val, stream, Api::Chat, ignored);
 }
 
@@ -3549,10 +3601,14 @@ fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) 
         show_thinking: true,
     };
     let body_str = String::from_utf8_lossy(&req.body);
-    let Ok(val) = json::parse_json(&body_str) else {
+    let Ok(mut val) = json::parse_json(&body_str) else {
         api.error(stream, 400, "invalid_request_error", "invalid JSON body");
         return;
     };
+    if let Err(e) = files::resolve_messages(state, req, &mut val) {
+        api.error(stream, 400, "invalid_request_error", &e);
+        return;
+    }
     match anthropic::translate(&val) {
         Ok(t) => run_chat(
             state,
@@ -3573,10 +3629,14 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut Conn)
         show_thinking: true,
     };
     let body_str = String::from_utf8_lossy(&req.body);
-    let Ok(val) = json::parse_json(&body_str) else {
+    let Ok(mut val) = json::parse_json(&body_str) else {
         api.error(stream, 400, "invalid_request_error", "invalid JSON body");
         return;
     };
+    if let Err(e) = files::resolve_messages(state, req, &mut val) {
+        api.error(stream, 400, "invalid_request_error", &e);
+        return;
+    }
     let rendered = anthropic::translate(&val).and_then(|t| {
         let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
         let p = prepare_prompt(state.cfg.a2ui, m, &t.chat)?;

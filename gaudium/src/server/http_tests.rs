@@ -358,6 +358,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
             cache_trim: None,
             profile: Vec::new(),
         response_store: ResponseStoreLimits::default(),
+            files: Default::default(),
         },
         models: vec![model("tags", chat::TEST_TEMPLATE, None)],
         slot: Mutex::new(EngineSlot {
@@ -395,6 +396,7 @@ fn harness_with_cache(host_cache: Option<Arc<crate::cache_ram::SharedCache>>) ->
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
         responses: response_store::ResponseStore::new(ResponseStoreLimits::default()),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
+        files: None,
     });
     let _ = model; // (one resident model per harness)
     Harness {
@@ -472,6 +474,7 @@ fn model_harness(id: &str, template: &str, config: Option<&str>, spec: Option<&s
         responses: response_store::ResponseStore::new(ResponseStoreLimits::default()),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
+        files: None,
     });
     Harness {
         state,
@@ -593,6 +596,7 @@ fn vision_harness(max_patches: u64, max_tokens: u64) -> Harness {
         lanes: lanes::LaneHub::new(1),
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
+        files: None,
     });
     Harness {
         state,
@@ -718,6 +722,10 @@ impl Harness {
         )
     }
 }
+
+/// The Files API and `file_id` sources.
+#[path = "http_files_tests.rs"]
+mod files_api;
 
 fn s<'a>(v: &'a JsonValue, path: &[&str]) -> &'a str {
     at(v, path)
@@ -1702,6 +1710,7 @@ fn served_engine_configuration_follows_the_server_options() {
         cache_trim: None,
         profile: Vec::new(),
         response_store: ResponseStoreLimits::default(),
+        files: Default::default(),
     };
     // a DSpine drafter: the adaptive pair of widths, the model's precision and cache
     let (q, drafter) = engine_config_of(&cfg, "a", Path::new("/models/Target"), 131_072);
@@ -2261,6 +2270,7 @@ fn vision_tower_follows_the_checkpoint_the_drafter_and_the_options() {
         cache_trim: None,
         profile: Vec::new(),
         response_store: ResponseStoreLimits::default(),
+        files: Default::default(),
     };
     // plain decode and the drafters that passed the vision suite on this (dense) family: the
     // server-wide tower
@@ -2931,6 +2941,7 @@ fn lane_harness(n: usize) -> Harness {
         recent: requests::RecentRequests::new(requests::RECENT_REQUESTS),
         responses: response_store::ResponseStore::new(ResponseStoreLimits::default()),
         stream_heartbeat_ms: AtomicU64::new(SSE_HEARTBEAT_MS),
+        files: None,
     });
     Harness { state, ..h }
 }

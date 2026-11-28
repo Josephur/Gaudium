@@ -113,6 +113,19 @@ pub const ROUTES: &[Route] = &[
     route("GET", "/completion", Inference),
     route("GET", "/completions", Inference),
     route("GET", "/v1/completions", Inference),
+    // the Files API: stored request content, owned by the key that uploaded it
+    route("POST", "/v1/files", Inference),
+    route("GET", "/v1/files", Inference),
+    Route {
+        method: Some("GET"),
+        path: RoutePath::Prefix("/v1/files/"),
+        kind: Inference,
+    },
+    Route {
+        method: Some("DELETE"),
+        path: RoutePath::Prefix("/v1/files/"),
+        kind: Inference,
+    },
 ];
 
 /// Path prefixes the API owns: a request under one that the table does not list needs the key.
@@ -367,6 +380,11 @@ mod tests {
             ("GET", "/v1/responses/resp_1/input_items"),
             ("DELETE", "/v1/responses/resp_1"),
             ("POST", "/v1/responses/resp_1/cancel"),
+            ("POST", "/v1/files"),
+            ("GET", "/v1/files"),
+            ("GET", "/v1/files/file-x"),
+            ("GET", "/v1/files/file-x/content"),
+            ("DELETE", "/v1/files/file-x"),
         ] {
             assert_eq!(kind(m, p), RouteKind::RouteInference, "{m} {p}");
             assert!(!admits(m, p, true, false), "{m} {p} served without the key");
