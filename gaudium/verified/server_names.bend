@@ -203,6 +203,47 @@ def hn_same_split(
       %Equal.sym(Bool, Nat.is_eq(hn_fold(x), hn_fold(x)), True{}, G.g_nat_eq_refl(hn_fold(x))) : {Bool.and(_, hn_same(hn_name_cat(ps, Con{a, xs}), hn_name_cat(ps, Con{b, ys}))) == False{} : Bool}
       hn_same_split(ps, a, b, xs, ys, ok)
 
+# Two names that compare the same never compare the same once each has a next byte and those
+# bytes differ once folded.
+def hn_same_split_same(
+  +p: List<&2, Nat>,
+  +q: List<&2, Nat>,
+  +a: Nat,
+  +b: Nat,
+  +xs: List<&2, Nat>,
+  +ys: List<&2, Nat>,
+  +okp: {hn_same(p, q) == True{} : Bool},
+  ok: {Nat.is_eq(hn_fold(a), hn_fold(b)) == False{} : Bool}
+) -> {hn_same(hn_name_cat(p, Con{a, xs}), hn_name_cat(q, Con{b, ys})) == False{} : Bool}:
+  match p q:
+    case Nil{} Nil{}:
+      %Equal.sym(Bool, Nat.is_eq(hn_fold(a), hn_fold(b)), False{}, ok) : {Bool.and(_, hn_same(xs, ys)) == False{} : Bool}
+      {==}
+    case Nil{} Con{+y, +qs}:
+      L.bool_absurd({hn_same(Con{a, xs}, Con{y, hn_name_cat(qs, Con{b, ys})}) == False{} : Bool}, okp)
+    case Con{+x, +ps} Nil{}:
+      L.bool_absurd({hn_same(Con{x, hn_name_cat(ps, Con{a, xs})}, Con{b, ys}) == False{} : Bool}, okp)
+    case Con{+x, +ps} Con{+y, +qs}:
+      +hx = hn_and_true_l(Nat.is_eq(hn_fold(x), hn_fold(y)), hn_same(ps, qs), okp)
+      +hr = hn_and_true_r(Nat.is_eq(hn_fold(x), hn_fold(y)), hn_same(ps, qs), okp)
+      %Equal.sym(Bool, Nat.is_eq(hn_fold(x), hn_fold(y)), True{}, hx) : {Bool.and(_, hn_same(hn_name_cat(ps, Con{a, xs}), hn_name_cat(qs, Con{b, ys}))) == False{} : Bool}
+      hn_same_split_same(ps, qs, a, b, xs, ys, hr, ok)
+
+# The verdict on a request whose Host is n, with m as the only name, is hn_same(n, m).
+def hn_one_name_true(+c: Bool, h: {Bool.and(Bool.or(c, False{}), True{}) == True{} : Bool}) -> {c == True{} : Bool}:
+  match c:
+    case True{}:
+      {==}
+    case False{}:
+      L.bool_absurd({False{} == True{} : Bool}, h)
+
+def hn_one_name_false(+c: Bool, h: {Bool.and(Bool.or(c, False{}), True{}) == False{} : Bool}) -> {c == False{} : Bool}:
+  match c:
+    case True{}:
+      L.bool_absurd_tf({True{} == False{} : Bool}, h)
+    case False{}:
+      {==}
+
 def hn_low_ne_aux(
   +x: Nat,
   +y: Nat,
@@ -562,11 +603,14 @@ def hn_fit_own_hosts_pass():
 #   hn_fold_capitals                  hn_name_case_ignored (section 4, sealed: every capital A..Z)
 #   hn_fold_last_capital              hn_last_capital_passes
 #   hn_fold_keeps_low                 hn_low_byte_adds_nothing, hn_at_sign_adds_nothing
-#   hn_fold_keeps_high                hn_high_byte_adds_nothing, hn_left_brace_adds_nothing
+#   hn_fold_keeps_high                hn_high_byte_adds_nothing, hn_left_brace_adds_nothing,
+#                                     hn_non_ascii_adds_nothing
 #   hn_same_shorter                   hn_longer_listed_name_adds_nothing
 #   hn_same_longer                    hn_longer_host_name_adds_nothing
-#   hn_same_byte_differs              hn_differing_byte_adds_nothing (after any common start)
-#   hn_same_rest_differs              hn_differing_byte_adds_nothing (with a common start)
+#   hn_same_byte_differs              hn_differing_byte_adds_nothing (after starts that compare the same)
+#   hn_same_rest_differs              hn_differing_byte_adds_nothing (starts that compare the same,
+#                                     a capital against its small letter among them),
+#                                     hn_case_start_rest_adds_nothing (a capital, then any rest)
 
 # promise: a listed name that is the requested name with more bytes after it never lets the request through
 # catches: an empty name taken as a match for any name (hn_same of Nil and Con gives True{})
@@ -592,20 +636,36 @@ law hn_longer_host_name_adds_nothing:
 def hn_longer_host_name_adds_nothing(m, y, ys, ns):
   hn_other_name_adds_nothing(hn_name_cat(m, Con{y, ys}), m, ns, hn_same_extended(m, y, ys))
 
-# promise: a listed name that has the requested name's start but then a byte that differs, once case is set aside, never lets the request through, whatever follows
+# promise: a listed name whose start compares the same as the requested name's start, but whose next byte differs once case is set aside, never lets the request through, whatever follows
 # catches: only the first bytes compared (the rest of the names ignored in hn_same)
 law hn_differing_byte_adds_nothing:
   for +p: List<&2, Nat>
+  for +q: List<&2, Nat>
   for +a: Nat
   for +b: Nat
   for +xs: List<&2, Nat>
   for +ys: List<&2, Nat>
   for +ns: List<&2, List<&2, Nat>>
+  for okp: {hn_request_ours(HnName{p}, Nil{}, Con{q, Nil{}}) == True{} : Bool}
   for ok: {Nat.is_eq(hn_fold(a), hn_fold(b)) == False{} : Bool}
-  {hn_request_ours(HnName{hn_name_cat(p, Con{a, xs})}, Nil{}, Con{hn_name_cat(p, Con{b, ys}), ns}) == hn_request_ours(HnName{hn_name_cat(p, Con{a, xs})}, Nil{}, ns) : Bool}
+  {hn_request_ours(HnName{hn_name_cat(p, Con{a, xs})}, Nil{}, Con{hn_name_cat(q, Con{b, ys}), ns}) == hn_request_ours(HnName{hn_name_cat(p, Con{a, xs})}, Nil{}, ns) : Bool}
 
-def hn_differing_byte_adds_nothing(p, a, b, xs, ys, ns, ok):
-  hn_other_name_adds_nothing(hn_name_cat(p, Con{a, xs}), hn_name_cat(p, Con{b, ys}), ns, hn_same_split(p, a, b, xs, ys, ok))
+def hn_differing_byte_adds_nothing(p, q, a, b, xs, ys, ns, okp, ok):
+  hn_other_name_adds_nothing(hn_name_cat(p, Con{a, xs}), hn_name_cat(q, Con{b, ys}), ns, hn_same_split_same(p, q, a, b, xs, ys, hn_one_name_true(hn_same(p, q), okp), ok))
+
+# promise: a listed name whose first byte is the small letter of the requested name's capital, but whose rest differs from the requested name's rest, never lets the request through
+# catches: a first byte that differs only in case taken as a match without comparing the rest (hn_same compares the rest only after identical bytes)
+law hn_case_start_rest_adds_nothing:
+  for +i: Nat
+  for ok: {Nat.is_lt(i, 26n) == True{} : Bool}
+  for +xs: List<&2, Nat>
+  for +ys: List<&2, Nat>
+  for +ns: List<&2, List<&2, Nat>>
+  for okr: {hn_request_ours(HnName{xs}, Nil{}, Con{ys, Nil{}}) == False{} : Bool}
+  {hn_request_ours(HnName{Con{Nat.add(65n, i), xs}}, Nil{}, Con{Con{Nat.add(97n, i), ys}, ns}) == hn_request_ours(HnName{Con{Nat.add(65n, i), xs}}, Nil{}, ns) : Bool}
+
+def hn_case_start_rest_adds_nothing(i, ok, xs, ys, ns, okr):
+  hn_other_name_adds_nothing(Con{Nat.add(65n, i), xs}, Con{Nat.add(97n, i), ys}, ns, hn_same_rest_differs(Nat.add(65n, i), Nat.add(97n, i), xs, ys, hn_one_name_false(hn_same(xs, ys), okr)))
 
 # promise: a byte below the capitals in the requested name is matched only by the same byte in a listed name
 # catches: the first bytes not compared (Bool.or in place of Bool.and in hn_same)
@@ -621,7 +681,7 @@ law hn_low_byte_adds_nothing:
   {hn_request_ours(HnName{hn_name_cat(p, Con{x, xs})}, Nil{}, Con{hn_name_cat(p, Con{y, ys}), ns}) == hn_request_ours(HnName{hn_name_cat(p, Con{x, xs})}, Nil{}, ns) : Bool}
 
 def hn_low_byte_adds_nothing(p, x, y, xs, ys, ns, okx, oky):
-  hn_differing_byte_adds_nothing(p, x, y, xs, ys, ns, hn_fold_low_ne(x, y, okx, oky))
+  hn_differing_byte_adds_nothing(p, p, x, y, xs, ys, ns, hn_listed_name_passes(p, Nil{}), hn_fold_low_ne(x, y, okx, oky))
 
 # promise: a byte above the small letters in the requested name, every non-ASCII byte among them, is never folded into a match with another byte
 # catches: the top bit of a byte dropped before folding (Nat.mod(b, 128n)), so a non-ASCII byte compares as an ASCII one
@@ -636,7 +696,7 @@ law hn_high_byte_adds_nothing:
   {hn_request_ours(HnName{hn_name_cat(p, Con{Nat.add(123n, b), xs})}, Nil{}, Con{hn_name_cat(p, Con{y, ys}), ns}) == hn_request_ours(HnName{hn_name_cat(p, Con{Nat.add(123n, b), xs})}, Nil{}, ns) : Bool}
 
 def hn_high_byte_adds_nothing(p, b, y, xs, ys, ns, oky):
-  hn_differing_byte_adds_nothing(p, Nat.add(123n, b), y, xs, ys, ns, hn_fold_high_ne(b, y, oky))
+  hn_differing_byte_adds_nothing(p, p, Nat.add(123n, b), y, xs, ys, ns, hn_listed_name_passes(p, Nil{}), hn_fold_high_ne(b, y, oky))
 
 # promise: @, the byte just below the capitals, never matches the byte 32 above it (the sampled bytes of hn_low_byte_adds_nothing stop short of it)
 # catches: the lower bound one too low (Nat.is_le(64n, b) in hn_fold)
@@ -656,6 +716,16 @@ law hn_left_brace_adds_nothing:
   {hn_request_ours(HnName{Con{123n, xs}}, Nil{}, Con{Con{91n, xs}, ns}) == hn_request_ours(HnName{Con{123n, xs}}, Nil{}, ns) : Bool}
 
 def hn_left_brace_adds_nothing(xs, ns):
+  {==}
+
+# promise: a non-ASCII byte is never folded: byte 192 never matches byte 224, 32 above it (the sampled bytes of hn_high_byte_adds_nothing stop short of them)
+# catches: non-ASCII capitals folded as well (bytes 192..222 also get 32 added in hn_fold)
+law hn_non_ascii_adds_nothing:
+  for +xs: List<&2, Nat>
+  for +ns: List<&2, List<&2, Nat>>
+  {hn_request_ours(HnName{Con{192n, xs}}, Nil{}, Con{Con{224n, xs}, ns}) == hn_request_ours(HnName{Con{192n, xs}}, Nil{}, ns) : Bool}
+
+def hn_non_ascii_adds_nothing(xs, ns):
   {==}
 
 # promise: a requested name starting with Z passes as the listed name starting with z (the sampled capitals of hn_name_case_ignored stop short of it)
