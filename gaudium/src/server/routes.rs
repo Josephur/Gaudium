@@ -88,6 +88,23 @@ pub const ROUTES: &[Route] = &[
     route("POST", "/chat/completions", Inference),
     route("POST", "/v1/messages", Inference),
     route("POST", "/v1/messages/count_tokens", Inference),
+    // the Responses API: a response is made, read, cancelled and deleted by its own client
+    route("POST", "/v1/responses", Inference),
+    Route {
+        method: Some("GET"),
+        path: RoutePath::Prefix("/v1/responses/"),
+        kind: Inference,
+    },
+    Route {
+        method: Some("DELETE"),
+        path: RoutePath::Prefix("/v1/responses/"),
+        kind: Inference,
+    },
+    Route {
+        method: Some("POST"),
+        path: RoutePath::Prefix("/v1/responses/"),
+        kind: Inference,
+    },
     route("POST", "/apply-template", Inference),
     route("POST", "/completion", Inference),
     route("POST", "/completions", Inference),
@@ -345,8 +362,14 @@ mod tests {
             ("POST", "/completion"),
             ("POST", "/completions"),
             ("POST", "/v1/completions"),
+            ("POST", "/v1/responses"),
+            ("GET", "/v1/responses/resp_1"),
+            ("GET", "/v1/responses/resp_1/input_items"),
+            ("DELETE", "/v1/responses/resp_1"),
+            ("POST", "/v1/responses/resp_1/cancel"),
         ] {
             assert_eq!(kind(m, p), RouteKind::RouteInference, "{m} {p}");
+            assert!(!admits(m, p, true, false), "{m} {p} served without the key");
         }
         for (m, p) in [
             ("POST", "/models/load"),

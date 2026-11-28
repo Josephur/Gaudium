@@ -325,17 +325,20 @@ impl StreamOut {
         self.take_in(d);
     }
 
-    /// One delta in: the block builder takes it at once (merged deltas would lose the order of
-    /// text and calls within a launch, #139); chat-completion chunks merge it into `pending`.
+    /// One delta in: the block or item builder takes it at once (merged deltas would lose the
+    /// order of text and calls within a launch, #139); chat-completion chunks merge it into
+    /// `pending`.
     fn take_in(&mut self, d: Delta) {
-        match self.anth.as_mut() {
-            Some(b) => {
-                let events = b.feed(&d);
-                if self.stream.is_some() {
-                    self.held.push_str(&events);
-                }
-            }
-            None => self.pending.append(d),
+        let events = if let Some(b) = self.anth.as_mut() {
+            b.feed(&d)
+        } else if let Some(b) = self.resp.as_mut() {
+            b.feed(&d)
+        } else {
+            self.pending.append(d);
+            return;
+        };
+        if self.stream.is_some() {
+            self.held.push_str(&events);
         }
     }
 

@@ -2416,8 +2416,14 @@ fn handle_request(state: Arc<AppState>, mut stream: Conn, loopback: bool) {
         }
         ("POST", "/v1/messages/count_tokens") => handle_messages_count(&state, &req, &mut stream),
         ("POST", "/v1/responses") => handle_responses(&state, &req, &mut stream),
-        (m, p) if p.starts_with("/v1/responses/") => {
-            handle_stored_response(&state, m, &p["/v1/responses/".len()..], &req, &mut stream);
+        ("GET", p) if p.starts_with("/v1/responses/") => {
+            handle_stored_response(&state, "GET", &p["/v1/responses/".len()..], &req, &mut stream);
+        }
+        ("DELETE", p) if p.starts_with("/v1/responses/") => {
+            handle_stored_response(&state, "DELETE", &p["/v1/responses/".len()..], &req, &mut stream);
+        }
+        ("POST", p) if p.starts_with("/v1/responses/") => {
+            handle_stored_response(&state, "POST", &p["/v1/responses/".len()..], &req, &mut stream);
         }
         ("POST", "/apply-template") => handle_apply_template(&state, &req, &mut stream),
         ("GET", _) => handle_static_ui(&state, &req.path, &mut stream, true),
@@ -2985,6 +2991,7 @@ impl Drop for Turn<'_> {
 impl TurnQueue {
     /// Waits for this request's turn on the card. `ready` reads the model loaded now (it takes the slot
     /// lock; this queue's lock is always taken first).
+    #[cfg(test)]
     fn acquire(
         &self,
         model: usize,
@@ -2992,6 +2999,19 @@ impl TurnQueue {
         limits: impl Fn() -> TurnLimits,
     ) -> Turn<'_> {
         self.acquire_from(model, Instant::now(), ready, limits)
+    }
+
+    /// [`Self::acquire`] for a request that may be cancelled while it waits: `gone` turns true
+    /// when it is (polled at least once a second, and on [`Self::wake`]). `None`: it left the
+    /// queue without the card.
+    fn acquire_unless(
+        &self,
+        model: usize,
+        ready: impl Fn() -> Option<usize>,
+        limits: impl Fn() -> TurnLimits,
+        gone: impl Fn() -> bool,
+    ) -> Option<Turn<'_>> {
+        self.wait_turn(model, Instant::now(), ready, limits, gone)
     }
 
     /// [`Self::acquire`] for a waiter that has waited since `since` (a lane session queues at its
@@ -3003,6 +3023,23 @@ impl TurnQueue {
         ready: impl Fn() -> Option<usize>,
         limits: impl Fn() -> TurnLimits,
     ) -> Turn<'_> {
+        self.wait_turn(model, since, ready, limits, || false)
+            .expect("a waiter that never gives up gets its turn")
+    }
+
+    /// Wakes every waiter, so one whose request was cancelled leaves the queue now.
+    fn wake(&self) {
+        self.cv.notify_all();
+    }
+
+    fn wait_turn(
+        &self,
+        model: usize,
+        since: Instant,
+        ready: impl Fn() -> Option<usize>,
+        limits: impl Fn() -> TurnLimits,
+        gone: impl Fn() -> bool,
+    ) -> Option<Turn<'_>> {
         let mut st = self.mu.lock().unwrap();
         let id = st.next_id;
         st.next_id += 1;
@@ -3017,6 +3054,13 @@ impl TurnQueue {
             },
         );
         loop {
+            if gone() {
+                // it leaves its place; the waiters behind it may now be next
+                st.waiting.retain(|w| w.id != id);
+                drop(st);
+                self.cv.notify_all();
+                return None;
+            }
             if !st.busy {
                 if let Some(pos) = next_turn(&st.waiting, ready(), Instant::now(), limits()) {
                     if st.waiting[pos].id == id {
@@ -3032,7 +3076,7 @@ impl TurnQueue {
                         }
                         st.waiting.remove(pos);
                         st.busy = true;
-                        return Turn(self);
+                        return Some(Turn(self));
                     }
                 }
             }
@@ -3231,8 +3275,11 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
         return;
     };
     let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if let Some(flag) = state.cancels.lock().unwrap().get(id) {
+    let flag = state.cancels.lock().unwrap().get(id).cloned();
+    if let Some(flag) = flag {
         flag.store(true, Ordering::Relaxed);
+        // a request that waits for the card leaves the queue now
+        state.turns.wake();
         write_json(stream, 200, "{\"ok\":true}");
     } else {
         write_json(stream, 200, "{\"ok\":false}");
@@ -3297,6 +3344,52 @@ impl Api {
             Api::Responses => responses::stream_error(msg),
         }
     }
+}
+
+/// A request's entry in the cancel table (`AppState::cancels`); dropping it removes the entry,
+/// so a request leaves no entry behind on any way out.
+struct CancelEntry<'a> {
+    cancels: &'a Mutex<HashMap<String, Arc<AtomicBool>>>,
+    id: &'a str,
+}
+
+impl Drop for CancelEntry<'_> {
+    fn drop(&mut self) {
+        self.cancels.lock().unwrap().remove(self.id);
+    }
+}
+
+/// Ends a response: closes its open item, keeps it in the store unless the request said
+/// `store: false`, a DELETE reached it, or the store can not take it, and hands the response
+/// object to a cancel waiting for it. Returns the events still to write (the terminal one last)
+/// and the response object.
+fn end_response(
+    state: &AppState,
+    b: &mut responses::Builder,
+    req_id: &str,
+    ending: responses::Ending,
+    usage: &str,
+    extra: &str,
+) -> (String, String) {
+    let mut events = b.close(ending);
+    let stored = match state.responses.put(req_id, b.head().store, || {
+        response_store::StoredResponse {
+            id: req_id.to_string(),
+            response: b.response(ending, None, usage, true, extra, false),
+            input: b.head().input.clone(),
+            own_from: b.head().own_from,
+        }
+    }) {
+        Ok(kept) => kept,
+        Err(e) => {
+            eprintln!("[server] response {req_id} not stored: {e}");
+            false
+        }
+    };
+    let resp = b.response(ending, None, usage, stored, extra, false);
+    state.responses.settle(req_id, &resp);
+    events.push_str(&b.finish(ending, &resp));
+    (events, resp)
 }
 
 /// The events that end a stream that failed: a response that began ends as `response.failed`
@@ -3553,11 +3646,13 @@ fn handle_stored_response(
         ("DELETE", "") => match state.responses.delete(id) {
             response_store::Deleted::None => not_found(stream, id),
             found => {
-                // a response still being generated stops at its next step and is not kept
+                // a response still being generated stops at its next step, or leaves the card's
+                // queue if it waits there, and is not kept
                 if found == response_store::Deleted::Running {
                     if let Some(flag) = state.cancels.lock().unwrap().get(id) {
                         flag.store(true, Ordering::Relaxed);
                     }
+                    state.turns.wake();
                 }
                 write_json(
                     stream,
@@ -3590,6 +3685,8 @@ fn handle_stored_response(
             match (flag, watch) {
                 (Some(flag), Some(watch)) => {
                     flag.store(true, Ordering::Relaxed);
+                    // (one that waits for the card leaves the queue now)
+                    state.turns.wake();
                     // the reply is the response as its generation ends it (the same object its
                     // own request and a later GET see), once the generation has it
                     match watch.wait(CANCEL_REPLY_WAIT) {
@@ -4028,8 +4125,9 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     // no reasoning span (its output is its text as generated): its parser already reported the
     // field as unknown.
     let think_close_ids: Vec<i32> = m.tokenizer.encode(&m.format.think_close, true);
+    // (the Responses translation sets no budget: its reasoning control is `reasoning.effort`)
     let think_field = match api {
-        Api::Chat | Api::Completion { .. } => "thinking_budget_tokens",
+        Api::Chat | Api::Completion { .. } | Api::Responses => "thinking_budget_tokens",
         Api::Messages { .. } => "thinking.budget_tokens",
     };
     let think_budget = match val.get("thinking_budget_tokens").and_then(|v| v.as_u64()) {
@@ -4067,6 +4165,26 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         return;
     }
     let cancel_flag = Arc::new(AtomicBool::new(false));
+    // The request can be cancelled from now on (`/v1/chat/completions/control`, a DELETE or a
+    // cancel of a response), while it waits for the card too: a cancelled request leaves the
+    // queue and never reaches the engine. The entry goes when this function returns.
+    state
+        .cancels
+        .lock()
+        .unwrap()
+        .insert(req_id.clone(), Arc::clone(&cancel_flag));
+    let _cancel_entry = CancelEntry {
+        cancels: &state.cancels,
+        id: &req_id,
+    };
+    // Verified RequestGuard tracks request lifecycle transitions!
+    let mut rguard = RequestGuard::new();
+    fn step_request_guard(rguard: &mut RequestGuard, ev: ReqEvent, req_id: &str) {
+        if let Err(e) = rguard.apply(ev) {
+            eprintln!("[server] request {req_id} invalid lifecycle transition: {e:?}");
+            debug_assert!(false, "request {req_id} invalid lifecycle transition: {e:?}");
+        }
+    }
     // A streamed request is admitted: its stream begins now, before it waits for the card (the
     // queue, a model load, a lane) and for its prefill, and a keep-alive goes out whenever a
     // heartbeat passes without a write, so no idle timeout cuts a reply that has not begun. A
@@ -4102,9 +4220,9 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         )
     });
     // An error after the stream began: an error event, then the end of the stream.
-    let mut stream_fail = |status: u16, msg: &str| {
+    let stream_fail = |resp: &mut Option<responses::Builder>, status: u16, msg: &str| {
         if let Some(s) = &sink {
-            let _ = s.write(stream_fail_events(api, resp_start.as_mut(), status, msg).as_bytes());
+            let _ = s.write(stream_fail_events(api, resp.as_mut(), status, msg).as_bytes());
             s.end();
         }
     };
@@ -4142,19 +4260,66 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let lane_mode = m.lanes > 1;
     // One turn covers the model load and the generation, so no request for another model can swap the card
     // between them; a request for the model already on the card may go ahead of older ones (TurnQueue).
-    let turn = (!lane_mode).then(|| {
-        state.turns.acquire(
-            idx,
-            || state.ready_model(),
-            || TurnLimits::read(state.cfg.queue_config.as_deref()),
-        )
-    });
+    // A request cancelled while it waits leaves the queue (`None`).
+    let turn = (!lane_mode)
+        .then(|| {
+            state.turns.acquire_unless(
+                idx,
+                || state.ready_model(),
+                || TurnLimits::read(state.cfg.queue_config.as_deref()),
+                || cancel_flag.load(Ordering::Relaxed),
+            )
+        })
+        .flatten();
+
+    // Cancelled while it waited (a cancel, a DELETE of its response, or the client gone): the
+    // request ends here, without the engine.
+    let end_cancelled = |resp: &mut Option<responses::Builder>, stream: &mut Conn| {
+        state.publish_request(
+            req_num,
+            format!(
+                "{{{}}}",
+                req_base("cancelled", t_arrival.elapsed().as_secs_f64() * 1e3)
+            ),
+        );
+        let client_gone = sink.as_ref().is_some_and(SseSink::failed);
+        if let Some(mut b) = resp.take() {
+            // the response ends as cancelled, with no output; kept unless it was deleted
+            let (events, r) =
+                end_response(state, &mut b, &req_id, responses::Ending::Cancelled, "null", "");
+            match &sink {
+                Some(s) => {
+                    let _ = s.write(events.as_bytes());
+                    s.end();
+                }
+                None => write_json(stream, 200, &r),
+            }
+        } else if !client_gone {
+            let msg = "the request was cancelled before it started";
+            match &sink {
+                Some(s) => {
+                    let _ = s.write(api.stream_error(409, msg).as_bytes());
+                    s.end();
+                }
+                None => api.error(stream, 409, "cancelled", msg),
+            }
+        }
+    };
+    // (before any model load: a deleted request never swaps the card's model)
+    if cancel_flag.load(Ordering::Relaxed) {
+        drop(turn);
+        rguard.cancel();
+        debug_assert!(rguard.is_terminal());
+        end_cancelled(&mut resp_start, stream);
+        return;
+    }
 
     // Ensure target model is loaded on Gaudi 2 before starting generation.
     if let Err(e) = (!lane_mode)
         .then(|| state.ensure_loaded(idx, false))
         .unwrap_or(Ok(()))
     {
+        step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
         state.publish_request(
             req_num,
             format!(
@@ -4164,34 +4329,20 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             ),
         );
         if stream_mode {
-            stream_fail(503, &e);
+            stream_fail(&mut resp_start, 503, &e);
         } else {
             api.error(stream, 503, "unavailable_error", &e);
         }
         return;
     }
 
-    state
-        .cancels
-        .lock()
-        .unwrap()
-        .insert(req_id.clone(), Arc::clone(&cancel_flag));
-
-    // Verified RequestGuard tracks request lifecycle transitions!
-    let mut rguard = RequestGuard::new();
-    fn step_request_guard(rguard: &mut RequestGuard, ev: ReqEvent, req_id: &str) {
-        if let Err(e) = rguard.apply(ev) {
-            eprintln!("[server] request {req_id} invalid lifecycle transition: {e:?}");
-            debug_assert!(false, "request {req_id} invalid lifecycle transition: {e:?}");
-        }
-    }
-
-    // The client went away while the request waited (a keep-alive found it gone): the engine
-    // does not take the request.
-    if sink.as_ref().is_some_and(SseSink::failed) {
-        state.cancels.lock().unwrap().remove(&req_id);
+    // Cancelled while the model loaded (the client gone included: its keep-alive sets the flag):
+    // the engine does not take the request.
+    if cancel_flag.load(Ordering::Relaxed) || sink.as_ref().is_some_and(SseSink::failed) {
+        drop(turn);
         rguard.cancel();
         debug_assert!(rguard.is_terminal());
+        end_cancelled(&mut resp_start, stream);
         return;
     }
 
@@ -4256,7 +4407,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 ),
             );
             if stream_mode {
-                stream_fail(503, &e);
+                stream_fail(&mut resp_start, 503, &e);
             } else {
                 api.error(stream, 503, "unavailable_error", &e);
             }
@@ -4305,7 +4456,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                     ),
                 );
                 if stream_mode {
-                    stream_fail(503, msg);
+                    stream_fail(&mut resp_start, 503, msg);
                 } else {
                     api.error(stream, 503, "unavailable_error", msg);
                 }
@@ -4651,7 +4802,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     out.add(tail_delta);
     let pending = out.take_pending();
     let builder = out.anth.take();
-    let resp_builder = out.resp.take();
+    let mut resp_builder = out.resp.take();
     let first_token_ms = out.first_token_ms();
 
     match report {
@@ -4864,28 +5015,11 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 );
                 let extra = format!(",\"timings\":{timings_json},\"gaudium\":{details}");
                 let mut events = out.take_held() + &b.feed(&pending);
-                events.push_str(&b.close(ending));
-                // kept unless the request said `store: false`, a DELETE reached it while it ran,
-                // or the store cannot take it
-                let stored = match state.responses.put(&req_id, b.head().store, || {
-                    response_store::StoredResponse {
-                        id: req_id.clone(),
-                        response: b.response(ending, None, &usage, true, &extra, false),
-                        input: b.head().input.clone(),
-                        own_from: b.head().own_from,
-                    }
-                }) {
-                    Ok(kept) => kept,
-                    Err(e) => {
-                        eprintln!("[server] response {req_id} not stored: {e}");
-                        false
-                    }
-                };
-                let resp = b.response(ending, None, &usage, stored, &extra, false);
-                state.responses.settle(&req_id, &resp);
+                let (end_events, resp) =
+                    end_response(state, &mut b, &req_id, ending, &usage, &extra);
+                events.push_str(&end_events);
                 if stream_mode {
                     out.write(&events);
-                    out.write(&b.finish(ending, &resp));
                     if let Some(s) = &sink {
                         s.end();
                     }

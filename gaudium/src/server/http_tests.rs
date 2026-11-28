@@ -4410,6 +4410,134 @@ fn responses_delete_while_running_cancels_it_and_keeps_nothing() {
     assert_eq!(h.state.responses.live_held(), (0, 0));
 }
 
+impl Harness {
+    /// Waits until a second request, besides `held`, can be cancelled (it waits for the card),
+    /// and returns its id.
+    fn queued_request(&self, held: &str) -> String {
+        let t0 = std::time::Instant::now();
+        loop {
+            let ids: Vec<String> = self
+                .state
+                .cancels
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| *k != held)
+                .cloned()
+                .collect();
+            if let [id] = ids.as_slice() {
+                return id.clone();
+            }
+            assert!(t0.elapsed() < Duration::from_secs(20), "no second request queued");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Waits up to 10 s for `t` to finish while the held generation stays held.
+    fn ends_while_held<T>(&self, t: &thread::ScopedJoinHandle<'_, T>) {
+        let t0 = std::time::Instant::now();
+        while !t.is_finished() {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "the cancelled request still waits for the card"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(self.tier.lock().unwrap().paused, "the held request was let go");
+    }
+
+    fn engine_prompts(&self) -> usize {
+        self.prompts.lock().unwrap().len()
+    }
+}
+
+/// Lets a held generation go when dropped, so a failed assertion never leaves a test waiting.
+struct ReleaseOnDrop<'a>(&'a Harness);
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// A streamed response that waits for the card (another request holds it) and is deleted
+/// leaves the queue at once: its stream ends as cancelled, it never reaches the engine, and
+/// nothing is kept.
+#[test]
+fn responses_delete_while_queued_never_reaches_the_engine() {
+    let h = harness();
+    h.script("</think>\n\nabcdefghijklmnopqrstuvwxyz");
+    h.script("</think>\n\nnever generated");
+    h.hold_after(3);
+    thread::scope(|sc| {
+        let _release = ReleaseOnDrop(&h);
+        let first = sc.spawn(|| h.post("/v1/responses", r#"{"input":"Hi"}"#));
+        let held = h.held_request();
+        let queued = sc.spawn(|| h.post("/v1/responses", r#"{"input":"Later","stream":true}"#));
+        let id = h.queued_request(&held);
+        assert!(id.starts_with("resp_"), "{id}");
+        assert_eq!(h.engine_prompts(), 1);
+        let (status, del) = h.exchange("DELETE", &format!("/v1/responses/{id}"), "");
+        assert_eq!(status, 200, "{del}");
+        // it ends while the first still holds the card
+        h.ends_while_held(&queued);
+        let (status, body) = queued.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        let evs = responses_events(&body);
+        assert_eq!(
+            types(&evs),
+            // (the API has no event of its own for a cancelled response)
+            ["response.created", "response.in_progress", "response.incomplete"],
+            "{body}"
+        );
+        let r = at(evs.last().unwrap(), &["response"]);
+        assert_eq!(s(r, &["id"]), id);
+        assert_eq!(s(r, &["status"]), "cancelled");
+        assert_eq!(at(r, &["store"]).as_bool(), Some(false));
+        assert!(at(r, &["output"]).as_array().unwrap().is_empty());
+        h.release();
+        let (status, text) = first.join().unwrap();
+        assert_eq!(status, 200, "{text}");
+    });
+    // the deleted request never reached the engine, and nothing of it is kept
+    assert_eq!(h.engine_prompts(), 1);
+    assert_eq!(h.replies.lock().unwrap().len(), 1, "its reply was taken");
+    assert!(h.state.cancels.lock().unwrap().is_empty());
+    assert_eq!(h.state.turns.mu.lock().unwrap().waiting.len(), 0);
+    assert_eq!(h.state.responses.live_held(), (0, 0));
+}
+
+/// A cancel of a response that waits for the card answers with the cancelled response, which
+/// is kept and never reached the engine.
+#[test]
+fn responses_cancel_while_queued_answers_and_keeps_the_response() {
+    let h = harness();
+    h.script("</think>\n\nabcdefghijklmnopqrstuvwxyz");
+    h.hold_after(3);
+    thread::scope(|sc| {
+        let _release = ReleaseOnDrop(&h);
+        let first = sc.spawn(|| h.post("/v1/chat/completions", r#"{"messages":[{"role":"user","content":"Hi"}]}"#));
+        let held = h.held_request();
+        let queued = sc.spawn(|| h.post("/v1/responses", r#"{"input":"Later"}"#));
+        let id = h.queued_request(&held);
+        let (status, cancelled) = h.post(&format!("/v1/responses/{id}/cancel"), "");
+        assert_eq!(status, 200, "{cancelled}");
+        h.ends_while_held(&queued);
+        let (status, own) = queued.join().unwrap();
+        assert_eq!(status, 200, "{own}");
+        let own = json::parse_json(&own).unwrap();
+        assert_eq!(json::parse_json(&cancelled).unwrap(), own);
+        assert_eq!(s(&own, &["status"]), "cancelled");
+        assert_eq!(at(&own, &["store"]).as_bool(), Some(true));
+        let (status, got) = h.get(&format!("/v1/responses/{id}"));
+        assert_eq!(status, 200);
+        assert_eq!(json::parse_json(&got).unwrap(), own);
+        h.release();
+        assert_eq!(first.join().unwrap().0, 200);
+    });
+    assert_eq!(h.engine_prompts(), 1);
+}
+
 #[test]
 fn responses_cancel_answers_with_the_response_its_generation_ends() {
     let h = harness();
