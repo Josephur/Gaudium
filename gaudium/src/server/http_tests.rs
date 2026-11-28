@@ -3601,11 +3601,6 @@ fn chat_refuses_fields_whose_ignoring_would_go_unseen() {
         (",\"n\":2", "n"),
         (",\"logprobs\":true", "logprobs"),
         (",\"logprobs\":true,\"top_logprobs\":3", "logprobs"),
-        (",\"response_format\":{\"type\":\"json_object\"}", "response_format"),
-        (
-            ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"w\",\"schema\":{\"type\":\"object\"}}}",
-            "response_format",
-        ),
     ] {
         let (status, r) = h.chat(extra);
         assert_eq!(status, 400, "{extra}: {}", r.dump());
@@ -3940,7 +3935,7 @@ fn chat_penalties_are_applied_not_reported_as_ignored() {
         "{}",
         r.dump()
     );
-
+}
 
 // ---- structured output (#107) ----
 

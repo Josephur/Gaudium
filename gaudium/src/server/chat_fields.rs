@@ -3,13 +3,12 @@
 //! - **applied**: the chat path reads the field and acts on it;
 //! - **ignored**: accepted but not applied; the reply names it in `gaudium.ignored`;
 //! - **refused**: a 400 that names the field, because ignoring it would change what the client
-//!   gets in a way the client cannot see (`n: 3` and one choice back, a JSON schema and free
-//!   text back).
+//!   gets in a way the client cannot see (`n: 3` and one choice back, `logprobs: true` and no
+//!   log probabilities back).
 //!
 //! A field outside the table is reported in `gaudium.ignored` as unknown, never refused, so a
 //! client written for a newer API keeps working. An ignored or refused field whose value changes
-//! nothing (`n: 1`, `logprobs: false`, `response_format: {"type": "text"}`, a zero penalty, or
-//! `null`) is neither reported nor refused. As a feature lands, its field moves to `Applied`
+//! nothing (`n: 1`, `logprobs: false`, `stream_options: {"include_usage": true}`, or `null`) is neither reported nor refused. As a feature lands, its field moves to `Applied`
 //! here (and the code that reads it moves into the chat path).
 //!
 //! This is request parsing (AGENTS.md 3a, second list): it decides only whether the request is
@@ -99,6 +98,8 @@ const FIELDS: &[Field] = &[
     applied("logit_bias"),
     // the reasoning span's token budget (the Messages API's `thinking.budget_tokens`)
     applied("thinking_budget_tokens"),
+    // structured output (`server/structured.rs` parses it)
+    applied("response_format"),
     // refused: ignoring them changes the reply without a sign
     refused(
         "n",
@@ -114,11 +115,6 @@ const FIELDS: &[Field] = &[
         "top_logprobs",
         "token log probabilities are not returned yet",
         is_zero,
-    ),
-    refused(
-        "response_format",
-        "constrained output (JSON mode, JSON schema) is not available yet; only {\"type\": \"text\"} is accepted",
-        is_text_format,
     ),
     // ignored and reported
     ignored(
@@ -244,11 +240,6 @@ fn is_empty_array(v: &JsonValue) -> bool {
 }
 
 /// `{"type": "text"}`: plain text, what the reply is anyway.
-fn is_text_format(v: &JsonValue) -> bool {
-    v.as_object()
-        .is_some_and(|o| o.len() == 1 && v.get("type").and_then(JsonValue::as_str) == Some("text"))
-}
-
 /// `["text"]`: text out, what the reply is anyway.
 fn is_text_modalities(v: &JsonValue) -> bool {
     v.as_array()
@@ -329,14 +320,6 @@ mod tests {
             (r#"{"n":0}"#, "n"),
             (r#"{"logprobs":true}"#, "logprobs"),
             (r#"{"top_logprobs":5}"#, "top_logprobs"),
-            (
-                r#"{"response_format":{"type":"json_object"}}"#,
-                "response_format",
-            ),
-            (
-                r#"{"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{}}}}"#,
-                "response_format",
-            ),
         ] {
             let e = run(body).unwrap_err();
             assert_eq!(e.field, field, "{body}");
@@ -346,11 +329,8 @@ mod tests {
 
     #[test]
     fn a_long_value_is_cut_in_the_message() {
-        let schema = "x".repeat(500);
-        let e = run(&format!(
-            r#"{{"response_format":{{"type":"json_schema","s":"{schema}"}}}}"#
-        ))
-        .unwrap_err();
+        let long = "x".repeat(500);
+        let e = run(&format!(r#"{{"n":{{"s":"{long}"}}}}"#)).unwrap_err();
         assert!(e.message.len() < 300, "{}", e.message);
         assert!(e.message.contains("..."));
     }
