@@ -143,9 +143,7 @@ pub fn plan(
         open: format.tool_open.clone(),
         close: format.tool_close.clone(),
         form,
-        // a reply the prompt did not start in the reasoning may still open it (a model that
-        // writes its own opening tag); a forced call's opening is already the reply's start
-        think: (!prompt.reasoning_open && prompt.forced_prefix.is_empty())
+        think: offers_reasoning(prompt, format)
             .then(|| (format.think_open.clone(), format.think_close.clone())),
     };
     let grammar = build::reply(req.answer.as_ref(), &req.tools, &tags)?;
@@ -167,6 +165,17 @@ pub fn plan(
         start,
         label: req.label.clone(),
     }))
+}
+
+/// The reply may open the model's reasoning itself: the prompt neither opened it (the reply
+/// then starts inside it) nor closed it (reasoning turned off renders an empty block), and no
+/// forced call's opening starts the reply.
+fn offers_reasoning(prompt: &ChatPrompt, format: &OutputFormat) -> bool {
+    let close = format.think_close.trim();
+    !prompt.reasoning_open
+        && prompt.forced_prefix.is_empty()
+        && !close.is_empty()
+        && !prompt.text.trim_end().ends_with(close)
 }
 
 /// The grammar's view of a model's vocabulary, built once per model (and end-token set).
@@ -291,6 +300,21 @@ mod tests {
         use crate::grammar::vocab::Kind;
         let bytes: Vec<Vec<u8>> = (0u8..128).map(|b| vec![b]).collect();
         plan(r, p, f, Arc::new(TokenTable::new(bytes, vec![Kind::Text; 128]))).unwrap()
+    }
+
+    #[test]
+    fn reasoning_is_offered_only_where_the_prompt_left_it_open() {
+        let f = OutputFormat::default();
+        let mut p = prompt(None);
+        p.text = "<|im_start|>assistant\n".into();
+        assert!(offers_reasoning(&p, &f));
+        // reasoning turned off: the template closed an empty block
+        p.text = "<|im_start|>assistant\n<think>\n\n</think>\n\n".into();
+        assert!(!offers_reasoning(&p, &f));
+        // the prompt opened it: the reply starts inside it (the verified reasoning phase)
+        p.text = "<|im_start|>assistant\n<think>\n".into();
+        p.reasoning_open = true;
+        assert!(!offers_reasoning(&p, &f));
     }
 
     #[test]
