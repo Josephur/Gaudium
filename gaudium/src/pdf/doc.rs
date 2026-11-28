@@ -15,6 +15,13 @@
 //! each key of a trailer merged and each entry or row of the cross-reference data. The memory
 //! the cross-reference map and the object cache keep is charged to the object budget, entry by
 //! entry, as they grow.
+//!
+//! An object is named by its number and its generation (section 7.3.10). The cross-reference
+//! data records the generation of every object in use (an object inside an object stream has
+//! generation 0), the header `N G obj` at its offset must name the same pair, and the cache is
+//! keyed by the pair. A reference whose generation is not the one recorded (a reference to an
+//! object that was freed and whose number was reused) reads as null, the value of a reference
+//! to a missing object (section 7.3.10), so it never reaches the replacement.
 
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
@@ -36,15 +43,18 @@ const TAIL: usize = 4096;
 /// twice its entries with a control byte each, and holds the old table beside the new one
 /// while it grows.
 const XREF_ENTRY_COST: u64 = 4 * (size_of::<(u32, Loc)>() as u64 + 1);
+/// An object's name: its number and its generation.
+type Key = (u32, u16);
 /// The memory one entry of the object cache is charged for besides the object (charged by its
 /// parse), on the same terms.
-const CACHE_ENTRY_COST: u64 = 4 * (size_of::<(u32, Obj)>() as u64 + 1);
+const CACHE_ENTRY_COST: u64 = 4 * (size_of::<(Key, Obj)>() as u64 + 1);
 
 #[derive(Clone, Copy, Debug)]
 enum Loc {
-    /// At a byte offset of the file.
-    At(u64),
-    /// Entry `index` of the object stream `stream`.
+    /// At a byte offset of the file, with the generation the cross-reference data gives it
+    /// (wider than a reference's, so a generation no reference can name is kept as such).
+    At(u64, u32),
+    /// Entry `index` of the object stream `stream` (generation 0).
     InStream(u32, u64),
     /// A free entry: the object was deleted, and an older section's definition of it does not
     /// count (it reads as null).
@@ -62,7 +72,7 @@ pub(crate) struct Doc<'a> {
     data: &'a [u8],
     xref: HashMap<u32, Loc>,
     pub trailer: Dict,
-    cache: HashMap<u32, Obj>,
+    cache: HashMap<Key, Obj>,
     objstm: HashMap<u32, Rc<ObjStm>>,
     /// Offsets of every `endstream` keyword (found once, for streams whose /Length is wrong).
     endstreams: Option<Vec<usize>>,
@@ -86,6 +96,12 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+/// A generation read from the cross-reference data or a header, saturated into a `u32` (one
+/// past a reference's widest is as good as any larger value: no reference names it).
+fn generation(g: u64) -> u32 {
+    u32::try_from(g).unwrap_or(u32::MAX)
 }
 
 fn non_negative(o: Option<&Obj>) -> Option<u64> {
@@ -233,7 +249,7 @@ impl<'a> Doc<'a> {
             for k in 0..count {
                 // every entry is a step
                 self.work.take(1)?;
-                let (Some(off), Some(_gen)) = (lx.read_uint(), lx.read_uint()) else {
+                let (Some(off), Some(gen)) = (lx.read_uint(), lx.read_uint()) else {
                     return Err(Fail::damaged("a damaged xref entry"));
                 };
                 let in_use = if lx.eat_keyword(b"n") {
@@ -245,7 +261,9 @@ impl<'a> Doc<'a> {
                 };
                 let num = start.checked_add(k).and_then(|n| u32::try_from(n).ok());
                 match (in_use, num) {
-                    (true, Some(num)) if off > 0 => self.insert(num, Loc::At(off))?,
+                    (true, Some(num)) if off > 0 => {
+                        self.insert(num, Loc::At(off, generation(gen)))?
+                    }
                     (false, Some(num)) => free.push(num),
                     _ => {}
                 }
@@ -262,7 +280,7 @@ impl<'a> Doc<'a> {
 
     /// The xref stream at file offset `off`; returns it (its dictionary is the trailer).
     fn xref_stream_at(&mut self, off: u64) -> Result<Rc<Stream>, Fail> {
-        let Some((_, obj)) = self.parse_at(off, 0)? else {
+        let Some((_, _, obj)) = self.parse_at(off, 0)? else {
             return Err(Fail::damaged("no cross-reference data at startxref"));
         };
         let Obj::Stream(s) = obj else {
@@ -324,7 +342,8 @@ impl<'a> Doc<'a> {
                 };
                 match kind {
                     0 => self.insert(num, Loc::Free)?,
-                    1 if f2 > 0 => self.insert(num, Loc::At(f2))?,
+                    // field 3 of a type-1 row is the generation (0 when the field is absent)
+                    1 if f2 > 0 => self.insert(num, Loc::At(f2, generation(f3)))?,
                     2 => {
                         if let Ok(stm) = u32::try_from(f2) {
                             self.insert(num, Loc::InStream(stm, f3))?;
@@ -372,14 +391,18 @@ impl<'a> Doc<'a> {
                 continue;
             }
             let mut lx = Lexer::words(data, j);
-            let (Some(num), Some(_)) = (lx.read_uint(), lx.read_uint()) else {
+            let (Some(num), Some(gen)) = (lx.read_uint(), lx.read_uint()) else {
                 continue;
             };
             if let Ok(num) = u32::try_from(num) {
                 // every header found is a step; a later definition of an object replaces an
-                // earlier one, and a new entry is charged
+                // earlier one (whatever its generation), and a new entry is charged
                 self.work.take(1)?;
-                if self.xref.insert(num, Loc::At(j as u64)).is_none() {
+                if self
+                    .xref
+                    .insert(num, Loc::At(j as u64, generation(gen)))
+                    .is_none()
+                {
                     self.objects.take(XREF_ENTRY_COST)?;
                 }
             }
@@ -397,10 +420,18 @@ impl<'a> Doc<'a> {
             }
         }
         if trailer.as_ref().is_none_or(|t| t.get(b"Root").is_none()) {
-            let mut nums: Vec<u32> = self.xref.keys().copied().collect();
-            nums.sort_unstable();
-            for num in nums {
-                let o = match self.resolve(num, 0) {
+            let mut keys: Vec<Key> = self
+                .xref
+                .iter()
+                .filter_map(|(&num, loc)| match *loc {
+                    Loc::At(_, gen) => u16::try_from(gen).ok().map(|g| (num, g)),
+                    Loc::InStream(..) => Some((num, 0)),
+                    Loc::Free => None,
+                })
+                .collect();
+            keys.sort_unstable();
+            for (num, gen) in keys {
+                let o = match self.resolve(num, gen, 0) {
                     Ok(o) => o,
                     Err(e @ Fail::TooLarge(_)) => return Err(e),
                     Err(_) => continue,
@@ -424,7 +455,7 @@ impl<'a> Doc<'a> {
                     if ty == Some(b"Catalog")
                         && trailer.as_ref().is_none_or(|t| t.get(b"Root").is_none())
                     {
-                        trailer = Some(Dict::from_iter([(b"Root".to_vec(), Obj::Ref(num, 0))]));
+                        trailer = Some(Dict::from_iter([(b"Root".to_vec(), Obj::Ref(num, gen))]));
                     }
                 }
             }
@@ -442,9 +473,9 @@ impl<'a> Doc<'a> {
     // Objects
     // ---------------------------------------------------------------------------------------
 
-    /// The indirect object at file offset `off`: its number and the object (`None` when no
-    /// object header is there). The parse is charged to the object budget.
-    fn parse_at(&mut self, off: u64, depth: u64) -> Result<Option<(u32, Obj)>, Fail> {
+    /// The indirect object at file offset `off`: its number, its generation and the object
+    /// (`None` when no object header is there). The parse is charged to the object budget.
+    fn parse_at(&mut self, off: u64, depth: u64) -> Result<Option<(u32, u64, Obj)>, Fail> {
         let len = self.data.len() as u64;
         if !v::pdf_below(off, len) {
             return Ok(None);
@@ -467,9 +498,9 @@ impl<'a> Doc<'a> {
         depth: u64,
         from: &mut usize,
         extra: &mut u64,
-    ) -> Result<Option<(u32, Obj)>, Fail> {
+    ) -> Result<Option<(u32, u64, Obj)>, Fail> {
         let len = self.data.len() as u64;
-        let (Some(num), Some(_gen)) = (lx.read_uint(), lx.read_uint()) else {
+        let (Some(num), Some(gen)) = (lx.read_uint(), lx.read_uint()) else {
             return Ok(None);
         };
         if !lx.eat_keyword(b"obj") {
@@ -480,10 +511,10 @@ impl<'a> Doc<'a> {
         };
         let obj = lx.object(0)?;
         let Obj::Dict(dict) = obj else {
-            return Ok(Some((num, obj)));
+            return Ok(Some((num, gen, obj)));
         };
         if !lx.eat_keyword(b"stream") {
-            return Ok(Some((num, Obj::Dict(dict))));
+            return Ok(Some((num, gen, Obj::Dict(dict))));
         }
         let dict = Rc::try_unwrap(dict).unwrap_or_else(|d| (*d).clone());
         // the data starts after the end of line that follows the keyword
@@ -495,13 +526,13 @@ impl<'a> Doc<'a> {
             start += 1;
         }
         let declared = match dict.get(b"Length") {
-            Some(Obj::Ref(n, _)) if *n != num => {
-                let n = *n;
+            Some(Obj::Ref(n, g)) if *n != num => {
+                let (n, g) = (*n, *g);
                 // the dictionary is held while the length is read: it is charged first
                 self.charge(lx, *from, 0)?;
                 *from = lx.pos;
                 lx.restart(self.objects);
-                non_negative(Some(&self.resolve(n, depth + 1)?))
+                non_negative(Some(&self.resolve(n, g, depth + 1)?))
             }
             other => non_negative(other),
         };
@@ -542,12 +573,14 @@ impl<'a> Doc<'a> {
         let start = start.min(end);
         Ok(Some((
             num,
+            gen,
             Obj::Stream(Rc::new(Stream { dict, start, end })),
         )))
     }
 
-    /// Object `num` (null when the file has no such object).
-    pub fn resolve(&mut self, num: u32, depth: u64) -> Result<Obj, Fail> {
+    /// Object `num` of generation `gen` (null when the file has no such object: the number is
+    /// free or missing, or the object of that number has another generation).
+    pub fn resolve(&mut self, num: u32, gen: u16, depth: u64) -> Result<Obj, Fail> {
         // every object resolved costs a step, an object read before too
         self.work.take(1)?;
         if !v::pdf_below(depth, MAX_REF_DEPTH) {
@@ -555,22 +588,28 @@ impl<'a> Doc<'a> {
                 "references nested more than {MAX_REF_DEPTH} deep"
             )));
         }
-        if let Some(o) = self.cache.get(&num) {
+        let key = (num, gen);
+        if let Some(o) = self.cache.get(&key) {
             return Ok(o.clone());
         }
-        // the cache keeps an entry for every object resolved, one the file lacks too
+        // the cache keeps an entry for every object resolved, one the file lacks too (a
+        // reference of another generation is one more entry, charged the same)
         self.objects.take(CACHE_ENTRY_COST)?;
         // a cycle back to this object sees null
-        self.cache.insert(num, Obj::Null);
+        self.cache.insert(key, Obj::Null);
+        let want = u64::from(gen);
         let obj = match self.xref.get(&num).copied() {
             None | Some(Loc::Free) => Obj::Null,
-            Some(Loc::At(off)) => match self.parse_at(off, depth)? {
-                Some((n, o)) if n == num => o,
+            // the entry and the header both name this generation
+            Some(Loc::At(off, g)) if u64::from(g) == want => match self.parse_at(off, depth)? {
+                Some((n, hg, o)) if n == num && hg == want => o,
                 _ => Obj::Null,
             },
-            Some(Loc::InStream(stm, index)) => self.from_objstm(stm, index, depth)?,
+            Some(Loc::At(..)) => Obj::Null,
+            Some(Loc::InStream(stm, index)) if gen == 0 => self.from_objstm(stm, index, depth)?,
+            Some(Loc::InStream(..)) => Obj::Null,
         };
-        self.cache.insert(num, obj.clone());
+        self.cache.insert(key, obj.clone());
         Ok(obj)
     }
 
@@ -578,8 +617,8 @@ impl<'a> Doc<'a> {
     pub fn get(&mut self, o: &Obj) -> Result<Obj, Fail> {
         let mut cur = o.clone();
         let mut depth = 0u64;
-        while let Obj::Ref(n, _) = cur {
-            cur = self.resolve(n, depth)?;
+        while let Obj::Ref(n, g) = cur {
+            cur = self.resolve(n, g, depth)?;
             depth += 1;
         }
         Ok(cur)
@@ -598,10 +637,11 @@ impl<'a> Doc<'a> {
             Some(os) => os.clone(),
             None => {
                 // an object stream is itself never inside another one
-                let Some(Loc::At(_)) = self.xref.get(&stm).copied() else {
+                let Some(Loc::At(..)) = self.xref.get(&stm).copied() else {
                     return Ok(Obj::Null);
                 };
-                let Obj::Stream(s) = self.resolve(stm, depth + 1)? else {
+                // the object stream's generation is implicitly 0 (section 7.5.8.3)
+                let Obj::Stream(s) = self.resolve(stm, 0, depth + 1)? else {
                     return Ok(Obj::Null);
                 };
                 if s.dict.get(b"Type").and_then(Obj::as_name) != Some(b"ObjStm") {
@@ -684,7 +724,7 @@ impl<'a> Doc<'a> {
 
     fn get_depth(&mut self, o: &Obj, depth: u64) -> Result<Obj, Fail> {
         match o {
-            Obj::Ref(n, _) => self.resolve(*n, depth + 1),
+            Obj::Ref(n, g) => self.resolve(*n, *g, depth + 1),
             _ => Ok(o.clone()),
         }
     }

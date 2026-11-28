@@ -1488,8 +1488,24 @@ fn updated(
     entries: &[(u32, Option<u64>)],
     as_stream: bool,
 ) -> Vec<u8> {
-    let prev = last_startxref(base);
-    let mut out = base.to_vec();
+    let entries: Vec<(u32, Option<(u64, u16)>)> = entries
+        .iter()
+        .map(|&(num, off)| (num, off.map(|o| (o, 0))))
+        .collect();
+    updated_gen(base.to_vec(), root, size, &entries, as_stream)
+}
+
+/// `updated` for a file whose update appended objects already (`out` is `base` plus them),
+/// with entries that give each in-use object its generation (`Some((offset, generation))`).
+fn updated_gen(
+    out: Vec<u8>,
+    root: u32,
+    size: u32,
+    entries: &[(u32, Option<(u64, u16)>)],
+    as_stream: bool,
+) -> Vec<u8> {
+    let prev = last_startxref(&out);
+    let mut out = out;
     let at = out.len();
     if as_stream {
         // W [1 4 2], unfiltered, one row per entry
@@ -1497,10 +1513,10 @@ fn updated(
         let mut index = Vec::new();
         for (num, off) in entries {
             index.push(format!("{num} 1"));
-            // type 1 at the offset, or type 0 (free, next generation 1)
+            // type 1 at the offset with its generation, or type 0 (free, next generation 1)
             rows.push(u8::from(off.is_some()));
-            rows.extend_from_slice(&(off.unwrap_or(0) as u32).to_be_bytes());
-            rows.extend_from_slice(&[0, u8::from(off.is_none())]);
+            rows.extend_from_slice(&(off.map_or(0, |o| o.0) as u32).to_be_bytes());
+            rows.extend_from_slice(&off.map_or(1, |o| o.1).to_be_bytes());
         }
         out.extend_from_slice(format!("{size} 0 obj\n").as_bytes());
         out.extend_from_slice(&stream(
@@ -1516,7 +1532,7 @@ fn updated(
         out.extend_from_slice(b"xref\n");
         for (num, off) in entries {
             let line = match off {
-                Some(o) => format!("{num} 1\n{o:010} 00000 n\r\n"),
+                Some((o, g)) => format!("{num} 1\n{o:010} {g:05} n\r\n"),
                 None => format!("{num} 1\n0000000000 00001 f\r\n"),
             };
             out.extend_from_slice(line.as_bytes());
@@ -1553,6 +1569,86 @@ fn a_freed_object_stays_deleted() {
     let at = (base.windows(8).position(|w| w == b"\n6 0 obj").unwrap() + 1) as u64;
     let file = updated(&base, root, size, &[(6, Some(at))], false);
     assert_eq!(text_of(&file).unwrap(), vec!["Kept", "Deleted secret"]);
+}
+
+#[test]
+fn a_stale_generation_never_reads_the_reused_number() {
+    // Codex repro: an update frees object 6 (the second page's content stream) and reuses its
+    // number as `6 1 obj`; the page still says `/Contents 6 0 R`, which must read as null (the
+    // value of a reference to a missing object), not as the unrelated replacement
+    let (p, root) = doc(
+        &[b"BT /F1 12 Tf (Kept) Tj ET", b"BT /F1 12 Tf (Old) Tj ET"],
+        HELVETICA,
+        false,
+    );
+    let base = p.table(root, "");
+    assert_eq!(text_of(&base).unwrap(), vec!["Kept", "Old"]);
+    let size = p.objs.len() as u32 + 1;
+    let page2 = 7u32;
+    let page2_body = String::from_utf8(p.objs[page2 as usize - 1].clone()).unwrap();
+    assert!(page2_body.contains("/Contents 6 0 R"));
+    for as_stream in [false, true] {
+        let mut out = base.clone();
+        let new6 = out.len() as u64;
+        out.extend_from_slice(b"6 1 obj\n");
+        out.extend_from_slice(&stream("", b"BT /F1 12 Tf (Replacement) Tj ET"));
+        out.extend_from_slice(b"\nendobj\n");
+        // the stale reference reads null: the page is empty, the document is still read
+        let file = updated_gen(out.clone(), root, size, &[(6, Some((new6, 1)))], as_stream);
+        assert_eq!(
+            text_of(&file).unwrap(),
+            vec!["Kept", ""],
+            "as_stream={as_stream}"
+        );
+        // a page updated to name the new generation reads the replacement
+        let new7 = out.len() as u64;
+        out.extend_from_slice(format!("{page2} 0 obj\n").as_bytes());
+        out.extend_from_slice(page2_body.replace("6 0 R", "6 1 R").as_bytes());
+        out.extend_from_slice(b"\nendobj\n");
+        let file = updated_gen(
+            out,
+            root,
+            size,
+            &[(6, Some((new6, 1))), (page2, Some((new7, 0)))],
+            as_stream,
+        );
+        assert_eq!(
+            text_of(&file).unwrap(),
+            vec!["Kept", "Replacement"],
+            "as_stream={as_stream}"
+        );
+    }
+    // an entry whose generation disagrees with the header at its offset reads null too: the
+    // update says `6 0` sits where the file holds `6 1 obj`
+    let mut out = base.clone();
+    let new6 = out.len() as u64;
+    out.extend_from_slice(b"6 1 obj\n");
+    out.extend_from_slice(&stream("", b"BT /F1 12 Tf (Replacement) Tj ET"));
+    out.extend_from_slice(b"\nendobj\n");
+    let file = updated_gen(out.clone(), root, size, &[(6, Some((new6, 0)))], false);
+    assert_eq!(text_of(&file).unwrap(), vec!["Kept", ""]);
+    // with the cross-reference data lost, the scan finds `6 1 obj` last and the stale
+    // reference still reads null
+    let mut damaged = out;
+    damaged.extend_from_slice(format!("trailer\n<< /Root {root} 0 R >>\n%%EOF\n").as_bytes());
+    let cut = damaged.windows(9).position(|w| w == b"startxref").unwrap();
+    damaged[cut..cut + 9].copy_from_slice(b"startxreg");
+    assert_eq!(text_of(&damaged).unwrap(), vec!["Kept", ""]);
+}
+
+#[test]
+fn objects_in_object_streams_have_generation_zero() {
+    // the catalog, the page tree and the page sit in an object stream: `N 0 R` reads them,
+    // while a reference of generation 1 to the packed page reads null
+    let (mut p, root) = doc(&[b"BT /F1 12 Tf (Packed) Tj ET"], HELVETICA, false);
+    let file = p.xref_stream(root, &[1, 2, 5]);
+    assert_eq!(text_of(&file).unwrap(), vec!["Packed"]);
+    let body = String::from_utf8(p.objs[1].clone()).unwrap();
+    assert!(body.contains("/Kids [5 0 R]"));
+    p.set(2, body.replace("/Kids [5 0 R]", "/Kids [5 1 R]"));
+    let file = p.xref_stream(root, &[1, 2, 5]);
+    // the page tree's only kid reads null: no page is left
+    assert!(matches!(text_of(&file), Err(Fail::NoText { pages: 0 })));
 }
 
 #[test]

@@ -500,8 +500,9 @@ const SPACE_COST: u64 = 2 * size_of::<(u32, u32)>() as u64;
 const WIDTH_COST: u64 = size_of::<(u32, u32, f64)>() as u64;
 /// The memory a font is charged for besides its tables: the font itself, its shared
 /// allocation and its entry in the document's font cache.
-const FONT_COST: u64 =
-    (size_of::<Font>() + size_of::<(u32, std::rc::Rc<Font>)>() + 8 * size_of::<usize>()) as u64;
+const FONT_COST: u64 = (size_of::<Font>()
+    + size_of::<((u32, u16), std::rc::Rc<Font>)>()
+    + 8 * size_of::<usize>()) as u64;
 /// The memory one entry of a simple font's code table is charged for, besides its text (an
 /// allocation of its own, charged as `TEXT_COST` plus its bytes).
 const CODE_COST: u64 = size_of::<Option<String>>() as u64;

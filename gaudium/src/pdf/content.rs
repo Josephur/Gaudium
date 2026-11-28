@@ -117,11 +117,12 @@ impl GState {
     }
 }
 
-/// Fonts already read (shared by the pages of a document): by object number, and direct font
-/// dictionaries by their shared allocation (kept alive here, so the address is not reused).
+/// Fonts already read (shared by the pages of a document): by object number and generation
+/// (a reference of a stale generation reads as null, never as the font now at that number),
+/// and direct font dictionaries by their shared allocation (kept alive here, so the address is not reused).
 #[derive(Default)]
 pub(crate) struct FontCache {
-    by_ref: HashMap<u32, Rc<Font>>,
+    by_ref: HashMap<(u32, u16), Rc<Font>>,
     direct: HashMap<*const Dict, (Rc<Dict>, Rc<Font>)>,
 }
 
@@ -440,7 +441,7 @@ impl<'d, 'a> Page<'d, 'a> {
     /// The font a resource entry names (a reference or a direct dictionary), read once.
     fn font_at(&mut self, entry: Obj) -> Result<Option<Rc<Font>>, Fail> {
         let key = match entry {
-            Obj::Ref(n, _) => Some(n),
+            Obj::Ref(n, g) => Some((n, g)),
             _ => None,
         };
         if let Some(f) = key.and_then(|k| self.fonts.by_ref.get(&k)) {
