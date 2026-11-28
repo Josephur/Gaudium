@@ -6,9 +6,9 @@
 
 use crate::verified::{
     block_close, block_close_events, block_must_open, call_accepts, call_after_finish,
-    call_is_streaming, call_step, finish_reason, gen_end, hold_max, hold_release, slice_bound,
-    stop_reason, tool_choice_forces, tool_choice_offers, tool_choice_valid, tool_force_applies,
-    tool_force_place, tool_thinking_allowed,
+    call_is_streaming, call_step, finish_reason, gen_end_closed, hold_max, hold_release,
+    slice_bound, stop_reason, tool_choice_forces, tool_choice_offers, tool_choice_valid,
+    tool_force_applies, tool_force_place, tool_thinking_allowed,
 };
 pub use crate::verified::{
     BlockKind, CallEvent, CallPhase, FinishReason, ForcePlace, GenEnd, StopReason, ToolChoice,
@@ -109,9 +109,18 @@ impl CallStream {
     }
 }
 
-/// How a generation ended, from what the engine and the parser report.
-pub fn generation_end(stop_string: bool, call_limit: bool, eos: bool, cancelled: bool) -> GenEnd {
-    gen_end(stop_string, call_limit, eos, cancelled)
+/// How a generation ended, from what the engine and the parser report. `stopped`: the parser
+/// stopped the generation (a stop string, or the call limit); `repaired`: the parser closed the
+/// last call itself when the generation ended (the model never finished it), so that call does
+/// not count for the call limit.
+pub fn generation_end(
+    stop_string: bool,
+    stopped: bool,
+    repaired: bool,
+    eos: bool,
+    cancelled: bool,
+) -> GenEnd {
+    gen_end_closed(stop_string, stopped, repaired, eos, cancelled)
 }
 
 /// `finish_reason` of a chat completion.
@@ -231,19 +240,33 @@ mod tests {
         assert!(!free.stopped() && free.index() == 3);
 
         // reasons
-        let end = generation_end(false, true, false, true);
+        let end = generation_end(false, true, false, false, true);
         assert_eq!(finish_reason_name(end, true), "tool_calls");
         assert_eq!(
-            stop_reason_name(generation_end(true, false, false, true), false),
+            stop_reason_name(generation_end(true, true, false, false, true), false),
             "stop_sequence"
         );
         assert_eq!(
-            finish_reason_name(generation_end(false, false, false, true), true),
+            finish_reason_name(generation_end(false, false, false, false, true), true),
             "cancelled"
         );
         assert_eq!(
-            stop_reason_name(generation_end(false, false, false, false), true),
+            stop_reason_name(generation_end(false, false, false, false, false), true),
             "max_tokens"
+        );
+        // a call the parser closed at the end does not reach the call limit: the generation ends
+        // as the engine ended it
+        assert_eq!(
+            generation_end(false, true, true, false, false),
+            GenEnd::GeLength
+        );
+        assert_eq!(
+            generation_end(false, true, true, false, true),
+            GenEnd::GeCancelled
+        );
+        assert_eq!(
+            generation_end(false, true, true, true, false),
+            GenEnd::GeEos
         );
 
         // arithmetic

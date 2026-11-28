@@ -454,6 +454,168 @@ def ge_is_stop_string(e: GenEnd) -> Bool:
     case _:
       False{}
 
+# The generation ended where the model ended it: an end-of-sequence token, or the call limit
+# after a whole call. A generation cut by the length limit, a stop string or a cancel did not.
+# (The server-side tool loop runs a round's calls only after such an end.)
+def ge_model_ended(e: GenEnd) -> Bool:
+  match e:
+    case GeEos{}:
+      True{}
+    case GeCallLimit{}:
+      True{}
+    case _:
+      False{}
+
+# promise: a generation cut by the length limit is never one the model ended
+# harm: the half-written call at the cut would be run as a whole one
+# catches: ge_model_ended answers True{} for every end
+law ge_length_not_model_end:
+  {ge_model_ended(GeLength{}) == False{} : Bool}
+
+def ge_length_not_model_end():
+  {==}
+
+# promise: a cancelled generation is never one the model ended
+# catches: ge_model_ended answers True{} for GeCancelled (a cancelled request runs its calls)
+law ge_cancel_not_model_end:
+  {ge_model_ended(GeCancelled{}) == False{} : Bool}
+
+def ge_cancel_not_model_end():
+  {==}
+
+# promise: a generation ended by one of the request's stop strings is never one the model ended
+# catches: ge_model_ended answers True{} for GeStopString (the client's stop sequence overridden)
+law ge_stop_string_not_model_end:
+  {ge_model_ended(GeStopString{}) == False{} : Bool}
+
+def ge_stop_string_not_model_end():
+  {==}
+
+# promise: a generation that ended with an end-of-sequence token is one the model ended
+# catches: ge_model_ended answers False{} always (no server-side call ever runs)
+law ge_eos_is_model_end:
+  {ge_model_ended(GeEos{}) == True{} : Bool}
+
+def ge_eos_is_model_end():
+  {==}
+
+# promise: a generation the call limit ended after a whole call is one the model ended
+# catches: ge_model_ended answers False{} for GeCallLimit (the round's whole calls are never run)
+law ge_call_limit_is_model_end:
+  {ge_model_ended(GeCallLimit{}) == True{} : Bool}
+
+def ge_call_limit_is_model_end():
+  {==}
+
+# How a generation ended, from the engine's flags and the parser's. stopped: the parser stopped the
+# generation (a stop string or the call limit); repaired: the parser closed the last call itself
+# when the generation ended, so the model never finished that call. The call limit counts only
+# when a call the model finished reached it: a generation whose last call was repaired ends as the
+# engine ended it (a cancel, the length limit, an end-of-sequence token).
+def gen_end_closed(stop_string: Bool, stopped: Bool, repaired: Bool, eos: Bool, cancelled: Bool) -> GenEnd:
+  gen_end(stop_string, Bool.and(stopped, Bool.not(repaired)), eos, cancelled)
+
+# promise: a generation cut by the length limit or a cancel inside a call the parser then closed is never one the model ended
+# harm: the half-written call would be run as a whole one, on a remote tool server with arguments the model never finished
+# catches: the repaired flag ignored (gen_end(stop_string, stopped, eos, cancelled)): the repair reaches the call limit and the round counts as ended
+law ge_repaired_cut_not_model_end:
+  for +ss: Bool
+  for +st: Bool
+  for +c: Bool
+  {ge_model_ended(gen_end_closed(ss, st, True{}, False{}, c)) == False{} : Bool}
+
+def ge_repaired_cut_not_model_end(ss, st, c):
+  match ss st c:
+    case True{} True{} True{}: {==}
+    case True{} True{} False{}: {==}
+    case True{} False{} True{}: {==}
+    case True{} False{} False{}: {==}
+    case False{} True{} True{}: {==}
+    case False{} True{} False{}: {==}
+    case False{} False{} True{}: {==}
+    case False{} False{} False{}: {==}
+
+# promise: a generation the call limit stopped after a call the model finished still ends as the call limit
+# catches: the call-limit flag dropped (gen_end(stop_string, False{}, eos, cancelled)): a whole call under the one-call limit is reported as a length cut and never runs
+law ge_whole_call_limit_stays:
+  for +eos: Bool
+  for +c: Bool
+  {gen_end_closed(False{}, True{}, False{}, eos, c) == GeCallLimit{} : GenEnd}
+
+def ge_whole_call_limit_stays(eos, c):
+  match eos c:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a generation the parser did not stop (no stop string, no call limit) ends as the engine ended it, whatever the parser closed at the end
+# harm: a plain length cut or cancel would count as the call limit, and its calls would run
+# catches: the stopped flag dropped (gen_end(stop_string, Bool.not(repaired), eos, cancelled)): every generation without a repaired call counts as the call limit
+law ge_unstopped_ends_as_engine:
+  for +r: Bool
+  for +eos: Bool
+  for +c: Bool
+  {gen_end_closed(False{}, False{}, r, eos, c) == gen_end(False{}, False{}, eos, c) : GenEnd}
+
+def ge_unstopped_ends_as_engine(r, eos, c):
+  match r eos c:
+    case True{} True{} True{}: {==}
+    case True{} True{} False{}: {==}
+    case True{} False{} True{}: {==}
+    case True{} False{} False{}: {==}
+    case False{} True{} True{}: {==}
+    case False{} True{} False{}: {==}
+    case False{} False{} True{}: {==}
+    case False{} False{} False{}: {==}
+
+# promise: a generation one of the request's stop strings ended ends as the stop string, whatever the parser stopped or closed
+# catches: the stop-string flag dropped (gen_end(False{}, Bool.and(stopped, Bool.not(repaired)), eos, cancelled)): a round a stop string ended counts as the call limit and runs its calls
+law ge_stop_string_closed_wins:
+  for +st: Bool
+  for +r: Bool
+  for +eos: Bool
+  for +c: Bool
+  {gen_end_closed(True{}, st, r, eos, c) == GeStopString{} : GenEnd}
+
+def ge_stop_string_closed_wins(st, r, eos, c):
+  {==}
+
+# promise: a generation the model ended with an end-of-sequence token inside a call the parser then closed is one the model ended, also when the parser's cleanup reached the call limit
+# harm: the round would end the reply without the unfinished call's error result and without the continuation the model asked for
+# catches: the end-of-sequence flag dropped once the parser stopped (gen_end(stop_string, Bool.and(stopped, Bool.not(repaired)), Bool.and(eos, Bool.not(stopped)), cancelled)): an EOS inside the only call under the one-call limit counts as a length cut
+law ge_repaired_eos_model_end:
+  for +st: Bool
+  for +c: Bool
+  {ge_model_ended(gen_end_closed(False{}, st, True{}, True{}, c)) == True{} : Bool}
+
+def ge_repaired_eos_model_end(st, c):
+  match st c:
+    case True{} True{}: {==}
+    case True{} False{}: {==}
+    case False{} True{}: {==}
+    case False{} False{}: {==}
+
+# promise: a generation whose last call the parser closed ends as the engine ended it (an end-of-sequence token, the length limit or a cancel), whether or not the parser's cleanup stopped it
+# harm: a cancelled round whose cleanup reached the call limit would report a length cut (or a stop string) instead of the cancel
+# catches: the cancel flag dropped once the parser stopped (gen_end(stop_string, Bool.and(stopped, Bool.not(repaired)), eos, Bool.and(cancelled, Bool.not(stopped)))): a cancel inside the only call under the one-call limit is reported as max_tokens
+law ge_repaired_ends_as_engine:
+  for +st: Bool
+  for +eos: Bool
+  for +c: Bool
+  {gen_end_closed(False{}, st, True{}, eos, c) == gen_end(False{}, False{}, eos, c) : GenEnd}
+
+def ge_repaired_ends_as_engine(st, eos, c):
+  match st eos c:
+    case True{} True{} True{}: {==}
+    case True{} True{} False{}: {==}
+    case True{} False{} True{}: {==}
+    case True{} False{} False{}: {==}
+    case False{} True{} True{}: {==}
+    case False{} True{} False{}: {==}
+    case False{} False{} True{}: {==}
+    case False{} False{} False{}: {==}
+
 type FinishReason is Data:
   FrStop{}
   FrLength{}

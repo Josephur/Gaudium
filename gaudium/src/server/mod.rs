@@ -17,7 +17,8 @@
 //! - A2UI interfaces as a per-request option (`--a2ui`, the request field `gaudium_a2ui`,
 //!   `/gaudium/a2ui`, instructions hot-reloaded from `--a2ui-prompt <file>`; see `a2ui.rs`)
 //! - The MCP proxy for the Web UI's MCP servers (`--mcp-proxy`, `/cors-proxy`, `/gaudium/proxy`;
-//!   see `proxy.rs`)
+//!   see `proxy.rs`), which also carries the Messages MCP connector (`mcp_servers`: the server
+//!   runs those tools itself over several generation rounds; see `tool_loop.rs`, `mcp_client.rs`)
 //! - The Files API in the OpenAI and the Messages-API shapes (`/v1/files`, `--files-dir`), and
 //!   `file_id` sources in chat and Messages requests; see `files.rs` and `file_store.rs`
 //!
@@ -69,6 +70,7 @@ pub mod file_store;
 mod files;
 mod jinja;
 mod lanes;
+mod mcp_client;
 mod multipart;
 mod outparse;
 mod penalty_fields;
@@ -80,6 +82,7 @@ mod response_store;
 mod responses;
 mod structured;
 mod stream_out;
+mod tool_loop;
 
 use chat::{ChatPrompt, ChatTemplate};
 
@@ -422,7 +425,8 @@ struct AppState {
     slot: Mutex<EngineSlot>,
     /// Serializes device-level load/generate/unload operations without blocking status reads.
     card_op: Mutex<()>,
-    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// What `POST /v1/chat/completions/control` cancels, by reply id.
+    cancels: Mutex<HashMap<String, Arc<CancelEntry>>>,
     next_req_id: AtomicU64,
     hub: EventHub,
     /// Data types of a model's step graph by `(model, fp8 weights, routed experts, FP8 K/V)`.
@@ -3388,9 +3392,9 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
         return;
     };
     let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let flag = state.cancels.lock().unwrap().get(id).cloned();
-    if let Some(flag) = flag {
-        flag.store(true, Ordering::Relaxed);
+    let entry = state.cancels.lock().unwrap().get(id).cloned();
+    if let Some(entry) = entry {
+        entry.cancel();
         // a request that waits for the card leaves the queue now
         state.turns.wake();
         write_json(stream, 200, "{\"ok\":true}");
@@ -3403,6 +3407,66 @@ fn handle_chat_control(state: &AppState, req: &HttpRequest, stream: &mut Conn) {
 /// over: their counts of the reasoning and a ban on the end-of-thinking marker. Not yet (#150):
 /// a budgeted request with penalties is refused (`think_penalties_ok`).
 const THINK_RESUME_CARRIES_PENALTIES: bool = false;
+
+/// What a cancel by one reply id reaches: the reply's own flag, and the engine flag of the
+/// generation it runs now. A reply with server-side tools runs one generation per round under the
+/// one id its client saw first (`tool_loop.rs`): a cancel reaches whichever round runs, and the
+/// loop between rounds. A stop the parser asks for (a stop string, the call limit) sets only the
+/// generation's own flag, never the reply's.
+pub(super) struct CancelEntry {
+    reply: Arc<AtomicBool>,
+    engine: Mutex<Arc<AtomicBool>>,
+}
+
+impl CancelEntry {
+    /// A reply of one generation, whose engine flag is the reply's flag.
+    fn single(flag: &Arc<AtomicBool>) -> Arc<CancelEntry> {
+        Arc::new(CancelEntry {
+            reply: Arc::clone(flag),
+            engine: Mutex::new(Arc::clone(flag)),
+        })
+    }
+
+    /// A reply of several generations, none running yet.
+    pub(super) fn rounds() -> Arc<CancelEntry> {
+        Arc::new(CancelEntry {
+            reply: Arc::new(AtomicBool::new(false)),
+            engine: Mutex::new(Arc::new(AtomicBool::new(false))),
+        })
+    }
+
+    /// Cancels the reply and the generation it runs.
+    pub(super) fn cancel(&self) {
+        self.reply.store(true, Ordering::Relaxed);
+        self.engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// The reply was cancelled (or its client went away: the keep-alive found it gone).
+    pub(super) fn cancelled(&self) -> bool {
+        self.reply.load(Ordering::Relaxed)
+    }
+
+    /// `engine` is the generation the reply runs now; a reply already cancelled cancels it at
+    /// once.
+    fn attach(&self, engine: &Arc<AtomicBool>) {
+        let mut e = self.engine.lock().unwrap_or_else(|e| e.into_inner());
+        *e = Arc::clone(engine);
+        if self.reply.load(Ordering::Relaxed) {
+            engine.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A heartbeat of the reply's stream that finds the client gone cancels the reply and the
+/// generation it runs then, as a cancel by its id does.
+impl stream_out::Cancel for CancelEntry {
+    fn cancel(&self) {
+        CancelEntry::cancel(self);
+    }
+}
 
 /// Which API a chat request came in on: the shape of its reply and of its errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3461,12 +3525,12 @@ impl Api {
 
 /// A request's entry in the cancel table (`AppState::cancels`); dropping it removes the entry,
 /// so a request leaves no entry behind on any way out.
-struct CancelEntry<'a> {
-    cancels: &'a Mutex<HashMap<String, Arc<AtomicBool>>>,
+struct CancelSlot<'a> {
+    cancels: &'a Mutex<HashMap<String, Arc<CancelEntry>>>,
     id: &'a str,
 }
 
-impl Drop for CancelEntry<'_> {
+impl Drop for CancelSlot<'_> {
     fn drop(&mut self) {
         self.cancels.lock().unwrap().remove(self.id);
     }
@@ -3624,10 +3688,11 @@ fn handle_chat_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mu
         write_error(stream, 400, "invalid_request_error", &e);
         return;
     }
-    run_chat(state, &val, stream, Api::Chat, ignored);
+    run_chat(state, &val, stream, Api::Chat, ignored, None);
 }
 
-/// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path.
+/// `POST /v1/messages`: the request is translated into a chat request and runs on the chat path
+/// (a request with `mcp_servers` over the server-side tool loop, `tool_loop.rs`).
 fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) {
     let api = Api::Messages {
         show_thinking: true,
@@ -3642,15 +3707,10 @@ fn handle_messages(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn) 
         return;
     }
     match anthropic::translate(&val) {
-        Ok(t) => run_chat(
-            state,
-            &t.chat,
-            stream,
-            Api::Messages {
-                show_thinking: t.show_thinking,
-            },
-            t.ignored,
-        ),
+        Ok(t) => {
+            let caller = state.proxy.caller(req, check_auth(&state.cfg, req));
+            tool_loop::run_messages(state, caller, &val, t, stream);
+        }
         Err(e) => api.error(stream, 400, "invalid_request_error", &e),
     }
 }
@@ -3669,14 +3729,19 @@ fn handle_messages_count(state: &AppState, req: &HttpRequest, stream: &mut Conn)
         api.error(stream, 400, "invalid_request_error", &e);
         return;
     }
-    let rendered = anthropic::translate(&val).and_then(|t| {
-        let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
-        let p = prepare_prompt(state.cfg.a2ui, m, &t.chat)?;
-        tokenize_prompt(m, &p, false).map(|(ids, _)| ids.len())
-    });
+    let caller = state.proxy.caller(req, check_auth(&state.cfg, req));
+    let rendered = anthropic::translate(&val)
+        .map_err(tool_loop::Refused::from)
+        .and_then(|mut t| {
+            // the MCP servers' tools are part of the prompt: they are listed for the count too
+            let _tools = tool_loop::open_server_tools(state, caller, &val, &mut t)?;
+            let m = &state.models[state.find_model(t.chat.get("model").and_then(|v| v.as_str()))];
+            let p = prepare_prompt(state.cfg.a2ui, m, &t.chat)?;
+            Ok(tokenize_prompt(m, &p, false).map(|(ids, _)| ids.len())?)
+        });
     match rendered {
         Ok(n) => write_json(stream, 200, &format!("{{\"input_tokens\":{n}}}")),
-        Err(e) => api.error(stream, 400, "invalid_request_error", &e),
+        Err(e) => api.error(stream, e.status, e.kind, &e.message),
     }
 }
 
@@ -3717,7 +3782,7 @@ fn handle_responses(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Conn)
         store: &state.responses,
         id: &id,
     };
-    run_chat(state, &t.chat, stream, api, t.ignored);
+    run_chat(state, &t.chat, stream, api, t.ignored, None);
 }
 
 /// A response's in-flight entry; dropping it ends the entry (`ResponseStore::end`), so its
@@ -3774,8 +3839,8 @@ fn handle_stored_response(
                 // a response still being generated stops at its next step, or leaves the card's
                 // queue if it waits there, and is not kept
                 if found == response_store::Deleted::Running {
-                    if let Some(flag) = state.cancels.lock().unwrap().get(id) {
-                        flag.store(true, Ordering::Relaxed);
+                    if let Some(entry) = state.cancels.lock().unwrap().get(id) {
+                        entry.cancel();
                     }
                     state.turns.wake();
                 }
@@ -3806,10 +3871,10 @@ fn handle_stored_response(
             // a response still being generated stops at its next step; a finished one is final
             // the watch is taken first, so a reply that comes as soon as the flag is set is seen
             let watch = state.responses.watch(id);
-            let flag = state.cancels.lock().unwrap().get(id).cloned();
-            match (flag, watch) {
-                (Some(flag), Some(watch)) => {
-                    flag.store(true, Ordering::Relaxed);
+            let entry = state.cancels.lock().unwrap().get(id).cloned();
+            match (entry, watch) {
+                (Some(entry), Some(watch)) => {
+                    entry.cancel();
                     // (one that waits for the card leaves the queue now)
                     state.turns.wake();
                     // the reply is the response as its generation ends it (the same object its
@@ -3949,22 +4014,46 @@ fn join_lanes(
     }
 }
 
+/// A request refused before the engine takes it: a status and an error body, or, for a later round
+/// of a reply whose stream began (`begun`), an error event that ends the stream.
+fn refuse(
+    api: Api,
+    stream: &mut Conn,
+    begun: Option<&SseSink>,
+    status: u16,
+    kind: &str,
+    msg: &str,
+) {
+    match begun {
+        Some(s) => {
+            let _ = s.write(api.stream_error(status, msg).as_bytes());
+            s.end();
+        }
+        None => api.error(stream, status, kind, msg),
+    }
+}
+
 /// Runs one chat request: prompt, card turn, generation, and the reply in the shape of `api`.
-/// `ignored`: request fields the caller already found accepted but not applied.
+/// `ignored`: request fields the caller already found accepted but not applied. `rounds`: the
+/// request is one generation round of a Messages reply with server-side tools; its blocks go on
+/// from the ones before, and at its end it hands the round's outcome over instead of finishing
+/// the reply (`tool_loop.rs`).
 fn run_chat(
     state: &Arc<AppState>,
     val: &JsonValue,
     stream: &mut Conn,
     api: Api,
     mut ignored: Vec<String>,
+    rounds: Option<&mut tool_loop::Rounds>,
 ) {
     let t_arrival = Instant::now();
+    let begun = rounds.as_deref().and_then(|r| r.sink.clone());
     let idx = state.find_model(val.get("model").and_then(|v| v.as_str()));
     let m = &state.models[idx];
     let prompt = match prepare_prompt(state.cfg.a2ui, m, val) {
         Ok(p) => p,
         Err(e) => {
-            api.error(stream, 400, "invalid_request_error", &e);
+            refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &e);
             return;
         }
     };
@@ -3974,7 +4063,7 @@ fn run_chat(
     let (prompt_ids, media) = match tokenize_prompt(m, &prompt, true) {
         Ok(x) => x,
         Err(e) => {
-            api.error(stream, 400, "invalid_request_error", &e);
+            refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &e);
             return;
         }
     };
@@ -3997,6 +4086,7 @@ fn run_chat(
             req_max,
             ignored,
         },
+        rounds,
     );
 }
 
@@ -4058,6 +4148,7 @@ fn handle_completions(state: &Arc<AppState>, req: &HttpRequest, stream: &mut Con
             req_max: creq.max_tokens,
             ignored: creq.ignored,
         },
+        None,
     );
 }
 
@@ -4078,8 +4169,15 @@ struct PreparedPrompt {
 }
 
 /// Runs one prepared request: admission, card turn, generation, and the reply in the shape of
-/// `api`. `val`: the request body (sampling and streaming fields).
-fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Api, p: PreparedPrompt) {
+/// `api`. `val`: the request body (sampling and streaming fields). `rounds`: as [`run_chat`].
+fn run_prompt(
+    state: &Arc<AppState>,
+    val: &JsonValue,
+    stream: &mut Conn,
+    api: Api,
+    p: PreparedPrompt,
+    mut rounds: Option<&mut tool_loop::Rounds>,
+) {
     let PreparedPrompt {
         t_arrival,
         idx,
@@ -4090,6 +4188,8 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         mut ignored,
     } = p;
     let m = &state.models[idx];
+    // a later round of a reply with server-side tools writes on the stream its first round began
+    let begun = rounds.as_deref().and_then(|r| r.sink.clone());
     let media_counts: MediaCounts = media.as_ref().map(|md| md.counts()).unwrap_or_default();
     let media_host_ms = media.as_ref().map_or(0.0, |md| md.host_ms);
     let n_images = media_counts.images + media_counts.videos;
@@ -4147,7 +4247,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                     crate::core::budget::advertised_served_ctx(m.max_ctx)
                 ),
             };
-            api.error(stream, 400, "invalid_request_error", &msg);
+            refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &msg);
             return;
         }
     };
@@ -4170,7 +4270,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let penalties = match penalty_fields::parse(val, emit_vocab) {
         Ok(p) => p,
         Err(e) => {
-            api.error(stream, 400, "invalid_request_error", &e);
+            refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &e);
             return;
         }
     };
@@ -4179,7 +4279,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let structured_req = match structured::request(val, &prompt) {
         Ok(r) => r,
         Err(e) => {
-            api.error(stream, 400, "invalid_request_error", &crate::grammar::build::message(&e));
+            refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &crate::grammar::build::message(&e));
             return;
         }
     };
@@ -4193,8 +4293,10 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             (_, Some(r)) => format!("sampling penalties, logit_bias or {}", r.label),
             _ => "sampling penalties or logit_bias".to_string(),
         };
-        api.error(
+        refuse(
+            api,
             stream,
+            begun.as_ref(),
             400,
             "invalid_request_error",
             &format!(
@@ -4222,7 +4324,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             match structured::plan(r, &prompt, &m.format, table, !split_reasoning) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    api.error(stream, 400, "invalid_request_error", &crate::grammar::build::message(&e));
+                    refuse(api, stream, begun.as_ref(), 400, "invalid_request_error", &crate::grammar::build::message(&e));
                     return;
                 }
             }
@@ -4247,8 +4349,10 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         .filter(|w| !w.is_empty() && *w != "default")
     {
         if want != method {
-            api.error(
+            refuse(
+                api,
                 stream,
+                begun.as_ref(),
                 400,
                 "invalid_request_error",
                 &format!(
@@ -4262,15 +4366,20 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     }
 
     let req_num = state.next_req_id.fetch_add(1, Ordering::Relaxed);
-    let req_id = match api {
-        Api::Chat => format!("chatcmpl-gaudium-{req_num}"),
-        Api::Messages { .. } => format!("msg_gaudium_{req_num}"),
-        Api::Completion { .. } => format!("cmpl-gaudium-{req_num}"),
-        // the id the translation gave the response
-        Api::Responses => val
-            .get("gaudium_response_id")
-            .and_then(|v| v.as_str())
-            .map_or_else(|| format!("resp_gaudium_{req_num}"), str::to_string),
+    // a round of a reply with server-side tools goes by the reply's id: the one its client saw
+    // first and cancels by
+    let req_id = match rounds.as_deref() {
+        Some(r) => r.id.clone(),
+        None => match api {
+            Api::Chat => format!("chatcmpl-gaudium-{req_num}"),
+            Api::Messages { .. } => format!("msg_gaudium_{req_num}"),
+            Api::Completion { .. } => format!("cmpl-gaudium-{req_num}"),
+            // the id the translation gave the response
+            Api::Responses => val
+                .get("gaudium_response_id")
+                .and_then(|v| v.as_str())
+                .map_or_else(|| format!("resp_gaudium_{req_num}"), str::to_string),
+        },
     };
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4319,8 +4428,10 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             Some(r) => format!("sampling penalties, logit_bias or {}", r.label),
             None => "sampling penalties or logit_bias".to_string(),
         };
-        api.error(
+        refuse(
+            api,
             stream,
+            begun.as_ref(),
             400,
             "invalid_request_error",
             &format!("{think_field} can not be combined with {what} yet: send one or the other"),
@@ -4330,15 +4441,34 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     let cancel_flag = Arc::new(AtomicBool::new(false));
     // The request can be cancelled from now on (`/v1/chat/completions/control`, a DELETE or a
     // cancel of a response), while it waits for the card too: a cancelled request leaves the
-    // queue and never reaches the engine. The entry goes when this function returns.
-    state
-        .cancels
-        .lock()
-        .unwrap()
-        .insert(req_id.clone(), Arc::clone(&cancel_flag));
-    let _cancel_entry = CancelEntry {
-        cancels: &state.cancels,
-        id: &req_id,
+    // queue and never reaches the engine. Its entry goes when this function returns. A round of
+    // a reply with server-side tools is reached through the reply's entry instead, which the
+    // loop holds for all its rounds (`tool_loop.rs`); a stop the parser asks for sets only this
+    // generation's flag.
+    let round_cancel: Option<Arc<CancelEntry>> = rounds.as_deref().map(|r| Arc::clone(&r.cancel));
+    let own_cancel = round_cancel.is_none();
+    let _cancel_slot = match &round_cancel {
+        Some(entry) => {
+            entry.attach(&cancel_flag);
+            None
+        }
+        None => {
+            state
+                .cancels
+                .lock()
+                .unwrap()
+                .insert(req_id.clone(), CancelEntry::single(&cancel_flag));
+            Some(CancelSlot {
+                cancels: &state.cancels,
+                id: &req_id,
+            })
+        }
+    };
+    // (an early removal of the request's own entry; a round's is the loop's)
+    let release_cancel = || {
+        if own_cancel {
+            state.cancels.lock().unwrap().remove(&req_id);
+        }
     };
     // Verified RequestGuard tracks request lifecycle transitions!
     let mut rguard = RequestGuard::new();
@@ -4352,7 +4482,11 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     // queue, a model load, a lane) and for its prefill, and a keep-alive goes out whenever a
     // heartbeat passes without a write, so no idle timeout cuts a reply that has not begun. A
     // failure from here on is an error event in the stream. (The refusals above are a status.)
-    let sink = if stream_mode {
+    // (A later round goes on with the stream the first round began: one `message_start` and one
+    // keep-alive for the whole reply, which also covers the tool calls between rounds.)
+    let sink = if begun.is_some() {
+        begun.clone()
+    } else if stream_mode {
         match stream.try_clone() {
             Ok(c) if write_sse_headers(stream).is_ok() => Some(SseSink::new(c)),
             // the client went away
@@ -4361,9 +4495,15 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     } else {
         None
     };
-    if let (Some(s), Api::Messages { .. }) = (&sink, api) {
+    // (a reply with server-side tools may have begun its stream before its first round, while it
+    // reached its MCP servers: its first round writes the `message_start`)
+    let started = rounds.as_deref().is_some_and(|r| r.started);
+    if let (Some(s), Api::Messages { .. }, false) = (&sink, api, started) {
         // the message as it begins; the client gets its blocks once the engine generates
         let _ = s.write(anthropic::Builder::message_start(&req_id, &m.id, n_prompt).as_bytes());
+        if let Some(r) = rounds.as_deref_mut() {
+            r.started = true;
+        }
     }
     // A response's output items are built from admission on: its stream begins with
     // `response.created` and `response.in_progress`, so the client has the response's id (to
@@ -4375,13 +4515,21 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
     if let (Some(s), Some(b)) = (&sink, resp_start.as_mut()) {
         let _ = s.write(b.start().as_bytes());
     }
-    let _keep_alive = sink.as_ref().and_then(|s| {
-        s.keep_alive(
-            api.keep_alive_line(),
-            Duration::from_millis(state.stream_heartbeat_ms.load(Ordering::Relaxed)),
-            Arc::clone(&cancel_flag),
-        )
-    });
+    let heartbeat = Duration::from_millis(state.stream_heartbeat_ms.load(Ordering::Relaxed));
+    let mut _keep_alive = None;
+    match (rounds.as_deref_mut(), &sink) {
+        // the reply's own: it outlives this round (a keep-alive that stops ends its stream), and
+        // a heartbeat that finds the client gone cancels the reply and the round it runs then
+        (Some(r), Some(s)) if r.sink.is_none() => {
+            r.sink = Some(s.clone());
+            r.keep_alive = s.keep_alive(api.keep_alive_line(), heartbeat, r.cancel.clone());
+        }
+        (Some(_), _) => {}
+        (None, Some(s)) => {
+            _keep_alive = s.keep_alive(api.keep_alive_line(), heartbeat, cancel_flag.clone());
+        }
+        (None, None) => {}
+    }
     // An error after the stream began: an error event, then the end of the stream.
     let stream_fail = |resp: &mut Option<responses::Builder>, status: u16, msg: &str| {
         if let Some(s) = &sink {
@@ -4559,7 +4707,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             Err(e) => (None, Some(e)),
         };
         if let Some(e) = err {
-            state.cancels.lock().unwrap().remove(&req_id);
+            release_cancel();
             step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
             debug_assert!(rguard.is_terminal());
             state.publish_request(
@@ -4607,7 +4755,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 s.engine = other;
                 s.active_requests = s.active_requests.saturating_sub(1);
                 drop(s);
-                state.cancels.lock().unwrap().remove(&req_id);
+                release_cancel();
                 step_request_guard(&mut rguard, ReqEvent::EvReqFail, &req_id);
                 debug_assert!(rguard.is_terminal());
                 let msg = "model unloaded concurrently; retry request";
@@ -4696,8 +4844,13 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 );
                 o.write(&init_chunk);
             }
-            Api::Messages { show_thinking } => {
-                o.anth = Some(anthropic::Builder::new(show_thinking));
+            Api::Messages { show_thinking, .. } => {
+                o.anth = Some(
+                    rounds
+                        .as_mut()
+                        .and_then(|r| r.builder.take())
+                        .unwrap_or_else(|| anthropic::Builder::new(show_thinking)),
+                );
             }
             // an empty text chunk
             Api::Completion { .. } => {
@@ -4744,12 +4897,22 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                         // this point is on the old flag; one that comes later finds the new one.
                         think_cut.set(Some(step));
                         let fresh = Arc::new(AtomicBool::new(false));
-                        state
-                            .cancels
-                            .lock()
-                            .unwrap()
-                            .insert(req_id.clone(), Arc::clone(&fresh));
-                        out.lock().unwrap().set_cancel(Arc::clone(&fresh));
+                        match &round_cancel {
+                            // a round: the reply's entry (and the reply's keep-alive, which
+                            // cancels through it) reaches the resumed generation from now on
+                            Some(entry) => {
+                                entry.attach(&fresh);
+                                out.lock().unwrap().set_cancel(Arc::clone(&fresh), false);
+                            }
+                            None => {
+                                state
+                                    .cancels
+                                    .lock()
+                                    .unwrap()
+                                    .insert(req_id.clone(), CancelEntry::single(&fresh));
+                                out.lock().unwrap().set_cancel(Arc::clone(&fresh), true);
+                            }
+                        }
                         let old = std::mem::replace(&mut *cancel_now.borrow_mut(), fresh);
                         client_cancelled.set(old.swap(true, Ordering::Relaxed));
                         if step == ThinkStep::End {
@@ -4956,7 +5119,7 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
         s.last_activity = Instant::now();
     }
     drop(turn);
-    state.cancels.lock().unwrap().remove(&req_id);
+    release_cancel();
 
     // Flush the decoder's and the parser's tail, after any output the last launch left unwritten
     let tail = decoder.flush();
@@ -4974,9 +5137,12 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
             // How the generation ended and what the client is told: the verified selection.
             let has_calls = !parser.tool_calls().is_empty();
             let stop_string = !parser.matched_stop().is_empty();
+            // a call the parser closed at the end (cut by the length limit or a cancel) never
+            // counts as the call limit
             let end = generation_end(
                 stop_string,
-                parser.stopped() && !stop_string,
+                parser.stopped(),
+                parser.repaired(),
                 rep.stopped_by_eos,
                 rep.stopped_by_cancel,
             );
@@ -5190,8 +5356,31 @@ fn run_prompt(state: &Arc<AppState>, val: &JsonValue, stream: &mut Conn, api: Ap
                 } else {
                     write_json(stream, 200, &resp);
                 }
-            } else if let Api::Messages { show_thinking } = api {
+            } else if let Api::Messages { show_thinking, .. } = api {
                 let mut b = builder.unwrap_or_else(|| anthropic::Builder::new(show_thinking));
+                if let Some(r) = rounds {
+                    // one round of several: its blocks so far go out, the loop decides the rest
+                    let events = out.take_held() + &b.feed(&pending);
+                    if stream_mode {
+                        out.write(&events);
+                    }
+                    r.builder = Some(b);
+                    r.end = Some(tool_loop::RoundEnd {
+                        model: model_id.clone(),
+                        end,
+                        calls: parser.tool_calls().to_vec(),
+                        content: parser.content().to_string(),
+                        reasoning: parser.reasoning().to_string(),
+                        stop_sequence: parser.matched_stop().to_string(),
+                        prompt_tokens: rep.prompt_tokens as u64,
+                        reused: rep.reused_tokens,
+                        output_tokens: n_gen,
+                        extra: format!(",\"timings\":{timings_json},\"gaudium\":{details}"),
+                        repaired: parser.repaired(),
+                        write_failed: out.write_failed,
+                    });
+                    return;
+                }
                 let stop = stop_reason_name(end, has_calls);
                 let usage = anthropic::usage_json_cached(
                     rep.prompt_tokens as u64,

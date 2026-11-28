@@ -637,6 +637,25 @@ fn image_url(w: usize, h: usize, k: usize) -> String {
     out
 }
 
+/// Extra request header lines for [`Harness::exchange_with`].
+trait HeaderLines {
+    fn lines(&self) -> String;
+}
+
+/// Lines already framed, each ending in `\r\n`.
+impl HeaderLines for str {
+    fn lines(&self) -> String {
+        self.to_string()
+    }
+}
+
+/// `"Name: value"` lines.
+impl<const N: usize> HeaderLines for [&str; N] {
+    fn lines(&self) -> String {
+        self.iter().map(|h| format!("{h}\r\n")).collect()
+    }
+}
+
 impl Harness {
     fn script(&self, reply: &str) {
         self.replies.lock().unwrap().push_back(reply.to_string());
@@ -665,8 +684,16 @@ impl Harness {
         self.exchange_with(method, path, "", body)
     }
 
-    /// [`Self::exchange`] with extra header lines (`headers`: each line ending in `\r\n`).
-    fn exchange_with(&self, method: &str, path: &str, headers: &str, body: &str) -> (u16, String) {
+    /// [`Self::exchange`] with extra header lines: a string of lines each ending in `\r\n`, or a
+    /// list of `"Name: value"` lines. The request's own host is `test`.
+    fn exchange_with<H: HeaderLines + ?Sized>(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &H,
+        body: &str,
+    ) -> (u16, String) {
+        let headers = headers.lines();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let state = Arc::clone(&self.state);
@@ -4717,7 +4744,7 @@ fn responses_cancel_answers_with_the_response_its_generation_ends() {
         let cancel = sc.spawn(move || hr.post(&path, ""));
         // the generation goes on once the cancel has reached it
         let t0 = std::time::Instant::now();
-        while !h.state.cancels.lock().unwrap()[&id].load(Ordering::Relaxed) {
+        while !h.state.cancels.lock().unwrap()[&id].cancelled() {
             assert!(t0.elapsed() < Duration::from_secs(20));
             thread::sleep(Duration::from_millis(1));
         }
@@ -4867,3 +4894,6 @@ fn a_responses_text_format_is_held_to_its_schema() {
     assert!(text.contains("'pattern'"), "{text}");
     assert_eq!(h.prompts.lock().unwrap().len(), before);
 }
+
+#[path = "tool_loop_tests.rs"]
+mod tool_loop_tests;

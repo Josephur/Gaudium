@@ -2158,3 +2158,91 @@ fn hosts_are_read_without_their_port_brackets_or_root_dot() {
         assert_eq!(named_host(bad), NamedHost::Bad, "{bad:?}");
     }
 }
+
+#[test]
+fn the_servers_own_requests_pass_the_same_gate_as_the_route() {
+    let t = target(None, |_, s| ok_json(s, "", "{\"ok\":true}"));
+    let p = proxy(&[], &["127.0.0.1"]);
+    let url = t.url("/mcp");
+    let fetch = |p: &McpProxy, key_ok: bool, site_ok: bool| {
+        let mut body = Vec::new();
+        p.fetch(
+            Caller {
+                key_ok,
+                hosts_ours: true,
+                site_ok,
+            },
+            Method::PxGet,
+            &url,
+            &[],
+            None,
+            &mut |_, d| {
+                body.extend_from_slice(d);
+                true
+            },
+        )
+        .map(|f| (f.status, String::from_utf8_lossy(&body).into_owned()))
+    };
+    // made for a page of another site, for a request without the key, or with the proxy off:
+    // refused before any connection
+    let e = fetch(&p, true, false).unwrap_err();
+    assert!(e.starts_with("mcp proxy: "), "{e}");
+    assert!(e.contains("another site"), "{e}");
+    let e = fetch(&p, false, true).unwrap_err();
+    assert!(e.contains("API key"), "{e}");
+    let e = fetch(&McpProxy::disabled(), true, true).unwrap_err();
+    assert!(e.contains("--mcp-proxy"), "{e}");
+    assert!(t.seen().is_empty(), "a refused fetch reached the target");
+    // made for a request the route would serve
+    assert_eq!(
+        fetch(&p, true, true).unwrap(),
+        (200, "{\"ok\":true}".to_string())
+    );
+    assert_eq!(t.seen().len(), 1);
+}
+
+#[test]
+fn the_caller_verdict_is_the_routes_site_rule() {
+    let req = |headers: &[(&str, &str)]| HttpRequest {
+        method: "POST".into(),
+        target: "/v1/messages".into(),
+        path: "/v1/messages".into(),
+        query: Default::default(),
+        headers: headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: Vec::new(),
+        streamed: None,
+    };
+    let p = proxy(&[], &["127.0.0.1"]);
+    let caller = |headers: &[(&str, &str)], key_ok: bool| p.caller(&req(headers), key_ok);
+    let host = ("host", "localhost:8090");
+    assert!(caller(&[host], true).site_ok);
+    assert!(caller(&[host, ("origin", "http://localhost:8090")], true).site_ok);
+    assert!(!caller(&[host, ("origin", "https://other.example")], true).site_ok);
+    assert!(
+        !caller(
+            &[
+                host,
+                ("origin", "http://localhost:8090"),
+                ("sec-fetch-site", "cross-site")
+            ],
+            true
+        )
+        .site_ok
+    );
+    assert!(!caller(&[host], false).key_ok);
+    // a request sent to a name that is not this server's (DNS rebinding) fails the site rule
+    // too, also with an origin of that name and from the same origin
+    let theirs = [
+        ("host", "rebound.example:8090"),
+        ("origin", "http://rebound.example:8090"),
+        ("sec-fetch-site", "same-origin"),
+    ];
+    let c = caller(&theirs, true);
+    assert!(!c.hosts_ours && !c.site_ok, "{c:?}");
+    let c = caller(&[host, ("x-forwarded-host", "rebound.example")], true);
+    assert!(!c.hosts_ours && !c.site_ok, "{c:?}");
+    assert!(caller(&[host], true).hosts_ours);
+}

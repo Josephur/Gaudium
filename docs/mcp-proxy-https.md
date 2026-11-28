@@ -74,6 +74,73 @@ Streamable HTTP, DELETE ends a session).
   and shown without their query and fragment, which may hold a credential, and without a user
   part (`user:password@`), also when the URL is refused or malformed.
 
+## The Messages MCP connector (`mcp_servers`)
+
+A `POST /v1/messages` request may name MCP servers (`mcp_servers`) whose tools the server runs
+itself: it lists their tools to the model, runs the calls the model makes, and answers with
+`mcp_tool_use` / `mcp_tool_result` content blocks before it goes on generating. Its requests to
+those servers are made under the proxy's rules, exactly as a page's request through
+`/cors-proxy`: the same allow-lists and address checks, the same redirect and header rules (the
+server's `authorization_token` goes as a bearer header and never follows a redirect to another
+origin), and the same size and time limits. They are counted and listed with the page's
+(`GET /gaudium/proxy`, `"by":"server"` on a refusal). A server started without `--mcp-proxy`
+refuses a request with `mcp_servers`, and a server whose address the lists do not allow refuses
+the request before generation starts. What is decided before any server is reached (the proxy is
+off, too many servers, a page of another site) is the request's HTTP status, streamed or not. A
+streamed reply then begins, with its keep-alive, before the servers' handshakes and tool lists,
+which may take longer than a front end's idle timeout: a failure from there on (a server that
+cannot be reached or is not allowed, a name clash) is an `error` event that ends the stream, and
+a client that goes away meanwhile stops the discovery (no further server or page is asked). A
+reply that is not streamed gets every failure as its status.
+
+The site rule of `/cors-proxy` holds here too: a `POST /v1/messages` or
+`POST /v1/messages/count_tokens` request with `mcp_servers` sent by a page of another site (its
+`Sec-Fetch-Site` is not `same-origin` or `none`, or without one, its `Origin` is not the host the
+request names) is refused with 403 `permission_error` before any MCP server is contacted.
+Otherwise any web page open in a browser that can reach the server could make it call the
+allow-listed servers, private ones included, and read the results. Each request the server makes
+for the connector is decided again by the proxy's gate on the key and site verdicts of the
+request that asked for it. A request without `mcp_servers` is not affected, and clients that are
+not browsers (no `Origin`, no `Sec-Fetch-Site`) are not either.
+
+- Accepted: `mcp_servers` entries `{"type": "url", "url", "name", "authorization_token"}`, with
+  either `tool_configuration` (`enabled`, `allowed_tools`) or an `mcp_toolset` entry in `tools`
+  (`mcp_server_name`, `default_config` and per-tool `configs` with `enabled` and
+  `defer_loading`). Tools reach the model as `mcp__<server>__<tool>`; a client tool of the same
+  name refuses the request. A `tool_reference` in the history (a tool search result) may name a
+  server's tool, deferred ones included: its definition is put in its place once the servers'
+  tools are listed.
+- Transport: Streamable HTTP (`initialize`, `tools/list` with its pages, `tools/call`; answers as
+  JSON or as an event stream; the session id the server assigns). Tool results are passed on as
+  text (an image or audio part becomes a note).
+- The loop: after each generation round the server runs the round's calls of MCP tools and
+  generates again, until the model ends its turn (`end_turn`), calls a client tool (the calls of
+  MCP tools in that round are still run; the reply stops with `tool_use`), or the round limit is
+  reached (`pause_turn`: send the reply back as the assistant turn to go on). A round cut by
+  `max_tokens`, a stop sequence or a cancel runs none of its calls, also when the parser closed
+  the call that was cut (with `disable_parallel_tool_use` too). A call the model left unfinished
+  in a round it ended (an end-of-sequence token inside the call, also inside the one call
+  `disable_parallel_tool_use` allows) is never sent: it gets an error
+  result, and the next round goes on from it. A forced `tool_choice`
+  applies to the first round. `max_tokens` holds for the whole reply: each round gets what the
+  rounds before left of it, and a reply that spends it stops with `max_tokens` (after the calls
+  of that round ran). Once the client's connection is gone, no further call is sent.
+- One id for the whole reply: the id in `message_start` (or of the message) is the one every
+  round goes by. `POST /v1/chat/completions/control` with `{"id": ...}` cancels the reply in any
+  round: the round that runs stops, a call that waits for its server is the last one sent (the
+  calls after it get an error result), and no round follows. A streamed reply gets its keep-alive
+  (`event: ping`, every 10 s without a write) from before its MCP servers are reached to its end,
+  also while the server waits for its MCP calls; pings may come before `message_start`.
+- Limits per request: 8 servers, 10 generation rounds, 64 calls of MCP tools (later calls get an
+  error result), 128 KiB of each result in the prompt (its parts as the prompt joins them, one
+  newline between two; the rest is cut, with a note), 16 pages of
+  a server's tool list. Usage sums every round; `gaudium_tool_loop` gives the rounds and calls.
+- The decisions (admission, where a call goes, whether a round's calls run, whether each call
+  runs and whether another round follows, the output limit over the rounds, and the bounds) are
+  in `gaudium/verified/server_tools.bend`, how a generation ended (a call the parser closed never
+  counts as the call limit) in `gaudium/verified/tool_calls.bend`; the loop is
+  `gaudium/src/server/tool_loop.rs`, the client `gaudium/src/server/mcp_client.rs`.
+
 ## Threat model and guards
 
 A route that fetches a URL named by the request is a forwarder inside the operator's network.
