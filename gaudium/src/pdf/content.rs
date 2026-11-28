@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::doc::Doc;
-use super::font::{Font, FontParts};
+use super::font::{Font, FontParts, MAX_SIMPLE_WIDTHS};
 use super::lex::{is_white, Dict, Lexer, Obj, Token};
 use super::{Budget, Fail, MAX_FORM_DEPTH, MAX_GSTATE_DEPTH};
 use crate::verified as v;
@@ -471,15 +471,36 @@ impl<'d, 'a> Page<'d, 'a> {
         Ok(Some(font))
     }
 
-    fn read_font(&mut self, dict: &Dict) -> Result<Font, Fail> {
-        let to_unicode = match soft(self.doc.entry(dict, b"ToUnicode"))? {
+    /// The first `max` entries of `a` with references followed (a number may be an indirect
+    /// object), each a step of work.
+    fn resolved(&mut self, a: &[Obj], max: usize) -> Result<Rc<[Obj]>, Fail> {
+        let kept = &a[..a.len().min(max)];
+        self.doc.work.take(kept.len() as u64)?;
+        let mut out = Vec::with_capacity(kept.len());
+        for x in kept {
+            out.push(soft(self.doc.get(x))?);
+        }
+        Ok(Rc::from(out))
+    }
+
+    fn read_font(&mut self, font: &Dict) -> Result<Font, Fail> {
+        // the entries `Font::new` reads from the font dictionary itself, references followed
+        let mut keys = Dict::default();
+        for key in [&b"Subtype"[..], b"BaseFont", b"FirstChar"] {
+            keys.set(key.to_vec(), soft(self.doc.entry(font, key))?);
+        }
+        if let Obj::Array(m) = soft(self.doc.entry(font, b"FontMatrix"))? {
+            keys.set(b"FontMatrix".to_vec(), Obj::Array(self.resolved(&m, 6)?));
+        }
+        let dict = &keys;
+        let to_unicode = match soft(self.doc.entry(font, b"ToUnicode"))? {
             Obj::Stream(s) => soft(self.doc.decode(&s, 0).map(Some))?,
             _ => None,
         };
         let composite = dict.get(b"Subtype").and_then(Obj::as_name) == Some(b"Type0");
         let mut encoding = None;
         let mut encoding_cmap = None;
-        match soft(self.doc.entry(dict, b"Encoding"))? {
+        match soft(self.doc.entry(font, b"Encoding"))? {
             Obj::Name(n) => encoding = Some(Obj::Name(n)),
             Obj::Stream(s) if composite => {
                 encoding_cmap = soft(self.doc.decode(&s, 0).map(Some))?;
@@ -498,16 +519,18 @@ impl<'d, 'a> Page<'d, 'a> {
         let mut widths = None;
         let mut default_width = None;
         if composite {
-            let desc = soft(self.doc.entry(dict, b"DescendantFonts"))?;
+            let desc = soft(self.doc.entry(font, b"DescendantFonts"))?;
             let first = desc.as_array().and_then(|a| a.first()).cloned();
             if let Some(first) = first {
                 let df = soft(self.doc.get(&first))?;
                 if let Some(df) = df.as_dict() {
                     if let Obj::Array(w) = soft(self.doc.entry(df, b"W"))? {
-                        self.doc.work.take(w.len() as u64)?;
-                        let mut out = Vec::with_capacity(w.len());
-                        for x in w.iter() {
-                            out.push(soft(self.doc.get(x))?);
+                        let mut out = self.resolved(&w, w.len())?.to_vec();
+                        // the widths of a run of CIDs (`c [w1 w2 ...]`) may be indirect too
+                        for x in out.iter_mut() {
+                            if let Obj::Array(list) = x {
+                                *x = Obj::Array(self.resolved(&list.clone(), list.len())?);
+                            }
                         }
                         widths = Some(Rc::from(out));
                     }
@@ -515,10 +538,10 @@ impl<'d, 'a> Page<'d, 'a> {
                 }
             }
         } else {
-            if let Obj::Array(w) = soft(self.doc.entry(dict, b"Widths"))? {
-                widths = Some(w);
+            if let Obj::Array(w) = soft(self.doc.entry(font, b"Widths"))? {
+                widths = Some(self.resolved(&w, MAX_SIMPLE_WIDTHS)?);
             }
-            let fd = soft(self.doc.entry(dict, b"FontDescriptor"))?;
+            let fd = soft(self.doc.entry(font, b"FontDescriptor"))?;
             if let Some(fd) = fd.as_dict() {
                 default_width = soft(self.doc.entry(fd, b"MissingWidth"))?
                     .as_f64()

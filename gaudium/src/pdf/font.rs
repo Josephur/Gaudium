@@ -511,6 +511,8 @@ const CODE_COST: u64 = size_of::<Option<String>>() as u64;
 const TEXT_COST: u64 = 2 * size_of::<usize>() as u64;
 /// The memory one entry of a simple font's width table is charged for.
 const SIMPLE_WIDTH_COST: u64 = size_of::<f64>() as u64;
+/// The widths of a simple font that are kept (one per one-byte code).
+pub(crate) const MAX_SIMPLE_WIDTHS: usize = 256;
 
 /// The codespace ranges of one code length, sorted by their low code, each with the highest
 /// code any range up to it reaches: whether a code lies in a range is one binary search.
@@ -928,7 +930,7 @@ impl Font {
                 .and_then(|c| u32::try_from(c).ok())
                 .unwrap_or(0);
             if let Some(w) = &p.widths {
-                let kept = w.len().min(256);
+                let kept = w.len().min(MAX_SIMPLE_WIDTHS);
                 work.take(kept as u64)?;
                 // at most 256 widths are kept
                 mem.take(SIMPLE_WIDTH_COST * kept as u64)?;

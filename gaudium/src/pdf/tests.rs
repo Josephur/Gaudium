@@ -488,6 +488,151 @@ fn utf16_cmaps_read_surrogate_pairs_as_one_code() {
     );
 }
 
+/// The text of a one-page document showing `content` in font F1, the dictionary `font` builds
+/// (it may add the objects it refers to).
+fn text_in_font(font: impl FnOnce(&mut Pdf) -> String, content: &[u8]) -> Vec<String> {
+    let mut p = Pdf::new();
+    let catalog = p.reserve();
+    let pages = p.reserve();
+    let dict = font(&mut p);
+    let f1 = p.add(dict);
+    let content = p.add(stream("", content));
+    let page = p.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /Contents {content} 0 R /Resources << /Font << /F1 {f1} 0 R >> >> >>"
+    ));
+    p.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    p.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    text_of(&p.table(catalog, "")).unwrap()
+}
+
+#[test]
+fn indirect_font_numbers_are_followed() {
+    // Codex repro (#136): /Widths entries that are indirect objects counted as 0 units, so
+    // "A", 500 units wide at 12 points, then "B" seven points after it, read as two words
+    let simple: &[u8] = b"BT /F1 12 Tf 72 700 Td (A) Tj 7 0 Td (B) Tj ET";
+    let simple_font = |first: &str, widths: &str| {
+        format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar {first} /LastChar 66 /Widths [{widths}] >>")
+    };
+    let want = vec!["AB".to_string()];
+    assert_eq!(text_in_font(|_| simple_font("65", "500 500"), simple), want);
+    assert_eq!(
+        text_in_font(
+            |p| {
+                let w = p.add("500");
+                simple_font("65", &format!("{w} 0 R {w} 0 R"))
+            },
+            simple
+        ),
+        want
+    );
+    // the whole array, and /FirstChar
+    assert_eq!(
+        text_in_font(
+            |p| {
+                let w = p.add("500");
+                let a = p.add(format!("[{w} 0 R 500]"));
+                let c = p.add("65");
+                format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar {c} 0 R /LastChar 66 /Widths {a} 0 R >>")
+            },
+            simple
+        ),
+        want
+    );
+    // /MissingWidth of the descriptor
+    assert_eq!(
+        text_in_font(
+            |p| {
+                let w = p.add("500");
+                format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FontDescriptor << /MissingWidth {w} 0 R >> >>")
+            },
+            simple
+        ),
+        want
+    );
+    // a Type3 font's /FontMatrix scales its widths: 50 units of 0.01 em are 500 of 0.001
+    let type3 = |p: &mut Pdf, matrix: &str| {
+        let _ = p;
+        format!("<< /Type /Font /Subtype /Type3 /FontMatrix {matrix} /FirstChar 65 /LastChar 66 /Widths [50 50] /Encoding << /Differences [65 /A /B] >> >>")
+    };
+    assert_eq!(
+        text_in_font(|p| type3(p, "[0.01 0 0 0.01 0 0]"), simple),
+        want
+    );
+    assert_eq!(
+        text_in_font(
+            |p| {
+                let m = p.add("0.01");
+                type3(p, &format!("[{m} 0 R 0 0 {m} 0 R 0 0]"))
+            },
+            simple
+        ),
+        want
+    );
+    assert_eq!(
+        text_in_font(
+            |p| {
+                let m = p.add("[0.01 0 0 0.01 0 0]");
+                type3(p, &format!("{m} 0 R"))
+            },
+            simple
+        ),
+        want
+    );
+    // a Type0 font's /W (a run of CIDs, and its widths) and /DW: CIDs 1 and 2 are 500 units
+    // wide, so nine points apart they leave a gap of three points (1000 units would overlap)
+    let cid: &[u8] = b"BT /F1 12 Tf 72 700 Td <0001> Tj 9 0 Td <0002> Tj ET";
+    let type0 = |p: &mut Pdf, desc: &str| {
+        let tu = p.add(stream(
+            "",
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange 1 beginbfrange <0001> <0002> <0041> endbfrange",
+        ));
+        let d = p.add(format!(
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X {desc} >>"
+        ));
+        format!("<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /DescendantFonts [{d} 0 R] /ToUnicode {tu} 0 R >>")
+    };
+    let spaced = vec!["A B".to_string()];
+    assert_eq!(
+        text_in_font(|p| type0(p, "/DW 1000 /W [1 [500 500]]"), cid),
+        spaced
+    );
+    assert_eq!(
+        text_in_font(
+            |p| {
+                let w = p.add("500");
+                let one = p.add("1");
+                type0(p, &format!("/DW 1000 /W [{one} 0 R [{w} 0 R {w} 0 R]]"))
+            },
+            cid
+        ),
+        spaced
+    );
+    assert_eq!(
+        text_in_font(
+            |p| {
+                let w = p.add("500");
+                let list = p.add(format!("[{w} 0 R 500]"));
+                type0(p, &format!("/DW 1000 /W [1 {list} 0 R]"))
+            },
+            cid
+        ),
+        spaced
+    );
+    assert_eq!(
+        text_in_font(
+            |p| {
+                let w = p.add("500");
+                type0(p, &format!("/DW {w} 0 R"))
+            },
+            cid
+        ),
+        spaced
+    );
+}
+
 #[test]
 fn xref_stream_object_stream_and_predictor() {
     let (p, root) = doc(
