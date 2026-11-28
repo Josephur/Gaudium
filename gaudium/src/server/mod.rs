@@ -192,7 +192,8 @@ pub struct ServerConfig {
     /// Bounds of the in-memory store of past responses (`--response-store`,
     /// `--response-store-mb`; 0 entries = off).
     pub response_store: ResponseStoreLimits,
-    /// The file store of the Files API (`--files-dir`, `--files-quota-gb`, `--files-max-mb`).
+    /// The file store of the Files API (`--files-dir`, `--files-quota-gb`, `--files-max-mb`,
+    /// `--files-max-count`).
     pub files: file_store::FileStoreOptions,
 }
 
@@ -1809,11 +1810,16 @@ planned_drafter_of(&cfg, &entry.id).filter(|d| {
     let host_cache = host_cache_of(&cfg)?;
     let files = match &cfg.files.dir {
         Some(dir) => {
-            let st =
-                file_store::FileStore::open(dir, cfg.files.quota_bytes, cfg.files.max_file_bytes)?;
+            let st = file_store::FileStore::open(
+                dir,
+                cfg.files.quota_bytes,
+                cfg.files.max_file_bytes,
+                cfg.files.max_files,
+            )?;
             let (used, free, quota) = st.usage();
+            let (count, max_count) = st.file_count();
             eprintln!(
-                "[server] Files API on: {used} of {quota} bytes in use, {free} free, files up to {} bytes",
+                "[server] Files API on: {used} of {quota} bytes in use, {free} free, files up to {} bytes, {count} of {max_count} files",
                 st.cap()
             );
             let (n, bytes) = st.unreachable(&file_store::Owner::of_config(cfg.api_key.as_deref()));

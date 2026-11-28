@@ -343,6 +343,9 @@ Serve options:
                         that does not fit is refused; a start whose files already hold
                         more is refused (docs/files-api.md)
   --files-max-mb <N>    With --files-dir: largest single file in MiB (default: 512)
+  --files-max-count <N> With --files-dir: most files the store holds, whatever their
+                        size (default: 10000), uploads in progress included. An upload
+                        past it is refused; a start with more files is refused
 
 Live status environment variables:
   GAUDI_LIVE_DIR        Directory for live dashboard JSON records (GAUDI_LIVE=0 disables).

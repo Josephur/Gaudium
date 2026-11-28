@@ -799,7 +799,7 @@ mod tests {
     fn the_files_one_request_names_share_one_budget() {
         let d = std::env::temp_dir().join(format!("gaudium-files-budget-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let store = FileStore::open(&d, 100, 100).unwrap();
+        let store = FileStore::open(&d, 100, 100, crate::server::file_store::DEFAULT_MAX_FILES).unwrap();
         let f = store
             .create(
                 &Owner::everyone(),

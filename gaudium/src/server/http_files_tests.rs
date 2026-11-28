@@ -11,6 +11,18 @@ fn tmp_dir(name: &str) -> PathBuf {
 
 /// `h` with a file store in `dir` (`quota` bytes, files up to `cap`) and the API key `key`.
 fn with_files(h: Harness, dir: &Path, quota: u64, cap: u64, key: Option<&str>) -> Harness {
+    with_files_max(h, dir, quota, cap, file_store::DEFAULT_MAX_FILES, key)
+}
+
+/// As [`with_files`], holding at most `max_files` files.
+fn with_files_max(
+    h: Harness,
+    dir: &Path,
+    quota: u64,
+    cap: u64,
+    max_files: u64,
+    key: Option<&str>,
+) -> Harness {
     let Harness {
         state,
         replies,
@@ -22,7 +34,7 @@ fn with_files(h: Harness, dir: &Path, quota: u64, cap: u64, key: Option<&str>) -
         .ok()
         .expect("the harness owns its state");
     st.files = Some(Arc::new(
-        file_store::FileStore::open(dir, quota, cap).unwrap(),
+        file_store::FileStore::open(dir, quota, cap, max_files).unwrap(),
     ));
     st.cfg.api_key = key.map(str::to_string);
     Harness {
@@ -380,6 +392,38 @@ fn files_api_in_the_messages_shape() {
         (status, s(&m, &["object"]), s(&m, &["purpose"])),
         (200, "file", "user_data")
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn uploads_of_no_bytes_stop_at_the_file_count() {
+    let dir = tmp_dir("count");
+    let h = with_files_max(harness(), &dir, 10, 10, 5, None);
+    let st = &h.state;
+    let part = |data: &'static [u8]| {
+        [
+            ("purpose", None, None, &b"batch"[..]),
+            ("file", Some("f"), None, data),
+        ]
+    };
+    // the quota is full; files of no bytes still fit it, up to the file count
+    assert_eq!(upload(st, "", &part(&[b'x'; 10])).0, 200);
+    for _ in 0..4 {
+        assert_eq!(upload(st, "", &part(b"")).0, 200);
+    }
+    for _ in 0..20 {
+        let (status, e) = upload(st, "", &part(b""));
+        assert_eq!(status, 400, "{}", e.dump());
+        let msg = s(&e, &["error", "message"]);
+        assert!(
+            msg.contains("holds 5 files") && msg.contains("--files-max-count"),
+            "{msg}"
+        );
+        let (status, _) = upload(st, ANTHROPIC, &[("file", Some("f"), None, b"")]);
+        assert_eq!(status, 400);
+    }
+    let (_, list) = get_json(st, "GET", "/v1/files", "");
+    assert_eq!(list.get("data").and_then(|d| d.as_array()).map(|a| a.len()), Some(5));
     let _ = fs::remove_dir_all(&dir);
 }
 

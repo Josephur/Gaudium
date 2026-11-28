@@ -372,6 +372,9 @@ fn print_usage() {
          \x20                       that does not fit is refused; a start whose files already hold\n\
          \x20                       more is refused (docs/files-api.md)\n\
          \x20 --files-max-mb <N>    With --files-dir: largest single file in MiB (default: 512)\n\
+         \x20 --files-max-count <N> With --files-dir: most files the store holds, whatever their\n\
+         \x20                       size (default: 10000), uploads in progress included. An upload\n\
+         \x20                       past it is refused; a start with more files is refused\n\
          \n\
          Live status environment variables:\n\
          \x20 GAUDI_LIVE_DIR        Directory for live dashboard JSON records (GAUDI_LIVE=0 disables).\n\
@@ -2559,6 +2562,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let mut files_dir: Option<PathBuf> = None;
     let mut files_quota_gb: Option<f64> = None;
     let mut files_max_mb: Option<f64> = None;
+    let mut files_max_count: Option<u64> = None;
     let mut mcp_proxy = ProxyOptions::default();
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
@@ -2896,6 +2900,13 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                     "--files-max-mb",
                 )?)
             }
+            "--files-max-count" => {
+                let s = next_val(&mut i, "--files-max-count")?;
+                files_max_count = Some(
+                    s.parse()
+                        .map_err(|_| format!("invalid --files-max-count '{s}'"))?,
+                );
+            }
             other => return Err(format!("unknown --serve flag '{other}'")),
         }
         i += 1;
@@ -2948,8 +2959,10 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let hsts_max_age =
         gaudium::server::hsts_max_age_for(tls_cert.is_some(), port, hsts_max_age)?;
 
-    if files_dir.is_none() && (files_quota_gb.is_some() || files_max_mb.is_some()) {
-        return Err("--files-quota-gb and --files-max-mb need --files-dir".into());
+    if files_dir.is_none()
+        && (files_quota_gb.is_some() || files_max_mb.is_some() || files_max_count.is_some())
+    {
+        return Err("--files-quota-gb, --files-max-mb and --files-max-count need --files-dir".into());
     }
     let files = gaudium::server::file_store::FileStoreOptions {
         dir: files_dir,
@@ -2961,6 +2974,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             gaudium::server::file_store::DEFAULT_MAX_FILE_BYTES,
             |m| (m * (1u64 << 20) as f64) as u64,
         ),
+        max_files: files_max_count.unwrap_or(gaudium::server::file_store::DEFAULT_MAX_FILES),
     };
 
     if !profile.is_empty() {

@@ -14,6 +14,10 @@
 #     never takes more than the free bytes, and is given back once; an upload larger than its
 #     reservation is never stored
 #   - a file is shown only to its owner, and only while it is live
+#   - the store holds at most a bound of files whatever their size (section 4): an upload takes a
+#     slot before its bytes are read, refused (the count unchanged) when the store is full; a
+#     slot is given back once; a start counts every file found on disk and refuses more than
+#     the bound
 # The ledger holds `used` and `free` (their sum is the quota) and `next`, the lowest id not yet
 # handed out. `used` counts the stored files and the reservations of uploads in progress.
 # Streaming the bytes to disk, the metadata files, the owner digests and the HTTP shapes stay in
@@ -1232,3 +1236,289 @@ law fs_visible_own_file:
 
 def fs_visible_own_file(s):
   {==}
+
+# ============================================================================
+# 4. The file count
+# ============================================================================
+# The files the store holds, whatever their size: at most `max` (`--files-max-count`), so files of
+# no bytes cannot grow the index and the directory past a bound the byte quota does not give. A
+# stored file, a file found at start (served or not) and an upload in progress each hold a slot.
+# An upload takes its slot before its room is reserved and its bytes are read; the slot passes to
+# the file it becomes, and is given back once when the upload is refused or dropped, or when the
+# file is deleted.
+
+type FsCount is Data:
+  FsCount{live: Nat, max: Nat}
+
+# What taking a slot comes to: the count after it, or a refusal because the store is full (the
+# count `live` and the bound `max` it was decided against).
+type FsTake is Data:
+  FsTaken{after: FsCount}
+  FsTooMany{live: Nat, max: Nat}
+
+# An empty count with the bound `max`.
+def fs_count_open(+max: Nat) -> FsCount:
+  FsCount{0n, max}
+
+def fs_count_live(c: FsCount) -> Nat:
+  match c:
+    case FsCount{n, _}:
+      n
+
+def fs_count_max(c: FsCount) -> Nat:
+  match c:
+    case FsCount{_, m}:
+      m
+
+def fs_take_go(+n: Nat, +m: Nat, room: Bool) -> FsTake:
+  match room:
+    case True{}:
+      FsTaken{FsCount{1n+n, m}}
+    case False{}:
+      FsTooMany{n, m}
+
+# Taking a slot for an upload: given while the store holds fewer files than its bound.
+def fs_count_take(c: FsCount) -> FsTake:
+  match c:
+    case FsCount{+n, +m}:
+      fs_take_go(n, m, Nat.is_lt(n, m))
+
+# The count after a take decided against `c`: the count after it, or `c` itself.
+def fs_take_count(+c: FsCount, t: FsTake) -> FsCount:
+  match t:
+    case FsTaken{a}:
+      a
+    case FsTooMany{_, _}:
+      c
+
+# Whether a take gave the upload its slot.
+def fs_take_ok(t: FsTake) -> Bool:
+  match t:
+    case FsTaken{_}:
+      True{}
+    case FsTooMany{_, _}:
+      False{}
+
+# Whether a take kept the count within `m`, the bound it was decided against: a given slot leaves
+# at most `m` files, and the bound unchanged.
+def fs_take_within(+m: Nat, t: FsTake) -> Bool:
+  match t:
+    case FsTaken{+a}:
+      Bool.and(Nat.is_le(fs_count_live(a), m), Nat.is_eq(fs_count_max(a), m))
+    case FsTooMany{_, _}:
+      True{}
+
+# Whether a take that gave its slot counted it: the count after it is above `n`, the count before.
+def fs_take_raises(+n: Nat, t: FsTake) -> Bool:
+  match t:
+    case FsTaken{a}:
+      Nat.is_lt(n, fs_count_live(a))
+    case FsTooMany{_, _}:
+      True{}
+
+# `a` when the take gave the slot, `c` when it refused it.
+def fs_take_kept(t: FsTake, +a: FsCount, +c: FsCount) -> FsCount:
+  match t:
+    case FsTaken{_}:
+      a
+    case FsTooMany{_, _}:
+      c
+
+def fs_count_give_go(+n: Nat, +m: Nat, held: Bool) -> FsCount:
+  match held:
+    case True{}:
+      FsCount{Nat.sub(n, 1n), m}
+    case False{}:
+      FsCount{n, m}
+
+# Giving a slot back (`held`: the caller still holds it): one file fewer. A slot already given
+# back (or never taken) changes nothing.
+def fs_count_give(c: FsCount, held: Bool) -> FsCount:
+  match c:
+    case FsCount{+n, +m}:
+      fs_count_give_go(n, m, held)
+
+# Counting a file found at start: it holds a slot whether or not it fits a bound lowered since.
+def fs_count_restore(c: FsCount) -> FsCount:
+  match c:
+    case FsCount{+n, +m}:
+      FsCount{1n+n, m}
+
+# Whether the store starts with the files it counted: no more than its bound.
+def fs_count_fits(c: FsCount) -> Bool:
+  match c:
+    case FsCount{+n, +m}:
+      Nat.is_le(n, m)
+
+# Proof helpers (erased)
+
+def fs_succ_le_of_lt(+i: Nat, +m: Nat, h: {Nat.is_lt(i, m) == True{} : Bool}) -> {Nat.is_le(1n+i, m) == True{} : Bool}:
+  match i m:
+    case 0n 0n:
+      L.bool_absurd({Nat.is_le(1n, 0n) == True{} : Bool}, h)
+    case 0n 1n+mp:
+      L.nat_le_zero(mp)
+    case 1n+ip 0n:
+      L.bool_absurd({Nat.is_le(1n+1n+ip, 0n) == True{} : Bool}, h)
+    case 1n+ip 1n+mp:
+      fs_succ_le_of_lt(ip, mp, h)
+
+def fs_take_go_within(+n: Nat, +m: Nat, k: Bool, ek: {k == Nat.is_lt(n, m) : Bool}) -> {fs_take_within(m, fs_take_go(n, m, k)) == True{} : Bool}:
+  match k:
+    case True{}:
+      %Equal.sym(Bool, Nat.is_le(1n+n, m), True{}, fs_succ_le_of_lt(n, m, Equal.sym(Bool, True{}, Nat.is_lt(n, m), ek))) : {Bool.and(_, Nat.is_eq(m, m)) == True{} : Bool}
+      G.g_nat_eq_refl(m)
+    case False{}:
+      {==}
+
+def fs_take_go_raises(+n: Nat, +m: Nat, k: Bool) -> {fs_take_raises(n, fs_take_go(n, m, k)) == True{} : Bool}:
+  match k:
+    case True{}:
+      L.nat_lt_succ_self(n)
+    case False{}:
+      {==}
+
+def fs_take_kept_eq(+c: FsCount, t: FsTake) -> {fs_take_kept(t, fs_take_count(c, t), c) == fs_take_count(c, t) : FsCount}:
+  match t:
+    case FsTaken{+a}:
+      {==}
+    case FsTooMany{+x, +y}:
+      {==}
+
+def fs_take_go_undone(+n: Nat, +m: Nat, k: Bool) -> {fs_count_give(fs_take_count(FsCount{n, m}, fs_take_go(n, m, k)), fs_take_ok(fs_take_go(n, m, k))) == FsCount{n, m} : FsCount}:
+  match k:
+    case True{}:
+      %Equal.sym(Nat, Nat.sub(n, 0n), n, L.nat_sub_zero_r(n)) : {FsCount{_, m} == FsCount{n, m} : FsCount}
+      {==}
+    case False{}:
+      {==}
+
+# Laws
+
+# promise: an opened count holds no files and keeps the bound it was given.
+# harm: a new store could start full and refuse every upload, or with another bound than configured
+# catches: fs_count_open starting the count at its bound (`FsCount{max, max}`)
+law fs_count_open_empty:
+  for +m: Nat
+  {fs_count_open(m) == FsCount{0n, m} : FsCount}
+
+def fs_count_open_empty(m):
+  {==}
+
+# promise: a slot is given only while one more file stays within the bound, so a take never leaves the store with more files than its bound, and keeps the bound.
+# harm: uploads of no bytes could grow the index and the directory without end
+# catches: the take's test made `Nat.is_le(n, m)`, giving a slot to a store already at its bound
+law fs_take_within_bound:
+  for +c: FsCount
+  {fs_take_within(fs_count_max(c), fs_count_take(c)) == True{} : Bool}
+
+def fs_take_within_bound(c):
+  match c:
+    case FsCount{+n, +m}:
+      fs_take_go_within(n, m, Nat.is_lt(n, m), {==})
+
+# promise: a refused take leaves the count the store keeps after it equal to the count it was decided against.
+# harm: a refusal could zero the count, and the store would then take files past its bound
+# catches: fs_take_count returning an empty count for a refused take
+law fs_take_refused_keeps:
+  for +c: FsCount
+  {fs_take_kept(fs_count_take(c), fs_take_count(c, fs_count_take(c)), c) == fs_take_count(c, fs_count_take(c)) : FsCount}
+
+def fs_take_refused_keeps(c):
+  fs_take_kept_eq(c, fs_count_take(c))
+
+# promise: a take that gives an upload its slot counts it: the store holds more files after it.
+# harm: uploads in progress and stored files would not count against the bound
+# catches: the given slot not counted (the count after a take left at `n`)
+law fs_take_raises_count:
+  for +c: FsCount
+  {fs_take_raises(fs_count_live(c), fs_count_take(c)) == True{} : Bool}
+
+def fs_take_raises_count(c):
+  match c:
+    case FsCount{+n, +m}:
+      fs_take_go_raises(n, m, Nat.is_lt(n, m))
+
+# promise: an upload is given its slot whenever the store holds fewer files than its bound.
+# harm: the store could refuse every upload, or the last one its bound allows
+# catches: the take's test off by one (`Nat.is_lt(1n+n, m)`), refusing the last slot under the bound
+law fs_take_below_bound:
+  for +n: Nat
+  for +z: Nat
+  {fs_take_ok(fs_count_take(FsCount{n, Nat.add(n, 1n+z)})) == True{} : Bool}
+
+def fs_take_below_bound(n, z):
+  %Equal.sym(Bool, Nat.is_lt(n, Nat.add(n, 1n+z)), True{}, fs_lt_add_succ(n, z)) : {fs_take_ok(fs_take_go(n, Nat.add(n, 1n+z), _)) == True{} : Bool}
+  {==}
+
+# promise: giving back a slot that is no longer held changes nothing, so a slot is freed at most once.
+# harm: an upload refused and then dropped could free its slot twice, and the store would take files past its bound
+# catches: the held flag ignored (every give lowers the count)
+law fs_give_once:
+  for +c: FsCount
+  {fs_count_give(c, False{}) == c : FsCount}
+
+def fs_give_once(c):
+  match c:
+    case FsCount{+n, +m}:
+      {==}
+
+# promise: giving back the slot a take gave leaves the count, and the bound, as they were before the take.
+# harm: deleted files and refused uploads would keep their slots, and the store would fill for good
+# catches: fs_count_give leaving the count unchanged for a held slot
+law fs_give_undoes_take:
+  for +c: FsCount
+  {fs_count_give(fs_take_count(c, fs_count_take(c)), fs_take_ok(fs_count_take(c))) == c : FsCount}
+
+def fs_give_undoes_take(c):
+  match c:
+    case FsCount{+n, +m}:
+      fs_take_go_undone(n, m, Nat.is_lt(n, m))
+
+# promise: every file found at start is counted, and the bound is kept.
+# harm: files kept across a restart would not count against the bound
+# catches: fs_count_restore returning the count unchanged
+law fs_restore_counts_file:
+  for +c: FsCount
+  {Bool.and(Nat.is_lt(fs_count_live(c), fs_count_live(fs_count_restore(c))), Nat.is_eq(fs_count_max(fs_count_restore(c)), fs_count_max(c))) == True{} : Bool}
+
+def fs_restore_counts_file(c):
+  match c:
+    case FsCount{+n, +m}:
+      %Equal.sym(Bool, Nat.is_lt(n, 1n+n), True{}, L.nat_lt_succ_self(n)) : {Bool.and(_, Nat.is_eq(m, m)) == True{} : Bool}
+      G.g_nat_eq_refl(m)
+
+# promise: deleting a file found at start frees the slot it was counted with.
+# harm: files deleted after a restart would keep their slots, and the store would fill for good
+# catches: fs_count_restore counting a file twice
+law fs_give_undoes_restore:
+  for +c: FsCount
+  {fs_count_give(fs_count_restore(c), True{}) == c : FsCount}
+
+def fs_give_undoes_restore(c):
+  match c:
+    case FsCount{+n, +m}:
+      %Equal.sym(Nat, Nat.sub(n, 0n), n, L.nat_sub_zero_r(n)) : {FsCount{_, m} == FsCount{n, m} : FsCount}
+      {==}
+
+# promise: a store whose files found on disk are more than its bound never starts.
+# harm: a bound lowered below the files kept would not be enforced
+# catches: fs_count_fits not comparing the count with the bound
+law fs_count_refuses_overfull:
+  for +m: Nat
+  for +x: Nat
+  {fs_count_fits(FsCount{Nat.add(m, 1n+x), m}) == False{} : Bool}
+
+def fs_count_refuses_overfull(m, x):
+  G.g_nat_le_add_succ_false(m, x)
+
+# promise: a store whose files found on disk are within its bound starts.
+# harm: a store holding as many files as its bound would refuse to start
+# catches: fs_count_fits made strict (`Nat.is_lt(n, m)`)
+law fs_count_fits_within:
+  for +n: Nat
+  for +z: Nat
+  {fs_count_fits(FsCount{n, Nat.add(n, z)}) == True{} : Bool}
+
+def fs_count_fits_within(n, z):
+  L.nat_add_le_r(n, z)

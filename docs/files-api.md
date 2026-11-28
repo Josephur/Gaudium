@@ -24,6 +24,17 @@ Ids are `file-<12 hex digits of the counter><12 random hex digits>`.
   was lowered since), the server does not start and says how many bytes they hold. Raise the
   quota, or stop the server and remove files as below.
 
+## The file count
+
+- `--files-max-count` (default 10000) bounds the number of files, whatever their size, so that
+  files of no bytes cannot grow the index and the directory without end. Stored files, files
+  found at start (also those not served) and uploads in progress each count. An upload past the
+  bound is refused before its bytes are read (400), and its slot is given back when an upload is
+  refused or dropped, or a file is deleted.
+- At start every file in the directory is counted. If there are more than the bound (it was
+  lowered since), the server does not start and says how many there are. Raise the bound, or stop
+  the server and remove files as below.
+
 ## Owners
 
 - With `--api-key`, a file belongs to the key that stored it. `owner` in its `.json` is
