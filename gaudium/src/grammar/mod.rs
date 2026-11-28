@@ -289,6 +289,15 @@ const S_START: u8 = 0;
 const S_NORMAL: u8 = 1;
 const S_ESC: u8 = 2;
 const S_HEX: u8 = 3;
+// after a high-surrogate escape (`\uD800`-`\uDBFF`): its low half's `\`, `u` and four digits
+const S_LOW_BS: u8 = 4;
+const S_LOW_U: u8 = 5;
+const S_LOW_HEX: u8 = 6;
+// a `\u` escape's state in `x`: digits read (low bits), its first digit was `D`, it is a high
+// surrogate (known after the second digit)
+const HEX_COUNT: u32 = 0xFF;
+const HEX_D: u32 = 1 << 8;
+const HEX_HIGH: u32 = 1 << 9;
 // Num
 const N_START: u8 = 0;
 const N_MINUS: u8 = 1;
@@ -648,13 +657,36 @@ impl Grammar {
                         }
                         Self::set_top(st, g, out);
                     }
-                    S_HEX if b.is_ascii_hexdigit() => {
-                        if f.x == 3 {
-                            g.ph = S_NORMAL;
-                            g.x = 0;
-                        } else {
-                            g.x += 1;
-                        }
+                    // RFC 8259 escapes a code point above U+FFFF as a surrogate pair: a high
+                    // half `\uD800`-`\uDBFF` is followed at once by a low half
+                    // `\uDC00`-`\uDFFF`, and a low half never stands alone. Each is refused at
+                    // the digit that decides it, so every admitted prefix can still complete.
+                    S_HEX | S_LOW_HEX if b.is_ascii_hexdigit() => {
+                        let low = f.ph == S_LOW_HEX;
+                        let v = (b as char).to_digit(16).unwrap_or(0);
+                        let d = f.x & HEX_D != 0;
+                        g.x = match f.x & HEX_COUNT {
+                            0 if low && v != 0xD => return,
+                            0 => 1 | if v == 0xD { HEX_D } else { 0 },
+                            // a low half needs DC-DF; outside one, DC-DF is a lone low half
+                            1 if low && v < 0xC => return,
+                            1 if !low && d && v >= 0xC => return,
+                            1 => 2 | if !low && d && v >= 0x8 { HEX_HIGH } else { 0 },
+                            2 => 3 | (f.x & HEX_HIGH),
+                            _ => {
+                                g.ph = if f.x & HEX_HIGH != 0 { S_LOW_BS } else { S_NORMAL };
+                                0
+                            }
+                        };
+                        Self::set_top(st, g, out);
+                    }
+                    S_LOW_BS if b == b'\\' => {
+                        g.ph = S_LOW_U;
+                        Self::set_top(st, g, out);
+                    }
+                    S_LOW_U if b == b'u' => {
+                        g.ph = S_LOW_HEX;
+                        g.x = 0;
                         Self::set_top(st, g, out);
                     }
                     _ => {}

@@ -238,7 +238,7 @@ fn differential_against_the_json_parser() {
         seed ^= seed << 17;
         seed % n
     };
-    let alphabet: &[u8] = b"{}[]\":,0123456789-.eE+ \ntruefalsn\\ux";
+    let alphabet: &[u8] = b"{}[]\":,0123456789-.eE+ \ntruefalsn\\uxDc";
     let mut accepted = 0;
     for _ in 0..20000 {
         let len = 1 + rnd(24) as usize;
@@ -270,6 +270,104 @@ fn differential_against_the_json_parser() {
         let v = parse_json(t).unwrap();
         assert!(accepts(&g, &v.dump()), "{}", v.dump());
     }
+}
+
+/// `\u` escapes pair as RFC 8259 pairs them and as `parse_json` reads them: a high surrogate is
+/// followed at once by a low one, a low one never stands alone. Every code unit at the range
+/// edges, alone, before a letter and before every other, in both letter cases.
+#[test]
+fn surrogate_escapes_agree_with_the_json_parser() {
+    let g = json_mode();
+    let units = [
+        0x0000u32, 0x0041, 0xD7FF, 0xD800, 0xDA12, 0xDBFF, 0xDC00, 0xDE00, 0xDFFF, 0xE000, 0xFFFF,
+    ];
+    let esc = |u: u32, lower: bool| {
+        if lower {
+            format!("\\u{u:04x}")
+        } else {
+            format!("\\u{u:04X}")
+        }
+    };
+    let mut checked = 0;
+    for lower in [false, true] {
+        for &a in &units {
+            let mut bodies = vec![esc(a, lower), format!("{}a", esc(a, lower))];
+            for &b in &units {
+                bodies.push(format!("{}{}", esc(a, lower), esc(b, lower)));
+            }
+            for body in bodies {
+                let text = format!("{{\"x\":\"{body}\"}}");
+                let parsed = parse_json(&text).is_ok();
+                assert_eq!(accepts(&g, &text), parsed, "{text}");
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 200);
+    // the digit that decides it refuses at once: no admitted prefix is a dead end
+    let c = g.start().unwrap();
+    assert!(g.step_bytes(&c, br#"{"x":"\uDC"#).is_none());
+    assert!(g.step_bytes(&c, br#"{"x":"\uD800""#).is_none());
+    assert!(g.step_bytes(&c, br#"{"x":"\uD800\uDB"#).is_none());
+    assert!(g.step_bytes(&c, br#"{"x":"\uD83D\uDE"#).is_some());
+}
+
+/// A strict tool's object-valued parameter never admits an argument the reply parser can not
+/// read back as JSON (it would then pass the whole parameter on as a string).
+#[test]
+fn a_strict_object_parameter_refuses_a_lone_surrogate() {
+    let tool = ToolDef {
+        name: "put".into(),
+        strict: Some(schema(
+            r#"{"type":"object","properties":{"obj":{"type":"object"}},"required":["obj"]}"#,
+        )),
+    };
+    let g = build::reply(None, &[tool], &params_tags()).unwrap();
+    let call = |v: &str| {
+        format!("<tool_call>\n<function=put>\n<parameter=obj>\n{v}\n</parameter>\n</function>\n</tool_call>")
+    };
+    for good in [r#"{"x":"\uD83D\uDE00"}"#, r#"{"x":"\u00e9"}"#] {
+        assert!(accepts(&g, &call(good)), "{good}");
+        assert!(parse_json(good).is_ok());
+    }
+    for bad in [r#"{"x":"\uD800"}"#, r#"{"x":"\uDC00"}"#, r#"{"x":"\uD800\u0041"}"#] {
+        assert!(refuses(&g, &call(bad)), "{bad}");
+        assert!(parse_json(bad).is_err());
+    }
+}
+
+/// A string parameter with `const` or `enum` (written as raw text in a parameter block) has its
+/// keywords checked like any other schema: one the literals would leave unenforced is refused.
+#[test]
+fn a_literal_string_parameter_checks_its_keywords() {
+    let tool = |p: &str| ToolDef {
+        name: "t".into(),
+        strict: Some(schema(&format!(
+            r#"{{"type":"object","properties":{{"s":{p}}},"required":["s"]}}"#
+        ))),
+    };
+    for (p, kw) in [
+        (r#"{"type":"string","const":"a","minLength":2}"#, "minLength"),
+        (r#"{"type":"string","enum":["a","b"],"pattern":"^a$"}"#, "pattern"),
+        (r#"{"type":"string","const":"a","enum":["a"]}"#, "const"),
+        (r#"{"type":"string","enum":[]}"#, "enum"),
+        (r#"{"type":"string","enum":[1,2]}"#, "enum"),
+    ] {
+        let e = build::reply(None, &[tool(p)], &params_tags()).unwrap_err();
+        assert!(e.contains(kw), "{p}: {e}");
+    }
+    // a literal with only annotations beside it still compiles, and holds the reply to it
+    let g = build::reply(
+        None,
+        &[tool(r#"{"type":"string","enum":["a","b"],"description":"one of two"}"#)],
+        &params_tags(),
+    )
+    .unwrap();
+    let call = |v: &str| {
+        format!("<tool_call>\n<function=t>\n<parameter=s>\n{v}\n</parameter>\n</function>\n</tool_call>")
+    };
+    assert!(accepts(&g, &call("b")));
+    assert!(refuses(&g, &call("c")));
 }
 
 fn params_tags() -> CallTags {

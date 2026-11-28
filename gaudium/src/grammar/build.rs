@@ -1080,6 +1080,10 @@ impl Builder {
     /// `</function>` or the tool tag's close, whichever comes first).
     fn raw_param(&mut self, s: &JsonValue, tags: &CallTags, path: &str) -> Result<NodeId, String> {
         let close = "\n</parameter>\n";
+        // the schema's keywords are checked first, as anywhere else: a keyword the literals
+        // below would leave unenforced (`minLength` beside a `const`, `const` beside `enum`) is
+        // refused, not ignored
+        self.value(s, path, 1)?;
         let values = s
             .get("const")
             .map(|c| vec![c.clone()])
@@ -1099,8 +1103,7 @@ impl Builder {
             }
             return Ok(self.literals(&texts));
         }
-        // the string schema itself admits every string: only its keywords are checked
-        self.value(s, path, 1)?;
+        // the string schema itself admits every string: its keywords are checked above
         let raw = self.push(Node::Raw {
             term: Pat::new(PARAM_CLOSE.as_bytes()),
             forbid: vec![Pat::new(FUNCTION_CLOSE.as_bytes()), Pat::new(tags.close.as_bytes())],
