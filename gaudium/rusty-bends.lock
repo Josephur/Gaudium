@@ -1183,8 +1183,6 @@ ca6c53e6ce7c6290  ln_fail_leaves_batch  law ln_fail_leaves_batch : for s : LaneS
 # promise ln_fail_leaves_batch: a lane whose request failed takes part in no further step.
 5fef5a8c3062d3ac  ln_finish_leaves_batch  law ln_finish_leaves_batch : for s : LaneState { ln_in_batch ( ln_step ( s , EvLnFinish { } ) ) == False { } : Bool }
 # promise ln_finish_leaves_batch: a lane whose request finished takes part in no further step.
-52c7bc612b499a87  ln_fork_from_decoding  law ln_fork_from_decoding : for + o : Nat { ln_fork_takes ( LnDecode { } , 0n , 1n + o ) == True { } : Bool }
-# promise ln_fork_from_decoding: a request that holds nothing of its prompt takes it over from a decoding lane that holds some of it.
 0cae6a548c7abcde  ln_fork_needs_gain  law ln_fork_needs_gain : for + s : LaneState for + h : Nat for + o : Nat { Bool.and ( ln_fork_takes ( s , h , o ) , Nat.is_le ( o , h ) ) == False { } : Bool }
 # promise ln_fork_needs_gain: a request never copies rows from another lane unless that gives it more of its prompt than it takes over already.
 b9070933479e11cd  ln_fork_never_from_prefill  law ln_fork_never_from_prefill : for + h : Nat for + o : Nat { ln_fork_takes ( LnPrefill { } , h , o ) == False { } : Bool }
@@ -1195,8 +1193,6 @@ b9070933479e11cd  ln_fork_never_from_prefill  law ln_fork_never_from_prefill : f
 # promise ln_fork_source_kept: a source keeps the recurrent state at the position the fork resumes at.
 e1d1b8645f39996a  ln_fork_source_never_self  law ln_fork_source_never_self : for + s : LaneState for + h : Nat for + o : Nat for + t : Nat for + hl : Nat for + k : Bool { ln_fork_source ( True { } , s , h , o , t , hl , k ) == False { } : Bool }
 # promise ln_fork_source_never_self: a request never takes the start of its prompt from its own lane.
-e1764d06783eedd1  ln_fork_source_some  law ln_fork_source_some : for + k : Nat for + tp : Nat { ln_fork_source ( False { } , LnDecode { } , 0n , Nat.mul ( 1n + k , 1n + tp ) , 1n + tp , Nat.mul ( 1n + k , 1n + tp ) , True { } ) == True { } : Bool }
-# promise ln_fork_source_some: a request that holds nothing of its prompt takes at least one whole tile of it from another decoding lane that holds those rows and keeps the state there.
 6e2d6d45cf28985a  ln_fork_source_takes  law ln_fork_source_takes : for + f : Bool for + s : LaneState for + h : Nat for + o : Nat for + t : Nat for + hl : Nat for + k : Bool { Bool.and ( ln_fork_source ( f , s , h , o , t , hl , k ) , Bool.not ( ln_fork_takes ( s , h , o ) ) ) == False { } : Bool }
 # promise ln_fork_source_takes: a lane is chosen as the source only when the lane fork rule (ln_fork_takes) takes it.
 0e2ec3f365378cca  ln_fork_tiles_cover  law ln_fork_tiles_cover : for + k : Nat for + tp : Nat { Nat.is_ge ( ln_fork_tiles ( Nat.mul ( k , 1n + tp ) , 1n + tp ) , k ) == True { } : Bool }

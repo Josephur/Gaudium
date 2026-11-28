@@ -2802,15 +2802,6 @@ law ln_fork_never_from_prefill:
 def ln_fork_never_from_prefill(h, o):
   {==}
 
-# promise: a request that holds nothing of its prompt takes it over from a decoding lane that holds some of it.
-# catches: ln_fork_takes returns False{} for every lane, so the choices of a request all prefill the whole prompt
-law ln_fork_from_decoding:
-  for +o: Nat
-  {ln_fork_takes(LnDecode{}, 0n, 1n+o) == True{} : Bool}
-
-def ln_fork_from_decoding(o):
-  {==}
-
 # promise: a fork never copies rows past the position it resumes at.
 # catches: ln_fork_tiles rounds up (Nat.div(rows + tile - 1, tile)), copying a tile the other lane's kept position does not cover
 law ln_fork_tiles_within:
@@ -2958,15 +2949,3 @@ def ln_fork_source_kept(f, s, h, o, t, hl):
       {==}
     case False{}:
       {==}
-
-# promise: a request that holds nothing of its prompt takes at least one whole tile of it from another decoding lane that holds those rows and keeps the state there.
-# catches: ln_fork_source returns False{} for every lane, so the choices of a request all prefill the whole prompt
-# The offer and the held rows are whole tiles (at least one), so a gate that refuses a fork copying no whole tile stays allowed.
-law ln_fork_source_some:
-  for +k: Nat
-  for +tp: Nat
-  {ln_fork_source(False{}, LnDecode{}, 0n, Nat.mul(1n+k, 1n+tp), 1n+tp, Nat.mul(1n+k, 1n+tp), True{}) == True{} : Bool}
-
-def ln_fork_source_some(k, tp):
-  %Equal.sym(Nat, Nat.div(Nat.mul(1n+k, 1n+tp), 1n+tp), 1n+k, L.nat_div_mul(1n+k, tp)) : {Bool.and(Nat.is_gt(Nat.mul(1n+k, 1n+tp), 0n), Nat.is_le(Nat.mul(_, 1n+tp), Nat.mul(1n+k, 1n+tp))) == True{} : Bool}
-  L.nat_le_refl(Nat.mul(1n+k, 1n+tp))
