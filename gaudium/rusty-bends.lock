@@ -1513,6 +1513,9 @@ f37e1ea922e84f0b  pool_init_conserved  law pool_init_conserved : for cap : Nat {
 e7c4808878bc6e78  pool_pinned_never_evicted  law pool_pinned_never_evicted : for p : Nat for busy : Bool { pool_can_evict ( 1n + p , busy ) == False { } : Bool }
 6e7ecfc69aba4cc1  prompt_token_first_ok  law prompt_token_first_ok : for + r : Nat for + n : Nat { prompt_token_ok ( 0n , 1n + r , 1n + n ) == True { } : Bool }
 # promise prompt_token_first_ok: the first token of a model with any embedding rows and tokens is accepted.
+58caa2d2bcdccc1d  prompt_token_within_names  law prompt_token_within_names : for + id : Nat for + rows : Nat for + names : Nat { Bool.and ( prompt_token_ok ( id , rows , names ) , Nat.is_le ( names , id ) ) == False { } : Bool }
+# promise prompt_token_within_names: a prompt token id at or past the tokenizer's last entry is never accepted.
+# harm prompt_token_within_names: the engine would run an embedding row the tokenizer cannot name (a padding row), and the reply could not be read back as text.
 b478e6ba7ed37511  prompt_token_within_rows  law prompt_token_within_rows : for + id : Nat for + rows : Nat for + names : Nat { Bool.and ( prompt_token_ok ( id , rows , names ) , Nat.is_le ( rows , id ) ) == False { } : Bool }
 # promise prompt_token_within_rows: a prompt token id at or past the embedding's last row is never accepted.
 # harm prompt_token_within_rows: the engine would read the embedding table past its end for that prompt row.

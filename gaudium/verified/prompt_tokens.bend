@@ -65,8 +65,7 @@ def prompt_token_first_ok(r, n):
   {==}
 
 # promise: a prompt token id at or past the tokenizer's last entry is never accepted.
-# harm: the engine would run an embedding row the tokenizer cannot name (a padding row), and the
-# reply could not be read back as text.
+# harm: the engine would run an embedding row the tokenizer cannot name (a padding row), and the reply could not be read back as text.
 # catches: the tokenizer bound dropped (only the embedding's rows checked)
 law prompt_token_within_names:
   for +id: Nat
