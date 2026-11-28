@@ -135,11 +135,13 @@ pub fn row_logprobs_u16(
         for &b in words {
             counts[key_of_bits(b as u32) as usize] += 1;
         }
-        // in the support: a non-NaN value at least the threshold (compared as values, so -0 and
-        // +0 are one value, as in the sampler)
+        // in the support: a non-NaN value above -inf and at least the threshold (compared as
+        // values, so -0 and +0 are one value, as in the sampler). A token at -inf (banned by
+        // the logit bias, refused by the request's grammar) has probability 0 and is never an
+        // alternative, also under greedy, whose threshold is -inf.
         let in_support = |k: usize| -> bool {
             let v = val_of_key(k as i32);
-            !v.is_nan() && v >= thr
+            !v.is_nan() && v != f32::NEG_INFINITY && v >= thr
         };
         let md = m as f64;
         let mut sum = 0.0f64;
@@ -322,6 +324,21 @@ mod tests {
         }
         let total: f64 = want.iter().map(|l| l.exp()).sum();
         assert!((total - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tokens_at_minus_infinity_are_never_alternatives() {
+        // a greedy row whose ban or grammar mask left two tokens: asking for more lists two
+        let ninf = f32::NEG_INFINITY;
+        let w = row(&[ninf, 2.0, ninf, ninf, 1.0, ninf]);
+        let dev = SampleParams::default().to_dev(6);
+        let r = row_logprobs_u16(&w, &dev, 1, 5);
+        assert_eq!(r.top.iter().map(|t| t.0).collect::<Vec<_>>(), vec![1, 4]);
+        assert!(r.top.iter().all(|t| t.1.is_finite()));
+        let mass: f64 = r.top.iter().map(|t| t.1.exp()).sum();
+        assert!((mass - 1.0).abs() < 1e-12);
+        // a refused token's own entry is -inf
+        assert_eq!(row_logprobs_u16(&w, &dev, 0, 0).logprob, f64::NEG_INFINITY);
     }
 
     #[test]

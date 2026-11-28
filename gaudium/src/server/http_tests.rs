@@ -4953,6 +4953,45 @@ fn chat_logprobs_give_one_entry_per_generated_token() {
     assert!(at(&r, &["choices", "0"]).get("logprobs").is_none());
 }
 
+/// A `response_format` request that asks for logprobs: both reach the engine together (the
+/// scripted engine holds each token to the grammar's mask, as the host pick does), and the
+/// entries are the reply's own tokens in order, reasoning and answer. That the alternatives of
+/// a constrained pick are only admitted tokens is the host pick's
+/// (`grammar::tests::logprobs_of_a_constrained_pick_report_only_admitted_tokens`).
+#[test]
+fn a_json_object_reply_reports_logprobs_of_its_own_tokens() {
+    let h = harness();
+    let tok = Arc::clone(&h.state.models[0].tokenizer);
+    let reply = "Hm.\n</think>\n\n{\"city\": \"Oslo\"}";
+    let ids = tok.encode(reply, true);
+    h.script(reply);
+    let (status, r) = h.chat(r#","response_format":{"type":"json_object"},"logprobs":true,"top_logprobs":2"#);
+    assert_eq!(status, 200, "{}", r.dump());
+    let content = s(&r, &["choices", "0", "message", "content"]);
+    assert_eq!(json::parse_json(content).unwrap().dump(), "{\"city\":\"Oslo\"}");
+    let entries = logprob_entries(&[at(&r, &["choices", "0"])]);
+    assert_eq!(entries.len(), ids.len(), "{}", r.dump());
+    let mut bytes = Vec::new();
+    for (e, &id) in entries.iter().zip(&ids) {
+        let b: Vec<u8> = at(e, &["bytes"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(b, tok.token_bytes(id));
+        assert_eq!(at(e, &["top_logprobs"]).as_array().unwrap().len(), 2);
+        bytes.extend_from_slice(&b);
+    }
+    let text = String::from_utf8(bytes).unwrap();
+    assert_eq!(text, reply);
+    assert!(text.ends_with(content), "{text:?} / {content:?}");
+    // the grammar still holds with logprobs on: a reply outside JSON is not one it emits
+    h.script("</think>\n\nnot json");
+    let (status, r) = h.chat(r#","response_format":{"type":"json_object"},"logprobs":true"#);
+    assert_ne!(status, 200, "{}", r.dump());
+}
+
 #[test]
 fn streamed_logprobs_cover_every_token_once_in_order() {
     let h = harness();
