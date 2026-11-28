@@ -2169,8 +2169,8 @@ fn api_request(headers: &[(&str, &str)]) -> HttpRequest {
         target: "/v1/messages".into(),
         path: "/v1/messages".into(),
         query: std::collections::HashMap::new(),
-        headers: headers
-            .iter()
+        headers: std::iter::once(("host", "localhost:8090"))
+            .chain(headers.iter().copied())
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         body: Vec::new(),
@@ -2249,6 +2249,23 @@ fn documents_are_fetched_under_the_proxy_rules() {
         .fetch_document(&foreign, true, &t.url("/doc.pdf"), 1000)
         .unwrap_err();
     assert!(e.contains("another origin"), "{e}");
+    // a request that names a host that is not one of this server's names (DNS rebinding), in
+    // Host or in a front-end header
+    for extra in [
+        &[("host", "rebind.example.com:8090")][..],
+        &[("x-forwarded-host", "rebind.example.com")],
+        &[("forwarded", "host=rebind.example.com")],
+    ] {
+        let rebound = api_request(extra);
+        let e = p
+            .fetch_document(&rebound, true, &t.url("/doc.pdf"), 1000)
+            .unwrap_err();
+        assert!(
+            e.contains("not one of this server's names"),
+            "{extra:?}: {e}"
+        );
+        assert!(e.contains("--server-name"), "{e}");
+    }
     let listed = proxy(&["mcp.example.com"], &[]);
     let e = listed
         .fetch_document(&req, true, &t.url("/doc.pdf"), 1000)

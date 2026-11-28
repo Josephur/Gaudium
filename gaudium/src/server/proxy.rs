@@ -1746,7 +1746,9 @@ impl McpProxy {
         max_bytes: u64,
     ) -> Result<(Vec<u8>, Option<String>), String> {
         let (site, has_origin, origin_is_host) = request_site(req);
-        let site_ok = rule::site_ok(site, has_origin, origin_is_host);
+        let (host, forwarded) = request_hosts(req);
+        let hosts_ours = names::request_ours(&host, &forwarded, &self.own_names);
+        let site_ok = names::site_ok(hosts_ours, rule::site_ok(site, has_origin, origin_is_host));
         match rule::gate(key_ok, self.enabled(), site_ok, true) {
             Gate::PxGateRun => {}
             Gate::PxGateDisabled => {
@@ -1756,6 +1758,12 @@ impl McpProxy {
                 )
             }
             Gate::PxGateNoKey => return Err("invalid or missing API key".into()),
+            Gate::PxGateForeign if !hosts_ours => {
+                return Err(format!(
+                    "the request names a host that is not one of this server's names (it may come from a page of another site that points its own name at this server); document urls are not fetched for it. Its names are {}, its addresses, and the names given with --server-name",
+                    self.server_names.join(", ")
+                ))
+            }
             Gate::PxGateForeign => {
                 return Err(
                     "the request comes from a page of another origin; document urls are not fetched for it"
