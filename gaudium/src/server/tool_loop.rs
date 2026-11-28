@@ -18,6 +18,7 @@ use super::anthropic::{self, Translated};
 use super::conn::Conn;
 use super::mcp_client::{Connector, BOUNDS};
 use super::outparse::ToolCall;
+use super::proxy::Caller;
 use super::{run_chat, write_json, write_sse_chunk, write_sse_end, Api, AppState};
 use crate::core::tool_calls::{stop_reason_name, GenEnd};
 use crate::json::{parse_json, JsonValue};
@@ -126,40 +127,71 @@ fn set_field(chat: &mut JsonValue, key: &str, value: Option<JsonValue>) {
     }
 }
 
+/// Why a request with server-side tools is refused before it runs: the HTTP status, the error
+/// type and the message.
+#[derive(Debug)]
+pub(super) struct Refused {
+    pub status: u16,
+    pub kind: &'static str,
+    pub message: String,
+}
+
+impl From<String> for Refused {
+    fn from(message: String) -> Refused {
+        Refused {
+            status: 400,
+            kind: "invalid_request_error",
+            message,
+        }
+    }
+}
+
 /// Opens the request's MCP servers and adds their tools to its chat body (`None`: it names
-/// none). The error is the reason the request is refused.
+/// none). `caller`: the verdicts of the HTTP request that carries it. The error is the reason
+/// the request is refused; nothing is sent to any server before admission lets it run.
 pub(super) fn open_server_tools<'a>(
     state: &'a AppState,
+    caller: Caller,
     t: &mut Translated,
-) -> Result<Option<Connector<'a>>, String> {
+) -> Result<Option<Connector<'a>>, Refused> {
     let asked = t.mcp.len() as u64;
-    let admit = sv_admit(asked, state.proxy.enabled(), BOUNDS.servers);
+    let admit = sv_admit(asked, state.proxy.enabled(), caller.site_ok, BOUNDS.servers);
     if sv_admit_is_none(admit) {
         return Ok(None);
     }
     if !sv_admit_runs(admit) {
-        return match admit {
-            SvAdmit::SvProxyOff => Err(
-                "mcp_servers: this server was started without --mcp-proxy. The MCP connector's \
-                 requests go out through the MCP proxy and its allow-list (--mcp-proxy, \
-                 --mcp-proxy-allow, --mcp-proxy-allow-private); or run the MCP tools in the client"
+        return Err(match admit {
+            SvAdmit::SvProxyOff => "mcp_servers: this server was started without --mcp-proxy. \
+                 The MCP connector's requests go out through the MCP proxy and its allow-list \
+                 (--mcp-proxy, --mcp-proxy-allow, --mcp-proxy-allow-private); or run the MCP \
+                 tools in the client"
+                .to_string()
+                .into(),
+            SvAdmit::SvForeign => Refused {
+                status: 403,
+                kind: "permission_error",
+                message: "mcp_servers: the request comes from a page of another site, not from \
+                          this server's own page; a page of another site may not make this \
+                          server reach MCP servers (run the MCP tools in the client)"
                     .into(),
-            ),
-            SvAdmit::SvTooMany | SvAdmit::SvRun | SvAdmit::SvNone => Err(format!(
+            },
+            SvAdmit::SvTooMany | SvAdmit::SvRun | SvAdmit::SvNone => format!(
                 "mcp_servers: {asked} servers named; this server takes at most {} per request",
                 BOUNDS.servers
-            )),
-        };
+            )
+            .into(),
+        });
     }
     let client = chat_tool_names(&t.chat);
-    let c = Connector::open(&state.proxy, &t.mcp)?;
+    let c = Connector::open(&state.proxy, caller, &t.mcp)?;
     if let Some(name) = c
         .names()
         .find(|n| sv_route_clash(sv_route(true, client.iter().any(|x| x == n))))
     {
         return Err(format!(
             "tools: '{name}' is the name of a client tool and of a tool of the request's MCP servers"
-        ));
+        )
+        .into());
     }
     extend_list(&mut t.chat, "tools", c.offered.clone());
     extend_list(&mut t.chat, "gaudium_hidden_tools", c.deferred.clone());
@@ -168,21 +200,27 @@ pub(super) fn open_server_tools<'a>(
 }
 
 /// `POST /v1/messages` once translated: a request without tool servers runs as one round, as
-/// any chat request; one with them runs the tool loop.
-pub(super) fn run_messages(state: &Arc<AppState>, mut t: Translated, stream: &mut Conn) {
+/// any chat request; one with them runs the tool loop. `caller`: the verdicts of the HTTP
+/// request.
+pub(super) fn run_messages(
+    state: &Arc<AppState>,
+    caller: Caller,
+    mut t: Translated,
+    stream: &mut Conn,
+) {
     let api = Api::Messages {
         show_thinking: t.show_thinking,
         begun: false,
     };
     let client = chat_tool_names(&t.chat);
-    let mut tools = match open_server_tools(state, &mut t) {
+    let mut tools = match open_server_tools(state, caller, &mut t) {
         Ok(Some(c)) => c,
         Ok(None) => {
             run_chat(state, &t.chat, stream, api, t.ignored, None);
             return;
         }
         Err(e) => {
-            api.error(stream, 400, "invalid_request_error", &e);
+            api.error(stream, e.status, e.kind, &e.message);
             return;
         }
     };

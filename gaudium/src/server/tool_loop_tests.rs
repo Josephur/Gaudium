@@ -533,3 +533,81 @@ fn token_counts_include_the_servers_tools() {
     };
     assert!(n(&b) > n(&a), "{a} {b}");
 }
+
+/// The headers a page of another site sends, as a browser sets them (page script cannot).
+const FOREIGN: [&str; 2] = [
+    "Origin: https://other.example",
+    "Sec-Fetch-Site: cross-site",
+];
+
+#[test]
+fn a_page_of_another_site_cannot_drive_the_mcp_servers() {
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    let ask = format!(
+        r#"{{"model":"any","max_tokens":64,{},"messages":[{{"role":"user","content":"Time?"}}]}}"#,
+        servers(&mcp.url())
+    );
+    // the route refuses such a page, and so does each Messages route that would reach a server
+    let (status, text) = h.exchange_with(
+        "GET",
+        &format!("/cors-proxy?url={}", mcp.url()),
+        &FOREIGN,
+        "",
+    );
+    assert_eq!(status, 403, "{text}");
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let (status, text) = h.exchange_with("POST", path, &FOREIGN, &ask);
+        assert_eq!(status, 403, "{path}: {text}");
+        assert!(text.contains("permission_error"), "{path}: {text}");
+        assert!(text.contains("another site"), "{path}: {text}");
+        assert!(!text.contains(TOKEN), "{path}: {text}");
+        // an origin that is not the request's own host, without the browser's statement
+        let (status, text) =
+            h.exchange_with("POST", path, &["Origin: https://other.example"], &ask);
+        assert_eq!(status, 403, "{path}: {text}");
+    }
+    assert!(
+        mcp.seen().is_empty(),
+        "a page of another site reached the MCP server: {:?}",
+        mcp.seen()
+    );
+    // the server's own page still runs them, and a request without servers from anywhere runs
+    // as before
+    let own = ["Origin: http://test", "Sec-Fetch-Site: same-origin"];
+    let (status, text) = h.exchange_with("POST", "/v1/messages/count_tokens", &own, &ask);
+    assert_eq!(status, 200, "{text}");
+    assert!(mcp.seen().iter().any(|x| x.rpc() == "tools/list"));
+    let (status, text) = h.exchange_with(
+        "POST",
+        "/v1/messages/count_tokens",
+        &FOREIGN,
+        r#"{"messages":[{"role":"user","content":"Time?"}]}"#,
+    );
+    assert_eq!(status, 200, "{text}");
+}
+
+#[test]
+fn the_servers_own_page_runs_the_mcp_servers() {
+    let mcp = McpServer::start();
+    let h = harness_with_proxy("127.0.0.1");
+    h.script(ROUND_CALL);
+    h.script(ROUND_END);
+    let (status, text) = h.exchange_with(
+        "POST",
+        "/v1/messages",
+        &["Origin: http://test"],
+        &format!(
+            r#"{{"model":"any","max_tokens":256,{},"messages":[{{"role":"user","content":"What time is it?"}}]}}"#,
+            servers(&mcp.url())
+        ),
+    );
+    assert_eq!(status, 200, "{text}");
+    let r = json::parse_json(&text).unwrap();
+    let blocks = at(&r, &["content"]).as_array().unwrap();
+    assert!(
+        kinds(blocks).contains(&"mcp_tool_result".to_string()),
+        "{text}"
+    );
+    assert!(mcp.seen().iter().any(|x| x.rpc() == "tools/call"));
+}

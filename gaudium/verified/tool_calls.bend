@@ -499,6 +499,14 @@ law ge_eos_is_model_end:
 def ge_eos_is_model_end():
   {==}
 
+# promise: a generation the call limit ended after a whole call is one the model ended
+# catches: ge_model_ended answers False{} for GeCallLimit (the round's whole calls are never run)
+law ge_call_limit_is_model_end:
+  {ge_model_ended(GeCallLimit{}) == True{} : Bool}
+
+def ge_call_limit_is_model_end():
+  {==}
+
 type FinishReason is Data:
   FrStop{}
   FrLength{}

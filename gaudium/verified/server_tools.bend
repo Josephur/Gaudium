@@ -21,6 +21,7 @@ type SvAdmit is Data:
   SvNone{}
   SvRun{}
   SvProxyOff{}
+  SvForeign{}
   SvTooMany{}
 
 # The request names at most `most` servers.
@@ -34,8 +35,10 @@ def sv_admit_fits(fits: Bool) -> SvAdmit:
 # asked:    tool servers the request names
 # proxy_on: the server offers the MCP proxy (its outbound connections go through the proxy's
 #           allow rules, so without it there is nothing they may reach)
+# site_ok:  px_site_ok of the request that names the servers (a page of another site, open in a
+#           browser that can reach the server, may not drive the proxy through this route either)
 # most:     servers one request may name
-def sv_admit(asked: Nat, proxy_on: Bool, most: Nat) -> SvAdmit:
+def sv_admit(asked: Nat, proxy_on: Bool, site_ok: Bool, most: Nat) -> SvAdmit:
   match asked:
     case 0n:
       SvNone{}
@@ -44,7 +47,11 @@ def sv_admit(asked: Nat, proxy_on: Bool, most: Nat) -> SvAdmit:
         case False{}:
           SvProxyOff{}
         case True{}:
-          sv_admit_fits(Nat.is_le(1n+ap, most))
+          match site_ok:
+            case False{}:
+              SvForeign{}
+            case True{}:
+              sv_admit_fits(Nat.is_le(1n+ap, most))
 
 # The request runs with its tool servers.
 def sv_admit_runs(a: SvAdmit) -> Bool:
@@ -88,15 +95,35 @@ def sv_fits_not_none(+b: Bool) -> {sv_admit_is_none(sv_admit_fits(b)) == False{}
 # catches: the proxy check dropped (sv_admit answers SvRun whenever the count fits)
 law sv_proxy_off_never_runs:
   for +n: Nat
+  for +s: Bool
   for +m: Nat
-  {sv_admit_runs(sv_admit(n, False{}, m)) == False{} : Bool}
+  {sv_admit_runs(sv_admit(n, False{}, s, m)) == False{} : Bool}
 
-def sv_proxy_off_never_runs(n, m):
+def sv_proxy_off_never_runs(n, s, m):
   match n:
     case 0n: {==}
     case 1n+np: {==}
 
-# LAW 1.2: A request that names more servers than allowed never runs them.
+# LAW 1.2: A page of another site never drives the tool servers.
+# promise: a request that names tool servers and comes from a page of another site never runs them
+# harm: any web page open in a browser that can reach the server could make it call allow-listed
+#       (even private) MCP servers and read their tool lists and results
+# catches: the site input ignored (sv_admit answers sv_admit_fits whenever the proxy is on)
+law sv_foreign_never_runs:
+  for +n: Nat
+  for +p: Bool
+  for +m: Nat
+  {sv_admit_runs(sv_admit(n, p, False{}, m)) == False{} : Bool}
+
+def sv_foreign_never_runs(n, p, m):
+  match n:
+    case 0n: {==}
+    case 1n+np:
+      match p:
+        case False{}: {==}
+        case True{}: {==}
+
+# LAW 1.3: A request that names more servers than allowed never runs them.
 # promise: a request naming more than `most` tool servers is never run
 # harm: one request could fan out to any number of outbound connections
 # catches: the count check off by one (Nat.is_le(ap, most) in place of Nat.is_le(1n+ap, most))
@@ -104,56 +131,65 @@ law sv_over_limit_never_runs:
   for +m: Nat
   for +d: Nat
   for +p: Bool
-  {sv_admit_runs(sv_admit(Nat.add(m, 1n+d), p, m)) == False{} : Bool}
+  for +s: Bool
+  {sv_admit_runs(sv_admit(Nat.add(m, 1n+d), p, s, m)) == False{} : Bool}
 
-def sv_over_limit_never_runs(m, d, p):
+def sv_over_limit_never_runs(m, d, p, s):
   match m:
     case 0n:
-      match p:
-        case False{}: {==}
-        case True{}: {==}
+      match p s:
+        case False{} False{}: {==}
+        case False{} True{}: {==}
+        case True{} False{}: {==}
+        case True{} True{}: {==}
     case 1n+mp:
-      match p:
-        case False{}: {==}
-        case True{}:
+      match p s:
+        case False{} False{}: {==}
+        case False{} True{}: {==}
+        case True{} False{}: {==}
+        case True{} True{}:
           sv_fits_past(1n+mp, d)
 
-# LAW 1.3: Named servers are never silently dropped: the request runs with them or is refused.
+# LAW 1.4: Named servers are never silently dropped: the request runs with them or is refused.
 # promise: a request that names at least one tool server is never treated as naming none
 # catches: a refused request answered as SvNone (the servers ignored and the request run without them)
 law sv_asked_never_dropped:
   for +n: Nat
   for +p: Bool
+  for +s: Bool
   for +m: Nat
-  {sv_admit_is_none(sv_admit(1n+n, p, m)) == False{} : Bool}
+  {sv_admit_is_none(sv_admit(1n+n, p, s, m)) == False{} : Bool}
 
-def sv_asked_never_dropped(n, p, m):
-  match p:
-    case False{}: {==}
-    case True{}:
+def sv_asked_never_dropped(n, p, s, m):
+  match p s:
+    case False{} False{}: {==}
+    case False{} True{}: {==}
+    case True{} False{}: {==}
+    case True{} True{}:
       sv_fits_not_none(Nat.is_le(1n+n, m))
 
-# LAW 1.4: With the proxy on, a request within the limit runs.
-# promise: with the MCP proxy on, a request naming between one and `most` servers runs them
+# LAW 1.5: With the proxy on, a request of the server's own site within the limit runs.
+# promise: with the MCP proxy on, a request that passes the site rule and names between one and `most` servers runs them
 # catches: sv_admit answers SvTooMany for every count (the connector never runs)
 law sv_within_limit_runs:
   for +n: Nat
   for +d: Nat
-  {sv_admit_runs(sv_admit(1n+n, True{}, Nat.add(1n+n, d))) == True{} : Bool}
+  {sv_admit_runs(sv_admit(1n+n, True{}, True{}, Nat.add(1n+n, d))) == True{} : Bool}
 
 def sv_within_limit_runs(n, d):
   sv_fits_within(1n+n, d)
 
-# LAW 1.5: A request that names no tool server is never refused for it.
-# promise: a request naming no tool server runs as any other request, whatever the proxy setting
+# LAW 1.6: A request that names no tool server is never refused for it.
+# promise: a request naming no tool server runs as any other request, whatever the proxy setting and wherever it comes from
 # harm: every request without tool servers would be refused
 # catches: the no-server case answers SvProxyOff (sv_admit refuses a request that asked for nothing)
 law sv_unasked_runs_as_before:
   for +p: Bool
+  for +s: Bool
   for +m: Nat
-  {sv_admit_is_none(sv_admit(0n, p, m)) == True{} : Bool}
+  {sv_admit_is_none(sv_admit(0n, p, s, m)) == True{} : Bool}
 
-def sv_unasked_runs_as_before(p, m):
+def sv_unasked_runs_as_before(p, s, m):
   {==}
 
 # ============================================================================

@@ -10,7 +10,7 @@
 //! How many pages of a tool list are read, how many calls a request makes, and how much of a
 //! result goes back into the prompt are verified decisions (`verified/server_tools.bend`).
 
-use super::proxy::{Fetched, McpProxy};
+use super::proxy::{Caller, Fetched, McpProxy};
 use super::tool_loop::{ServerTools, ToolOutput};
 use crate::core::proxy::Method;
 use crate::json::{parse_json, parse_json_bytes, JsonValue};
@@ -133,6 +133,8 @@ pub(super) fn model_name(server: &str, tool: &str) -> String {
 /// A session with one MCP server.
 pub(super) struct Session<'a> {
     proxy: &'a McpProxy,
+    /// The request the session is opened for: every exchange is decided on its verdicts.
+    caller: Caller,
     url: String,
     token: Option<String>,
     session: Option<String>,
@@ -165,9 +167,15 @@ impl Reply {
 
 impl<'a> Session<'a> {
     /// Connects and runs the initialization handshake.
-    pub fn open(proxy: &'a McpProxy, url: &str, token: Option<&str>) -> Result<Self, String> {
+    pub fn open(
+        proxy: &'a McpProxy,
+        caller: Caller,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<Self, String> {
         let mut s = Session {
             proxy,
+            caller,
             url: url.to_string(),
             token: token.map(str::to_string),
             session: None,
@@ -232,6 +240,7 @@ impl<'a> Session<'a> {
     fn notify(&mut self, method: &str) -> Result<(), String> {
         let body = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\"}}");
         let fetched = self.proxy.fetch(
+            self.caller,
             Method::PxPost,
             &self.url,
             &self.headers(),
@@ -257,6 +266,7 @@ impl<'a> Session<'a> {
         let mut events = EventLines::default();
         let mut found: Option<JsonValue> = None;
         let fetched = self.proxy.fetch(
+            self.caller,
             Method::PxPost,
             &self.url,
             &self.headers(),
@@ -392,6 +402,7 @@ impl<'a> Session<'a> {
             return;
         }
         let _ = self.proxy.fetch(
+            self.caller,
             Method::PxDelete,
             &self.url,
             &self.headers(),
@@ -559,7 +570,7 @@ pub(super) struct Connector<'a> {
 
 impl<'a> Connector<'a> {
     /// Opens every server and lists its tools. The error names the server that failed.
-    pub fn open(proxy: &'a McpProxy, specs: &[ServerSpec]) -> Result<Self, String> {
+    pub fn open(proxy: &'a McpProxy, caller: Caller, specs: &[ServerSpec]) -> Result<Self, String> {
         let mut c = Connector {
             sessions: Vec::new(),
             tools: Vec::new(),
@@ -570,7 +581,7 @@ impl<'a> Connector<'a> {
         for (i, spec) in specs.iter().enumerate() {
             let fail = |e: String| format!("mcp_servers.{i} ({}): {e}", spec.name);
             let mut session =
-                Session::open(proxy, &spec.url, spec.token.as_deref()).map_err(fail)?;
+                Session::open(proxy, caller, &spec.url, spec.token.as_deref()).map_err(fail)?;
             let (tools, cut) = session.list_tools(BOUNDS.list_pages).map_err(fail)?;
             if cut {
                 c.notes.push(format!(

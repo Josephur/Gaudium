@@ -87,6 +87,16 @@ origin), and the same size and time limits. They are counted and listed with the
 refuses a request with `mcp_servers`, and a server whose address the lists do not allow refuses
 the request before generation starts.
 
+The site rule of `/cors-proxy` holds here too: a `POST /v1/messages` or
+`POST /v1/messages/count_tokens` request with `mcp_servers` sent by a page of another site (its
+`Sec-Fetch-Site` is not `same-origin` or `none`, or without one, its `Origin` is not the host the
+request names) is refused with 403 `permission_error` before any MCP server is contacted.
+Otherwise any web page open in a browser that can reach the server could make it call the
+allow-listed servers, private ones included, and read the results. Each request the server makes
+for the connector is decided again by the proxy's gate on the key and site verdicts of the
+request that asked for it. A request without `mcp_servers` is not affected, and clients that are
+not browsers (no `Origin`, no `Sec-Fetch-Site`) are not either.
+
 - Accepted: `mcp_servers` entries `{"type": "url", "url", "name", "authorization_token"}`, with
   either `tool_configuration` (`enabled`, `allowed_tools`) or an `mcp_toolset` entry in `tools`
   (`mcp_server_name`, `default_config` and per-tool `configs` with `enabled` and

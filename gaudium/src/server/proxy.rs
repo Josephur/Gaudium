@@ -654,6 +654,36 @@ fn forwarded_headers(req: &HttpRequest, same_origin: bool) -> Vec<(String, Strin
     out
 }
 
+/// The verdicts of the request a proxied exchange is made for: the route's own request, or the
+/// Messages request whose `mcp_servers` the server reaches for the client. Every exchange,
+/// through the route or of the server's own, is decided by the same verified gate on these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Caller {
+    /// The request carries the server's API key, or the server has none.
+    pub key_ok: bool,
+    /// Every host the request names is an address or one of the server's own names
+    /// (`hn_request_ours`): it was not sent to a name another site points at this server.
+    pub hosts_ours: bool,
+    /// The request names this server and passes the site rule (`hn_site_ok` of `hosts_ours` and
+    /// `px_site_ok`): it was not sent by a page of another site.
+    pub site_ok: bool,
+}
+
+impl Caller {
+    /// The verdicts of `req` for a server whose own names are `own`. `key_ok`: it carries the
+    /// server's API key, or there is none.
+    fn of(req: &HttpRequest, key_ok: bool, own: &OwnNames) -> Caller {
+        let (site, has_origin, origin_is_host) = request_site(req);
+        let (host, forwarded) = request_hosts(req);
+        let hosts_ours = names::request_ours(&host, &forwarded, own);
+        Caller {
+            key_ok,
+            hosts_ours,
+            site_ok: names::site_ok(hosts_ours, rule::site_ok(site, has_origin, origin_is_host)),
+        }
+    }
+}
+
 /// What the request's own headers say about where it comes from.
 fn request_site(req: &HttpRequest) -> (Site, bool, bool) {
     let site = match req.headers.get("sec-fetch-site").map(|s| s.trim()) {
@@ -1184,6 +1214,12 @@ impl McpProxy {
         self.own_names = OwnNames::new(&self.server_names);
     }
 
+    /// The verdicts of `req` (`Caller`), its hosts compared with this server's own names.
+    /// `key_ok`: it carries the server's API key, or there is none.
+    pub(super) fn caller(&self, req: &HttpRequest, key_ok: bool) -> Caller {
+        Caller::of(req, key_ok, &self.own_names)
+    }
+
     /// The proxy is offered (`/props` reports this).
     pub fn enabled(&self) -> bool {
         rule::start_serves(self.start)
@@ -1495,10 +1531,7 @@ impl McpProxy {
             "DELETE" => Some(Method::PxDelete),
             _ => None,
         };
-        let (site, has_origin, origin_is_host) = request_site(req);
-        let (host, forwarded) = request_hosts(req);
-        let hosts_ours = names::request_ours(&host, &forwarded, &self.own_names);
-        let site_ok = names::site_ok(hosts_ours, rule::site_ok(site, has_origin, origin_is_host));
+        let caller = self.caller(req, key_ok);
         let url = req.query.get("url").map(String::as_str).unwrap_or("");
         let refuse = |stream: &mut Conn, status: u16, kind: &str, why: String| {
             self.note(
@@ -1514,7 +1547,12 @@ impl McpProxy {
             write_proxy_error(stream, status, kind, &format!("mcp proxy: {why}"));
         };
         let method = match (
-            rule::gate(key_ok, self.enabled(), site_ok, method.is_some()),
+            rule::gate(
+                caller.key_ok,
+                self.enabled(),
+                caller.site_ok,
+                method.is_some(),
+            ),
             method,
         ) {
             (Gate::PxGateRun, Some(m)) => m,
@@ -1536,7 +1574,8 @@ impl McpProxy {
                 );
                 return;
             }
-            (Gate::PxGateForeign, _) if !hosts_ours => {
+            (Gate::PxGateForeign, _) if !caller.hosts_ours => {
+                let (host, forwarded) = request_hosts(req);
                 let shown = |h: Option<&String>| {
                     shown_url(h.map_or("none", String::as_str))
                         .chars()
@@ -1771,8 +1810,10 @@ impl McpProxy {
         }
     }
 
-    /// A request of the server's own (the Messages MCP connector). It is made under every rule a
-    /// page's request through the route is made under: the proxy must be on, the target URL and
+    /// A request of the server's own (the Messages MCP connector), made for `caller`, the request
+    /// that asked for it. It is made under every rule a page's request through the route is made
+    /// under: the same gate decides it on the caller's key and site verdicts (a page of another
+    /// site cannot reach a target through it either), the proxy must be on, the target URL and
     /// each address it resolves to must pass the allow-lists, a header goes to the target only
     /// as the header rules say (one bound to the origin, such as `authorization` or
     /// `mcp-session-id`, never follows a redirect to another origin), redirects are followed
@@ -1784,6 +1825,7 @@ impl McpProxy {
     /// error: ...` for a target that could not be reached or did not answer properly.
     pub fn fetch(
         &self,
+        caller: Caller,
         method: Method,
         url: &str,
         headers: &[(String, String)],
@@ -1803,8 +1845,31 @@ impl McpProxy {
             );
             Err(format!("mcp proxy: {why}"))
         };
-        if !self.enabled() {
-            return refuse("this server was started without --mcp-proxy".into());
+        // the method is one the proxy forwards: `Method` holds no other
+        match rule::gate(caller.key_ok, self.enabled(), caller.site_ok, true) {
+            Gate::PxGateRun => {}
+            Gate::PxGateNoKey => {
+                return refuse("the request that asked for it carries no valid API key".into());
+            }
+            Gate::PxGateDisabled => {
+                return refuse("this server was started without --mcp-proxy".into());
+            }
+            Gate::PxGateForeign if !caller.hosts_ours => {
+                return refuse(
+                    "the request that asked for it names a host that is not one of this server's \
+                     names: it may come from a page of another site that points its own name at \
+                     this server"
+                        .into(),
+                );
+            }
+            Gate::PxGateForeign => {
+                return refuse(
+                    "the request that asked for it comes from a page of another site, not from \
+                     this server's own page"
+                        .into(),
+                );
+            }
+            Gate::PxGateMethod => return refuse("the method is not forwarded".into()),
         }
         let tls_state = self.tls.as_ref().map(|_| ()).map_err(String::as_str);
         let target = match parse_target(url, tls_state) {
