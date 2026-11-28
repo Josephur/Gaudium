@@ -224,6 +224,7 @@ Serve options:
   --kv-scales <id=file> K/V calibration of model <id> (default:
                         <model_dir>-gaudium-pc/kv_scales.txt)
   --api-key <key>       Optional Bearer / X-Api-Key auth token (or GAUDIUM_API_KEY)
+                        Only the Web UI's files, GET /health and OPTIONS go without it
   --a2ui                Offer A2UI 1.0 interfaces (or GAUDIUM_A2UI=1): a chat request that
                         declares its renderer in the field gaudium_a2ui (true, or an
                         object with supportedCatalogIds) gets the instructions that teach
