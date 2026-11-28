@@ -8,7 +8,13 @@
 //! The count is the heap the task itself allocated since it started, less what it released
 //! (never below zero: a release of memory allocated before the start does not lower it). The
 //! task reads it at its own checkpoints and decides there what to do with it; the allocator
-//! never refuses or fails an allocation. Memory mapped outside the allocator (pinned host
+//! never refuses or fails an allocation.
+//!
+//! A metered task may run inside another (one PDF read inside the expansion of all the
+//! documents of a request). The inner task's reading also gives what the enclosing count held
+//! when it started and the enclosing cap ([`Outer`]), so the inner task can check the two
+//! together: the enclosing count does not grow while the inner one runs, and the inner count is
+//! added to it when the inner task ends. Memory mapped outside the allocator (pinned host
 //! buffers, mapped weight files, device memory) is never counted.
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -26,6 +32,10 @@ struct State {
     peak: u64,
     /// The heap the task allows itself (read back by the task, never enforced here).
     cap: u64,
+    /// The enclosing count when this one started, and its cap (`outer_on` false: none).
+    outer_on: bool,
+    outer_held: u64,
+    outer_cap: u64,
 }
 
 const OFF: State = State {
@@ -33,6 +43,9 @@ const OFF: State = State {
     live: 0,
     peak: 0,
     cap: 0,
+    outer_on: false,
+    outer_held: 0,
+    outer_cap: 0,
 };
 
 thread_local! {
@@ -114,13 +127,19 @@ pub struct Metered {
 
 impl Metered {
     /// Starts the count at zero, with the cap `cap` (bytes) for the task to check against.
+    /// Inside another metered task, the reading also gives that task's count and cap as they
+    /// are now ([`Reading::outer`]).
     pub fn start(cap: u64) -> Metered {
         let before = STATE.with(|s| {
+            let b = s.get();
             s.replace(State {
                 on: true,
                 live: 0,
                 peak: 0,
                 cap,
+                outer_on: b.on,
+                outer_held: if b.on { b.live } else { 0 },
+                outer_cap: if b.on { b.cap } else { 0 },
             })
         });
         Metered { before }
@@ -150,6 +169,17 @@ pub struct Reading {
     pub peak: u64,
     /// The cap the task set.
     pub cap: u64,
+    /// The enclosing task's count when this one started, and its cap (`None`: not nested).
+    pub outer: Option<Outer>,
+}
+
+/// The enclosing metered task of a nested one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Outer {
+    /// Its count when the nested task started (it does not change while the nested one runs).
+    pub held: u64,
+    /// Its cap.
+    pub cap: u64,
 }
 
 /// The current thread's count (`None` when its meter is off).
@@ -160,6 +190,10 @@ pub fn reading() -> Option<Reading> {
         live: st.live,
         peak: st.peak,
         cap: st.cap,
+        outer: st.outer_on.then_some(Outer {
+            held: st.outer_held,
+            cap: st.outer_cap,
+        }),
     })
 }
 
@@ -183,7 +217,8 @@ mod tests {
                 Some(Reading {
                     live: 0,
                     peak: 0,
-                    cap: 7
+                    cap: 7,
+                    outer: None,
                 })
             );
             let a: Vec<u8> = black_box(Vec::with_capacity(4 << 20));
@@ -224,11 +259,16 @@ mod tests {
             let _inner = Metered::start(2);
             assert!(live() < 1 << 20);
             assert_eq!(reading().unwrap().cap, 2);
+            // the enclosing count as it was when this one started, and its cap
+            let o = reading().unwrap().outer.unwrap();
+            assert!(o.held >= 2 << 20 && o.held < 3 << 20, "{o:?}");
+            assert_eq!(o.cap, 1);
             drop(black_box(Vec::<u8>::with_capacity(8 << 20)));
             black_box(Vec::<u8>::with_capacity(3 << 20))
         };
         let r = reading().unwrap();
         assert_eq!(r.cap, 1);
+        assert_eq!(r.outer, None);
         assert!(r.live >= 5 << 20 && r.live < 6 << 20, "{r:?}");
         assert!(r.peak >= 10 << 20, "{r:?}");
         drop((keep, kept));

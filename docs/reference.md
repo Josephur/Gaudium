@@ -334,7 +334,9 @@ Serve options:
   --pdf-max-inflate-mb <N>  Most bytes one PDF's streams may decode to, in MiB, every
                         read of a stream counted, filtered or not (default: 256).
                         Also, each on its own: the most bytes its object parses may
-                        read and their objects take, and the most text it may yield
+                        read and their objects take, and the most text it may yield;
+                        the text all the documents of one request keep together is
+                        capped at the same number
   --pdf-max-forms <N>   Most form XObjects one PDF may draw, all pages together, a
                         form drawn again counted again (default: 100000)
   --pdf-max-work <N>    Most steps of work the reader may take over one PDF's
@@ -345,7 +347,11 @@ Serve options:
   --pdf-max-heap-mb <N>  Most heap the reader may hold while it reads one PDF, in
                         MiB, as the allocator counts it on the reading thread
                         (default: 1024): checked at every charge of the budgets above,
-                        so memory no budget covers is still refused
+                        so memory no budget covers is still refused. The documents of
+                        one request hold at most this much together, each read
+                        counted with what the request held before it
+  --pdf-max-docs <N>    Most documents (PDFs and text files, Messages document blocks
+                        and chat file parts) one request may carry (default: 100)
   --verbose             Print server, HBM, and recipe diagnostics
   --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the
                         last 64 chat requests (job, reply id, endpoint, model,

@@ -3,7 +3,9 @@
 //!
 //! Text is placed by its position: a move to another baseline starts a new line, and a gap on
 //! the same baseline wider than a fraction of the font size becomes a space (words placed by
-//! `Td`, `TJ` adjustments or separate strings). Form XObjects are followed; inline images are
+//! `Td`, `TJ` adjustments or separate strings). Both are measured along the baseline of the
+//! text before and across it, so rotated text (a table heading set vertically) splits into
+//! words and lines as it would unrotated. Form XObjects are followed; inline images are
 //! skipped; graphics other than text are ignored. A form starts in the graphics state of the
 //! `Do` that draws it (its font and text state included), and a font may also be selected by an
 //! ExtGState's /Font entry (`gs`).
@@ -21,7 +23,7 @@ use std::rc::Rc;
 
 use super::doc::Doc;
 use super::font::{Font, FontParts};
-use super::lex::{Dict, Lexer, Obj, Token};
+use super::lex::{is_white, Dict, Lexer, Obj, Token};
 use super::{Budget, Fail, MAX_FORM_DEPTH, MAX_GSTATE_DEPTH};
 use crate::verified as v;
 
@@ -132,8 +134,30 @@ pub(crate) struct Page<'d, 'a> {
     /// Form XObjects the document may still draw.
     pub forms: &'d mut Budget,
     pub out: String,
-    /// Where the last text shown ended: x, y and the height of its font, in page space.
-    last: Option<(f64, f64, f64)>,
+    /// Where the last text shown ended, in page space, the height of its font, and the
+    /// direction of its baseline.
+    last: Option<Last>,
+}
+
+#[derive(Clone, Copy)]
+struct Last {
+    x: f64,
+    y: f64,
+    height: f64,
+    /// The baseline's direction in page space (a unit vector).
+    ux: f64,
+    uy: f64,
+}
+
+/// The unit vector along the baseline of text drawn with the matrix `m` (text space x in page
+/// space); x when the matrix flattens it.
+fn baseline(m: &M) -> (f64, f64) {
+    let n = m.a.hypot(m.b);
+    if n > 0.0 && n.is_finite() {
+        (m.a / n, m.b / n)
+    } else {
+        (1.0, 0.0)
+    }
 }
 
 impl<'d, 'a> Page<'d, 'a> {
@@ -301,7 +325,7 @@ impl<'d, 'a> Page<'d, 'a> {
                         }
                     }
                 }
-                b"BI" => skip_inline_image(&mut lx),
+                b"BI" => skip_inline_image(&mut lx, &mut self.doc.work)?,
                 _ => {}
             }
             args.clear();
@@ -336,18 +360,28 @@ impl<'d, 'a> Page<'d, 'a> {
         self.place(trm.e, trm.f, height, em);
         self.out.push_str(&text);
         let end = tm.then(gs.ctm);
-        self.last = Some((end.e, end.f, height));
+        let (ux, uy) = baseline(&trm);
+        self.last = Some(Last {
+            x: end.e,
+            y: end.f,
+            height,
+            ux,
+            uy,
+        });
         Ok(())
     }
 
     /// Separates text starting at (x, y) from the text before it: a line break, an empty line,
-    /// a space, or nothing.
+    /// a space, or nothing. The move is measured along the baseline of the text before (the
+    /// gap) and across it (the change of line).
     fn place(&mut self, x: f64, y: f64, height: f64, em: f64) {
-        let Some((lx, ly, lh)) = self.last else {
+        let Some(last) = self.last else {
             return;
         };
-        let h = if height > 0.0 { height } else { lh };
-        let dy = (y - ly).abs();
+        let h = if height > 0.0 { height } else { last.height };
+        let (mx, my) = (x - last.x, y - last.y);
+        let gap = mx * last.ux + my * last.uy;
+        let dy = (my * last.ux - mx * last.uy).abs();
         if h > 0.0 && dy > NEW_LINE * h {
             while self.out.ends_with(' ') {
                 self.out.pop();
@@ -360,7 +394,6 @@ impl<'d, 'a> Page<'d, 'a> {
             }
             return;
         }
-        let gap = x - lx;
         let ends_white = self.out.chars().last().is_none_or(char::is_whitespace);
         if !ends_white && em > 0.0 && (gap > SPACE_GAP * em || gap < -em) {
             self.out.push(' ');
@@ -569,29 +602,245 @@ fn soft<T: Default>(r: Result<T, Fail>) -> Result<T, Fail> {
 }
 
 /// Skips an inline image after `BI`: its parameters, `ID`, the image bytes and `EI`.
-fn skip_inline_image(lx: &mut Lexer) {
+///
+/// The image bytes may hold anything, `EI` between white space too, so where they end is taken
+/// from the image's own framing when it has one ([`framed_end`]): its declared length (`/L`),
+/// the end marker of an ASCII filter, or, unfiltered, its size (rows of its width times its
+/// components times their bits). An end found that way counts only when `EI` follows it.
+/// Otherwise (another filter, a colour space named in the resources, a size that does not fit)
+/// the image ends at the first `EI` between white space that content-stream operators follow
+/// ([`operators_follow`]); each candidate's check is charged to the work budget.
+fn skip_inline_image(lx: &mut Lexer, work: &mut Budget) -> Result<(), Fail> {
+    let mut params: Vec<Obj> = Vec::new();
     loop {
         match lx.token(0, true) {
             Ok(Some(Token::Op(op))) if op == b"ID" => break,
+            Ok(Some(Token::Obj(o))) => {
+                if params.len() < MAX_OPERANDS {
+                    params.push(o);
+                }
+            }
             Ok(Some(_)) => {}
-            _ => return,
+            Err(e @ Fail::TooLarge(_)) => return Err(e),
+            _ => return Ok(()),
         }
     }
-    // one white-space byte, then data up to `EI` between white space
-    lx.pos += 1;
+    // one white-space byte, then the image bytes
     let d = lx.data;
-    let mut i = lx.pos;
+    let start = (lx.pos + 1).min(d.len());
+    if let Some(after) = framed_end(&params, d, start).and_then(|end| ei_at(d, end)) {
+        lx.pos = after;
+        return Ok(());
+    }
+    let mut i = start;
     while i + 1 < d.len() {
         if d[i] == b'E'
             && d[i + 1] == b'I'
             && i > 0
-            && super::lex::is_white(d[i - 1])
-            && d.get(i + 2).is_none_or(|b| super::lex::is_white(*b))
+            && is_white(d[i - 1])
+            && d.get(i + 2).is_none_or(|b| is_white(*b))
         {
-            lx.pos = i + 2;
-            return;
+            work.take(1)?;
+            if operators_follow(d, i + 2, work)? {
+                lx.pos = i + 2;
+                return Ok(());
+            }
         }
         i += 1;
     }
     lx.pos = d.len();
+    Ok(())
+}
+
+/// Where an inline image's bytes starting at `start` end by its own framing (`None`: it has
+/// none the reader knows, or the end it declares lies past the data).
+fn framed_end(params: &[Obj], d: &[u8], start: usize) -> Option<usize> {
+    let get = |a: &[u8], b: &[u8]| {
+        params.chunks_exact(2).find_map(|kv| match &kv[0] {
+            Obj::Name(n) if &n[..] == a || &n[..] == b => Some(&kv[1]),
+            _ => None,
+        })
+    };
+    let avail = (d.len() - start) as u64;
+    // a declared length (PDF 2.0)
+    if let Some(l) = get(b"L", b"Length").and_then(Obj::as_int) {
+        let l = u64::try_from(l).ok()?;
+        return v::pdf_span_ok(start as u64, l, d.len() as u64).then(|| start + l as usize);
+    }
+    let filter = match get(b"F", b"Filter") {
+        Some(Obj::Name(n)) => Some(n.clone()),
+        Some(Obj::Array(a)) => match a.first() {
+            Some(Obj::Name(n)) => Some(n.clone()),
+            Some(_) => return None,
+            None => None,
+        },
+        Some(_) => return None,
+        None => None,
+    };
+    if let Some(f) = filter {
+        let rest = &d[start..];
+        return match &f[..] {
+            b"AHx" | b"ASCIIHexDecode" => {
+                rest.iter().position(|&b| b == b'>').map(|k| start + k + 1)
+            }
+            b"A85" | b"ASCII85Decode" => rest
+                .windows(2)
+                .position(|w| w == b"~>")
+                .map(|k| start + k + 2),
+            _ => None,
+        };
+    }
+    // unfiltered: rows of the width's samples, each row padded to a whole byte
+    let int = |a: &[u8], b: &[u8]| get(a, b).and_then(Obj::as_int);
+    let mask = matches!(get(b"IM", b"ImageMask"), Some(Obj::Bool(true)));
+    let (components, bpc): (u64, i64) = if mask {
+        (1, 1)
+    } else {
+        let components = match get(b"CS", b"ColorSpace") {
+            Some(Obj::Name(n)) => match &n[..] {
+                b"G" | b"DeviceGray" | b"CalGray" | b"I" | b"Indexed" => 1,
+                b"RGB" | b"DeviceRGB" | b"CalRGB" => 3,
+                b"CMYK" | b"DeviceCMYK" => 4,
+                _ => return None,
+            },
+            Some(Obj::Array(a)) => match a.first() {
+                Some(Obj::Name(n)) if &n[..] == b"I" || &n[..] == b"Indexed" => 1,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        (components, int(b"BPC", b"BitsPerComponent")?)
+    };
+    let width = int(b"W", b"Width")?;
+    let height = u64::try_from(int(b"H", b"Height")?).ok()?;
+    if !matches!(bpc, 1 | 2 | 4 | 8 | 16) || !(1..=1 << 24).contains(&width) {
+        return None;
+    }
+    // all three are small, so their product fits easily
+    let row = (width as u64 * components * bpc as u64).div_ceil(8);
+    v::pdf_count_fits(height, row, avail).then(|| start + v::pdf_row_offset(height, row) as usize)
+}
+
+/// Where the operator after `EI` starts, when `EI` (between optional white space before it and
+/// white space, a delimiter or the end after it) is at `end`.
+fn ei_at(d: &[u8], end: usize) -> Option<usize> {
+    let mut j = end;
+    while d.get(j).is_some_and(|b| is_white(*b)) {
+        j += 1;
+    }
+    (d.get(j..j + 2) == Some(b"EI")
+        && d.get(j + 2)
+            .is_none_or(|b| is_white(*b) || super::lex::is_delim(*b)))
+    .then_some(j + 2)
+}
+
+/// Bytes of operands an end-of-image check may read.
+const CHECK_BYTES: u64 = 4096;
+/// Operands an end-of-image check may read before its operator.
+const CHECK_TOKENS: usize = 16;
+
+/// Whether the bytes at `at` read as content: the end of the data, or operands and then a
+/// content-stream operator. The bytes the check reads are charged to the work budget.
+fn operators_follow(d: &[u8], at: usize, work: &mut Budget) -> Result<bool, Fail> {
+    let mem = Budget::new(
+        CHECK_BYTES,
+        "an inline image's end check reads",
+        "bytes",
+        super::INFLATE_FLAG,
+    );
+    let mut lx = Lexer::new(d, at, mem);
+    let mut ok = false;
+    for _ in 0..CHECK_TOKENS {
+        match lx.token(0, true) {
+            Ok(None) => {
+                ok = true;
+                break;
+            }
+            Ok(Some(Token::Op(op))) => {
+                ok = is_operator(&op);
+                break;
+            }
+            Ok(Some(Token::Obj(_))) => {}
+            Err(_) => break,
+        }
+    }
+    work.take((lx.pos - at) as u64)?;
+    Ok(ok)
+}
+
+/// The operators of content streams (ISO 32000-1, Annex A).
+fn is_operator(op: &[u8]) -> bool {
+    matches!(
+        op,
+        b"b" | b"B"
+            | b"b*"
+            | b"B*"
+            | b"BDC"
+            | b"BI"
+            | b"BMC"
+            | b"BT"
+            | b"BX"
+            | b"c"
+            | b"cm"
+            | b"CS"
+            | b"cs"
+            | b"d"
+            | b"d0"
+            | b"d1"
+            | b"Do"
+            | b"DP"
+            | b"EMC"
+            | b"ET"
+            | b"EX"
+            | b"f"
+            | b"F"
+            | b"f*"
+            | b"G"
+            | b"g"
+            | b"gs"
+            | b"h"
+            | b"i"
+            | b"j"
+            | b"J"
+            | b"K"
+            | b"k"
+            | b"l"
+            | b"m"
+            | b"M"
+            | b"MP"
+            | b"n"
+            | b"q"
+            | b"Q"
+            | b"re"
+            | b"RG"
+            | b"rg"
+            | b"ri"
+            | b"s"
+            | b"S"
+            | b"SC"
+            | b"sc"
+            | b"SCN"
+            | b"scn"
+            | b"sh"
+            | b"T*"
+            | b"Tc"
+            | b"Td"
+            | b"TD"
+            | b"Tf"
+            | b"TJ"
+            | b"Tj"
+            | b"TL"
+            | b"Tm"
+            | b"Tr"
+            | b"Ts"
+            | b"Tw"
+            | b"Tz"
+            | b"v"
+            | b"w"
+            | b"W"
+            | b"W*"
+            | b"y"
+            | b"'"
+            | b"\""
+    )
 }

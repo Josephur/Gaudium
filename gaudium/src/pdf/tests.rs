@@ -1883,3 +1883,170 @@ fn a_shared_filter_name_is_not_copied_per_use() {
     assert!(matches!(got, Err(Fail::NoText { pages: 1 })), "{got:?}");
     assert!(peak < 8 << 20, "{peak}");
 }
+
+/// A font whose printable glyphs are all 500 units wide.
+fn wide_font() -> String {
+    format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 126 /Widths [{}] >>",
+        vec!["500"; 95].join(" ")
+    )
+}
+
+#[test]
+fn rotated_text_splits_into_words_and_lines_like_unrotated() {
+    // Codex repro: gaps measured on the page's axes merged rotated words ("HelloWorld")
+    let font = wide_font();
+    for m in ["1 0 0 1", "0 1 -1 0", "-1 0 0 -1", "0 -1 1 0", "0.7071 0.7071 -0.7071 0.7071"] {
+        let words = format!("BT /F1 12 Tf {m} 100 100 Tm (Hello) Tj 36 0 Td (World) Tj ET");
+        let (p, root) = doc(&[words.as_bytes()], &font, false);
+        assert_eq!(text_of(&p.table(root, "")).unwrap(), vec!["Hello World"], "{m}");
+        // a glyph's advance later on the same baseline: no space
+        let joined = format!("BT /F1 12 Tf {m} 100 100 Tm (Hel) Tj 18 0 Td (lo) Tj ET");
+        let (p, root) = doc(&[joined.as_bytes()], &font, false);
+        assert_eq!(text_of(&p.table(root, "")).unwrap(), vec!["Hello"], "{m}");
+        // a move across the baseline: a new line
+        let lines = format!("BT /F1 12 Tf {m} 100 100 Tm (Hello) Tj 0 -14 Td (World) Tj ET");
+        let (p, root) = doc(&[lines.as_bytes()], &font, false);
+        assert_eq!(text_of(&p.table(root, "")).unwrap(), vec!["Hello\nWorld"], "{m}");
+    }
+}
+
+/// The text of a page that shows "Before", then the inline image `image`, then "After".
+fn around_image(image: &[u8]) -> Vec<String> {
+    let mut c = b"BT /F1 12 Tf 72 700 Td (Before) Tj ET\n".to_vec();
+    c.extend_from_slice(image);
+    c.extend_from_slice(b"\nBT /F1 12 Tf 72 680 Td (After) Tj ET");
+    let (p, root) = doc(&[&c], HELVETICA, false);
+    text_of(&p.table(root, "")).unwrap()
+}
+
+#[test]
+fn inline_image_bytes_holding_ei_do_not_end_the_image() {
+    let want = vec!["Before\nAfter".to_string()];
+    // Codex repro: an unfiltered 8x1 8-bit gray image whose samples are " EI (xxx" ended at
+    // the first " EI ", and the "(" left over swallowed the rest of the page
+    assert_eq!(around_image(b"BI /W 8 /H 1 /BPC 8 /CS /G ID  EI (xxx\nEI"), want);
+    // its size from its width, components and bits: rows padded to whole bytes
+    assert_eq!(
+        around_image(b"BI /W 20 /H 2 /BPC 1 /CS /DeviceGray ID  EI (x EI\nEI"),
+        want
+    );
+    assert_eq!(
+        around_image(b"BI /W 1 /H 3 /BPC 8 /CS /RGB ID  EI (xxxx\nEI"),
+        want
+    );
+    assert_eq!(around_image(b"BI /W 40 /H 2 /IM true ID  EI (xxxxx\nEI"), want);
+    assert_eq!(
+        around_image(b"BI /W 8 /H 1 /BPC 8 /CS [/I /RGB 1 <000000ffffff>] ID  EI (xxx EI"),
+        want
+    );
+    // a declared length (PDF 2.0), and the end markers of the ASCII filters
+    assert_eq!(
+        around_image(b"BI /W 8 /H 1 /BPC 8 /CS /G /F /Fl /L 8 ID  EI (xxx\nEI"),
+        want
+    );
+    assert_eq!(
+        around_image(b"BI /W 8 /H 1 /BPC 8 /CS /G /F /A85 ID  EI (xxx~>\nEI"),
+        want
+    );
+    assert_eq!(
+        around_image(b"BI /W 1 /H 1 /BPC 8 /CS /G /F [/AHx] ID 41>\nEI"),
+        want
+    );
+    // no framing the reader knows (a filter it cannot size): the first EI that operators
+    // follow ends it, so the candidate inside the data is passed over
+    assert_eq!(
+        around_image(b"BI /W 8 /H 1 /BPC 8 /CS /G /F /DCT ID \xff\xd8 EI (xxx\xff\xd9\nEI"),
+        want
+    );
+    assert_eq!(
+        around_image(b"BI /W 8 /H 1 /BPC 8 /CS /CS0 ID  EI \x01\x02 EI  EI \nEI"),
+        want
+    );
+    // a declared size that is wrong (no EI after it) falls back to the checked scan
+    assert_eq!(around_image(b"BI /W 2 /H 1 /BPC 8 /CS /G ID abc EI (x EI"), want);
+    // an image that runs to the end of the content
+    let (p, root) = doc(
+        &[b"BT /F1 12 Tf 72 700 Td (Only) Tj ET BI /W 99 /H 99 /BPC 8 /CS /G ID  EI (x"],
+        HELVETICA,
+        false,
+    );
+    assert_eq!(text_of(&p.table(root, "")).unwrap(), vec!["Only"]);
+}
+
+#[test]
+fn the_check_of_an_inline_images_end_is_charged_to_the_work_budget() {
+    // many candidate ends inside unsized data: each check is charged, so the work stops at
+    // its cap
+    let mut c = b"BI /W 8 /H 1 /BPC 8 /CS /CS0 ID ".to_vec();
+    for _ in 0..20_000 {
+        c.extend_from_slice(b" EI (");
+    }
+    let (p, root) = doc(&[&c], HELVETICA, false);
+    let lim = Limits {
+        max_work: 10_000,
+        ..Limits::default()
+    };
+    let e = extract_text(&p.table(root, ""), &lim).unwrap_err();
+    assert!(e.to_string().contains("--pdf-max-work"), "{e}");
+}
+
+#[test]
+fn a_read_inside_a_request_counts_what_the_request_holds() {
+    // a request that already holds 950 KB of its 1 MiB: a read that would hold more than the
+    // rest is refused, though it is far under its own cap
+    let big = format!("BT /F1 12 Tf 72 700 Td ({}) Tj ET", "A".repeat(120_000));
+    let (p, root) = doc(&[big.as_bytes()], HELVETICA, false);
+    let file = p.table(root, "");
+    let lim = Limits {
+        max_heap: 1 << 20,
+        ..Limits::default()
+    };
+    let mut req = Request::new(&lim);
+    let held = std::hint::black_box(vec![1u8; 950_000]);
+    req.admit().unwrap();
+    let mut own = lim;
+    own.max_heap = 64 << 20;
+    let e = extract_text(&file, &own).unwrap_err();
+    assert!(
+        e.to_string().contains(
+            "reading it, with the request's documents before it, holds more than 1048576 bytes of memory (--pdf-max-heap-mb)"
+        ),
+        "{e}"
+    );
+    // with the request's memory released, the same read fits
+    drop(held);
+    assert!(extract_text(&file, &own).is_ok());
+    drop(req);
+    assert_eq!(crate::heap_meter::reading(), None);
+}
+
+#[test]
+fn a_request_budget_counts_documents_and_text_together() {
+    let lim = Limits {
+        max_docs: 3,
+        max_decoded: 100,
+        ..Limits::default()
+    };
+    let mut req = Request::new(&lim);
+    for _ in 0..3 {
+        req.admit().unwrap();
+    }
+    let e = req.admit().unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "the request's documents are too large together: there are more than 3 documents (--pdf-max-docs)"
+    );
+    req.keep(60).unwrap();
+    let e = req.keep(41).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "the request's documents are too large together: their text is more than 100 bytes (--pdf-max-inflate-mb)"
+    );
+    req.keep(40).unwrap();
+}
+
+#[test]
+fn the_default_document_count_is_pinned() {
+    assert_eq!(Limits::default().max_docs, 100);
+}

@@ -10,6 +10,11 @@
 //! by `verified/mcp_proxy.bend`), and only when the server was started with the proxy on;
 //! otherwise it is refused with a 400 that says how to send the document instead. `file`
 //! sources (uploaded files) are left to the Messages translation, which refuses them.
+//!
+//! The documents of one request are charged together to one [`pdf::Request`] budget (verified
+//! like the budgets of one PDF): each is counted before it is decoded or fetched, its text
+//! before it is kept, and the heap the expansion holds across all of them is checked at every
+//! charge, so many documents that each fit cannot add up past the caps.
 
 use crate::json::JsonValue;
 use crate::pdf;
@@ -45,23 +50,43 @@ fn s(v: &str) -> JsonValue {
     JsonValue::Str(v.to_string())
 }
 
-/// The text of a document's bytes: a PDF's text layer, or UTF-8 text.
-fn bytes_text(bytes: &[u8], media: &str, ctx: &Ctx, path: &str) -> R<String> {
+/// Counts one more document of the request, before it is decoded or fetched.
+fn admit(req: &mut pdf::Request, path: &str) -> R<()> {
+    req.admit().map_err(|e| format!("{path}: {e}"))
+}
+
+/// The text of a document's bytes: a PDF's text layer, or UTF-8 text, charged to the
+/// request's text budget before it is kept.
+fn bytes_text(
+    bytes: &[u8],
+    media: &str,
+    ctx: &Ctx,
+    req: &mut pdf::Request,
+    path: &str,
+) -> R<String> {
     let media = media.trim().to_ascii_lowercase();
-    if media.starts_with("application/pdf") || pdf::is_pdf(bytes) {
-        return pdf::extract_text(bytes, &ctx.limits)
+    let text = if media.starts_with("application/pdf") || pdf::is_pdf(bytes) {
+        pdf::extract_text(bytes, &ctx.limits)
             .map(|e| e.text())
-            .map_err(|e| format!("{path}: {e}"));
-    }
-    if media.starts_with("text/") || media.is_empty() {
-        if let Ok(t) = String::from_utf8(bytes.to_vec()) {
-            return Ok(t);
-        }
-    }
-    let what = if media.is_empty() { "this" } else { &media };
-    Err(format!(
+            .map_err(|e| format!("{path}: {e}"))?
+    } else if let Some(t) = (media.starts_with("text/") || media.is_empty())
+        .then(|| std::str::from_utf8(bytes).ok())
+        .flatten()
+    {
+        t.to_string()
+    } else {
+        return Err(unsupported(&media, path));
+    };
+    req.keep(text.len() as u64)
+        .map_err(|e| format!("{path}: {e}"))?;
+    Ok(text)
+}
+
+fn unsupported(media: &str, path: &str) -> String {
+    let what = if media.is_empty() { "this" } else { media };
+    format!(
         "{path}: {what} documents are not supported by this server (PDF and plain-text documents are); send the text"
-    ))
+    )
 }
 
 fn decode_base64(data: &str, path: &str) -> R<Vec<u8>> {
@@ -73,6 +98,7 @@ fn decode_base64(data: &str, path: &str) -> R<Vec<u8>> {
 /// not applied (`citations`).
 pub(super) fn expand_messages(body: &mut JsonValue, ctx: &Ctx) -> R<Vec<String>> {
     let mut ignored = Vec::new();
+    let req = &mut pdf::Request::new(&ctx.limits);
     let Some(JsonValue::Array(messages)) = field_mut(body, "messages") else {
         return Ok(ignored);
     };
@@ -83,12 +109,13 @@ pub(super) fn expand_messages(body: &mut JsonValue, ctx: &Ctx) -> R<Vec<String>>
         for (j, b) in blocks.iter_mut().enumerate() {
             let p = format!("messages.{i}.content.{j}");
             match kind(b) {
-                "document" => document(b, &p, ctx, &mut ignored)?,
+                "document" => document(b, &p, ctx, req, &mut ignored)?,
                 "tool_result" => {
                     if let Some(JsonValue::Array(inner)) = field_mut(b, "content") {
                         for (k, x) in inner.iter_mut().enumerate() {
                             if kind(x) == "document" {
-                                document(x, &format!("{p}.content.{k}"), ctx, &mut ignored)?;
+                                let p = format!("{p}.content.{k}");
+                                document(x, &p, ctx, req, &mut ignored)?;
                             }
                         }
                     }
@@ -100,7 +127,13 @@ pub(super) fn expand_messages(body: &mut JsonValue, ctx: &Ctx) -> R<Vec<String>>
     Ok(ignored)
 }
 
-fn document(b: &mut JsonValue, path: &str, ctx: &Ctx, ignored: &mut Vec<String>) -> R<()> {
+fn document(
+    b: &mut JsonValue,
+    path: &str,
+    ctx: &Ctx,
+    req: &mut pdf::Request,
+    ignored: &mut Vec<String>,
+) -> R<()> {
     if b.get("citations")
         .and_then(|c| c.get("enabled"))
         .and_then(JsonValue::as_bool)
@@ -124,12 +157,9 @@ fn document(b: &mut JsonValue, path: &str, ctx: &Ctx, ignored: &mut Vec<String>)
             let Some(data) = src.get("data").and_then(JsonValue::as_str) else {
                 return Err(format!("{sp}.data: Field required (a string)"));
             };
-            bytes_text(
-                &decode_base64(data, &format!("{sp}.data"))?,
-                media,
-                ctx,
-                path,
-            )?
+            admit(req, path)?;
+            let bytes = decode_base64(data, &format!("{sp}.data"))?;
+            bytes_text(&bytes, media, ctx, req, path)?
         }
         "url" => {
             let Some(url) = src.get("url").and_then(JsonValue::as_str) else {
@@ -140,9 +170,10 @@ fn document(b: &mut JsonValue, path: &str, ctx: &Ctx, ignored: &mut Vec<String>)
                     "{sp}: document url sources are fetched through the server's outbound proxy, which is off (start the server with --mcp-proxy and an allow-list that names the host); send the document as base64"
                 ));
             };
+            admit(req, path)?;
             let (bytes, ctype) =
                 fetch(url, ctx.limits.max_bytes).map_err(|e| format!("{sp}: {e}"))?;
-            bytes_text(&bytes, ctype.as_deref().unwrap_or(""), ctx, path)?
+            bytes_text(&bytes, ctype.as_deref().unwrap_or(""), ctx, req, path)?
         }
         _ => return Ok(()),
     };
@@ -164,6 +195,7 @@ pub(super) fn expand_chat(body: &mut JsonValue, ctx: &Ctx) -> R<()> {
     let Some(JsonValue::Array(messages)) = field_mut(body, "messages") else {
         return Ok(());
     };
+    let req = &mut pdf::Request::new(&ctx.limits);
     for (i, m) in messages.iter_mut().enumerate() {
         let Some(JsonValue::Array(parts)) = field_mut(m, "content") else {
             continue;
@@ -192,8 +224,9 @@ pub(super) fn expand_chat(body: &mut JsonValue, ctx: &Ctx) -> R<()> {
                 },
                 None => (String::new(), data),
             };
+            admit(req, &path)?;
             let bytes = decode_base64(b64, &format!("{path}.file_data"))?;
-            let mut text = bytes_text(&bytes, &media, ctx, &path)?;
+            let mut text = bytes_text(&bytes, &media, ctx, req, &path)?;
             if let Some(name) = file
                 .get("filename")
                 .and_then(JsonValue::as_str)
@@ -227,6 +260,24 @@ mod tests {
              5 0 obj << /Length {} >>\nstream\n{content}\nendstream endobj\n\
              trailer << /Root 1 0 R >>\n%%EOF\n",
             content.len()
+        )
+        .into_bytes()
+    }
+
+    /// A small PDF whose page draws a form showing 1,000 letters `draws` times.
+    fn pdf_drawn(draws: usize) -> Vec<u8> {
+        let form = format!("BT /F1 12 Tf 0 0 Td ({}) Tj ET", "A".repeat(1000));
+        let content = "q /X1 Do Q\n".repeat(draws);
+        format!(
+            "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+             2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+             3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> /XObject << /X1 6 0 R >> >> /Contents 5 0 R >> endobj\n\
+             4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n\
+             5 0 obj << /Length {} >>\nstream\n{content}\nendstream endobj\n\
+             6 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length {} >>\nstream\n{form}\nendstream endobj\n\
+             trailer << /Root 1 0 R >>\n%%EOF\n",
+            content.len(),
+            form.len()
         )
         .into_bytes()
     }
@@ -362,6 +413,89 @@ mod tests {
             &ctx(),
         );
         assert!(e.is_ok()); // left alone: not a PDF
+    }
+
+    /// A chat request with `n` file parts, each the data URL `data`.
+    fn chat_files(n: usize, data: &str) -> JsonValue {
+        let part = format!("{{\"type\":\"file\",\"file\":{{\"file_data\":\"{data}\"}}}}");
+        parse_json(&format!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":[{}]}}]}}",
+            vec![part; n].join(",")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_documents_of_a_request_share_one_budget() {
+        // Codex repro: every document had fresh budgets, so many PDFs that each fit added up
+        // without a bound. Now they are counted together: the documents a request carries...
+        let one = format!("data:application/pdf;base64,{}", b64(&pdf("Small PDF")));
+        expand_chat(&mut chat_files(100, &one), &ctx()).unwrap();
+        let e = expand_chat(&mut chat_files(101, &one), &ctx()).unwrap_err();
+        assert_eq!(
+            e,
+            "messages[0].content[100].file: the request's documents are too large together: there are more than 100 documents (--pdf-max-docs)"
+        );
+        // ... the bytes of text they keep (each one under its own text cap) ...
+        let words = "word ".repeat(400);
+        let text = format!("--- Page 1 ---\n{}\n", words.trim()).len() as u64;
+        let longer = format!("data:application/pdf;base64,{}", b64(&pdf(&words)));
+        let c = Ctx {
+            limits: pdf::Limits {
+                max_decoded: 16_384,
+                ..pdf::Limits::default()
+            },
+            fetch: None,
+        };
+        let fit = (16_384 / text) as usize;
+        assert_eq!(fit, 8);
+        expand_chat(&mut chat_files(fit, &longer), &c).unwrap();
+        let e = expand_chat(&mut chat_files(fit + 1, &longer), &c).unwrap_err();
+        assert!(
+            e.starts_with(&format!("messages[0].content[{fit}].file: "))
+                && e.ends_with("their text is more than 16384 bytes (--pdf-max-inflate-mb)"),
+            "{e}"
+        );
+        // ... and the heap the expansion holds across them: small PDFs whose text is large (a
+        // form drawn 200 times), each far under the heap cap on its own
+        let c = Ctx {
+            limits: pdf::Limits {
+                max_heap: 1 << 20,
+                ..pdf::Limits::default()
+            },
+            fetch: None,
+        };
+        let drawn = pdf_drawn(200);
+        assert!(drawn.len() < 4096, "{}", drawn.len());
+        let big = format!("data:application/pdf;base64,{}", b64(&drawn));
+        let mut two = chat_files(2, &big);
+        expand_chat(&mut two, &c).unwrap();
+        assert!(two.dump().len() > 400_000);
+        let e = expand_chat(&mut chat_files(8, &big), &c).unwrap_err();
+        assert!(
+            e.contains("more than 1048576 bytes of memory (--pdf-max-heap-mb)")
+                && (e.contains("the request's documents") || e.contains("they hold")),
+            "{e}"
+        );
+        // the Messages expansion is charged the same way
+        let block = format!(
+            "{{\"type\":\"document\",\"source\":{{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"{}\"}}}}",
+            b64(&pdf("Small PDF"))
+        );
+        let body = |n: usize| {
+            parse_json(&format!(
+                "{{\"model\":\"m\",\"max_tokens\":8,\"messages\":[{{\"role\":\"user\",\"content\":[{}]}}]}}",
+                vec![block.clone(); n].join(",")
+            ))
+            .unwrap()
+        };
+        expand_messages(&mut body(100), &ctx()).unwrap();
+        let e = expand_messages(&mut body(101), &ctx()).unwrap_err();
+        assert!(
+            e.starts_with("messages.0.content.100: ") && e.ends_with("(--pdf-max-docs)"),
+            "{e}"
+        );
+        assert_eq!(crate::heap_meter::reading(), None);
     }
 
     #[test]

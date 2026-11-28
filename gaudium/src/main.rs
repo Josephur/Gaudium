@@ -363,7 +363,9 @@ fn print_usage() {
          \x20 --pdf-max-inflate-mb <N>  Most bytes one PDF's streams may decode to, in MiB, every\n\
          \x20                       read of a stream counted, filtered or not (default: 256).\n\
          \x20                       Also, each on its own: the most bytes its object parses may\n\
-         \x20                       read and their objects take, and the most text it may yield\n\
+         \x20                       read and their objects take, and the most text it may yield;\n\
+         \x20                       the text all the documents of one request keep together is\n\
+         \x20                       capped at the same number\n\
          \x20 --pdf-max-forms <N>   Most form XObjects one PDF may draw, all pages together, a\n\
          \x20                       form drawn again counted again (default: 100000)\n\
          \x20 --pdf-max-work <N>    Most steps of work the reader may take over one PDF's\n\
@@ -374,7 +376,11 @@ fn print_usage() {
          \x20 --pdf-max-heap-mb <N>  Most heap the reader may hold while it reads one PDF, in\n\
          \x20                       MiB, as the allocator counts it on the reading thread\n\
          \x20                       (default: 1024): checked at every charge of the budgets above,\n\
-         \x20                       so memory no budget covers is still refused\n\
+         \x20                       so memory no budget covers is still refused. The documents of\n\
+         \x20                       one request hold at most this much together, each read\n\
+         \x20                       counted with what the request held before it\n\
+         \x20 --pdf-max-docs <N>    Most documents (PDFs and text files, Messages document blocks\n\
+         \x20                       and chat file parts) one request may carry (default: 100)\n\
          \x20 --verbose             Print server, HBM, and recipe diagnostics\n\
          \x20 --debug-endpoints     Serve the debug endpoints: GET /gaudium/requests lists the\n\
          \x20                       last 64 chat requests (job, reply id, endpoint, model,\n\
@@ -2946,6 +2952,14 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                         format!("invalid --pdf-max-heap-mb '{s}' (MiB, 1 to 1048576)")
                     })?
                     << 20;
+            }
+            "--pdf-max-docs" => {
+                let s = next_val(&mut i, "--pdf-max-docs")?;
+                pdf.max_docs = s
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=100_000).contains(&n))
+                    .ok_or_else(|| format!("invalid --pdf-max-docs '{s}' (1 to 100000)"))?;
             }
             "--pdf-max-forms" => {
                 let s = next_val(&mut i, "--pdf-max-forms")?;

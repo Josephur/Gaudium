@@ -32,6 +32,12 @@
 //! checked at every charge of every budget (`--pdf-max-heap-mb`): memory a path keeps without
 //! charging it to a budget is still refused at the next charge.
 //!
+//! A request may carry many documents, so what they keep together is capped as well, through
+//! the same verified budgets ([`Request`]): the number of documents (`--pdf-max-docs`), the
+//! bytes of text they keep (the text cap of one document, `--pdf-max-inflate-mb`), and the heap
+//! the expansion holds (`--pdf-max-heap-mb`), counted across all of them: each read checks its
+//! own heap and, at every charge, the heap the request held before it plus its own.
+//!
 //! Encrypted PDFs are refused.
 
 mod content;
@@ -59,8 +65,11 @@ pub const DEFAULT_MAX_INFLATE_MB: u64 = 256;
 pub const DEFAULT_MAX_FORMS: u64 = 100_000;
 /// `--pdf-max-work` default: most steps of work the reader may take over one PDF's structure.
 pub const DEFAULT_MAX_WORK: u64 = 20_000_000;
-/// `--pdf-max-heap-mb` default: most heap the reader may hold while it reads one PDF, in MiB.
+/// `--pdf-max-heap-mb` default: most heap the reader may hold while it reads one PDF, in MiB
+/// (and the documents of one request together).
 pub const DEFAULT_MAX_HEAP_MB: u64 = 1024;
+/// `--pdf-max-docs` default: most documents (PDF or text files) one request may carry.
+pub const DEFAULT_MAX_DOCS: u64 = 100;
 
 /// Deepest nesting of arrays and dictionaries.
 pub(crate) const MAX_NEST: u64 = 64;
@@ -90,8 +99,11 @@ pub struct Limits {
     pub max_forms: u64,
     /// Steps of work over the file's structure (see the module documentation).
     pub max_work: u64,
-    /// Bytes of heap the reader may hold while it reads the PDF, as the allocator counts them.
+    /// Bytes of heap the reader may hold while it reads the PDF, as the allocator counts them
+    /// (and the expansion of all the documents of a request, [`Request`]).
     pub max_heap: u64,
+    /// Documents one request may carry ([`Request`]).
+    pub max_docs: u64,
 }
 
 impl Default for Limits {
@@ -103,6 +115,7 @@ impl Default for Limits {
             max_forms: DEFAULT_MAX_FORMS,
             max_work: DEFAULT_MAX_WORK,
             max_heap: DEFAULT_MAX_HEAP_MB << 20,
+            max_docs: DEFAULT_MAX_DOCS,
         }
     }
 }
@@ -114,6 +127,8 @@ pub enum Fail {
     Encrypted,
     /// A limit is exceeded (what, with its numbers).
     TooLarge(String),
+    /// A limit of the request's documents together is exceeded ([`Request`]).
+    RequestTooLarge(String),
     Damaged(String),
     /// A feature the reader does not have (a filter, a predictor).
     Unsupported(String),
@@ -138,6 +153,9 @@ impl std::fmt::Display for Fail {
                 "the PDF is encrypted, and this server reads only unencrypted PDFs; remove its password or encryption and send it again"
             ),
             Fail::TooLarge(m) => write!(f, "the PDF is too large: {m}"),
+            Fail::RequestTooLarge(m) => {
+                write!(f, "the request's documents are too large together: {m}")
+            }
             Fail::Damaged(m) => write!(f, "the PDF is damaged or not supported: {m}"),
             Fail::Unsupported(m) => write!(f, "the PDF uses {m}, which this server cannot read"),
             Fail::NoText { pages } => write!(
@@ -156,24 +174,44 @@ pub(crate) const WORK_FLAG: &str = "--pdf-max-work";
 /// The flag that sets the heap the reader may hold.
 pub(crate) const HEAP_FLAG: &str = "--pdf-max-heap-mb";
 
-/// Whether the heap this read holds (as the allocator counts it) is within its cap. Every
-/// charge of every budget checks it first and is refused when it is not, so memory a path keeps
-/// without charging it is refused at the next charge. Outside a read (the meter off) it holds.
+/// The flag that sets the documents a request may carry.
+pub(crate) const DOCS_FLAG: &str = "--pdf-max-docs";
+
+/// Whether the heap this read holds (as the allocator counts it) is within its cap, and, when
+/// the read runs inside a request's expansion ([`Request`]), whether what the request held
+/// before it plus what it holds is within the request's cap. Every charge of every budget
+/// checks it first and is refused when it is not, so memory a path keeps without charging it
+/// is refused at the next charge. Outside a read (the meter off) it holds.
 #[inline]
-pub(crate) fn heap_fits() -> bool {
-    match crate::heap_meter::reading() {
-        Some(r) => v::pdf_within(r.live, r.cap),
-        None => true,
+pub(crate) fn heap_check() -> Result<(), Fail> {
+    let Some(r) = crate::heap_meter::reading() else {
+        return Ok(());
+    };
+    if !v::pdf_within(r.live, r.cap) {
+        return Err(heap_over(r.cap));
+    }
+    match r.outer {
+        Some(o) if !v::pdf_budget_fits(o.held, r.live, o.cap) => Err(request_heap_over(o.cap)),
+        _ => Ok(()),
     }
 }
 
 /// The refusal of a read that holds more heap than it may.
 #[cold]
 #[inline(never)]
-fn heap_over() -> Fail {
-    let cap = crate::heap_meter::reading().map_or(0, |r| r.cap);
+fn heap_over(cap: u64) -> Fail {
     Fail::TooLarge(format!(
         "reading it holds more than {cap} bytes of memory ({HEAP_FLAG})"
+    ))
+}
+
+/// The refusal of a read that, with the request's documents before it, holds more heap than
+/// the request may.
+#[cold]
+#[inline(never)]
+fn request_heap_over(cap: u64) -> Fail {
+    Fail::TooLarge(format!(
+        "reading it, with the request's documents before it, holds more than {cap} bytes of memory ({HEAP_FLAG})"
     ))
 }
 
@@ -212,11 +250,9 @@ impl Budget {
     }
 
     /// Charges `n`; refused past the budget (the spend then stays as it was), and refused,
-    /// whatever `n`, once the read holds more heap than it may ([`heap_fits`]).
+    /// whatever `n`, once the read holds more heap than it may ([`heap_check`]).
     pub fn take(&mut self, n: u64) -> Result<(), Fail> {
-        if !heap_fits() {
-            return Err(heap_over());
-        }
+        heap_check()?;
         let fits = v::pdf_budget_fits(self.used, n, self.max);
         self.used = v::pdf_budget_charge(self.used, n, self.max);
         if fits {
@@ -233,6 +269,62 @@ impl Budget {
             "{} more than {} {} ({})",
             self.what, self.max, self.unit, self.flag
         ))
+    }
+}
+
+/// What all the documents of one request may cost together: the documents it carries, the
+/// bytes of text they keep, and the heap its expansion holds, counted by the allocator from
+/// [`Request::new`] until it is dropped (on the thread that expands the request). Every
+/// document read while it lives checks, at every charge, the heap the request held before the
+/// read plus its own ([`heap_check`]); every document is charged to it before it is read
+/// ([`Request::admit`]) and its text before it is kept ([`Request::keep`]). All charges go
+/// through the verified budget (`pdf_budget_charge`).
+pub struct Request {
+    docs: Budget,
+    text: Budget,
+    _heap: crate::heap_meter::Metered,
+}
+
+impl Request {
+    /// The budgets of a request under `limits`; the heap is counted from here.
+    pub fn new(limits: &Limits) -> Request {
+        Request {
+            docs: Budget::new(limits.max_docs, "there are", "documents", DOCS_FLAG),
+            text: Budget::new(limits.max_decoded, "their text is", "bytes", INFLATE_FLAG),
+            _heap: crate::heap_meter::Metered::start(limits.max_heap),
+        }
+    }
+
+    /// Charges one more document, before it is read: refused past the request's documents, or
+    /// once the request holds more heap than it may.
+    pub fn admit(&mut self) -> Result<(), Fail> {
+        self.heap()?;
+        self.docs.take(1).map_err(request_over)
+    }
+
+    /// Charges `n` bytes of a document's text, before it is kept: refused past the request's
+    /// text, or once the request holds more heap than it may.
+    pub fn keep(&mut self, n: u64) -> Result<(), Fail> {
+        self.heap()?;
+        self.text.take(n).map_err(request_over)
+    }
+
+    fn heap(&self) -> Result<(), Fail> {
+        match crate::heap_meter::reading() {
+            Some(r) if !v::pdf_within(r.live, r.cap) => Err(Fail::RequestTooLarge(format!(
+                "they hold more than {} bytes of memory ({HEAP_FLAG})",
+                r.cap
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A request budget's refusal, worded for the request rather than one PDF.
+fn request_over(e: Fail) -> Fail {
+    match e {
+        Fail::TooLarge(m) => Fail::RequestTooLarge(m),
+        e => e,
     }
 }
 
