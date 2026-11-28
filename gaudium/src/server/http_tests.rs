@@ -3770,3 +3770,19 @@ fn models_list_refuses_a_bad_page_query() {
         assert_eq!(s(&v, &["error", "type"]), "invalid_request_error", "{body}");
     }
 }
+
+#[test]
+fn every_completion_route_is_behind_the_api_key() {
+    let h = configured_harness(|cfg| cfg.api_key = Some("server-key".into()));
+    for path in ["/v1/completions", "/completions", "/completion"] {
+        for auth in ["", "\r\nAuthorization: Bearer wrong"] {
+            let (status, _, body) = plain_exchange(
+                &h.state,
+                &format!("POST {path} HTTP/1.1\r\nHost: localhost{auth}"),
+                "{\"prompt\":\"hi\",\"max_tokens\":1}",
+            );
+            assert_eq!(status, 401, "{path} {auth:?}");
+            assert!(body.contains("authentication_error"), "{body}");
+        }
+    }
+}
